@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, Request
@@ -24,6 +25,7 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import get_user_id as _get_user_id
 from omnigent.server.routes._auth_helpers import require_access as _require_access
+from omnigent.server.routes._sessions.helpers import _GOAL_STATE_LABEL_KEY
 from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _HOST_BOUND_RUNNER_CONNECT_GRACE_S,
@@ -42,12 +44,50 @@ from omnigent.server.schemas import (
     UpdateCodexGoalStatusRequest,
 )
 from omnigent.stores import ConversationStore
+from omnigent.stores.conversation_store import _GOAL_OPERATION_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
 
 
 _CODEX_NATIVE_GOAL_ERROR = "codex_native_goal_failed"
+_CODEX_GOAL_MARKERS: dict[str | None, Literal["active", "paused"] | None] = {
+    "active": "active",
+    "paused": "paused",
+    "blocked": "paused",
+    "usageLimited": "paused",
+    "budgetLimited": "paused",
+    "complete": None,
+    None: None,
+}
+
+
+async def _sync_codex_goal_marker(
+    session_id: str,
+    conv: Conversation,
+    response: CodexGoalResponse,
+    conversation_store: ConversationStore,
+) -> None:
+    status = response.goal.status if response.goal is not None else None
+    if status not in _CODEX_GOAL_MARKERS:
+        # Preserve the marker for a newer, unmapped Codex status.
+        return
+    marker = _CODEX_GOAL_MARKERS[status]
+    operation = conv.labels.get(_GOAL_OPERATION_LABEL_KEY)
+    if conv.agent_id is None or operation is None:
+        return
+    updated = await asyncio.to_thread(
+        conversation_store.update_labels_if_agent_matches,
+        session_id,
+        conv.agent_id,
+        {_GOAL_STATE_LABEL_KEY: marker, _GOAL_OPERATION_LABEL_KEY: None},
+        {_GOAL_OPERATION_LABEL_KEY: operation},
+    )
+    if updated:
+        if marker is None:
+            conv.labels.pop(_GOAL_STATE_LABEL_KEY, None)
+        else:
+            conv.labels[_GOAL_STATE_LABEL_KEY] = marker
 
 
 def _codex_goal_error(status_code: int, *, detail: str) -> JSONResponse:
@@ -459,6 +499,18 @@ async def _require_codex_native_goal_session(
             "codex_goal is only supported for codex-native sessions",
             code=ErrorCode.INVALID_INPUT,
         )
+    if conv.agent_id is None:
+        raise OmnigentError("Codex session has no agent", code=ErrorCode.CONFLICT)
+    operation = uuid4().hex
+    reserved = await asyncio.to_thread(
+        conversation_store.update_labels_if_agent_matches,
+        session_id,
+        conv.agent_id,
+        {_GOAL_OPERATION_LABEL_KEY: operation},
+    )
+    if not reserved:
+        raise OmnigentError("Session changed during Goal request", code=ErrorCode.CONFLICT)
+    conv.labels[_GOAL_OPERATION_LABEL_KEY] = operation
     return conv
 
 
@@ -484,13 +536,15 @@ def register_codex_session_routes(
         """
         Read the current Codex app-server goal for a Codex-native session.
 
+        This read reserves a hidden operation token but never launches a runner.
+
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: Current Codex goal state, or ``goal=None`` when no goal is
-            set.
+        :returns: Current Goal, or HTTP 200 ``goal=None`` when unset or no live
+            runner is connected; the persisted marker is preserved.
         :raises OmnigentError: 400 for non-Codex sessions, 404 for missing
-            sessions, or 503 when no live Codex runner can read the goal.
+            sessions, or 409 if the session changes while reserving the read.
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
@@ -522,13 +576,15 @@ def register_codex_session_routes(
         if isinstance(runner_payload, JSONResponse):
             return runner_payload
         try:
-            return CodexGoalResponse.model_validate(runner_payload)
+            response = CodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
             del exc
             return _codex_goal_error(
                 502,
                 detail="Could not read Codex goal: runner returned a malformed response.",
             )
+        await _sync_codex_goal_marker(session_id, conv, response, conversation_store)
+        return response
 
     @router.put(
         "/sessions/{session_id}/codex_goal",
@@ -593,13 +649,15 @@ def register_codex_session_routes(
         if isinstance(runner_payload, JSONResponse):
             return runner_payload
         try:
-            return CodexGoalResponse.model_validate(runner_payload)
+            response = CodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
             del exc
             return _codex_goal_error(
                 502,
                 detail="Could not set Codex goal: runner returned a malformed response.",
             )
+        await _sync_codex_goal_marker(session_id, conv, response, conversation_store)
+        return response
 
     @router.patch(
         "/sessions/{session_id}/codex_goal/status",
@@ -654,13 +712,15 @@ def register_codex_session_routes(
         if isinstance(runner_payload, JSONResponse):
             return runner_payload
         try:
-            return CodexGoalResponse.model_validate(runner_payload)
+            response = CodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
             del exc
             return _codex_goal_error(
                 502,
                 detail="Could not update Codex goal status: runner returned a malformed response.",
             )
+        await _sync_codex_goal_marker(session_id, conv, response, conversation_store)
+        return response
 
     @router.delete(
         "/sessions/{session_id}/codex_goal",
@@ -707,10 +767,17 @@ def register_codex_session_routes(
         if isinstance(runner_payload, JSONResponse):
             return runner_payload
         try:
-            return ClearCodexGoalResponse.model_validate(runner_payload)
+            response = ClearCodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
             del exc
             return _codex_goal_error(
                 502,
                 detail="Could not clear Codex goal: runner returned a malformed response.",
             )
+        await _sync_codex_goal_marker(
+            session_id,
+            conv,
+            CodexGoalResponse(goal=None),
+            conversation_store,
+        )
+        return response

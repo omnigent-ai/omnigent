@@ -2559,6 +2559,7 @@ class SessionListItem(BaseModel):
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
     :param status: Derived session lifecycle status.
+    :param goal_state: Native Goal state; ``None`` means no current Goal.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
     :param title: Optional human-readable title.
@@ -2652,6 +2653,7 @@ class SessionListItem(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    goal_state: Literal["active", "paused"] | None = None
     created_at: int
     updated_at: int
     title: str | None = None

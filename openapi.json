@@ -5527,6 +5527,22 @@
             "description": "Git branch checked out in the session's worktree, e.g. `\"feature/login\"`. Set only when the session was created with a server-created git worktree; `None` otherwise. The Web UI uses a non-`None` value to offer the \"delete local branch\" cleanup checkbox on session delete. See designs/SESSION_GIT_WORKTREE.md.",
             "title": "Git Branch"
           },
+          "goal_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "active",
+                  "paused"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native Goal state; `None` means no current Goal.",
+            "title": "Goal State"
+          },
           "host_id": {
             "anyOf": [
               {
@@ -11518,7 +11534,7 @@
         ]
       },
       "get": {
-        "description": "Read the current Codex app-server goal for a Codex-native session.\n\n**Returns:** Current Codex goal state, or `goal=None` when no goal is set.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can read the goal.",
+        "description": "Read the current Codex app-server goal for a Codex-native session.\n\nThis read reserves a hidden operation token but never launches a runner.\n\n**Returns:** Current Goal, or HTTP 200 `goal=None` when unset or no live runner is connected; the persisted marker is preserved.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 409 if the session changes while reserving the read.",
         "operationId": "get_codex_goal_v1_sessions__session_id__codex_goal_get",
         "parameters": [
           {

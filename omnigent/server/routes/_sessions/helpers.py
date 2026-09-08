@@ -159,8 +159,10 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CURSOR_NATIVE_HARNESS,
     _DENY_SENTINEL_PREFIX,
     _ELICITATION_MODE,
+    _EXTERNAL_GOAL_STATE_VALUES,
     _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
     _FORK_HISTORY_NATIVE_HARNESSES,
+    _GOAL_STATE_LABEL_KEY,
     _HOOK_ELICITATION_ID_RE,
     _HOST_LAUNCH_RESULT_TIMEOUT_S,
     _KIMI_NATIVE_HARNESS,
@@ -276,6 +278,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    _GOAL_OPERATION_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
@@ -2757,6 +2760,51 @@ def _handle_external_session_todos(
         todos=validated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+async def _persist_external_goal_state(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    raw_state = body.data.get("state")
+    if "state" not in body.data or (
+        raw_state is not None
+        and (not isinstance(raw_state, str) or raw_state not in _EXTERNAL_GOAL_STATE_VALUES)
+    ):
+        raise OmnigentError(
+            "external_goal_state requires data.state to be active, paused, or null",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    await _set_goal_state_marker(
+        session_id,
+        conv,
+        cast(Literal["active", "paused"] | None, raw_state),
+        conversation_store,
+    )
+
+
+async def _set_goal_state_marker(
+    session_id: str,
+    conv: Conversation,
+    state: Literal["active", "paused"] | None,
+    conversation_store: ConversationStore,
+) -> None:
+    if conv.agent_id is None:
+        return
+    updated = await asyncio.to_thread(
+        conversation_store.update_labels_if_agent_matches,
+        session_id,
+        conv.agent_id,
+        {_GOAL_STATE_LABEL_KEY: state, _GOAL_OPERATION_LABEL_KEY: None},
+    )
+    if not updated:
+        return
+    if state is None:
+        conv.labels.pop(_GOAL_STATE_LABEL_KEY, None)
+    else:
+        conv.labels[_GOAL_STATE_LABEL_KEY] = state
 
 
 def _publish_external_conversation_item(
@@ -10517,6 +10565,7 @@ __all__ = [
     "_persist_external_assistant_message",
     "_persist_external_codex_approval_mode_change",
     "_persist_external_codex_collaboration_mode_change",
+    "_persist_external_goal_state",
     "_persist_external_model_change",
     "_persist_external_model_options",
     "_persist_external_permission_mode_change",
@@ -10599,6 +10648,7 @@ __all__ = [
     "_seed_missing_title_from_user_message",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
+    "_set_goal_state_marker",
     "_set_read_state",
     "_signal_harness_elicitation_resolved_by_id",
     "_signal_terminal_resolved_harness_elicitation",

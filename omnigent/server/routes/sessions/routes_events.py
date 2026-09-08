@@ -90,6 +90,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_COMPACTION_STATUS_VALUES,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+    _EXTERNAL_GOAL_STATE_TYPE,
     _EXTERNAL_MCP_STARTUP_STATUS_VALUES,
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
@@ -144,6 +145,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
     _persist_external_codex_collaboration_mode_change,
+    _persist_external_goal_state,
     _persist_external_model_change,
     _persist_external_model_options,
     _persist_external_permission_mode_change,
@@ -598,6 +600,7 @@ def register_events_routes(
             _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
+            _EXTERNAL_GOAL_STATE_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
@@ -1480,6 +1483,9 @@ def register_events_routes(
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
             _handle_external_session_todos(session_id, body)
+            return {"queued": False}
+        if body.type == _EXTERNAL_GOAL_STATE_TYPE:
+            await _persist_external_goal_state(session_id, conv, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id = await _persist_external_subagent_start(

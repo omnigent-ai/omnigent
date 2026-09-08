@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -10768,3 +10769,79 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+async def test_external_goal_state_updates_and_clears_session_list_marker(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    active = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_goal_state", "data": {"state": "active"}},
+    )
+    assert active.status_code in (200, 202), active.text
+    rows = (await client.get("/v1/sessions")).json()["data"]
+    assert next(row for row in rows if row["id"] == session["id"])["goal_state"] == "active"
+
+    cleared = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_goal_state", "data": {"state": None}},
+    )
+    assert cleared.status_code in (200, 202), cleared.text
+    rows = (await client.get("/v1/sessions")).json()["data"]
+    assert "goal_state" not in next(row for row in rows if row["id"] == session["id"])
+
+
+async def test_external_goal_state_cannot_cross_agent_switch(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    entered, release = threading.Event(), threading.Event()
+    original = SqlAlchemyConversationStore.update_labels_if_agent_matches
+
+    def blocked(store, *args, **kwargs):
+        entered.set()
+        release.wait(5)
+        return original(store, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "update_labels_if_agent_matches", blocked)
+    stale = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_goal_state", "data": {"state": "active"}},
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.switch_conversation_agent(
+        session["id"],
+        new_agent_id="b" * 32,
+        new_agent_name="replacement",
+        new_agent_bundle_location="replacement/hash",
+        new_agent_description=None,
+        copy_model_settings=True,
+        carry_history_into_native=False,
+        presentation_labels={},
+        previous_builtin_id=None,
+    )
+    release.set()
+    assert (await stale).status_code in (200, 202)
+    assert "omnigent.goal_state" not in store.get_conversation(session["id"]).labels
+
+
+@pytest.mark.parametrize("data", [{"state": "complete"}, {"state": []}, {}])
+async def test_external_goal_state_rejects_unknown_value(
+    client: httpx.AsyncClient, data: dict[str, Any]
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_goal_state", "data": data},
+    )
+    assert response.status_code == 400, response.text

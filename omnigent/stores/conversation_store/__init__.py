@@ -150,6 +150,8 @@ def pinned_label_key(user_id: str | None) -> str:
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
 
+_GOAL_OPERATION_LABEL_KEY = "_omnigent.goal_operation"
+
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
 # agent switch (deleted from the switched session). Two distinct reasons
@@ -176,6 +178,8 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.goal_state",
+        _GOAL_OPERATION_LABEL_KEY,
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
@@ -979,6 +983,15 @@ class ConversationStore(ABC):
             and the actual DB write.
         """
         ...
+
+    def update_labels_if_agent_matches(
+        self,
+        conversation_id: str,
+        expected_agent_id: str,
+        updates: dict[str, str | None],
+        expected: dict[str, str | None] | None = None,
+    ) -> bool:
+        raise NotImplementedError
 
     @abstractmethod
     def delete_label(

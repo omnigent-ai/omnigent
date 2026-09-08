@@ -14,6 +14,7 @@ from omnigent.errors import OmnigentError
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.server import app as app_module
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.codex_parity.helpers import (
     assert_completed as _assert_completed,
 )
@@ -69,6 +70,25 @@ class _CodexGoalConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
+    def update_labels_if_agent_matches(
+        self,
+        conversation_id: str,
+        expected_agent_id: str,
+        updates: dict[str, str | None],
+        expected: dict[str, str | None] | None = None,
+    ) -> bool:
+        conversation = self._conversations[conversation_id]
+        if conversation.agent_id != expected_agent_id or any(
+            conversation.labels.get(key) != value for key, value in (expected or {}).items()
+        ):
+            return False
+        for key, value in updates.items():
+            if value is None:
+                conversation.labels.pop(key, None)
+            else:
+                conversation.labels[key] = value
+        return True
+
 
 class _CodexGoalAgentStore:
     def get(self, agent_id: str) -> None:
@@ -110,6 +130,12 @@ class _CodexGoalRunnerClient:
                 json=self.response_body,
                 request=httpx.Request("POST", url),
             )
+        if isinstance(json, dict) and json.get("type") == "goal_clear":
+            return httpx.Response(
+                status_code=200,
+                json={"cleared": True},
+                request=httpx.Request("POST", url),
+            )
         requested_status = json.get("status") if isinstance(json, dict) else None
         status = self.response_status or (
             requested_status if isinstance(requested_status, str) else "active"
@@ -130,6 +156,22 @@ class _CodexGoalRunnerClient:
         )
 
 
+class _BlockingCodexGoalRunnerClient(_CodexGoalRunnerClient):
+    def __init__(self, blocked_type: str) -> None:
+        super().__init__()
+        self.blocked_type = blocked_type
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def post(
+        self, url: str, *, json: Any = None, timeout: float | None = None
+    ) -> httpx.Response:
+        if isinstance(json, dict) and json.get("type") == self.blocked_type:
+            self.entered.set()
+            await self.release.wait()
+        return await super().post(url, json=json, timeout=timeout)
+
+
 class _CodexGoalRoutedRunner:
     def __init__(self, client: _CodexGoalRunnerClient) -> None:
         self.runner_id = "runner_goal_test"
@@ -146,8 +188,12 @@ class _CodexGoalRunnerRouter:
         return _CodexGoalRoutedRunner(self.client)
 
 
-def _codex_goal_api_app(runner_client: _CodexGoalRunnerClient | None) -> FastAPI:
+def _codex_goal_api_app(
+    runner_client: _CodexGoalRunnerClient | None,
+    conversation_store: Any | None = None,
+) -> FastAPI:
     app = FastAPI()
+    store = conversation_store or _CodexGoalConversationStore()
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -162,7 +208,7 @@ def _codex_goal_api_app(runner_client: _CodexGoalRunnerClient | None) -> FastAPI
 
     app.include_router(
         create_sessions_router(
-            _CodexGoalConversationStore(),  # type: ignore[arg-type]
+            store,  # type: ignore[arg-type]
             _CodexGoalAgentStore(),  # type: ignore[arg-type]
             runner_router=_CodexGoalRunnerRouter(runner_client),  # type: ignore[arg-type]
         ),
@@ -396,9 +442,10 @@ async def test_omnigent_codex_goal_api_maps_partial_goal_to_502() -> None:
 
 
 @pytest.mark.asyncio
-async def test_omnigent_codex_goal_status_api_forwards_pause_resume() -> None:
+async def test_omnigent_codex_goal_controls_sync_session_marker() -> None:
     runner_client = _CodexGoalRunnerClient()
-    app = _codex_goal_api_app(runner_client)
+    conversation_store = _CodexGoalConversationStore()
+    app = _codex_goal_api_app(runner_client, conversation_store)
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -406,19 +453,75 @@ async def test_omnigent_codex_goal_status_api_forwards_pause_resume() -> None:
             "/v1/sessions/conv_codex/codex_goal/status",
             json={"status": "paused"},
         )
+        assert pause.status_code == 200
+        assert pause.json()["goal"]["status"] == "paused"
+        assert (
+            conversation_store.get_conversation("conv_codex").labels["omnigent.goal_state"]
+            == "paused"
+        )
         resume = await client.patch(
             "/v1/sessions/conv_codex/codex_goal/status",
             json={"status": "active"},
         )
+        assert resume.status_code == 200
+        assert resume.json()["goal"]["status"] == "active"
+        assert (
+            conversation_store.get_conversation("conv_codex").labels["omnigent.goal_state"]
+            == "active"
+        )
+        runner_client.response_status = "budgetLimited"
+        read = await client.get("/v1/sessions/conv_codex/codex_goal")
+        assert read.status_code == 200
+        assert (
+            conversation_store.get_conversation("conv_codex").labels["omnigent.goal_state"]
+            == "paused"
+        )
 
-    assert pause.status_code == 200
-    assert pause.json()["goal"]["status"] == "paused"
-    assert resume.status_code == 200
-    assert resume.json()["goal"]["status"] == "active"
-    assert runner_client.post_json_calls == [
+        cleared = await client.delete("/v1/sessions/conv_codex/codex_goal")
+        assert cleared.status_code == 200
+
+    assert runner_client.post_json_calls[:2] == [
         ("/v1/sessions/conv_codex/events", {"type": "goal_status", "status": "paused"}),
         ("/v1/sessions/conv_codex/events", {"type": "goal_status", "status": "active"}),
     ]
+    assert "omnigent.goal_state" not in conversation_store.get_conversation("conv_codex").labels
+
+
+@pytest.mark.parametrize("intervening", ["switch", "clear"])
+@pytest.mark.asyncio
+async def test_late_codex_goal_response_is_fenced(tmp_path: Path, intervening: str) -> None:
+    conversation_store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'goal.db'}")
+    conv = conversation_store.create_conversation(agent_id="a" * 32)
+    conversation_store.set_labels(
+        conv.id, {"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"}
+    )
+    runner = _BlockingCodexGoalRunnerClient("goal_get")
+    app = _codex_goal_api_app(runner, conversation_store)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        stale = asyncio.create_task(client.get(f"/v1/sessions/{conv.id}/codex_goal"))
+        await runner.entered.wait()
+        if intervening == "switch":
+            conversation_store.switch_conversation_agent(
+                conv.id,
+                new_agent_id="b" * 32,
+                new_agent_name="codex new",
+                new_agent_bundle_location="ag_goal_new/hash",
+                new_agent_description=None,
+                copy_model_settings=True,
+                carry_history_into_native=True,
+                presentation_labels={
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "codex-native-ui",
+                },
+                previous_builtin_id=None,
+            )
+        else:
+            assert (await client.delete(f"/v1/sessions/{conv.id}/codex_goal")).status_code == 200
+        runner.release.set()
+        assert (await stale).status_code == 200
+    assert "omnigent.goal_state" not in conversation_store.get_conversation(conv.id).labels
 
 
 @pytest.mark.asyncio

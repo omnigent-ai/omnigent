@@ -83,6 +83,7 @@ from omnigent.session_import.models import (
 )
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
+    _GOAL_OPERATION_LABEL_KEY,
     _INSTANCE_SCOPED_LABEL_KEYS,
     ARCHIVED_AT_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -212,6 +213,8 @@ def _to_conversation(
     session_usage: dict[str, Any] = {}
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
+    visible_labels = dict(labels or {})
+    visible_labels.pop(_GOAL_OPERATION_LABEL_KEY, None)
     overrides = _decode_session_overrides(row.session_overrides)
     return Conversation(
         id=row.id,
@@ -228,7 +231,7 @@ def _to_conversation(
         agent_id=row.agent_id,
         runner_id=meta.runner_id if meta else None,
         host_id=meta.host_id if meta else None,
-        labels=labels if labels is not None else {},
+        labels=visible_labels,
         session_state=session_state,
         session_usage=session_usage,
         reasoning_effort=overrides["reasoning_effort"],
@@ -1344,6 +1347,41 @@ class SqlAlchemyConversationStore(ConversationStore):
         stamp = updated_at if updated_at is not None else now_epoch()
         with self._conv_session("set_labels") as session:
             _upsert_labels(session, conversation_id, updates, stamp)
+
+    def update_labels_if_agent_matches(
+        self,
+        conversation_id: str,
+        expected_agent_id: str,
+        updates: dict[str, str | None],
+        expected: dict[str, str | None] | None = None,
+    ) -> bool:
+        workspace_id = current_workspace_id()
+        with self._conv_session_immediate("update_labels_if_agent_matches") as session:
+            agent_query = select(SqlConversation.agent_id).where(
+                SqlConversation.workspace_id == workspace_id,
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                agent_query = agent_query.with_for_update()
+            if session.scalar(agent_query) != expected_agent_id:
+                return False
+            if expected:
+                current = _fetch_labels(session, conversation_id)
+                if any(current.get(key) != value for key, value in expected.items()):
+                    return False
+            deletes = [key for key, value in updates.items() if value is None]
+            if deletes:
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key.in_(deletes),
+                    )
+                )
+            upserts = {key: value for key, value in updates.items() if value is not None}
+            if upserts:
+                _upsert_labels(session, conversation_id, upserts, now_epoch())
+            return True
 
     def set_session_state(
         self,
