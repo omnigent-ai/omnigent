@@ -6111,7 +6111,7 @@ async def _post_external_session_todos(
     """
     Post one ``external_session_todos`` event to the Sessions API.
 
-    Drives the web ``TodoPanel`` from a Codex plan update. The server caches
+    Drives the web ``TodoPanel`` from a Codex plan update. The server persists
     the list and broadcasts a ``session.todos`` SSE event, so the panel
     replaces its contents with the full current plan.
 

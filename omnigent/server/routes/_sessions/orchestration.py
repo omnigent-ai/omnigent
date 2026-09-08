@@ -192,7 +192,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
-    _session_todos_cache,
     get_caps,
     get_server_runner_router,
     session_stream,
@@ -1144,10 +1143,8 @@ def _build_session_response(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
-        # Replay the latest todo list for claude-native sessions.
-        # Populated by _handle_external_session_todos; empty list for
-        # non-claude-native sessions or before the first poll tick.
-        todos=_session_todos_cache.get(conv.id, []),
+        # Replay the last native Plan after a Server restart.
+        todos=conv.session_todos,
         skills=skills or [],
         model_options=[
             NativeModelOption.model_validate(option) for option in (model_options or [])

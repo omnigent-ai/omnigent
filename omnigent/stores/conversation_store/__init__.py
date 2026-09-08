@@ -1039,8 +1039,8 @@ class ConversationStore(ABC):
         """
         Persist the full session-state snapshot for a conversation.
 
-        Overwrites the existing ``session_state`` JSON column with
-        the serialized *state* dict. Called by
+        Replaces policy-visible state while preserving the internal Plan key
+        in the existing conversation metadata JSON. Called by
         :meth:`PolicyEngine.apply_state_updates` after applying
         structured :class:`StateUpdate` operations to the hot
         cache.
@@ -1074,6 +1074,14 @@ class ConversationStore(ABC):
             sub-dict (per-model token/cost buckets), hence ``Any``.
         """
         ...
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
+        raise NotImplementedError
 
     @abstractmethod
     def set_conversation_project(
