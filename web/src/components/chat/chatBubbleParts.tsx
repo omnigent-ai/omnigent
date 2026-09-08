@@ -505,9 +505,7 @@ export const BubbleView = memo(
     showsWorking?: boolean;
     actionsPersistent?: boolean;
   }) {
-    if (bubble.kind === "user") {
-      return <UserBubble bubble={bubble} actionsPersistent={actionsPersistent} />;
-    }
+    if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
@@ -588,13 +586,7 @@ function AttachmentChip({ icon: Icon, label }: { icon: LucideIcon; label: string
   );
 }
 
-function UserBubble({
-  bubble,
-  actionsPersistent,
-}: {
-  bubble: Extract<Bubble, { kind: "user" }>;
-  actionsPersistent: boolean;
-}) {
+function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
@@ -749,12 +741,7 @@ function UserBubble({
         {/* Skip an empty row when there is neither a timestamp nor a copy
             action. 40%-visible on touch, hover/focus-reveal on desktop. */}
         {(ts || text) && (
-          <div
-            className={cn(
-              "flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:group-hover:opacity-100 md:group-focus-within:opacity-100",
-              !actionsPersistent && "md:opacity-0",
-            )}
-          >
+          <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {ts && (
               <span
                 className="select-none text-[11px] leading-4 text-foreground/56"

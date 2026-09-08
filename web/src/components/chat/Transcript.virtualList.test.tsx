@@ -35,6 +35,7 @@ function list(
           scrollEl={scrollEl}
           lastAssistantIndex={-1}
           showsWorking={false}
+          sessionIdle
           conversationId={undefined}
           hasTasks={hasTasks}
           disableVirtualization={disableVirtualization}
@@ -45,7 +46,7 @@ function list(
   );
 }
 
-function messageList(bubbles: Bubble[], showsWorking: boolean) {
+function messageList(bubbles: Bubble[], showsWorking: boolean, sessionIdle: boolean) {
   return (
     <Conversation>
       <ConversationContent>
@@ -54,6 +55,7 @@ function messageList(bubbles: Bubble[], showsWorking: boolean) {
           scrollEl={null}
           lastAssistantIndex={bubbles.findLastIndex((item) => item.kind === "assistant")}
           showsWorking={showsWorking}
+          sessionIdle={sessionIdle}
           conversationId="conv-1"
           hasTasks={false}
           disableVirtualization
@@ -139,25 +141,25 @@ it("renders every bubble in normal flow after native find is detected", () => {
   expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(1);
 });
 
-it("keeps actions visible only on the final settled message", () => {
-  const bubbles: Bubble[] = [assistantBubble, bubble, { kind: "compaction", itemId: "compact-1" }];
-  const view = render(messageList(bubbles, false));
+it("keeps actions visible only on a final assistant message while idle", () => {
+  const bubbles: Bubble[] = [bubble, assistantBubble, { kind: "compaction", itemId: "compact-1" }];
+  const view = render(messageList(bubbles, false, true));
   const copyButtons = screen.getAllByRole("button", { name: "Copy" });
 
   expect(actionFooter(copyButtons[0]!)).toHaveClass("md:opacity-0");
   expect(actionFooter(copyButtons[1]!)).not.toHaveClass("md:opacity-0");
   expect(actionFooter(copyButtons[1]!)).toHaveClass("md:group-hover:opacity-100");
 
-  view.rerender(messageList(bubbles, true));
+  view.rerender(messageList(bubbles, false, false));
   expect(actionFooter(screen.getAllByRole("button", { name: "Copy" })[1]!)).toHaveClass(
     "md:opacity-0",
   );
 });
 
-it("keeps the final assistant actions visible while its response is active", () => {
-  render(messageList([bubble, { ...assistantBubble, lifecycle: "streaming" }], true));
+it("keeps every action row hover-only when the final message is from the user", () => {
+  render(messageList([assistantBubble, bubble], false, true));
 
-  expect(actionFooter(screen.getAllByRole("button", { name: "Copy" })[1]!)).not.toHaveClass(
-    "md:opacity-0",
-  );
+  for (const button of screen.getAllByRole("button", { name: "Copy" })) {
+    expect(actionFooter(button)).toHaveClass("md:opacity-0");
+  }
 });

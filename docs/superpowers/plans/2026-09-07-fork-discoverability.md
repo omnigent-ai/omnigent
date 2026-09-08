@@ -2,16 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Expose Fork in session menus and keep actions visible on the final settled message.
+**Goal:** Expose Fork in session menus and keep actions visible on the final assistant response only while the session is idle.
 
-**Architecture:** Reuse `ForkSessionDialog` and the existing AppShell fork opener. Sidebar rows own only their dialog's open flag; transcript code passes one persistent-actions boolean to the final real message bubble.
+**Architecture:** Reuse `ForkSessionDialog` and the existing AppShell fork opener. Sidebar rows own only their dialog's open flag; transcript code passes one persistent-actions boolean to the final assistant message when the session reports `idle`.
 
 **Tech Stack:** React, TypeScript, Radix menus, Tailwind CSS, Vitest, Testing Library.
 
 ## Global Constraints
 
 - Fork remains available with read access, including shared and child sessions.
-- A final user message is persistent only when no agent work is active.
+- User-message actions always remain hover-only.
+- A final assistant message is persistent only when the session status is `idle`.
 - Earlier messages retain hover/focus-only actions.
 - Add no dependencies or unrelated refactors.
 
@@ -34,6 +35,7 @@
 **Interfaces:**
 - `ChatHeader` consumes `canFork: boolean` and `onFork: () => void`.
 - `BubbleView` consumes `actionsPersistent?: boolean`.
+- `VirtualBubbleList` consumes `sessionIdle: boolean`.
 - Sidebar and header actions open the existing `ForkSessionDialog` without `upToResponseId`.
 
 - [ ] **Step 1: Write failing menu tests**
@@ -67,7 +69,8 @@ expect(footer).not.toHaveClass("md:opacity-0");
 expect(earlierFooter).toHaveClass("md:opacity-0");
 ```
 
-Exercise `VirtualBubbleList` with a trailing user bubble for both `showsWorking=false` and `showsWorking=true`.
+Exercise `VirtualBubbleList` with an idle final assistant bubble, a non-idle
+final assistant bubble, and a trailing user bubble.
 
 - [ ] **Step 4: Run message tests and verify RED**
 
@@ -89,11 +92,13 @@ Find the last user/assistant index in `VirtualBubbleList`. Pass:
 
 ```tsx
 actionsPersistent={
-  index === lastMessageIndex && (bubble.kind === "assistant" || !showsWorking)
+  index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
 }
 ```
 
-Use that boolean to omit the hover-only opacity classes from user and assistant action footers. Keep the existing streaming Fork gate.
+Use that boolean to omit the resting `md:opacity-0` class from the assistant
+action footer while preserving its hover-to-full-opacity classes. User-message
+actions remain hover-only. Keep the existing streaming Fork gate.
 
 - [ ] **Step 7: Verify tests, types, lint, and formatting**
 

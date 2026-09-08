@@ -3,7 +3,7 @@
 ## Goal
 
 Make conversation forking discoverable from session menus and keep the final
-message's actions visible without requiring hover.
+assistant response's actions visible once the session is confirmed idle.
 
 ## Session menus
 
@@ -22,14 +22,15 @@ to use the AppShell-owned fork dialog.
 
 ## Message actions
 
-The transcript identifies the final real message bubble, considering user and
-assistant bubbles while ignoring routing and compaction markers. That bubble's
-action footer remains visible without hover.
+The transcript identifies the final real message bubble while ignoring routing
+and compaction markers. Its action footer remains visible without hover only
+when that message is an assistant response and the session status is exactly
+`idle`.
 
-For a final user bubble, the footer remains hover-only while the agent is
-working and becomes persistent once activity ends, including after a failed
-turn. A final assistant bubble is persistent; Fork itself remains unavailable
-while that response is streaming, preserving the current safety gate.
+User-message actions always remain hover-only. Assistant actions also remain
+hover-only during loading, startup, streaming, waiting, and failure states.
+Fork itself remains unavailable while a response is streaming, preserving the
+current safety gate.
 
 All earlier message footers keep the existing hover/focus behavior.
 
@@ -40,9 +41,9 @@ Component tests will cover:
 - Fork in the sidebar kebab and right-click menu, opening the existing dialog
   for the selected row.
 - Fork in the owner header menu and the fallback header menu.
-- Persistent actions on the final assistant bubble.
-- Persistent actions on a settled final user bubble, but not while work is in
-  progress.
+- Persistent actions on the final assistant bubble only while the session is
+  confirmed idle.
+- Hover-only actions on a final user bubble and during non-idle session states.
 - Hover-only actions on earlier messages.
 
 No API or server changes are required.

@@ -356,6 +356,7 @@ function TranscriptImpl({
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
                   showsWorking={display.showsWorking}
+                  sessionIdle={sessionStatus === "idle"}
                   conversationId={display.conversationId}
                   hasTasks={display.hasTasks}
                   disableVirtualization={disableVirtualization}
@@ -542,6 +543,7 @@ export function VirtualBubbleList({
   scrollEl,
   lastAssistantIndex,
   showsWorking,
+  sessionIdle,
   conversationId,
   hasTasks,
   disableVirtualization,
@@ -551,6 +553,7 @@ export function VirtualBubbleList({
   scrollEl: HTMLElement | null;
   lastAssistantIndex: number;
   showsWorking: boolean;
+  sessionIdle: boolean;
   conversationId: string | null | undefined;
   hasTasks: boolean;
   disableVirtualization: boolean;
@@ -826,7 +829,7 @@ export function VirtualBubbleList({
             isLastAssistant={index === lastAssistantIndex}
             showsWorking={showsWorking && index === lastAssistantIndex}
             actionsPersistent={
-              index === lastMessageIndex && (bubble.kind === "assistant" || !showsWorking)
+              index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
             }
           />
         ))}
@@ -853,7 +856,7 @@ export function VirtualBubbleList({
               isLastAssistant={item.index === lastAssistantIndex}
               showsWorking={showsWorking && item.index === lastAssistantIndex}
               actionsPersistent={
-                item.index === lastMessageIndex && (bubble.kind === "assistant" || !showsWorking)
+                item.index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
               }
             />
           </div>
