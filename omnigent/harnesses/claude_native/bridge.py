@@ -5014,10 +5014,12 @@ def _tool_relay_handler_factory(
                 self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
                 return
             hook_output = evaluation_response_to_hook_output(hook_event, verdict)
+            hook_specific = (hook_output or {}).get("hookSpecificOutput")
             decision = (
-                (hook_output or {}).get("hookSpecificOutput", {}).get("permissionDecision")
-                or (hook_output or {}).get("decision")
-            )
+                hook_specific.get("permissionDecision")
+                if isinstance(hook_specific, dict)
+                else None
+            ) or (hook_output or {}).get("decision")
             if decision in ("deny", "ask", "block"):
                 _logger.info(
                     "policy_eval_relay_verdict: session=%s hook_event=%s "

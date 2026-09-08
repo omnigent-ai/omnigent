@@ -957,8 +957,7 @@ def register_hooks_routes(
         # policy evaluation failures without needing audit-log access.
         if result.action in (PolicyAction.DENY, PolicyAction.ASK):
             _logger.info(
-                "policy_eval_verdict: session=%s phase=%s action=%s "
-                "policy=%s reason=%r tool=%s",
+                "policy_eval_verdict: session=%s phase=%s action=%s policy=%s reason=%r tool=%s",
                 session_id,
                 phase.value,
                 result.action.value,
