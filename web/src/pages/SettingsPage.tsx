@@ -11,7 +11,8 @@
  *
  * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   default transcript view, Workspace panel default, and UI/code font controls.
+ *   default transcript view, Workspace panel default for new chats, default
+ *   Agents panel view, and UI/code font controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -48,11 +49,13 @@ import {
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
+  ListIcon,
   LogOutIcon,
   MessagesSquareIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
+  NetworkIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   PlusIcon,
@@ -172,6 +175,12 @@ import {
   writeTranscriptViewDefault,
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
+import {
+  AGENTS_VIEW_DEFAULT,
+  readAgentsViewDefault,
+  writeAgentsViewDefault,
+  type AgentsViewMode,
+} from "@/lib/agentsViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
@@ -377,6 +386,15 @@ const workspacePanelCards: {
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
+const agentsViewCards: {
+  value: AgentsViewMode;
+  label: string;
+  icon: typeof ListIcon;
+}[] = [
+  { value: "list", label: "List", icon: ListIcon },
+  { value: "graph", label: "Graph", icon: NetworkIcon },
+];
+
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
 function iconCardBody(Icon: typeof SunIcon, label: string) {
   return (
@@ -535,6 +553,36 @@ function WorkspacePanelDefaultControl() {
         items={workspacePanelCards.map((card) => ({
           value: card.value,
           testId: `workspace-panel-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Default List vs Graph view for each new Agents panel mount. */
+function AgentsViewDefaultControl() {
+  const [value, setValue] = useState(() => readAgentsViewDefault());
+  const labelId = useId();
+  const choose = useCallback((next: AgentsViewMode) => {
+    setValue(next);
+    writeAgentsViewDefault(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default Agents view"
+      helper="Whether the Agents panel opens in list or graph view. Switching inside the panel only lasts until it remounts."
+    >
+      <CardRadioGroup<AgentsViewMode>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={agentsViewCards.map((card) => ({
+          value: card.value,
+          testId: `agents-view-default-${card.value}`,
           body: iconCardBody(card.icon, card.label),
         }))}
       />
@@ -783,6 +831,8 @@ function AppearanceSection() {
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
+    writeAgentsViewDefault(AGENTS_VIEW_DEFAULT);
+
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
@@ -809,6 +859,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
+          "omnigent:default-agents-view",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -892,6 +943,8 @@ function AppearanceSection() {
         <TranscriptViewDefaultControl />
 
         <WorkspacePanelDefaultControl />
+
+        <AgentsViewDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
 

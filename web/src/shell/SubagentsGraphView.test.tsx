@@ -140,9 +140,13 @@ beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
   useSessionMock.mockReturnValue(defaultSession());
+  localStorage.clear();
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 // ===========================================================================
 // Unit tests: childActivity
@@ -579,7 +583,7 @@ describe("buildTree", () => {
 // ===========================================================================
 
 describe("SubagentsPanel view-mode toggle", () => {
-  it("defaults to list view", () => {
+  it("defaults to list view when no preference is stored", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
 
     renderPanel();
@@ -588,6 +592,34 @@ describe("SubagentsPanel view-mode toggle", () => {
     expect(screen.getByTestId("view-mode-graph")).toBeInTheDocument();
     expect(screen.getByTestId("subagent-main-row")).toBeInTheDocument();
     expect(screen.queryByTestId("subagents-graph-view")).toBeNull();
+  });
+
+  it("starts in graph view when the Appearance preference is graph", async () => {
+    localStorage.setItem("omnigent:default-agents-view", "graph");
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+
+    renderPanel();
+
+    expect(await screen.findByTestId("subagents-graph-view")).toBeInTheDocument();
+    expect(screen.queryByTestId("subagent-main-row")).toBeNull();
+  });
+
+  it("keeps an in-panel list switch ephemeral without writing the preference", async () => {
+    localStorage.setItem("omnigent:default-agents-view", "graph");
+    mockChildTree({
+      conv_root: [childInfo({ id: "c1", tool: "researcher" })],
+    });
+
+    const { unmount } = renderPanel();
+
+    expect(await screen.findByTestId("subagents-graph-view")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("view-mode-list"));
+    expect(screen.getByTestId("subagent-main-row")).toBeInTheDocument();
+    expect(localStorage.getItem("omnigent:default-agents-view")).toBe("graph");
+
+    unmount();
+    renderPanel();
+    expect(await screen.findByTestId("subagents-graph-view")).toBeInTheDocument();
   });
 
   it("switches to graph view when the graph button is clicked", async () => {
