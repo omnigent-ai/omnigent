@@ -177,14 +177,13 @@ async def test_handle_model_options_serves_the_claude_catalog(
     _cleanup_host(host)
 
 
-async def test_handle_model_options_claude_probe_failure_is_an_honest_empty(
+async def test_handle_model_options_claude_probe_failure_is_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No Claude catalog means an empty answer that says why.
+    """No Claude catalog means the model-options lookup failed.
 
     There is no configured/static fallback lane left: a probe that cannot
-    run yields an honest empty listing with the reason, never invented
-    rows.
+    run returns a failure with the reason, never invented rows.
     """
     from omnigent.harnesses.claude_native import main as claude_native
 
@@ -206,8 +205,7 @@ async def test_handle_model_options_claude_probe_failure_is_an_honest_empty(
 
     assert result == HostModelOptionsResultFrame(
         request_id="req_models",
-        status="ok",
-        models=[],
+        status="failed",
         error="the claude model probe failed — see the host log",
     )
     _cleanup_host(host)
@@ -250,14 +248,14 @@ async def test_handle_model_options_uses_host_pi_configuration(
 
 
 @pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
-async def test_handle_model_options_codex_probe_failure_is_an_honest_empty(
+async def test_handle_model_options_codex_probe_failure_is_failed(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """No Codex catalog means an empty answer that says why.
+    """No Codex catalog means the model-options lookup failed.
 
     There is no curated/provider fallback lane left: whether the catalog
-    machinery raises or resolves nothing, the picker gets an honest empty
-    listing with the reason, never invented rows.
+    machinery raises or resolves nothing, the host returns the reason as a
+    failed lookup, never invented rows.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
@@ -275,8 +273,7 @@ async def test_handle_model_options_codex_probe_failure_is_an_honest_empty(
 
     assert result == HostModelOptionsResultFrame(
         request_id="req_models",
-        status="ok",
-        models=[],
+        status="failed",
         error="the codex model probe failed — see the host log",
     )
     _cleanup_host(host)

@@ -152,16 +152,23 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
         listen_url: str,
         env: dict[str, str],
         cwd: Path,
-    ) -> _FakeProcess:
+    ) -> object:
         assert codex_path == "/test/codex"
         assert listen_url.startswith("ws://127.0.0.1:")
         assert cwd.is_dir()
         assert Path(env["CODEX_HOME"]).is_dir()
         captured_env.update(env)
-        return process
 
-    async def _fake_wait(process: _FakeProcess, port: int) -> None:
-        assert process is not None
+        async def _empty_stderr() -> str:
+            return ""
+
+        return codex_native_app_server._CodexModelDiscoveryProcess(
+            process=process,  # type: ignore[arg-type]
+            stderr_tail=asyncio.create_task(_empty_stderr()),
+        )
+
+    async def _fake_wait(discovery: object, port: int) -> None:
+        assert discovery is not None
         assert port > 0
 
     class _FakeClient:
@@ -2530,15 +2537,22 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
         env: dict[str, str],
         cwd: Path,
         config_overrides: tuple[str, ...] = (),
-    ) -> _FakeProcess:
+    ) -> object:
         captured["codex_path"] = codex_path
         captured["env"] = dict(env)
         captured["cwd"] = cwd
         captured["config_overrides"] = list(config_overrides)
-        return _FakeProcess()
 
-    async def _fake_wait(process: object, port: int) -> None:
-        del process, port
+        async def _empty_stderr() -> str:
+            return ""
+
+        return codex_native_app_server._CodexModelDiscoveryProcess(
+            process=_FakeProcess(),  # type: ignore[arg-type]
+            stderr_tail=asyncio.create_task(_empty_stderr()),
+        )
+
+    async def _fake_wait(discovery: object, port: int) -> None:
+        del discovery, port
 
     class _FakeClient:
         def __init__(self, *, ws_url: str, client_name: str) -> None:
@@ -2650,13 +2664,20 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
         env: dict[str, str],
         cwd: Path,
         config_overrides: tuple[str, ...] = (),
-    ) -> _FakeProcess:
+    ) -> object:
         captured["env"] = dict(env)
         captured["config_overrides"] = list(config_overrides)
-        return _FakeProcess()
 
-    async def _fake_wait(process: object, port: int) -> None:
-        del process, port
+        async def _empty_stderr() -> str:
+            return ""
+
+        return codex_native_app_server._CodexModelDiscoveryProcess(
+            process=_FakeProcess(),  # type: ignore[arg-type]
+            stderr_tail=asyncio.create_task(_empty_stderr()),
+        )
+
+    async def _fake_wait(discovery: object, port: int) -> None:
+        del discovery, port
 
     class _FakeClient:
         def __init__(self, *, ws_url: str, client_name: str) -> None:
@@ -2799,3 +2820,103 @@ def test_probe_codex_home_bridges_provider_tables_and_credential(
     )
     home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
     assert "https://two.example" in (home / "config.toml").read_text()
+
+
+async def test_discovery_stderr_tail_is_bounded_and_redacted() -> None:
+    """The probe retains one safe diagnostic without persisting raw stderr."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    stderr = asyncio.StreamReader()
+    stderr.feed_data(
+        b"discarded prefix "
+        + (b"x" * 128)
+        + b"\nError: Model provider `Databricks` not found; token=sk-abcdefghijklmnop\n"
+    )
+    stderr.feed_eof()
+
+    detail = await codex_native_app_server._capture_codex_discovery_stderr_tail(
+        stderr,
+        byte_limit=96,
+    )
+
+    assert "Model provider `Databricks` not found" in detail
+    assert "discarded prefix" not in detail
+    assert "sk-abcdefghijklmnop" not in detail
+    assert "[REDACTED]" in detail
+
+
+async def test_discovery_early_exit_error_carries_redacted_codex_stderr() -> None:
+    """A failed probe exposes Codex's redacted in-memory diagnostic."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    class _DeadProcess:
+        returncode = 1
+
+    async def _stderr_tail() -> str:
+        return "Error: Model provider `Databricks` not found; token=[REDACTED]"
+
+    discovery = codex_native_app_server._CodexModelDiscoveryProcess(
+        process=_DeadProcess(),  # type: ignore[arg-type]
+        stderr_tail=asyncio.create_task(_stderr_tail()),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await codex_native_app_server._wait_for_discovery_listener(discovery, port=1)
+
+    message = str(excinfo.value)
+    assert "exited early (1)" in message
+    assert "Model provider `Databricks` not found" in message
+    assert "[REDACTED]" in message
+
+
+async def test_discovery_process_captures_stderr_in_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe drains stderr through a pipe rather than a filesystem log."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    captured_stderr: object = None
+
+    async def _fake_create_subprocess_exec(*args: object, **kwargs: object) -> object:
+        nonlocal captured_stderr
+        del args
+        captured_stderr = kwargs["stderr"]
+        stderr = asyncio.StreamReader()
+        stderr.feed_data(b"Error: provider unavailable\n")
+        stderr.feed_eof()
+
+        class _FakeProcess:
+            pass
+
+        process = _FakeProcess()
+        process.stderr = stderr
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    discovery = await codex_native_app_server._start_codex_model_discovery_process(
+        codex_path="/test/codex",
+        listen_url="ws://127.0.0.1:12345",
+        env={},
+        cwd=Path("/work"),
+    )
+
+    assert captured_stderr == asyncio.subprocess.PIPE
+    assert await discovery.stderr_tail == "Error: provider unavailable"
+
+
+async def test_discovery_early_exit_without_stderr_keeps_plain_error() -> None:
+    """Empty captured stderr retains the existing error text."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    class _DeadProcess:
+        returncode = 1
+
+    async def _empty_stderr() -> str:
+        return ""
+
+    discovery = codex_native_app_server._CodexModelDiscoveryProcess(
+        process=_DeadProcess(),  # type: ignore[arg-type]
+        stderr_tail=asyncio.create_task(_empty_stderr()),
+    )
+    with pytest.raises(RuntimeError, match=r"^Codex model discovery exited early \(1\)$"):
+        await codex_native_app_server._wait_for_discovery_listener(discovery, port=1)

@@ -2596,6 +2596,32 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostModelOptionsResponse": {
+        "description": "Pre-launch model choices resolved by a host harness.",
+        "properties": {
+          "models": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "routable_models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Routable Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models",
+          "routable_models"
+        ],
+        "title": "HostModelOptionsResponse",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -9609,12 +9635,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {},
-                    "type": "array"
-                  },
-                  "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HostModelOptionsResponse"
                 }
               }
             },

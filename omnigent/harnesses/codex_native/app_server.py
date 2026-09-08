@@ -65,7 +65,7 @@ from omnigent.inner.codex_executor import (
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
-from omnigent.process_logging import log_info_once, log_once
+from omnigent.process_logging import log_info_once, log_once, redact_log_text
 
 _logger = logging.getLogger(__name__)
 
@@ -80,6 +80,8 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
+_MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
+_MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
@@ -119,6 +121,14 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 # interactive trust prompt may appear instead.
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
+
+
+@dataclass(frozen=True)
+class _CodexModelDiscoveryProcess:
+    """Short-lived Codex process plus its bounded stderr drain."""
+
+    process: asyncio.subprocess.Process
+    stderr_tail: asyncio.Task[str]
 
 
 def _string_object_dict(value: object) -> _JsonObject | None:
@@ -811,7 +821,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
             }:
                 env.pop(name)
         env["CODEX_HOME"] = str(codex_home)
-        process = await _start_codex_model_discovery_process(
+        discovery = await _start_codex_model_discovery_process(
             codex_path=resolved_codex,
             listen_url=listen_url,
             env=env,
@@ -819,7 +829,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
         )
         client: CodexAppServerClient | None = None
         try:
-            await _wait_for_discovery_listener(process, port)
+            await _wait_for_discovery_listener(discovery, port)
             client = CodexAppServerClient(
                 ws_url=listen_url,
                 client_name="omnigent-codex-model-discovery",
@@ -830,12 +840,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.close()
-            _proc.terminate_tree(process)
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-            except TimeoutError:
-                _proc.kill_tree(process)
-                await process.wait()
+            await _stop_codex_model_discovery_process(discovery)
 
     _model_discovery_cache[resolved_codex] = tuple(dict(option) for option in options)
     return options
@@ -848,12 +853,12 @@ async def _start_codex_model_discovery_process(
     env: dict[str, str],
     cwd: Path,
     config_overrides: Sequence[str] = (),
-) -> asyncio.subprocess.Process:
+) -> _CodexModelDiscoveryProcess:
     """Start the isolated Codex process used only for model discovery."""
     override_args: list[str] = []
     for override in config_overrides:
         override_args.extend(("-c", override))
-    return await asyncio.create_subprocess_exec(
+    process = await asyncio.create_subprocess_exec(
         codex_path,
         "app-server",
         "--listen",
@@ -861,11 +866,53 @@ async def _start_codex_model_discovery_process(
         *override_args,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
         env=env,
         cwd=str(cwd),
         **_proc.spawn_kwargs(),
     )
+    assert process.stderr is not None
+    stderr_tail = asyncio.create_task(
+        _capture_codex_discovery_stderr_tail(process.stderr),
+        name="codex-model-discovery-stderr",
+    )
+    return _CodexModelDiscoveryProcess(process=process, stderr_tail=stderr_tail)
+
+
+async def _capture_codex_discovery_stderr_tail(
+    stderr: asyncio.StreamReader,
+    *,
+    byte_limit: int = _MODEL_DISCOVERY_STDERR_TAIL_BYTES,
+) -> str:
+    """Drain stderr while retaining only a redacted final line in memory."""
+    tail = bytearray()
+    try:
+        while chunk := await stderr.read(8192):
+            if len(chunk) >= byte_limit:
+                tail = bytearray(chunk[-byte_limit:])
+                continue
+            overflow = len(tail) + len(chunk) - byte_limit
+            if overflow > 0:
+                del tail[:overflow]
+            tail.extend(chunk)
+    except OSError:
+        return ""
+    text = tail.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    return redact_log_text(text.splitlines()[-1].strip())[:_MODEL_DISCOVERY_STDERR_LINE_CHARS]
+
+
+async def _stop_codex_model_discovery_process(discovery: _CodexModelDiscoveryProcess) -> None:
+    """Terminate a discovery process and finish draining its stderr pipe."""
+    process = discovery.process
+    _proc.terminate_tree(process)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+    except TimeoutError:
+        _proc.kill_tree(process)
+        await process.wait()
+    await discovery.stderr_tail
 
 
 def _allocate_loopback_port() -> int:
@@ -876,14 +923,19 @@ def _allocate_loopback_port() -> int:
 
 
 async def _wait_for_discovery_listener(
-    process: asyncio.subprocess.Process,
+    discovery: _CodexModelDiscoveryProcess,
     port: int,
 ) -> None:
     """Wait until a discovery app-server accepts loopback connections."""
+    process = discovery.process
     deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
     while asyncio.get_running_loop().time() < deadline:
         if process.returncode is not None:
-            raise RuntimeError(f"Codex model discovery exited early ({process.returncode})")
+            message = f"Codex model discovery exited early ({process.returncode})"
+            detail = await discovery.stderr_tail
+            if detail:
+                message = f"{message}: {detail}"
+            raise RuntimeError(message)
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
         except OSError:
@@ -1010,7 +1062,7 @@ async def probe_codex_model_options(
     env["CODEX_HOME"] = str(codex_home)
     port = _allocate_loopback_port()
     listen_url = f"ws://127.0.0.1:{port}"
-    process = await _start_codex_model_discovery_process(
+    discovery = await _start_codex_model_discovery_process(
         codex_path=resolved_codex,
         listen_url=listen_url,
         env=env,
@@ -1019,7 +1071,7 @@ async def probe_codex_model_options(
     )
     client: CodexAppServerClient | None = None
     try:
-        await _wait_for_discovery_listener(process, port)
+        await _wait_for_discovery_listener(discovery, port)
         client = CodexAppServerClient(
             ws_url=listen_url,
             client_name="omnigent-codex-model-probe",
@@ -1030,12 +1082,7 @@ async def probe_codex_model_options(
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
-        _proc.terminate_tree(process)
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5.0)
-        except TimeoutError:
-            _proc.kill_tree(process)
-            await process.wait()
+        await _stop_codex_model_discovery_process(discovery)
     return mark_launch_default(rows, pinned_model)
 
 

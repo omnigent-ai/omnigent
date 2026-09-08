@@ -2841,7 +2841,7 @@ class HostProcess:
             # Harness-truth lane: every launch shape is answered from the
             # shared catalog, probed from the configured Codex binary itself.
             # No curated fallback and no serving-endpoints listing — a probe
-            # that cannot run yields an honest empty answer with the reason.
+            # that cannot run is a failed lookup, not a successful empty catalog.
             probed = await self._probed_codex_model_options()
             if probed is not None:
                 return HostModelOptionsResultFrame(
@@ -2852,8 +2852,7 @@ class HostProcess:
                 )
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
-                status="ok",
-                models=[],
+                status="failed",
                 error="the codex model probe failed — see the host log",
             )
 
@@ -2935,8 +2934,7 @@ class HostProcess:
             )
         return HostModelOptionsResultFrame(
             request_id=frame.request_id,
-            status="ok",
-            models=[],
+            status="failed",
             error="the claude model probe failed — see the host log",
         )
 
