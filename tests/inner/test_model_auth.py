@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.inner._proc import process_alive
 from omnigent.inner.model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
@@ -109,7 +110,7 @@ printf 'opaque-token-value\\n'
     assert f"NETRC={os.devnull}" in child_env
 
 
-async def test_ucode_helper_inherits_signer_process_group(
+async def test_ucode_helper_gets_an_owned_process_group(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -125,8 +126,10 @@ async def test_ucode_helper_inherits_signer_process_group(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
 
     assert await mint_ucode_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
-    assert "start_new_session" not in observed_kwargs
-    assert "creationflags" not in observed_kwargs
+    if os.name == "posix":
+        assert observed_kwargs["start_new_session"] is True
+    else:
+        assert "creationflags" in observed_kwargs
 
 
 async def test_cancelled_ucode_mint_terminates_helper(
@@ -147,6 +150,31 @@ async def test_cancelled_ucode_mint_terminates_helper(
 
     with pytest.raises(asyncio.CancelledError):
         await mint
+
+
+@pytest.mark.skipif(os.name != "posix", reason="forked helper acceptance is POSIX-only")
+async def test_nonzero_helper_leader_exit_does_not_leave_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    _write_ucode(
+        tmp_path / "ucode",
+        f"(trap '' TERM; while true; do sleep 1; done) >/dev/null 2>&1 &\n"
+        f"printf '%s' \"$!\" > {child_pid_path}\n"
+        "exit 19\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
+
+    with pytest.raises(ProviderAuthRequired):
+        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    for _ in range(100):
+        if not process_alive(child_pid):
+            break
+        await asyncio.sleep(0.02)
+    assert not process_alive(child_pid)
 
 
 @pytest.mark.parametrize(

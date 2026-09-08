@@ -8,9 +8,11 @@ import os
 import re
 import shutil
 import stat
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import _proc
 from .egress.rules import is_dns_safe_host
 
 PROVIDER_AUTH_REQUIRED = "PROVIDER_AUTH_REQUIRED"
@@ -106,7 +108,7 @@ async def _collect_stdout(proc: asyncio.subprocess.Process) -> bytes:
         chunks.append(chunk)
         size += len(chunk)
         if size > _MAX_TOKEN_BYTES:
-            proc.kill()
+            _proc.kill_tree(proc)
             break
     await proc.wait()
     return b"".join(chunks)
@@ -126,28 +128,58 @@ async def mint_ucode_token(*, host: str, profile: str) -> str:
     host, profile = _validated_authority(host, profile)
     message = _provider_auth_message(host, profile)
     proc: asyncio.subprocess.Process | None = None
+    liveness_read_fd: int | None = None
+    liveness_write_fd: int | None = None
     try:
         executable = _resolve_ucode_executable()
+        helper_argv = _ucode_auth_token_argv(executable, host=host, profile=profile)
+        pass_fds: tuple[int, ...] = ()
+        if os.name == "posix":
+            liveness_read_fd, liveness_write_fd = os.pipe()
+            os.set_inheritable(liveness_read_fd, True)
+            helper_argv = [
+                sys.executable,
+                str(Path(__file__).with_name("_liveness_exec.py")),
+                "--liveness-fd",
+                str(liveness_read_fd),
+                *helper_argv,
+            ]
+            pass_fds = (liveness_read_fd,)
         proc = await asyncio.create_subprocess_exec(
-            *_ucode_auth_token_argv(executable, host=host, profile=profile),
+            *helper_argv,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env=_ucode_env(),
+            pass_fds=pass_fds,
+            **_proc.spawn_kwargs(),
         )
+        if liveness_read_fd is not None:
+            os.close(liveness_read_fd)
+            liveness_read_fd = None
+        _proc.remember_process_group(proc)
         stdout = await asyncio.wait_for(_collect_stdout(proc), timeout=_TOKEN_TIMEOUT_SECONDS)
         return _parse_token(stdout, proc.returncode)
     except asyncio.CancelledError:
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+        if proc is not None:
+            _proc.terminate_tree(proc)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            _proc.kill_tree(proc)
             with contextlib.suppress(Exception):
                 await proc.wait()
         raise
     except (OSError, ValueError, asyncio.TimeoutError):
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+        if proc is not None:
+            _proc.terminate_tree(proc)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            _proc.kill_tree(proc)
             with contextlib.suppress(Exception):
                 await proc.wait()
         raise ProviderAuthRequired(message) from None
+    finally:
+        for fd in (liveness_read_fd, liveness_write_fd):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)

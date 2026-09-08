@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -134,6 +135,7 @@ _TURN_COMPLETED_DRAIN_SECONDS = 1.0
 # build that blocks (e.g. on stdin) must not stall session startup — on
 # timeout the probe kills the process and reports the version as unknown.
 _CODEX_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
+_WORKER_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
@@ -472,6 +474,7 @@ async def _create_subprocess_exec(
     stderr: int | None = None,
     env: Mapping[str, str] | Mapping[bytes, bytes] | None = None,
     cwd: _ProcessPath | None = None,
+    pass_fds: tuple[int, ...] = (),
     start_new_session: bool = False,
     creationflags: int = 0,
 ) -> asyncio.subprocess.Process:
@@ -484,6 +487,7 @@ async def _create_subprocess_exec(
         stderr=stderr,
         env=env,
         cwd=cwd,
+        pass_fds=pass_fds,
         start_new_session=start_new_session,
         creationflags=creationflags,
     )
@@ -2355,6 +2359,8 @@ class _CodexAppServerSession:
         self._containment_confirmed = False
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
+        self._codex_home_identity: tuple[int, int] | None = None
+        self._worker_liveness_fd: int | None = None
         # Most recent ``thread/tokenUsage/updated`` payload's ``last``
         # turn breakdown, mapped to the wire shape. Consumed (and cleared)
         # on the next ``turn/completed`` so each TurnComplete carries the
@@ -2390,21 +2396,30 @@ class _CodexAppServerSession:
             self._signer_exited = False
             self._signer_watch_task = asyncio.create_task(self._watch_signer())
         codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd and self._cwd != "/":
+        if self._signer is None and self._cwd and self._cwd != "/":
             try:
-                codex_home_root = Path(self._cwd) / (
-                    "omnigent-codex-tmp" if self._signer is not None else ".codex-tmp"
-                )
+                codex_home_root = Path(self._cwd) / ".codex-tmp"
                 codex_home_root.mkdir(parents=True, exist_ok=True)
             except OSError:
-                # The cwd may be on a read-only filesystem — e.g. macOS
-                # root ``/`` inherited from a runner whose working
-                # directory was never explicitly set.  Fall back to the
-                # system temp directory so the codex home is still writable.
                 codex_home_root = Path(tempfile.gettempdir())
+        elif self._signer is not None:
+            root_stat = codex_home_root.lstat()
+            unsafe_writable = bool(root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or codex_home_root.is_symlink()
+                or (unsafe_writable and not root_stat.st_mode & stat.S_ISVTX)
+            ):
+                raise OSError("unsafe signer session temp root")
         self._codex_home_dir = Path(
             tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
         )
+        home_stat = self._codex_home_dir.lstat()
+        self._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
+        os.chmod(self._codex_home_dir, 0o700)
+        home_stat = self._codex_home_dir.lstat()
+        if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
+            raise OSError("unsafe signer CODEX_HOME")
         # Populate the per-conversation CODEX_HOME's ``skills/`` subdir
         # based on the spec's ``skills:`` field. Codex auto-discovers
         # skills under ``$CODEX_HOME/skills/<name>/SKILL.md``; without
@@ -2496,15 +2511,35 @@ class _CodexAppServerSession:
             argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
-            self._proc = await _create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=proc_env,
-                **_proc.spawn_kwargs(),
-                cwd=self._cwd or os.getcwd(),
-            )
+            spawn_argv = argv
+            pass_fds: tuple[int, ...] = ()
+            liveness_read_fd: int | None = None
+            if self._signer is not None and os.name == "posix":
+                liveness_read_fd, self._worker_liveness_fd = os.pipe()
+                os.set_inheritable(liveness_read_fd, True)
+                spawn_argv = [
+                    sys.executable,
+                    str(Path(__file__).with_name("_liveness_exec.py")),
+                    "--liveness-fd",
+                    str(liveness_read_fd),
+                    *argv,
+                ]
+                pass_fds = (liveness_read_fd,)
+            try:
+                self._proc = await _create_subprocess_exec(
+                    *spawn_argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=proc_env,
+                    pass_fds=pass_fds,
+                    **_proc.spawn_kwargs(),
+                    cwd=self._cwd or os.getcwd(),
+                )
+                _proc.remember_process_group(self._proc)
+            finally:
+                if liveness_read_fd is not None:
+                    os.close(liveness_read_fd)
             self._reader_task = asyncio.create_task(self._reader_loop())
             self._stderr_task = asyncio.create_task(self._stderr_loop())
             await self._request(
@@ -2542,10 +2577,12 @@ class _CodexAppServerSession:
     async def close(self) -> None:
         self._closing = True
         await self._close_signer()
+        self._close_worker_liveness()
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
-            if self._proc is not None and self._proc.returncode is None:
+            if self._proc is not None:
                 _terminate_process_tree(self._proc)
+                _kill_process_tree(self._proc)
             self._pending_requests.clear()
             if self._proc is not None:
                 close_subprocess_transport(self._proc)
@@ -2561,13 +2598,19 @@ class _CodexAppServerSession:
             self._closing = False
             return
 
-        if self._proc is not None and self._proc.returncode is None:
+        if self._proc is not None:
             _terminate_process_tree(self._proc)
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
+                await asyncio.wait_for(
+                    self._proc.wait(),
+                    timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                )
             except asyncio.TimeoutError:
                 _kill_process_tree(self._proc)
                 await self._proc.wait()
+            else:
+                # The process leader exiting does not prove its group is empty.
+                _kill_process_tree(self._proc)
         stdin = self._proc.stdin if self._proc is not None else None
         if stdin is not None:
             with suppress(Exception):
@@ -2608,8 +2651,18 @@ class _CodexAppServerSession:
         except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
             logger.debug("model signer watcher failed", exc_info=True)
         self._signer_exited = True
-        if not self._closing and self._proc is not None and self._proc.returncode is None:
+        if not self._closing and self._proc is not None:
             _terminate_process_tree(self._proc)
+            try:
+                await asyncio.wait_for(
+                    self._proc.wait(),
+                    timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                _kill_process_tree(self._proc)
+                await self._proc.wait()
+            else:
+                _kill_process_tree(self._proc)
 
     async def _close_signer(self) -> None:
         signer = self._signer
@@ -2635,8 +2688,22 @@ class _CodexAppServerSession:
 
     def _cleanup_process_cwd(self) -> None:
         if self._codex_home_dir is not None:
-            shutil.rmtree(self._codex_home_dir, ignore_errors=True)
+            try:
+                current = self._codex_home_dir.lstat()
+                identity = (current.st_dev, current.st_ino)
+                if stat.S_ISDIR(current.st_mode) and identity == self._codex_home_identity:
+                    shutil.rmtree(self._codex_home_dir, ignore_errors=True)
+            except OSError:
+                pass
             self._codex_home_dir = None
+            self._codex_home_identity = None
+
+    def _close_worker_liveness(self) -> None:
+        fd = self._worker_liveness_fd
+        self._worker_liveness_fd = None
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
 
     def _record_event(self, message: CodexMessage) -> None:
         self._recent_events.append(message)

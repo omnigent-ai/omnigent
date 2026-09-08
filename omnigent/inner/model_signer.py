@@ -192,6 +192,7 @@ class SubprocessModelSigner:
                 pass_fds=(read_fd,),
                 **_proc.spawn_kwargs(),
             )
+            _proc.remember_process_group(self._proc)
         finally:
             with contextlib.suppress(OSError):
                 os.close(read_fd)
@@ -239,6 +240,11 @@ class SubprocessModelSigner:
                 except asyncio.TimeoutError:
                     _proc.kill_tree(proc)
                     await proc.wait()
+        else:
+            # The signer leader may have exited while a helper inherited its
+            # process group. A completed Process handle is not proof that the
+            # group is empty.
+            _proc.kill_tree(proc)
         close_subprocess_transport(proc)
         self._readiness = None
 
