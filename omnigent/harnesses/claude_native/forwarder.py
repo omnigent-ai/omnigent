@@ -1550,6 +1550,10 @@ async def _forward_available_subagents(
                     # attach. Park the child too rather than re-resolving it every
                     # tick; the empty child id filters it out of the tail loops.
                     if subagent_id not in updated.subagents:
+                        # No dead letter: the child can't be replayed anywhere
+                        # correct — its parent conversation never existed, and a
+                        # replay would re-post it under the root session and
+                        # flatten the hierarchy. The WARNING is the recovery signal.
                         _logger.warning(
                             "Parking claude-native sub-agent whose parent was "
                             "dropped; parent_session=%s subagent_id=%s "
@@ -1557,23 +1561,6 @@ async def _forward_available_subagents(
                             parent_session_id,
                             subagent_id,
                             parent_subagent_id,
-                        )
-                        # The parent's own dead letter can't carry descendant
-                        # info, so record the child's start payload too or its
-                        # metadata is unrecoverable on replay.
-                        append_dead_letter(
-                            bridge_dir,
-                            session_id=parent_session_id,
-                            event_type="external_subagent_start",
-                            payload={
-                                "subagent_id": subagent_id,
-                                "agent_type": meta["agentType"],
-                                "description": meta["description"],
-                                "tool_use_id": meta["toolUseId"],
-                                "parent_subagent_id": parent_subagent_id,
-                            },
-                            reason="parent sub-agent was dropped",
-                            delivered_ambiguous=False,
                         )
                         updated = SubagentForwardState(
                             subagents={

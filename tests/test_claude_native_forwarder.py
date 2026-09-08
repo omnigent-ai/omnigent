@@ -5404,14 +5404,10 @@ async def test_subagent_watcher_parks_child_of_a_parked_parent(
     assert forwarder._read_subagent_forward_state(bridge_dir) == state
     assert "whose parent was dropped" in caplog.text
 
-    # The child's start payload is dead-lettered for replay parity: the parent's
-    # own dead letter can't carry descendant info.
-    dead_letter = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
-    assert len(dead_letter) == 1
-    record = json.loads(dead_letter[0])
-    assert record["event_type"] == "external_subagent_start"
-    assert record["payload"]["subagent_id"] == "a-child"
-    assert record["payload"]["parent_subagent_id"] == "z-parent"
+    # No dead letter: a replay would re-post the child under the root session and
+    # flatten the hierarchy, so the child is parked (WARNING only), not recorded
+    # for replay.
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
 
 
 async def test_subagent_watcher_defers_a_spawn_owned_by_two_transcripts(
