@@ -191,10 +191,8 @@ class OmnigentWebViewClient(
         view: WebView,
         detail: RenderProcessGoneDetail,
     ): Boolean {
-        // detail.didCrash() distinguishes a genuine renderer crash from a benign
-        // system reclaim under memory pressure; the host uses it to budget
-        // recovery so a page that reliably crashes the renderer can't wedge the
-        // app in an invisible rebuild→reload→crash loop.
+        // didCrash() separates a real crash from a benign system reclaim; the
+        // host budgets recovery on it so a crashing page can't loop forever.
         onRendererGone(view, detail.didCrash())
         return true
     }

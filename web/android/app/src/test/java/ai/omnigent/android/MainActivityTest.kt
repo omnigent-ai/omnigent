@@ -153,11 +153,9 @@ class MainActivityTest {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
-        // Drive MAX_RENDERER_CRASHES + 1 clustered crashes: the last exceeds the
-        // budget. Each still rebuilds — the manual recovery paths (server-switcher
-        // Reload / Switch) reuse the webView field and would be dead if we left
-        // the corpse in place — so the loop is broken by WHAT loads, not by
-        // refusing to rebuild.
+        // MAX_RENDERER_CRASHES + 1 clustered crashes. Each still rebuilds (manual
+        // recovery reuses the webView field, so the corpse can't stay); the loop
+        // is broken by what loads, not by refusing to rebuild.
         var dead = activity.webView()
         repeat(4) {
             dead.loadUrl("https://example.com/chat/loops")
@@ -185,10 +183,9 @@ class MainActivityTest {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
-        // The common real crash shape: the page loads fine (onPageReady fires),
-        // then the renderer crashes seconds later. A budget reset on page load
-        // would clear the counter every cycle and the guard would never trip;
-        // the time-window budget must accumulate these clustered crashes.
+        // Common crash shape: page loads fine, then crashes seconds later. A
+        // page-load reset would clear the budget each cycle and never trip; the
+        // gap-based budget must accumulate these clustered crashes.
         var dead = activity.webView()
         repeat(4) {
             dead.loadUrl("https://example.com/chat/heavy")

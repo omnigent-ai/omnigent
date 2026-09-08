@@ -62,13 +62,9 @@ class MainActivity : AppCompatActivity() {
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
-    // Renderer-crash budget: real crashes (didCrash) chained less than
-    // RENDERER_CRASH_WINDOW_MS apart are counted so a page that reliably kills
-    // its renderer can't wedge the app in an invisible rebuild→reload→crash loop.
-    // Not reset on page load (a load-then-crash loop would clear it every cycle);
-    // a long gap since the last crash resets it. System reclaims (didCrash=false)
-    // don't count. lastRendererCrashAt is the wall-clock time of the last counted
-    // crash, used to measure that gap.
+    // Renderer-crash budget: crashes chained closer than RENDERER_CRASH_WINDOW_MS
+    // count toward a give-up threshold, so a reliably-crashing page can't loop
+    // forever. lastRendererCrashAt is the last crash's wall-clock time (the gap).
     private var rendererCrashes = 0
     private var lastRendererCrashAt = 0L
 
@@ -301,31 +297,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * The WebView's renderer process died — crashed ([didCrash]), or reclaimed by
-     * the system under memory pressure. The instance can never render again
-     * (Android's contract: `reload()`/`loadUrl()` on it won't spin up a new
-     * renderer), so we ALWAYS detach and destroy it and swap in a freshly built
-     * WebView wired like the original (clients, bridge, insets). Without this the
-     * framework would terminate the whole app.
-     *
-     * The crash budget decides only *what the fresh WebView loads*, never whether
-     * we rebuild — so every manual recovery path (the server-switcher pill's
-     * Reload / Switch) always acts on a live instance:
-     * - within budget: reload where the user was (the dead renderer's
-     *   last-committed same-origin route), so a mid-chat/terminal session comes
-     *   back instead of the landing page;
-     * - over budget (a real crash loop): load a local offline error page with a
-     *   retry link to the server root, breaking the rebuild→reload→crash loop
-     *   without stranding the user on a dead view.
-     *
-     * Transient in-page state (composer text, scroll) lived in the renderer heap
-     * and is lost either way — recovery preserves the route, not that state.
-     * System reclaims (didCrash=false, routine while backgrounded) never count
-     * against the budget.
+     * The WebView's renderer died; the instance can't render again, so always
+     * destroy it and swap in a fresh one — otherwise the framework kills the app.
+     * The crash budget only decides what the fresh view loads (the user's route,
+     * or an offline recovery page over budget), never whether we rebuild, so the
+     * server-switcher recovery paths always act on a live instance. In-page state
+     * (composer text, scroll) is lost either way; only the route is preserved.
      *
      * @param dead The WebView whose renderer died.
-     * @param didCrash True for a genuine renderer crash, false for a
-     *   system-initiated reclaim.
+     * @param didCrash True for a real crash, false for a system reclaim (which
+     *   never counts against the budget).
      */
     private fun recoverFromRendererDeath(
         dead: WebView,
@@ -346,9 +327,8 @@ class MainActivity : AppCompatActivity() {
         parent?.removeView(dead)
         dead.destroy()
 
-        // The bridge listener and document-start script died with the WebView;
-        // reset the bookkeeping so installBridge() re-registers them, and re-arm
-        // the page-ready state the fresh document will rebuild.
+        // The bridge and page-ready state died with the WebView; reset so
+        // installBridge() re-registers and the fresh document rebuilds them.
         bridgeScriptHandler = null
         bridgeTransportInstalled = false
         pageLoaded = false
@@ -358,14 +338,12 @@ class MainActivity : AppCompatActivity() {
         parent?.addView(webView, index)
         attachInsetsListener(webView)
         installBridge()
-        // A rebuilt view isn't guaranteed an immediate inset dispatch; request one
-        // so the IME resize margin isn't stale if the keyboard was up at death.
+        // A rebuilt view may miss the first inset dispatch; request one so the
+        // IME resize margin isn't stale if the keyboard was up at death.
         ViewCompat.requestApplyInsets(webView)
 
         if (loopExhausted) {
-            // Offline page (no network fetch) so it can't itself re-trigger the
-            // crash; its retry link targets the server root, the least likely
-            // page to reproduce a route-specific crash.
+            // Offline page (no network) so it can't re-trigger the crash.
             webView.loadDataWithBaseURL(
                 null,
                 recoveryErrorHtml(serverUrl),
@@ -376,24 +354,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Reload where the user was: a same-origin deep route comes back; blank or
-        // foreign (an error/login page we shouldn't restore into) falls back to
-        // the server root.
+        // Reload the user's route; a blank or foreign URL falls back to the root.
         val reloadUrl =
             if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
         webView.loadUrl(reloadUrl)
     }
 
     /**
-     * Consume one unit of the renderer-crash budget, returning whether recovery
-     * may auto-reload the route. Gap-based, not a fixed window: the counter
-     * resets only when more than [RENDERER_CRASH_WINDOW_MS] has elapsed since the
-     * previous crash, so crashes chained closer than that accumulate toward
-     * [MAX_RENDERER_CRASHES] regardless of total span, while a genuinely isolated
-     * crash (a long gap since the last one) starts fresh. Deliberately NOT reset
-     * on a healthy page load — a load-then-crash loop fires a good load every
-     * cycle, so a page-load reset would clear the budget before each next crash
-     * and the guard would never trip.
+     * Consume one unit of the crash budget, returning whether auto-reload may
+     * proceed. Gap-based: the counter resets only after a gap longer than
+     * [RENDERER_CRASH_WINDOW_MS], so crashes chained closer accumulate toward
+     * [MAX_RENDERER_CRASHES]. Not reset on page load — a load-then-crash loop
+     * loads fine every cycle, so a page-load reset would defeat the guard.
      */
     private fun withinCrashBudget(): Boolean {
         val now = System.currentTimeMillis()
@@ -406,10 +378,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Minimal self-contained recovery page shown after a renderer crash loop.
-     * No external assets or network so it can't reproduce the crash; the single
-     * link returns to the pinned server root (same origin, so the normal load
-     * path handles it).
+     * Self-contained recovery page for a crash loop. No network/assets so it
+     * can't reproduce the crash; its link returns to the server root.
      */
     private fun recoveryErrorHtml(serverUrl: String): String {
         val escaped = serverUrl.replace("&", "&amp;").replace("\"", "&quot;")
@@ -767,12 +737,8 @@ class MainActivity : AppCompatActivity() {
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
-        // Deliberately does NOT reset the renderer-crash budget: a page that
-        // loads fine and then crashes the renderer (delayed JS/WebGL/OOM — the
-        // common shape) fires onPageReady every cycle, so resetting here would
-        // clear the budget before each next crash and the loop guard would never
-        // trip. The time window in withinCrashBudget() handles isolated crashes:
-        // ones spaced beyond the window reset; ones clustered tightly accumulate.
+        // Does NOT reset the crash budget: a load-then-crash loop fires onPageReady
+        // every cycle, so resetting here would defeat withinCrashBudget()'s guard.
         flushPendingActivation()
         emitInsets()
     }
