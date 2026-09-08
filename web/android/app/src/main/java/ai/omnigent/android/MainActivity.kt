@@ -398,7 +398,7 @@ class MainActivity : AppCompatActivity() {
               <p>The app hit a repeated display problem and stopped reloading on its own.</p>
               <a class="retry" href="$escaped">Reload</a>
             </body></html>
-        """.trimIndent()
+            """.trimIndent()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
