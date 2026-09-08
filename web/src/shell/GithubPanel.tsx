@@ -53,6 +53,13 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { MessageResponse } from "@/components/ai-elements/message";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -63,6 +70,7 @@ import {
   useGithubChangedFiles,
   useGithubInfo,
   useGithubPrDiff,
+  useSetGithubPreference,
   type GithubChangedFile,
   type GithubCheckRun,
   type GithubChecks,
@@ -83,22 +91,76 @@ function PanelMessage({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Full-panel empty state: an icon, a title, and an optional hint line. Used
- *  for every "no GitHub content to show" reason so they read as one family. */
+/** Full-panel empty state: an icon, a title, an optional hint line, and optional
+ *  children below (the account/remote selectors). Used for every "no GitHub
+ *  content to show" reason so they read as one family. */
 function GithubEmptyState({
   icon: Icon,
   title,
   hint,
+  children,
 }: {
   icon: LucideIcon;
   title: React.ReactNode;
   hint?: React.ReactNode;
+  children?: React.ReactNode;
 }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
       <Icon className="size-8 text-muted-foreground/50" />
       <p className="text-ui font-medium text-foreground">{title}</p>
       {hint && <p className="max-w-xs text-ui text-muted-foreground">{hint}</p>}
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Account switcher — the one PR-resolution lever that can't be inferred: it picks
+ * which signed-in identity `gh` runs as, i.e. which account can even see the repo.
+ * Shown ONLY when the upstream repo can't be reached (the `repo-unresolved` empty
+ * state), since that's an access problem the account can fix. Once the repo
+ * resolves, the account is correct — surfacing the knob then would just invite a
+ * misconfiguration, so it's absent from the header and the `no-pr` state. Renders
+ * nothing with a single account (nothing to choose).
+ */
+function GithubAccountSelector({
+  conversationId,
+  info,
+}: {
+  conversationId: string;
+  info: GithubInfo;
+}) {
+  const setPref = useSetGithubPreference(conversationId);
+  const accounts = info.accounts ?? [];
+  if (accounts.length <= 1) return null;
+
+  const selectedAccount = info.selected_account ?? undefined;
+
+  return (
+    <div className="flex w-full max-w-xs flex-col items-center gap-2 pt-2">
+      <Select
+        value={selectedAccount}
+        onValueChange={(login) => setPref.mutate({ account: login })}
+        disabled={setPref.isPending}
+      >
+        <SelectTrigger aria-label="GitHub account" className="h-8 w-full text-ui">
+          <SelectValue placeholder="Account" />
+        </SelectTrigger>
+        <SelectContent>
+          {accounts.map((a) => (
+            <SelectItem key={a.login} value={a.login}>
+              {a.login}
+              {a.active ? " (active)" : ""}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {setPref.isError && (
+        <p className="text-ui text-red-600 dark:text-red-400">
+          Couldn’t apply: {(setPref.error as Error).message}
+        </p>
+      )}
     </div>
   );
 }
@@ -884,14 +946,18 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           title="Can’t reach the upstream repo"
           hint={
             <>
-              Run <span className="font-mono">gh auth status</span> on the host to confirm the
-              GitHub CLI is signed in to the right account.
+              Pick the account to use, or run <span className="font-mono">gh auth status</span> on
+              the host to confirm the GitHub CLI is signed in.
             </>
           }
-        />
+        >
+          {info.data && <GithubAccountSelector conversationId={conversationId} info={info.data} />}
+        </GithubEmptyState>
       );
     case "no-pr":
       // TODO: offer a "Create PR" action here once the panel can open PRs.
+      // No account selector here: the repo resolved, so the account is correct —
+      // this is a genuine "no PR yet", not a misconfiguration to fix.
       return (
         <GithubEmptyState
           icon={GitPullRequestIcon}

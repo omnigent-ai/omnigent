@@ -51,6 +51,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
@@ -2992,6 +2993,79 @@ class HostProcess:
             return r.github_pr_diff()
         raise ValueError(f"unknown fs op: {op!r}")
 
+    def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
+        """Serve a workspace-mutating op from the host (runner-offline fallback).
+
+        Mirrors :meth:`_handle_fs_request` but for the small set of writes the
+        host can serve — currently the GitHub account/base preference, which
+        touches the host's ``~/.omnigent/config.yaml`` and runs ``gh``/``git`` in
+        the workspace. Called inside a worker thread by the dispatcher.
+
+        :param frame: The write frame (op + workspace + params).
+        :returns: A result frame with the refreshed payload, or an error frame.
+        """
+        try:
+            expanded = os.path.expanduser(frame.workspace)
+        except (TypeError, ValueError) as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=400,
+                error_code="invalid_workspace",
+                error=f"workspace path expansion failed: {exc}",
+            )
+        if not os.path.isdir(expanded):
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=404,
+                error_code="not_found",
+                error="workspace directory does not exist on host",
+            )
+        try:
+            payload = self._dispatch_fs_write_op(expanded, frame.op, frame.params or {})
+        except ValueError as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=400,
+                error_code="invalid_request",
+                error=str(exc),
+            )
+        except Exception as exc:
+            _logger.exception("host fs_write op %r failed", frame.op)
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=500,
+                error_code="fs_write_failed",
+                error=str(exc),
+            )
+        return HostFsResultFrame(request_id=frame.request_id, status="ok", payload=payload)
+
+    @staticmethod
+    def _dispatch_fs_write_op(
+        workspace: str,
+        op: str,
+        params: dict[str, object],
+    ) -> dict[str, object]:
+        """Route a write op to its handler. Writes call ``github_resource``
+        directly (not the read-only ``WorkspaceReader``).
+
+        :raises ValueError: On an unknown op.
+        """
+        from typing import cast
+
+        from omnigent.runner import github_resource
+
+        if op == "github_set_preference":
+            return github_resource.set_github_preference(
+                workspace,
+                account=cast("str | None", params.get("account")),
+                remote=cast("str | None", params.get("remote")),
+            )
+        raise ValueError(f"unknown fs write op: {op!r}")
+
     async def _handle_create_worktree(
         self,
         frame: HostCreateWorktreeFrame,
@@ -4038,6 +4112,10 @@ class HostProcess:
             # off the event loop and reply when it completes.
             fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(fs_result))
+        elif isinstance(frame, HostFsWriteFrame):
+            # gh/git writes can block; run off the event loop and reply back.
+            fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
+            await ws.send(encode_host_frame(fs_write_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall

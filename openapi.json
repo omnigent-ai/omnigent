@@ -14100,6 +14100,48 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/preferences": {
+      "post": {
+        "description": "Apply the GitHub panel's account (and optional base) selection.\n\nPersists the choice \u2014 a per-workspace account preference in the user\nconfig, and `gh repo set-default` when a base is given \u2014 then returns the\nrefreshed `session.github.info`. Served by the runner when it's online,\nelse by the host over its tunnel (both run the same\n`github_resource.set_github_preference` against the local config +\nworkspace), so a preference change works with the runner asleep.\n\n**Returns:** The refreshed `session.github.info` object.",
+        "operationId": "set_session_github_preference_v1_sessions__session_id__resources_github_preferences_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Session Github Preference",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/terminals": {
       "get": {
         "description": "Return only terminal resources for a session.\n\nThe runner endpoint's pagination params (`limit` / `after` /\n`before` / `order`) are forwarded from the incoming query\nstring \u2014 without this, a client-requested `order=asc` (the web\nterminal tabs rely on creation order to keep the session's own\nterminal first) would be silently dropped and the runner's\n`desc` default would apply.\n\n**Returns:** `PaginatedList` of terminal resources.",

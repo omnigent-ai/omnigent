@@ -772,6 +772,53 @@ def register_resources_routes(
             # runner proxy, which wraps non-200/404 responses as a 502.
             raise HTTPException(status_code=502, detail=exc.message) from exc
 
+    async def _write_workspace_via_host(
+        session_id: str,
+        conversation: Conversation,
+        op: str,
+        host_params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Serve a workspace-mutating op over the session's host tunnel.
+
+        The write counterpart of :func:`_read_workspace_via_host`, for when the
+        runner is offline but the host holding the workspace is connected.
+
+        :param op: Host-side write op — currently ``"github_set_preference"``.
+        :param host_params: Op-specific args for the host writer.
+        :returns: The refreshed payload, or ``None`` when no host is bound /
+            connected / reachable (caller re-raises the runner-offline error).
+        :raises HTTPException: On host-reported failures, reproducing the runner's
+            status.
+        """
+        from omnigent.server.routes._host_filesystem import (
+            HostFsError,
+            HostFsUnavailableError,
+            write_workspace_from_host,
+        )
+
+        if host_registry is None:
+            return None
+        if not conversation.host_id or not conversation.workspace:
+            return None
+        host_conn = host_registry.get(conversation.host_id)
+        if host_conn is None:
+            return None
+        try:
+            return await write_workspace_from_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                op=op,
+                workspace=conversation.workspace,
+                session_id=session_id,
+                params=host_params,
+            )
+        except HostFsUnavailableError:
+            return None
+        except HostFsError as exc:
+            if exc.status == 400:
+                raise HTTPException(status_code=400, detail=exc.message) from exc
+            raise HTTPException(status_code=502, detail=exc.message) from exc
+
     async def _proxy_post_to_runner(
         session_id: str,
         path: str,
@@ -2566,6 +2613,56 @@ def register_resources_routes(
             host_params={},
             runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
         )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/preferences",
+        response_model=None,
+    )
+    async def set_session_github_preference(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Apply the GitHub panel's account (and optional base) selection.
+
+        Persists the choice — a per-workspace account preference in the user
+        config, and ``gh repo set-default`` when a base is given — then returns the
+        refreshed ``session.github.info``. Served by the runner when it's online,
+        else by the host over its tunnel (both run the same
+        :func:`github_resource.set_github_preference` against the local config +
+        workspace), so a preference change works with the runner asleep.
+
+        :param request: The incoming FastAPI request (JSON body + auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The refreshed ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        params = {"account": body.get("account"), "remote": body.get("remote")}
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/preferences",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            # Runner asleep — serve the write from the host if it's connected.
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_set_preference", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            error = result.get("error", {})
+            raise OmnigentError(
+                error.get("message", f"GitHub preference update failed (HTTP {status})"),
+                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        return result
 
     # Generic single-resource lookup — registered AFTER typed
     # collections so "environments", "terminals", "files" are not

@@ -5726,3 +5726,31 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
     assert [f.session.external_session_id for f in session_frames] == ["good"]
     assert len(done_frames) == 1
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+
+
+async def test_dispatch_fs_write_op_routes_github_set_preference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The write dispatcher forwards to github_resource.set_github_preference."""
+    from omnigent.runner import github_resource
+
+    seen: dict[str, object] = {}
+
+    def fake_set(root, *, account=None, remote=None):
+        seen.update({"root": root, "account": account, "remote": remote})
+        return {"object": "session.github.info", "ok": True}
+
+    monkeypatch.setattr(github_resource, "set_github_preference", fake_set)
+    out = HostProcess._dispatch_fs_write_op(
+        "/ws/omnigent",
+        "github_set_preference",
+        {"account": "octocat", "remote": "origin"},
+    )
+    assert out == {"object": "session.github.info", "ok": True}
+    assert seen == {"root": "/ws/omnigent", "account": "octocat", "remote": "origin"}
+
+
+async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
+    """An unknown write op fails loud rather than silently no-op'ing."""
+    with pytest.raises(ValueError, match="unknown fs write op"):
+        HostProcess._dispatch_fs_write_op("/ws", "bogus", {})

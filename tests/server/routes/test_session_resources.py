@@ -5747,6 +5747,10 @@ class _OfflineRunnerClient:
         del params, timeout
         raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
 
+    async def post(self, url: str, *, json: Any = None, timeout: float | None = None) -> Any:
+        del json, timeout
+        raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
+
 
 @pytest.fixture
 def offline_env_app(
@@ -5926,6 +5930,49 @@ async def test_github_diff_falls_back_to_host_when_runner_offline(
     assert resp.json()["after"] == "changed"
     assert captured["op"] == "github_diff"
     assert captured["params"] == {"base": "main", "path": "app.py"}
+
+
+@pytest.mark.asyncio
+async def test_github_set_preference_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preference WRITE is served over the host tunnel when the runner is offline.
+
+    Proves the POST endpoint's runner-offline branch routes to the host write op
+    with the selection params, and returns the refreshed info.
+    """
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_write(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id
+        captured["op"] = op
+        captured["workspace"] = workspace
+        captured["params"] = params
+        return {"object": "session.github.info", "available": True, "selected_account": "octocat"}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", _fake_write)
+
+    resp = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/preferences",
+        json={"account": "octocat"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["selected_account"] == "octocat"
+    assert captured["op"] == "github_set_preference"
+    assert captured["workspace"] == _OFFLINE_WORKSPACE
+    assert captured["params"] == {"account": "octocat", "remote": None}
 
 
 # ── Workspace-file gzip (GZipFileContentRoute) ───────────────────

@@ -10085,6 +10085,27 @@ def create_runner_app(
         )
         return JSONResponse(status_code=200, content=result)
 
+    @app.post("/v1/sessions/{session_id}/resources/github/preferences")
+    async def set_github_preference_route(
+        session_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        # Apply the panel's account / remote selection (gh repo set-default +
+        # a per-repo account preference), then return the refreshed info payload.
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import set_github_preference
+
+        body = await request.json()
+        root = await _github_workspace_root(session_id)
+        info = await _asyncio.to_thread(
+            set_github_preference,
+            root,
+            account=body.get("account"),
+            remote=body.get("remote"),
+        )
+        return JSONResponse(status_code=200, content=info)
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
