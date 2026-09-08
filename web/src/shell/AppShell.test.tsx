@@ -2072,8 +2072,11 @@ describe("Workspace rail maximize", () => {
     // During the card's click-through entry window the pointer still hit-tests
     // to the chat-header toggle beneath it, so a wobble there must count as
     // "inside the peek surface" — not arm the outside-dismiss timer.
+    stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
+    fireEvent.keyDown(window, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     const toggle = screen.getByRole("button", { name: /open sidebar/i });
     fireEvent.pointerEnter(toggle);
