@@ -162,9 +162,16 @@ _COMPOSER_MODE_GLYPHS = (_CLAUDE_PROMPT_GLYPH, _SHELL_MODE_GLYPH)
 # Claude Code has framed the input box both ways across versions.
 _BOX_RULE_GLYPHS = "─━╭╮╰╯│┃╌╍"
 _BOX_RULE_CHARS = frozenset(_BOX_RULE_GLYPHS)
-# Shortest leading run of rule glyphs that can open a *labelled* rule, so an
-# ordinary output line starting with one box glyph is not read as a rule.
-_MIN_TITLED_RULE_RUN = 3
+# Glyphs that may frame a *labelled* rule. Verticals are excluded because they
+# bound table cells and ``tree`` rows, which are otherwise the same shape as a
+# labelled rule (see :func:`_is_box_rule`).
+_VERTICAL_RULE_GLYPHS = "│┃"
+_TITLED_RULE_EDGE_GLYPHS = "".join(
+    glyph for glyph in _BOX_RULE_GLYPHS if glyph not in _VERTICAL_RULE_GLYPHS
+)
+# Narrowest a labelled rule may be: the composer's rule spans the pane, so a
+# short run of glyphs around a word is decoration, not the box.
+_MIN_TITLED_RULE_WIDTH = 20
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
@@ -4382,13 +4389,19 @@ def _is_box_rule(line: str) -> bool:
     every glyph be a rule glyph instead anchors :func:`_composer_row` on
     the *closing* rule, which reports "no input box" with ``❯`` plainly on
     screen and times the turn out with the message undelivered. A label is
-    accepted only between a leading run of at least
-    :data:`_MIN_TITLED_RULE_RUN` glyphs and a trailing run, spaced off from
-    both, and carrying no rule glyph itself, so ordinary output cannot pass
-    as a rule. That last condition matters: a pasted ``tree``/table line of
-    nested ``│`` glyphs and spaces must stay content, or
-    :func:`_composer_row` collects it as an interior rule and misses the
-    real opening rule the same way.
+    accepted between a leading and a trailing run of
+    :data:`_TITLED_RULE_EDGE_GLYPHS` when it is spaced off from both,
+    carries no rule glyph itself, and the whole rule is at least
+    :data:`_MIN_TITLED_RULE_WIDTH` wide. Those conditions are what keep
+    ordinary output from passing as a rule: a pasted ``tree``/table line of
+    nested ``│`` glyphs and spaces, and a ``│ cell │`` of any width, must
+    stay content, or :func:`_composer_row` collects it as an interior rule
+    and misses the real opening rule the same way. Excluding the vertical
+    glyphs is what draws that line, since a table cell and a labelled rule
+    are otherwise the same shape. The length of the leading run cannot draw
+    it: Claude Code right-aligns the label, so that run shrinks to a single
+    glyph once the title nears the pane width, and the pane is only as wide
+    as the person's browser terminal.
 
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
@@ -4399,9 +4412,9 @@ def _is_box_rule(line: str) -> bool:
         return False
     if all(ch in _BOX_RULE_CHARS for ch in stripped):
         return True
-    lead = len(stripped) - len(stripped.lstrip(_BOX_RULE_GLYPHS))
-    trail = len(stripped) - len(stripped.rstrip(_BOX_RULE_GLYPHS))
-    if lead < _MIN_TITLED_RULE_RUN or trail < 1:
+    lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
+    trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
+    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
         return False
     label = stripped[lead : len(stripped) - trail]
     if any(ch in _BOX_RULE_CHARS for ch in label):
