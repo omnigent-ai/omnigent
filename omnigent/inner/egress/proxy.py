@@ -576,88 +576,93 @@ class EgressProxy:
         self._tls_handshake_completed(tls_writer)
 
         try:
-            inner_first = await asyncio.wait_for(tls_reader.readline(), timeout=30)
-            if not inner_first:
-                return
+            while True:
+                inner_first = await asyncio.wait_for(tls_reader.readline(), timeout=30)
+                if not inner_first:
+                    return
 
-            if inner_first == _HTTP2_PREFACE_FIRST_LINE:
-                if not self._allows_unrestricted_host(host):
-                    logger.warning(
-                        "BLOCKED-H2 https://%s — HTTP/2 requires an unrestricted host rule",
-                        host,
+                if inner_first == _HTTP2_PREFACE_FIRST_LINE:
+                    if not self._allows_unrestricted_host(host):
+                        logger.warning(
+                            "BLOCKED-H2 https://%s — HTTP/2 requires an unrestricted host rule",
+                            host,
+                        )
+                        await self._send_forbidden(
+                            tls_writer, "HTTP/2 requires an unrestricted host rule"
+                        )
+                        return
+                    if host.lower() in self._cred_by_host:
+                        logger.warning(
+                            "BLOCKED-H2-CREDENTIAL https://%s — opaque HTTP/2 "
+                            "cannot rewrite credentials",
+                            host,
+                        )
+                        await self._send_forbidden(
+                            tls_writer, "HTTP/2 cannot use a credential rewrite rule"
+                        )
+                        return
+                    logger.info("ALLOW-H2 https://%s/**", host)
+                    await self._forward_http2(tls_reader, tls_writer, host, port, inner_first)
+                    return
+
+                try:
+                    inner_method, inner_path = self._parse_inner_request_line(inner_first)
+                    inner_headers_raw = await self._read_headers(tls_reader)
+                    content_length = self._parse_inner_content_length(inner_headers_raw)
+                except ValueError:
+                    await self._send_forbidden(tls_writer, "malformed inner request")
+                    return
+
+                if not check_request(self._rules, inner_method, host, inner_path):
+                    logger.warning("BLOCKED %s https://%s%s", inner_method, host, inner_path)
+                    msg = f"{inner_method} https://{host}{inner_path} denied by policy"
+                    await self._send_forbidden(tls_writer, msg)
+                    return
+
+                logger.info("ALLOW %s https://%s%s", inner_method, host, inner_path)
+
+                # Forward a request line re-serialized from the parsed
+                # method/path rather than the raw ``inner_first`` bytes, so
+                # the upstream always receives exactly the (method, path)
+                # the policy authorized. Mirrors the plain-HTTP path in
+                # ``_handle_http`` (``relative_line``); closes the
+                # policy-vs-forwarded byte differential.
+                inner_request_line = f"{inner_method} {inner_path} HTTP/1.1\r\n".encode("latin-1")
+
+                # Max-Forwards conformance (RFC 7231 §5.1.2): terminate an
+                # exhausted TRACE / OPTIONS at the proxy over the MITM tunnel
+                # (never forwarding it into the credential-injection path);
+                # decrement a positive budget on the forwarded headers.
+                terminate, inner_headers_raw = self._apply_max_forwards(
+                    inner_method, inner_headers_raw
+                )
+                if terminate:
+                    logger.info(
+                        "MAX-FORWARDS-TERMINATE %s https://%s%s", inner_method, host, inner_path
                     )
-                    await self._send_forbidden(
-                        tls_writer, "HTTP/2 requires an unrestricted host rule"
+                    await self._send_max_forwards_reply(
+                        tls_writer, inner_method, inner_request_line, inner_headers_raw
                     )
                     return
-                if host.lower() in self._cred_by_host:
-                    logger.warning(
-                        "BLOCKED-H2-CREDENTIAL https://%s — opaque HTTP/2 "
-                        "cannot rewrite credentials",
-                        host,
+
+                body = b""
+                if content_length > 0:
+                    body = await asyncio.wait_for(
+                        tls_reader.readexactly(content_length), timeout=30
                     )
-                    await self._send_forbidden(
-                        tls_writer, "HTTP/2 cannot use a credential rewrite rule"
-                    )
+
+                keep_alive = await self._forward_https(
+                    tls_writer,
+                    host,
+                    port,
+                    inner_method,
+                    inner_path,
+                    inner_request_line,
+                    inner_headers_raw,
+                    body,
+                )
+                if not keep_alive:
                     return
-                logger.info("ALLOW-H2 https://%s/**", host)
-                await self._forward_http2(tls_reader, tls_writer, host, port, inner_first)
-                return
-
-            try:
-                inner_method, inner_path = self._parse_inner_request_line(inner_first)
-                inner_headers_raw = await self._read_headers(tls_reader)
-                content_length = self._parse_inner_content_length(inner_headers_raw)
-            except ValueError:
-                await self._send_forbidden(tls_writer, "malformed inner request")
-                return
-
-            if not check_request(self._rules, inner_method, host, inner_path):
-                logger.warning("BLOCKED %s https://%s%s", inner_method, host, inner_path)
-                msg = f"{inner_method} https://{host}{inner_path} denied by policy"
-                await self._send_forbidden(tls_writer, msg)
-                return
-
-            logger.info("ALLOW %s https://%s%s", inner_method, host, inner_path)
-
-            # Forward a request line re-serialized from the parsed
-            # method/path rather than the raw ``inner_first`` bytes, so
-            # the upstream always receives exactly the (method, path)
-            # the policy authorized. Mirrors the plain-HTTP path in
-            # ``_handle_http`` (``relative_line``); closes the
-            # policy-vs-forwarded byte differential.
-            inner_request_line = f"{inner_method} {inner_path} HTTP/1.1\r\n".encode("latin-1")
-
-            # Max-Forwards conformance (RFC 7231 §5.1.2): terminate an
-            # exhausted TRACE / OPTIONS at the proxy over the MITM tunnel
-            # (never forwarding it into the credential-injection path);
-            # decrement a positive budget on the forwarded headers.
-            terminate, inner_headers_raw = self._apply_max_forwards(
-                inner_method, inner_headers_raw
-            )
-            if terminate:
-                logger.info(
-                    "MAX-FORWARDS-TERMINATE %s https://%s%s", inner_method, host, inner_path
-                )
-                await self._send_max_forwards_reply(
-                    tls_writer, inner_method, inner_request_line, inner_headers_raw
-                )
-                return
-
-            body = b""
-            if content_length > 0:
-                body = await asyncio.wait_for(tls_reader.readexactly(content_length), timeout=30)
-
-            await self._forward_https(
-                tls_writer,
-                host,
-                port,
-                inner_method,
-                inner_path,
-                inner_request_line,
-                inner_headers_raw,
-                body,
-            )
         except asyncio.TimeoutError:
             # WARNING (was DEBUG) so this is visible without raising
             # caplog levels: with the protocol-swap race fixed above,
@@ -782,14 +787,14 @@ class EgressProxy:
         request_line: bytes,
         headers_raw: bytes,
         body: bytes,
-    ) -> None:
+    ) -> bool:
         """Open a real TLS connection to the target and relay."""
         try:
             pinned_ip = await self._assert_destination_allowed(host, port)
         except PermissionError as exc:
             logger.warning("BLOCKED-DEST https://%s:%d - %s", host, port, exc)
             await self._send_forbidden(client_writer, str(exc))
-            return
+            return False
         # Reuse the context pinned at construction. Do NOT rebuild from
         # a cafile here — that re-read of a (potentially sandbox-writable)
         # file on every request was the vulnerability this guards against.
@@ -812,7 +817,7 @@ class EgressProxy:
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
             )
             await self._send_forbidden(client_writer, rewrite.error)
-            return
+            return False
         # Single-shot the upstream so ``_relay_response`` gets a prompt EOF
         # instead of blocking on a keep-alive socket — and so pipelining
         # clients (git's libcurl) don't stall waiting to reuse a tunnel the
@@ -831,7 +836,7 @@ class EgressProxy:
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
             logger.warning("Cannot connect to %s:%d - %s", host, port, exc)
             await self._send_bad_gateway(client_writer, str(exc))
-            return
+            return False
 
         try:
             upstream_writer.write(request_line)
@@ -871,6 +876,7 @@ class EgressProxy:
                 await upstream_writer.wait_closed()
             except Exception:  # noqa: BLE001 — upstream close is best-effort
                 pass
+        return False
 
     # ------------------------------------------------------------------
     # Plain HTTP handling

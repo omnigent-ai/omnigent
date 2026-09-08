@@ -85,7 +85,7 @@ def test_request_line_accepts_only_the_frozen_route() -> None:
         b"Host: model.test\r\nContent-Length: 999999999999999999999\r\n\r\n",
         b"Host: model.test\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nTransfer-Encoding: chunked\r\n\r\n",
-        b"Host: model.test\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+        b"Host: model.test\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nProxy-Connection: keep-alive\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nUpgrade: websocket\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n",
@@ -115,6 +115,14 @@ def test_request_headers_accept_canonical_bounded_content_length() -> None:
     assert ("Content-Length", "2") in parsed
 
 
+def test_request_headers_accept_and_strip_exact_keep_alive() -> None:
+    parsed, length = _parse_strict_request_headers(
+        b"Host: model.test\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+    )
+    assert length == 0
+    assert all(name.lower() != "connection" for name, _ in parsed)
+
+
 def test_request_headers_reject_body_over_limit_before_read() -> None:
     with pytest.raises(SigningRejected):
         _parse_strict_request_headers(
@@ -137,15 +145,16 @@ async def test_response_strips_sensitive_and_hop_headers_and_reframes() -> None:
     )
     client = _Writer()
 
-    relayed, status = await relay._relay_response_observing_status(upstream, client)
+    relayed, status, keep_alive = await relay._relay_response_observing_status(upstream, client)
 
     assert status == 200
     assert relayed > 0
+    assert keep_alive
     assert bytes(client.data) == (
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: application/json\r\n"
         b"Content-Length: 2\r\n"
-        b"Connection: close\r\n\r\n{}"
+        b"Connection: keep-alive\r\n\r\n{}"
     )
 
 
@@ -160,9 +169,10 @@ async def test_chunked_sse_is_decoded_and_streamed_without_te_or_cl() -> None:
     )
     client = _Writer()
 
-    relayed, status = await relay._relay_response_observing_status(upstream, client)
+    relayed, status, keep_alive = await relay._relay_response_observing_status(upstream, client)
 
     assert status == 200
+    assert not keep_alive
     response = bytes(client.data)
     assert b"Transfer-Encoding" not in response
     assert b"Content-Length" not in response
@@ -188,9 +198,11 @@ async def test_malformed_upstream_response_becomes_no_relay(response: bytes) -> 
     relay._credential_source = Mock()
     client = _Writer()
 
-    relayed, status = await relay._relay_response_observing_status(_reader(response), client)
+    relayed, status, keep_alive = await relay._relay_response_observing_status(
+        _reader(response), client
+    )
 
-    assert (relayed, status) == (0, 0)
+    assert (relayed, status, keep_alive) == (0, 0, False)
     assert not client.data
 
 
@@ -200,7 +212,11 @@ async def test_oversized_response_headers_are_rejected() -> None:
     response = b"HTTP/1.1 200 OK\r\nX-Fill: " + (b"a" * 65_536) + b"\r\n\r\n"
     client = _Writer()
 
-    assert await relay._relay_response_observing_status(_reader(response), client) == (0, 0)
+    assert await relay._relay_response_observing_status(_reader(response), client) == (
+        0,
+        0,
+        False,
+    )
     assert not client.data
 
 
@@ -214,9 +230,10 @@ async def test_redirect_is_returned_without_an_upstream_follow() -> None:
         b"Content-Length: 0\r\n\r\n"
     )
 
-    _, status = await relay._relay_response_observing_status(upstream, client)
+    _, status, keep_alive = await relay._relay_response_observing_status(upstream, client)
 
     assert status == 307
+    assert keep_alive
     assert b"Location: https://other.test/path\r\n" in client.data
 
 
@@ -242,7 +259,11 @@ async def test_idle_response_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch)
     relay._credential_source = Mock()
     client = _Writer()
 
-    assert await relay._relay_response_observing_status(asyncio.StreamReader(), client) == (0, 0)
+    assert await relay._relay_response_observing_status(asyncio.StreamReader(), client) == (
+        0,
+        0,
+        False,
+    )
     assert not client.data
 
 
@@ -262,6 +283,7 @@ async def test_total_response_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch
     assert result == (
         0,
         0,
+        False,
     )
     assert not client.data
 
@@ -289,12 +311,13 @@ async def test_unframed_infinite_response_is_bounded(monkeypatch: pytest.MonkeyP
     relay._credential_source = Mock()
     client = _Writer()
 
-    relayed, status = await relay._relay_response_observing_status(
+    relayed, status, keep_alive = await relay._relay_response_observing_status(
         _reader(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n12345"),
         client,
     )
 
     assert status == 200
+    assert not keep_alive
     assert relayed == bytes(client.data).index(b"\r\n\r\n") + 4
     assert bytes(client.data).endswith(b"\r\n\r\n")
 
@@ -337,11 +360,12 @@ async def test_upstream_401_is_observed_without_replay() -> None:
     relay._credential_source = credential
     client = _Writer()
 
-    _, status = await relay._relay_response_observing_status(
+    _, status, keep_alive = await relay._relay_response_observing_status(
         _reader(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"),
         client,
     )
 
     assert status == 401
+    assert keep_alive
     credential.invalidate_after_unauthorized.assert_called_once_with()
     credential.token_for_request.assert_not_awaited()

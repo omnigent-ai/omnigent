@@ -86,6 +86,7 @@ from .model_signer import (
     ModelSignerSession,
     SignerLaunchConfig,
     SignerReadiness,
+    SignerStartError,
     SubprocessModelSigner,
 )
 
@@ -2346,6 +2347,7 @@ class _CodexAppServerSession:
         skills_filter: str | list[str] = "all",
         os_env: OSEnvSpec | None = None,
         signer_factory: Callable[[], ModelSignerSession] | None = None,
+        provider_auth_authority: tuple[str, str] | None = None,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2358,6 +2360,7 @@ class _CodexAppServerSession:
         self._skills_filter = skills_filter
         self._os_env_spec = os_env
         self._signer_factory = signer_factory
+        self._provider_auth_authority = provider_auth_authority
         self._signer: ModelSignerSession | None = None
         self._signer_readiness: SignerReadiness | None = None
         self._signer_watch_task: asyncio.Task[None] | None = None
@@ -2551,6 +2554,7 @@ class _CodexAppServerSession:
             spawn_argv = argv
             pass_fds: tuple[int, ...] = ()
             liveness_read_fd: int | None = None
+            await self._require_live_signer()
             if self._signer is not None and os.name == "posix":
                 liveness_read_fd, self._worker_liveness_fd = os.pipe()
                 os.set_inheritable(liveness_read_fd, True)
@@ -2574,6 +2578,7 @@ class _CodexAppServerSession:
                     cwd=self._cwd or os.getcwd(),
                 )
                 _proc.remember_process_group(self._proc)
+                await self._require_live_signer()
             finally:
                 if liveness_read_fd is not None:
                     os.close(liveness_read_fd)
@@ -2700,6 +2705,17 @@ class _CodexAppServerSession:
                 await self._proc.wait()
             else:
                 _kill_process_tree(self._proc)
+
+    async def _require_live_signer(self) -> None:
+        """Fail startup if the signer exited before or during worker spawn."""
+        if self._signer is None:
+            return
+        # Give a signer wait task whose process has already exited a chance to
+        # publish that state before crossing the worker-spawn boundary.
+        await asyncio.sleep(0)
+        task = self._signer_watch_task
+        if self._signer_exited or (task is not None and task.done()):
+            raise SignerStartError("model signer exited during worker startup")
 
     async def _close_signer(self) -> None:
         signer = self._signer
@@ -3077,6 +3093,12 @@ class _CodexAppServerSession:
                         await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
                     except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
                         logger.debug("Codex auth-failure turn interrupt failed: %s", exc)
+                    if (
+                        fatal_gateway_error.code == 401
+                        and self._provider_auth_authority is not None
+                    ):
+                        host, profile = self._provider_auth_authority
+                        raise ProviderAuthRequired.for_authority(host, profile)
                     yield ExecutorError(
                         message=fatal_gateway_error.detail(model=model), retryable=False
                     )
@@ -3580,6 +3602,11 @@ def _default_app_session_factory(
         signer_factory=(
             (lambda: SubprocessModelSigner(signer_launch_config))
             if signer_launch_config is not None
+            else None
+        ),
+        provider_auth_authority=(
+            (f"https://{signer_launch_config.routes[0].host}", signer_launch_config.auth_profile)
+            if signer_launch_config is not None and signer_launch_config.auth_profile is not None
             else None
         ),
     )

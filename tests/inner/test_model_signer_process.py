@@ -138,12 +138,12 @@ def _raw_proxy_post(
         sock.close()
 
 
-def _raw_proxy_pipeline_is_closed(
+def _raw_proxy_pipeline_is_reauthorized(
     *,
     proxy_port: int,
     ca_bundle_path: Path,
     placeholder: str,
-) -> bool:
+) -> tuple[int, int]:
     sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
     try:
         sock.sendall(b"CONNECT model.test:443 HTTP/1.1\r\nHost: model.test:443\r\n\r\n")
@@ -159,7 +159,7 @@ def _raw_proxy_pipeline_is_closed(
         )
         sock = tls_sock
         body = b'{"model":"fake"}'
-        request = (
+        authorized_request = (
             b"POST /v1/responses HTTP/1.1\r\n"
             b"Host: model.test\r\n"
             + f"Authorization: Bearer {placeholder}\r\n".encode()
@@ -167,11 +167,18 @@ def _raw_proxy_pipeline_is_closed(
             + f"Content-Length: {len(body)}\r\n\r\n".encode()
             + body
         )
-        tls_sock.sendall(request + request)
-        response = http.client.HTTPResponse(tls_sock)
-        response.begin()
-        response.read()
-        return tls_sock.recv(1) == b""
+        denied_request = authorized_request.replace(
+            f"Authorization: Bearer {placeholder}\r\n".encode(),
+            b"Authorization: Bearer wrong-placeholder\r\n",
+        )
+        tls_sock.sendall(authorized_request + denied_request)
+        first = http.client.HTTPResponse(tls_sock)
+        first.begin()
+        first.read()
+        second = http.client.HTTPResponse(tls_sock)
+        second.begin()
+        second.read()
+        return first.status, second.status
     finally:
         sock.close()
 
@@ -469,11 +476,11 @@ async def test_real_signer_relays_only_placeholder_authorized_responses(
     output = json.loads(body)["output"]
     assert output[0]["content"][0]["text"].startswith("BROKERED_E2E_OK")
     assert await asyncio.to_thread(
-        _raw_proxy_pipeline_is_closed,
+        _raw_proxy_pipeline_is_reauthorized,
         proxy_port=readiness.relay_port,
         ca_bundle_path=readiness.ca_bundle_path,
         placeholder=readiness.placeholder,
-    )
+    ) == (200, 403)
 
     missing_status, _, _ = await asyncio.to_thread(
         _raw_proxy_post,

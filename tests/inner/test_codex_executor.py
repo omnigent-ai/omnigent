@@ -41,6 +41,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
@@ -4201,6 +4202,59 @@ def test_app_server_run_turn_fails_fast_on_gateway_auth_error():
             {"threadId": "thread-1", "turnId": "turn-1"},
         )
         native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_signer_runtime_auth_failure_preserves_recovery_error():
+    async def _t():
+        native_forwarder_health.clear()
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo",
+            cwd="/tmp/workspace",
+            env={},
+            tool_executor=None,
+            provider_auth_authority=(
+                "https://workspace.cloud.databricks.com",
+                "agent-profile",
+            ),
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+                {"result": {}},
+            ]
+        )
+
+        async def _inject_gateway_error() -> None:
+            await asyncio.sleep(0.01)
+            session._note_stderr_gateway_error("Reconnecting... 5/5")
+            session._note_stderr_gateway_error(
+                "unexpected status 401 Unauthorized: {}, "
+                "url: https://workspace.cloud.databricks.com/"
+                "ai-gateway/codex/v1/responses"
+            )
+
+        inject_task = asyncio.create_task(_inject_gateway_error())
+        try:
+            with pytest.raises(ProviderAuthRequired) as raised:
+                async for _ in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="Be helpful.",
+                    model="databricks-gpt-5",
+                    cwd=".",
+                    sandbox="workspace-write",
+                ):
+                    pass
+            assert raised.value.code == "PROVIDER_AUTH_REQUIRED"
+            assert raised.value.remediation == "ucode configure"
+        finally:
+            await inject_task
+            native_forwarder_health.clear()
 
     _run(_t())
 
