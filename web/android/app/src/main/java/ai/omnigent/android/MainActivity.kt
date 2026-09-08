@@ -62,6 +62,13 @@ class MainActivity : AppCompatActivity() {
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
+    // Renderer-crash budget: real crashes (didCrash) inside a rolling window are
+    // counted so a page that reliably kills its renderer can't wedge the app in
+    // an invisible rebuild→reload→crash loop. Reset on a healthy page load and
+    // when the window elapses. System reclaims (didCrash=false) don't count.
+    private var rendererCrashes = 0
+    private var rendererCrashWindowStart = 0L
+
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
     // visible so it's always available as a recovery path (backward compatible
     // with older web builds). Theme-aware via brand colors (light/dark XML).
@@ -291,17 +298,52 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * The WebView's renderer process died — crashed, or reclaimed by the system
-     * under memory pressure. The instance can never render again, so detach and
-     * destroy it, swap in a freshly built WebView wired like the original
-     * (clients, bridge, insets), and reload the server. Without this the
-     * framework would terminate the whole app.
+     * The WebView's renderer process died — crashed ([didCrash]), or reclaimed by
+     * the system under memory pressure. The instance can never render again, so
+     * detach and destroy it, swap in a freshly built WebView wired like the
+     * original (clients, bridge, insets), and reload where the user was. Without
+     * this the framework would terminate the whole app.
+     *
+     * A real crash is budgeted ([MAX_RENDERER_CRASHES] within
+     * [RENDERER_CRASH_WINDOW_MS]): a page that reliably kills its renderer would
+     * otherwise loop rebuild→reload→crash forever. Once the budget is spent we
+     * stop auto-recovering and show a reload affordance instead. System reclaims
+     * (didCrash=false, routine while backgrounded) don't count against it.
+     *
+     * @param dead The WebView whose renderer died.
+     * @param didCrash True for a genuine renderer crash, false for a
+     *   system-initiated reclaim.
      */
-    private fun recoverFromRendererDeath(dead: WebView) {
+    private fun recoverFromRendererDeath(
+        dead: WebView,
+        didCrash: Boolean,
+    ) {
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
         // A late delivery for an already-replaced WebView must not tear down
         // the healthy replacement.
         if (dead !== webView) return
+
+        // Reload where the user was, not the server root: the dead renderer's
+        // last-committed URL survives readable, so a same-origin deep route
+        // (mid-chat, a terminal) comes back instead of dropping to the landing
+        // page. Falls back to the server root when it's blank or foreign (an
+        // error/login page we shouldn't restore into). Transient in-page state
+        // (composer text, scroll) lived in the renderer heap and is lost either
+        // way — this only preserves the route.
+        val serverUrl = ServerStore(this).currentServerUrl()
+        val lastUrl = dead.url
+        val reloadUrl =
+            if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
+
+        if (didCrash && !withinCrashBudget()) {
+            // Budget spent: a genuine crash loop. Stop rebuilding — that only
+            // feeds the loop — and leave the dead WebView in place showing the
+            // failure so the user isn't staring at an app that silently churns.
+            // The always-present server-switcher pill is the manual recovery path.
+            authLog("renderer crash budget exhausted; not auto-recovering")
+            return
+        }
+
         val parent = dead.parent as? ViewGroup
         val index = parent?.indexOfChild(dead) ?: 0
         parent?.removeView(dead)
@@ -319,7 +361,24 @@ class MainActivity : AppCompatActivity() {
         parent?.addView(webView, index)
         attachInsetsListener(webView)
         installBridge()
-        webView.loadUrl(ServerStore(this).currentServerUrl())
+        webView.loadUrl(reloadUrl)
+    }
+
+    /**
+     * Consume one unit of the renderer-crash budget, returning whether recovery
+     * may proceed. The first crash (or the first after the window elapses) opens
+     * a fresh window; crashes are then counted until [MAX_RENDERER_CRASHES] is
+     * reached within [RENDERER_CRASH_WINDOW_MS]. A healthy page load
+     * ([onPageReady]) resets the budget so isolated crashes never accumulate.
+     */
+    private fun withinCrashBudget(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - rendererCrashWindowStart > RENDERER_CRASH_WINDOW_MS) {
+            rendererCrashWindowStart = now
+            rendererCrashes = 0
+        }
+        rendererCrashes++
+        return rendererCrashes <= MAX_RENDERER_CRASHES
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -658,6 +717,10 @@ class MainActivity : AppCompatActivity() {
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
+        // A healthy render clears the crash budget: only crashes with no good
+        // page in between accumulate toward the give-up threshold.
+        rendererCrashes = 0
+        rendererCrashWindowStart = 0L
         flushPendingActivation()
         emitInsets()
     }
@@ -832,5 +895,12 @@ class MainActivity : AppCompatActivity() {
         // (a few ms) always wins the race, short enough to not feel stuck if it
         // doesn't answer. Only the timer ever fires when the renderer is gone.
         const val BACK_FALLBACK_MS = 600L
+
+        // Renderer-crash budget. A handful of rebuilds absorbs transient crashes;
+        // beyond that within the window it's a crash loop, so stop auto-recovering
+        // rather than churn forever. Window bounds "rolling" so long-separated
+        // one-off crashes never accumulate.
+        const val MAX_RENDERER_CRASHES = 3
+        const val RENDERER_CRASH_WINDOW_MS = 60_000L
     }
 }

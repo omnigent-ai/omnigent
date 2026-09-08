@@ -290,16 +290,23 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `renderer death hands the dying WebView to the recovery callback`() {
+    fun `renderer death hands the dying WebView and crash flag to the recovery callback`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var recovered: WebView? = null
-        val client = client(onRendererGone = { recovered = it })
+        var reportedCrash: Boolean? = null
+        val client =
+            client(
+                onRendererGone = { view, didCrash ->
+                    recovered = view
+                    reportedCrash = didCrash
+                },
+            )
 
         val handled =
             client.onRenderProcessGone(
                 webView,
                 object : RenderProcessGoneDetail() {
-                    override fun didCrash(): Boolean = false
+                    override fun didCrash(): Boolean = true
 
                     override fun rendererPriorityAtExit(): Int = WebView.RENDERER_PRIORITY_IMPORTANT
                 },
@@ -307,6 +314,9 @@ class OmnigentWebViewClientTest {
 
         assertTrue(handled)
         assertEquals(webView, recovered)
+        // The client must forward detail.didCrash() so the host can budget
+        // recovery for real crashes distinctly from system reclaims.
+        assertEquals(true, reportedCrash)
     }
 
     /** Run posted bounces (see the client's mainHandler) before asserting. */
@@ -316,7 +326,7 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
-        onRendererGone: (WebView) -> Unit = {},
+        onRendererGone: (WebView, Boolean) -> Unit = { _, _ -> },
         onPageReady: (String?) -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },

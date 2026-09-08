@@ -117,9 +117,76 @@ class MainActivityTest {
         assertFalse(shadowOf(replacement).wasDestroyCalled())
     }
 
-    private fun rendererGone() =
+    @Test
+    fun `renderer death reloads the last route, not the server root`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val dead = activity.webView()
+        // The user was on a deep same-origin route when the renderer died;
+        // getUrl() reports the last-committed URL, which survives the death.
+        dead.loadUrl("https://example.com/chat/abc123")
+
+        dead.webViewClient.onRenderProcessGone(dead, rendererGone())
+
+        // The rebuilt WebView returns to the route, not the landing page.
+        assertEquals(
+            "https://example.com/chat/abc123",
+            shadowOf(activity.webView()).lastLoadedUrl,
+        )
+    }
+
+    @Test
+    fun `a foreign last URL falls back to the server root on recovery`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val dead = activity.webView()
+        // A foreign / error origin must not be restored into — reload the server.
+        dead.loadUrl("https://accounts.google.com/o/oauth2/v2/auth")
+
+        dead.webViewClient.onRenderProcessGone(dead, rendererGone())
+
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `a renderer crash loop stops auto-recovering once the budget is spent`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        // Drive MAX_RENDERER_CRASHES successful recoveries; each rebuilds.
+        repeat(3) {
+            val live = activity.webView()
+            live.webViewClient.onRenderProcessGone(live, rendererGone(crashed = true))
+        }
+        val survivor = activity.webView()
+
+        // The next crash exceeds the budget: stop rebuilding, leave the dead
+        // WebView in place rather than feeding an endless rebuild→crash loop.
+        survivor.webViewClient.onRenderProcessGone(survivor, rendererGone(crashed = true))
+
+        assertSame(survivor, activity.webView())
+    }
+
+    @Test
+    fun `system reclaims never exhaust the crash budget`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        // Far more than MAX_RENDERER_CRASHES, but all system reclaims
+        // (didCrash=false): each must recover, none counts against the budget.
+        repeat(6) {
+            val live = activity.webView()
+            live.webViewClient.onRenderProcessGone(live, rendererGone(crashed = false))
+        }
+        val latest = activity.webView()
+
+        latest.webViewClient.onRenderProcessGone(latest, rendererGone(crashed = false))
+        assertNotSame(latest, activity.webView())
+    }
+
+    private fun rendererGone(crashed: Boolean = false) =
         object : RenderProcessGoneDetail() {
-            override fun didCrash(): Boolean = false
+            override fun didCrash(): Boolean = crashed
 
             override fun rendererPriorityAtExit(): Int = WebView.RENDERER_PRIORITY_IMPORTANT
         }

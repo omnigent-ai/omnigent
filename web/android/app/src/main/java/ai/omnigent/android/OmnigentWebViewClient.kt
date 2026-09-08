@@ -33,7 +33,7 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
-    private val onRendererGone: (WebView) -> Unit,
+    private val onRendererGone: (view: WebView, didCrash: Boolean) -> Unit,
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -191,7 +191,11 @@ class OmnigentWebViewClient(
         view: WebView,
         detail: RenderProcessGoneDetail,
     ): Boolean {
-        onRendererGone(view)
+        // detail.didCrash() distinguishes a genuine renderer crash from a benign
+        // system reclaim under memory pressure; the host uses it to budget
+        // recovery so a page that reliably crashes the renderer can't wedge the
+        // app in an invisible rebuild→reload→crash loop.
+        onRendererGone(view, detail.didCrash())
         return true
     }
 

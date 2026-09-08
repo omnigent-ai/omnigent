@@ -53,7 +53,7 @@ class OmnigentWebViewClientRenderProcessGoneTest {
             shouldInjectBridgeAtPageReady = { false },
             onPageReady = {},
             onLoginRequired = {},
-            onRendererGone = {},
+            onRendererGone = { _, _ -> },
         )
 
     private fun detail(crashed: Boolean) =
