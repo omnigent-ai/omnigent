@@ -181,6 +181,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
         tools=_translate_tools_to_omnigent(spec),
         executor=executor_spec,
         os_env=spec.os_env,
+        model_egress=spec.model_egress,
         bundle_dir=bundle_dir,
         skills_filter=spec.skills_filter,
     )
@@ -1152,6 +1153,7 @@ def agent_def_to_agent_spec(
         guardrails=guardrails,
         mcp_servers=mcp_servers,
         os_env=agent_def.os_env,
+        model_egress=agent_def.model_egress,
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,

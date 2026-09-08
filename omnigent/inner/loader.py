@@ -254,6 +254,18 @@ def _parse_agent_def(
     agent.spawn = data.get("spawn", False)
     agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
+    raw_model_egress = data.get("model_egress")
+    if raw_model_egress is not None:
+        if not isinstance(raw_model_egress, list) or not raw_model_egress:
+            raise ValueError("model_egress must be a non-empty list")
+        from .egress.rules import parse_rule
+
+        agent.model_egress = []
+        for index, rule in enumerate(raw_model_egress):
+            if not isinstance(rule, str):
+                raise ValueError(f"model_egress[{index}] must be a string")
+            parse_rule(rule)
+            agent.model_egress.append(rule)
 
     # Executor
     executor_data = data.get("executor")

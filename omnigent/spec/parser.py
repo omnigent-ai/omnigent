@@ -245,6 +245,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
+    model_egress = _parse_model_egress(raw.get("model_egress"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
@@ -311,6 +312,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         sub_agents=sub_agents,
         async_enabled=async_enabled,
         os_env=os_env,
+        model_egress=model_egress,
         terminals=terminals,
         timers=timers,
         spawn=spawn,
@@ -1311,6 +1313,35 @@ def _parse_egress_rules(raw: object) -> list[str] | None:
         except ValueError as exc:
             raise OmnigentError(
                 f"os_env.sandbox.egress_rules[{i}] is invalid: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        validated.append(entry)
+    return validated
+
+
+def _parse_model_egress(raw: object) -> list[str] | None:
+    """Parse the explicit model-signing grant independently of generic egress."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise OmnigentError(
+            "model_egress must be a non-empty list of HTTP egress rules",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    from omnigent.inner.egress.rules import parse_rule
+
+    validated: list[str] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, str):
+            raise OmnigentError(
+                f"model_egress[{index}] must be a string",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            parse_rule(entry)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"model_egress[{index}] is invalid: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         validated.append(entry)

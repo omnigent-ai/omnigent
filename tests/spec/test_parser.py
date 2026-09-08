@@ -42,6 +42,28 @@ def test_parse_minimal(agent_dir: Path) -> None:
     assert spec.mcp_servers == []
     assert spec.local_tools == []
     assert spec.sub_agents == []
+    assert spec.model_egress is None
+
+
+def test_parse_model_egress_as_distinct_typed_grant(tmp_path: Path) -> None:
+    rule = "POST workspace.databricks.com/ai-gateway/codex/v1/responses"
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"spec_version": 1, "model_egress": [rule]})
+    )
+
+    spec = parse(tmp_path)
+
+    assert spec.model_egress == [rule]
+
+
+@pytest.mark.parametrize("value", [[], "POST workspace.databricks.com/**", [123]])
+def test_parse_model_egress_rejects_invalid_grants(tmp_path: Path, value: object) -> None:
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"spec_version": 1, "model_egress": value})
+    )
+
+    with pytest.raises(OmnigentError, match="model_egress"):
+        parse(tmp_path)
 
 
 def test_parse_missing_config_yaml(tmp_path: Path) -> None:

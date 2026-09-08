@@ -21,8 +21,10 @@ subprocess spawn, no real CLI.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import yaml as _yaml
@@ -119,6 +121,7 @@ def _make_spec(
     use_responses: object | None = None,
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None,
     os_env: object | None = None,
+    model_egress: list[str] | None = None,
 ) -> AgentSpec:
     """
     Build a minimal :class:`AgentSpec` for a given harness.
@@ -148,6 +151,7 @@ def _make_spec(
         executor=ExecutorSpec(type="omnigent", config=config, model=model, auth=auth),
         llm=LLMConfig(model=model) if model is not None else None,
         os_env=os_env,  # type: ignore[arg-type]
+        model_egress=model_egress,
     )
 
 
@@ -1099,28 +1103,18 @@ def test_no_provider_api_key_path_unchanged(config_home: Path) -> None:
     assert "HARNESS_CLAUDE_SDK_GATEWAY" not in env
 
 
-def test_no_provider_legacy_profile_path_unchanged(config_home: Path) -> None:
-    """
-    With NO provider configured, the legacy profile path is untouched.
-
-    A codex spec with a legacy ``executor.config["profile"]`` must still emit
-    the ``DATABRICKS=true`` + ``DATABRICKS_PROFILE`` pair and NO provider
-    gateway base_url. Failure means the provider branch hijacked the
-    legacy-profile path (it must only fire for ProviderAuth / no-auth).
-    """
+def test_codex_legacy_databricks_profile_fails_without_broker_policy(
+    config_home: Path,
+) -> None:
+    """A legacy Databricks route cannot bypass the signer policy."""
     _write_config(config_home, {})
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    env = _build_codex_spawn_env(spec, workdir=None)
-
-    assert env["HARNESS_CODEX_GATEWAY"] == "true"
-    assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "legacy-profile"
-    # The legacy path never emits a gateway base_url or auth command.
-    assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
-    assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
+    with pytest.raises(OmnigentError, match="active os_env sandbox"):
+        _build_codex_spawn_env(spec, workdir=None)
 
 
-def test_legacy_profile_suppresses_global_default_provider(config_home: Path) -> None:
+def test_legacy_profile_still_suppresses_global_default_provider(config_home: Path) -> None:
     """
     A legacy ``profile`` on the spec suppresses the global-default provider.
 
@@ -1132,11 +1126,8 @@ def test_legacy_profile_suppresses_global_default_provider(config_home: Path) ->
     _write_config(config_home, _openai_default_config())  # global default exists
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    env = _build_codex_spawn_env(spec, workdir=None)
-
-    # The legacy profile wins; the global-default provider is not consulted.
-    assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "legacy-profile"
-    assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
+    with pytest.raises(OmnigentError, match="active os_env sandbox"):
+        _build_codex_spawn_env(spec, workdir=None)
 
 
 def test_codex_spec_databricks_auth_routes_via_synthesized_provider(config_home: Path) -> None:
@@ -1151,14 +1142,97 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(config_home:
     the gateway + profile wiring the fold owns (no ``~/.databrickscfg`` needed).
     """
     _write_config(config_home, {})
-    spec = _make_spec(harness="codex", auth=DatabricksAuth(profile="test-dbx-ws"))
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
 
-    env = _build_codex_spawn_env(spec, workdir=None)
+    endpoint = "https://workspace.databricks.com/ai-gateway/codex/v1"
+    spec = _make_spec(
+        harness="codex",
+        model="databricks-gpt-5",
+        auth=DatabricksAuth(profile="test-dbx-ws"),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        model_egress=[
+            "POST workspace.databricks.com/ai-gateway/codex/v1/responses",
+        ],
+    )
+    with (
+        patch(
+            "omnigent.runtime.workflow.get_workspace_url_for_profile",
+            return_value="https://workspace.databricks.com",
+        ),
+        patch(
+            "omnigent.runtime.workflow.read_ucode_state",
+            return_value=UcodeWorkspaceState(
+                workspace_url="https://workspace.databricks.com",
+                agents={
+                    "codex": UcodeAgentState(
+                        model="databricks-gpt-5",
+                        base_url=endpoint,
+                        auth_command="sh -c arbitrary",
+                    )
+                },
+            ),
+        ),
+    ):
+        env = _build_codex_spawn_env(spec, workdir=None)
 
-    assert env["HARNESS_CODEX_GATEWAY"] == "true"
     assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "test-dbx-ws"
-    # A databricks-kind provider delegates to ucode and never emits a raw base_url.
-    assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
+    assert env["HARNESS_CODEX_SIGNER_PROVIDER"] == "databricks-ucode-v1"
+    assert env["HARNESS_CODEX_SIGNER_ENDPOINT"] == endpoint
+    assert env["HARNESS_CODEX_MODEL_EGRESS"] == (
+        '["POST workspace.databricks.com/ai-gateway/codex/v1/responses"]'
+    )
+    assert "HARNESS_CODEX_GATEWAY" not in env
+    assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
+
+    from omnigent.inner import codex_harness
+    from omnigent.inner.codex_executor import CodexExecutor
+    from omnigent.inner.model_signer import SignerLaunchConfig
+
+    captured: dict[str, object] = {}
+    original_init = CodexExecutor.__init__
+
+    def _capture_init(self: CodexExecutor, **kwargs: object) -> None:
+        captured.update(kwargs)
+        original_init(self, **kwargs)  # type: ignore[arg-type]
+
+    harness_env = {
+        **env,
+        "OMNIGENT_CODEX_PATH": "/bin/true",
+    }
+    with (
+        patch.dict(os.environ, harness_env, clear=True),
+        patch.object(CodexExecutor, "__init__", _capture_init),
+    ):
+        executor = codex_harness._build_codex_executor()
+
+    signer = captured["signer_launch_config"]
+    assert isinstance(signer, SignerLaunchConfig)
+    assert signer.endpoint == endpoint
+    assert isinstance(executor, CodexExecutor)
+    generated = "\n".join(executor._codex_config_overrides)
+    assert 'auth={command="sh"' not in generated
+    assert "sh -c arbitrary" not in generated
+
+
+def test_codex_databricks_broker_fails_without_model_egress(config_home: Path) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    _write_config(config_home, {})
+    spec = _make_spec(
+        harness="codex",
+        model="databricks-gpt-5",
+        auth=DatabricksAuth(profile="test-dbx-ws"),
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                egress_rules=["* workspace.databricks.com/**"],
+            )
+        ),
+    )
+
+    with pytest.raises(OmnigentError, match="model_egress"):
+        _build_codex_spawn_env(spec, workdir=None)
 
 
 # ── cli-config kind: model_provider pinning ─────────────────────────────────
