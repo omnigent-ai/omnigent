@@ -27,6 +27,7 @@ This module owns two pieces:
 
 from __future__ import annotations
 
+import math
 import os
 import secrets
 import subprocess
@@ -196,7 +197,22 @@ def prepare_credential_proxy_runtime(
 
     synthetic_by_env: dict[str, str] = {}
     for entry in spec.entries:
-        real_secret = _resolve_secret(entry.source, parent_env=parent_env)
+        # A source with a refresh interval is re-resolved on each swap
+        # (throttled) so a rotating secret — e.g. a ``command`` minting a
+        # short-lived token — stays fresh for long sessions, instead of
+        # being baked in once here. A source without one resolves once and
+        # is attached as a static ``real_secret`` (the original behavior).
+        real_secret: str | None = None
+        secret_provider: Callable[[], str] | None = None
+        if entry.source.refresh_interval is not None:
+            provider = RefreshingSecretProvider(
+                entry.source,
+                parent_env=parent_env,
+                refresh_interval=entry.source.refresh_interval,
+            )
+            secret_provider = provider.resolve
+        else:
+            real_secret = _resolve_secret(entry.source, parent_env=parent_env)
         # Mint a placeholder only when the entry injects an env var. The
         # placeholder is what the cross-host leak guard keys on; pure
         # swap-on-access entries put nothing in the sandbox, so there is
@@ -223,6 +239,7 @@ def prepare_credential_proxy_runtime(
                 host=entry.host,
                 scheme=entry.scheme,
                 real_secret=real_secret,
+                secret_provider=secret_provider,
                 synthetic=synthetic,
                 username=entry.username,
             )
@@ -284,6 +301,95 @@ def _resolve_secret(source: CredentialSourceSpec, *, parent_env: dict[str, str])
             raise ValueError("credential_proxy command source produced empty stdout")
         return value
     raise ValueError(f"unsupported credential_proxy source kind: {source.kind!r}")
+
+
+class RefreshingSecretProvider:
+    """Re-resolving secret source for ``env`` / ``file`` / ``command`` kinds.
+
+    Wraps :func:`_resolve_secret` so a source whose backing value rotates
+    mid-session is re-read for the egress proxy instead of baked in once at
+    helper start. The motivating case is a ``command`` source that mints a
+    short-lived token (e.g. a GitHub App installation token that expires in
+    ~1h): a session running past expiry would otherwise hit proxy-injected
+    401s.
+
+    The value is resolved eagerly at construction — so a misconfigured
+    source still fails loud at prepare time, exactly as the static path
+    does — and re-resolved at most once per :attr:`_refresh_interval` on
+    each swap; ``0`` re-resolves on every swap. Thread-safe: the egress
+    proxy resolves from its own event-loop thread. This mirrors
+    :class:`DatabricksProfileTokenProvider`, which already uses the same
+    throttle to survive Databricks OAuth expiry.
+    """
+
+    def __init__(
+        self,
+        source: CredentialSourceSpec,
+        *,
+        parent_env: dict[str, str],
+        refresh_interval: float,
+        clock: Callable[[], float] = time.monotonic,
+        resolver: Callable[[CredentialSourceSpec], str] | None = None,
+    ) -> None:
+        """
+        Build a provider for *source* and resolve it once, eagerly.
+
+        :param source: The ``env`` / ``file`` / ``command`` source to
+            re-resolve.
+        :param parent_env: Parent process environment for ``env`` lookups
+            and as the environment for ``command`` execution.
+        :param refresh_interval: Minimum seconds between re-resolutions.
+            ``0`` re-resolves on every swap.
+        :param clock: Monotonic clock, injectable for tests.
+        :param resolver: Test seam resolving *source* to a secret
+            (defaults to :func:`_resolve_secret` bound to *parent_env*).
+        :raises ValueError: If *refresh_interval* is not a finite,
+            non-negative number, or if the source cannot be resolved to a
+            non-empty secret (both raised eagerly here).
+        """
+        if not math.isfinite(refresh_interval) or refresh_interval < 0:
+            # Prepare-time fail-loud boundary for callers that build a
+            # CredentialSourceSpec directly, bypassing the spec parser's
+            # equivalent check (NaN would re-resolve on every swap; infinity
+            # would disable refresh forever).
+            raise ValueError(
+                f"refresh_interval must be a finite, non-negative number, got {refresh_interval!r}"
+            )
+        self._source = source
+        self._refresh_interval = refresh_interval
+        self._clock = clock
+        if resolver is None:
+            # Snapshot the parent environment at construction so a later
+            # mutation of the caller's dict can't change what env / command
+            # sources resolve against — the trusted startup env is fixed here.
+            frozen_env = dict(parent_env)
+            self._resolver: Callable[[CredentialSourceSpec], str] = lambda src: _resolve_secret(
+                src, parent_env=frozen_env
+            )
+        else:
+            self._resolver = resolver
+        self._lock = threading.Lock()
+        self._value: str | None = None
+        self._next_refresh = 0.0
+        # Resolve now so a misconfigured source fails at prepare time,
+        # matching the fail-loud behavior of the static resolution path.
+        self.resolve()
+
+    def resolve(self) -> str:
+        """
+        Return the current secret, re-resolving past the throttle window.
+
+        :returns: The freshest resolved secret.
+        :raises ValueError: If re-resolution fails.
+        """
+        with self._lock:
+            now = self._clock()
+            if self._value is not None and now < self._next_refresh:
+                return self._value
+            value = self._resolver(self._source)
+            self._value = value
+            self._next_refresh = now + self._refresh_interval
+            return value
 
 
 # Default seconds between re-authentications for a Databricks profile. The
@@ -501,5 +607,6 @@ __all__ = [
     "CredentialRewriteRule",
     "DatabricksProfileTokenProvider",
     "MaterializedFile",
+    "RefreshingSecretProvider",
     "prepare_credential_proxy_runtime",
 ]

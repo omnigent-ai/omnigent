@@ -389,12 +389,23 @@ class CredentialSourceSpec:
         expanded), e.g. ``"~/.config/tokens/github_pat.txt"``.
     :param command: Shell command whose stdout is the secret when
         ``kind="command"``, e.g. ``"gh auth token"``.
+    :param refresh_interval: Optional throttle, in seconds, after which the
+        parent re-resolves the source instead of baking its value in once
+        at helper start. ``None`` (the default) resolves once and reuses
+        the value for the whole session — correct for a static secret. Set
+        it for a source whose backing value rotates mid-session (most
+        notably a ``command`` that mints a short-lived token, e.g. a
+        GitHub App installation token that expires in ~1h): the value is
+        then re-read at most once per interval on each proxy swap, so a
+        long session survives expiry. ``0`` re-resolves on every swap
+        (cheap for ``file`` / ``command`` sources).
     """
 
     kind: Literal["env", "file", "command"]
     env: str | None = None
     path: str | None = None
     command: str | None = None
+    refresh_interval: float | None = None
 
 
 @dataclass

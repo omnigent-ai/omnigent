@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -1344,6 +1345,12 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
         secret, e.g. ``"~/.config/tokens/github_pat.txt"``.
     :param command: Shell command whose stdout is the secret, e.g.
         ``"gh auth token"``.
+    :param refresh_interval: Optional non-negative throttle, in seconds,
+        after which the parent re-resolves the source instead of baking its
+        value in once at helper start (``NaN`` / infinity are rejected).
+        Omit for a static secret; set it for
+        a source whose value rotates mid-session (e.g. a ``command`` that
+        mints a short-lived token). ``0`` re-resolves on every proxy swap.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1351,6 +1358,7 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     env: str | None = None
     file: str | None = None
     command: str | None = None
+    refresh_interval: float | None = None
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> _CredentialSourceModel:
@@ -1375,6 +1383,10 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
             raise ValueError("source 'file' must be a non-empty path")
         if self.command is not None and not self.command.strip():
             raise ValueError("source 'command' must be a non-empty command")
+        if self.refresh_interval is not None and (
+            not math.isfinite(self.refresh_interval) or self.refresh_interval < 0
+        ):
+            raise ValueError("source 'refresh_interval' must be a finite, non-negative number")
         return self
 
     def to_spec(self) -> CredentialSourceSpec:
@@ -1386,11 +1398,17 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
             (guaranteed by :meth:`_exactly_one_source`).
         """
         if self.env is not None:
-            return CredentialSourceSpec(kind="env", env=self.env)
+            return CredentialSourceSpec(
+                kind="env", env=self.env, refresh_interval=self.refresh_interval
+            )
         if self.file is not None:
-            return CredentialSourceSpec(kind="file", path=self.file.strip())
+            return CredentialSourceSpec(
+                kind="file", path=self.file.strip(), refresh_interval=self.refresh_interval
+            )
         assert self.command is not None
-        return CredentialSourceSpec(kind="command", command=self.command.strip())
+        return CredentialSourceSpec(
+            kind="command", command=self.command.strip(), refresh_interval=self.refresh_interval
+        )
 
 
 class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]

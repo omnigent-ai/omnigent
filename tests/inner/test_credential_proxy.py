@@ -21,6 +21,7 @@ from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialProxyRuntime,
     DatabricksProfileTokenProvider,
+    RefreshingSecretProvider,
     _prepare_databricks_runtime,
     prepare_credential_proxy_runtime,
 )
@@ -395,3 +396,158 @@ def test_databricks_runtime_rejects_same_host_profiles() -> None:
 
     with pytest.raises(OmnigentError, match="resolve to workspace host"):
         _prepare_databricks_runtime(spec, CredentialProxyRuntime(), provider_factory=factory)
+
+
+def test_refresh_interval_reresolves_rotated_source(tmp_path: Path) -> None:
+    """A source with ``refresh_interval`` re-reads a value that rotates mid-run.
+
+    This is the whole point of the feature: our GitHub App token source is a
+    ``command`` that force-mints a fresh ~1h token, so a session running past
+    expiry must see the *new* value on a later swap, not the one baked in at
+    helper start. Modeled with a ``file`` source rotated between swaps.
+    ``refresh_interval=0`` re-resolves on every swap. This assertion fails on
+    unpatched main, where the value is resolved once and frozen (and where the
+    ``refresh_interval`` field does not exist).
+    """
+    secret_file = tmp_path / "token.txt"
+    secret_file.write_text("token-v1\n", encoding="utf-8")
+    spec = CredentialProxySpec(
+        entries=[
+            _bearer_entry(
+                "api.example.com",
+                env_var="API_TOKEN",
+                source=CredentialSourceSpec(
+                    kind="file", path=str(secret_file), refresh_interval=0.0
+                ),
+            )
+        ]
+    )
+    runtime = prepare_credential_proxy_runtime(spec, parent_env={})
+    rule = runtime.rewrites[0]
+    # No static secret is baked in for a refreshing source; the proxy pulls
+    # the current value through the provider on each swap.
+    assert rule.real_secret is None
+    assert rule.resolve_secret() == "token-v1"
+
+    # Rotate the backing source mid-session (as a fresh App-token mint would).
+    secret_file.write_text("token-v2\n", encoding="utf-8")
+    assert rule.resolve_secret() == "token-v2"
+
+
+def test_no_refresh_interval_bakes_in_source(tmp_path: Path) -> None:
+    """Without ``refresh_interval`` the secret is resolved once and frozen.
+
+    The control for :func:`test_refresh_interval_reresolves_rotated_source`:
+    the default (static) path must keep its baked-in value even after the
+    backing source changes, so refreshing is strictly opt-in.
+    """
+    secret_file = tmp_path / "token.txt"
+    secret_file.write_text("token-v1\n", encoding="utf-8")
+    spec = CredentialProxySpec(
+        entries=[
+            _bearer_entry(
+                "api.example.com",
+                env_var="API_TOKEN",
+                source=CredentialSourceSpec(kind="file", path=str(secret_file)),
+            )
+        ]
+    )
+    runtime = prepare_credential_proxy_runtime(spec, parent_env={})
+    rule = runtime.rewrites[0]
+    assert rule.real_secret == "token-v1"
+    assert rule.secret_provider is None
+
+    secret_file.write_text("token-v2\n", encoding="utf-8")
+    # Static source: the rotated value is intentionally NOT picked up.
+    assert rule.resolve_secret() == "token-v1"
+
+
+def test_refreshing_provider_throttles_re_resolution() -> None:
+    """The provider caches within the window and re-resolves once past it.
+
+    Mirrors ``test_databricks_provider_resolves_host_and_refreshes``: uses a
+    clock seam and a resolver seam so no real subprocess/file is needed. The
+    eager resolve at construction consumes the first value; subsequent calls
+    inside the window reuse it, and one call past the window re-resolves.
+    """
+    values = iter(["v1", "v2"])
+    resolver_calls = {"n": 0}
+
+    def resolver(_source: CredentialSourceSpec) -> str:
+        resolver_calls["n"] += 1
+        return next(values)
+
+    clock = {"now": 0.0}
+    provider = RefreshingSecretProvider(
+        CredentialSourceSpec(kind="command", command="unused"),
+        parent_env={},
+        refresh_interval=100.0,
+        clock=lambda: clock["now"],
+        resolver=resolver,
+    )
+    # Eager resolve at construction already fetched v1.
+    assert resolver_calls["n"] == 1
+    assert provider.resolve() == "v1"
+    clock["now"] = 50.0  # still inside the window -> cached
+    assert provider.resolve() == "v1"
+    assert resolver_calls["n"] == 1
+    clock["now"] = 150.0  # past the window -> re-resolve
+    assert provider.resolve() == "v2"
+    assert resolver_calls["n"] == 2
+
+
+def test_refreshing_source_fails_loud_eagerly() -> None:
+    """A misconfigured refreshing source raises at prepare time, not first swap.
+
+    Fail-loud parity with the static path: a refreshing ``env`` source whose
+    variable is missing must raise during
+    :func:`prepare_credential_proxy_runtime`, so a bad config never yields a
+    live rule that only blows up on the first outbound request.
+    """
+    spec = CredentialProxySpec(
+        entries=[
+            _bearer_entry(
+                "h.example.com",
+                env_var="T",
+                source=CredentialSourceSpec(kind="env", env="MISSING", refresh_interval=0.0),
+            )
+        ]
+    )
+    with pytest.raises(ValueError, match="missing or empty"):
+        prepare_credential_proxy_runtime(spec, parent_env={})
+
+
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+def test_refreshing_provider_rejects_non_finite_or_negative_interval(bad: float) -> None:
+    """The provider fails loud on a negative / NaN / infinite interval.
+
+    This is the prepare-time boundary for callers that build a
+    :class:`CredentialSourceSpec` directly (bypassing the parser check):
+    ``NaN`` would re-resolve on every swap and infinity would disable
+    refresh forever, both silently violating the throttle contract.
+    """
+    with pytest.raises(ValueError, match="finite, non-negative"):
+        RefreshingSecretProvider(
+            CredentialSourceSpec(kind="command", command="unused"),
+            parent_env={},
+            refresh_interval=bad,
+            resolver=lambda _s: "unused",
+        )
+
+
+def test_refreshing_provider_snapshots_parent_env() -> None:
+    """The provider resolves against the env captured at construction.
+
+    A later mutation of the caller's ``parent_env`` dict must not change
+    what an ``env`` source resolves to — the trusted startup environment is
+    frozen when the provider is built.
+    """
+    env = {"OA_SECRET": "v1"}
+    provider = RefreshingSecretProvider(
+        CredentialSourceSpec(kind="env", env="OA_SECRET", refresh_interval=0.0),
+        parent_env=env,
+        refresh_interval=0.0,
+    )
+    assert provider.resolve() == "v1"
+    env["OA_SECRET"] = "v2"  # mutate the original dict after construction
+    assert provider.resolve() == "v1"
