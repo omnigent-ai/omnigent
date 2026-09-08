@@ -1,0 +1,50 @@
+# Remy Auto — an assistant that remembers, automatically.
+#
+# This is the runtime-`memory:`-block counterpart to the `remy` example. Where
+# `remy` declares the hindsight_* TOOLS and a prompt instructing the model to
+# call them, Remy Auto has NO memory tools and a NEUTRAL prompt. Recall and
+# retain are handled deterministically by the runtime: before each turn the
+# runner recalls relevant memories and injects them; after each turn it retains
+# the user's message. The model is never asked to manage memory.
+#
+# So if Remy Auto answers, in a fresh session, a question about something you
+# told it in an earlier session, that is the automatic `memory:` layer working
+# — not the model choosing to call a tool.
+#
+# Setup:
+#   pip install 'omnigent[hindsight]'
+#   export HINDSIGHT_API_KEY=hsk_...        # https://ui.hindsight.vectorize.io
+#
+# Usage:
+#   omnigent run examples/remy_auto
+#
+# Runs on the Claude Agent SDK harness, so configure a Claude provider first
+# (e.g. `omnigent setup`, or export ANTHROPIC_API_KEY).
+
+spec_version: 1
+name: remy-auto
+description: >-
+  A helpful assistant with automatic long-term memory. Remy Auto recalls what it
+  already knows before each turn and retains what you tell it — with no memory
+  tools and no memory instructions, entirely via the runtime `memory:` block,
+  powered by Hindsight.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+# Deliberately neutral: the model is NOT told to save or recall anything. Any
+# cross-session memory you observe is the `memory:` block below, not the prompt.
+prompt: |
+  You are a helpful, concise assistant.
+
+# Automatic long-term memory. bank_id pins a stable, human-readable bank so every
+# session shares one memory store (omit it and the bank defaults to the agent
+# id). Setting enabled turns on both auto_recall and auto_retain.
+memory:
+  enabled: true
+  provider: hindsight        # memory backend (default & only value today)
+  api_key: ${HINDSIGHT_API_KEY}
+  bank_id: remy-auto
+  budget: mid

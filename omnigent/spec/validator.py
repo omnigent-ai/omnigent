@@ -94,6 +94,7 @@ def validate(spec: AgentSpec) -> ValidationResult:
     _validate_local_tools(spec, result)
     _validate_sub_agents(spec, result)
     _validate_compaction(spec, result)
+    _validate_memory(spec, result)
     _validate_os_env(spec, result)
     return result
 
@@ -489,6 +490,30 @@ def _validate_compaction(spec: AgentSpec, result: ValidationResult) -> None:
         result.add(
             "compaction.recent_window",
             f"must be non-negative, got {spec.compaction.recent_window}",
+        )
+
+
+def _validate_memory(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate the automatic-memory configuration if present.
+
+    Budget and the enabled/api_key requirement are enforced at parse
+    time; this covers the numeric bounds a mapping-shape check can't.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.memory is None:
+        return
+    if spec.memory.max_tokens <= 0:
+        result.add(
+            "memory.max_tokens",
+            f"must be positive, got {spec.memory.max_tokens}",
+        )
+    if spec.memory.recall_timeout <= 0:
+        result.add(
+            "memory.recall_timeout",
+            f"must be positive, got {spec.memory.recall_timeout}",
         )
 
 
