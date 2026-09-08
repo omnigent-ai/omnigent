@@ -757,7 +757,7 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse>{item.text}</FilePathAwareMessageResponse>
+          <FilePathAwareMessageResponse breaks>{item.text}</FilePathAwareMessageResponse>
         </div>
       );
     case "reasoning":
