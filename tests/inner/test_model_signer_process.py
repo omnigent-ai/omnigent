@@ -330,7 +330,8 @@ async def test_real_signer_relays_only_placeholder_authorized_responses(
             json={"model": "fake"},
         )
         assert response.status_code == 200
-        assert response.json() == {"upstream_saw_fake_bearer": True}
+        output = response.json()["output"]
+        assert output[0]["content"][0]["text"].startswith("BROKERED_E2E_OK")
 
         missing = await client.post(
             "https://model.test/v1/responses",

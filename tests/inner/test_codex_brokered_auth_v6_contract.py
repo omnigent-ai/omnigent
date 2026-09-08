@@ -9,6 +9,7 @@ from omnigent.inner.model_egress import (
     ProviderModelBinding,
     resolve_model_routes,
 )
+from omnigent.inner.model_signer import SignerLaunchConfig
 
 _HOST = "workspace.cloud.databricks.com"
 _PREFIX = "/serving-endpoints/openai"
@@ -81,3 +82,38 @@ def test_query_is_denied_by_default() -> None:
 
     assert route.matches(method="POST", host=_HOST, path=_RESPONSES, query="")
     assert not route.matches(method="POST", host=_HOST, path=_RESPONSES, query="debug=true")
+
+
+def test_signer_launch_config_resolves_three_way_authority() -> None:
+    signed = FrozenModelRoute(method="POST", host=_HOST, path=_RESPONSES)
+    config = SignerLaunchConfig.from_trusted_authority(
+        binding_id="test-fake-provider-v1",
+        provider=_binding(
+            signed,
+            FrozenModelRoute(method="GET", host=_HOST, path="/api/2.0/clusters/list"),
+        ),
+        trusted_session_endpoint=f"https://{_HOST}{_PREFIX}",
+        operator_model_egress=[f"POST {_HOST}{_RESPONSES}"],
+    )
+
+    assert config.endpoint == f"https://{_HOST}{_PREFIX}"
+    assert config.routes == (signed,)
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", _RESPONSES),
+        ("POST", f"{_PREFIX}/chat/completions"),
+    ],
+)
+def test_signer_launch_config_rejects_non_responses_authority(
+    method: str,
+    path: str,
+) -> None:
+    with pytest.raises(ValueError, match="exact POST trusted /responses"):
+        SignerLaunchConfig(
+            binding_id="test-fake-provider-v1",
+            endpoint=f"https://{_HOST}{_PREFIX}",
+            routes=(FrozenModelRoute(method=method, host=_HOST, path=path),),
+        )

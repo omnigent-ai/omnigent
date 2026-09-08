@@ -165,6 +165,7 @@ async def test_signer_backed_home_excludes_host_credential_files(
     await session.start()
 
     assert populate.call_args.kwargs["include_credentials"] is False
+    assert populate.call_args.kwargs["minimal_config"] is True
     await session.close()
 
 
@@ -175,6 +176,7 @@ def test_credential_exclusion_keeps_config_but_not_host_auth(tmp_path: Path) -> 
     target.mkdir()
     (source / "auth.json").write_text('{"token":"host-secret"}', encoding="utf-8")
     (source / ".credentials.json").write_text('{"token":"mcp-secret"}', encoding="utf-8")
+    (source / "memories_1.sqlite").write_bytes(b"host-state")
     (source / "config.toml").write_text(
         'model_provider = "host"\n'
         "[model_providers.host]\n"
@@ -187,6 +189,7 @@ def test_credential_exclusion_keeps_config_but_not_host_auth(tmp_path: Path) -> 
 
     assert not (target / "auth.json").exists()
     assert not (target / ".credentials.json").exists()
+    assert not (target / "memories_1.sqlite").exists()
     assert not (target / "config.toml").exists()
 
 

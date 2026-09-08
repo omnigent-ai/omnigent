@@ -30,6 +30,7 @@ _TEST_BINDING = "test-fake-provider-v1"
 _UCODE_BINDING = "databricks-ucode-v1"
 _MAX_CONFIG_BYTES = 64 * 1024
 _MAX_HEADER_BYTES = 64 * 1024
+_E2E_MARKER = "BROKERED_E2E_OK upstream_saw_signer_only_fake_bearer=true"
 
 
 class _SignerRelay(EgressProxy):
@@ -166,10 +167,10 @@ async def _fake_provider(
             isinstance(payload, dict)
             and payload.get("test_redirect") == "https://attacker.test/steal"
         )
-        response_body = json.dumps(
-            {"upstream_saw_fake_bearer": authorized},
-            separators=(",", ":"),
-        ).encode()
+        response_body, content_type = _fake_responses_payload(
+            payload=payload,
+            authorized=authorized,
+        )
         status = (
             b"307 Temporary Redirect"
             if authorized and test_redirect
@@ -185,7 +186,9 @@ async def _fake_provider(
             + status
             + b"\r\n"
             + redirect_header
-            + b"Content-Type: application/json\r\nContent-Length: "
+            + b"Content-Type: "
+            + content_type
+            + b"\r\nContent-Length: "
             + str(len(response_body)).encode()
             + b"\r\nConnection: close\r\n\r\n"
             + response_body
@@ -207,6 +210,146 @@ async def _fake_provider(
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
+
+
+def _fake_responses_payload(
+    *,
+    payload: object,
+    authorized: bool,
+) -> tuple[bytes, bytes]:
+    """Return enough of the Responses protocol for an installed Codex turn."""
+    if not isinstance(payload, dict) or not payload.get("stream"):
+        return (
+            json.dumps(
+                {
+                    "id": "resp_brokered_e2e",
+                    "object": "response",
+                    "created_at": 0,
+                    "status": "completed",
+                    "model": str(payload.get("model", "fake"))
+                    if isinstance(payload, dict)
+                    else "fake",
+                    "output": (
+                        [
+                            {
+                                "id": "msg_brokered_e2e",
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": _E2E_MARKER,
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ]
+                        if authorized
+                        else []
+                    ),
+                    "usage": {
+                        "input_tokens": 1,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": 1,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 2,
+                    },
+                },
+                separators=(",", ":"),
+            ).encode(),
+            b"application/json",
+        )
+
+    model = str(payload.get("model", "fake"))
+    message = {
+        "id": "msg_brokered_e2e",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": _E2E_MARKER,
+                "annotations": [],
+            }
+        ],
+    }
+    completed = {
+        "id": "resp_brokered_e2e",
+        "object": "response",
+        "created_at": 0,
+        "status": "completed",
+        "model": model,
+        "output": [message],
+        "usage": {
+            "input_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 1,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 2,
+        },
+    }
+    events = [
+        (
+            "response.created",
+            {**completed, "status": "in_progress", "output": [], "usage": None},
+        ),
+        (
+            "response.output_item.added",
+            {
+                "output_index": 0,
+                "item": {**message, "status": "in_progress", "content": []},
+            },
+        ),
+        (
+            "response.content_part.added",
+            {
+                "item_id": message["id"],
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            },
+        ),
+        (
+            "response.output_text.delta",
+            {
+                "item_id": message["id"],
+                "output_index": 0,
+                "content_index": 0,
+                "delta": _E2E_MARKER,
+            },
+        ),
+        (
+            "response.output_text.done",
+            {
+                "item_id": message["id"],
+                "output_index": 0,
+                "content_index": 0,
+                "text": _E2E_MARKER,
+            },
+        ),
+        (
+            "response.content_part.done",
+            {
+                "item_id": message["id"],
+                "output_index": 0,
+                "content_index": 0,
+                "part": message["content"][0],
+            },
+        ),
+        ("response.output_item.done", {"output_index": 0, "item": message}),
+        ("response.completed", {"response": completed}),
+    ]
+    body = b"".join(
+        b"event: "
+        + event.encode()
+        + b"\ndata: "
+        + json.dumps({"type": event, **data}, separators=(",", ":")).encode()
+        + b"\n\n"
+        for event, data in events
+    )
+    return body, b"text/event-stream"
 
 
 def _load_config(fd: int) -> tuple[str, FrozenModelRoute, str | None]:
