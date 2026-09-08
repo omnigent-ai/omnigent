@@ -15,6 +15,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { isTempConvId } from "@/lib/tempConversationId";
 import {
   isRunnerUnavailable503,
   RunnerOfflineError,
@@ -246,7 +247,9 @@ export function computeGithubPollInterval(info: GithubInfo | undefined): number 
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
  */
-export function useGithubInfo(conversationId: string | undefined, options?: { poll?: boolean }) {
+export function useGithubInfo(rawConversationId: string | undefined, options?: { poll?: boolean }) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session.
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
   // Turn-end backstop: refetch when the focused session goes active→idle, so a
   // just-opened PR appears without opening the tab. Keys off the turn lifecycle,

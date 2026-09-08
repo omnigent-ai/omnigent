@@ -462,6 +462,7 @@ function mockConversations(
     runner_id?: string | null;
     workspace?: string | null;
     created_at?: number;
+    provisional?: boolean;
   }[],
 ) {
   useConvMock.mockReturnValue({
@@ -479,6 +480,7 @@ function mockConversations(
             host_id: c.host_id ?? null,
             runner_id: c.runner_id ?? null,
             workspace: c.workspace ?? null,
+            provisional: c.provisional,
           })),
           first_id: null,
           last_id: null,
@@ -568,6 +570,23 @@ describe("AppShell header", () => {
     mockConversations([]);
     renderShell("/");
     expect(screen.getByRole("button", { name: /sidebar/i })).toBeInTheDocument();
+  });
+
+  it("does not fetch child sessions for a temp id in debug mode", () => {
+    mockConversations([]);
+    renderShell("/c/temp:12345678?debug=1");
+
+    expect(useChildSessionsMock).not.toHaveBeenCalledWith("temp:12345678");
+    expect(screen.queryByTestId("execution-logs-card")).toBeNull();
+  });
+
+  it("does not expose conversation actions for a provisional temp row", () => {
+    mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
+    renderShell("/c/temp:12345678");
+
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Share" })).toBeNull();
+    expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "false");
   });
 
   it("shows owner actions for a top-level session omitted from conversation pages", () => {
