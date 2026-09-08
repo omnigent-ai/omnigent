@@ -9416,3 +9416,42 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_wait_for_claude_prompt_ready_reports_a_pending_dialog_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dialog awaiting a keypress raises ``ClaudePromptBlocked``, not a boot timeout.
+
+    A selection dialog blocks the composer until a person answers. Calling that
+    a failed boot misdiagnoses a healthy terminal and, via the executor's reap,
+    kills the session holding the unanswered prompt.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    dialog_pane = "\n".join(
+        [
+            "  New MCP server found in this project: example",
+            "  MCP servers may execute code or access system resources.",
+            "    Use this MCP server",
+            "  ❯ Continue without using this MCP server",
+            "  Enter to confirm · Esc to cancel",
+        ]
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._capture_pane",
+        lambda socket_path, tmux_target: dialog_pane,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptBlocked) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "waiting for an answer in its terminal" in message
+    # The boot-failure wording must not be used for a healthy terminal.
+    assert "did not become ready" not in message
+    # The dialog itself is attached so the person knows what to answer.
+    assert "New MCP server found in this project" in message
