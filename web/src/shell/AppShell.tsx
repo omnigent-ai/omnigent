@@ -20,7 +20,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isIOSShell,
@@ -736,11 +736,26 @@ export function AppShell() {
   // a one-entry list, not a dead end).
   const agentCount = childSessions.length + 1;
 
-  // Hide the files panel entirely when the agent spec has no os_env. Probe
-  // the default environment resource instead of the root filesystem listing:
-  // it is enough to prove availability without paying for directory contents.
-  const environmentQuery = useWorkspaceEnvironment(conversationId);
-  const showFilesPanel = environmentQuery.data?.available !== false;
+  // Whether this viewer may browse the workspace at all. Edit-level and up
+  // always can; a view-only collaborator only when the owner opted into
+  // sharing the session's files (share_workspace_files) — otherwise a read
+  // grant shares the conversation, not the raw filesystem (which routinely
+  // holds secrets), and the server refuses those reads. Reads the KNOWN level
+  // (snapshot, else sidebar row) and stays permissive while it's unresolved,
+  // so an owner never sees a flash of hidden files; the server gate is what
+  // actually protects the bytes.
+  const canBrowseWorkspace =
+    isEditorLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null) ||
+    activeSession?.shareWorkspaceFiles === true;
+  // Hide the files panel entirely when the agent spec has no os_env, or when
+  // this viewer may not browse the workspace. Probe the default environment
+  // resource instead of the root filesystem listing: it is enough to prove
+  // availability without paying for directory contents. The probe is disabled
+  // for a non-browsing viewer so it never fires a request the server refuses.
+  const environmentQuery = useWorkspaceEnvironment(conversationId, {
+    enabled: canBrowseWorkspace,
+  });
+  const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
   // The GitHub tab needs a git checkout on disk: hide it once the session's
   // GitHub info resolves to "not a git repo" — that panel is a dead end. Other
   // unavailable reasons keep the tab: `host_outdated` renders an actionable
@@ -816,12 +831,15 @@ export function AppShell() {
   // Browser-capable shells only; no-op elsewhere (the bus never fires without a relay).
   useEffect(() => {
     if (!supportsBrowser()) return;
-    return onBrowserActionRequest((evt) => {
-      if (evt.action !== "navigate") return;
-      setRightRailTab("browser");
-      setRightPanelOpen(true);
+    return onBrowserActionRequest((evt, sourceConversationId) => {
+      if (evt.action !== "navigate" || !sourceConversationId) return;
+      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
+      if (sourceConversationId === conversationId) {
+        setRightRailTab("browser");
+        setRightPanelOpen(true);
+      }
     });
-  }, []);
+  }, [conversationId]);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
@@ -916,7 +934,11 @@ export function AppShell() {
   // can tell BlockRenderer which inline code spans are real workspace files.
   // We use the changed-files list (not the flat top-level directory listing)
   // because it contains full relative paths like `web/src/shell/Foo.tsx`.
-  const changedFilesQuery = useWorkspaceChangedFiles(conversationId);
+  // Disabled for a viewer who may not browse the workspace: the server refuses
+  // the read, so the fetch would only 403.
+  const changedFilesQuery = useWorkspaceChangedFiles(conversationId, {
+    enabled: canBrowseWorkspace,
+  });
   const changedFilePaths = useMemo(
     () => new Set(changedFilesQuery.data?.data.map((f) => f.path) ?? []),
     [changedFilesQuery.data],
@@ -1296,12 +1318,16 @@ export function AppShell() {
     };
     // Anything the peek card legitimately spawns outside its own subtree (Radix
     // menus, tooltips, dialogs) must not count as "outside", or opening a row's
-    // context menu would dismiss the card under it.
+    // context menu would dismiss the card under it. Both peek triggers count as
+    // inside too: while the card's entry animation keeps it click-through, the
+    // pointer still rests on the chat-header toggle beneath it, and a wobble
+    // there must not arm the dismiss timer.
     const insidePeekSurface = (target: EventTarget | null) => {
       if (!(target instanceof Element)) return false;
       return !!target.closest(
         [
           "aside.conversations-sidebar",
+          ".chat-header-sidebar-toggle",
           ".electron-sidebar-header-actions",
           "[data-radix-popper-content-wrapper]",
           '[role="menu"]',
@@ -2177,6 +2203,7 @@ export function AppShell() {
           {conversationId && (
             <PermissionsModal
               sessionId={conversationId}
+              workspace={activeSession?.workspace ?? activeConv?.workspace}
               open={shareOpen}
               onOpenChange={setShareOpen}
             />

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not

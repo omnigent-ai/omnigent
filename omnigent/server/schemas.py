@@ -1962,6 +1962,12 @@ class SessionResponse(BaseModel):
         a row created before this became explicit inherits nothing.
         Stamped ``"on"`` at create for Smart Routing sessions; also set
         via ``PATCH /v1/sessions/{id}``.
+    :param share_workspace_files: Whether the owner opted into letting
+        view-level collaborators browse the workspace (Files/Changes/GitHub
+        surfaces). ``False`` by default — read grants share the conversation
+        only. The web share dialog reads this to render the toggle, and the
+        rail reads it to decide whether to mount the file surfaces for a
+        view-only viewer.
     :param context_window: The model's context window size in tokens
         as looked up server-side from litellm's registry (or from the
         ``AP_CONTEXT_WINDOW_OVERRIDE`` env var), e.g. ``200_000``.
@@ -2118,6 +2124,7 @@ class SessionResponse(BaseModel):
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    share_workspace_files: bool = False
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -2224,6 +2231,13 @@ class UpdateSessionRequest(BaseModel):
         presence-is-the-clear-signal rule as
         ``cost_control_mode_override``). Effective on the next spawn, so
         it can be changed at any point in a session.
+    :param share_workspace_files: Opt-in that lets people with *view*
+        (read-only) access browse the session's workspace files. ``True``
+        turns sharing on, ``False`` turns it off (back to edit-only, the
+        default), ``None`` leaves it unchanged. Manage-gated — it sits with
+        the grant/revoke and public-access controls that decide who can see
+        the session. Never widens absolute-path browsing, which stays
+        owner-only.
     :param external_session_id: Runtime-native session id captured
         by a wrapper bridge (e.g. Claude Code's session uuid for
         ``omnigent claude`` sessions). Idempotent on same-value
@@ -2270,6 +2284,7 @@ class UpdateSessionRequest(BaseModel):
     approval_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    share_workspace_files: bool | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None

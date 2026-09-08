@@ -16,9 +16,10 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from omnigent import codex_native_app_server as codex_app
-from omnigent import codex_native_bridge, model_catalog_store
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.codex_native import app_server as codex_app
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.models import model_catalog_store
 from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native import orchestration as runner_native
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -98,7 +99,7 @@ async def codex_launch_harness(
     monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: _CODEX_PATH)
     monkeypatch.setattr(codex_app, "_find_codex_cli", lambda: _CODEX_PATH)
     monkeypatch.setattr(
-        "omnigent.codex_native_process_registry.reap_codex_native_processes_for_state_dir",
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
         lambda _path: None,
     )
 
@@ -548,7 +549,9 @@ async def test_resumed_fallback_resets_pick_only_if_preload_and_terminal_succeed
     harness.snapshot["external_session_id"] = "019e96aa-0be2-7343-8d3b-6f914d60936c"
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
     preload = AsyncMock(side_effect=RuntimeError("preload unavailable") if preload_fails else None)
-    monkeypatch.setattr("omnigent.codex_native._ensure_local_codex_resume_rollout", AsyncMock())
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", AsyncMock()
+    )
     monkeypatch.setattr(codex_app, "preload_codex_thread_for_resume", preload)
     monkeypatch.setattr(runner_native, "_codex_forward_known_thread", AsyncMock())
 

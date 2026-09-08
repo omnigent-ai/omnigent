@@ -20,7 +20,7 @@ _logger = logging.getLogger("omnigent.runner.background_titles.codex_native")
 
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with an isolated native Codex exec process."""
-    from omnigent.codex_native_app_server import (
+    from omnigent.harnesses.codex_native.app_server import (
         build_codex_native_server,
         resolve_native_codex_launch,
     )

@@ -743,7 +743,7 @@ function FileRowItem({
   const { handlers, tooltip } = useCursorTooltip(path);
 
   return (
-    <li>
+    <li className="list-none">
       <div
         className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
         style={{ paddingLeft: `${indentFor(depth)}px` }}

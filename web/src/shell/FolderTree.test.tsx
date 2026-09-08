@@ -219,6 +219,14 @@ describe("FolderTree file size / download alignment", () => {
 });
 
 describe("FolderTree trailing column", () => {
+  it("suppresses browser list markers on virtualized file rows", () => {
+    // Virtualized tree rows are no longer direct children of a <ul>, so the
+    // file row's <li> must neutralize the browser's default bullet marker.
+    renderTree({ files: [file("README.md")] });
+
+    expect(screen.getByText("README.md").closest("li")).toHaveClass("list-none");
+  });
+
   it("gives folders and files alike the same fixed-width trailing slot", () => {
     // The size label is variable width ("985 B" vs "463 KB"). Letting it size
     // the column dragged the copy button, the download button and the status

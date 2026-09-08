@@ -636,9 +636,13 @@ class QueuedResponse:
     status_code: int = 500
     delay: float = 0.0
     truncate_after: int | None = None
-    # Prompt-usage overrides for the Anthropic ``message_start`` event
-    # (``/v1/messages`` only), e.g. {"input_tokens": 50000} — lets a test
-    # script the context size a claude harness observes mid-turn.
+    # Usage overrides. On ``/v1/messages`` merged into the Anthropic
+    # ``message_start`` event (e.g. {"input_tokens": 50000}) so a test can
+    # script the context size a claude harness observes mid-turn. On
+    # ``/v1/chat/completions`` returned verbatim as the OpenAI ``usage``
+    # object (JSON body and, when the client requests
+    # ``stream_options.include_usage``, the final stream chunk) so a test can
+    # script the token accounting an openai-wire harness (e.g. kimi) records.
     usage: dict | None = None
     # When set, ``/v1/messages`` returns a safeguard-refusal SSE stream with
     # this category (e.g. ``"cyber"``) instead of text — used to exercise
@@ -1056,6 +1060,11 @@ async def create_chat_completion(
     if cc_tool_calls:
         cc_message["tool_calls"] = cc_tool_calls
     resp_id = _response_id()
+    cc_usage: dict[str, object] = qr.usage or {
+        "prompt_tokens": 10,
+        "completion_tokens": max(5, len(text.split())),
+        "total_tokens": 15,
+    }
     body_json = {
         "id": f"chatcmpl-{resp_id}",
         "object": "chat.completion",
@@ -1067,11 +1076,7 @@ async def create_chat_completion(
                 "finish_reason": finish_reason,
             }
         ],
-        "usage": {
-            "prompt_tokens": 10,
-            "completion_tokens": max(5, len(text.split())),
-            "total_tokens": 15,
-        },
+        "usage": cc_usage,
     }
     if parsed.get("stream"):
         delta: dict[str, object] = {"role": "assistant", "content": text or None}
@@ -1090,7 +1095,24 @@ async def create_chat_completion(
             ],
         }
 
-        stream_body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+        events: list[dict[str, object]] = [chunk]
+        # OpenAI stream-usage semantics: when the client requests
+        # ``stream_options.include_usage``, a final chunk with empty
+        # ``choices`` carries the ``usage`` object right before ``[DONE]``.
+        # Harnesses on this wire (e.g. kimi-code) read their per-turn token
+        # accounting from exactly this chunk.
+        stream_options = parsed.get("stream_options") if isinstance(parsed, dict) else None
+        if isinstance(stream_options, dict) and stream_options.get("include_usage"):
+            events.append(
+                {
+                    "id": f"chatcmpl-{resp_id}",
+                    "object": "chat.completion.chunk",
+                    "model": model or "mock-model",
+                    "choices": [],
+                    "usage": cc_usage,
+                }
+            )
+        stream_body = "".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n"
         # Mid-stream fault: drop the trailing ``[DONE]`` (and, at 0, the chunk
         # too) so the client sees the stream end without a terminator.
         if qr.truncate_after is not None:

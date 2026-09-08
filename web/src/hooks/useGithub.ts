@@ -43,6 +43,19 @@ export interface GithubChecks {
   runs: GithubCheckRun[];
 }
 
+/** One top-level PR conversation comment (from `gh pr view --json comments`).
+ *  Minimized/collapsed comments are dropped by the runner, matching GitHub. */
+export interface GithubComment {
+  /** Commenter's GitHub login, or null when unknown. */
+  author: string | null;
+  /** Comment body (GitHub-flavored markdown). */
+  body: string;
+  /** ISO-8601 creation time, or null. */
+  created_at: string | null;
+  /** Link to the comment on GitHub, or null. */
+  url: string | null;
+}
+
 export interface GithubPr {
   number: number;
   title: string;
@@ -54,6 +67,11 @@ export interface GithubPr {
   base_ref: string | null;
   head_ref: string | null;
   checks: GithubChecks;
+  /** PR description (GitHub-flavored markdown); null when empty. Optional: a
+   *  host predating the Summary tab omits it, so treat undefined as none. */
+  body?: string | null;
+  /** Top-level PR comments GitHub shows by default; absent from an older host. */
+  comments?: GithubComment[];
 }
 
 export interface GithubRepo {

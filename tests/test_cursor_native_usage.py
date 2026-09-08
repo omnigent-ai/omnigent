@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import cursor_native_usage as usage
+from omnigent.harnesses.cursor_native import usage
 
 # A representative cursor ``stop``-hook payload (live-captured field set).
 _TURN1 = {
@@ -127,7 +127,7 @@ class TestRecordUsageCli:
             [
                 sys.executable,
                 "-m",
-                "omnigent.cursor_native_usage",
+                "omnigent.harnesses.cursor_native.usage",
                 "record-usage",
                 "--bridge-dir",
                 str(tmp_path),

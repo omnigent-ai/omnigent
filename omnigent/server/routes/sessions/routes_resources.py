@@ -30,7 +30,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.runner.routing import RunnerRouter
@@ -595,6 +595,70 @@ def register_resources_routes(
         :returns: The required permission level.
         """
         return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
+
+    async def _authorize_browse_read(
+        session_id: str,
+        request: Request | None,
+        client_path: str = "",
+    ) -> Conversation:
+        """Authorize a workspace *content* read and return the conversation.
+
+        The read surfaces (file read/list, directory listing, changed files,
+        diffs, search, and the GitHub diff views) all serve the workspace's
+        own bytes or paths. An ABSOLUTE ``client_path`` is the owner's own
+        machine — owner-only, exactly as :func:`_browse_level` decides for a
+        mutation. A workspace-relative read needs ``LEVEL_EDIT`` *unless* the
+        session owner opted into ``share_workspace_files``, which lowers the
+        bar to ``LEVEL_READ``.
+
+        Fail-closed by default: a plain read grant shares the *conversation*,
+        not the raw filesystem — workspace files routinely hold secrets
+        (``.env`` / key files), so a read-only viewer sees nothing there until
+        the owner turns sharing on. The opt-in never widens absolute-path
+        browsing; that stays owner-only.
+
+        One :func:`require_access_and_level` round-trip resolves both the
+        caller's level and (via the conversation it returns) the session flag,
+        so the hot file-panel path pays no extra query in the common case.
+
+        :param session_id: Session/conversation identifier.
+        :param request: Incoming request; ``None`` for internal (no-auth)
+            calls, which are admitted at read level like ``_validate_session``.
+        :param client_path: Client-supplied path (``""`` for the whole-
+            workspace surfaces such as ``/changes``). A leading ``/`` — on any
+            platform — marks it absolute and forces the owner gate.
+        :returns: The authorized conversation.
+        :raises OmnigentError: 401/403/404 on auth failure.
+        """
+        if ntpath.isabs(client_path):
+            return await _validate_session(session_id, request, LEVEL_OWNER)
+        if request is None:
+            return await _validate_session(session_id, request, LEVEL_READ)
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        )
+        conv = access.conversation
+        if conv is None:
+            # Admin caller or permissions disabled: no conversation was fetched
+            # during authorization, so read it here (matching _validate_session).
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        # ``level is None`` means permissions are disabled (single-user); admins
+        # resolve to owner. Edit collaborators keep the workspace unconditionally;
+        # a view-only grant reaches it only once the owner shares its files.
+        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+            return conv
+        raise OmnigentError(
+            f"{user_id!r} needs edit access to browse the workspace of session "
+            f"{session_id!r}, or the owner must enable file sharing",
+            code=ErrorCode.FORBIDDEN,
+        )
 
     def _resolve_browse_path(request: Request, client_path: str) -> tuple[bool, str]:
         """Resolve a filesystem request path against its declared base.
@@ -1924,7 +1988,7 @@ def register_resources_routes(
             params["before"] = before
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return _skip_gzip_for_binary(
             request,
             await _fs_get_with_host_fallback(
@@ -2049,9 +2113,7 @@ def register_resources_routes(
             params["exclude"] = exclude
 
         absolute, path = _resolve_browse_path(request, path)
-        conv = await _validate_session(
-            session_id, request, _browse_level(path, within_workspace=LEVEL_READ)
-        )
+        conv = await _authorize_browse_read(session_id, request, path)
 
         qs = urllib.parse.urlencode(params)
         suffix = ""
@@ -2099,7 +2161,7 @@ def register_resources_routes(
         :returns: Flat list of changed filesystem entries with ``status``.
         """
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2137,7 +2199,7 @@ def register_resources_routes(
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/diff/{relative_path}"
         )
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request, relative_path)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2167,7 +2229,7 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: JSON with the ``patch`` text.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2201,7 +2263,7 @@ def register_resources_routes(
         :param base: Base branch name; the default is derived when omitted.
         :returns: JSON with ``before`` and ``after`` content strings.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request, relative_path)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2271,9 +2333,7 @@ def register_resources_routes(
         # `_mutating_level` for why anything weaker would make this route a
         # way around the owner-scoped host filesystem endpoint.
         absolute, relative_path = _resolve_browse_path(request, relative_path)
-        conv = await _validate_session(
-            session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
-        )
+        conv = await _authorize_browse_read(session_id, request, relative_path)
 
         qs = urllib.parse.urlencode(params)
         runner_rel = _runner_path_segment(relative_path, absolute=absolute)
@@ -2498,7 +2558,7 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: Flat list of changed files with ``status`` and line counts.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,

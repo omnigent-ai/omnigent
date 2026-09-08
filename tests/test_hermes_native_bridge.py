@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import hermes_native_bridge as b
+from omnigent.harnesses.hermes_native import bridge as b
 
 
 def test_bridge_dir_is_per_session_and_under_root() -> None:
@@ -484,7 +484,7 @@ def test_mint_hermes_session_id_returns_uuid() -> None:
 
 def test_inject_relay_into_policy_hook_rewrites_wrapper(tmp_path: Path) -> None:
     """inject_relay_into_policy_hook rewrites omnigent-policy-hook.sh with relay env vars."""
-    from omnigent.hermes_native_bridge import inject_relay_into_policy_hook
+    from omnigent.harnesses.hermes_native.bridge import inject_relay_into_policy_hook
 
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir(mode=0o700)
@@ -494,7 +494,7 @@ def test_inject_relay_into_policy_hook_rewrites_wrapper(tmp_path: Path) -> None:
 
     bridge_dir = tmp_path
     # put hermes_home under bridge_dir/_HERMES_HOME_SUBDIR
-    import omnigent.hermes_native_bridge as _b
+    import omnigent.harnesses.hermes_native.bridge as _b
 
     (bridge_dir / _b._HERMES_HOME_SUBDIR).mkdir(parents=True, exist_ok=True)
     real_wrapper = bridge_dir / _b._HERMES_HOME_SUBDIR / "omnigent-policy-hook.sh"
@@ -523,6 +523,6 @@ def test_inject_relay_into_policy_hook_returns_false_when_wrapper_absent(
     tmp_path: Path,
 ) -> None:
     """inject_relay_into_policy_hook returns False when wrapper script is missing."""
-    from omnigent.hermes_native_bridge import inject_relay_into_policy_hook
+    from omnigent.harnesses.hermes_native.bridge import inject_relay_into_policy_hook
 
     assert inject_relay_into_policy_hook(tmp_path, "http://x", "tok", "http://ap", "sid") is False

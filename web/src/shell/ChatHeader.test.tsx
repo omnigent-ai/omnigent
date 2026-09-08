@@ -210,6 +210,41 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
       vi.useRealTimers();
     }
   });
+
+  it("suppresses the hover tooltip once the dwell fires the peek", () => {
+    // The peek card fades in click-through, so the pointer keeps resting on the
+    // toggle past the tooltip's own delay. The peek is the intended hover
+    // reveal, so its "Open sidebar" tooltip must not also pop over the card.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.pointerEnter(toggle);
+      // Past the 400ms peek dwell and the tooltip's 600ms hover delay.
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.queryByRole("tooltip", { name: "Open sidebar" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still shows the tooltip on keyboard focus (no peek armed)", () => {
+    // Focus never arms a peek, so the tooltip stays available for a11y.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.focus(toggle);
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.getByRole("tooltip", { name: "Open sidebar" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("ChatHeader — conversation breadcrumb", () => {

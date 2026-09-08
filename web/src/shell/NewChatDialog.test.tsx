@@ -186,8 +186,29 @@ const CLAUDE_MODEL_OPTIONS_RESULT = {
 };
 const CODEX_MODEL_OPTIONS_RESULT = {
   data: [
-    { id: "databricks-gpt-5-5", displayName: "GPT-5.5", isDefault: true },
-    { id: "databricks-gpt-5-6", displayName: "GPT-5.6" },
+    {
+      id: "databricks-gpt-5-5",
+      displayName: "GPT-5.5",
+      isDefault: true,
+      // Codex's catalog advertises a per-model effort ladder; the config
+      // modal's Effort row is built from exactly this metadata.
+      supportedReasoningEfforts: [
+        { reasoningEffort: "low" },
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+      ],
+    },
+    {
+      id: "databricks-gpt-5-6",
+      displayName: "GPT-5.6",
+      // A deliberately different ladder so tests can observe the row follow
+      // the drafted model (xhigh only here; low only on 5.5).
+      supportedReasoningEfforts: [
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "xhigh" },
+      ],
+    },
   ],
   isLoading: false,
   isError: false,
@@ -1782,6 +1803,83 @@ describe("NewChatLandingScreen", () => {
     openSelect("new-chat-landing-config-approval");
     expect(screen.getByText("Full access")).toBeTruthy();
     expect(screen.getByText("Read only")).toBeTruthy();
+  });
+
+  it("offers the Codex effort ladder in the gear modal and sends the pick as reasoning_effort", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentConfig("a2");
+    // With no model pinned, the row lists the catalog default's (GPT-5.5)
+    // ladder — raw Codex ids, never another model's rungs.
+    openSelect("new-chat-landing-config-effort");
+    expect(screen.getByRole("option", { name: "low" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "medium" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "xhigh" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "high" }));
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
+    saveConfig();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    // The pick rides the create exactly like Claude's landing row — the field
+    // the codex-native launch path reads at terminal launch.
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("drops a drafted Codex effort the newly-picked model doesn't offer", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentConfig("a2");
+    // Pin GPT-5.6: the Effort row follows the DRAFTED model, so its ladder
+    // swaps in (xhigh appears, low disappears).
+    pickSelectOption("new-chat-landing-config-model", "GPT-5.6");
+    openSelect("new-chat-landing-config-effort");
+    expect(screen.queryByRole("option", { name: "low" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "xhigh" }));
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("xhigh");
+    // Back to Default (GPT-5.5), whose ladder has no xhigh: the stale rung
+    // resets so Save can't commit a level the model rejects.
+    openSelect("new-chat-landing-config-model");
+    fireEvent.click(screen.getByRole("option", { name: "Default (GPT-5.5)" }));
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("Default");
+    saveConfig();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("remembers the Codex effort per harness without leaking it onto Claude", () => {
+    renderLanding();
+    openAgentConfig("a2");
+    pickSelectOption("new-chat-landing-config-effort", "high");
+    saveConfig();
+
+    // Claude's row reopens on its own remembered effort (nothing stored →
+    // Default) — the Codex pick must not ride the shared state across.
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("Default");
+    saveConfig();
+
+    // Codex reopens on the remembered pick, still valid for its ladder.
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
   });
 
   it("sends the selected Codex launch model without changing Claude's remembered model", async () => {

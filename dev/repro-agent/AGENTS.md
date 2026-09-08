@@ -376,6 +376,13 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
 Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 
+A clip must show a **live action producing the outcome** — a command executing
+and printing, a screen changing — never static text on screen asserting the bug.
+When a facet's whole user-visible outcome is a static piece of text (an error
+line, a value) with nothing to watch, do **not** manufacture a video of it: keep
+`recordings: []` and state the observed text in your evidence, per
+`dev/recording-lanes.md`.
+
 ## Output — the reproduction artifacts
 
 The **last thing in your final message** must be exactly one fenced ```json code
@@ -485,9 +492,12 @@ Field meanings:
   authored-but-unrendered VHS tape in the artifact, but do not declare it as a
   recording. Empty list when nothing valid was recorded.
 - `recording_unavailable_reason` — empty when every expected clip is present;
-  otherwise the concrete per-surface tooling or reachability blocker. For an
-  API-only bug, say that the evidence is textual. Never substitute a synthetic
-  fallback or test-runner video.
+  otherwise the concrete per-surface tooling or reachability blocker. For a bug
+  whose outcome is purely textual — an `api` facet, or a facet whose user-visible
+  result is just a static error line or value with nothing to watch — say the
+  evidence is textual and put the observed text in `evidence`; `recordings: []` is
+  correct and not a blocker. Never substitute a synthetic fallback or test-runner
+  video.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +

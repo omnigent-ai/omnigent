@@ -30,7 +30,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from omnigent.server_url import is_workspace_hosted_url
+from omnigent.util.server_url import is_workspace_hosted_url
 
 if TYPE_CHECKING:
     import httpx

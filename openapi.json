@@ -1056,9 +1056,13 @@
                 "type": "integer"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
+            "description": "Opaque vendor compaction-window identifier. Current Codex writes a UUID string to `payload.window_id` on its `type == \"compacted\"` rollout JSONL record; older Codex rollouts used integer counters there.",
             "title": "Window Id"
           }
         },
@@ -6595,6 +6599,12 @@
             ],
             "description": "Managed-sandbox launch progress while the session's background sandbox launch is in flight or has failed \u2014 see `SandboxStatus`. `None` for sessions without a managed launch and once the launch succeeds. Sourced from the Omnigent server's in-memory `_session_sandbox_status_cache` at snapshot build time, so a client opening the session mid-launch sees the current stage."
           },
+          "share_workspace_files": {
+            "default": false,
+            "description": "Whether the owner opted into letting view-level collaborators browse the workspace (Files/Changes/GitHub surfaces). `False` by default \u2014 read grants share the conversation only. The web share dialog reads this to render the toggle, and the rail reads it to decide whether to mount the file surfaces for a view-only viewer.",
+            "title": "Share Workspace Files",
+            "type": "boolean"
+          },
           "skills": {
             "description": "Skills the bound agent has access to \u2014 the merged result of the agent spec's bundled `skills` and the host-scope skills discovered along the agent workdir / `~/.claude/skills/` (subject to the spec's `skills_filter`). Mirrors what the TUI passes to the runner at startup. Empty list when the agent spec cannot be loaded, or when bundled + host discovery yields nothing.",
             "items": {
@@ -8176,6 +8186,18 @@
             ],
             "description": "Identifier of a registered runner, e.g. `\"runner_abc123\"`. `None` leaves runner binding unchanged.",
             "title": "Runner Id"
+          },
+          "share_workspace_files": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opt-in that lets people with *view* (read-only) access browse the session's workspace files. `True` turns sharing on, `False` turns it off (back to edit-only, the default), `None` leaves it unchanged. Manage-gated \u2014 it sits with the grant/revoke and public-access controls that decide who can see the session. Never widens absolute-path browsing, which stays owner-only.",
+            "title": "Share Workspace Files"
           },
           "silent": {
             "default": false,
@@ -12456,7 +12478,7 @@
     },
     "/v1/sessions/{session_id}/policies/evaluate": {
       "post": {
-        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.claude_native_hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
+        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.harnesses.claude_native.hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
         "operationId": "evaluate_policy_v1_sessions__session_id__policies_evaluate_post",
         "parameters": [
           {

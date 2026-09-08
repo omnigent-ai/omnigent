@@ -5,8 +5,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import model_catalog
-from omnigent import pi_native_credentials as pnc
+from omnigent.harnesses.pi_native import credentials as pnc
+from omnigent.models import model_catalog
 
 
 def _transport(status: int, text: str) -> httpx.MockTransport:

@@ -32,11 +32,10 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
 )
-from omnigent.env_credentials import expand_envvars_with_omnigent_prefix
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms import Client as LLMClient
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.onboarding.databricks_config import (
     get_workspace_url_for_profile,
 )
@@ -87,6 +86,7 @@ from omnigent.spec.types import (
     RetryPolicy,
 )
 from omnigent.stores import ConversationStore
+from omnigent.util.env_credentials import expand_envvars_with_omnigent_prefix
 
 # ── Module-level constants ────────────────────────────────────
 
@@ -564,7 +564,7 @@ def configure_agent_harness_with_provider(
         )
     if entry.kind == BEDROCK_KIND:
         # Bedrock mode is wired only into the native ``omnigent claude`` launch
-        # (:func:`omnigent.claude_native._bedrock_config_for_native_claude`),
+        # (:func:`omnigent.harnesses.claude_native.main._bedrock_config_for_native_claude`),
         # which sets CLAUDE_CODE_USE_BEDROCK + AWS_BEARER_TOKEN_BEDROCK directly.
         # The in-process / gateway harnesses have no Bedrock path, so emitting
         # the generic ``HARNESS_*_GATEWAY_*`` vars would silently point the
@@ -913,7 +913,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     (:func:`default_provider_for_harness`), so when that default is a
     ``cli-config`` Databricks AI Gateway, this path must route it rather than
     fail loud. We reuse the pi-native translation
-    (:func:`omnigent.pi_native_credentials._cli_config_pi_provider`) — which
+    (:func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`) — which
     reads the codex ``[model_providers.X]`` transport, rewrites the base URL to
     the gateway's Anthropic Messages surface (``/anthropic``) Pi speaks
     natively, and builds the per-request bearer-token ``!command`` apiKey — then
@@ -931,7 +931,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     """
     # Imported lazily: pi_native_credentials is on the runner's session-create
     # hot path and pulls onboarding-only deps; keep this off workflow import.
-    from omnigent.pi_native_credentials import _cli_config_pi_provider
+    from omnigent.harnesses.pi_native.credentials import _cli_config_pi_provider
 
     # The spec model (if any) is already in HARNESS_PI_MODEL; thread it so the
     # gateway translation honors an explicit override, else its default.

@@ -57,8 +57,11 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
-# non-interactive subprocess.
-_PR_VIEW_FIELDS = "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup"
+# non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
+# both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
+_PR_VIEW_FIELDS = (
+    "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
+)
 
 
 def _gh_timeout_seconds() -> float:
@@ -197,6 +200,41 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     }
 
 
+# Cap the comments list so a very chatty PR can't bloat the payload; ``gh``
+# returns them oldest-first, so the cap keeps the earliest ``_MAX_COMMENTS``.
+_MAX_COMMENTS = 100
+
+
+def _shape_comments(raw: Any) -> list[dict[str, Any]]:
+    """Shape ``gh``'s PR ``comments`` into the Summary tab's comment list.
+
+    Keeps the top-level conversation comments GitHub shows by default: a
+    minimized/collapsed comment is dropped (mirroring the PR page). Each entry
+    is ``{author, body, created_at, url}``; the list is capped at
+    ``_MAX_COMMENTS``.
+    """
+    shaped: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return shaped
+    for comment in raw:
+        if not isinstance(comment, dict):
+            continue
+        if comment.get("isMinimized"):
+            continue
+        author = comment.get("author")
+        shaped.append(
+            {
+                "author": author.get("login") if isinstance(author, dict) else None,
+                "body": str(comment.get("body") or ""),
+                "created_at": comment.get("createdAt") or None,
+                "url": comment.get("url") or None,
+            }
+        )
+        if len(shaped) >= _MAX_COMMENTS:
+            break
+    return shaped
+
+
 def _current_branch(root: str) -> str | None:
     """Return the workspace's current branch name, or ``None`` (detached / not a repo)."""
     rc, out, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
@@ -329,6 +367,7 @@ def github_info(root: str) -> dict[str, Any]:
     data = _pr_view_json(root, _PR_VIEW_FIELDS)
     if data is not None:
         author = data.get("author")
+        body = data.get("body")
         pr = {
             "number": data.get("number"),
             "title": data.get("title"),
@@ -339,6 +378,10 @@ def github_info(root: str) -> dict[str, Any]:
             "base_ref": data.get("baseRefName"),
             "head_ref": data.get("headRefName"),
             "checks": _summarize_checks(data.get("statusCheckRollup")),
+            # PR description + conversation comments feed the Summary tab; an
+            # empty body is null so the UI shows its "no description" state.
+            "body": body if isinstance(body, str) and body.strip() else None,
+            "comments": _shape_comments(data.get("comments")),
         }
     payload["pr"] = pr
 

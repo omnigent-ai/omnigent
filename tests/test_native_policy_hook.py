@@ -5,8 +5,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import native_policy_hook
-from omnigent.native_policy_hook import (
+from omnigent.native import native_policy_hook
+from omnigent.native.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_ask_hook_output,

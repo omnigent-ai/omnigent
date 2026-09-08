@@ -61,6 +61,16 @@ _INFO = {
                 {"name": "e2e", "bucket": "failing", "url": None},
             ],
         },
+        # The Summary tab renders the description (markdown) and comments.
+        "body": "## Summary\n\nAdds the GitHub tab to the workspace rail.",
+        "comments": [
+            {
+                "author": "octocat",
+                "body": "Nice work!",
+                "created_at": "2026-09-05T07:32:02Z",
+                "url": "https://example.com/pr/4242#c1",
+            }
+        ],
     },
 }
 
@@ -129,11 +139,11 @@ def _stub_github(page: Page) -> None:
     )
 
 
-def test_github_tab_shows_pr_checks_and_file_tree(
+def test_github_tab_shows_summary_checks_and_file_tree(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The GitHub tab renders the PR, its CI pills, and the compacted file tree."""
+    """The GitHub tab lands on Summary; Changes shows the compacted file tree."""
     base_url, session_id = seeded_session
     _stub_github(page)
     page.goto(f"{base_url}/c/{session_id}")
@@ -142,7 +152,7 @@ def test_github_tab_shows_pr_checks_and_file_tree(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="GitHub").click()
 
-    # PR header: title + number.
+    # PR header (shared across both inner tabs): title + number.
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
 
@@ -151,9 +161,15 @@ def test_github_tab_shows_pr_checks_and_file_tree(
     expect(rail.get_by_text(re.compile(r"3\s*passed"))).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*failed"))).to_be_visible()
 
-    # Sidebar file tree: the src → app single-child chain compacts into one
-    # "src/app" folder row (exact match — the diff section header carries the
-    # full path and would match a substring).
+    # Summary is the default tab: the PR description + a comment render there.
+    expect(rail.get_by_text(re.compile(r"Adds the GitHub tab"))).to_be_visible()
+    expect(rail.get_by_text("Nice work!")).to_be_visible()
+
+    # Switching to Changes reveals the sidebar file tree. Scope to the inner
+    # "Pull request" tablist — the rail's own tab bar also has a "Changes" tab.
+    # The src → app single-child chain compacts into one "src/app" folder row
+    # (exact — the diff section header carries the full path and would substring).
+    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
     expect(rail.get_by_role("button", name="src/app", exact=True)).to_be_visible()
     expect(rail.get_by_role("button", name=re.compile(r"main\.py")).first).to_be_visible()
 

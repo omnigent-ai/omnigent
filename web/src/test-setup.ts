@@ -80,22 +80,42 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 
 // @tanstack/react-virtual windows rows off the scroll element's measured
 // height, but jsdom does no layout — every element is 0×0, so the real
-// virtualizer renders nothing and component tests can't see any tree rows.
-// Replace it with a pass-through that renders every item; the windowing itself
-// is browser behaviour verified manually, and the tree's logic (flatten,
-// expand/collapse, lazy load) is what the unit tests actually assert.
+// virtualizer renders nothing and component tests can't see any rows. Replace
+// it with a pass-through that renders every item; the windowing itself is
+// browser behaviour verified manually, and the components' logic (flatten /
+// expand / lazy-load for FolderTree; bubble building / history load /
+// indicators for the transcript) is what the unit tests assert. Shared by both
+// consumers, so the shape is the superset they read — honouring `getItemKey`
+// and exposing the offset/range/scroll handles the transcript's
+// VirtualBubbleList touches, so its real path doesn't throw under jsdom.
+const ROW = 200;
 vi.mock("@tanstack/react-virtual", () => ({
-  useVirtualizer: ({ count }: { count: number }) => {
+  useVirtualizer: ({
+    count,
+    getItemKey,
+  }: {
+    count: number;
+    getItemKey?: (i: number) => unknown;
+  }) => {
     const items = Array.from({ length: count }, (_, index) => ({
       index,
-      key: index,
-      start: index * 28,
-      size: 28,
+      key: getItemKey ? getItemKey(index) : index,
+      start: index * ROW,
+      size: ROW,
+      end: (index + 1) * ROW,
+      lane: 0,
     }));
     return {
       getVirtualItems: () => items,
-      getTotalSize: () => count * 28,
+      getTotalSize: () => count * ROW,
       measureElement: () => {},
+      scrollToIndex: () => {},
+      getVirtualItemForOffset: (offset: number) =>
+        items[Math.max(0, Math.min(Math.floor(offset / ROW), count - 1))],
+      getOffsetForIndex: (index: number) => [index * ROW, "start"] as const,
+      takeSnapshot: () => items,
+      scrollOffset: 0,
+      range: count > 0 ? { startIndex: 0, endIndex: count - 1 } : null,
     };
   },
 }));

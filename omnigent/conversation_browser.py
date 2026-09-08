@@ -10,9 +10,9 @@ import webbrowser
 from collections.abc import Callable
 
 # The server-URL shape (API mount, UI mount, display mapping) lives in
-# ``omnigent.server_url`` — the one representation of a server URL. The
+# ``omnigent.util.server_url`` — the one representation of a server URL. The
 # helpers below only borrow it to build browser links.
-from omnigent.server_url import WORKSPACE_UI_PATH, ServerUrl
+from omnigent.util.server_url import WORKSPACE_UI_PATH, ServerUrl
 
 # Client-side SPA route for one conversation (see web/src/App.tsx's
 # ``c/:conversationId``). ``conversation_url`` appends it; ``strip_conversation_path``

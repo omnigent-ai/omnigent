@@ -648,7 +648,7 @@ known-first-party = ["omnigent"]
 # top-level catch is a deliberate, documented boundary catch — BLE001 is
 # waived for these top-level antigravity_native modules (see the inline
 # comments at each catch site).
-"omnigent/antigravity_native*.py" = ["BLE001"]
+"omnigent/harnesses/antigravity_native/*.py" = ["BLE001"]
 # Telemetry modules intentionally catch all exceptions at every boundary —
 # telemetry must never disrupt the application under any circumstances.
 "omnigent/telemetry/*.py" = ["BLE001", "SIM105"]
