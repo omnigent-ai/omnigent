@@ -136,8 +136,65 @@ def test_claude_provider_sources_user_skills_from_config_dir(
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
-    out = resolve_harness_skills(_ctx(workspace, home, claude_config_dir=cfg), "claude-sdk")
+    out = resolve_harness_skills(_ctx(workspace, home, claude_config_dir=cfg), "claude-native")
     assert [s.name for s in out] == ["config-dir-skill"]
+
+
+def test_claude_sdk_keeps_generic_walk_native_matches_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The terminal-matching resolution is native-only; SDK keeps the generic walk.
+
+    A ``claude-native`` session types ``/name`` into the CLI as plaintext, so
+    its menu must mirror the tiers the CLI loads: ``.claude/skills`` plus the
+    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``. The in-process
+    ``claude-sdk`` harness has no such terminal, so it stays on the generic host
+    walk it used before this scoping — which lists ``.agents/skills`` and ignores
+    ``$CLAUDE_CONFIG_DIR``. The same seeded tree must diverge by harness.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    (home / ".claude" / "skills").mkdir(parents=True)  # empty default user tier
+    workspace = tmp_path / "ws"
+    _write_skill(workspace / ".claude" / "skills", "claude-dir-skill")
+    _write_skill(workspace / ".agents" / "skills", "agents-only-skill")
+    cfg = tmp_path / "claude-config"
+    _write_skill(cfg / "skills", "user-cfg-skill")
+    ctx = _ctx(workspace, home, claude_config_dir=cfg)
+
+    sdk = {s.name for s in resolve_harness_skills(ctx, "claude-sdk")}
+    native = {s.name for s in resolve_harness_skills(ctx, "claude-native")}
+
+    # SDK (unchanged): generic walk lists the .agents entry, ignores config-dir.
+    assert "agents-only-skill" in sdk
+    assert "claude-dir-skill" in sdk
+    assert "user-cfg-skill" not in sdk
+    # Native: mirrors the CLI — .agents excluded, config-dir user tier sourced.
+    assert native == {"claude-dir-skill", "user-cfg-skill"}
+
+
+def test_codex_native_and_sdk_resolve_identically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex has no native/SDK menu divergence to scope.
+
+    The Codex provider sources skills from the same roots the executor
+    populates a session's ``$CODEX_HOME/skills`` from — ``<bundle>/skills`` and
+    ``~/.codex/skills`` — and never scans ``.agents``. That holds for both the
+    ``codex`` (SDK) and ``codex-native`` harnesses, so the native flag leaves
+    codex untouched (the fix is confined to the claude family that had it).
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".codex" / "skills", "codex-host-skill")
+    _write_skill(home / ".agents" / "skills", "agents-only-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    ctx = _ctx(workspace, home)
+
+    native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
+    sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
+    assert native == sdk == {"codex-host-skill"}
 
 
 def test_claude_provider_defaults_user_tier_to_home_claude(

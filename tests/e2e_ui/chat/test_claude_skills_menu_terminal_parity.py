@@ -1,13 +1,19 @@
-"""Recording driver: the claude-family composer menu matches the terminal.
+"""Recording driver: the claude-native composer menu matches the terminal.
 
 Drives the fixed journey in a real browser for the after-fix clip: a
-claude-family session whose workspace carries skills under both
+``claude-native`` session whose workspace carries skills under both
 ``.claude/skills`` and ``.agents/skills``, with a user skill in
 ``$CLAUDE_CONFIG_DIR/skills`` (the env var must be exported to the spawned
 runner before pytest starts, with the skill seeded inside it). Opening the
 composer's ``/`` menu must list the ``.claude`` tier and the config-dir
 user tier — the skills the Claude terminal itself loads — and must NOT
 list the ``.agents/skills`` entry the terminal cannot invoke.
+
+The harness is ``claude-native`` deliberately: the terminal-matching menu
+resolution is native-only, so a native spec is what exercises it. The
+``/skills`` endpoint resolves from the spec's harness independent of whether
+the CLI terminal actually launches, so the composer menu is populated even
+under the suite's mock LLM.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ prompt: You are a friendly assistant.
 
 executor:
   model: claude-sonnet-4-5
-  harness: claude-sdk
+  harness: claude-native
 
 os_env:
   type: caller_process

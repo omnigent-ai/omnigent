@@ -82,6 +82,10 @@ class SkillSourceContext:
     :param claude_config_dir: Claude Code's user config dir when configured
         (``$CLAUDE_CONFIG_DIR``), else ``None`` for the ``home/.claude``
         default; injected so tests can pin it.
+    :param is_native: Whether the session's harness is a native CLI harness.
+        Set by :func:`resolve_harness_skills` from the harness id. Gates the
+        terminal-matching resolution (config-dir tier, ``.agents`` exclusion)
+        so it applies only to native harnesses, never the in-process SDK ones.
     """
 
     roots: tuple[Path, ...]
@@ -89,6 +93,7 @@ class SkillSourceContext:
     skills_filter: str | list[str]
     bundle_dir: Path | None
     claude_config_dir: Path | None = None
+    is_native: bool = False
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -118,11 +123,16 @@ def _claude_user_dir(ctx: SkillSourceContext) -> Path:
     """
     Claude Code's user-scope config dir (its skills/plugins/settings root).
 
-    Mirrors Claude's own resolution (``CLAUDE_CONFIG_DIR`` when set,
-    otherwise ``~/.claude``) the way :mod:`omnigent.session_import.local`
-    and ``claude_native_status_file`` already do.
+    For a native session this mirrors Claude's own resolution
+    (``CLAUDE_CONFIG_DIR`` when set, otherwise ``~/.claude``) the way
+    :mod:`omnigent.session_import.local` and ``claude_native_status_file``
+    already do. The in-process SDK path keeps its pre-scoping ``~/.claude``
+    root, so the ``$CLAUDE_CONFIG_DIR`` tier is honored only for native
+    harnesses.
     """
-    return ctx.claude_config_dir if ctx.claude_config_dir is not None else ctx.home / ".claude"
+    if ctx.is_native and ctx.claude_config_dir is not None:
+        return ctx.claude_config_dir
+    return ctx.home / ".claude"
 
 
 def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
@@ -190,9 +200,16 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
         internal orchestration skills, not user-typeable slash commands
         (applied uniformly across every harness).
     """
+    from omnigent.harness_aliases import is_native_harness
+
     family = _harness_family(harness)
     provider = _SKILL_SOURCES.get(family, _generic_host_skills)
-    return [s for s in _dedup(provider(ctx)) if s.user_invocable]
+    # The terminal-matching resolution — a native session types ``/name`` into
+    # the vendor CLI as plaintext, so its menu must mirror what that CLI loads —
+    # is native-only. Tag the context so providers keep the in-process SDK
+    # harnesses on their pre-scoping behavior (see ``claude_host_skills``).
+    native_ctx = replace(ctx, is_native=is_native_harness(harness))
+    return [s for s in _dedup(provider(native_ctx)) if s.user_invocable]
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
@@ -378,8 +395,21 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
-    """The tiers Claude Code itself loads plus its enabled plugins."""
-    return _claude_code_skills(ctx) + _claude_plugin_skills(ctx)
+    """
+    Claude host skills, gated by native vs SDK, plus enabled plugins.
+
+    A native ``claude-native`` session types ``/name`` into the Claude CLI
+    as plaintext, so its menu must mirror exactly the tiers that CLI loads
+    (:func:`_claude_code_skills`: ``.claude/skills`` and the
+    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``). The in-process
+    ``claude-sdk`` harness has no such terminal to match, so it keeps the
+    generic host walk it used before this scoping — the terminal-matching
+    behavior only affects native harnesses. Enabled plugin slash-commands are
+    added in both cases (config-dir-resolved for native, ``~/.claude`` for SDK
+    via :func:`_claude_user_dir`).
+    """
+    walk = _claude_code_skills if ctx.is_native else _generic_host_skills
+    return walk(ctx) + _claude_plugin_skills(ctx)
 
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
