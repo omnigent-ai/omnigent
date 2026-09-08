@@ -1532,8 +1532,9 @@ def _await_accounts_first_run_setup(
     loopback token, which we detect and return on.
 
     No-op when the server is not in accounts mode, when this CLI already holds
-    a token for *base_url*, or when an admin already exists (the server mints
-    our token at boot in that case).
+    a credential for *base_url* (a stored token or a Databricks login pointer),
+    or when an admin already exists (the server mints our token at boot in that
+    case).
 
     :param base_url: Resolved local Omnigent server URL, e.g.
         ``"http://127.0.0.1:6767"``.
@@ -1545,8 +1546,17 @@ def _await_accounts_first_run_setup(
     """
     from omnigent import cli_auth
 
-    # Already authenticated to this server — nothing to wait for.
-    if cli_auth.load_token(base_url) is not None:
+    # Already authenticated to this server — nothing to wait for. A stored
+    # Databricks pointer record counts: it is only written after a successful
+    # login against this server, which a fresh accounts server awaiting its
+    # first admin can never have granted. Without this arm every remote start
+    # paid a TCP+TLS handshake and a round trip for the /v1/info probe below,
+    # which answers 401 there anyway (it is deliberately unauthenticated, so a
+    # needs-setup server can answer it before anyone holds a credential).
+    if (
+        cli_auth.load_token(base_url) is not None
+        or cli_auth.load_databricks_workspace_host(base_url) is not None
+    ):
         return
     try:
         info = _server_get(f"{base_url}/v1/info", timeout=5.0).json()
