@@ -196,6 +196,48 @@ def test_evict_noop_for_uncached_agent(
     agent_cache.evict("never-loaded")
 
 
+@pytest.mark.parametrize(
+    "agent_id",
+    ["", ".", "..", "../outside", "nested/agent", r"..\outside", "/tmp/outside"],
+)
+def test_cache_operations_reject_unsafe_agent_ids(
+    agent_cache: AgentCache,
+    cache_dir: Path,
+    agent_id: str,
+) -> None:
+    """Cache operations reject ids that could escape the cache root."""
+    with pytest.raises(ValueError, match="unsafe agent id"):
+        agent_cache.load(agent_id, "unused")
+    with pytest.raises(ValueError, match="unsafe agent id"):
+        agent_cache.replace(agent_id, "unused", b"not-a-bundle")
+    with pytest.raises(ValueError, match="unsafe agent id"):
+        agent_cache.evict(agent_id)
+
+    assert not cache_dir.exists()
+
+
+def test_cache_operations_reject_symlink_escape(
+    agent_cache: AgentCache,
+    cache_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """An existing cache symlink cannot redirect a load outside the root."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "marker"
+    marker.write_text("keep", encoding="utf-8")
+    cache_dir.mkdir()
+    try:
+        (cache_dir / "linked-agent").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="unsafe agent id"):
+        agent_cache.load("linked-agent", "unused")
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
 # ── env-var expansion is gated on provenance ──────────
 #
 # A tenant-uploaded (session-scoped) bundle must NOT have its ${VAR}
