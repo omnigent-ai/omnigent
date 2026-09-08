@@ -623,7 +623,10 @@ describe("AppShell header", () => {
 
     renderShell("/c/conv_child");
 
-    expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
+    fireEvent.pointerDown(screen.getByTestId("desktop-fork-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Fork" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Rename" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Delete" })).toBeNull();
   });
 
   it("defaults to chat view on a native Claude session", () => {

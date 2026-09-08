@@ -509,19 +509,39 @@ export function ChatHeader({
             nothing when the user is alone. */}
         {conversationId && <PresenceAvatars />}
         {/* Desktop (md+) action buttons. On mobile these collapse into
-            the three-dot "Session actions" menu below, which renders
-            the same set off the same gating booleans. Clone has no
-            header presence at all — it's reached via the per-message
-            "Fork from here" action on assistant bubbles (ChatPage). */}
+            the three-dot "Session actions" menu below. Fork is also
+            available from the session menus and assistant messages. */}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
         {conversationId && <ViewModeToggle />}
-        {/* Fallback kebab for sessions with no owner-managed menu. Desktop
-            exposes Fork; mobile also carries Share, Agent info, and the
-            workspace-rail entries so a phone still needs only one trigger. */}
+        {!actionConversation && canFork && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Conversation actions"
+                data-testid="desktop-fork-actions-menu"
+                className="hidden border-none text-muted-foreground hover:text-foreground md:inline-flex"
+              >
+                <EllipsisVerticalIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-44">
+              <DropdownMenuItem onSelect={onFork}>
+                <GitForkIcon className="size-3.5" />
+                Fork
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {/* Fallback mobile kebab for sessions with no owner-managed menu.
+            It carries Fork, Share, Agent info, and the workspace-rail entries
+            so a phone still needs only one trigger. */}
         {(hasHeaderMenu || workspaceItems || canFork) && (!actionConversation || !isMobile) && (
           // Non-modal on mobile: modal mode's body-wide pointer-events:none
           // makes the menu the sole touch target, so touch-target adjustment
@@ -535,10 +555,7 @@ export function ChatHeader({
                 size="icon"
                 aria-label="Session actions"
                 data-testid="session-actions-menu"
-                className={cn(
-                  "text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full",
-                  actionConversation && "md:hidden",
-                )}
+                className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11 max-md:rounded-full"
               >
                 <EllipsisVerticalIcon className="size-4 max-md:size-5" />
               </Button>

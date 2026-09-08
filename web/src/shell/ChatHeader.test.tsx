@@ -743,7 +743,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getByTestId("session-actions-menu")).toBeInTheDocument();
   });
 
-  it("keeps Fork reachable from the desktop fallback menu", () => {
+  it("keeps the desktop fallback menu limited to Fork", () => {
     const onFork = vi.fn();
     renderHeader({
       sidebarOpen: true,
@@ -751,12 +751,17 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       conversationTitle: conversation.title,
       actionConversation: null,
       canFork: true,
+      hasAgentInfo: true,
+      hasRailContent: true,
+      showFilesPanel: true,
       onFork,
     });
 
-    const trigger = screen.getByTestId("session-actions-menu");
-    expect(trigger).not.toHaveClass("md:hidden");
+    const trigger = screen.getByTestId("desktop-fork-actions-menu");
     fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Fork",
+    ]);
     fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
 
     expect(onFork).toHaveBeenCalledOnce();

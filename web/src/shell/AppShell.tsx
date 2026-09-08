@@ -598,9 +598,8 @@ export function AppShell() {
   // Any viewer can fork a shared session, sub-agents included — forking a
   // child is how it gets promoted to a top-level session of its own. Gated on
   // knowing which the session is (sidebar row or loaded snapshot) so the
-  // affordance doesn't flicker in before that resolves. Surfaced as
-  // ForkDialogContext.canFork — the per-message "Fork from here" action is
-  // the only fork entry point.
+  // affordance doesn't flicker in before that resolves. Shared by the header
+  // menus and ForkDialogContext's per-message "Fork from here" action.
   const canClone =
     !!conversationId &&
     (isKnownTopLevel || isChildSession) &&
@@ -1833,9 +1832,8 @@ export function AppShell() {
     ],
   );
 
-  // Opener for the fork/clone dialog, shared with descendants via
-  // ForkDialogContext. ChatPage's per-message "Fork from here" action is
-  // the only fork entry point (no header/menu Clone button).
+  // Opener for the fork/clone dialog, shared by the header menu and descendants
+  // through ForkDialogContext's per-message "Fork from here" action.
   const forkDialogContextValue = useMemo<ForkDialogContextValue>(
     () => ({
       canFork: canClone,
