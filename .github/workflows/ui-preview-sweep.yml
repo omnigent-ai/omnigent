@@ -1,0 +1,103 @@
+name: UI Preview Sweep
+
+# Reclaims stale per-PR preview apps (omnigent-ui-preview-pr-<N>) from the
+# shared Databricks workspace. The UI Preview workflow's close-event cleanup
+# deletes an app when its PR closes, but that event fires exactly once: a
+# missed or skipped delete leaks the app slot forever, and an open PR that
+# dropped the ui-preview label keeps holding a slot. The workspace caps the
+# number of apps, so leaked slots eventually block every new preview deploy
+# ("has reached the maximum limit of 100 apps"). This sweep is the
+# close-event-independent reclamation path: on a schedule (and on demand) it
+# deletes every preview app whose PR is gone, closed, or no longer labelled.
+#
+# Selection lives in .github/scripts/ui-preview/sweep.py (unit-tested in
+# tests/github/test_ui_preview_sweep.py); deletion stays here so every
+# reclaimed app is visible in the job log. An app is deleted only on positive
+# evidence its PR no longer needs a preview -- lookup failures keep the app
+# and turn the run red instead of silently under-reclaiming.
+
+on:
+  schedule:
+    - cron: "23 */4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ui-preview-sweep
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sweep:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/2260866f83a41a2df55e1cfe7ffe038b78325bf6/install.sh | sh
+          databricks --version
+
+      - name: Select stale preview apps
+        id: select
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          DATABRICKS_AUTH_TYPE: oauth-m2m
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          python3 .github/scripts/ui-preview/sweep.py > /tmp/stale-preview-apps.txt
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          echo "Stale preview apps selected for deletion:"
+          cat /tmp/stale-preview-apps.txt
+
+      - name: Delete stale preview apps
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          DATABRICKS_AUTH_TYPE: oauth-m2m
+          SELECT_RC: ${{ steps.select.outputs.rc }}
+        run: |
+          FAILED=0
+          while IFS= read -r APP_NAME; do
+            [ -n "$APP_NAME" ] || continue
+            # Defense in depth: never delete anything but a per-PR preview app,
+            # whatever the selector printed.
+            case "$APP_NAME" in
+              omnigent-ui-preview-pr-*) ;;
+              *)
+                echo "::error::selector produced unexpected app name '$APP_NAME'; refusing to delete it"
+                FAILED=1
+                continue
+                ;;
+            esac
+            echo "Deleting stale preview app $APP_NAME"
+            SOURCE_PATH=$( (databricks apps get "$APP_NAME" -o json 2>/dev/null || true) \
+              | jq -r '.default_source_code_path // empty')
+            if ! databricks apps delete "$APP_NAME" --auto-approve; then
+              echo "::error::Failed to delete $APP_NAME"
+              FAILED=1
+              continue
+            fi
+            if [ -n "$SOURCE_PATH" ]; then
+              databricks workspace delete "${SOURCE_PATH#/Workspace}" --recursive 2>/dev/null || true
+            fi
+          done < /tmp/stale-preview-apps.txt
+          if [ "$FAILED" -ne 0 ] || [ "$SELECT_RC" != "0" ]; then
+            echo "::error::sweep finished with failures (selector rc=$SELECT_RC)"
+            exit 1
+          fi
