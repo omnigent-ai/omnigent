@@ -1130,7 +1130,10 @@ def test_legacy_profile_still_suppresses_global_default_provider(config_home: Pa
         _build_codex_spawn_env(spec, workdir=None)
 
 
-def test_codex_spec_databricks_auth_routes_via_synthesized_provider(config_home: Path) -> None:
+def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
+    config_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     A spec ``executor.auth: {type: databricks}`` on codex routes via the
     synthesized-provider path.
@@ -1200,11 +1203,13 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(config_home:
         **env,
         "OMNIGENT_CODEX_PATH": "/bin/true",
     }
-    with (
-        patch.dict(os.environ, harness_env, clear=True),
-        patch.object(CodexExecutor, "__init__", _capture_init),
-    ):
-        executor = codex_harness._build_codex_executor()
+    with monkeypatch.context() as env_patch:
+        for name in tuple(os.environ):
+            env_patch.delenv(name)
+        for name, value in harness_env.items():
+            env_patch.setenv(name, value)
+        with patch.object(CodexExecutor, "__init__", _capture_init):
+            executor = codex_harness._build_codex_executor()
 
     signer = captured["signer_launch_config"]
     assert isinstance(signer, SignerLaunchConfig)

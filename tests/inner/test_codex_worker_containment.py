@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from omnigent.inner.codex_executor import _CodexAppServerSession
-from omnigent.inner.codex_worker import prepare_codex_worker
+from omnigent.inner.codex_worker import _BROKERED_AUTH_SECRET_ENV, prepare_codex_worker
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.model_signer import SignerReadiness
 from omnigent.inner.sandbox import SandboxPolicy, with_additional_write_roots
@@ -193,12 +193,13 @@ def test_signer_readiness_adds_only_relay_and_public_ca(
     )
     monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
     monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
+    secret_env = {
+        name: f"host-secret-{index}" for index, name in enumerate(_BROKERED_AUTH_SECRET_ENV)
+    }
     worker_env = {
         "PATH": os.environ["PATH"],
         "CODEX_HOME": str(codex_home),
-        "DATABRICKS_BEARER": "host-bearer-secret",
-        "DATABRICKS_CLIENT_SECRET": "host-client-secret",
-        "DATABRICKS_CODEX_TOKEN": "host-codex-secret",
+        **secret_env,
     }
 
     worker = prepare_codex_worker(
@@ -221,9 +222,7 @@ def test_signer_readiness_adds_only_relay_and_public_ca(
     assert worker_env["HTTPS_PROXY"] == "http://127.0.0.1:43123"
     assert worker_env["OPENAI_API_KEY"] == readiness.placeholder
     assert worker_env["SSL_CERT_FILE"] == str(readiness.ca_bundle_path)
-    assert "DATABRICKS_BEARER" not in worker_env
-    assert "DATABRICKS_CLIENT_SECRET" not in worker_env
-    assert "DATABRICKS_CODEX_TOKEN" not in worker_env
+    assert all(worker_env.get(name) != value for name, value in secret_env.items())
     assert str(readiness.socket_path) not in worker_env.values()
     assert "token" not in str(policy.to_jsonable()).lower()
     worker.close()
