@@ -1915,6 +1915,7 @@ def augment_claude_args(
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    include_workspace_settings: bool = False,
     append_system_prompt: str | None = None,
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
@@ -1954,6 +1955,13 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
+    :param include_workspace_settings: ``True`` keeps Claude's default
+        setting sources so workspace-scoped settings load behind
+        Claude's own trust dialog. ``False`` (default) restricts the
+        sources to ``user``: a launch that pre-accepts the trust dialog
+        (:func:`ensure_claude_workspace_trusted`) must not let an
+        unreviewed workspace's ``.claude/settings.json`` hooks execute.
+        See :func:`omnigent.inner.bundle_skills.claude_native_skill_args`.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) to append through Claude
         Code's native ``--append-system-prompt`` flag.
@@ -2005,6 +2013,7 @@ def augment_claude_args(
             bundle_dir,
             agent_name=agent_name,
             skills_filter=skills_filter,
+            include_workspace_settings=include_workspace_settings,
         )
     )
     return args
