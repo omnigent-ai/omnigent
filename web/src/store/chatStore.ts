@@ -57,6 +57,7 @@ import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
@@ -4514,7 +4515,7 @@ export async function startStreamPump(
           // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
-            finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
+            failUnavailableStream(set, `stream unavailable (${streamRes.status})`);
             set({ status: "idle" });
             break;
           }
@@ -6573,6 +6574,39 @@ function finalizeActive(
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";
     return {
       activeResponse: { responseId, state, error, completedAt: Date.now() },
+    };
+  });
+}
+
+const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
+
+/** Fail the active turn and surface one fallback when no bubble can show it. */
+function failUnavailableStream(set: Setter, error: string): void {
+  set((s) => {
+    const activeResponse =
+      s.activeResponse === null
+        ? null
+        : { ...s.activeResponse, state: "failed" as const, error, completedAt: Date.now() };
+    const blocks = s.blocks.filter(
+      (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
+    );
+    const hasVisibleFailure =
+      activeResponse !== null &&
+      buildBubbles(blocks, activeResponse).some(
+        (bubble) => bubble.kind === "assistant" && bubble.responseId === activeResponse.responseId,
+      );
+    if (hasVisibleFailure) {
+      return blocks.length === s.blocks.length ? { activeResponse } : { activeResponse, blocks };
+    }
+    return {
+      ...(activeResponse !== null ? { activeResponse } : {}),
+      blocks: [
+        ...blocks,
+        makeClientErrorBlock(
+          "The live connection to the assistant is unavailable. Reload the page to reconnect.",
+          STREAM_UNAVAILABLE_CODE,
+        ),
+      ],
     };
   });
 }
