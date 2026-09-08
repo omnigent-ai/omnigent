@@ -1126,7 +1126,7 @@ def _listing_for_provider(
 
 def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
     """Build a live listing from the installed Cursor CLI."""
-    from omnigent.cursor_native import list_cursor_cli_model_options
+    from omnigent.harnesses.cursor_native.main import list_cursor_cli_model_options
 
     options = list_cursor_cli_model_options()
     return ModelListing(

@@ -35,7 +35,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 
-from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.runtime import session_stream
 from omnigent.server._elicitation_registry import (
     _harness_pre_resolved_elicitations,
@@ -236,7 +236,7 @@ async def test_cursor_permission_request_hook_allow_round_trip(
     """
     cursor-native TUI prompt → web ApprovalCard → accept → verdict.
 
-    The runner-side mirror (``omnigent.cursor_native_permissions``) POSTs a
+    The runner-side mirror (``omnigent.harnesses.cursor_native.permissions``) POSTs a
     detected cursor TUI approval prompt to
     ``/hooks/cursor-permission-request``; the route publishes a
     ``response.elicitation_request`` (phase ``pre_tool_use``, policy
@@ -293,7 +293,7 @@ async def test_qwen_permission_request_hook_allow_round_trip(
     """
     qwen-native TUI ``can_use_tool`` → web ApprovalCard → accept → verdict.
 
-    The runner-side mirror (``omnigent.qwen_native_permissions``) reads a
+    The runner-side mirror (``omnigent.harnesses.qwen_native.permissions``) reads a
     ``can_use_tool`` control request off qwen's ``--json-file`` and POSTs it to
     the generic ``/hooks/native-permission-request`` (shared with hermes-/goose-
     native) with ``agent="qwen"`` + ``policy_name="qwen_native_permission"``; the

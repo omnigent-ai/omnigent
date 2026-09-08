@@ -911,7 +911,7 @@ async def _measure_hook_spawn(env: BenchEnvironment, ctx: JourneyContext) -> Non
         sys.executable,
         "-I",
         "-m",
-        "omnigent.claude_native_message_display_hook",
+        "omnigent.harnesses.claude_native.message_display_hook",
         "--bridge-dir",
         str(ctx),
         stdin=asyncio.subprocess.PIPE,

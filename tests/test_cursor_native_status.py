@@ -2,12 +2,12 @@
 
 Covers the three layers of the cursor parent-wake path:
 
-1. :mod:`omnigent.cursor_native_status` — the turn-end marker store + poster
+1. :mod:`omnigent.harnesses.cursor_native.status` — the turn-end marker store + poster
    state (record/count markers, read/write/clear the posted-count).
-2. :func:`omnigent.cursor_native_usage._cli_record_usage` — the cursor ``stop``
+2. :func:`omnigent.harnesses.cursor_native.usage._cli_record_usage` — the cursor ``stop``
    hook entrypoint, which must record a turn-end marker on EVERY firing (even a
    turn with no billable usage) so the parent wake never depends on usage.
-3. :func:`omnigent.cursor_native_forwarder.forward_cursor_store_to_session` —
+3. :func:`omnigent.harnesses.cursor_native.forwarder.forward_cursor_store_to_session` —
    the poll loop must POST ``external_session_status: idle`` exactly once per
    completed turn, deduped against the persisted posted-count and restart-safe.
 
@@ -24,8 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import cursor_native_forwarder as fwd
-from omnigent import cursor_native_status as status
+from omnigent.harnesses.cursor_native import forwarder as fwd
+from omnigent.harnesses.cursor_native import status
 
 # --- status store: markers + poster state ------------------------------------
 
@@ -70,7 +70,7 @@ def test_read_posted_count_ignores_corrupt_state(tmp_path: Path) -> None:
 
 def test_cli_record_usage_records_turn_end(tmp_path: Path, monkeypatch) -> None:
     """The cursor ``stop`` hook entrypoint records a turn-end marker per firing."""
-    from omnigent import cursor_native_usage
+    from omnigent.harnesses.cursor_native import usage as cursor_native_usage
 
     bridge = tmp_path / "cursor-native" / "sess"
     bridge.mkdir(parents=True)
@@ -83,7 +83,7 @@ def test_cli_record_usage_records_turn_end(tmp_path: Path, monkeypatch) -> None:
 
 def test_cli_record_usage_records_turn_end_on_empty_stdin(tmp_path: Path, monkeypatch) -> None:
     """Even an empty hook payload (no usage) still records the turn-end marker."""
-    from omnigent import cursor_native_usage
+    from omnigent.harnesses.cursor_native import usage as cursor_native_usage
 
     bridge = tmp_path / "b"
     bridge.mkdir(parents=True)

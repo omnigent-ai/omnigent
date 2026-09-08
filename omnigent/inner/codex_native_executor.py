@@ -12,12 +12,12 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
-from omnigent.codex_native_app_server import (
+from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
     client_for_transport,
 )
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CodexNativeBridgeState,

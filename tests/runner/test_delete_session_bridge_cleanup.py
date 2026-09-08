@@ -31,38 +31,38 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.antigravity_native_bridge import (
+from omnigent.harnesses.antigravity_native.bridge import (
     bridge_dir_for_bridge_id as antigravity_bridge_dir,
 )
-from omnigent.claude_native_bridge import bridge_dir_for_bridge_id, prepare_bridge_dir
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id, prepare_bridge_dir
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id as claude_bridge_dir,
 )
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native.bridge import (
     bridge_dir_for_bridge_id as codex_bridge_dir,
 )
-from omnigent.cursor_native_bridge import (
+from omnigent.harnesses.cursor_native.bridge import (
     bridge_dir_for_session_id as cursor_bridge_dir,
 )
-from omnigent.goose_native_bridge import (
+from omnigent.harnesses.goose_native.bridge import (
     bridge_dir_for_session_id as goose_bridge_dir,
 )
-from omnigent.hermes_native_bridge import (
+from omnigent.harnesses.hermes_native.bridge import (
     bridge_dir_for_session_id as hermes_bridge_dir,
 )
-from omnigent.kimi_native_bridge import (
+from omnigent.harnesses.kimi_native.bridge import (
     bridge_dir_for_session_id as kimi_bridge_dir,
 )
-from omnigent.kiro_native_bridge import (
+from omnigent.harnesses.kiro_native.bridge import (
     bridge_dir_for_session_id as kiro_bridge_dir,
 )
-from omnigent.opencode_native_bridge import (
+from omnigent.harnesses.opencode_native.bridge import (
     bridge_dir_for_bridge_id as opencode_bridge_dir,
 )
-from omnigent.pi_native_bridge import (
+from omnigent.harnesses.pi_native.bridge import (
     bridge_dir_for_session_id as pi_bridge_dir,
 )
-from omnigent.qwen_native_bridge import (
+from omnigent.harnesses.qwen_native.bridge import (
     bridge_dir_for_session_id as qwen_bridge_dir,
 )
 from omnigent.runner import create_runner_app

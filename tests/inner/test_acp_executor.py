@@ -1491,7 +1491,7 @@ async def test_mcp_relay_starts_and_builds_serve_mcp_entry() -> None:
         entry = servers[0]
         assert entry["name"] == "omnigent"
         assert "serve-mcp" in entry["args"]
-        assert "omnigent.claude_native_bridge" in entry["args"]
+        assert "omnigent.harnesses.claude_native.bridge" in entry["args"]
         assert all("name" in e and "value" in e for e in entry["env"])
         # Idempotent: a second call returns the cached relay, not a new one.
         assert m.session_new_servers(tools=[], tool_executor=fake_exec, loop=loop) is servers

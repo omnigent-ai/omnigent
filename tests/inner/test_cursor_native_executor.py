@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.cursor_native_bridge import (
+from omnigent.harnesses.cursor_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     FORK_HISTORY_CLOSE_TAG,
     FORK_HISTORY_OPEN_TAG,
@@ -230,7 +230,7 @@ class TestBridge:
         so mirror the real ``<uid-scoped temp>/cursor-native/<digest>`` layout.
         """
         root = tmp_path / "omnigent-test" / "cursor-native"
-        monkeypatch.setattr("omnigent.cursor_native_bridge._BRIDGE_ROOT", root)
+        monkeypatch.setattr("omnigent.harnesses.cursor_native.bridge._BRIDGE_ROOT", root)
         return root / "sess"
 
     def test_bridge_dir_is_deterministic_and_session_scoped(self) -> None:
@@ -264,7 +264,7 @@ class TestBridge:
         assert server["args"] == [
             "-I",
             "-m",
-            "omnigent.claude_native_bridge",
+            "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
             "--bridge-dir",
             str(tmp_path),
@@ -279,7 +279,7 @@ class TestBridge:
     ) -> None:
         workspace = tmp_path / "workspace"
         monkeypatch.setattr(
-            "omnigent.cursor_native_bridge.approve_mcp_server_for_workspace",
+            "omnigent.harnesses.cursor_native.bridge.approve_mcp_server_for_workspace",
             lambda _workspace: pytest.fail("approval must happen after tool relay starts"),
         )
         path = write_mcp_config(workspace, bridge_dir, python_executable="python-test")
@@ -373,7 +373,7 @@ class TestBridge:
         calls: list[dict[str, object]] = []
 
         monkeypatch.setattr(
-            "omnigent.cursor_native.resolve_cursor_executable",
+            "omnigent.harnesses.cursor_native.main.resolve_cursor_executable",
             lambda: "/bin/cursor-agent-test",
         )
 

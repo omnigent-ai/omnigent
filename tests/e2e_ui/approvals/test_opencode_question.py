@@ -10,8 +10,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent.opencode_native_client import OpenCodeEvent
-from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
+from omnigent.harnesses.opencode_native.client import OpenCodeEvent
+from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
 
 _FORM = '[data-testid="ask-user-question-form"]'
 _SUBMIT = '[data-testid="ask-user-question-submit"]'

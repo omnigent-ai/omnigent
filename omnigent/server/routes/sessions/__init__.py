@@ -50,7 +50,6 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -70,6 +69,7 @@ from omnigent.entities.conversation import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )

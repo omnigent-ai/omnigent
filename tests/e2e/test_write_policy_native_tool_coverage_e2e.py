@@ -20,7 +20,7 @@ Journey (per policy): attach the built-in policy to a live session → Claude
 Code's ``PreToolUse`` hook posts the tool call to
 ``POST /v1/sessions/{id}/policies/evaluate`` (the exact wire path the
 claude-native harness takes for every native tool call; driven here with the
-same request shape ``omnigent.claude_native_hook._main_evaluate_policy``
+same request shape ``omnigent.harnesses.claude_native.hook._main_evaluate_policy``
 sends) → the verdict must be ``POLICY_ACTION_DENY``. Control legs prove the
 same journey with ``Write`` (and ``MultiEdit`` for read_only_os) DENYs today,
 so a failure is specifically the ``NotebookEdit`` coverage gap.
@@ -102,7 +102,7 @@ def _evaluate_tool_call(
     """POST a ``PHASE_TOOL_CALL`` evaluate request; return the verdict string.
 
     Same body shape the claude-native ``evaluate-policy`` hook sends for a
-    ``PreToolUse`` event (see ``omnigent.claude_native_hook``).
+    ``PreToolUse`` event (see ``omnigent.harnesses.claude_native.hook``).
     """
     resp = http_client.post(
         f"/v1/sessions/{session_id}/policies/evaluate",

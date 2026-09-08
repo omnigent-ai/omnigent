@@ -5,7 +5,7 @@ from __future__ import annotations
 import click
 import pytest
 
-from omnigent import hermes_native as hn
+from omnigent.harnesses.hermes_native import main as hn
 
 
 def test_resolve_hermes_executable_found() -> None:

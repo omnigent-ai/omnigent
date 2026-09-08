@@ -3,7 +3,7 @@
 A *native-server* harness drives a per-conversation server process the
 runner owns: the runner starts the server + an event forwarder, and the
 harness injects web turns over this transport. OpenCode speaks HTTP + SSE
-(:class:`omnigent.opencode_http_transport.OpenCodeHttpTransport`);
+(:class:`omnigent.harnesses.opencode_native.http_transport.OpenCodeHttpTransport`);
 :class:`NativeServerTransport` is the seam so the orchestration in
 :class:`omnigent.native_server_harness.NativeServerHarness` stays
 protocol-agnostic.

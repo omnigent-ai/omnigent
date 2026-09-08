@@ -76,7 +76,7 @@ async def test_kiro_native_executor_surfaces_injection_failure(
 
 def test_kiro_native_executor_requires_bridge_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The harness process must receive the Kiro bridge dir env."""
-    from omnigent.kiro_native_bridge import KIRO_NATIVE_BRIDGE_DIR_ENV_VAR
+    from omnigent.harnesses.kiro_native.bridge import KIRO_NATIVE_BRIDGE_DIR_ENV_VAR
 
     monkeypatch.delenv(KIRO_NATIVE_BRIDGE_DIR_ENV_VAR, raising=False)
 

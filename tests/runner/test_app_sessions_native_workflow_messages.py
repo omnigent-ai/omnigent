@@ -12,10 +12,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import (
-    claude_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,

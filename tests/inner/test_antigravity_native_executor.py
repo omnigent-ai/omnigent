@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 import omnigent.inner.antigravity_native_executor as executor_mod
-from omnigent.antigravity_native_bridge import (
+from omnigent.harnesses.antigravity_native.bridge import (
     AntigravityNativeBridgeState,
     write_bridge_state,
 )

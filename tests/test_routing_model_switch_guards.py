@@ -79,7 +79,7 @@ def test_the_model_switch_path_polls_and_never_sleeps_a_fixed_interval(name: str
     A sleep on a literal is a guess about how long a TUI takes to render, which
     is what row 100 disproved.
     """
-    from omnigent import claude_native_bridge
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 
     tree = _tree("claude_native_bridge.py")
     functions = {

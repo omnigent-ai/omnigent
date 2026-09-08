@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.kimi_native_forwarder import KimiWireItem, read_kimi_wire_items
-from omnigent.kiro_native_session_forwarder import (
+from omnigent.harnesses.kimi_native.forwarder import KimiWireItem, read_kimi_wire_items
+from omnigent.harnesses.kiro_native.session_forwarder import (
     KiroConversationMessage,
     parse_kiro_jsonl_line,
 )

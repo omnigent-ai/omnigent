@@ -7447,7 +7447,7 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
     debug level. Drives ``_forward_permission_mode_from_pane`` itself rather
     than a hand-rolled POST, so the mirror's own logic is on the path.
     """
-    from omnigent import claude_native_forwarder as fwd
+    from omnigent.harnesses.claude_native import forwarder as fwd
     from tests.server.helpers import start_session_stream_collector
 
     agent = await create_test_agent(client)

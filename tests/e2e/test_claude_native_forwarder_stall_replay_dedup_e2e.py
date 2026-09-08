@@ -176,7 +176,7 @@ def _create_claude_native_session(base_url: str) -> str:
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.claude_native import _materialize_claude_agent_spec
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
@@ -221,7 +221,7 @@ def _seed_transcript(bridge_dir: Path) -> Path:
     :param bridge_dir: Native Claude bridge directory.
     :returns: The transcript path.
     """
-    from omnigent.claude_native_bridge import record_hook_event
+    from omnigent.harnesses.claude_native.bridge import record_hook_event
 
     transcript_path = bridge_dir / "transcript.jsonl"
     lines = [
@@ -290,7 +290,7 @@ async def _drive_forwarder_through_a_stall(
     :param session_id: Conversation the forwarder mirrors into.
     :param bridge_dir: Seeded native Claude bridge directory.
     """
-    import omnigent.claude_native_forwarder as fwd
+    import omnigent.harnesses.claude_native.forwarder as fwd
 
     real_post = fwd._post_external_conversation_item
     stalled_once = {"done": False}
@@ -387,7 +387,7 @@ def test_forward_loop_stall_does_not_duplicate_committed_items(tmp_path: Path) -
         # Root the bridge dir under the production claude-native bridge root
         # (prepare_bridge_dir is the same helper the runner uses at launch), so
         # the forwarder tails a genuinely-rooted bridge exactly as in production.
-        from omnigent.claude_native_bridge import prepare_bridge_dir
+        from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
 
         bridge_dir = prepare_bridge_dir(session_id, workspace=workspace)
         _seed_transcript(bridge_dir)

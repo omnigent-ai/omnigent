@@ -1,6 +1,6 @@
 """Tests for the Claude Code ``sessions/<pid>.json`` status reader.
 
-Covers :mod:`omnigent.claude_native_status_file` — resolving the status
+Covers :mod:`omnigent.harnesses.claude_native.status_file` — resolving the status
 file for a launched Claude, mapping its interactive status to the runner
 vocabulary, and the per-tick poller that turns it into status edges and
 falls back to the PTY watcher when the file never appears or vanishes.
@@ -12,7 +12,7 @@ import json
 import time
 from pathlib import Path
 
-from omnigent.claude_native_status_file import (
+from omnigent.harnesses.claude_native.status_file import (
     IDLE,
     RUNNING,
     SessionStatusPoller,

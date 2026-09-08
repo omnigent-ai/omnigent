@@ -281,7 +281,10 @@ def _pane_text(base_url: str, session_id: str) -> str:
     :returns: The pane's visible text, or ``""`` before the terminal has
         been advertised (or if the capture fails).
     """
-    from omnigent.claude_native_bridge import BRIDGE_ID_LABEL_KEY, bridge_dir_for_bridge_id
+    from omnigent.harnesses.claude_native.bridge import (
+        BRIDGE_ID_LABEL_KEY,
+        bridge_dir_for_bridge_id,
+    )
 
     session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
     labels = session.get("labels") or {}

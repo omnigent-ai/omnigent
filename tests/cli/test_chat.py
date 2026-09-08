@@ -86,7 +86,7 @@ def test_redirect_native_resume_routes_kiro_wrapper(monkeypatch: pytest.MonkeyPa
     def _capture(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main.run_kiro_native", _capture)
 
     redirected = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
@@ -4424,7 +4424,9 @@ def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) 
     def _fake_run_cursor_native(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.cursor_native.run_cursor_native", _fake_run_cursor_native)
+    monkeypatch.setattr(
+        "omnigent.harnesses.cursor_native.main.run_cursor_native", _fake_run_cursor_native
+    )
 
     handled = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
@@ -4460,7 +4462,7 @@ def test_redirect_native_resume_covers_every_native_agent(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.goose_native.run_goose_native",
+        "omnigent.harnesses.goose_native.main.run_goose_native",
         lambda **kwargs: captured.update(kwargs),
     )
 
@@ -4520,7 +4522,7 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
     redirected: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.cursor_native.run_cursor_native",
+        "omnigent.harnesses.cursor_native.main.run_cursor_native",
         lambda **kwargs: redirected.update(kwargs),
     )
 

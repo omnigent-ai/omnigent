@@ -1125,7 +1125,7 @@ def test_cursor_listing_uses_live_cli_base_models(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     """
-    from omnigent import cursor_native
+    from omnigent.harnesses.cursor_native import main as cursor_native
 
     _isolate_config(monkeypatch, tmp_path, "")
     monkeypatch.setattr(
@@ -1151,7 +1151,7 @@ def test_cursor_listing_failure_is_empty_and_retryable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A transient Cursor CLI failure does not cache an empty catalog."""
-    from omnigent import cursor_native
+    from omnigent.harnesses.cursor_native import main as cursor_native
 
     _isolate_config(monkeypatch, tmp_path, "")
     calls = 0
@@ -1185,7 +1185,7 @@ def test_cursor_listing_failure_degrades_to_usable_static_row(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     """
-    from omnigent import cursor_native
+    from omnigent.harnesses.cursor_native import main as cursor_native
 
     _isolate_config(monkeypatch, tmp_path, "")
 

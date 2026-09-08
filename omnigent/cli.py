@@ -2593,7 +2593,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         as ``"online"``; ``False`` if the host id is unknown, the server
         is unreachable, or the host reports offline.
     """
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     host_id = record.host_id or _load_existing_host_id()
     if host_id is None:
@@ -7171,66 +7171,66 @@ class _NativeTerminalDispatchSpec:
 
 _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
     "claude": _NativeTerminalDispatchSpec(
-        module="omnigent.claude_native",
+        module="omnigent.harnesses.claude_native.main",
         function="run_claude_native",
         args_param="extra_args",
         prompt_param="prompt",
     ),
     "codex": _NativeTerminalDispatchSpec(
-        module="omnigent.codex_native",
+        module="omnigent.harnesses.codex_native.main",
         function="run_codex_native",
         args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
     ),
     "pi": _NativeTerminalDispatchSpec(
-        module="omnigent.pi_native",
+        module="omnigent.harnesses.pi_native.main",
         function="run_pi_native",
         args_param="extra_args",
     ),
     "opencode": _NativeTerminalDispatchSpec(
-        module="omnigent.opencode_native",
+        module="omnigent.harnesses.opencode_native.main",
         function="run_opencode_native",
         args_param="extra_args",
         model_strategy="first_class",
     ),
     "cursor": _NativeTerminalDispatchSpec(
-        module="omnigent.cursor_native",
+        module="omnigent.harnesses.cursor_native.main",
         function="run_cursor_native",
         args_param="extra_args",
     ),
     "kimi": _NativeTerminalDispatchSpec(
-        module="omnigent.kimi_native",
+        module="omnigent.harnesses.kimi_native.main",
         function="run_kimi_native",
         args_param="extra_args",
     ),
     "kiro": _NativeTerminalDispatchSpec(
-        module="omnigent.kiro_native",
+        module="omnigent.harnesses.kiro_native.main",
         function="run_kiro_native",
         args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
     ),
     "goose": _NativeTerminalDispatchSpec(
-        module="omnigent.goose_native",
+        module="omnigent.harnesses.goose_native.main",
         function="run_goose_native",
         args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
-        module="omnigent.antigravity_native",
+        module="omnigent.harnesses.antigravity_native.main",
         function="run_antigravity_native",
         args_param="extra_args",
         model_strategy="first_class",
     ),
     "qwen": _NativeTerminalDispatchSpec(
-        module="omnigent.qwen_native",
+        module="omnigent.harnesses.qwen_native.main",
         function="run_qwen_native",
         args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "hermes": _NativeTerminalDispatchSpec(
-        module="omnigent.hermes_native",
+        module="omnigent.harnesses.hermes_native.main",
         function="run_hermes_native",
         args_param="extra_args",
         model_strategy="explicit_passthrough",
@@ -9057,7 +9057,7 @@ def _runner_online_map(
     :returns: Map of ``runner_id`` to ``True`` / ``False``. ``None``
         means the runner status could not be resolved.
     """
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     runner_ids = sorted(
         {
@@ -9156,7 +9156,7 @@ def _add_daemon_host_status(
     if not isinstance(host_id, str) or not host_id:
         payload["error"] = "host id is not available in local config"
         return
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     host_result = _host_http_json(
         base_url=base_url,
@@ -9730,7 +9730,7 @@ def _stop_session_on_server(
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     :raises click.ClickException: If the server rejects the stop event.
     """
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     # This is a standalone CLI process with an empty session→host map, so read
     # the session's host from its record first: the stop_session event is a

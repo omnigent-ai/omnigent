@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from omnigent.kimi_native_forwarder import (
+from omnigent.harnesses.kimi_native.forwarder import (
     _discover_wire,
     _ForwardState,
     _read_state,

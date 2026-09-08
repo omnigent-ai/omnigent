@@ -298,7 +298,7 @@ class HermesExecutor(Executor):
                 conv_id or "(unset)",
             )
             return
-        from omnigent.hermes_native_bridge import (
+        from omnigent.harnesses.hermes_native.bridge import (
             bridge_dir_for_session_id,
             write_policy_hook_config,
         )

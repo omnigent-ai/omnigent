@@ -2403,7 +2403,7 @@ class _CodexAppServerSession:
                 # App-server threads run persisted-trusted hooks only, so the
                 # routing hooks need the trust handshake to be enforced.
                 # Imported here: the app-server module imports this one.
-                from omnigent.codex_native_app_server import trust_codex_router_hooks
+                from omnigent.harnesses.codex_native.app_server import trust_codex_router_hooks
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())

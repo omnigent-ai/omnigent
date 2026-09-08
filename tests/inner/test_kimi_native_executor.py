@@ -15,13 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import kimi_native_bridge
-from omnigent.inner.kimi_native_executor import (
-    KimiNativeExecutor,
-    _content_to_text,
-    _latest_user_text,
-)
-from omnigent.kimi_native_bridge import (
+from omnigent.harnesses.kimi_native import bridge as kimi_native_bridge
+from omnigent.harnesses.kimi_native.bridge import (
     APPROVE_KEY,
     BRIDGE_DIR_ENV_VAR,
     DENY_KEY,
@@ -31,6 +26,11 @@ from omnigent.kimi_native_bridge import (
     inject_approval_keystroke,
     read_tmux_info,
     write_tmux_target,
+)
+from omnigent.inner.kimi_native_executor import (
+    KimiNativeExecutor,
+    _content_to_text,
+    _latest_user_text,
 )
 
 

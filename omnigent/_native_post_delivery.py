@@ -261,7 +261,7 @@ async def post_session_event_with_retry(
     :param retry_delay: Callable ``attempt -> float`` returning the delay
         before the next attempt (one-based failed attempt number).
     :param logger_name: Logger name used for warning messages, e.g.
-        ``"omnigent.antigravity_native_reader"``.
+        ``"omnigent.harnesses.antigravity_native.reader"``.
     :returns: Final HTTP response, or ``None`` when all attempts raised
         transport errors (or after an ambiguous conversation-item failure).
     """

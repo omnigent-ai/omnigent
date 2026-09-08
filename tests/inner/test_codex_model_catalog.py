@@ -251,7 +251,7 @@ def test_the_catalog_probe_runs_off_the_event_loop(
     """
     import inspect
 
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
     for module in (codex_executor, codex_native_app_server):
         source = inspect.getsource(module)

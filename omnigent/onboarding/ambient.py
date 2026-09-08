@@ -499,7 +499,7 @@ def claude_managed_gateway(
 
     The single canonical parser for Claude Code's managed-settings credential,
     shared by ambient detection, the readiness gate, and the Smart-Routing
-    gateway check (:func:`omnigent.claude_native.managed_claude_gateway_signal`
+    gateway check (:func:`omnigent.harnesses.claude_native.main.managed_claude_gateway_signal`
     delegates here). A credential counts as delivered when the file carries a
     top-level ``apiKeyHelper`` (a token-printing command) or a truthy
     ``env.CLAUDE_CODE_USE_GATEWAY``.

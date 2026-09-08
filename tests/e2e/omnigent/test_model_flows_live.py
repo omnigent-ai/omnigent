@@ -27,7 +27,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.claude_native import claude_catalog_fingerprint
+from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
 from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from tests.e2e.omnigent._model_flows_rig import (
     ModelFlowsRig,

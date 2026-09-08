@@ -2783,7 +2783,7 @@ class HostProcess:
 
         :returns: The catalog listing, or ``None`` when unavailable.
         """
-        from omnigent.codex_native_app_server import codex_launch_catalog
+        from omnigent.harnesses.codex_native.app_server import codex_launch_catalog
 
         try:
             rows = await codex_launch_catalog()
@@ -2806,7 +2806,10 @@ class HostProcess:
 
         :returns: The catalog listing, or ``None`` when unavailable.
         """
-        from omnigent.claude_native import claude_launch_catalog, resolve_native_claude_config
+        from omnigent.harnesses.claude_native.main import (
+            claude_launch_catalog,
+            resolve_native_claude_config,
+        )
 
         try:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
@@ -2855,7 +2858,7 @@ class HostProcess:
 
         if harness == "pi-native":
             try:
-                from omnigent.pi_native_credentials import pi_native_model_options
+                from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
                 pi_models = await asyncio.to_thread(pi_native_model_options)
             except Exception:

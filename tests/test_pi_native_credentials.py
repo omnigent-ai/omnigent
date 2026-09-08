@@ -1,4 +1,4 @@
-"""Tests for omnigent.pi_native_credentials (native Pi provider wiring)."""
+"""Tests for omnigent.harnesses.pi_native.credentials (native Pi provider wiring)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent import pi_native_credentials as creds
+from omnigent.harnesses.pi_native import credentials as creds
 
 
 @pytest.fixture(autouse=True)
@@ -701,7 +701,7 @@ def test_cli_config_databricks_warns_on_unresolvable(
     monkeypatch.setenv("HOME", str(tmp_path))
     import logging
 
-    with caplog.at_level(logging.INFO, logger="omnigent.pi_native_credentials"):
+    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.pi_native.credentials"):
         assert (
             creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config) is None
         )
@@ -2005,7 +2005,7 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 def test_default_claude_model_from_picks_by_tier_then_newest() -> None:
     """Pi's launch default follows the ``opus > sonnet > …`` precedence, newest first."""
-    from omnigent.pi_native_credentials import _default_claude_model_from
+    from omnigent.harnesses.pi_native.credentials import _default_claude_model_from
 
     entries = [
         {"id": "system.ai.claude-sonnet-5"},

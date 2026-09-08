@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import cursor_native
+from omnigent.harnesses.cursor_native import main as cursor_native
 
 
 class _FakeAsyncClient:

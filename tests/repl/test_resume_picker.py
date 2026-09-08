@@ -1117,7 +1117,7 @@ def test_render_workspace_cell_matching_cwd_no_flag(
     *where* the session was started; only the action-required
     hint is suppressed.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1149,7 +1149,7 @@ def test_render_workspace_cell_mismatched_cwd_shows_cd_flag(
     this row is picked — without it the user has no way to
     anticipate the prompt.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1189,7 +1189,7 @@ def test_workspace_metadata_appears_in_wrapper_picker_list(
     ``show_workspace=True`` somewhere between the wrapper picker
     entry point and item rendering is caught.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import pick_conversation
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1237,7 +1237,7 @@ def test_render_workspace_cell_codex_native_uses_codex_state(
     :param tmp_path: Temporary state root and workspace.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "codex-state"))

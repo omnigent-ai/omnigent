@@ -291,7 +291,7 @@ class KimiExecutor(Executor):
             # kimi is a curl-installed single binary: it must read its own
             # install dir and write its config dir ($KIMI_CODE_HOME, default
             # ~/.kimi-code) and /tmp, or it can't start inside the jail.
-            from omnigent.kimi_native_credentials import resolve_user_kimi_home
+            from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 
             resolved_bin = shutil.which(self._binary_path) or self._binary_path
             bin_dir = Path(resolved_bin).resolve(strict=False).parent

@@ -17,7 +17,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from omnigent import goose_native_forwarder as f
+from omnigent.harnesses.goose_native import forwarder as f
 
 _SCHEMA = """
 CREATE TABLE sessions (

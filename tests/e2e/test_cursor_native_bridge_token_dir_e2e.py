@@ -2,7 +2,7 @@
 
 ``cursor-native`` keeps its per-session bridge tree under
 ``$TMPDIR/omnigent-<uid>/cursor-native/<digest>/``. At terminal launch the
-runner calls :func:`omnigent.cursor_native_bridge.write_mcp_config`, which
+runner calls :func:`omnigent.harnesses.cursor_native.bridge.write_mcp_config`, which
 routes through :func:`write_mcp_bridge_config` to write ``bridge.json`` — the
 bearer token for the Omnigent MCP relay's localhost control endpoint.
 
@@ -42,7 +42,7 @@ import os
 import stat
 import sys
 
-from omnigent import cursor_native_bridge as cnb
+from omnigent.harnesses.cursor_native import bridge as cnb
 
 result = {"raised": None, "token_written": False, "token_realpath": None, "ancestor_mode": None}
 bridge_dir = cnb.bridge_dir_for_session_id(sys.argv[1])

@@ -16,12 +16,12 @@ from typing import Any
 
 import pytest
 
-from omnigent import claude_native_bridge
-from omnigent.claude_native_bridge import (
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
     write_tmux_target,
 )
-from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import app as runner_app_module
 from omnigent.runner import create_runner_app

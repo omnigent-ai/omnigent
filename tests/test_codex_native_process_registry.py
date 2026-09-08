@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import codex_native_process_registry as registry
+from omnigent.harnesses.codex_native import process_registry as registry
 
 fcntl = pytest.importorskip("fcntl")
 

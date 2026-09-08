@@ -13,16 +13,14 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent import (
-    antigravity_native_bridge,
-    claude_native_bridge,
-    cursor_native_bridge,
-    goose_native_bridge,
-    hermes_native_bridge,
-    kimi_native_bridge,
-    kiro_native_bridge,
-    qwen_native_bridge,
-)
+from omnigent.harnesses.antigravity_native import bridge as antigravity_native_bridge
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.goose_native import bridge as goose_native_bridge
+from omnigent.harnesses.hermes_native import bridge as hermes_native_bridge
+from omnigent.harnesses.kimi_native import bridge as kimi_native_bridge
+from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 
 _BRIDGES = {
     "antigravity": antigravity_native_bridge,

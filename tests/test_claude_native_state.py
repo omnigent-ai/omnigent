@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.claude_native_state import (
+from omnigent.harnesses.claude_native.state import (
     _state_dir_for_conversation_id,
     read_launch_state,
     redirect_launch_state,

@@ -8,8 +8,8 @@ and whose ``UserPromptSubmit`` payload carries the user prompt under
 that hook shape and the server's proto-compatible ``EvaluationRequest``
 / ``EvaluationResponse`` schema served by
 ``POST /v1/sessions/{id}/policies/evaluate``, so the per-harness hook
-entrypoints (:mod:`omnigent.claude_native_hook`,
-:mod:`omnigent.codex_native_hook`) share one implementation.
+entrypoints (:mod:`omnigent.harnesses.claude_native.hook`,
+:mod:`omnigent.harnesses.codex_native.hook`) share one implementation.
 
 The output contract differs by hook event: ``PreToolUse`` enforces via
 ``hookSpecificOutput.permissionDecision``, while ``UserPromptSubmit``

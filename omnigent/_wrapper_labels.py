@@ -12,7 +12,7 @@ The values are tiny string constants that need to match across at
 least four call sites. Centralizing them here lets us:
 
 * keep ``omnigent.repl._resume_picker`` decoupled from the
-  ``omnigent.claude_native`` import graph (which pulls in tmux /
+  ``omnigent.harnesses.claude_native.main`` import graph (which pulls in tmux /
   websocket code); the picker just imports this module instead;
 * fail fast in CI if a refactor diverges any of the call sites
   (see ``tests/test_wrapper_labels.py``);

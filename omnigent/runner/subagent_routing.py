@@ -1478,7 +1478,7 @@ def _prune_router_dirs(router: SubagentRouter) -> None:
     Only dirs under the subagent-router root: the native harnesses' bridge
     dirs are advertised in too and belong to the bridge, not to this router.
     """
-    from omnigent.claude_native_bridge import subagent_router_bridge_root
+    from omnigent.harnesses.claude_native.bridge import subagent_router_bridge_root
 
     root = subagent_router_bridge_root()
     for bridge_dir in (*router.advertised_dirs, router.bridge_dir):
@@ -1502,7 +1502,10 @@ def router_dir_for_session(session_id: str) -> Path:
     :returns: Created directory, mode ``0o700``.
     :raises RuntimeError: If an ancestor fails the ownership check.
     """
-    from omnigent.claude_native_bridge import ensure_secure_dir, subagent_router_bridge_root
+    from omnigent.harnesses.claude_native.bridge import (
+        ensure_secure_dir,
+        subagent_router_bridge_root,
+    )
 
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
     path = subagent_router_bridge_root() / digest

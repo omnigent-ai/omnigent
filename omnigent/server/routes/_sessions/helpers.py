@@ -8915,7 +8915,7 @@ def _derive_terminal_launch_args_from_spec(
     (``permission_mode``) are matched exactly, mirroring claude-native's
     verbatim pass-through and the runner's exact ``bypassPermissions``
     comparison (``should_skip_permissions`` in
-    :mod:`omnigent.antigravity_native_launch`). A present-but-unrecognized
+    :mod:`omnigent.harnesses.antigravity_native.launch`). A present-but-unrecognized
     value logs at debug and leaves args unset.
 
     Only those native harnesses are translated; for any other harness

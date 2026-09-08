@@ -13,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
-import omnigent.claude_native_state as claude_state
-import omnigent.codex_native_state as codex_state
-import omnigent.opencode_native_state as opencode_state
+import omnigent.harnesses.claude_native.state as claude_state
+import omnigent.harnesses.codex_native.state as codex_state
+import omnigent.harnesses.opencode_native.state as opencode_state
 
 _HEX = "12dcd7df501e40e9a506a5b0058cbafc"
 

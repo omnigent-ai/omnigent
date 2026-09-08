@@ -1387,7 +1387,7 @@ def _bridge_thread_probe(bridge_dir: Path) -> Callable[[], bool]:
     """Build the "codex has published a thread to deliver to" probe."""
 
     def _ready() -> bool:
-        from omnigent.codex_native_bridge import read_bridge_state
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
 
         state = read_bridge_state(bridge_dir)
         return state is not None and bool(state.thread_id)
@@ -1427,7 +1427,7 @@ async def _apply_routed_model(
     if harness != "claude-native" or not model:
         return True
     from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
-    from omnigent.claude_native_bridge import (
+    from omnigent.harnesses.claude_native.bridge import (
         SWITCH_MODEL_DIALOG_HINT,
         inject_slash_command,
         read_claude_status_model,
@@ -1494,14 +1494,14 @@ def _settle_probe(bridge_dir: Path, harness: str | None) -> Callable[[str | None
 
         def _pane_ready(blocked_turn_id: str | None) -> bool:
             del blocked_turn_id
-            from omnigent.claude_native_bridge import claude_pane_ready
+            from omnigent.harnesses.claude_native.bridge import claude_pane_ready
 
             return claude_pane_ready(bridge_dir)
 
         return _pane_ready
 
     def _cleared(blocked_turn_id: str | None) -> bool:
-        from omnigent.codex_native_bridge import read_bridge_state
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
 
         state = read_bridge_state(bridge_dir)
         active = state.active_turn_id if state is not None else None

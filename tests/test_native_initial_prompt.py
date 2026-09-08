@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from omnigent import claude_native
+from omnigent.harnesses.claude_native import main as claude_native
 
 _MULTILINE = "line one\nline two\n\n  indented third"
 

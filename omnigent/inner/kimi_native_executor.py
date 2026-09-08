@@ -20,6 +20,7 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from omnigent.harnesses.kimi_native.bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -31,7 +32,6 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.kimi_native_bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
 
 logger = logging.getLogger(__name__)
 

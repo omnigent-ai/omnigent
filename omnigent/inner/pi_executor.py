@@ -50,6 +50,10 @@ from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent import model_catalog
+from omnigent.harnesses.pi_native.credentials import (
+    _databricks_workspace_url_for_gateway,
+    _is_databricks_ai_gateway_url,
+)
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.json_types import JsonObject as _JsonObject
@@ -64,10 +68,6 @@ from omnigent.pi_model_compatibility import (
     pi_model_is_reasoning,
     pi_model_json_entry,
     unsupported_in_pi,
-)
-from omnigent.pi_native_credentials import (
-    _databricks_workspace_url_for_gateway,
-    _is_databricks_ai_gateway_url,
 )
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
@@ -1827,7 +1827,7 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        from omnigent.pi_native import pi_supports_approve
+        from omnigent.harnesses.pi_native.main import pi_supports_approve
 
         self._extra_args: list[str] = ["--no-tools"]
         if pi_supports_approve(self._pi_path):

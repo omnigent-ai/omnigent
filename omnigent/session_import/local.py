@@ -11,23 +11,23 @@ from hashlib import sha256
 from pathlib import Path
 from typing import get_args
 
-from omnigent.claude_native_bridge import read_transcript_items_from_offset
-from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
 from omnigent.entities import NewConversationItem, parse_item_data
-from omnigent.kimi_native_credentials import resolve_user_kimi_home
-from omnigent.kimi_native_forwarder import (
+from omnigent.harnesses.claude_native.bridge import read_transcript_items_from_offset
+from omnigent.harnesses.codex_native.main import _CODEX_THREAD_ID_RE, _find_codex_rollout
+from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
+from omnigent.harnesses.kimi_native.forwarder import (
     read_kimi_wire_items,
     workdirs_for_kimi_sessions,
 )
-from omnigent.kiro_native_session_forwarder import (
+from omnigent.harnesses.kiro_native.session_forwarder import (
     kiro_cli_sessions_dir,
     parse_kiro_jsonl_line,
 )
-from omnigent.opencode_native_app_server import (
+from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
     find_opencode_cli,
 )
-from omnigent.opencode_native_forwarder import opencode_tool_output_text
+from omnigent.harnesses.opencode_native.forwarder import opencode_tool_output_text
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,

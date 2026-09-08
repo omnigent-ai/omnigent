@@ -24,7 +24,7 @@ Steps to reproduce (adapted from the bug report):
 
 from __future__ import annotations
 
-from omnigent import pi_native_credentials as creds
+from omnigent.harnesses.pi_native import credentials as creds
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures

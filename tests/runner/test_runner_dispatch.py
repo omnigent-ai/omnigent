@@ -2098,7 +2098,7 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
     # Keep the codex-native pre-turn bridge writes (write_mcp_bridge_config)
     # out of the real ``~/.omnigent/codex-native`` tree. The module documents
     # this monkeypatch as the supported test isolation point.
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """

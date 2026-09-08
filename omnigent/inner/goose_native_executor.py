@@ -16,7 +16,7 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from omnigent.goose_native_bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
+from omnigent.harnesses.goose_native.bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,

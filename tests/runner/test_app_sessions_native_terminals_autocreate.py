@@ -13,39 +13,37 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-    cursor_native_bridge,
-    kiro_native_bridge,
-)
-from omnigent.antigravity_native_bridge import (
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
 )
-from omnigent.antigravity_native_bridge import (
+from omnigent.harnesses.antigravity_native.bridge import (
     prepare_bridge_dir as prepare_antigravity_bridge_dir,
 )
-from omnigent.antigravity_native_bridge import (
+from omnigent.harnesses.antigravity_native.bridge import (
     write_bridge_state as write_antigravity_bridge_state,
 )
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeNativeHookInterpreterMismatchError,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
     read_permission_hook_config,
 )
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
     CodexNativeBridgeState,
 )
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native.bridge import (
     prepare_bridge_dir as prepare_codex_bridge_dir,
 )
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state as write_codex_bridge_state,
 )
-from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
@@ -141,9 +139,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    import omnigent.pi_native as pi_native
-    import omnigent.pi_native_bridge as pi_native_bridge
-    import omnigent.pi_native_credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
@@ -233,9 +231,9 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     no reason. The warning is delivered as an ``error`` item (which the web UI
     renders as a distinct banner) via ``external_conversation_item``.
     """
-    import omnigent.pi_native as pi_native
-    import omnigent.pi_native_bridge as pi_native_bridge
-    import omnigent.pi_native_credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
@@ -320,7 +318,7 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Kiro-native auto-create launches the TUI and session forwarder."""
-    import omnigent.kiro_native as kiro_native
+    import omnigent.harnesses.kiro_native.main as kiro_native
 
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -347,11 +345,11 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
         relay_calls.append({"session_id": session_id, **kwargs})
 
     monkeypatch.setattr(
-        "omnigent.kiro_native_session_forwarder.supervise_kiro_session_forwarder",
+        "omnigent.harnesses.kiro_native.session_forwarder.supervise_kiro_session_forwarder",
         _fake_supervise_kiro_session_forwarder,
     )
     monkeypatch.setattr(
-        "omnigent.kiro_native_permissions.supervise_kiro_permission_mirror",
+        "omnigent.harnesses.kiro_native.permissions.supervise_kiro_permission_mirror",
         _fake_supervise_kiro_permission_mirror,
     )
 
@@ -473,7 +471,7 @@ async def test_auto_create_kiro_terminal_skips_mcp_wiring_without_relay(
     to route calls back to. With ``ensure_comment_relay`` absent the gate must
     short-circuit: no workspace ``mcp.json`` is written.
     """
-    import omnigent.kiro_native as kiro_native
+    import omnigent.harnesses.kiro_native.main as kiro_native
 
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -489,11 +487,11 @@ async def test_auto_create_kiro_terminal_skips_mcp_wiring_without_relay(
         return None
 
     monkeypatch.setattr(
-        "omnigent.kiro_native_session_forwarder.supervise_kiro_session_forwarder",
+        "omnigent.harnesses.kiro_native.session_forwarder.supervise_kiro_session_forwarder",
         _noop_supervise,
     )
     monkeypatch.setattr(
-        "omnigent.kiro_native_permissions.supervise_kiro_permission_mirror",
+        "omnigent.harnesses.kiro_native.permissions.supervise_kiro_permission_mirror",
         _noop_supervise,
     )
     mcp_writes: list[Any] = []
@@ -562,9 +560,9 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    import omnigent.pi_native as pi_native
-    import omnigent.pi_native_bridge as pi_native_bridge
-    import omnigent.pi_native_credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -676,7 +674,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -776,7 +774,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_under_w
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setattr("omnigent.claude_native_bridge.is_wsl", lambda: True)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.is_wsl", lambda: True)
     # No ambient override may leak in: the launch must resolve the bare
     # "claude" name, and config isolation keeps a developer's real
     # ``harness.claude-native.command`` out of the test.
@@ -794,7 +792,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_under_w
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -843,7 +841,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_env_ove
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setattr("omnigent.claude_native_bridge.is_wsl", lambda: True)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.is_wsl", lambda: True)
     config_home = tmp_path / "config-home"
     config_home.mkdir()
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
@@ -860,7 +858,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_env_ove
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -909,7 +907,7 @@ async def test_auto_create_claude_terminal_honors_compatible_claude_env_override
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setattr("omnigent.claude_native_bridge.is_wsl", lambda: True)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.is_wsl", lambda: True)
     config_home = tmp_path / "config-home"
     config_home.mkdir()
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
@@ -931,7 +929,7 @@ async def test_auto_create_claude_terminal_honors_compatible_claude_env_override
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -1082,7 +1080,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -1176,7 +1174,7 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -1274,7 +1272,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -1294,7 +1292,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -1305,9 +1303,9 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         model="databricks-claude-opus-4-7",
     )
     # The runner imports ``_ucode_config_for_profile`` from
-    # ``omnigent.claude_native`` per call, so patch it at the source.
+    # ``omnigent.harnesses.claude_native.main`` per call, so patch it at the source.
     monkeypatch.setattr(
-        "omnigent.claude_native._ucode_config_for_profile",
+        "omnigent.harnesses.claude_native.main._ucode_config_for_profile",
         lambda profile, *, refresh_models=True: ucode,
     )
 
@@ -1392,7 +1390,7 @@ async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_fai
     lifetime. A resolver exception leaves the cache UNSET,
     so a later successful resolution still gets recorded.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     class _FakeResourceRegistry:
         """Records the launched terminal spec; returns a stub view."""
@@ -1499,17 +1497,19 @@ async def _run_auto_create_cursor_terminal(
     workspace.mkdir()
     monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setattr("omnigent.cursor_native.resolve_cursor_executable", lambda: "cursor-agent")
+    monkeypatch.setattr(
+        "omnigent.harnesses.cursor_native.main.resolve_cursor_executable", lambda: "cursor-agent"
+    )
 
     async def _no_op_forwarder(**kwargs: Any) -> None:
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.cursor_native_forwarder.supervise_cursor_forwarder",
+        "omnigent.harnesses.cursor_native.forwarder.supervise_cursor_forwarder",
         _no_op_forwarder,
     )
     monkeypatch.setattr(
-        "omnigent.cursor_native_usage.supervise_cursor_usage_forwarder",
+        "omnigent.harnesses.cursor_native.usage.supervise_cursor_usage_forwarder",
         _no_op_forwarder,
     )
     # The forwarder is stubbed, so the auth it would carry is never used — keep
@@ -1524,7 +1524,7 @@ async def _run_auto_create_cursor_terminal(
         started.set()
 
     monkeypatch.setattr(
-        "omnigent.cursor_native_permissions.supervise_cursor_transcript_elicitations",
+        "omnigent.harnesses.cursor_native.permissions.supervise_cursor_transcript_elicitations",
         _capture_elicitation_supervisor,
     )
 
@@ -1750,7 +1750,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         forwarder_kwargs.update(kwargs)
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _capture_forwarder,
     )
 
@@ -1774,7 +1774,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         return tmp_path / f"{external_session_id}.jsonl"
 
     monkeypatch.setattr(
-        "omnigent.claude_native._ensure_local_claude_resume_transcript",
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
         _fake_synth,
     )
 
@@ -1921,7 +1921,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         return tmp_path / f"{external_session_id}.jsonl"
 
     monkeypatch.setattr(
-        "omnigent.claude_native._ensure_local_claude_resume_transcript",
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
         _fake_synth,
     )
 
@@ -1931,7 +1931,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         forwarder_kwargs.update(kwargs)
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _capture_forwarder,
     )
 
@@ -2035,7 +2035,7 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -2313,7 +2313,7 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -2425,7 +2425,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -2942,7 +2942,7 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
     target again).
     """
     monkeypatch.setattr(
-        "omnigent.antigravity_native_bridge._BRIDGE_ROOT",
+        "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT",
         tmp_path / "antigravity-native",
     )
 
@@ -3195,7 +3195,7 @@ async def test_create_session_codex_auto_create_guard_skips_rotation_targets(
     antigravity-native guard tests above.
     """
     monkeypatch.setattr(
-        "omnigent.codex_native_bridge._BRIDGE_ROOT",
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT",
         tmp_path / "codex-native",
     )
 
@@ -3348,7 +3348,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         forwarder_kwargs.update(kwargs)
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -3453,7 +3453,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         cost-control field, which is the shape a sub-agent child of a routed
         parent is created with.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3469,7 +3469,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
@@ -3487,7 +3487,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         model="databricks-claude-opus-4-7",
     )
     monkeypatch.setattr(
-        "omnigent.claude_native._ucode_config_for_profile",
+        "omnigent.harnesses.claude_native.main._ucode_config_for_profile",
         lambda profile, *, refresh_models=True: ucode,
     )
 
@@ -3651,7 +3651,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     rather than refuse the resume; a gateway, which routes only its own
     spellings, launches on its own default instead and resets the pick to Default.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3661,7 +3661,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
     prefix = "" if endpoint == "subscription" else "system.ai."
@@ -3679,7 +3679,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         del config
         return catalog
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
 
     captured: dict[str, Any] = {}
 
@@ -3774,7 +3774,7 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
     catalog = [
@@ -3791,9 +3791,10 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
         del config
         return catalog
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
     monkeypatch.setattr(
-        "omnigent.claude_native.claude_launch_catalog_is_stale", lambda config: False
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog_is_stale",
+        lambda config: False,
     )
 
     captured: dict[str, Any] = {}
@@ -3877,9 +3878,10 @@ async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fail
         del config
         return catalog
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
     monkeypatch.setattr(
-        "omnigent.claude_native.claude_launch_catalog_is_stale", lambda config: False
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog_is_stale",
+        lambda config: False,
     )
 
     class _FailingResourceRegistry:
@@ -3940,7 +3942,7 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     import time
 
     from omnigent import model_catalog_store
-    from omnigent.claude_native import claude_catalog_fingerprint
+    from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
     from tests.runner.conftest import (
         REAL_CLAUDE_LAUNCH_CATALOG,
         REAL_CLAUDE_REPROBED_LAUNCH_CATALOG,
@@ -3954,12 +3956,14 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
     monkeypatch.setattr(
-        "omnigent.claude_native.claude_reprobed_launch_catalog",
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_reprobed_launch_catalog",
         REAL_CLAUDE_REPROBED_LAUNCH_CATALOG,
     )
     stale_rows = [
@@ -3983,7 +3987,7 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
             raise OSError("provider unreachable")
         return refreshed_rows
 
-    monkeypatch.setattr("omnigent.claude_native.claude_model_catalog", _probe)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_model_catalog", _probe)
     fingerprint = claude_catalog_fingerprint(None)
     model_catalog_store.write_catalog("claude-native", fingerprint, stale_rows)
     path = model_catalog_store.catalog_path("claude-native", fingerprint)
@@ -4089,7 +4093,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
     through its resolved provider option, so the fold must consult the
     resolved spelling too, and the pick must survive the launch un-reset.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -4099,7 +4103,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
     catalog = [
@@ -4111,7 +4115,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
         del config
         return catalog
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
 
     captured: dict[str, Any] = {}
 
@@ -4201,7 +4205,7 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     import time
 
     from omnigent import model_catalog_store
-    from omnigent.claude_native import claude_catalog_fingerprint
+    from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
@@ -4212,19 +4216,23 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         del kwargs
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
     # The real store-backed resolver, against the conftest-isolated store
     # dir; the background re-probe is stubbed so no real CLI ever runs.
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
     refreshed = [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
 
     async def _fake_probe_catalog(config: object) -> list[dict[str, object]]:
         del config
         return refreshed
 
-    monkeypatch.setattr("omnigent.claude_native.claude_model_catalog", _fake_probe_catalog)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_model_catalog", _fake_probe_catalog
+    )
     fingerprint = claude_catalog_fingerprint(None)
     model_catalog_store.write_catalog(
         "claude-native",
