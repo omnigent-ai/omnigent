@@ -9,6 +9,7 @@ import pytest
 
 from omnigent.runtime.credentials.databricks import (
     WorkspaceCreds,
+    _clear_sdk_config_cache,
     resolve_databricks_workspace,
 )
 
@@ -30,6 +31,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     Each test that wants to exercise the SDK path explicitly
     overrides this monkeypatch (see ``test_resolves_via_sdk_*``).
     """
+    _clear_sdk_config_cache()
     for var in (
         "DATABRICKS_CONFIG_FILE",
         "DATABRICKS_CONFIG_PROFILE",
@@ -466,6 +468,76 @@ def test_sdk_value_error_does_not_emit_warning(
     assert exc_info is not None and exc_info[2] is not None, (
         "INFO record must carry exc_info with a real traceback."
     )
+
+
+def test_sdk_config_constructed_once_per_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A single launch resolves the same profile through several call
+    # sites (host resolution, model catalog, policy build, executor).
+    # Constructing Config per resolution shells out to the Databricks
+    # CLI each time, so the resolver must construct once per profile
+    # and lean on the SDK's own token caching for freshness.
+    constructions: list[str | None] = []
+    authentications = 0
+
+    class _CountingConfig:
+        def __init__(self, *, profile: str | None) -> None:
+            constructions.append(profile)
+            self.host = "https://sdk.example.com"
+
+        def authenticate(self) -> dict[str, str]:
+            nonlocal authentications
+            authentications += 1
+            return {"Authorization": "Bearer sdk-minted-token"}
+
+    monkeypatch.setattr("databricks.sdk.config.Config", _CountingConfig)
+
+    creds1 = resolve_databricks_workspace(profile="dev")
+    creds2 = resolve_databricks_workspace(profile="dev")
+    resolve_databricks_workspace(profile="other")
+
+    assert constructions == ["dev", "other"]
+    # Every resolution still authenticates — token freshness is the
+    # SDK's job, not skipped by the shared Config.
+    assert authentications == 3
+    assert (
+        creds1
+        == creds2
+        == WorkspaceCreds(host="https://sdk.example.com", token="sdk-minted-token")
+    )
+
+
+def test_failed_sdk_construction_is_not_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A Config that fails to construct (e.g. unknown profile) must not
+    # be pinned in the cache: the user can fix the cfg file and the next
+    # resolution has to retry construction rather than replay the failure.
+    class _FlakyConfig:
+        constructions = 0
+
+        def __init__(self, *, profile: str | None) -> None:
+            type(self).constructions += 1
+            if type(self).constructions == 1:
+                raise ValueError("unknown profile")
+            self.host = "https://sdk.example.com"
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer sdk-minted-token"}
+
+    monkeypatch.setattr("databricks.sdk.config.Config", _FlakyConfig)
+    cfg = _write_cfg(
+        tmp_path,
+        "[dev]\nhost = https://cfg-fallback.example.com\ntoken = cfg-token\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    # First resolve: construction fails, falls through to the cfg file.
+    assert resolve_databricks_workspace(profile="dev").host == "https://cfg-fallback.example.com"
+    # Second resolve: construction retried and succeeds — the earlier
+    # failure was not cached.
+    creds = resolve_databricks_workspace(profile="dev")
+    assert creds == WorkspaceCreds(host="https://sdk.example.com", token="sdk-minted-token")
+    assert _FlakyConfig.constructions == 2
 
 
 def test_honors_databricks_config_file_env(

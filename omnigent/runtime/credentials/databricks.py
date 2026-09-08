@@ -37,12 +37,14 @@ the same module. Once the ``inner/`` package is sunset (see
 ``designs/UNIFICATION.md``), both functions there should be deleted in
 favor of calling this helper.
 
-**v1 limitation (documented):** the SDK-minted token is fetched once
-per call and then cached in the returned :class:`WorkspaceCreds`. OAuth
-access tokens typically expire after ~1 hour. Long-running sessions
-will therefore hit expiry mid-stream. v2 will refactor callers to
-hold the SDK ``Config`` object and re-call ``authenticate()`` on
-demand (which performs refresh-token handling transparently).
+**Token freshness:** the SDK ``Config`` is cached per profile for the
+life of the process (:func:`_sdk_config_for`), and every resolution
+re-calls ``authenticate()`` on it. The SDK's own token source returns
+its cached token while valid and refreshes transparently on expiry, so
+repeat resolutions in one process do not re-spawn the Databricks CLI,
+and long-running processes still rotate tokens. The returned
+:class:`WorkspaceCreds` is a point-in-time snapshot; callers that hold
+it for longer than a token's lifetime should re-resolve instead.
 """
 
 from __future__ import annotations
@@ -50,8 +52,13 @@ from __future__ import annotations
 import configparser
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from databricks.sdk.config import Config
 
 _logger = logging.getLogger(__name__)
 
@@ -66,6 +73,42 @@ ENV_DATABRICKS_CONFIG_FILE: str = "DATABRICKS_CONFIG_FILE"
 
 # Section name used by ConfigParser for the implicit default section.
 DEFAULT_SECTION: str = "DEFAULT"
+
+# One SDK Config per profile per process. Constructing Config eagerly
+# resolves the credential chain — for ``databricks-cli`` profiles that
+# shells out to the CLI — while ``authenticate()`` on an existing Config
+# reuses its cached token until expiry, so the cache turns N resolutions
+# into one CLI spawn without pinning a stale token.
+_SDK_CONFIG_LOCK = threading.Lock()
+_SDK_CONFIG_CACHE: dict[str | None, Config] = {}
+
+
+def _sdk_config_for(profile: str | None) -> Config:
+    """
+    Return the process-wide SDK ``Config`` for *profile*, creating it once.
+
+    Construction failures (e.g. an unknown profile) are not cached: the
+    cfg file may be fixed between resolutions, and construction is the
+    SDK's own retry point. Re-calling ``authenticate()`` on the returned
+    Config performs refresh handling transparently.
+
+    :param profile: The resolved profile name, or ``None`` for the SDK's
+        default chain.
+    """
+    from databricks.sdk.config import Config
+
+    with _SDK_CONFIG_LOCK:
+        cfg = _SDK_CONFIG_CACHE.get(profile)
+        if cfg is None:
+            cfg = Config(profile=profile)
+            _SDK_CONFIG_CACHE[profile] = cfg
+        return cfg
+
+
+def _clear_sdk_config_cache() -> None:
+    """Drop cached SDK Configs; for tests that swap cfg files or profiles."""
+    with _SDK_CONFIG_LOCK:
+        _SDK_CONFIG_CACHE.clear()
 
 
 @dataclass(frozen=True)
@@ -295,22 +338,20 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
         or ``None`` if the SDK could not produce one (import failed,
         config invalid, non-Bearer auth scheme).
     """
+    # ``None`` means "let the SDK decide" (env var / DEFAULT section).
+    sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     try:
-        from databricks.sdk.config import Config
+        cfg = _sdk_config_for(sdk_profile)
+        headers = cfg.authenticate()
     except ImportError as exc:
         # Pinned dep missing = real env bug, not routine auth failure.
+        # Raised by the import inside ``_sdk_config_for``.
         _logger.warning(
             "databricks-sdk is not importable: %s — OAuth profiles will be invisible "
             "to the resolver, falling through to configparser path.",
             exc,
         )
         return None
-
-    # ``None`` means "let the SDK decide" (env var / DEFAULT section).
-    sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
-    try:
-        cfg = Config(profile=sdk_profile)
-        headers = cfg.authenticate()
     except ValueError as exc:
         # INFO (not WARNING): expired tokens raise here. WARNING would
         # surface via root's lastResort handler to stderr, drowning the
@@ -342,7 +383,7 @@ def _try_resolve_via_sdk(profile: str | None) -> WorkspaceCreds | None:
     The SDK's ``Config(profile=...).authenticate()`` covers every
     ``auth_type`` in ``~/.databrickscfg`` (``pat``, ``databricks-cli`` /
     OAuth-U2M, service-principal OAuth, Azure CLI, env-OIDC, metadata-
-    service, etc.) and always returns a freshly-minted bearer. For
+    service, etc.) and returns a bearer the SDK refreshes as needed. For
     OAuth profiles whose cfg has no static ``token`` field, this is
     the ONLY path that yields a usable token — the raw configparser
     fallback returns ``None`` for those.
