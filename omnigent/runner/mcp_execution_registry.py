@@ -4,7 +4,8 @@ The Omnigent server reaches local MCP processes through a tunneled runner
 request.  A server restart cancels that request, but it must not cancel and
 then replay an external tool that may already have side effects.  This
 registry shields the actual execution and lets the next server generation
-reattach with the same operation id and step.
+reattach with the same operation id and step. The originating proxy reserves
+the operation until its call ends, so completed steps cannot expire mid-retry.
 """
 
 from __future__ import annotations
@@ -12,9 +13,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from time import monotonic
 
 from omnigent.json_types import JsonObject
 
@@ -60,10 +61,35 @@ class McpExecutionRegistry:
 
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str, str], _Execution] = {}
+        self._operation_leases: dict[tuple[str, str], int] = {}
+        self._released_at: dict[tuple[str, str], float] = {}
+
+    def retain_operation(self, session_id: str, operation_id: str) -> None:
+        """Keep an operation reattachable while its originating call is live."""
+        key = (session_id, operation_id)
+        self._operation_leases[key] = self._operation_leases.get(key, 0) + 1
+        self._released_at.pop(key, None)
+        self._prune()
+
+    def release_operation(self, session_id: str, operation_id: str) -> None:
+        """Release one live caller's retention lease."""
+        key = (session_id, operation_id)
+        leases = self._operation_leases.get(key, 0)
+        if leases > 1:
+            self._operation_leases[key] = leases - 1
+            return
+        if leases == 0:
+            return
+        self._operation_leases.pop(key, None)
+        if any(entry_key[:2] == key for entry_key in self._entries):
+            self._released_at[key] = monotonic()
+        self._prune()
 
     def has_operation(self, session_id: str, operation_id: str) -> bool:
-        """Return whether any step for an operation is retained."""
+        """Return whether an operation is reserved or has a retained step."""
         self._prune()
+        if (session_id, operation_id) in self._operation_leases:
+            return True
         return any(
             stored_session == session_id and stored_operation == operation_id
             for stored_session, stored_operation, _step in self._entries
@@ -90,6 +116,7 @@ class McpExecutionRegistry:
                     "refusing to execute the external tool again"
                 )
         else:
+
             async def _run() -> McpExecutionResult:
                 return await run()
 
@@ -101,7 +128,7 @@ class McpExecutionRegistry:
             self._entries[key] = entry
 
             def _mark_completed(_task: asyncio.Task[McpExecutionResult]) -> None:
-                entry.completed_at = time.monotonic()
+                entry.completed_at = monotonic()
 
             task.add_done_callback(_mark_completed)
 
@@ -111,6 +138,13 @@ class McpExecutionRegistry:
 
     async def cancel_session(self, session_id: str) -> None:
         """Cancel and forget retained operations for a deleted session."""
+        for key in tuple(self._operation_leases):
+            if key[0] == session_id:
+                self._operation_leases.pop(key, None)
+        for key in tuple(self._released_at):
+            if key[0] == session_id:
+                self._released_at.pop(key, None)
+
         tasks: list[asyncio.Task[McpExecutionResult]] = []
         for key, entry in tuple(self._entries.items()):
             if key[0] != session_id:
@@ -123,18 +157,29 @@ class McpExecutionRegistry:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _prune(self) -> None:
-        """Bound retention of completed results; never evict active work."""
-        now = time.monotonic()
-        completed: list[tuple[tuple[str, str, str], _Execution]] = []
+        """Bound unleased completed results; never evict live caller work."""
+        now = monotonic()
+        completed: list[tuple[tuple[str, str, str], _Execution, float]] = []
         for key, entry in tuple(self._entries.items()):
             if entry.completed_at is None:
                 continue
-            if now - entry.completed_at >= _COMPLETED_TTL_S:
+            operation_key = key[:2]
+            if operation_key in self._operation_leases:
+                continue
+            retained_at = max(
+                entry.completed_at,
+                self._released_at.get(operation_key, entry.completed_at),
+            )
+            if now - retained_at >= _COMPLETED_TTL_S:
                 self._entries.pop(key, None)
                 continue
-            completed.append((key, entry))
-        if len(completed) <= _MAX_COMPLETED:
-            return
-        completed.sort(key=lambda item: item[1].completed_at or 0.0)
-        for key, _entry in completed[: len(completed) - _MAX_COMPLETED]:
-            self._entries.pop(key, None)
+            completed.append((key, entry, retained_at))
+        if len(completed) > _MAX_COMPLETED:
+            completed.sort(key=lambda item: item[2])
+            for key, _entry, _retained_at in completed[: len(completed) - _MAX_COMPLETED]:
+                self._entries.pop(key, None)
+
+        retained_operations = {key[:2] for key in self._entries}
+        for key in tuple(self._released_at):
+            if key not in retained_operations:
+                self._released_at.pop(key, None)

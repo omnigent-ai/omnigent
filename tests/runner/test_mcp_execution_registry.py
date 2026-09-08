@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionConflict,
     McpExecutionRegistry,
@@ -63,6 +64,47 @@ async def test_cancelled_tunnel_waiter_reattaches_without_reexecuting() -> None:
         content={"result": {"output": "done"}},
     )
     assert invocations == 1
+
+
+@pytest.mark.asyncio
+async def test_live_operation_lease_survives_result_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live proxy call must retain completed steps until it returns."""
+    monkeypatch.setattr(mcp_execution_registry_mod, "_COMPLETED_TTL_S", 0.0)
+    monkeypatch.setattr(mcp_execution_registry_mod, "_MAX_COMPLETED", 0)
+    registry = McpExecutionRegistry()
+    invocations = 0
+
+    async def _external_work() -> McpExecutionResult:
+        nonlocal invocations
+        invocations += 1
+        return McpExecutionResult(status_code=200, content={"result": {"output": "done"}})
+
+    registry.retain_operation("conv_restart", "mcpop_restart")
+    assert registry.has_operation("conv_restart", "mcpop_restart")
+
+    request = {"name": "deploy", "arguments": {}}
+    first = await registry.execute(
+        session_id="conv_restart",
+        operation_id="mcpop_restart",
+        step="initial",
+        params=request,
+        run=_external_work,
+    )
+    second = await registry.execute(
+        session_id="conv_restart",
+        operation_id="mcpop_restart",
+        step="initial",
+        params=request,
+        run=_external_work,
+    )
+
+    assert first == second
+    assert invocations == 1
+
+    registry.release_operation("conv_restart", "mcpop_restart")
+    assert not registry.has_operation("conv_restart", "mcpop_restart")
 
 
 @pytest.mark.asyncio

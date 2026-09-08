@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
@@ -453,8 +454,13 @@ async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_reattaches_retained_execution_after_server_disconnect() -> None:
-    """A replacement server attaches to the original runner-owned operation."""
+async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect wait pins completed work past its normal retention window."""
+    clock = 0.0
+    monkeypatch.setattr(mcp_execution_registry_mod, "_COMPLETED_TTL_S", 1.0)
+    monkeypatch.setattr(mcp_execution_registry_mod, "monotonic", lambda: clock)
     registry = McpExecutionRegistry()
 
     class _DetachThenSucceedTransport(httpx.AsyncBaseTransport):
@@ -466,22 +472,22 @@ async def test_call_tool_reattaches_retained_execution_after_server_disconnect()
             body = json.loads(request.content)
             self.calls.append(_Call(url=str(request.url), body=body))
             operation_id = body["params"][MCP_OPERATION_ID_PARAM]
-            if len(self.calls) == 1:
 
-                async def _retained_work() -> McpExecutionResult:
-                    self.external_invocations += 1
-                    return McpExecutionResult(
-                        status_code=200,
-                        content={"result": {"output": "retained"}},
-                    )
-
-                await registry.execute(
-                    session_id="conv_test",
-                    operation_id=operation_id,
-                    step="initial",
-                    params={"name": "github__deploy", "arguments": {}},
-                    run=_retained_work,
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(
+                    status_code=200,
+                    content={"result": {"output": "retained"}},
                 )
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=operation_id,
+                step="initial",
+                params={"name": "github__deploy", "arguments": {}},
+                run=_retained_work,
+            )
+            if len(self.calls) == 1:
                 return _json_resp(
                     {
                         "jsonrpc": "2.0",
@@ -514,9 +520,11 @@ async def test_call_tool_reattaches_retained_execution_after_server_disconnect()
     task = asyncio.create_task(manager.call_tool(None, "github__deploy", {}))
     try:
         for _ in range(1000):
-            if transport.calls:
+            if pending_approvals._server_reconnect_waiters:
                 break
             await asyncio.sleep(0.001)
+        assert pending_approvals._server_reconnect_waiters
+        clock = 2.0
         pending_approvals.notify_server_reconnect()
 
         assert await task == "reattached"

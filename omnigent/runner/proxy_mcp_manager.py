@@ -325,8 +325,24 @@ class ProxyMcpManager:
         """
         del spec  # Omnigent server resolves spec from session context
 
-        request_id = 1
         operation_id = f"mcpop_{uuid.uuid4().hex}"
+        registry = self._execution_registry
+        if registry is not None:
+            registry.retain_operation(self._session_id, operation_id)
+        try:
+            return await self._call_tool_with_operation(tool_name, arguments, operation_id)
+        finally:
+            if registry is not None:
+                registry.release_operation(self._session_id, operation_id)
+
+    async def _call_tool_with_operation(
+        self,
+        tool_name: str,
+        arguments: _JsonObject,
+        operation_id: str,
+    ) -> str:
+        """Run one proxy call under an already-retained operation id."""
+        request_id = 1
 
         def _initial_payload() -> _JsonObject:
             return {
@@ -348,7 +364,7 @@ class ProxyMcpManager:
             if registry is None or not registry.has_operation(self._session_id, operation_id):
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
-                    f"{self._session_id!r} lost its server without a retained "
+                    f"{self._session_id!r} lost its server without a reserved "
                     "runner operation"
                 ) from cause
             try:
