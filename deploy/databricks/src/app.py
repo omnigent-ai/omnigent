@@ -170,6 +170,7 @@ try:
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 
     # OTel: the Databricks Apps platform auto-injects
     # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
@@ -238,6 +239,7 @@ try:
     project_store = SqlAlchemyProjectStore(DB_URI)
     host_store = HostStore(DB_URI)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
+    user_preferences_store = SqlAlchemyUserPreferencesStore(DB_URI)
 
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR)
 
@@ -278,6 +280,7 @@ try:
         project_store=project_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
+        user_preferences_store=user_preferences_store,
         auth_provider=auth_provider,
     )
 

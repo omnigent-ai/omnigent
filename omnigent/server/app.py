@@ -14,10 +14,10 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -60,7 +60,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -78,6 +78,8 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -104,6 +106,19 @@ from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.schemas import (
+    CurrentUserResponse,
+    UserPreferenceNamespace,
+    UserPreferenceNamespacePatchRequest,
+    UserPreferencesEnvelope,
+)
+from omnigent.server.user_preferences_store import (
+    USER_PREFERENCE_NAMESPACES,
+    USER_PREFERENCES_MAX_BYTES,
+    SqlAlchemyUserPreferencesStore,
+    UserPreferencesUserNotFoundError,
+    UserPreferencesValidationError,
+)
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1075,6 +1090,7 @@ def create_app(
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
+    user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
     debug_router_modules: list[str] | None = None,
@@ -1133,6 +1149,9 @@ def create_app(
     :param host_store: Store for host registrations. ``None``
         disables host connectivity features (list hosts, launch
         runners on remote hosts).
+    :param user_preferences_store: Store for authenticated, cross-device user
+        preferences. ``None`` leaves ``/v1/me.preferences`` unset and makes
+        preference mutation endpoints unavailable.
     :param policy_modules: Additional dotted module paths to
         scan for ``POLICY_REGISTRY`` lists at startup, e.g.
         ``["myorg.policies.safety"]``. Sourced from the server
@@ -2494,8 +2513,12 @@ def create_app(
             headers={"X-Content-Type-Options": "nosniff"},
         )
 
-    @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
-    async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
+    @app.get(
+        "/v1/me",
+        response_model=CurrentUserResponse,
+        response_model_exclude_unset=True,
+    )
+    async def me(request: Request, http_response: Response) -> dict[str, Any] | JSONResponse:
         """Return the current user's identity.
 
         Reads the user from the auth provider (same logic that
@@ -2525,7 +2548,9 @@ def create_app(
             return JSONResponse(
                 status_code=401,
                 content={"user_id": None, "login_url": login_url},
+                headers={"Cache-Control": "private, no-store"},
             )
+        http_response.headers["Cache-Control"] = "private, no-store"
         # Mirror the admin check the auth routes use
         # (``permission_store.is_admin(caller) or admin_list.is_admin(caller)``)
         # so the SPA's admin chrome never under-reports relative to what the
@@ -2536,7 +2561,216 @@ def create_app(
             (permission_store is not None and permission_store.is_admin(user_id))
             or admin_list.is_admin(user_id)
         )
-        return {"user_id": user_id, "is_admin": is_admin}
+        preferences = None
+        preferences_owner: str | None = None
+        if auth_provider is None:
+            preferences_owner = RESERVED_USER_LOCAL
+        elif user_id is not None:
+            preferences_owner = user_id
+        if user_preferences_store is not None and preferences_owner is not None:
+            preferences = await asyncio.to_thread(
+                user_preferences_store.get,
+                preferences_owner,
+            )
+        response: dict[str, Any] = {
+            "user_id": user_id,
+            "is_admin": is_admin,
+        }
+        # Preserve the response contract for create_app consumers that have not
+        # adopted preferences persistence.
+        if user_preferences_store is not None:
+            response["preferences"] = preferences
+        return response
+
+    def _preferences_store() -> SqlAlchemyUserPreferencesStore:
+        if user_preferences_store is None:
+            raise StarletteHTTPException(
+                status_code=503,
+                detail="Synced user preferences are unavailable",
+            )
+        return user_preferences_store
+
+    def _preferences_owner(request: Request) -> tuple[str, bool]:
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        from omnigent.server.auth import UnifiedAuthProvider
+
+        accounts_mode = (
+            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        )
+        # Accounts are created only by the account lifecycle. The store checks
+        # the user row inside its write transaction, so a stale cookie cannot
+        # recreate an account deleted concurrently with this request.
+        return owner, not accounts_mode
+
+    _preferences_http_max_bytes = USER_PREFERENCES_MAX_BYTES + 4096
+
+    async def _read_preferences_body(request: Request, model: type[BaseModel]) -> BaseModel:
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > _preferences_http_max_bytes:
+                    raise StarletteHTTPException(
+                        status_code=413,
+                        detail="Preferences body too large",
+                    )
+            except ValueError as exc:
+                raise StarletteHTTPException(
+                    status_code=400,
+                    detail="Invalid Content-Length",
+                ) from exc
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > _preferences_http_max_bytes:
+                raise StarletteHTTPException(status_code=413, detail="Preferences body too large")
+        try:
+            return model.model_validate_json(bytes(body))
+        except ValidationError as exc:
+            raise StarletteHTTPException(
+                status_code=422,
+                detail="Invalid preferences payload",
+            ) from exc
+
+    _preference_write_hits: dict[str, list[float]] = {}
+    _preference_last_rate_cleanup = 0.0
+
+    _preferences_envelope_request_schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["version", "settings"],
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "settings": {
+                "type": "object",
+                "propertyNames": {"enum": sorted(USER_PREFERENCE_NAMESPACES)},
+                "additionalProperties": {},
+            },
+        },
+    }
+    _preferences_patch_request_schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["value"],
+        "properties": {"value": {}},
+    }
+    _preferences_error_responses: dict[int | str, dict[str, Any]] = {
+        400: {"description": "Invalid Content-Length header"},
+        401: {"description": "Authentication required or account deleted"},
+        413: {"description": "Request body exceeds the preferences limit"},
+        415: {"description": "Request body is not application/json"},
+        422: {"description": "Invalid preferences payload or namespace"},
+        429: {"description": "Per-user write rate exceeded"},
+        503: {"description": "Preferences persistence is unavailable"},
+    }
+
+    def _check_preference_write_rate(owner: str) -> None:
+        nonlocal _preference_last_rate_cleanup
+        now = time.monotonic()
+        cutoff = now - 60.0
+        hits = [hit for hit in _preference_write_hits.get(owner, ()) if hit > cutoff]
+        if len(hits) >= 120:
+            _preference_write_hits[owner] = hits
+            raise StarletteHTTPException(
+                status_code=429,
+                detail="Too many preference updates",
+                headers={"Retry-After": "60"},
+            )
+        if owner not in _preference_write_hits and len(_preference_write_hits) >= 10_000:
+            # Throttle the full-map cleanup so rotating new identities cannot
+            # turn a bounded-memory guard into repeated O(n) work.
+            if now - _preference_last_rate_cleanup >= 1.0:
+                _preference_last_rate_cleanup = now
+                expired = [
+                    key
+                    for key, key_hits in _preference_write_hits.items()
+                    if not key_hits or key_hits[-1] <= cutoff
+                ]
+                for key in expired:
+                    _preference_write_hits.pop(key, None)
+            if len(_preference_write_hits) >= 10_000:
+                raise StarletteHTTPException(
+                    status_code=429,
+                    detail="Too many preference updates",
+                    headers={"Retry-After": "60"},
+                )
+        hits.append(now)
+        _preference_write_hits[owner] = hits
+
+    @app.put(
+        "/v1/me/preferences",
+        response_model=UserPreferencesEnvelope,
+        dependencies=[Depends(require_json_content_type)],
+        responses=_preferences_error_responses,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": _preferences_envelope_request_schema}},
+            }
+        },
+    )
+    async def initialize_user_preferences(
+        request: Request,
+    ) -> UserPreferencesEnvelope:
+        """Initialize the caller's full preference envelope exactly once."""
+        store = _preferences_store()
+        owner, create_if_missing = _preferences_owner(request)
+        _check_preference_write_rate(owner)
+        body = await _read_preferences_body(request, UserPreferencesEnvelope)
+        assert isinstance(body, UserPreferencesEnvelope)
+        try:
+            persisted = await asyncio.to_thread(
+                store.initialize,
+                owner,
+                body.model_dump(mode="python"),
+                create_if_missing=create_if_missing,
+            )
+        except UserPreferencesUserNotFoundError as exc:
+            raise StarletteHTTPException(
+                status_code=401,
+                detail="Account no longer exists",
+            ) from exc
+        except UserPreferencesValidationError as exc:
+            raise StarletteHTTPException(status_code=422, detail=str(exc)) from exc
+        return UserPreferencesEnvelope.model_validate(persisted)
+
+    @app.patch(
+        "/v1/me/preferences/{namespace}",
+        response_model=UserPreferencesEnvelope,
+        dependencies=[Depends(require_json_content_type)],
+        responses=_preferences_error_responses,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": _preferences_patch_request_schema}},
+            }
+        },
+    )
+    async def patch_user_preferences_namespace(
+        namespace: UserPreferenceNamespace,
+        request: Request,
+    ) -> UserPreferencesEnvelope:
+        """Atomically merge or remove one namespace for the current user."""
+        store = _preferences_store()
+        owner, create_if_missing = _preferences_owner(request)
+        _check_preference_write_rate(owner)
+        body = await _read_preferences_body(request, UserPreferenceNamespacePatchRequest)
+        assert isinstance(body, UserPreferenceNamespacePatchRequest)
+        try:
+            persisted = await asyncio.to_thread(
+                store.patch_namespace,
+                owner,
+                namespace,
+                body.value,
+                create_if_missing=create_if_missing,
+            )
+        except UserPreferencesUserNotFoundError as exc:
+            raise StarletteHTTPException(
+                status_code=401,
+                detail="Account no longer exists",
+            ) from exc
+        except UserPreferencesValidationError as exc:
+            raise StarletteHTTPException(status_code=422, detail=str(exc)) from exc
+        return UserPreferencesEnvelope.model_validate(persisted)
 
     app.include_router(
         create_sessions_router(

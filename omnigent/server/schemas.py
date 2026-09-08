@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     SerializerFunctionWrapHandler,
     Strict,
     field_validator,
@@ -30,6 +31,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.server.user_preferences_store import validate_preferences_envelope
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -58,6 +60,46 @@ class PaginatedList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+
+
+UserPreferenceNamespace = Literal[
+    "keyboard_shortcuts",
+    "mobile_assistant",
+    "session_navigation",
+    "context_indicator",
+    "usage_context",
+    "agent_badges",
+]
+
+
+class UserPreferencesEnvelope(BaseModel):
+    """Versioned, allowlisted cross-device preference payload."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: Literal[1]
+    settings: dict[UserPreferenceNamespace, JsonValue]
+
+    @model_validator(mode="after")
+    def _validate_persisted_contract(self) -> Self:
+        validate_preferences_envelope(self.model_dump(mode="python"))
+        return self
+
+
+class UserPreferenceNamespacePatchRequest(BaseModel):
+    """Atomic partial update for one preference namespace."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    value: JsonValue | None
+
+
+class CurrentUserResponse(BaseModel):
+    """Authenticated identity and optional synchronized preferences."""
+
+    user_id: str | None
+    is_admin: bool
+    preferences: UserPreferencesEnvelope | None = None
 
 
 # ── Agents ──────────────────────────────────────────────────────

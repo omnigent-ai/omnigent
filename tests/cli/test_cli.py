@@ -2314,6 +2314,12 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert captured["create_app_kwargs"]["server_config"] == {
         "session_title_instructions": "Prefix titles with the current date."
     }
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+    assert isinstance(
+        captured["create_app_kwargs"]["user_preferences_store"],
+        SqlAlchemyUserPreferencesStore,
+    )
 
 
 def test_server_explicit_config_overrides_omnigent_config_env(
