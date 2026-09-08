@@ -3203,9 +3203,12 @@ async def _maybe_handle_turn_event(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 _logger.warning(
-                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                    "Failed to persist codex compaction item for %s: %s",
+                    session_id,
+                    _compaction_persist_failure_reason(exc),
+                    exc_info=True,
                 )
             else:
                 if forwarder_state is not None:
@@ -4568,9 +4571,12 @@ async def _handle_completed_item(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 _logger.warning(
-                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                    "Failed to persist codex compaction item for %s: %s",
+                    session_id,
+                    _compaction_persist_failure_reason(exc),
+                    exc_info=True,
                 )
             else:
                 if forwarder_state is not None:
@@ -6230,6 +6236,24 @@ async def _post_compaction_status(
         forwarder_state.compaction_status_posted = status
         if status == "in_progress":
             forwarder_state.compaction_item_persisted = False
+
+
+def _compaction_persist_failure_reason(exc: BaseException) -> str:
+    """Describe why persisting a compaction item failed.
+
+    ``raise_for_status`` reports only the status and URL, so a 4xx rejection of
+    the compaction payload was undiagnosable from logs -- which field the server
+    objected to is stated only in the response body.
+
+    :param exc: The exception raised while persisting.
+    :returns: A one-line reason, e.g. ``"server returned 400: ..."``.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        body_preview = exc.response.text[:200] if exc.response.content else ""
+        return f"server returned {exc.response.status_code}" + (
+            f": {body_preview}" if body_preview else ""
+        )
+    return f"{type(exc).__name__}: {exc}"
 
 
 async def _persist_codex_compaction_item(
