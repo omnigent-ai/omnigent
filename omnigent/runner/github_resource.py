@@ -57,11 +57,16 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
-# non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
-# both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
-_PR_VIEW_FIELDS = (
-    "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
-)
+# non-interactive subprocess.
+#
+# The core set is returned by every supported ``gh``. ``body`` + ``comments``
+# (the Summary tab's description and conversation) are appended in the full set;
+# an older ``gh`` that predates the ``comments`` field rejects the whole call, so
+# ``github_info`` refetches the core set and flags the summary as unavailable.
+# Both sets are accepted by ``gh pr list`` too, so the fork-fallback path shares
+# them.
+_PR_CORE_FIELDS = "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup"
+_PR_VIEW_FIELDS = f"{_PR_CORE_FIELDS},body,comments"
 
 
 def _gh_timeout_seconds() -> float:
@@ -257,8 +262,19 @@ def _pushed_head_ref(root: str, branch: str) -> str | None:
     return out.strip().removeprefix("refs/heads/") or None
 
 
-def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
-    """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
+def _is_unknown_field_error(stderr: str) -> bool:
+    """Whether ``gh`` failed because a requested ``--json`` field is unknown.
+
+    An older ``gh`` that predates a field (e.g. ``comments``) exits non-zero with
+    ``Unknown JSON field: "<name>"`` — distinct from a "no PR"/auth/network
+    failure, so the caller can retry with a smaller field set rather than treat
+    the branch as having no PR.
+    """
+    return "unknown json field" in stderr.lower()
+
+
+def _pr_view_json(root: str, fields: str) -> tuple[dict[str, Any] | None, bool]:
+    """Return the branch's PR as a ``gh``-JSON object for ``fields``.
 
     Resolves the PR in a single ``gh`` call, choosing the query from a cheap git
     signal: whether the pushed ref (``branch.<name>.merge``) was *renamed* from
@@ -274,11 +290,16 @@ def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
     ``master``. Using ``gh pr list --head`` there would be wrong — it matches on
     the head ref name alone, so on ``master`` it returns a stranger's unrelated
     PR whose head merely happens to be named ``master``.
+
+    :returns: ``(data, fields_unsupported)``. ``data`` is the PR object, or
+        ``None`` when no PR resolves or ``gh`` failed. ``fields_unsupported`` is
+        ``True`` only when ``gh`` rejected a requested ``--json`` field (a CLI
+        that predates it), so the caller can retry with a reduced set.
     """
     branch = _current_branch(root)
     pushed_ref = _pushed_head_ref(root, branch) if branch is not None else None
     if pushed_ref is not None and pushed_ref != branch:
-        rc, out, _ = _gh(
+        rc, out, err = _gh(
             [
                 "pr",
                 "list",
@@ -294,23 +315,23 @@ def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
             cwd=root,
         )
         if rc != 0:
-            return None
+            return None, _is_unknown_field_error(err)
         try:
             rows = json.loads(out)
         except ValueError:
-            return None
+            return None, False
         if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-            return rows[0]
-        return None
+            return rows[0], False
+        return None, False
 
-    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root)
+    rc, out, err = _gh(["pr", "view", "--json", fields], cwd=root)
     if rc != 0:
-        return None
+        return None, _is_unknown_field_error(err)
     try:
         data = json.loads(out)
     except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
+        return None, False
+    return (data, False) if isinstance(data, dict) else (None, False)
 
 
 def github_info(root: str) -> dict[str, Any]:
@@ -364,7 +385,16 @@ def github_info(root: str) -> dict[str, Any]:
             pass
 
     pr: dict[str, Any] | None = None
-    data = _pr_view_json(root, _PR_VIEW_FIELDS)
+    data, fields_unsupported = _pr_view_json(root, _PR_VIEW_FIELDS)
+    # An older ``gh`` rejects the whole call over the ``comments`` field. Refetch
+    # the core set so the PR (header + diff) still resolves, and flag the summary
+    # unavailable so the UI can prompt a ``gh`` upgrade instead of the diff
+    # silently claiming the branch has no PR.
+    summary_supported = True
+    if data is None and fields_unsupported:
+        data, _ = _pr_view_json(root, _PR_CORE_FIELDS)
+        if data is not None:
+            summary_supported = False
     if data is not None:
         author = data.get("author")
         body = data.get("body")
@@ -382,6 +412,9 @@ def github_info(root: str) -> dict[str, Any]:
             # empty body is null so the UI shows its "no description" state.
             "body": body if isinstance(body, str) and body.strip() else None,
             "comments": _shape_comments(data.get("comments")),
+            # False only when a too-old ``gh`` couldn't return body/comments;
+            # the Summary tab then prompts an upgrade.
+            "summary_supported": summary_supported,
         }
     payload["pr"] = pr
 
@@ -450,7 +483,7 @@ def _pr_number(root: str) -> int | None:
     :returns: The associated PR's number, or ``None`` when no PR resolves (none
         for the branch, ``gh`` missing, or not authenticated).
     """
-    data = _pr_view_json(root, "number")
+    data, _ = _pr_view_json(root, "number")
     if data is None:
         return None
     number = data.get("number")

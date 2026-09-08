@@ -220,6 +220,18 @@ describe("GithubPanel", () => {
     expect(screen.queryByTestId("diff")).toBeNull();
   });
 
+  it("prompts to upgrade gh when the PR summary is unsupported", () => {
+    // A too-old gh on the host couldn't return the body/comments.
+    state.info!.data!.pr!.summary_supported = false;
+    renderPanel();
+    expect(screen.getByText("Update the GitHub CLI to see the summary")).toBeInTheDocument();
+    // The upgrade prompt replaces the description/comments empty states…
+    expect(screen.queryByText("No description provided.")).toBeNull();
+    expect(screen.queryByText("No comments yet.")).toBeNull();
+    // …but checks still render (they come from the core PR fetch).
+    expect(screen.getByText("Checks")).toBeInTheDocument();
+  });
+
   it("reveals the stacked diff after switching to the Changes tab", async () => {
     renderPanel();
     expect(screen.queryByTestId("diff")).toBeNull();

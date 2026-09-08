@@ -72,6 +72,10 @@ export interface GithubPr {
   body?: string | null;
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: GithubComment[];
+  /** False when the host's `gh` CLI was too old to return the body/comments (it
+   *  rejects the `comments` field); the Summary tab then prompts a gh upgrade.
+   *  Undefined on hosts predating this flag — treated as supported. */
+  summary_supported?: boolean;
 }
 
 export interface GithubRepo {

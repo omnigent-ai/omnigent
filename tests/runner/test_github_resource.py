@@ -458,6 +458,8 @@ def test_github_info_includes_body_and_comments(
 
     info = github_info(str(repo))
     assert info["pr"]["body"] == "## Summary\nDoes things."
+    # A modern gh returned the fields, so the summary is marked supported.
+    assert info["pr"]["summary_supported"] is True
     # The minimized comment is dropped; the survivor is flattened to snake_case.
     assert info["pr"]["comments"] == [
         {
@@ -499,6 +501,53 @@ def test_github_info_empty_body_is_null(repo: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
 
     info = github_info(str(repo))
+    assert info["pr"]["body"] is None
+    assert info["pr"]["comments"] == []
+
+
+def test_github_info_old_gh_degrades_summary(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An old ``gh`` that rejects ``comments`` still resolves the PR, sans summary.
+
+    The full ``gh pr view`` (which requests ``body,comments``) fails with the
+    "Unknown JSON field" error an older CLI emits. The PR must still resolve from
+    the core fields — otherwise the panel would misreport "no PR" — with the
+    summary flagged unavailable and body/comments empty.
+    """
+    core_view = {
+        "number": 8,
+        "title": "t",
+        "state": "OPEN",
+        "url": "u",
+        "isDraft": False,
+        "author": {"login": "a"},
+        "baseRefName": "main",
+        "headRefName": "feature",
+        "statusCheckRollup": [],
+    }
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+        if head == ("pr", "view"):
+            # argv == ["pr", "view", "--json", <fields>]. Old gh rejects the full
+            # set (it predates ``comments``) but serves the core fields.
+            fields = argv[3] if len(argv) > 3 else ""
+            if "comments" in fields:
+                return (1, "", 'Unknown JSON field: "comments"\nAvailable fields:\n  additions')
+            return (0, json.dumps(core_view), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    # The PR resolved from the core fields despite the failed full call.
+    assert info["pr"] is not None
+    assert info["pr"]["number"] == 8
+    assert info["pr"]["summary_supported"] is False
     assert info["pr"]["body"] is None
     assert info["pr"]["comments"] == []
 

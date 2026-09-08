@@ -433,15 +433,19 @@ function GithubCommentCard({ comment }: { comment: GithubComment }) {
   );
 }
 
-/** The Summary tab body: CI checks, the PR description, then its comments. */
+/** The Summary tab body: CI checks, the PR description, then its comments.
+ *  When the host's `gh` is too old to return the body/comments, the description
+ *  and comments give way to an upgrade prompt (checks still render). */
 function GithubSummaryTab({
   checks,
   body,
   comments,
+  summarySupported,
 }: {
   checks: GithubChecks;
   body: string | null | undefined;
   comments: GithubComment[];
+  summarySupported: boolean;
 }) {
   return (
     // Extra bottom padding so the last comment can scroll clear of the very
@@ -479,32 +483,50 @@ function GithubSummaryTab({
           </div>
         </section>
       )}
-      <section className="space-y-1.5">
-        <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Description
-        </h3>
-        {body ? (
-          <div className="text-ui break-words">
-            <MessageResponse>{body}</MessageResponse>
+      {!summarySupported ? (
+        // Too-old gh on the host: it couldn't return the body/comments, so
+        // point the user at the fix rather than showing empty description /
+        // comments sections that read as "there are none".
+        <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/30 p-3 text-ui text-muted-foreground">
+          <TerminalIcon className="mt-0.5 size-4 shrink-0" />
+          <div className="space-y-0.5">
+            <p className="font-medium text-foreground">Update the GitHub CLI to see the summary</p>
+            <p>
+              The PR description and comments need a newer <span className="font-mono">gh</span> on
+              the host. Update it, then reconnect the session.
+            </p>
           </div>
-        ) : (
-          <p className="text-ui text-muted-foreground italic">No description provided.</p>
-        )}
-      </section>
-      <section className="space-y-2">
-        <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          {comments.length > 0 ? `Comments (${comments.length})` : "Comments"}
-        </h3>
-        {comments.length === 0 ? (
-          <p className="text-ui text-muted-foreground">No comments yet.</p>
-        ) : (
-          <ul className="space-y-2">
-            {comments.map((c, i) => (
-              <GithubCommentCard key={c.url ?? `${c.author}-${i}`} comment={c} />
-            ))}
-          </ul>
-        )}
-      </section>
+        </div>
+      ) : (
+        <>
+          <section className="space-y-1.5">
+            <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              Description
+            </h3>
+            {body ? (
+              <div className="text-ui break-words">
+                <MessageResponse>{body}</MessageResponse>
+              </div>
+            ) : (
+              <p className="text-ui text-muted-foreground italic">No description provided.</p>
+            )}
+          </section>
+          <section className="space-y-2">
+            <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              {comments.length > 0 ? `Comments (${comments.length})` : "Comments"}
+            </h3>
+            {comments.length === 0 ? (
+              <p className="text-ui text-muted-foreground">No comments yet.</p>
+            ) : (
+              <ul className="space-y-2">
+                {comments.map((c, i) => (
+                  <GithubCommentCard key={c.url ?? `${c.author}-${i}`} comment={c} />
+                ))}
+              </ul>
+            )}
+          </section>
+        </>
+      )}
     </div>
   );
 }
@@ -972,7 +994,12 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
 
         {/* Summary: CI checks + the PR description + its conversation comments. */}
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
-          <GithubSummaryTab checks={checks} body={pr.body} comments={comments} />
+          <GithubSummaryTab
+            checks={checks}
+            body={pr.body}
+            comments={comments}
+            summarySupported={pr.summary_supported !== false}
+          />
         </TabsContent>
 
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
