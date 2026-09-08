@@ -660,6 +660,32 @@ def _provider_default_families(entry: ProviderEntry, config: dict[str, object]) 
     return result
 
 
+def _subscription_auth_summary(entry: ProviderEntry) -> str:
+    """Return the auth summary for a ``subscription`` provider row.
+
+    A codex "subscription" entry covers *any* usable ``~/.codex/auth.json``,
+    but that file's credential may be an API key rather than a ChatGPT plan
+    (``codex`` itself reports ``auth_mode: apikey``). Naming the effective
+    mode keeps a quota diagnosis pointed at the right credential — a bare
+    "subscription" label looks healthy when the real problem is a dead key.
+
+    :param entry: A ``kind: subscription`` provider entry.
+    :returns: A display string, e.g. ``"via claude CLI"``,
+        ``"via codex CLI (API key login)"``.
+    """
+    from omnigent.onboarding.ambient import codex_cli_effective_auth_mode
+
+    base = f"via {entry.cli} CLI"
+    if entry.cli != "codex":
+        return base
+    mode = codex_cli_effective_auth_mode()
+    if mode == "apikey":
+        return f"{base} (API key login, not a ChatGPT plan)"
+    if mode == "pat":
+        return f"{base} (personal access token)"
+    return base
+
+
 def _entry_models_summary(entry: ProviderEntry) -> str:
     """Return a short model summary for a provider listing row.
 
@@ -674,7 +700,7 @@ def _entry_models_summary(entry: ProviderEntry) -> str:
         databricks profile).
     """
     if entry.kind == SUBSCRIPTION_KIND:
-        return f"via {entry.cli} CLI"
+        return _subscription_auth_summary(entry)
     if entry.kind == DATABRICKS_KIND:
         return f"profile: {entry.profile}"
     if entry.kind == CLI_CONFIG_KIND:

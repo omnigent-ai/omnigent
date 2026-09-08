@@ -738,6 +738,9 @@ When runner liveness is wired (and not skipped via
 DELETE /v1/sessions/{session_id}[?delete_branch=true]
 
 200 OK — {"id": "conv_abc123", "deleted": true}
+409 Conflict — `delete_branch=true` but the host/runner is offline,
+  so worktree cleanup cannot run. Delete without the flag, or wait
+  for the runner to reconnect.
 404 Not Found — no session with that id
 403 Forbidden — caller is not the session owner
 ```
@@ -750,8 +753,10 @@ files, and the conversation row.
     server-created worktree (`git_branch` set), the host removes the
     worktree directory and deletes its branch (`git worktree remove
     --force` then `git branch -D`). Ignored for sessions with no
-    worktree. Best-effort: a cleanup failure does not block the
-    delete. See `designs/SESSION_GIT_WORKTREE.md`.
+    worktree. If the host tunnel is down, the delete is rejected
+    with 409 rather than a misleading 404; a host-reported git
+    failure is still logged and does not block the delete. See
+    `designs/SESSION_GIT_WORKTREE.md`.
 
 ### Bind Session Runner
 
@@ -1173,6 +1178,7 @@ stream and surface queue/interrupt semantics.
 | `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
+| `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |

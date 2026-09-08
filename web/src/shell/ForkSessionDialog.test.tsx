@@ -19,7 +19,11 @@ import { useSession } from "@/hooks/useSession";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
-import { checkHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
+import {
+  checkHostDirectory,
+  hostDirectoryMissing,
+  useHostFilesystem,
+} from "@/hooks/useHostFilesystem";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -39,16 +43,25 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({ useRunnerHealthRegistration: vi
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   checkHostDirectory: vi.fn(),
+  hostDirectoryMissing: vi.fn(),
 }));
 // The tree browser only mounts when browsing; coding-fork tests rely on the
 // directory being prefilled from the source, so the real picker never opens —
-// stub it anyway to keep its filesystem fetch out of the test.
+// stub it anyway to keep its filesystem fetch out of the test. Its "Select"
+// button commits an absolute path (onSelect), the only way browsing feeds the
+// form now that typed ~-paths resolve directly.
 vi.mock("./WorkspacePicker", async (importActual) => ({
   ...(await importActual<typeof WorkspacePickerModule>()),
   WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
-    <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
-      pick
-    </button>
+    <div data-testid="mock-workspace-picker">
+      <button
+        type="button"
+        data-testid="mock-pick-workspace"
+        onClick={() => onSelect("/Users/a/git/omnigent")}
+      >
+        pick
+      </button>
+    </div>
   ),
 }));
 
@@ -63,6 +76,7 @@ const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const checkHostDirectoryMock = vi.mocked(checkHostDirectory);
+const hostDirectoryMissingMock = vi.mocked(hostDirectoryMissing);
 const prefetchAvailableAgentDetailsMock = vi.mocked(prefetchAvailableAgentDetails);
 
 function host(overrides: Partial<Host> = {}): Host {
@@ -177,6 +191,7 @@ beforeEach(() => {
   // The submit pre-flight passes by default; the nonexistent-directory
   // test overrides it with a failure message.
   checkHostDirectoryMock.mockReset();
+  hostDirectoryMissingMock.mockReset();
   checkHostDirectoryMock.mockResolvedValue(null);
   prefetchAvailableAgentDetailsMock.mockReset();
   setAgents(AVAILABLE_AGENTS, "claude-sdk");
@@ -792,6 +807,74 @@ describe("ForkSessionDialog", () => {
       );
     });
 
+    it("recreates the source worktree when its directory was deleted and the name is untouched", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      // The worktree pre-flight fails — the directory is gone — but the
+      // miss is a 404, so the fork recreates the worktree at the same
+      // branch instead of erroring. The repo path itself is intact.
+      checkHostDirectoryMock.mockImplementation(async (_hostId: string, path: string) =>
+        path === "/Users/a/repo"
+          ? null
+          : "The working directory /Users/a/repo-worktrees/fix-1 doesn't exist on this host (or isn't a directory).",
+      );
+      hostDirectoryMissingMock.mockResolvedValue(true);
+      renderDialog(WORKTREE_CODING);
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // Launched from the REPO path with the prefilled branch (which already
+      // exists) — the host adds the worktree back at the conventional path.
+      // existingBranch (not baseBranch): the branch survives its deleted
+      // directory, so it is checked out rather than re-created.
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
+        branchName: "fix-1",
+        existingBranch: true,
+      });
+      // Both the worktree path and the repo fallback path were pre-flighted.
+      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/Users/a/repo");
+    });
+
+    it("still errors when the repo path is also missing (nothing to recreate from)", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      // Worktree gone (404 miss) AND the repo itself gone: the recreate
+      // fallback has nothing to launch from, so the fork must abort.
+      checkHostDirectoryMock.mockResolvedValue(
+        "The working directory doesn't exist on this host (or isn't a directory).",
+      );
+      hostDirectoryMissingMock.mockResolvedValue(true);
+      renderDialog(WORKTREE_CODING);
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(screen.getByText(/doesn't exist on this host/i)).toBeTruthy());
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+    });
+
+    it("still errors when the pre-flight fails for a reason other than a missing directory", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      // Host unreachable: NOT a 404 miss, so no worktree-recreate fallback.
+      checkHostDirectoryMock.mockResolvedValue(
+        "Couldn't verify the working directory. Check your connection and try again.",
+      );
+      hostDirectoryMissingMock.mockResolvedValue(false);
+      renderDialog(WORKTREE_CODING);
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() =>
+        expect(screen.getByText(/Couldn't verify the working directory/i)).toBeTruthy(),
+      );
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+    });
+
     it("creates a fresh worktree off the source branch when the branch is renamed", async () => {
       forkSessionMock.mockResolvedValue({
         id: "conv_fork",
@@ -838,6 +921,82 @@ describe("ForkSessionDialog", () => {
         "host_1",
         "conv_fork",
         "/Users/a/repo-worktrees/fix-1",
+        undefined,
+      );
+    });
+
+    it("enables the submit for a typed tilde path without opening the browser", async () => {
+      // The reported journey: type "~/git/omnigent" into the field and stop —
+      // no Enter, no browsing. A tilde path reads like a real directory but
+      // the server never expands ~, so the submit used to stay greyed unless
+      // the user discovered the tree browser. The dialog now resolves ~
+      // against the host's home (from the home listing) so the typed path is
+      // directly submittable.
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      // Home listing: the first entry's parent (/Users/a) resolves the host's
+      // home, so "~/git/omnigent" expands to "/Users/a/git/omnigent".
+      useHostFilesystemMock.mockReturnValue({
+        data: { entries: [{ name: "git", path: "/Users/a/git", type: "directory" }] },
+        isPlaceholderData: false,
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useHostFilesystem>);
+      renderDialog(CODING);
+
+      openAdvanced();
+      const input = screen.getByTestId("workspace-path-input");
+      fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+
+      // No Enter, no browser — the submit enables purely from the ~-resolve.
+      expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
+      await waitFor(() => expect(screen.getByTestId("fork-session-submit")).toBeEnabled());
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // Launched with the resolved absolute path, not the raw tilde.
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/git/omnigent",
+        undefined,
+      );
+    });
+
+    it("adopts an absolute path picked from the tree browser", async () => {
+      // The browse route: open the tree browser and click "Select". The
+      // picker commits an absolute path (onSelect), which enables the submit
+      // and launches on it. (Typed ~-paths resolve directly, tested above —
+      // this covers the still-live browser path.)
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(CODING);
+
+      openAdvanced();
+      const input = screen.getByTestId("workspace-path-input");
+      // A tilde value alone is not submittable (the server never expands ~).
+      fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+      expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+
+      // Enter commits the typed path and opens the tree browser at it.
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
+
+      // "Select" commits the browser's absolute path into the form.
+      fireEvent.click(screen.getByTestId("mock-pick-workspace"));
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/git/omnigent");
+      expect(screen.getByTestId("fork-session-submit")).toBeEnabled();
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/git/omnigent",
         undefined,
       );
     });

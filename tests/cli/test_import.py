@@ -345,6 +345,47 @@ def test_import_command_continues_batch_after_session_failure(tmp_path: Path) ->
     assert "Failed: 1" in result.output
 
 
+@respx.mock
+def test_import_command_continues_batch_after_network_failure(tmp_path: Path) -> None:
+    """A per-session network failure (e.g. a read timeout on a large session)
+    is counted as a failure without aborting the rest of the batch."""
+    session_ids = (
+        "a1b2c3d4-1234-5678-9abc-def012345676",
+        "a1b2c3d4-1234-5678-9abc-def012345677",
+    )
+    for modified_at, session_id in enumerate(session_ids, start=1):
+        _write_claude_transcript(
+            tmp_path,
+            session_id,
+            text=f"prompt {modified_at}",
+            modified_at=modified_at,
+        )
+
+    # Concurrency makes POST arrival order nondeterministic, so key the outcome
+    # to the session: the oldest times out, the newest imports.
+    def _respond(request: httpx.Request) -> httpx.Response:
+        ext = json.loads(request.content)["external_session_id"]
+        if ext == session_ids[0]:
+            raise httpx.ReadTimeout("The read operation timed out", request=request)
+        return httpx.Response(
+            201, json={"session_id": "imported-new", "status": "imported", "item_count": 1}
+        )
+
+    respx.post(f"{_BASE}/v1/imports").mock(side_effect=_respond)
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "claude", "--last", "2"],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert result.exit_code == 1, result.output
+    assert "Imported: 1" in result.output
+    assert "Failed: 1" in result.output
+    assert "Could not reach the Omnigent server" in result.output
+
+
 def test_import_command_requires_exactly_one_session_selector() -> None:
     """Single and batch selectors cannot be omitted or combined."""
     runner = CliRunner()

@@ -52,9 +52,14 @@ import {
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
-import type { RememberScope } from "@/lib/types";
+import type { CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
+import {
+  type ElicitationAnswers,
+  ElicitationSchemaForm,
+  schemaFields,
+} from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 
 /**
@@ -69,6 +74,10 @@ import { ExitPlanModeReview } from "./ExitPlanModeReview";
 function extractOptionLabels(schema: Record<string, unknown>): string[] {
   const properties = schema.properties;
   if (!properties || typeof properties !== "object") return [];
+  // Only when ``answer`` is the whole question. A schema pairing it with, say,
+  // a required ``reason`` renders as buttons that submit the answer and drop
+  // the reason the server said it needed; that shape belongs to the form.
+  if (Object.keys(properties as Record<string, unknown>).length !== 1) return [];
   const answer = (properties as Record<string, unknown>).answer;
   if (!answer || typeof answer !== "object") return [];
   const enumValues = (answer as Record<string, unknown>).enum;
@@ -85,6 +94,7 @@ export type SubmitApprovalFn = (
   elicitationId: string,
   action: "accept" | "decline",
   content?: Record<string, unknown>,
+  meta?: Record<string, unknown>,
 ) => void;
 
 interface ApprovalCardProps {
@@ -104,6 +114,7 @@ interface ApprovalCardProps {
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
     content?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
   } | null;
   /**
    * Structured AskUserQuestion payload — set when the server-side
@@ -151,6 +162,8 @@ interface ApprovalCardProps {
    * elicitation (edit tools take the ``allowAllEdits`` path instead).
    */
   rememberScope?: RememberScope | null;
+  /** Codex-native MCP persistence scopes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -159,6 +172,8 @@ interface ApprovalCardProps {
    */
   onSubmit?: SubmitApprovalFn;
 }
+
+const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
 export function ApprovalCard({
   elicitationId,
@@ -175,18 +190,27 @@ export function ApprovalCard({
   codexCommand,
   allowAllEdits,
   rememberScope,
+  codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
 }: ApprovalCardProps) {
   const submit: SubmitApprovalFn =
     onSubmit ??
-    ((id, action, content) => {
-      void useChatStore.getState().submitApproval(id, action, content);
+    ((id, action, content, meta) => {
+      const store = useChatStore.getState();
+      if (meta === undefined) {
+        void store.submitApproval(id, action, content);
+      } else {
+        void store.submitApproval(id, action, content, meta);
+      }
     });
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);
   };
   const submitOption = (label: string) => {
     submit(elicitationId, "accept", { answer: label });
+  };
+  const submitSchemaAnswers = (content: ElicitationAnswers) => {
+    submit(elicitationId, "accept", content);
   };
   const submitAnswers = (answers: AskUserQuestionAnswers) => {
     // ``content`` is MCP's ``ElicitResult.content``: a flat
@@ -217,6 +241,9 @@ export function ApprovalCard({
     // permission update back to the PermissionRequest hook.
     submit(elicitationId, "accept", { remember: true });
   };
+  const submitCodexPersist = (mode: CodexPersistMode) => {
+    submit(elicitationId, "accept", undefined, { persist: mode });
+  };
   const submitPlanRejection = (feedback: string) => {
     // The typed feedback rides on `content.feedback`; the server
     // forwards it to Claude as the deny `message`, so Claude stays in
@@ -239,6 +266,12 @@ export function ApprovalCard({
   const optionLabels = askPayload === null ? extractOptionLabels(requestedSchema) : [];
   const isAskUserQuestion = askPayload !== null;
   const isMultiChoice = optionLabels.length > 0;
+  // Any other schema that names fields: a free-form string, several
+  // properties, an enum under a name other than ``answer``. These used to
+  // fall through to Approve / Reject, which cannot answer them.
+  const schemaFormFields =
+    askPayload === null && !isMultiChoice ? schemaFields(requestedSchema) : [];
+  const isSchemaForm = schemaFormFields.length > 0;
   const isCodexCommandApproval = codexCommand !== null && codexCommand !== undefined;
   // External URL: the elicitation points to a third-party page (OAuth,
   // external MCP server, etc.) — show a link. Our own /approve/...
@@ -271,7 +304,7 @@ export function ApprovalCard({
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
+    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -283,6 +316,7 @@ export function ApprovalCard({
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
   const acceptedRemember = response?.content?.remember === true;
+  const acceptedCodexPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
   // domain when present, else the tool name. Drives the third binary
   // button and the responded-state pill.
@@ -301,6 +335,28 @@ export function ApprovalCard({
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
+      {codexPersistModes.includes("session") && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => submitCodexPersist("session")}
+          componentId="approval.approve_session"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve for this session
+        </Button>
+      )}
+      {codexPersistModes.includes("always") && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => submitCodexPersist("always")}
+          componentId="approval.approve_always"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Always allow
+        </Button>
+      )}
       {allowAllEdits && (
         <Button
           size="sm"
@@ -423,6 +479,12 @@ export function ApprovalCard({
       label = rememberTarget
         ? `Approved · won't ask again for ${rememberTarget}`
         : "Approved · won't ask again";
+    } else if (acceptedCodexPersist === "session") {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved for this session";
+    } else if (acceptedCodexPersist === "always") {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Always allowed";
     } else if (accepted) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved" : "Approved";
@@ -575,6 +637,12 @@ export function ApprovalCard({
                   </a>
                 </Button>
               </div>
+            ) : isSchemaForm ? (
+              <ElicitationSchemaForm
+                fields={schemaFormFields}
+                onSubmit={submitSchemaAnswers}
+                onReject={() => submitBinary("decline")}
+              />
             ) : isMultiChoice ? (
               <div className="flex flex-wrap gap-2 pt-1" data-testid="approval-card-options">
                 {optionLabels.map((optLabel) => (
@@ -628,6 +696,7 @@ export function ElicitationCard({
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       rememberScope={item.rememberScope}
+      codexPersistModes={item.codexPersistModes}
       onSubmit={onSubmit}
     />
   );

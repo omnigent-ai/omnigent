@@ -33,7 +33,7 @@ import {
   routingExtras,
 } from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
-import type { RememberScope } from "./types";
+import type { CodexPersistMode, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -99,6 +99,7 @@ export type RenderItem =
       message: string;
       source: string;
       code: string;
+      level?: "error" | "info";
       title?: string;
       cause?: string;
       remediation?: string;
@@ -126,6 +127,7 @@ export type RenderItem =
       response: {
         action: "accept" | "decline" | "cancel" | "auto_resolved";
         content?: Record<string, unknown>;
+        _meta?: Record<string, unknown>;
       } | null;
       askUserQuestion?: Record<string, unknown> | null;
       exitPlanMode?: Record<string, unknown> | null;
@@ -137,6 +139,7 @@ export type RenderItem =
       } | null;
       allowAllEdits?: boolean;
       rememberScope?: RememberScope | null;
+      codexPersistModes?: CodexPersistMode[];
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -194,7 +197,7 @@ export type Bubble =
        *  Display-only. */
       createdAtS?: number;
     }
-  | { kind: "compaction_loading"; itemId: string }
+  | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
   | {
       kind: "routing_decision";
@@ -809,25 +812,47 @@ function walkBubbles(
     }
 
     if (b.type === "compaction_loading") {
+      // One compaction → one spinner. A long compaction re-announces
+      // in_progress on every status poll, so a spinner for this compaction
+      // may already be on screen; refresh it in place — preferring the
+      // server-reported start as the elapsed anchor — instead of stacking
+      // another spinner that completion would then orphan.
+      let existing = -1;
+      for (let j = bubbles.length - 1; j >= 0; j--) {
+        if (bubbles[j]?.kind === "compaction_loading") {
+          existing = j;
+          break;
+        }
+      }
+      if (existing !== -1) {
+        const prev = bubbles[existing] as Extract<Bubble, { kind: "compaction_loading" }>;
+        bubbles[existing] = { ...prev, createdAtS: b.startedAtS ?? prev.createdAtS };
+        lastBubbleStart = i;
+        lastBubbleCount = 0;
+        i += 1;
+        continue;
+      }
       lastBubbleStart = i;
       lastBubbleCount = 1;
       bubbles.push({
         kind: "compaction_loading",
         itemId: b.ctx.itemId ?? `compaction_loading_${i}`,
+        createdAtS: b.startedAtS ?? b.ctx.clientCreatedAtS,
       });
       i += 1;
       continue;
     }
 
     if (b.type === "compaction") {
-      // Remove the loading spinner for this compaction so the user sees
-      // a single transition from spinner → checkmark.  The spinner may
-      // not be the immediately preceding bubble when assistant blocks
-      // (text, tool calls) were streamed during compaction.
+      // Remove EVERY loading spinner for this compaction so the user sees
+      // a single transition from spinner → checkmark. The spinner may not
+      // be the immediately preceding bubble when assistant blocks (text,
+      // tool calls) were streamed during compaction, and a long compaction
+      // that re-announced progress may have left more than one — an
+      // unremoved spinner would keep counting beside the marker forever.
       for (let j = bubbles.length - 1; j >= 0; j--) {
         if (bubbles[j]?.kind === "compaction_loading") {
           bubbles.splice(j, 1);
-          break;
         }
       }
       lastBubbleStart = i;
@@ -1482,6 +1507,7 @@ function buildAssistantItems(
         message: b.message,
         source: b.source,
         code: b.code,
+        ...(b.level ? { level: b.level } : {}),
         ...(b.title ? { title: b.title } : {}),
         ...(b.cause ? { cause: b.cause } : {}),
         ...(b.remediation ? { remediation: b.remediation } : {}),
@@ -1522,6 +1548,7 @@ function buildAssistantItems(
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
         rememberScope: b.rememberScope,
+        codexPersistModes: b.codexPersistModes,
       });
       i += 1;
       continue;

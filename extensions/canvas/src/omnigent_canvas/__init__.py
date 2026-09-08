@@ -1,0 +1,1 @@
+"""Omnigent Canvas browser extension."""

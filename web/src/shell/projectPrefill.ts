@@ -21,6 +21,10 @@ export interface ProjectPrefillConfig {
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
   useWorktree?: boolean;
+  /** Default model for the configured agent's harness. Not seeded by this
+   *  machine — the composer's harness-seed effect consumes it directly (it owns
+   *  the model slot and would otherwise clobber a machine write). */
+  model?: string;
 }
 
 export interface ProjectPrefillState {

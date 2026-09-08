@@ -115,6 +115,13 @@ export interface ServerInfo {
    */
   sandbox_providers?: string[];
   /**
+   * Connection providers this deploy has wired (config + store present),
+   * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
+   * Sandbox Integrations nav; the SPA renders one panel per provider via
+   * CONNECTION_PANELS. Adding a provider adds a string here, not a new flag.
+   */
+  enabled_connections: string[];
+  /**
    * Server session-sharing policy. Drives whether the SPA shows the
    * Share control (``"on"``), restricts it to read-only invites
    * (``"read_only"``), or hides it entirely (``"off"``), in lockstep
@@ -224,6 +231,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
   sandbox_providers: [],
+  enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
   sharing_mode: "on",
@@ -307,6 +315,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)
             ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
+            : [],
+          enabled_connections: Array.isArray(data.enabled_connections)
+            ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
           sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
             ? (data.sharing_mode as SharingMode)

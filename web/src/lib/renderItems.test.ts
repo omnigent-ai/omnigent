@@ -377,6 +377,27 @@ describe("buildBubbles — bubble grouping", () => {
     ]);
   });
 
+  it("error block level reaches the render item", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "First" }],
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_info", responseId: "resp_1" }),
+        source: "harness",
+        code: "codex_thread_reset",
+        message: "Codex started a fresh thread.",
+        level: "info",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    const asst = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    expect(asst.items[0]).toMatchObject({ kind: "error", level: "info" });
+  });
+
   it("compaction block becomes a standalone compaction bubble", () => {
     const blocks: AnyBlock[] = [
       {
@@ -424,6 +445,84 @@ describe("buildBubbles — bubble grouping", () => {
     ];
     const bubbles = buildBubbles(blocks, null);
     expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "compaction"]);
+  });
+
+  it("repeated compaction_loading blocks refresh one spinner instead of stacking", () => {
+    // A long compaction re-announces in_progress on every status poll. The
+    // walker must fold the repeats into the ONE live spinner — anchored to
+    // the server-reported start — or completion later orphans the extras.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }), startedAtS: 900 },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }), startedAtS: 900 },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction_loading"]);
+    expect((bubbles[0] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(900);
+  });
+
+  it("a spinner refresh without a server start keeps the first client receive time", () => {
+    // An emitter that doesn't track started_at must not re-anchor the
+    // elapsed counter to the later announcement's receive time.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }) },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }) },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction_loading"]);
+    expect((bubbles[0] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(1_000);
+  });
+
+  it("completion clears every compaction spinner, leaving only the marker", () => {
+    // Regression: each re-announcement used to stack a spinner and
+    // completion removed only the most recent one — the orphan kept
+    // counting and flashing beside the "Conversation compacted" marker.
+    const blocks: AnyBlock[] = [
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_000 }) },
+      { type: "compaction_loading", ctx: ctx({ clientCreatedAtS: 1_060 }) },
+      { type: "compaction", ctx: ctx({ itemId: "comp_1", responseId: "resp_compact" }) },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["compaction"]);
+  });
+
+  it("incremental appends fold re-announcements and clear the spinner on completion", () => {
+    // The cached walk must behave exactly like the full rebuild across the
+    // announce → re-announce → complete sequence (the live-stream path).
+    const cache = createBubbleCache();
+    const user: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+      content: [{ type: "input_text", text: "hello" }],
+    };
+    const first: AnyBlock = {
+      type: "compaction_loading",
+      ctx: ctx({ clientCreatedAtS: 1_000, responseId: "resp_compact" }),
+      startedAtS: 900,
+    };
+    const again: AnyBlock = {
+      type: "compaction_loading",
+      ctx: ctx({ clientCreatedAtS: 1_060, responseId: "resp_compact" }),
+      startedAtS: 900,
+    };
+    const done: AnyBlock = {
+      type: "compaction",
+      ctx: ctx({ itemId: "comp_1", responseId: "resp_compact" }),
+    };
+
+    let blocks: AnyBlock[] = [user, first];
+    expect(buildBubbles(blocks, null, cache).map((b) => b.kind)).toEqual([
+      "user",
+      "compaction_loading",
+    ]);
+
+    blocks = [...blocks, again];
+    let bubbles = buildBubbles(blocks, null, cache);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "compaction_loading"]);
+    expect((bubbles[1] as Extract<Bubble, { kind: "compaction_loading" }>).createdAtS).toBe(900);
+
+    blocks = [...blocks, done];
+    bubbles = buildBubbles(blocks, null, cache);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "compaction"]);
   });
 
   it("UserMessageBlock with mixed content preserves attachments", () => {

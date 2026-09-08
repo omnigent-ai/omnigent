@@ -19,7 +19,6 @@ import { MessageResponse } from "@/components/ai-elements/message";
 import { WORKSPACE_FILE_LINK_ATTR } from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
-import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import {
   useFileViewer,
@@ -174,8 +173,6 @@ function WorkspaceFileLink({
   children,
   className,
   title,
-  target: _target,
-  rel: _rel,
   node: _node,
   ...props
 }: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
@@ -184,16 +181,13 @@ function WorkspaceFileLink({
   const openWorkspaceFile = useWorkspaceFileOpener(path);
 
   if (!path) {
-    const opensOutsideShell = isElectronShell();
     return (
       <a
-        {...props}
         href={href}
-        target={opensOutsideShell ? "_blank" : "_self"}
-        rel={opensOutsideShell ? "noopener noreferrer" : "noreferrer"}
         className={cn(STREAMDOWN_LINK_CLASS, className)}
         title={title}
         data-streamdown="link"
+        {...props}
       >
         {children}
       </a>

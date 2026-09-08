@@ -296,3 +296,64 @@ async def test_create_session_policy_no_telemetry_on_error(
         )
     assert resp.status_code == 409
     mock_emit.assert_not_called()
+
+
+# ── Audit logging ─────────────────────────────────────────────────────
+
+
+async def test_create_session_policy_logs_audit(
+    client: httpx.AsyncClient,
+    session_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``POST /v1/sessions/{id}/policies`` emits an audit log line."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.session_policies"):
+        resp = await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload())
+    assert resp.status_code == 200
+    pid = resp.json()["id"]
+    assert "session_policies/create" in caplog.text
+    assert pid in caplog.text
+    assert session_id in caplog.text
+    assert "(single-user)" in caplog.text
+
+
+async def test_update_session_policy_logs_audit(
+    client: httpx.AsyncClient,
+    session_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``PATCH /v1/sessions/{id}/policies/{pid}`` emits an audit log line."""
+    import logging
+
+    create_resp = await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload())
+    pid = create_resp.json()["id"]
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.session_policies"):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}/policies/{pid}", json={"name": "renamed"}
+        )
+    assert resp.status_code == 200
+    assert "session_policies/update" in caplog.text
+    assert pid in caplog.text
+    assert session_id in caplog.text
+    assert "(single-user)" in caplog.text
+
+
+async def test_delete_session_policy_logs_audit(
+    client: httpx.AsyncClient,
+    session_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``DELETE /v1/sessions/{id}/policies/{pid}`` emits an audit log line."""
+    import logging
+
+    create_resp = await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload())
+    pid = create_resp.json()["id"]
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.session_policies"):
+        resp = await client.delete(f"/v1/sessions/{session_id}/policies/{pid}")
+    assert resp.status_code == 200
+    assert "session_policies/delete" in caplog.text
+    assert pid in caplog.text
+    assert session_id in caplog.text
+    assert "(single-user)" in caplog.text

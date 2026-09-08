@@ -21,6 +21,37 @@ const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
 
+/**
+ * Storage partition for one conversation's browser view. Every view MUST get
+ * its own partition: with none, Electron places the view on
+ * `session.defaultSession`, sharing one cookie/localStorage/cache store across
+ * all agents and the main window (agent A's login bleeds into agent B's view).
+ * Deliberately NOT `persist:`-prefixed — an in-memory partition keeps
+ * agent-visited cookies off disk and leaves nothing to clean up when a
+ * conversation is deleted, while Electron still reuses the same in-memory
+ * session for the name within an app run (a reopened view keeps its login).
+ *
+ * `scope` namespaces the partition per REGISTRY (i.e. per shell window):
+ * Electron sessions are app-global, but conversation ids are only unique per
+ * server — two windows connected to different servers could carry the same
+ * conversationId and would otherwise share a cookie jar.
+ *
+ * `conversationId` is interpolated raw. Production ids are opaque 32-character
+ * UUID hex strings; encode them if that contract ever loosens.
+ *
+ * @param {string} scope Registry-unique namespace (one per shell window).
+ * @param {string} conversationId
+ * @returns {string}
+ */
+function agentPartition(scope, conversationId) {
+  return `omnigent-agent-${scope}-${conversationId}`;
+}
+
+// Monotonic per-process counter: each registry (shell window) gets a distinct
+// default partition scope. In-memory partitions never outlive the process, so
+// no cross-run uniqueness is needed.
+let registrySeq = 0;
+
 function createBrowserViewRegistry({
   WebContentsViewCtor, // (opts) => new WebContentsView(opts) — injectable for tests
   createBoundsController, // bounds-controller factory (createBrowserViewBoundsController)
@@ -29,7 +60,15 @@ function createBrowserViewRegistry({
   sendToRenderer, // (channel, payload) => mainWindow.webContents.send(...)
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
+  // Desktop affordances for the pane's context menu; injected so the registry
+  // stays Electron-free. No-op defaults keep tests and non-menu hosts simple.
+  openUrlExternal = () => {}, // (url) => shell.openExternal(url)
+  copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
+  showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   cap = DEFAULT_CAP,
+  // Partition namespace for this registry's views — see agentPartition.
+  // Injectable so tests can pin it; defaults to a per-instance unique value.
+  partitionScope = `w${++registrySeq}`,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
@@ -108,6 +147,8 @@ function createBrowserViewRegistry({
     }
     const view = WebContentsViewCtor({
       webPreferences: {
+        // Per-conversation storage isolation — see agentPartition.
+        partition: agentPartition(partitionScope, conversationId),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
@@ -115,20 +156,82 @@ function createBrowserViewRegistry({
     });
     const entry = makeEntry(conversationId, view);
     entries.set(conversationId, entry);
-    denyChildWindowOpen(entry);
+    installWindowOpenPolicy(entry);
+    attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
     return { ok: true, entry, created: true };
   }
 
-  // SECURITY: a visited page must not spawn windows from the desktop shell.
-  // Deny every window.open / target=_blank on the child view (the safe default;
-  // unlike the main shell window we do NOT route to shell.openExternal, since an
-  // agent-visited page popping the user's real browser to an arbitrary URL is
-  // itself an abuse vector).
-  function denyChildWindowOpen(entry) {
+  // SECURITY: a visited page must not spawn windows from the desktop shell, so
+  // window.open / target=_blank still never creates a window here and is never
+  // routed to shell.openExternal (an agent-visited page popping the user's real
+  // browser to an arbitrary URL is itself an abuse vector). Instead an http(s)
+  // target navigates the SAME view in place — nothing the page couldn't already
+  // do with location.href — so a clicked link goes somewhere instead of dying
+  // silently. The agent nav guard cannot see this hop (will-navigate skips
+  // programmatic loadURL), so an agent-locked view is allowlist-checked here.
+  function installWindowOpenPolicy(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
-    wc.setWindowOpenHandler(() => ({ action: "deny" }));
+    wc.setWindowOpenHandler(({ url }) => {
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return { action: "deny" }; // unparseable URL — nothing safe to open
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return { action: "deny" };
+      }
+      if (entry.agentNavLocked) {
+        const verdict = isAgentNavigationAllowed(url);
+        if (!verdict.ok) {
+          sendToRenderer("browser-nav-blocked", {
+            conversationId: entry.conversationId,
+            url,
+            error: verdict.error,
+          });
+          return { action: "deny" };
+        }
+      }
+      try {
+        wc.loadURL(url);
+      } catch {
+        /* view destroyed mid-click */
+      }
+      return { action: "deny" };
+    });
+  }
+
+  // Right-click menu for the child view — the shell window's own menu covers
+  // only the shell webContents, so without one a pane link can be neither
+  // opened externally nor copied. "Open Link in Browser" is user-chosen, so
+  // shell.openExternal is safe here (unlike the page-initiated path above).
+  // Items are plain data; the host (main.js) builds the actual Electron Menu.
+  function attachViewContextMenu(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    wc.on("context-menu", (_event, params) => {
+      const items = [];
+      if (params.linkURL) {
+        if (/^https?:\/\//i.test(params.linkURL)) {
+          items.push({
+            label: "Open Link in Browser",
+            click: () => openUrlExternal(params.linkURL),
+          });
+        }
+        items.push({
+          label: "Copy Link Address",
+          click: () => copyTextToClipboard(params.linkURL),
+        });
+      }
+      if (typeof params.selectionText === "string" && params.selectionText.trim() !== "") {
+        if (items.length > 0) items.push({ type: "separator" });
+        items.push({ label: "Copy", click: () => wc.copy() });
+      }
+      if (items.length === 0) return;
+      showContextMenu(items);
+    });
   }
 
   // SECURITY (SSRF): enforce the agent-navigation allowlist on the child view's
@@ -359,5 +462,6 @@ function createBrowserViewRegistry({
 
 module.exports = {
   createBrowserViewRegistry,
+  agentPartition,
   DEFAULT_CAP,
 };

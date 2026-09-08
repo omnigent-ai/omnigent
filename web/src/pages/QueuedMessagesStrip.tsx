@@ -15,6 +15,16 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
 
+/**
+ * Row action buttons: compact icon buttons on desktop; on mobile (`max-md:`)
+ * they grow to a 44px tap target (Apple HIG / WCAG target size) with a larger,
+ * higher-contrast icon, matching the app's other mobile-adjusted controls.
+ */
+const ACTION_BUTTON_CLASS =
+  "flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground max-md:size-11 max-md:text-muted-foreground";
+
+const ACTION_ICON_CLASS = "size-3.5 max-md:size-5";
+
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
   messages: QueuedMessage[];
@@ -70,7 +80,7 @@ function QueuedRow({
     <div
       ref={setDropRef}
       className={cn(
-        "flex items-center gap-1.5 text-sm text-muted-foreground",
+        "flex items-center gap-1.5 text-sm text-muted-foreground max-md:gap-0.5",
         isDragging && "opacity-40",
         isOver && "rounded bg-foreground/5",
       )}
@@ -80,14 +90,17 @@ function QueuedRow({
           type="button"
           ref={setDragRef}
           aria-label="Reorder queued message"
-          className="shrink-0 cursor-grab touch-none rounded p-0.5 text-muted-foreground/50 transition hover:text-foreground focus-visible:text-foreground active:cursor-grabbing"
+          className={cn(
+            ACTION_BUTTON_CLASS,
+            "cursor-grab touch-none text-muted-foreground/50 active:cursor-grabbing max-md:text-muted-foreground/80",
+          )}
           {...attributes}
           {...listeners}
         >
-          <GripVerticalIcon className="size-3.5" aria-hidden="true" />
+          <GripVerticalIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
         </button>
       ) : (
-        <ClockIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        <ClockIcon className={cn(ACTION_ICON_CLASS, "shrink-0")} aria-hidden="true" />
       )}
       <span className="min-w-0 flex-1 truncate">{message.text}</span>
       {/* Always visible (not hover-gated) so the actions are discoverable;
@@ -98,10 +111,10 @@ function QueuedRow({
             <button
               type="button"
               aria-label="Send queued message now"
-              className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+              className={ACTION_BUTTON_CLASS}
               onClick={() => onSteer(message.queueId)}
             >
-              <ArrowUpIcon className="size-3.5" aria-hidden="true" />
+              <ArrowUpIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="top">Send now</TooltipContent>
@@ -110,18 +123,18 @@ function QueuedRow({
       <button
         type="button"
         aria-label="Edit queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+        className={ACTION_BUTTON_CLASS}
         onClick={() => onEdit(message.queueId)}
       >
-        <PencilIcon className="size-3.5" aria-hidden="true" />
+        <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
       </button>
       <button
         type="button"
         aria-label="Remove queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+        className={ACTION_BUTTON_CLASS}
         onClick={() => onDelete(message.queueId)}
       >
-        <Trash2Icon className="size-3.5" aria-hidden="true" />
+        <Trash2Icon className={ACTION_ICON_CLASS} aria-hidden="true" />
       </button>
     </div>
   );

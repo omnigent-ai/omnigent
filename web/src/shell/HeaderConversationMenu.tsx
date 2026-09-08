@@ -12,6 +12,7 @@ import {
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
+  GitForkIcon,
   InfoIcon,
   MailIcon,
   PencilIcon,
@@ -35,6 +36,9 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -61,9 +65,11 @@ interface HeaderConversationMenuProps {
   conversation: Conversation;
   currentProject: string | null;
   canShare: boolean;
+  canFork: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   onShare: () => void;
+  onFork: () => void;
   hasAgentInfo?: boolean;
   onAgentInfo?: () => void;
   /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
@@ -89,9 +95,11 @@ export function HeaderConversationMenu({
   conversation,
   currentProject,
   canShare,
+  canFork,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
+  onFork,
   hasAgentInfo = false,
   onAgentInfo,
   workspaceItems = null,
@@ -170,15 +178,16 @@ export function HeaderConversationMenu({
 
   const archiveConversation = () => {
     closeMenu();
-    archive.mutate(
-      { id: conversation.id, archived: true },
-      {
-        onSuccess: () => {
-          navigate("/", { replace: true });
-          showArchivedToast();
-        },
-      },
-    );
+    // The row leaves the sidebar optimistically (useArchiveConversation flips
+    // the cached `archived` flag in onMutate), and we're viewing the session
+    // being archived, so leave its chat surface now — synchronously, like
+    // confirmDelete — rather than in an onSuccess callback that fires a
+    // round-trip later with a stale active session.
+    navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: true });
+    // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
+    // and per-call mutate callbacks don't fire once their observer unmounts.
+    showArchivedToast();
   };
 
   const mainItems = (
@@ -210,6 +219,16 @@ export function HeaderConversationMenu({
           Share
         </DropdownMenuItem>
       )}
+      {canFork && (
+        <DropdownMenuItem
+          data-testid="header-fork-conversation"
+          className={itemClass}
+          onSelect={onFork}
+        >
+          <GitForkIcon className="size-3.5" />
+          Fork
+        </DropdownMenuItem>
+      )}
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"
@@ -223,19 +242,17 @@ export function HeaderConversationMenu({
           Agent info
         </DropdownMenuItem>
       )}
-      {/* Rename lives here only on mobile — the native shells hide the
-          breadcrumb, so this menu is the sole entry point. On desktop the
-          shortcut is clicking the breadcrumb title (HeaderTitle). */}
-      {isMobile && (
-        <DropdownMenuItem
-          data-testid="header-rename-conversation"
-          className={itemClass}
-          onSelect={() => setRenameOpen(true)}
-        >
-          <PencilIcon className="size-3.5" />
-          Rename
-        </DropdownMenuItem>
-      )}
+      {/* Rename is also reachable on desktop by clicking the breadcrumb title
+          (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
+          menu is the sole entry point. */}
+      <DropdownMenuItem
+        data-testid="header-rename-conversation"
+        className={itemClass}
+        onSelect={() => setRenameOpen(true)}
+      >
+        <PencilIcon className="size-3.5" />
+        Rename
+      </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}
@@ -244,10 +261,12 @@ export function HeaderConversationMenu({
         <MailIcon className="size-3.5" />
         Mark as unread
       </DropdownMenuItem>
-      {/* Move to project lives here only on mobile — the native mobile shells
-          hide the breadcrumb, so this menu is the sole entry point. On desktop
-          the shortcut is the breadcrumb's folder tag (HeaderProjectTag). */}
-      {isMobile && (
+      {/* Move to project is also reachable on desktop via the breadcrumb's
+          folder tag (HeaderProjectTag); on mobile the native shells hide the
+          breadcrumb, so this menu is the sole entry point. */}
+      {isMobile ? (
+        // Mobile has no room for a side flyout, so this item swaps the menu body
+        // to the project picker in place (see the `projectPickerOpen` branch).
         <DropdownMenuItem
           data-testid="header-move-to-project"
           className={cn("whitespace-nowrap", itemClass)}
@@ -259,6 +278,21 @@ export function HeaderConversationMenu({
           <FolderInputIcon className="size-3.5" />
           {currentProject ? "Move session" : "Add to project"}
         </DropdownMenuItem>
+      ) : (
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger
+            data-testid="header-move-to-project"
+            className="whitespace-nowrap"
+          >
+            <FolderInputIcon className="size-3.5" />
+            {currentProject ? "Move session" : "Add to project"}
+          </DropdownMenuSubTrigger>
+          {/* A native submenu flyout — no separate popover layer, so no
+              open/dismiss race with the parent menu. */}
+          <DropdownMenuSubContent className="min-w-56">
+            <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
       )}
       {workspaceItems && (
         <>
@@ -291,6 +325,13 @@ export function HeaderConversationMenu({
     <>
       <DropdownMenu
         open={menuOpen}
+        // Radix's modal mode sets `pointer-events: none` on <body> while the
+        // menu is open, leaving the menu as the only touch target on screen.
+        // Browser touch-target adjustment then snaps outside taps near the
+        // menu onto it, so on a phone the menu can't be dismissed. Non-modal
+        // keeps the page interactive, so an outside tap lands on real content
+        // and dismisses the menu.
+        modal={!isMobile}
         onOpenChange={(open) => {
           setMenuOpen(open);
           if (!open) setProjectPickerOpen(false);
@@ -303,9 +344,9 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:rounded-full"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full"
           >
-            <EllipsisIcon className={isMobile ? "size-4" : "size-3.5"} />
+            <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -324,7 +365,7 @@ export function HeaderConversationMenu({
               <DropdownMenuSeparator />
             </>
           )}
-          {isMobile && projectPickerOpen ? (
+          {projectPickerOpen ? (
             <>
               <DropdownMenuItem
                 data-testid="header-project-picker-back"

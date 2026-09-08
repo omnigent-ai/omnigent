@@ -16,9 +16,11 @@ import hmac
 import json
 import logging
 from dataclasses import dataclass
+from typing import cast
 
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, and_, or_, select, update
 from sqlalchemy import delete as sql_delete
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -67,9 +69,14 @@ class Host:
         host (``host_type="managed"`` sessions), e.g. ``"modal"``.
         ``None`` for external (user-connected) hosts — non-``None``
         marks the host as server-managed.
-    :param sandbox_id: Provider-assigned id of the sandbox currently
-        backing a managed host, e.g. ``"sb-a1b2c3"`` — what
-        termination is issued against. ``None`` for external hosts.
+    :param sandbox_id: Provider-assigned id of the sandbox generation
+        currently backing a managed host, e.g. ``"sb-a1b2c3"`` — what
+        termination is issued against. ``None`` for external hosts and
+        managed hosts whose prior generation was reaped while the durable
+        host/session binding remains available for relaunch.
+    :param terminating_sandbox_id: Provider-assigned id detached from the
+        active generation and awaiting provider termination. A newly launched
+        generation may coexist in ``sandbox_id`` while this cleanup retries.
     :param configured_harnesses: Per-harness readiness reported in the
         host's last ``host.hello`` frame, e.g.
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
@@ -86,6 +93,7 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    terminating_sandbox_id: str | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -153,6 +161,7 @@ def _row_to_host(row: SqlHost) -> Host:
         updated_at=row.updated_at,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
+        terminating_sandbox_id=row.terminating_sandbox_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -202,6 +211,7 @@ class HostStore:
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
+        managed_token: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -241,6 +251,9 @@ class HostStore:
             Written on every connect — including ``None`` from an older
             host that doesn't report it, which correctly resets any
             stale value back to "unknown".
+        :param managed_token: Raw launch token for a managed host. When set,
+            registration atomically revalidates the current credential instead
+            of performing the external-host upsert path.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
@@ -248,6 +261,35 @@ class HostStore:
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
         with self._session("upsert_host_on_connect") as session:
+            if managed_token is not None:
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        update(SqlHost)
+                        .where(
+                            SqlHost.workspace_id == current_workspace_id(),
+                            SqlHost.host_id == host_id,
+                            SqlHost.user_id == user_id,
+                            SqlHost.token_hash == hash_host_launch_token(managed_token),
+                            SqlHost.token_expires_at.is_not(None),
+                            SqlHost.token_expires_at >= now,
+                            SqlHost.sandbox_id.is_not(None),
+                        )
+                        .values(
+                            name=name,
+                            status=encode_host_status("online"),
+                            updated_at=now,
+                            configured_harnesses=harnesses_json,
+                        )
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise ValueError("managed host launch token is no longer valid")
+                managed_row = session.get(SqlHost, (current_workspace_id(), host_id))
+                if managed_row is None:
+                    raise ValueError("managed host registration disappeared")
+                return _row_to_host(managed_row)
+
             # Primary lookup: by (workspace_id, host_id) — the new PK.
             row = session.get(SqlHost, (current_workspace_id(), host_id))
             if row is not None:
@@ -357,6 +399,7 @@ class HostStore:
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
+        terminating_sandbox_id = row.terminating_sandbox_id
 
         bound_ids = list(
             session.execute(
@@ -398,6 +441,7 @@ class HostStore:
             token_expires_at=token_expires_at,
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
+            terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
         )
         session.add(new_row)
@@ -635,6 +679,58 @@ class HostStore:
             )
             return [_row_to_host(row) for row in rows]
 
+    def list_managed_sandbox_workspace_ids(self) -> list[int]:
+        """List workspaces with active or pending managed sandbox generations.
+
+        This is the privileged discovery query used by the server-wide managed
+        sandbox reaper. Unlike normal request-path store methods, it
+        intentionally spans workspace partitions; the reaper immediately enters
+        each returned :func:`workspace_scope` before reading sessions or hosts.
+
+        :returns: Workspace ids in ascending order.
+        """
+        with self._session("list_managed_sandbox_workspaces") as session:
+            return list(
+                session.execute(
+                    select(SqlHost.workspace_id)
+                    .where(
+                        SqlHost.sandbox_provider.is_not(None),
+                        or_(
+                            SqlHost.sandbox_id.is_not(None),
+                            SqlHost.terminating_sandbox_id.is_not(None),
+                        ),
+                    )
+                    .distinct()
+                    .order_by(SqlHost.workspace_id.asc())
+                ).scalars()
+            )
+
+    def list_stale_managed_sandbox_hosts(self, older_than_epoch: int) -> list[Host]:
+        """List stale active and pending managed sandboxes in this workspace.
+
+        :param older_than_epoch: Latest included host heartbeat timestamp.
+        :returns: Stale generations ordered from oldest to newest.
+        """
+        with self._session("list_stale_managed_sandbox_hosts") as session:
+            rows = (
+                session.query(SqlHost)
+                .filter(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.sandbox_provider.is_not(None),
+                    or_(
+                        SqlHost.terminating_sandbox_id.is_not(None),
+                        and_(
+                            SqlHost.terminating_sandbox_id.is_(None),
+                            SqlHost.sandbox_id.is_not(None),
+                            SqlHost.updated_at <= older_than_epoch,
+                        ),
+                    ),
+                )
+                .order_by(SqlHost.updated_at.asc(), SqlHost.host_id.asc())
+                .all()
+            )
+            return [_row_to_host(row) for row in rows]
+
     def get_host(self, host_id: str) -> Host | None:
         """
         Fetch a single host by ID.
@@ -696,17 +792,17 @@ class HostStore:
         :param token_expires_at: Unix epoch seconds after which the
             token no longer authenticates.
         :returns: The registered :class:`Host`.
-        :raises ValueError: If a row for *host_id* exists under a
-            DIFFERENT user_id — a relaunch may only re-credential a host
-            the same user owns.
+        :raises ValueError: If a row for *host_id* belongs to another user,
+            changes provider while cleanup is pending, or tries to re-arm the
+            exact sandbox id still awaiting termination.
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
         with self._session("register_managed_host") as session:
             existing = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
-                )
+                select(SqlHost)
+                .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+                .with_for_update()
             ).scalar_one_or_none()
             if existing is not None:
                 if existing.user_id != user_id:
@@ -719,6 +815,18 @@ class HostStore:
                     raise ValueError(
                         f"host {host_id!r} is registered to a different user; "
                         "refusing to re-credential it"
+                    )
+                if (
+                    existing.terminating_sandbox_id is not None
+                    and existing.sandbox_provider != provider
+                ):
+                    raise ValueError(
+                        "cannot change managed sandbox provider while termination is pending"
+                    )
+                if existing.terminating_sandbox_id == sandbox_id:
+                    raise ValueError(
+                        f"sandbox {sandbox_id!r} is still pending termination; "
+                        "refusing to re-arm it"
                     )
                 existing.token_hash = token_hash
                 existing.token_expires_at = token_expires_at
@@ -740,6 +848,52 @@ class HostStore:
             )
             session.add(row)
             return _row_to_host(row)
+
+    def rearm_managed_host(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+        expected_updated_at: int,
+        token: str,
+        token_expires_at: int,
+    ) -> Host | None:
+        """Atomically re-arm the exact active generation before resuming it.
+
+        The compare-and-update races against reaper detachment and tunnel
+        heartbeats. Cleanup of a different, older generation does not block the
+        active generation. A missing result means the caller's snapshot is no
+        longer current and the provider must not be asked to resume that sandbox id.
+        """
+        now = now_epoch()
+        with self._session("rearm_managed_host") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.sandbox_id == sandbox_id,
+                        SqlHost.updated_at == expected_updated_at,
+                        SqlHost.sandbox_provider.is_not(None),
+                        or_(
+                            SqlHost.terminating_sandbox_id.is_(None),
+                            SqlHost.terminating_sandbox_id != sandbox_id,
+                        ),
+                    )
+                    .values(
+                        token_hash=hash_host_launch_token(token),
+                        token_expires_at=token_expires_at,
+                        status=encode_host_status("offline"),
+                        updated_at=now,
+                    )
+                ),
+            )
+            if result.rowcount != 1:
+                return None
+            row = session.get(SqlHost, (current_workspace_id(), host_id))
+            return _row_to_host(row) if row is not None else None
 
     def resolve_launch_token(self, host_id: str, token: str) -> Host | None:
         """
@@ -809,6 +963,76 @@ class HostStore:
                     SqlHost.host_id == host_id,
                 )
             )
+
+    def detach_stale_managed_sandbox(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+        expected_updated_at: int,
+    ) -> bool:
+        """Atomically detach one stale generation before provider termination.
+
+        The sandbox id and heartbeat timestamp form the stale snapshot. A
+        reconnect, resume, or relaunch changes one of them and wins the race.
+        Detachment revokes the old token immediately and leaves the cleanup id
+        persisted for later retries.
+
+        :param host_id: Durable managed host identifier.
+        :param sandbox_id: Provider id of the stale active generation.
+        :param expected_updated_at: Heartbeat timestamp observed by the sweep.
+        :returns: ``True`` when that exact stale generation was detached.
+        """
+        with self._session("detach_stale_managed_sandbox") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.sandbox_id == sandbox_id,
+                        SqlHost.updated_at == expected_updated_at,
+                        SqlHost.sandbox_provider.is_not(None),
+                        SqlHost.terminating_sandbox_id.is_(None),
+                    )
+                    .values(
+                        token_hash=None,
+                        token_expires_at=None,
+                        sandbox_id=None,
+                        terminating_sandbox_id=sandbox_id,
+                        status=encode_host_status("offline"),
+                    )
+                ),
+            )
+            return result.rowcount == 1
+
+    def mark_terminating_sandbox_terminated(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+    ) -> bool:
+        """Clear one successfully terminated pending sandbox id.
+
+        :param host_id: Durable managed host identifier.
+        :param sandbox_id: Exact pending provider id that was terminated.
+        :returns: ``True`` when that pending id was cleared.
+        """
+        with self._session("mark_terminating_sandbox_terminated") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.terminating_sandbox_id == sandbox_id,
+                    )
+                    .values(terminating_sandbox_id=None)
+                ),
+            )
+            return result.rowcount == 1
 
     def revoke_launch_token(self, host_id: str) -> None:
         """

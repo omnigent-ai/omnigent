@@ -395,6 +395,27 @@ describe("useHostModelOptions", () => {
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("polls the host's catalog every 15 s while mounted", async () => {
+    // The host re-resolves its provider per request, so an open picker must
+    // follow a provider change on the host without being remounted.
+    fetchMock.mockResolvedValue(
+      mockResponse({ models: [{ id: "opus", model: "claude-opus-5", displayName: "Opus 5" }] }),
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() => useHostModelOptions("host_1", "claude-native"), {
+        wrapper,
+      });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("useStoreCredential", () => {

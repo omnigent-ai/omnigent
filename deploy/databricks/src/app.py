@@ -210,13 +210,23 @@ try:
     # The app SP owns the tables — run any pending Alembic upgrades
     # before the stores boot, since the verify-schema check refuses
     # to start a stale DB. Idempotent: a no-op when the DB is at head.
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
+    #
+    # Lakebase endpoints suspend after an idle window (default 24h). A
+    # boot that lands while the endpoint is cold/resuming raises a
+    # transient OperationalError, which the module-level catch-all below
+    # would turn into a fatal exit — the container then crash-loops and
+    # the app "doesn't load" until a manual redeploy happens to hit a
+    # warm endpoint. run_migrations_with_retry retries the connect+migrate
+    # with linear backoff so a cold start self-heals; a genuinely broken
+    # DB still fails after the attempts are exhausted. Both knobs are
+    # env-overridable (defaults: 8 attempts, 3s×attempt, ~84s budget).
+    from omnigent.db.utils import run_migrations_with_retry
 
-    _migration_engine = sqlalchemy.create_engine(DB_URI)
-    try:
-        _run_alembic_upgrade(_migration_engine, DB_URI)
-    finally:
-        _migration_engine.dispose()
+    run_migrations_with_retry(
+        DB_URI,
+        max_attempts=int(os.environ.get("AP_MIGRATE_MAX_ATTEMPTS", "8")),
+        backoff_seconds=float(os.environ.get("AP_MIGRATE_BACKOFF_SECONDS", "3")),
+    )
 
     agent_store = SqlAlchemyAgentStore(DB_URI)
     file_store = SqlAlchemyFileStore(DB_URI)

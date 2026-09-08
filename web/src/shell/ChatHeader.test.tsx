@@ -60,6 +60,7 @@ const mobileMenu = {
 function renderHeader(props: {
   sidebarOpen: boolean;
   isChildSession?: boolean;
+  subAgentName?: string | null;
   conversationId?: string;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
@@ -68,6 +69,7 @@ function renderHeader(props: {
   boundAgent?: Agent;
   wrapperLabel?: string | null;
   canShare?: boolean;
+  canFork?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
@@ -76,6 +78,7 @@ function renderHeader(props: {
   showFilesPanel?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
+  onFork?: () => void;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -86,6 +89,7 @@ function renderHeader(props: {
             sidebarOpen={props.sidebarOpen}
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
             isChildSession={props.isChildSession ?? false}
+            subAgentName={props.subAgentName ?? null}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
             // right-panel toggle / rail entries all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
@@ -97,9 +101,11 @@ function renderHeader(props: {
             boundAgent={props.boundAgent}
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
+            canFork={props.canFork ?? false}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
+            onFork={props.onFork ?? (() => {})}
             hasAgentInfo={props.hasAgentInfo ?? false}
             onAgentInfo={() => {}}
             hasHeaderMenu={props.hasHeaderMenu ?? false}
@@ -208,6 +214,41 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
       vi.useRealTimers();
     }
   });
+
+  it("suppresses the hover tooltip once the dwell fires the peek", () => {
+    // The peek card fades in click-through, so the pointer keeps resting on the
+    // toggle past the tooltip's own delay. The peek is the intended hover
+    // reveal, so its "Open sidebar" tooltip must not also pop over the card.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.pointerEnter(toggle);
+      // Past the 400ms peek dwell and the tooltip's 600ms hover delay.
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.queryByRole("tooltip", { name: "Open sidebar" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still shows the tooltip on keyboard focus (no peek armed)", () => {
+    // Focus never arms a peek, so the tooltip stays available for a11y.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.focus(toggle);
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.getByRole("tooltip", { name: "Open sidebar" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("ChatHeader — conversation breadcrumb", () => {
@@ -260,6 +301,38 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
   });
 
+  it("names the session's own sub-agent, not the parent bundle's agent row", () => {
+    // A `sys_session_send` child is bound to its PARENT bundle's agent row,
+    // so boundAgent.name is the parent's name. The session's own
+    // sub_agent_name must win, or the child masquerades as its parent.
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      subAgentName: "comic_one",
+      conversationTitle: "Joke night",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name: "joke_director" },
+    });
+    expect(screen.getByText("comic_one")).toBeInTheDocument();
+    expect(screen.queryByText("joke_director")).toBeNull();
+  });
+
+  it("falls back past a blank sub_agent_name to the bound agent's name", () => {
+    // An empty/whitespace sub_agent_name must not render a blank identity
+    // segment — the fallback chain continues to boundAgent.name.
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      subAgentName: "  ",
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name: "check-account-eligibility" },
+    });
+    expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
+  });
+
   it("names the product, not the internal wrapper row, on a native sub-agent", () => {
     // A Claude Code Task child is bound to its parent's `claude-native-ui`
     // agent — an Omnigent internal the server hides everywhere else
@@ -275,6 +348,24 @@ describe("ChatHeader — conversation breadcrumb", () => {
     });
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
     expect(screen.queryByText("claude-native-ui")).toBeNull();
+  });
+
+  it("prefers the vendor product name over sub_agent_name on a native sub-agent", () => {
+    // A native child carries BOTH a wrapper label and a sub_agent_name; the
+    // product name (matching the Agents rail and composer) outranks the raw
+    // sub-agent identifier.
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      subAgentName: "general-purpose",
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name: "claude-native-ui" },
+      wrapperLabel: "claude-code-native-ui-subagent",
+    });
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.queryByText("general-purpose")).toBeNull();
   });
 
   it("falls back to a 'Sub-agent' segment before the agent snapshot loads", () => {
@@ -369,7 +460,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
                 boundAgent={undefined}
                 wrapperLabel={null}
                 canShare={false}
+                canFork={false}
                 onShare={() => {}}
+                onFork={() => {}}
                 hasAgentInfo={false}
                 onAgentInfo={() => {}}
                 hasHeaderMenu={false}
@@ -391,7 +484,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
               boundAgent={undefined}
               wrapperLabel={null}
               canShare={false}
+              canFork={false}
               onShare={() => {}}
+              onFork={() => {}}
               hasAgentInfo={false}
               onAgentInfo={() => {}}
               hasHeaderMenu={false}
@@ -517,6 +612,23 @@ describe("ChatHeader — floating mobile controls", () => {
       "max-md:backdrop-blur-xl",
     );
   });
+
+  it("keeps the page touchable while the fallback menu is open on mobile", () => {
+    // Modal mode's body-wide pointer-events:none leaves the menu as the only
+    // touch target, so touch-target adjustment snaps outside taps onto it and
+    // a phone can never dismiss the menu (see HeaderConversationMenu).
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      canShare: true,
+      hasHeaderMenu: true,
+    });
+
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).not.toBe("none");
+  });
 });
 
 describe("ChatHeader — title-adjacent conversation actions", () => {
@@ -629,6 +741,30 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
 
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByTestId("session-actions-menu")).toBeInTheDocument();
+  });
+
+  it("keeps the desktop fallback menu limited to Fork", () => {
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: null,
+      canFork: true,
+      hasAgentInfo: true,
+      hasRailContent: true,
+      showFilesPanel: true,
+      onFork,
+    });
+
+    const trigger = screen.getByTestId("desktop-fork-actions-menu");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Fork",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(onFork).toHaveBeenCalledOnce();
   });
 
   it("folds the workspace-rail entries into the one mobile kebab", () => {

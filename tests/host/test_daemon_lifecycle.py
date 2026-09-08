@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -71,12 +72,23 @@ def test_acquire_flocks_the_record_and_preserves_content(tmp_path: Path) -> None
 
 
 def test_acquire_creates_record_when_absent(tmp_path: Path) -> None:
-    # Auto-spawn can start the daemon before the launching CLI writes the
-    # record, so acquire() must create + flock the file rather than fail.
+    # The elected child locks before writing its metadata, so acquire() must
+    # create + flock the record file rather than fail when it is absent.
     lock = DaemonLifecycleLock.for_target("local", base_dir=tmp_path, pid=7)
     assert lock.acquire() is True
     assert daemon_record_path("local", base_dir=tmp_path).exists()
     lock.release()
+
+
+def test_different_targets_can_be_claimed_concurrently(tmp_path: Path) -> None:
+    first = DaemonLifecycleLock.for_target("https://one.example.com", base_dir=tmp_path)
+    second = DaemonLifecycleLock.for_target("https://two.example.com", base_dir=tmp_path)
+    assert first.acquire() is True
+    try:
+        assert second.acquire() is True
+    finally:
+        first.release()
+        second.release()
 
 
 def test_still_owner_delete_and_mismatch(tmp_path: Path) -> None:
@@ -115,6 +127,76 @@ def test_record_flock_is_held_states(tmp_path: Path) -> None:
     assert record_flock_is_held(record) is True
     lock.release()
     assert record_flock_is_held(record) is False
+
+
+def test_background_daemon_claims_record_before_connecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The elected child owns and records the target before opening a tunnel."""
+    from omnigent.host import _daemon_entry
+    from omnigent.host import identity as identity_module
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    target = "https://server.example.com"
+    log_path = tmp_path / "host.log"
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_HOST_DAEMON_CONFIG_SIG", "config-signature")
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--server", target])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging", lambda *_a, **_kw: log_path
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "load_or_create_host_identity",
+        lambda _path: HostIdentity(host_id="host_elected", name="elected"),
+    )
+
+    connected: list[str] = []
+
+    def _run(*, server_url: str, daemon_target: str, lifecycle_lock: object) -> None:
+        assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is True
+        assert lifecycle_lock is not None
+        connected.append(f"{server_url}|{daemon_target}")
+
+    monkeypatch.setattr("omnigent.host.connect.run_host_process", _run)
+
+    _daemon_entry.main()
+
+    payload = json.loads(daemon_record_path(target, base_dir=tmp_path).read_text())
+    assert payload["pid"] == os.getpid()
+    assert payload["host_id"] == "host_elected"
+    assert payload["config_sig"] == "config-signature"
+    assert connected == [f"{target}|{target}"]
+    assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is False
+
+
+def test_background_daemon_loser_exits_before_connecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second child for one target exits without replacing the live owner."""
+    from omnigent.host import _daemon_entry
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    target = "https://server.example.com"
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--server", target])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging",
+        lambda *_a, **_kw: tmp_path / "loser.log",
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda **_kw: pytest.fail("losing daemon must not connect"),
+    )
+    owner = DaemonLifecycleLock.for_target(target, base_dir=tmp_path, pid=4242)
+    assert owner.acquire() is True
+    try:
+        _write_record(daemon_record_path(target, base_dir=tmp_path), 4242)
+        before = daemon_record_path(target, base_dir=tmp_path).read_text()
+        _daemon_entry.main()
+        assert daemon_record_path(target, base_dir=tmp_path).read_text() == before
+    finally:
+        owner.release()
 
 
 def _record(target: str, pid: int) -> object:

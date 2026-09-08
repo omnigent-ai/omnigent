@@ -762,6 +762,43 @@ def test_session_git_existing_worktree_rejects_base_branch() -> None:
         SessionGitOptions(branch_name="feature/x", base_branch="main", existing_worktree=True)
 
 
+def test_session_git_existing_branch_rejects_base_branch() -> None:
+    """Recreate mode + ``base_branch`` is contradictory and rejected (422).
+
+    An existing branch has no base to fork; sending both would be an
+    ambiguous request.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="base_branch cannot be set when existing_branch is true"
+    ):
+        SessionGitOptions(branch_name="fix-1", base_branch="main", existing_branch=True)
+
+
+def test_session_git_existing_branch_rejects_existing_worktree() -> None:
+    """``existing_branch`` and ``existing_worktree`` are distinct modes (422).
+
+    Bind mode reuses a directory that exists; recreate mode makes a new
+    directory for a branch that exists — both at once is contradictory.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="existing_branch and existing_worktree cannot both be true"
+    ):
+        SessionGitOptions(branch_name="fix-1", existing_branch=True, existing_worktree=True)
+
+
+def test_session_git_existing_branch_ok() -> None:
+    """Recreate mode alone validates cleanly and round-trips the flag."""
+    from omnigent.server.schemas import SessionGitOptions
+
+    git = SessionGitOptions(branch_name="fix-1", existing_branch=True)
+    assert git.existing_branch is True
+    assert git.base_branch is None
+
+
 def test_session_git_existing_worktree_with_host_id_ok() -> None:
     """Bind mode with ``host_id`` and no ``base_branch`` validates cleanly."""
     from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions

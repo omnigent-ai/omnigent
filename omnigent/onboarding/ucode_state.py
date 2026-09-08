@@ -60,7 +60,7 @@ class UcodeWorkspaceState:
         e.g. ``{"opus": "databricks-claude-opus-4-7", "sonnet": "..."}``.
         An optional ``"sonnet_5"`` key pins Claude Code's one custom
         ``/model`` picker slot (see
-        :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) to the
+        :data:`omnigent.harnesses.claude_native.main._UCODE_CLAUDE_CUSTOM_TIER`) to the
         newer Sonnet generation, offered as an opt-in alongside the default
         ``"sonnet"`` tier, for workspaces that serve both side by side.
     :param fable_enabled: Whether the user opted into ucode's premium Fable
