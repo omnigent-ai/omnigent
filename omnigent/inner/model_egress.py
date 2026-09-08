@@ -8,6 +8,9 @@ from urllib.parse import SplitResult, urlsplit
 
 from .egress.rules import is_dns_safe_host, parse_rules
 
+UCODE_SIGNER_BINDING_ID = "databricks-ucode-v1"
+_UCODE_CODEX_PATH = "/ai-gateway/codex/v1"
+
 
 @dataclass(frozen=True)
 class FrozenModelRoute:
@@ -45,6 +48,44 @@ class ProviderModelBinding:
 
     endpoint: str
     maximum_routes: tuple[FrozenModelRoute, ...]
+
+
+def registered_model_provider_binding(
+    *,
+    binding_id: str,
+    trusted_session_endpoint: str,
+    trusted_host: str,
+) -> ProviderModelBinding:
+    """Resolve a named provider's immutable maximum route."""
+    if binding_id != UCODE_SIGNER_BINDING_ID:
+        raise ValueError(f"unsupported model signer provider {binding_id!r}")
+    host = urlsplit(trusted_host)
+    endpoint = _parse_endpoint(trusted_session_endpoint)
+    if (
+        host.scheme != "https"
+        or host.hostname is None
+        or host.username is not None
+        or host.password is not None
+        or host.port not in (None, 443)
+        or host.path not in ("", "/")
+        or host.query
+        or host.fragment
+        or not is_dns_safe_host(host.hostname)
+        or endpoint.hostname != host.hostname
+        or endpoint.path.rstrip("/") != _UCODE_CODEX_PATH
+    ):
+        raise ValueError("signer endpoint is not the registered Databricks ucode endpoint")
+    endpoint_url = f"https://{host.hostname.lower()}{_UCODE_CODEX_PATH}"
+    return ProviderModelBinding(
+        endpoint=endpoint_url,
+        maximum_routes=(
+            FrozenModelRoute(
+                method="POST",
+                host=host.hostname,
+                path=f"{_UCODE_CODEX_PATH}/responses",
+            ),
+        ),
+    )
 
 
 def resolve_model_routes(
