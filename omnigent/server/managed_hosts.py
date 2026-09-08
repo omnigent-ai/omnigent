@@ -198,6 +198,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "mesos",
         "microsandbox",
         "agent_sandbox",
     }
@@ -213,6 +214,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "mesos",
         "microsandbox",
         "agent_sandbox",
     }
@@ -1398,6 +1400,23 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "mesos":
+        mesos_section = _parse_provider_section(raw, "mesos")
+        if mesos_section is not None:
+            _reject_unknown_keys(
+                mesos_section,
+                {"image", "env", "compose_url", "username", "verify_ssl", "target_hostname"},
+                "sandbox.mesos",
+            )
+        launcher_factory = _mesos_launcher_factory(
+            image=_parse_provider_image(raw, "mesos"),
+            env=_parse_provider_env(raw, "mesos"),
+            compose_url=_parse_provider_string(raw, "mesos", "compose_url"),
+            username=_parse_provider_string(raw, "mesos", "username"),
+            verify_ssl=_parse_provider_bool(raw, "mesos", "verify_ssl"),
+            target_hostname=_parse_provider_string(raw, "mesos", "target_hostname"),
+        )
+        token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S        
     elif provider == "microsandbox":
         microsandbox_section = _parse_provider_section(raw, "microsandbox")
         if microsandbox_section is not None:
@@ -2892,6 +2911,34 @@ def _kubernetes_launcher_factory(
             secret_mounts=secret_mounts,
             pod_ready_timeout_s=pod_ready_timeout_s,
             runtime_class=runtime_class,
+        )
+
+    return _build
+
+def _mesos_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    compose_url: str | None,
+    username: str | None,
+    verify_ssl: bool | None,
+    target_hostname: str | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: mesos`` path.
+    """
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the mesos-compose launcher."""
+        from omnigent.onboarding.sandboxes.mesos import MesosSandboxLauncher
+
+        return MesosSandboxLauncher(
+            image=image,
+            env=env,
+            compose_url=compose_url,
+            username=username,
+            verify_ssl=verify_ssl,
+            target_hostname=target_hostname,
         )
 
     return _build
