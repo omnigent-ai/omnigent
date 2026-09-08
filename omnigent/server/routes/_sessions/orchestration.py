@@ -8637,6 +8637,19 @@ async def _create_session_from_existing_agent(
                 for item in body.initial_items
             ]
             await asyncio.to_thread(conversation_store.append, conv.id, new_items)
+            # Keep the original event envelopes so a later runner bind can
+            # replay them through the normal dispatch path.  The transcript
+            # seed above remains the durable history copy; this state is only
+            # the delivery ledger and is cleared after dispatch succeeds.
+            await asyncio.to_thread(
+                conversation_store.set_session_state,
+                conv.id,
+                {
+                    **conv.session_state,
+                    "pending_initial_items": [item.model_dump(mode="json") for item in body.initial_items],
+                    "pending_initial_items_warning": "initial_items_seeded_not_dispatched",
+                },
+            )
             # Seeding is a silent downgrade: the caller asked for a prompt and
             # got history. That is invisible in the session snapshot -- the item
             # is present and looks delivered -- so a client that creates a
