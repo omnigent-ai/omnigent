@@ -2654,6 +2654,29 @@ def test_populate_codex_skills_from_bundle_links_bundle_skills(tmp_path: Path) -
     assert (linked / "SKILL.md").is_file()
 
 
+def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Path) -> None:
+    """
+    ``source_codex_home`` reads host skills from the resolved ``$CODEX_HOME``.
+
+    Native Codex honors ``$CODEX_HOME``; its launch passes the resolved host
+    home here so the seeded skills match what the CLI loads. Without the
+    override the helper reads ``~/.codex`` (the wrapped executor's behavior),
+    so a host skill under a custom ``$CODEX_HOME`` is picked up only when the
+    override is supplied.
+    """
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+
+    custom_codex_home = tmp_path / "custom-codex"
+    _make_skill_dir(custom_codex_home / "skills", "host-skill")
+    codex_home = tmp_path / "codex_home"
+
+    populate_codex_skills_from_bundle(codex_home, None, "all", source_codex_home=custom_codex_home)
+
+    linked = codex_home / "skills" / "host-skill"
+    assert linked.is_symlink() or linked.is_dir()
+    assert (linked / "SKILL.md").is_file()
+
+
 def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) -> None:
     """
     ``skills_filter="none"`` produces no ``skills/`` dir even when the

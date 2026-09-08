@@ -4148,10 +4148,21 @@ async def _auto_create_codex_terminal(
     # executor's skill population; the native CLI otherwise sees zero
     # bundled skills. Best-effort: a skill-link failure must not break
     # the terminal launch.
-    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+    from omnigent.inner.codex_executor import (
+        _codex_home_config_source_from_env,
+        populate_codex_skills_from_bundle,
+    )
 
     try:
-        populate_codex_skills_from_bundle(codex_home, bundle_dir, skills_filter)
+        # Native Codex honors $CODEX_HOME; seed skills from that resolved home
+        # (not a hardcoded ~/.codex) so the terminal and the web menu list the
+        # same host skills.
+        populate_codex_skills_from_bundle(
+            codex_home,
+            bundle_dir,
+            skills_filter,
+            source_codex_home=_codex_home_config_source_from_env(),
+        )
     except OSError:
         _logger.warning(
             "Could not populate codex skills for %s; native Codex will see no bundled skills",

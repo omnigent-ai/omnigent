@@ -31,6 +31,7 @@ def _ctx(
     home: Path,
     skills_filter: str | list[str] = "all",
     claude_config_dir: Path | None = None,
+    codex_home: Path | None = None,
 ) -> SkillSourceContext:
     """Build a context with a single discovery root and a pinned home."""
     return SkillSourceContext(
@@ -39,6 +40,7 @@ def _ctx(
         skills_filter=skills_filter,
         bundle_dir=None,
         claude_config_dir=claude_config_dir,
+        codex_home=codex_home,
     )
 
 
@@ -173,16 +175,15 @@ def test_claude_sdk_keeps_generic_walk_native_matches_terminal(
     assert native == {"claude-dir-skill", "user-cfg-skill"}
 
 
-def test_codex_native_and_sdk_resolve_identically(
+def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Codex has no native/SDK menu divergence to scope.
+    """Without a configured ``$CODEX_HOME`` both codex harnesses read ``~/.codex``.
 
-    The Codex provider sources skills from the same roots the executor
-    populates a session's ``$CODEX_HOME/skills`` from — ``<bundle>/skills`` and
-    ``~/.codex/skills`` — and never scans ``.agents``. That holds for both the
-    ``codex`` (SDK) and ``codex-native`` harnesses, so the native flag leaves
-    codex untouched (the fix is confined to the claude family that had it).
+    The Codex provider never scans ``.agents`` and, absent a resolved
+    ``$CODEX_HOME`` (``ctx.codex_home is None``), the native provider falls back
+    to the same ``~/.codex/skills`` the SDK path uses — so the two agree until a
+    custom codex home is in play (see the divergence test below).
     """
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
@@ -195,6 +196,33 @@ def test_codex_native_and_sdk_resolve_identically(
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
     assert native == sdk == {"codex-host-skill"}
+
+
+def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native codex sources host skills from ``$CODEX_HOME``; SDK keeps ``~/.codex``.
+
+    The codex analog of the ``$CLAUDE_CONFIG_DIR`` facet: codex-native honors
+    ``$CODEX_HOME`` (its launch seeds the per-bridge home from that resolved
+    home), so the menu must read it too. The in-process ``codex`` (SDK) harness
+    has no such terminal, so it stays on ``~/.codex`` — the same seeded tree
+    must diverge by harness.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".codex" / "skills", "default-codex-skill")
+    custom = tmp_path / "custom-codex-home"
+    _write_skill(custom / "skills", "custom-codex-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    ctx = _ctx(workspace, home, codex_home=custom)
+
+    native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
+    sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
+    # Native reads $CODEX_HOME's skills; SDK ignores codex_home and reads ~/.codex.
+    assert native == {"custom-codex-skill"}
+    assert sdk == {"default-codex-skill"}
 
 
 def test_claude_provider_defaults_user_tier_to_home_claude(

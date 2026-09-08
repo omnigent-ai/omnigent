@@ -10327,10 +10327,19 @@ def create_runner_app(
             merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
             seen = {s.name for s in spec.skills}
             seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+            harness = canonicalize_harness(spec.executor.harness_kind)
             # Claude Code resolves its user scope from $CLAUDE_CONFIG_DIR
             # (default ~/.claude); the terminal inherits this env, so the
             # menu must read the same tier or the two surfaces diverge.
             configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+            # Native Codex honors $CODEX_HOME for its skills; resolve the same
+            # host home the launch seeds from so the menu matches the terminal
+            # (only the native provider reads it — see codex_host_skills).
+            codex_home: Path | None = None
+            if harness is not None and "codex" in harness:
+                from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+                codex_home = _codex_home_config_source_from_env()
             ctx = SkillSourceContext(
                 roots=tuple(roots),
                 home=Path.home(),
@@ -10339,8 +10348,8 @@ def create_runner_app(
                 claude_config_dir=(
                     Path(configured_claude_dir).expanduser() if configured_claude_dir else None
                 ),
+                codex_home=codex_home,
             )
-            harness = canonicalize_harness(spec.executor.harness_kind)
             for hs in resolve_harness_skills(ctx, harness):
                 if hs.name in seen:
                     continue

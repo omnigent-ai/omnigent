@@ -82,9 +82,13 @@ class SkillSourceContext:
     :param claude_config_dir: Claude Code's user config dir when configured
         (``$CLAUDE_CONFIG_DIR``), else ``None`` for the ``home/.claude``
         default; injected so tests can pin it.
+    :param codex_home: Codex's resolved host home when configured
+        (``$CODEX_HOME``), else ``None`` for the ``home/.codex`` default;
+        injected so tests can pin it. Used only for native codex, mirroring
+        the terminal, which honors ``$CODEX_HOME`` for its skills.
     :param is_native: Whether the session's harness is a native CLI harness.
         Set by :func:`resolve_harness_skills` from the harness id. Gates the
-        terminal-matching resolution (config-dir tier, ``.agents`` exclusion)
+        terminal-matching resolution (config-home tiers, ``.agents`` exclusion)
         so it applies only to native harnesses, never the in-process SDK ones.
     """
 
@@ -93,6 +97,7 @@ class SkillSourceContext:
     skills_filter: str | list[str]
     bundle_dir: Path | None
     claude_config_dir: Path | None = None
+    codex_home: Path | None = None
     is_native: bool = False
 
 
@@ -414,7 +419,7 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Codex skills: ``<bundle>/skills`` + ``~/.codex/skills`` under the filter.
+    Codex skills: ``<bundle>/skills`` + the host codex skills dir under the filter.
 
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
@@ -423,6 +428,12 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     that selection whose ``SKILL.md`` parses: the executor links by existence,
     so a present-but-unparseable skill is linked but not shown (correct — Codex
     won't register a malformed skill as a command either).
+
+    A native ``codex-native`` session honors ``$CODEX_HOME``: its launch seeds
+    the per-bridge home from the ``$CODEX_HOME``-resolved host home, so the menu
+    reads the same resolved home (``ctx.codex_home``) to stay in step with the
+    terminal. The in-process ``codex`` (SDK) harness has no such terminal, so it
+    keeps the ``~/.codex`` host dir it used before this scoping.
 
     Names are surfaced by **directory name** (the selector's key), not the
     frontmatter ``name``. Codex registers a skill's slash command under its
@@ -433,7 +444,8 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
 
-    sources = codex_skill_sources(ctx.bundle_dir, ctx.home)
+    host_override = ctx.codex_home if ctx.is_native else None
+    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
     out: list[SkillSpec] = []
     for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources).items():
         try:
