@@ -5,15 +5,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import http
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
+import ssl
 import sys
 import tempfile
+import weakref
+from collections.abc import Awaitable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 from urllib.parse import urlsplit
 
 from .egress.ca import ensure_ca, ensure_ca_bundle
@@ -37,12 +43,51 @@ _TEST_BINDING = "test-fake-provider-v1"
 _UCODE_BINDING = "databricks-ucode-v1"
 _MAX_CONFIG_BYTES = 64 * 1024
 _MAX_HEADER_BYTES = 64 * 1024
+_MAX_HEADER_LINE_BYTES = 8 * 1024
+_MAX_BODY_BYTES = 10 * 1024 * 1024
+_MAX_RESPONSE_BODY_BYTES = 64 * 1024 * 1024
+_RESPONSE_IDLE_TIMEOUT_SECONDS = 60.0
+_RESPONSE_TOTAL_TIMEOUT_SECONDS = 10 * 60.0
+_HEADER_NAME_RE = re.compile(rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+_STATUS_LINE_RE = re.compile(rb"HTTP/1\.1 ([1-5][0-9]{2})(?: ([\x20-\x7e]*))?\r\n\Z")
+_REQUEST_REJECTED_HEADERS = frozenset(
+    {
+        "connection",
+        "expect",
+        "forwarded",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "websocket",
+        "x-http-method-override",
+        "x-original-url",
+        "x-rewrite-url",
+    }
+)
+_RESPONSE_ALLOWED_HEADERS = frozenset(
+    {
+        "cache-control",
+        "content-type",
+        "location",
+        "openai-processing-ms",
+        "openai-request-id",
+        "request-id",
+        "retry-after",
+        "x-request-id",
+    }
+)
 _UCODE_MAX_CACHE_AGE_SECONDS = 5 * 60.0
 _UCODE_REFRESH_SKEW_SECONDS = 30.0
 _UCODE_MIN_REFRESH_INTERVAL_SECONDS = 2.0
 _UCODE_BACKOFF_BASE_SECONDS = 2.0
 _UCODE_BACKOFF_MAX_SECONDS = 30.0
 _E2E_MARKER = "BROKERED_E2E_OK upstream_saw_signer_only_fake_bearer=true"
+_VALIDATION_BEARER = "request-validation-only"
+_T = TypeVar("_T")
 
 
 class _CredentialSource(Protocol):
@@ -60,6 +105,121 @@ class _StaticCredential:
 
     def invalidate_after_unauthorized(self) -> None:
         pass
+
+
+@dataclass(frozen=True)
+class _ParsedResponse:
+    status: int
+    headers: tuple[tuple[str, str], ...]
+    content_length: int | None
+    chunked: bool
+
+
+def _parse_strict_request_line(raw: bytes, route: FrozenModelRoute) -> tuple[str, str]:
+    expected = f"{route.method} {route.path} HTTP/1.1\r\n".encode("ascii")
+    if raw != expected:
+        raise SigningRejected("request line must be the exact frozen HTTP/1.1 route")
+    return route.method, route.path
+
+
+def _parse_strict_header_lines(
+    raw: bytes,
+    *,
+    repeatable_names: frozenset[str] = frozenset(),
+) -> list[tuple[str, str]]:
+    if len(raw) > _MAX_HEADER_BYTES:
+        raise SigningRejected("header block exceeds the configured limit")
+    if not raw.endswith(b"\r\n\r\n"):
+        raise SigningRejected("header block is incomplete or not CRLF-delimited")
+    lines = raw[:-4].split(b"\r\n")
+    if any(b"\n" in line or b"\r" in line for line in lines):
+        raise SigningRejected("header block is not CRLF-delimited")
+    parsed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in lines:
+        if not line or len(line) > _MAX_HEADER_LINE_BYTES or line[:1] in (b" ", b"\t"):
+            raise SigningRejected("request contains a malformed header line")
+        name_raw, separator, value_raw = line.partition(b":")
+        if not separator or _HEADER_NAME_RE.fullmatch(name_raw) is None:
+            raise SigningRejected("request contains an invalid header name")
+        if value_raw.startswith(b" "):
+            value_raw = value_raw[1:]
+        if value_raw.startswith(b" ") or value_raw.endswith(b" "):
+            raise SigningRejected("request contains ambiguous header whitespace")
+        if any(byte < 0x20 or byte > 0x7E for byte in value_raw):
+            raise SigningRejected("request contains an invalid header value")
+        name = name_raw.decode("ascii")
+        lowered = name.lower()
+        if lowered in seen and lowered not in repeatable_names:
+            raise SigningRejected("duplicate request header is not allowed")
+        seen.add(lowered)
+        parsed.append((name, value_raw.decode("ascii")))
+    return parsed
+
+
+def _parse_strict_request_headers(raw: bytes) -> tuple[list[tuple[str, str]], int]:
+    parsed = _parse_strict_header_lines(raw)
+    by_name = {name.lower(): value for name, value in parsed}
+    for name in by_name:
+        if name in _REQUEST_REJECTED_HEADERS or name.startswith(
+            ("proxy-", "sec-websocket-", "x-forwarded-")
+        ):
+            raise SigningRejected("request contains a forbidden transport or routing header")
+    length_raw = by_name.get("content-length")
+    if (
+        length_raw is None
+        or not length_raw
+        or not length_raw.isascii()
+        or not length_raw.isdecimal()
+    ):
+        raise SigningRejected("exactly one decimal Content-Length is required")
+    if len(length_raw) > 20:
+        raise SigningRejected("Content-Length exceeds the configured limit")
+    length = int(length_raw)
+    if length > _MAX_BODY_BYTES:
+        raise SigningRejected("request body exceeds the configured limit")
+    return parsed, length
+
+
+def _parse_strict_response_head(status_line: bytes, headers_raw: bytes) -> _ParsedResponse:
+    match = _STATUS_LINE_RE.fullmatch(status_line)
+    if match is None:
+        raise ValueError("malformed upstream status line")
+    status = int(match.group(1))
+    parsed = _parse_strict_header_lines(
+        headers_raw,
+        repeatable_names=frozenset({"set-cookie"}),
+    )
+    by_name = {name.lower(): value for name, value in parsed}
+    transfer_encoding = by_name.get("transfer-encoding")
+    content_length_raw = by_name.get("content-length")
+    if transfer_encoding is not None and content_length_raw is not None:
+        raise ValueError("ambiguous upstream response framing")
+    if transfer_encoding is not None and transfer_encoding.lower() != "chunked":
+        raise ValueError("unsupported upstream response transfer coding")
+    content_length: int | None = None
+    if content_length_raw is not None:
+        if (
+            not content_length_raw
+            or not content_length_raw.isascii()
+            or not content_length_raw.isdecimal()
+            or len(content_length_raw) > 20
+        ):
+            raise ValueError("invalid upstream response Content-Length")
+        content_length = int(content_length_raw)
+        if content_length > _MAX_RESPONSE_BODY_BYTES:
+            raise ValueError("upstream response body exceeds the configured limit")
+    allowed = tuple(
+        (name, value)
+        for name, value in parsed
+        if name.lower() in _RESPONSE_ALLOWED_HEADERS or name.lower().startswith("x-ratelimit-")
+    )
+    return _ParsedResponse(
+        status=status,
+        headers=allowed,
+        content_length=content_length,
+        chunked=transfer_encoding is not None,
+    )
 
 
 class _SignerRelay(EgressProxy):
@@ -90,6 +250,43 @@ class _SignerRelay(EgressProxy):
             raise ValueError("signer relay requires exactly one credential source")
         self._credential_source = credential_source or _StaticCredential(bearer_token or "")
         self._provider_port = provider_port
+        self._tls_sni_by_task: dict[asyncio.Task[object], str | None] = {}
+        self._tls_sni_by_object: weakref.WeakKeyDictionary[
+            ssl.SSLObject | ssl.SSLSocket, str | None
+        ] = weakref.WeakKeyDictionary()
+
+    def _configure_server_ssl_context(self, host: str, ssl_ctx: ssl.SSLContext) -> None:
+        del host
+
+        def _capture_sni(
+            ssl_socket: ssl.SSLObject | ssl.SSLSocket,
+            server_name: str | None,
+            context: ssl.SSLSocket,
+        ) -> int | None:
+            del context
+            self._tls_sni_by_object[ssl_socket] = server_name.lower() if server_name else None
+            return None
+
+        ssl_ctx.set_servername_callback(_capture_sni)
+
+    def _tls_handshake_completed(self, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        ssl_object = writer.get_extra_info("ssl_object")
+        if task is not None and ssl_object is not None:
+            self._tls_sni_by_task[task] = self._tls_sni_by_object.pop(ssl_object, None)
+
+    def _tls_connection_closed(self) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._tls_sni_by_task.pop(task, None)
+
+    def _parse_inner_request_line(self, raw: bytes) -> tuple[str, str]:
+        return _parse_strict_request_line(raw, self._route)
+
+    @staticmethod
+    def _parse_inner_content_length(headers_raw: bytes) -> int:
+        _, length = _parse_strict_request_headers(headers_raw)
+        return length
 
     async def _assert_destination_allowed(self, host: str, port: int) -> str | None:
         if host.lower() != self._route.host or port != 443:
@@ -110,32 +307,48 @@ class _SignerRelay(EgressProxy):
         body: bytes,
     ) -> None:
         del request_line
-        message = _parse_http_headers(headers_raw)
-        host_values = message.get_all("Host", [])
-        request_host = host_values[0] if len(host_values) == 1 else ""
+        headers, _ = _parse_strict_request_headers(headers_raw)
+        request_host = next(
+            (value for name, value in headers if name.lower() == "host"),
+            "",
+        )
+        task = asyncio.current_task()
+        sni_host = self._tls_sni_by_task.pop(task, None) if task is not None else None
+        try:
+            reconstruct_signed_request(
+                route=self._route,
+                placeholder=self._placeholder,
+                bearer_token=_VALIDATION_BEARER,
+                method=method,
+                connect_host=host,
+                sni_host=sni_host or "",
+                request_host=request_host,
+                target=path,
+                headers=headers,
+                body=body,
+            )
+        except SigningRejected:
+            await self._send_forbidden(client_writer, "")
+            return
         try:
             bearer_token = await self._credential_source.token_for_request()
         except ProviderAuthRequired:
             await self._send_auth_required(client_writer)
             return
-        try:
-            signed = reconstruct_signed_request(
-                route=self._route,
-                placeholder=self._placeholder,
-                bearer_token=bearer_token,
-                method=method,
-                connect_host=host,
-                sni_host=host,
-                request_host=request_host,
-                target=path,
-                headers=list(message.raw_items()),
-                body=body,
-            )
-        except SigningRejected as exc:
-            await self._send_forbidden(client_writer, str(exc))
-            return
+        signed = reconstruct_signed_request(
+            route=self._route,
+            placeholder=self._placeholder,
+            bearer_token=bearer_token,
+            method=method,
+            connect_host=host,
+            sni_host=sni_host or "",
+            request_host=request_host,
+            target=path,
+            headers=headers,
+            body=body,
+        )
         if port != 443:
-            await self._send_forbidden(client_writer, "model route requires port 443")
+            await self._send_forbidden(client_writer, "")
             return
 
         try:
@@ -144,14 +357,17 @@ class _SignerRelay(EgressProxy):
                 if self._provider_port is not None
                 else await self._assert_destination_allowed(signed.host, 443)
             )
-            upstream_reader, upstream_writer = await asyncio.open_connection(
-                connect_host or signed.host,
-                self._provider_port or 443,
-                ssl=self._upstream_ssl_ctx,
-                server_hostname=signed.host,
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    connect_host or signed.host,
+                    self._provider_port or 443,
+                    ssl=self._upstream_ssl_ctx,
+                    server_hostname=signed.host,
+                ),
+                timeout=30,
             )
-        except OSError:
-            await self._send_bad_gateway(client_writer, "trusted provider unavailable")
+        except (asyncio.TimeoutError, OSError):
+            await self._send_bad_gateway(client_writer, "")
             return
 
         try:
@@ -168,7 +384,7 @@ class _SignerRelay(EgressProxy):
             if bytes_relayed == 0:
                 await self._send_bad_gateway(
                     client_writer,
-                    "trusted provider returned no response",
+                    "",
                 )
         finally:
             upstream_writer.close()
@@ -184,35 +400,183 @@ class _SignerRelay(EgressProxy):
         upstream_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> tuple[int, int]:
-        """Observe only the status line needed for credential invalidation."""
+        """Validate, sanitize, and stream one bounded upstream response."""
+        started = asyncio.get_running_loop().time()
         try:
-            status_line = await asyncio.wait_for(
+            status_line = await self._read_response_part(
                 upstream_reader.readline(),
-                timeout=60,
+                started=started,
             )
-        except (asyncio.TimeoutError, OSError):
-            return 0, 0
-        if (
-            not status_line.endswith(b"\r\n")
-            or len(status_line) > _MAX_HEADER_BYTES
-            or len(status_line) < 14
-            or status_line[:7] not in (b"HTTP/1.",)
+            headers_raw = await self._read_response_headers(upstream_reader, started=started)
+            response = _parse_strict_response_head(status_line, headers_raw)
+        except (
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            asyncio.TimeoutError,
+            OSError,
+            SigningRejected,
+            ValueError,
         ):
             return 0, 0
-        parts = status_line.rstrip(b"\r\n").split(b" ", 2)
-        if (
-            len(parts) < 2
-            or parts[0] not in (b"HTTP/1.0", b"HTTP/1.1")
-            or len(parts[1]) != 3
-            or not parts[1].isdigit()
-        ):
-            return 0, 0
-        status = int(parts[1])
-        self._observe_upstream_status(status)
-        client_writer.write(status_line)
-        await client_writer.drain()
-        relayed, _ = await self._relay_response(upstream_reader, client_writer)
-        return len(status_line) + relayed, status
+        self._observe_upstream_status(response.status)
+        try:
+            reason = http.HTTPStatus(response.status).phrase
+        except ValueError:
+            reason = ""
+        downstream_head = f"HTTP/1.1 {response.status} {reason}\r\n".encode("ascii")
+        for name, value in response.headers:
+            downstream_head += f"{name}: {value}\r\n".encode("ascii")
+        if response.content_length is not None:
+            downstream_head += f"Content-Length: {response.content_length}\r\n".encode("ascii")
+        downstream_head += b"Connection: close\r\n\r\n"
+        client_writer.write(downstream_head)
+        await self._read_response_part(client_writer.drain(), started=started)
+        bytes_relayed = len(downstream_head)
+        try:
+            if response.chunked:
+                body_bytes = await self._relay_chunked_body(
+                    upstream_reader,
+                    client_writer,
+                    started=started,
+                )
+            elif response.content_length is not None:
+                body_bytes = await self._relay_fixed_body(
+                    upstream_reader,
+                    client_writer,
+                    length=response.content_length,
+                    started=started,
+                )
+            elif response.status in (204, 304) or 100 <= response.status < 200:
+                body_bytes = 0
+            else:
+                body_bytes = await self._relay_eof_body(
+                    upstream_reader,
+                    client_writer,
+                    started=started,
+                )
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, OSError, ValueError):
+            return bytes_relayed, response.status
+        return bytes_relayed + body_bytes, response.status
+
+    @staticmethod
+    async def _read_response_part(
+        awaitable: Awaitable[_T],
+        *,
+        started: float,
+    ) -> _T:
+        remaining = _RESPONSE_TOTAL_TIMEOUT_SECONDS - (asyncio.get_running_loop().time() - started)
+        if remaining <= 0:
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(
+            awaitable,
+            timeout=min(_RESPONSE_IDLE_TIMEOUT_SECONDS, remaining),
+        )
+
+    async def _read_response_headers(
+        self,
+        reader: asyncio.StreamReader,
+        *,
+        started: float,
+    ) -> bytes:
+        raw = bytearray()
+        while True:
+            line = await self._read_response_part(reader.readline(), started=started)
+            if not line or not line.endswith(b"\r\n"):
+                raise ValueError("incomplete upstream response headers")
+            raw.extend(line)
+            if len(raw) > _MAX_HEADER_BYTES:
+                raise ValueError("upstream response headers exceed the configured limit")
+            if line == b"\r\n":
+                return bytes(raw)
+
+    async def _relay_fixed_body(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        length: int,
+        started: float,
+    ) -> int:
+        relayed = 0
+        while relayed < length:
+            size = min(64 * 1024, length - relayed)
+            data = await self._read_response_part(reader.read(size), started=started)
+            if not data:
+                raise asyncio.IncompleteReadError(b"", size)
+            writer.write(data)
+            await self._read_response_part(writer.drain(), started=started)
+            relayed += len(data)
+        return relayed
+
+    async def _relay_eof_body(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        started: float,
+    ) -> int:
+        relayed = 0
+        while True:
+            data = await self._read_response_part(reader.read(64 * 1024), started=started)
+            if not data:
+                return relayed
+            relayed += len(data)
+            if relayed > _MAX_RESPONSE_BODY_BYTES:
+                raise ValueError("upstream response body exceeds the configured limit")
+            writer.write(data)
+            await self._read_response_part(writer.drain(), started=started)
+
+    async def _relay_chunked_body(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        started: float,
+    ) -> int:
+        relayed = 0
+        while True:
+            line = await self._read_response_part(reader.readline(), started=started)
+            if (
+                not line.endswith(b"\r\n")
+                or len(line) > 32
+                or not line[:-2]
+                or any(byte not in b"0123456789abcdefABCDEF" for byte in line[:-2])
+            ):
+                raise ValueError("invalid upstream chunk framing")
+            size = int(line[:-2], 16)
+            if size == 0:
+                trailer_end = await self._read_response_part(
+                    reader.readexactly(2),
+                    started=started,
+                )
+                if trailer_end != b"\r\n":
+                    raise ValueError("upstream response trailers are not supported")
+                return relayed
+            if relayed + size > _MAX_RESPONSE_BODY_BYTES:
+                raise ValueError("upstream response body exceeds the configured limit")
+            chunk_relayed = await self._relay_fixed_body(
+                reader,
+                writer,
+                length=size,
+                started=started,
+            )
+            terminator = await self._read_response_part(reader.readexactly(2), started=started)
+            if terminator != b"\r\n":
+                raise ValueError("invalid upstream chunk framing")
+            relayed += chunk_relayed
+
+    @staticmethod
+    async def _send_forbidden(writer: asyncio.StreamWriter, message: str) -> None:
+        del message
+        await _send_generic_error(writer, 403, "Forbidden")
+
+    @staticmethod
+    async def _send_bad_gateway(writer: asyncio.StreamWriter, message: str) -> None:
+        del message
+        await _send_generic_error(writer, 502, "Bad Gateway")
 
     @staticmethod
     async def _send_auth_required(writer: asyncio.StreamWriter) -> None:
@@ -225,6 +589,24 @@ class _SignerRelay(EgressProxy):
         with contextlib.suppress(Exception):
             writer.write(response)
             await writer.drain()
+
+
+async def _send_generic_error(
+    writer: asyncio.StreamWriter,
+    status: int,
+    reason: str,
+) -> None:
+    body = f"{status} {reason}\r\n".encode("ascii")
+    response = (
+        f"HTTP/1.1 {status} {reason}\r\n".encode("ascii")
+        + b"Content-Type: text/plain\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode("ascii")
+        + b"Connection: close\r\n\r\n"
+        + body
+    )
+    with contextlib.suppress(Exception):
+        writer.write(response)
+        await writer.drain()
 
 
 async def _fake_provider(
