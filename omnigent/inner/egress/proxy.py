@@ -513,6 +513,7 @@ class EgressProxy:
         await writer.drain()
 
         ssl_ctx = self._cert_cache.get_ssl_context(host)
+        self._configure_server_ssl_context(host, ssl_ctx)
         if self._allows_http2_passthrough(host):
             ssl_ctx.set_alpn_protocols(["h2", "http/1.1"])
         else:
@@ -572,6 +573,7 @@ class EgressProxy:
             return
 
         tls_writer = asyncio.StreamWriter(tls_transport, tls_protocol, tls_reader, loop)
+        self._tls_handshake_completed(tls_writer)
 
         try:
             inner_first = await asyncio.wait_for(tls_reader.readline(), timeout=30)
@@ -602,42 +604,13 @@ class EgressProxy:
                 await self._forward_http2(tls_reader, tls_writer, host, port, inner_first)
                 return
 
-            inner_line = inner_first.decode("latin-1", errors="replace").strip()
-
-            # S6 (security): a sandboxed agent controls these
-            # MITM-decrypted bytes, so the policy parse and the bytes we
-            # forward upstream MUST NOT be able to diverge. The primary
-            # guard is re-serializing the forwarded request line from the
-            # parsed (method, path) below — that makes the upstream
-            # receive byte-for-byte what the policy authorized, no matter
-            # how ``str.split()`` tokenized the line. (``str.split()`` with
-            # no argument splits on *any* Unicode whitespace, which after
-            # the ``latin-1`` decode includes not just bare
-            # ``\r``/``\t``/``\v``/``\f`` but also NEL ``0x85`` and NBSP
-            # ``0xa0`` — so a control-byte filter alone would be
-            # insufficient.) As defense in depth we additionally reject
-            # any control byte (< SP) here, which gives a clean 403 for
-            # the classic bare-``\r``/``\t`` request-line smuggle instead
-            # of silently normalizing it.
-            if any(ord(ch) < _MIN_PRINTABLE_BYTE for ch in inner_line):
-                logger.warning(
-                    "REJECT-CONTROL-CHAR CONNECT %s — inner request line contains a control byte",
-                    host,
-                )
-                await self._send_forbidden(
-                    tls_writer, "inner request line contains forbidden character"
-                )
+            try:
+                inner_method, inner_path = self._parse_inner_request_line(inner_first)
+                inner_headers_raw = await self._read_headers(tls_reader)
+                content_length = self._parse_inner_content_length(inner_headers_raw)
+            except ValueError:
+                await self._send_forbidden(tls_writer, "malformed inner request")
                 return
-
-            inner_parts = inner_line.split()
-            if len(inner_parts) < 2:
-                return
-
-            inner_method = inner_parts[0].upper()
-            inner_path = inner_parts[1]
-
-            inner_headers_raw = await self._read_headers(tls_reader)
-            inner_headers = self._parse_header_dict(inner_headers_raw)
 
             if not check_request(self._rules, inner_method, host, inner_path):
                 logger.warning("BLOCKED %s https://%s%s", inner_method, host, inner_path)
@@ -671,7 +644,6 @@ class EgressProxy:
                 )
                 return
 
-            content_length = int(inner_headers.get("content-length", "0"))
             body = b""
             if content_length > 0:
                 body = await asyncio.wait_for(tls_reader.readexactly(content_length), timeout=30)
@@ -706,6 +678,7 @@ class EgressProxy:
         except Exception:
             logger.exception("Error handling CONNECT inner request for %s", host)
         finally:
+            self._tls_connection_closed()
             try:
                 tls_writer.close()
                 await asyncio.wait_for(tls_writer.wait_closed(), timeout=2)
@@ -715,6 +688,34 @@ class EgressProxy:
     def _allows_unrestricted_host(self, host: str) -> bool:
         """Return whether one rule allows every method and path for *host*."""
         return any(rule.allows_all_requests_to(host) for rule in self._rules)
+
+    def _configure_server_ssl_context(self, host: str, ssl_ctx: ssl.SSLContext) -> None:
+        """Allow a specialized relay to observe its inbound TLS handshake."""
+        del host, ssl_ctx
+
+    def _tls_handshake_completed(self, writer: asyncio.StreamWriter) -> None:
+        """Notify a specialized relay after inbound TLS is established."""
+        del writer
+
+    def _tls_connection_closed(self) -> None:
+        """Notify a specialized relay when the inbound TLS tunnel ends."""
+
+    @staticmethod
+    def _parse_inner_request_line(raw: bytes) -> tuple[str, str]:
+        """Parse the generic proxy's inner HTTP request line."""
+        line = raw.decode("latin-1", errors="replace").strip()
+        if any(ord(char) < _MIN_PRINTABLE_BYTE for char in line):
+            raise ValueError("inner request line contains a control byte")
+        parts = line.split()
+        if len(parts) < 2:
+            raise ValueError("inner request line is malformed")
+        return parts[0].upper(), parts[1]
+
+    @staticmethod
+    def _parse_inner_content_length(headers_raw: bytes) -> int:
+        """Parse body framing for the generic proxy."""
+        headers = EgressProxy._parse_header_dict(headers_raw)
+        return int(headers.get("content-length", "0"))
 
     def _allows_http2_passthrough(self, host: str) -> bool:
         """Return whether opaque HTTP/2 relay is safe for *host*."""

@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import os
+import socket
 import ssl
 import stat
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
-import httpx
 import pytest
 
 from omnigent.inner.egress.proxy import EgressProxy
@@ -95,6 +96,82 @@ for line in sys.stdin:
         + "\n",
         encoding="utf-8",
     )
+
+
+def _raw_proxy_post(
+    *,
+    proxy_port: int,
+    ca_bundle_path: Path,
+    host: str,
+    path: str,
+    headers: dict[str, str],
+    body: bytes,
+) -> tuple[int, dict[str, str], bytes]:
+    sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    try:
+        sock.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
+        connect_response = bytearray()
+        while b"\r\n\r\n" not in connect_response:
+            data = sock.recv(4096)
+            if not data:
+                raise OSError("proxy closed during CONNECT")
+            connect_response.extend(data)
+        if not connect_response.startswith(b"HTTP/1.1 200 "):
+            raise OSError("proxy rejected CONNECT")
+        tls_sock = ssl.create_default_context(cafile=str(ca_bundle_path)).wrap_socket(
+            sock,
+            server_hostname=host,
+        )
+        sock = tls_sock
+        request = bytearray(f"POST {path} HTTP/1.1\r\nHost: {host}\r\n".encode())
+        for name, value in headers.items():
+            request.extend(f"{name}: {value}\r\n".encode())
+        request.extend(f"Content-Length: {len(body)}\r\n\r\n".encode())
+        request.extend(body)
+        tls_sock.sendall(request)
+        response = http.client.HTTPResponse(tls_sock)
+        response.begin()
+        return response.status, dict(response.getheaders()), response.read()
+    finally:
+        sock.close()
+
+
+def _raw_proxy_pipeline_is_closed(
+    *,
+    proxy_port: int,
+    ca_bundle_path: Path,
+    placeholder: str,
+) -> bool:
+    sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    try:
+        sock.sendall(b"CONNECT model.test:443 HTTP/1.1\r\nHost: model.test:443\r\n\r\n")
+        connect_response = bytearray()
+        while b"\r\n\r\n" not in connect_response:
+            data = sock.recv(4096)
+            if not data:
+                raise OSError("proxy closed during CONNECT")
+            connect_response.extend(data)
+        tls_sock = ssl.create_default_context(cafile=str(ca_bundle_path)).wrap_socket(
+            sock,
+            server_hostname="model.test",
+        )
+        sock = tls_sock
+        body = b'{"model":"fake"}'
+        request = (
+            b"POST /v1/responses HTTP/1.1\r\n"
+            b"Host: model.test\r\n"
+            + f"Authorization: Bearer {placeholder}\r\n".encode()
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        tls_sock.sendall(request + request)
+        response = http.client.HTTPResponse(tls_sock)
+        response.begin()
+        response.read()
+        return tls_sock.recv(1) == b""
+    finally:
+        sock.close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="v1 signer uses config fd")
@@ -329,56 +406,81 @@ async def test_real_signer_relays_only_placeholder_authorized_responses(
 
     ready = start_relay(readiness.relay_port, readiness.socket_path)
     assert ready.wait(timeout=5)
-    proxy = f"http://127.0.0.1:{readiness.relay_port}"
-    async with httpx.AsyncClient(
-        proxy=proxy,
-        verify=ssl.create_default_context(cafile=str(readiness.ca_bundle_path)),
-        trust_env=False,
-        timeout=10,
-    ) as client:
-        response = await client.post(
-            "https://model.test/v1/responses",
-            headers={"Authorization": f"Bearer {readiness.placeholder}"},
-            json={"model": "fake"},
-        )
-        assert response.status_code == 200
-        output = response.json()["output"]
-        assert output[0]["content"][0]["text"].startswith("BROKERED_E2E_OK")
+    status, _, body = await asyncio.to_thread(
+        _raw_proxy_post,
+        proxy_port=readiness.relay_port,
+        ca_bundle_path=readiness.ca_bundle_path,
+        host="model.test",
+        path="/v1/responses",
+        headers={
+            "Authorization": f"Bearer {readiness.placeholder}",
+            "Content-Type": "application/json",
+        },
+        body=b'{"model":"fake"}',
+    )
+    assert status == 200
+    output = json.loads(body)["output"]
+    assert output[0]["content"][0]["text"].startswith("BROKERED_E2E_OK")
+    assert await asyncio.to_thread(
+        _raw_proxy_pipeline_is_closed,
+        proxy_port=readiness.relay_port,
+        ca_bundle_path=readiness.ca_bundle_path,
+        placeholder=readiness.placeholder,
+    )
 
-        missing = await client.post(
-            "https://model.test/v1/responses",
-            json={"model": "fake"},
-        )
-        assert missing.status_code == 403
+    missing_status, _, _ = await asyncio.to_thread(
+        _raw_proxy_post,
+        proxy_port=readiness.relay_port,
+        ca_bundle_path=readiness.ca_bundle_path,
+        host="model.test",
+        path="/v1/responses",
+        headers={"Content-Type": "application/json"},
+        body=b'{"model":"fake"}',
+    )
+    assert missing_status == 403
 
-        queried = await client.post(
-            "https://model.test/v1/responses?debug=true",
-            headers={"Authorization": f"Bearer {readiness.placeholder}"},
-            json={"model": "fake"},
-        )
-        assert queried.status_code == 403
+    queried_status, _, _ = await asyncio.to_thread(
+        _raw_proxy_post,
+        proxy_port=readiness.relay_port,
+        ca_bundle_path=readiness.ca_bundle_path,
+        host="model.test",
+        path="/v1/responses?debug=true",
+        headers={
+            "Authorization": f"Bearer {readiness.placeholder}",
+            "Content-Type": "application/json",
+        },
+        body=b'{"model":"fake"}',
+    )
+    assert queried_status == 403
 
-        redirect = await client.post(
-            "https://model.test/v1/responses",
-            headers={"Authorization": f"Bearer {readiness.placeholder}"},
-            json={"test_redirect": "https://attacker.test/steal"},
-        )
-        assert redirect.status_code == 307
-        assert redirect.headers["location"] == "https://attacker.test/steal"
+    redirect_status, redirect_headers, _ = await asyncio.to_thread(
+        _raw_proxy_post,
+        proxy_port=readiness.relay_port,
+        ca_bundle_path=readiness.ca_bundle_path,
+        host="model.test",
+        path="/v1/responses",
+        headers={
+            "Authorization": f"Bearer {readiness.placeholder}",
+            "Content-Type": "application/json",
+        },
+        body=b'{"test_redirect":"https://attacker.test/steal"}',
+    )
+    assert redirect_status == 307
+    assert redirect_headers["Location"] == "https://attacker.test/steal"
 
-    async with httpx.AsyncClient(
-        proxy=proxy,
-        verify=ssl.create_default_context(cafile=str(readiness.ca_bundle_path)),
-        trust_env=False,
-        follow_redirects=True,
-        timeout=10,
-    ) as redirecting_client:
-        with pytest.raises(httpx.ProxyError):
-            await redirecting_client.post(
-                "https://model.test/v1/responses",
-                headers={"Authorization": f"Bearer {readiness.placeholder}"},
-                json={"test_redirect": "https://attacker.test/steal"},
-            )
+    with pytest.raises(OSError, match="rejected CONNECT"):
+        await asyncio.to_thread(
+            _raw_proxy_post,
+            proxy_port=readiness.relay_port,
+            ca_bundle_path=readiness.ca_bundle_path,
+            host="attacker.test",
+            path="/steal",
+            headers={
+                "Authorization": f"Bearer {readiness.placeholder}",
+                "Content-Type": "application/json",
+            },
+            body=b'{"model":"fake"}',
+        )
 
     await signer.close()
     assert await signer.wait() == 0
