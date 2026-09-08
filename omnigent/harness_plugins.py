@@ -1240,6 +1240,29 @@ def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, str | None]]]:
     }
 
 
+def harness_capabilities_by_spelling() -> dict[str, dict[str, str | bool | None]]:
+    """Map every harness spelling to its declared capability record.
+
+    :func:`harness_catalog` only carries capabilities for picker rows, and the
+    native wrappers a session actually declares (``claude-native``,
+    ``codex-native``, ...) are not picker rows -- they have no
+    :func:`harness_labels` entry, so they never become one. That left the
+    registry declaring capabilities for every harness while the API served them
+    for a third of them, and nothing in the UI able to ask whether a harness it
+    can launch supports subagents or resume.
+
+    Keyed by spelling for the same reason as
+    :func:`harness_setup_steps_by_spelling`: a caller resolves by the harness id
+    it is holding, not by picker membership. Values mirror the catalog's
+    ``capabilities`` (same :func:`harness_capabilities` source), so the two
+    cannot drift.
+
+    :returns: ``{spelling: capability.as_dict()}`` for every harness that
+        declares capabilities.
+    """
+    return {harness: record.as_dict() for harness, record in harness_capabilities().items()}
+
+
 def load_object(import_path: str) -> object:
     """Load ``module:attribute`` or ``module.attribute``."""
     if ":" in import_path:

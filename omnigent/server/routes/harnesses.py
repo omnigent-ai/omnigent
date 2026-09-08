@@ -6,7 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from omnigent.harness_plugins import harness_catalog, harness_setup_steps_by_spelling
+from omnigent.harness_plugins import (
+    harness_capabilities_by_spelling,
+    harness_catalog,
+    harness_setup_steps_by_spelling,
+)
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 
@@ -24,9 +28,13 @@ def create_harnesses_router(*, auth_provider: AuthProvider | None = None) -> API
         # aren't picker rows (``opencode``/``qwen``) — so the setup dialog can
         # resolve steps by the harness it actually holds without the picker
         # list gaining non-pickable rows.
+        # ``capabilities`` is keyed the same way and for the same reason: the
+        # native wrappers a session declares are not picker rows, so their
+        # declared feature set was computed and never served.
         return {
             "data": harness_catalog(),
             "setup_steps": harness_setup_steps_by_spelling(),
+            "capabilities": harness_capabilities_by_spelling(),
         }
 
     return router
