@@ -806,6 +806,80 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
 
 
 @pytest.mark.asyncio
+async def test_connected_host_dispatch_threads_tunnel_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The connected-host scheduled dispatch must pass ``deps.tunnel_registry``
+    through to ``_dispatch_session_event_to_runner``, not silently default
+    it to ``None``.
+
+    ``deps.tunnel_registry`` is already used a few lines earlier in this
+    same closure (the ``_wait_for_runner_client`` connect-wait), so it was
+    available the whole time — this is the fourth call site in the
+    terminal-delivery/recovery family found to need explicit threading
+    (after the main route, the dispatch impl itself, and the sub-agent
+    block wake), closing the class for the scheduled-fire path.
+    """
+    import omnigent.server.routes._host_launch as host_launch
+    import omnigent.server.routes.sessions as sessions_routes
+
+    captured: dict[str, Any] = {}
+
+    def _resolve_host_launch(**kwargs: Any) -> Any:
+        return type(
+            "Target",
+            (),
+            {"conv": kwargs["conversation_store"].get_conversation("conv_1"), "conn": object()},
+        )()
+
+    async def _launch_runner_on_host(
+        conv: Any, conversation_store: Any, host_registry: Any, conn: Any
+    ) -> Any:
+        return type("Attempt", (), {"error": None, "runner_id": "runner_1"})()
+
+    async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> object:
+        return object()
+
+    async def _ensure_runner_session_initialized(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
+        captured["tunnel_registry"] = kwargs.get("tunnel_registry")
+        return
+
+    monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
+    monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
+    monkeypatch.setattr(sessions_routes, "_wait_for_runner_client", _wait_for_runner_client)
+    monkeypatch.setattr(
+        sessions_routes,
+        "_ensure_runner_session_initialized",
+        _ensure_runner_session_initialized,
+    )
+    monkeypatch.setattr(
+        sessions_routes,
+        "_dispatch_session_event_to_runner",
+        _dispatch_session_event_to_runner,
+    )
+
+    sentinel_tunnel_registry = object()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    dispatch = fire_mod._make_connected_host_dispatch(
+        _deps(
+            store,
+            conversation_store=FakeConversationStore(),
+            host_store=FakeHostStore({"host_1": _FakeHost("host_1", RESERVED_USER_LOCAL)}),
+            host_registry=FakeHostRegistry(online={"host_1"}),
+            tunnel_registry=sentinel_tunnel_registry,
+        )
+    )
+
+    await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
+
+    assert captured["tunnel_registry"] is sentinel_tunnel_registry
+
+
+@pytest.mark.asyncio
 async def test_on_fire_returns_before_launch_completes() -> None:
     """on_fire must return fast so the scheduler timer re-arms immediately."""
     store = FakeScheduledTaskStore(rows={"task_1": _task()})

@@ -1039,6 +1039,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
+            tunnel_registry=deps.tunnel_registry,
         )
 
     return _dispatch

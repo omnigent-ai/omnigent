@@ -746,6 +746,92 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
     assert conv.host_id == _HOST_ID
 
 
+async def test_message_relaunch_harness_not_configured_threads_tunnel_registry(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The host-launch-failure arm (routes_events.py post_event, around the
+    ``_HARNESS_NOT_CONFIGURED_ERROR_CODE`` branch) must thread the real
+    ``app.state.tunnel_registry`` to ``_persist_host_launch_failure_turn``,
+    not silently drop it.
+
+    Same real-route drive as
+    ``test_message_relaunch_harness_not_configured_persists_error_turn``
+    (host connect, create-time launch, then a relaunch refused with
+    ``harness_not_configured``), but spies on
+    ``_persist_host_launch_failure_turn`` to assert the ``tunnel_registry``
+    kwarg it receives is the exact same object as ``app.state.tunnel_registry``
+    — proving this specific arm of the real ASGI route, not just the
+    persist function called directly with an explicit ``None``.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events as routes_events_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    captured: dict[str, Any] = {}
+    real_persist = routes_events_module._persist_host_launch_failure_turn
+
+    async def _spy_persist(*args: Any, **kwargs: Any) -> Any:
+        captured["tunnel_registry"] = kwargs.get("tunnel_registry")
+        return await real_persist(*args, **kwargs)
+
+    # routes_events.py imports this name directly via a wildcard import from
+    # orchestration.py (not through the sessions facade proxy), so its own
+    # module-global binding — not sessions_module's — must be patched for
+    # the real route call to observe the spy.
+    monkeypatch.setattr(routes_events_module, "_persist_host_launch_failure_turn", _spy_persist)
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        name="host-launch-tunnel-registry",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+
+    set_runner_client(None)
+    relaunch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=_HARNESS_REFUSAL,
+            launch_error_code="harness_not_configured",
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    finally:
+        await relaunch_responder
+        set_runner_client(None)
+
+    assert msg_resp.status_code == 202, msg_resp.text
+    assert "tunnel_registry" in captured, (
+        "_persist_host_launch_failure_turn was never called — the trigger "
+        "scenario for this test regressed."
+    )
+    assert captured["tunnel_registry"] is app.state.tunnel_registry, (
+        "the host-launch-failure arm of post_event did not thread the real "
+        "app.state.tunnel_registry through to _persist_host_launch_failure_turn."
+    )
+
+
 @pytest.mark.parametrize(
     "workspace,expected_detail",
     [

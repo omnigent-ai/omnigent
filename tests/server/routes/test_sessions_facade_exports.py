@@ -8,7 +8,60 @@ than as a ``NameError`` on a runtime-only branch.
 
 from __future__ import annotations
 
+import ast
+import importlib
+import pathlib
+
 import pytest
+
+
+def _facade_attributes(source: str) -> list[tuple[int, str, str]]:
+    tree = ast.parse(source)
+    aliases = {
+        imported.asname or imported.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "omnigent.server.routes"
+        for imported in node.names
+        if imported.name == "sessions"
+    }
+    return sorted(
+        (node.lineno, node.value.id, node.attr)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in aliases
+    )
+
+
+def test_every_facade_attribute_used_by_routes_resolves() -> None:
+    """Every attribute reached through an imported sessions facade resolves."""
+    facade = importlib.import_module("omnigent.server.routes.sessions")
+    routes_dir = pathlib.Path(facade.__file__).parent.parent
+
+    missing: list[str] = []
+    for path in sorted(routes_dir.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for line, alias, name in _facade_attributes(source):
+            if not hasattr(facade, name):
+                missing.append(f"{path.relative_to(routes_dir)}:{line} -> {alias}.{name}")
+    assert not missing, "facade is missing re-exports used by routes: " + ", ".join(missing)
+
+
+@pytest.mark.parametrize(
+    ("imported", "alias"),
+    [
+        ("sessions", "sessions"),
+        ("sessions as _sf", "_sf"),
+        ("sessions as _facade", "_facade"),
+        ("sessions as _sessions_facade", "_sessions_facade"),
+        ("sessions as future_facade", "future_facade"),
+    ],
+)
+def test_facade_attribute_discovery_uses_import_alias(imported: str, alias: str) -> None:
+    """A future facade alias is discovered from its import binding."""
+    source = f"from omnigent.server.routes import {imported}\n{alias}.future_helper\n"
+
+    assert _facade_attributes(source) == [(2, alias, "future_helper")]
 
 
 def test_harness_override_executor_type_reexported() -> None:

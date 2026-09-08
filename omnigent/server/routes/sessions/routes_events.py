@@ -168,6 +168,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
+    _RunnerForwardResult,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
     _stop_session_via_runner,
@@ -548,6 +549,13 @@ def register_events_routes(
                 pass
             else:
                 created_by = body_created_by
+        # Resolved once, unconditionally, so every downstream use (the
+        # host-relaunch connect-grace wait, the terminal-status recovery
+        # path, and the item-dispatch native-boot-failure recovery) sees it
+        # regardless of which branch below actually runs — a runner_client
+        # that resolves immediately skips the host-relaunch block entirely,
+        # so a conditional assignment there left this unbound on that path.
+        _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
@@ -1318,38 +1326,35 @@ def register_events_routes(
                 )
             forward_body = body.model_dump()
             forward_body["data"] = data
-            runner_result = await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                forward_body,
-            )
-            if (
+            # Codex-internal children are tracked inside the same app-server
+            # thread tree; they have no runner inbox entry to forward
+            # terminal status to.
+            is_subagent_terminal_delivery = (
                 conv.kind == "sub_agent"
                 and status in {"idle", "failed"}
                 and not _is_codex_native_subagent(conv)
-            ):
-                # Codex-internal children are tracked inside the same
-                # app-server thread tree; they have no runner inbox entry
-                # to forward terminal status to.
-                if runner_result is None:
-                    # The child's pinned runner_id is stale — its runner was
-                    # relaunched under a new id and only the parent was
-                    # rebound, so the child points at a dead runner forever and
-                    # this terminal status would 503 indefinitely while the
-                    # parent hangs waiting for the child's inbox result. Heal
-                    # the binding and re-deliver through the parent's live
-                    # runner before failing.
-                    from omnigent.server.routes import sessions as _sf
+            )
+            runner_result: _RunnerForwardResult | None = None
+            if is_subagent_terminal_delivery:
+                from omnigent.server.routes import sessions as _sf
 
-                    recovered = await _sf._recover_subagent_status_forward_via_parent(
-                        conv,
-                        runner_router,
-                        getattr(request.app.state, "tunnel_registry", None),
-                        conversation_store,
-                        forward_body,
-                    )
-                    if recovered is not None:
-                        runner_result = recovered
+                # Shared with _forward_native_subagent_terminal_failure: the
+                # preflight heal, direct forward, and missing-parent-inbox
+                # recovery are one policy, not duplicated per call site.
+                runner_result = await _sf._deliver_subagent_terminal_status_with_recovery(
+                    conv,
+                    runner_router,
+                    getattr(request.app.state, "tunnel_registry", None),
+                    conversation_store,
+                    forward_body,
+                )
+            else:
+                runner_result = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    forward_body,
+                )
+            if is_subagent_terminal_delivery:
                 _require_external_status_forward(
                     session_id,
                     status,
@@ -1636,7 +1641,6 @@ def register_events_routes(
             # runner is dead but the parent has a live replacement, repair the
             # stale binding via the ancestor chain and continue through the
             # normal init+dispatch flow.
-            _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             healed_client = await _heal_subagent_runner_binding_via_parent(
                 conv,
                 runner_router,
@@ -1654,7 +1658,6 @@ def register_events_routes(
                 # holds the child's state — no re-initialization needed.
                 _runner_needs_session_init = _is_native_terminal_session(conv)
         if runner_client is None and conv.host_id is not None:
-            _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = cast(
                 HostRegistry | None,
                 getattr(request.app.state, "host_registry", None),
@@ -1745,6 +1748,7 @@ def register_events_routes(
                             launch_attempt.error,
                             runner_router,
                             created_by=created_by,
+                            tunnel_registry=_tunnel_registry,
                         )
                         return {"queued": True, "item_id": item_id}
                     if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE:
@@ -1854,6 +1858,7 @@ def register_events_routes(
                     offline_error,
                     runner_router,
                     created_by=created_by,
+                    tunnel_registry=_tunnel_registry,
                 )
                 return {"queued": True, "item_id": item_id}
             # Raise so the Omnigent server doesn't persist an item the
@@ -1979,6 +1984,7 @@ def register_events_routes(
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.
             host_store=getattr(request.app.state, "host_store", None),
+            tunnel_registry=_tunnel_registry,
         )
         if pending_background_title is not None:
             pending_background_title.schedule()

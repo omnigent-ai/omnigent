@@ -350,15 +350,20 @@ async def test_healthy_registered_work_entry_still_delivers(
 
 
 @pytest.mark.asyncio
-async def test_undeliverable_native_completion_returns_503_not_silent_204(
+async def test_cold_parent_inbox_is_seeded_and_delivery_succeeds(
     _clean_subagent_registry: None,
 ) -> None:
-    """A recoverable sub-agent whose parent inbox is elsewhere must 503, not 204.
+    """A confirmed parent edge with no local inbox now seeds one and delivers.
 
-    When the parent inbox is not on this runner (the parent lives on a different
-    runner, or the runner restarted and lost it), delivery cannot be confirmed.
-    The handler must return 503 so the forwarder retries and server-side recovery
-    re-routes to the parent's runner — instead of a silent 204 that drops it.
+    A nested sub-agent's intermediate parent is itself a sub-agent this runner
+    may never have run ``create_session`` for, so ``_session_inboxes`` has no
+    entry for it even though the child's terminal completion legitimately
+    belongs here (a child always runs on its parent's runner). Once
+    ``_ensure_subagent_work_entry`` confirms the real parent edge from the
+    server snapshot, the runner must ``setdefault`` the parent's inbox (and
+    async-task map) before delivering — mirroring the pair
+    ``_initialize_session`` seeds — instead of dropping the completion behind
+    a 503 the parent's own orchestrator would otherwise wait on forever.
     """
     http, items = await _post_native_idle(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
@@ -366,9 +371,227 @@ async def test_undeliverable_native_completion_returns_503_not_silent_204(
         register_work=False,
     )
 
-    assert http == 503, (
-        "an undeliverable native sub-agent completion was acked with "
-        f"http={http}; expected 503 so the forwarder retries. Items={items!r}"
+    assert http == 204, (
+        "a nested sub-agent's terminal completion was not delivered even "
+        f"though the parent edge was confirmed from the snapshot; http={http}, "
+        f"items={items!r}"
+    )
+    assert items and items[0]["status"] == "completed"
+    assert items[0]["conversation_id"] == CHILD_SESSION_ID
+    # The seed must actually be usable by later work, not just present: a
+    # fresh queue was installed under the parent id.
+    assert PARENT_SESSION_ID in runner_app._session_inboxes_ref
+
+
+@pytest.mark.asyncio
+async def test_sibling_terminal_completions_racing_on_cold_parent_both_deliver(
+    _clean_subagent_registry: None,
+) -> None:
+    """Two siblings terminating concurrently on a cold parent must not clobber.
+
+    Both children share ``PARENT_SESSION_ID`` and neither has a pre-registered
+    work entry, so both trigger the snapshot-recovery + inbox-seed path at
+    roughly the same time, via two separate runner-app instances sharing the
+    process-global inbox dicts. This is an end-to-end wiring check — both
+    concurrent completions land in the same parent inbox — NOT a proof of the
+    ``setdefault`` atomicity property itself: the real seed statements (see
+    app.py's terminal-status branch) have no ``await`` between the seed
+    decision and the write, so nothing between the barrier release and
+    delivery can force two coroutines to actually interleave AT that
+    specific line under CPython's single-threaded event loop — a plain
+    check-then-assign would pass this exact test too, since by the time
+    either coroutine reaches its own check, the other has either not started
+    or has already finished. See
+    ``test_seed_cold_parent_delivery_queues_survives_concurrent_callers``
+    for direct coverage of the real seed function (``app._seed_cold_parent_delivery_queues``)
+    against concurrent callers.
+    """
+    other_child_id = "conv_child_second_reviewer"
+    # The barrier still forces both requests to be genuinely in-flight
+    # together up through their snapshot fetch — real, if not sufficient on
+    # its own to exercise the setdefault line specifically.
+    barrier = asyncio.Barrier(2)
+
+    async def _post_for(child_id: str, child_body: dict[str, Any]) -> int:
+        pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+        async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+            del agent_id, session_id
+            return AgentSpec(
+                spec_version=1,
+                name="reviewer",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+            )
+
+        class _TwoChildSnapshotServerClient(_SnapshotServerClient):
+            async def get(self, url: str, **kwargs: Any) -> Any:
+                del kwargs
+                if url.rstrip("/").endswith(child_id):
+                    await barrier.wait()
+                    return self._Resp(child_body)
+                if url.rstrip("/").endswith("/items"):
+                    return self._Resp({"data": [], "has_more": False})
+                return self._Response()
+
+        app = create_runner_app(
+            process_manager=pm,  # type: ignore[arg-type]
+            spec_resolver=_resolver,
+            server_client=_TwoChildSnapshotServerClient(child_body),  # type: ignore[arg-type]
+        )
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "x"},
+                },
+            )
+        return resp.status_code
+
+    http_a, http_b = await asyncio.gather(
+        _post_for(
+            CHILD_SESSION_ID,
+            _child_snapshot(sub_agent_name="reviewer_a", parent_session_id=PARENT_SESSION_ID),
+        ),
+        _post_for(
+            other_child_id,
+            _child_snapshot(sub_agent_name="reviewer_b", parent_session_id=PARENT_SESSION_ID),
+        ),
+    )
+
+    assert http_a == 204 and http_b == 204
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    delivered_ids = set()
+    while not inbox.empty():
+        delivered_ids.add(inbox.get_nowait()["conversation_id"])
+    assert delivered_ids == {CHILD_SESSION_ID, other_child_id}
+
+
+@pytest.mark.asyncio
+async def test_seed_cold_parent_delivery_queues_survives_concurrent_callers(
+    _clean_subagent_registry: None,
+) -> None:
+    """
+    Calls the REAL production seed function concurrently against the REAL dicts.
+
+    Previous versions of this test reimplemented the seed statements as
+    local closures instead of calling production code, and falsely claimed
+    to touch a module-level ``_session_async_tasks_ref`` that does not exist
+    (``_session_async_tasks`` is created fresh per ``create_runner_app()``
+    call, not a shared module singleton like ``_session_inboxes_ref`` —
+    sharing it across runner-app instances would be a real behavior change,
+    not just a testability one, so it is passed in as a parameter instead).
+
+    This test imports and calls :func:`app._seed_cold_parent_delivery_queues`
+    directly — the exact function app.py's terminal ``external_session_status``
+    branch calls (see the call site around app.py:6852) — against a real
+    inbox dict and a real per-call async-task dict, from two concurrent
+    coroutines that each also deliver a payload afterward. There is no
+    reimplementation: the statements under test are the production
+    statements, imported and invoked, not copied.
+
+    On genuine interleaving: the function's body is two ``setdefault``
+    calls with no ``await`` between them, so — like any single synchronous
+    statement under CPython's cooperative event loop — it is atomic by
+    construction; no external caller can ever observe or force a partial
+    execution of it. That is not a gap in this test's coverage, it is the
+    property the fix relies on: replacing it with a hypothetical
+    check-then-assign INSIDE this same function would still be safe against
+    concurrent CALLERS for the same reason (no await inside the function
+    itself), so the meaningful regression this test guards is a different
+    one — someone inlining a non-atomic seed sequence back at the CALL SITE
+    with an ``await`` in between (e.g. moving the inbox lookup behind an
+    async cache fetch), which is exactly why the seed logic now lives in
+    its own tightly-scoped function instead of being inlined. This test
+    proves concurrent callers of that function never see partial state;
+    ``test_sibling_terminal_completions_racing_on_cold_parent_both_deliver``,
+    earlier in this file, proves the full real HTTP handler — which calls
+    this same function — delivers correctly for two genuinely concurrent
+    sibling requests.
+    """
+    from omnigent.runner.app import _seed_cold_parent_delivery_queues
+
+    parent_id = "conv_atomicity_probe"
+    # Pre-seed BOTH maps with SENTINEL objects before the call — mirrors a
+    # cold parent whose queue/map were already installed by an earlier
+    # sibling's setdefault. A REPLACING assignment (``store[parent_id] =
+    # asyncio.Queue()``) would destroy the sentinel identity; only true
+    # setdefault semantics preserve it. Asserting membership alone (the
+    # round-4 version of this test) does not catch that regression —
+    # asserting the exact object survives does.
+    sentinel_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    sentinel_async_tasks: dict[str, Any] = {"already_here": object()}
+    session_inboxes: dict[str, asyncio.Queue[dict[str, Any]]] = {parent_id: sentinel_inbox}
+    session_async_tasks: dict[str, dict[str, Any]] = {parent_id: sentinel_async_tasks}
+
+    async def _seed_and_deliver(label: str) -> None:
+        # A real await before the call so both coroutines are genuinely
+        # scheduled concurrently going into it — asyncio.gather alone does
+        # not guarantee that without at least one yield point first.
+        await asyncio.sleep(0)
+        _seed_cold_parent_delivery_queues(parent_id, session_inboxes, session_async_tasks)
+        await session_inboxes[parent_id].put({"label": label})
+
+    await asyncio.gather(
+        _seed_and_deliver("sibling_a"),
+        _seed_and_deliver("sibling_b"),
+    )
+
+    # The exact pre-seeded objects survived — not just "a queue/map exists
+    # under this key". A replacing assignment (instead of setdefault) would
+    # swap in a fresh queue/dict here and fail this identity check even
+    # though the looser membership check above would still pass.
+    assert session_inboxes[parent_id] is sentinel_inbox
+    assert session_async_tasks[parent_id] is sentinel_async_tasks
+    assert sentinel_async_tasks == {"already_here": sentinel_async_tasks["already_here"]}
+
+    delivered = set()
+    while not sentinel_inbox.empty():
+        delivered.add(sentinel_inbox.get_nowait()["label"])
+    assert delivered == {"sibling_a", "sibling_b"}
+
+
+@pytest.mark.asyncio
+async def test_cold_parent_delivery_route_invokes_real_seed_helper(
+    _clean_subagent_registry: None,
+) -> None:
+    """
+    The real HTTP terminal-status branch calls the real seed helper.
+
+    Proves the production wiring, not just the helper in isolation: spies on
+    ``app._seed_cold_parent_delivery_queues`` (module attribute, so the
+    running app's call — imported at module scope in app.py — resolves
+    through the patched name) and asserts the real
+    ``POST /v1/sessions/{child}/events`` cold-parent delivery path actually
+    invokes it, with this exact parent id, rather than some other
+    inlined/duplicated seed logic.
+    """
+    from omnigent.runner import app as runner_app
+
+    calls: list[str] = []
+    real_seed = runner_app._seed_cold_parent_delivery_queues
+
+    def _spy_seed(parent_id: str, inboxes: Any, async_tasks: Any) -> None:
+        calls.append(parent_id)
+        real_seed(parent_id, inboxes, async_tasks)
+
+    original = runner_app._seed_cold_parent_delivery_queues
+    runner_app._seed_cold_parent_delivery_queues = _spy_seed
+    try:
+        http, items = await _post_native_idle(
+            child_body=_child_snapshot(
+                sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID
+            ),
+            seed_parent_inbox=False,
+            register_work=False,
+        )
+    finally:
+        runner_app._seed_cold_parent_delivery_queues = original
+
+    assert http == 204, f"delivery should have succeeded; http={http} items={items!r}"
+    assert calls == [PARENT_SESSION_ID], (
+        f"expected the real route to call the real seed helper exactly once "
+        f"for {PARENT_SESSION_ID!r}; got {calls!r}"
     )
 
 
