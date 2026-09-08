@@ -113,9 +113,9 @@ async def _collect_stdout(proc: asyncio.subprocess.Process) -> bytes:
 
 
 def _parse_token(stdout: bytes, returncode: int | None) -> str:
-    if returncode != 0 or not stdout or len(stdout) > _MAX_TOKEN_BYTES:
+    if returncode != 0 or not stdout.endswith(b"\n") or len(stdout) > _MAX_TOKEN_BYTES:
         raise ValueError("credential helper failed")
-    token_bytes = stdout[:-1] if stdout.endswith(b"\n") else stdout
+    token_bytes = stdout[:-1]
     if not token_bytes or any(byte < 0x21 or byte > 0x7E for byte in token_bytes):
         raise ValueError("credential helper returned malformed output")
     return token_bytes.decode("ascii")
@@ -137,6 +137,13 @@ async def mint_ucode_token(*, host: str, profile: str) -> str:
         )
         stdout = await asyncio.wait_for(_collect_stdout(proc), timeout=_TOKEN_TIMEOUT_SECONDS)
         return _parse_token(stdout, proc.returncode)
+    except asyncio.CancelledError:
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+        raise
     except (OSError, ValueError, asyncio.TimeoutError):
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):

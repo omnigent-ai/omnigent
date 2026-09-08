@@ -129,10 +129,31 @@ async def test_ucode_helper_inherits_signer_process_group(
     assert "creationflags" not in observed_kwargs
 
 
+async def test_cancelled_ucode_mint_terminates_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started = tmp_path / "started"
+    _write_ucode(
+        tmp_path / "ucode",
+        f": > {started}\ntrap 'exit 0' TERM\nwhile true; do sleep 1; done\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
+
+    mint = asyncio.create_task(mint_ucode_token(host=_HOST, profile=_PROFILE))
+    while not started.exists():
+        await asyncio.sleep(0)
+    mint.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await mint
+
+
 @pytest.mark.parametrize(
     "stdout",
     [
         b"",
+        b"token",
         b"token\nextra\n",
         b"token\x00\n",
         b"token with-space\n",

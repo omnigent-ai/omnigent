@@ -9,7 +9,7 @@ import ssl
 import stat
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -220,6 +220,18 @@ async def test_signer_pins_validated_dns_result_and_rejects_authority_reroute(
     with pytest.raises(PermissionError, match="outside the signer route"):
         await relay._assert_destination_allowed("attacker.example", 443)
     resolve.assert_not_awaited()
+
+
+def test_upstream_401_only_invalidates_for_a_future_request() -> None:
+    credential = Mock()
+    credential.token_for_request = AsyncMock()
+    relay = object.__new__(_SignerRelay)
+    relay._credential_source = credential
+
+    relay._observe_upstream_status(401)
+
+    credential.invalidate_after_unauthorized.assert_called_once_with()
+    credential.token_for_request.assert_not_awaited()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="v1 signer uses config fd")
