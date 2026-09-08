@@ -1,10 +1,9 @@
 """Deployment-wide release feature management.
 
 Release features are enabled as a comma-separated set in
-``OMNIGENT_FEATURES``. The Canvas page also has a dedicated switch,
-``OMNIGENT_ENABLE_CANVAS``, which deployments toggle on its own. The set is
-resolved once when an application or route factory is built, so every request
-handled by that process sees one immutable snapshot.
+``OMNIGENT_FEATURES``. The set is resolved once when an application or route
+factory is built, so every request handled by that process sees one immutable
+snapshot.
 """
 
 from __future__ import annotations
@@ -15,9 +14,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
-CANVAS_ENV_VAR = "OMNIGENT_ENABLE_CANVAS"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
-_TRUTHY_VALUES = frozenset({"1", "true", "yes"})
 
 
 class Feature(StrEnum):
@@ -90,8 +87,6 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
     The variable is a comma-separated enabled set, for example
     ``usage_page,harness_install``. Unset or empty means every release feature
     is off. Unknown names fail startup instead of silently applying a typo.
-    ``OMNIGENT_ENABLE_CANVAS`` set to ``1``, ``true``, or ``yes`` (any case)
-    enables the ``canvas`` feature on its own.
 
     :param environ: Environment mapping; defaults to :data:`os.environ`.
     :returns: Resolved immutable feature values.
@@ -122,7 +117,5 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
         raise ValueError(
             f"unknown feature(s) in {FEATURES_ENV_VAR}: {invalid}; known features: {known}"
         )
-    if source.get(CANVAS_ENV_VAR, "").strip().lower() in _TRUTHY_VALUES:
-        enabled.add(Feature.CANVAS)
 
     return FeatureFlags(frozenset(enabled))
