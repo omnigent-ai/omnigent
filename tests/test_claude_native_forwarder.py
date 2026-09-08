@@ -5404,6 +5404,87 @@ async def test_subagent_watcher_parks_child_of_a_parked_parent(
     assert forwarder._read_subagent_forward_state(bridge_dir) == state
     assert "whose parent was dropped" in caplog.text
 
+    # The child's start payload is dead-lettered for replay parity: the parent's
+    # own dead letter can't carry descendant info.
+    dead_letter = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    assert len(dead_letter) == 1
+    record = json.loads(dead_letter[0])
+    assert record["event_type"] == "external_subagent_start"
+    assert record["payload"]["subagent_id"] == "a-child"
+    assert record["payload"]["parent_subagent_id"] == "z-parent"
+
+
+async def test_subagent_watcher_defers_a_spawn_owned_by_two_transcripts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawn id claimed by two agent transcripts is dropped as ambiguous.
+
+    Attribution is trustworthy only when a spawn `tool_use` id has a single
+    owner. If the same id appears in two `agent-*.jsonl` transcripts, the owner
+    can't be resolved, so it must be dropped (not guessed) and the agent
+    deferred rather than mis-attributed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    # Seed a normal agent (spawn lands in the root transcript, owner=None); then
+    # write the SAME spawn tool-use id into an agent transcript too, so the id
+    # resolves to two conflicting owners (root and that agent) and is dropped.
+    jsonl_path = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-worker",
+        agent_type="Explore",
+        description="ambiguous spawn",
+        tool_use_id="toolu_dup",
+    )
+    other_owner = jsonl_path.parent / "agent-owner-two.jsonl"
+    other_owner.write_text(
+        json.dumps(
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "dup-spawn",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_dup", "name": "Agent"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.DEBUG, logger="omnigent.claude_native_forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert starts == 0
+    assert "a-worker" not in state.subagents
+    assert "no resolved parent" in caplog.text
+
 
 async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spawn(
     tmp_path: Path,

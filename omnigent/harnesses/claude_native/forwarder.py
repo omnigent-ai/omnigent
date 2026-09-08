@@ -1369,7 +1369,10 @@ def _tool_use_ids_in_transcript(
     :returns: Tool-use ids owned by this transcript.
     """
     try:
-        lines = transcript_path.read_text(encoding="utf-8").splitlines()
+        # ``errors="replace"`` tolerates a snapshot that ends mid-multibyte char
+        # while Claude is writing; the mangled tail line fails JSON parse below
+        # and is skipped, and the completed record is read on the next poll.
+        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return set()
     tool_use_ids: set[str] = set()
@@ -1546,6 +1549,23 @@ async def _forward_available_subagents(
                             parent_session_id,
                             subagent_id,
                             parent_subagent_id,
+                        )
+                        # The parent's own dead letter can't carry descendant
+                        # info, so record the child's start payload too or its
+                        # metadata is unrecoverable on replay.
+                        append_dead_letter(
+                            bridge_dir,
+                            session_id=parent_session_id,
+                            event_type="external_subagent_start",
+                            payload={
+                                "subagent_id": subagent_id,
+                                "agent_type": meta["agentType"],
+                                "description": meta["description"],
+                                "tool_use_id": meta["toolUseId"],
+                                "parent_subagent_id": parent_subagent_id,
+                            },
+                            reason="parent sub-agent was dropped",
+                            delivered_ambiguous=False,
                         )
                         updated = SubagentForwardState(
                             subagents={
