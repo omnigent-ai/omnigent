@@ -1,23 +1,19 @@
 """Browser e2e: a manually typed working directory must enable "Clone & start".
 
 In the clone/fork dialog, manually typing the working directory as a
-home-relative path (``~/git/omnigent``) and pressing Enter never enabled the
-"Clone & start" button — even though Enter opens the directory browser at that
-path and the host resolves and lists it (proving the directory exists).  The
-user had to discover the tree browser's "Select" button and click it before
-the form accepted the very directory they already typed and committed.
+home-relative path (``~/git/omnigent``) never enabled the "Clone & start"
+button — the user had to open the tree browser and click "Select" before the
+form accepted the very directory they already typed.
 
-Root cause: ``ForkSessionForm`` validates the raw input with
+Root cause: ``ForkSessionForm`` validated the raw input with
 ``isValidWorkspace``, which accepts only fully-absolute paths (``/…``) —
-tilde paths are rejected because the server never expands ``~``.  But the
-path field itself treats ``~/…`` as perfectly navigable: Enter fires
-``onCommit`` → ``commitWorkspacePath``, which keeps the raw tilde text as the
-form's workspace value and opens the tree browser at it.  The browser
-resolves the path to its absolute form (from the host's listing) and displays
-it, but nothing feeds that resolved absolute path back into the form value —
-only the browser's "Select" button does (``onSelect`` → ``setWorkspace`` with
-``currentAbsolute``).  So the form sits on an "invalid" tilde value with the
-resolved directory on screen and the submit greyed out, with no hint why.
+tilde paths are rejected because the server never expands ``~``.  Nothing
+expanded the typed ``~`` client-side, so the form sat on an "invalid" tilde
+value with the submit greyed out and no hint why.
+
+The fix resolves a typed ``~``-path against the host's home (derived from the
+host's home listing) so it becomes the absolute path the server needs —
+directly, without the user opening the browser at all.
 
 Test shape
 ----------
@@ -28,14 +24,14 @@ network layer (same pattern as ``test_fork_deleted_worktree_recreate``):
 - ``GET /v1/sessions/{id}`` → patched with host + workspace so the dialog
   treats the source as a coding session on that host.
 - ``GET /v1/hosts/{id}/filesystem[/**]`` → 200 listings; ``~``-relative
-  paths are expanded against a fake home, mirroring the host's behavior.
+  paths are expanded against a fake home, mirroring the host's behavior.  The
+  home listing is what lets the dialog resolve ``~`` to its absolute form.
 
 The test opens the fork dialog, confirms the prefilled absolute directory
 enables the submit (sanity that the host/dir geometry is right), then types
-``~/git/omnigent`` into the working-directory field and presses Enter.  It
-asserts the tree browser opens at the typed path and resolves it to the
-absolute directory — and then that the submit button is enabled.  On the
-buggy build that last assertion fails: the button stays disabled until the
+``~/git/omnigent`` into the working-directory field.  It asserts the submit
+button becomes enabled from the typing alone — no Enter, no tree browser.  On
+the buggy build that assertion fails: the button stays disabled until the
 browser's "Select" button is clicked.
 """
 
@@ -61,7 +57,6 @@ _HOME = "/home/e2euser"
 _SRC_DIR = f"{_HOME}/work"
 # What the user manually types — the reported "~/git/omnigent" journey.
 _TYPED = "~/git/omnigent"
-_TYPED_ABS = f"{_HOME}/git/omnigent"
 
 
 def test_typed_tilde_workspace_enables_clone(
@@ -69,14 +64,13 @@ def test_typed_tilde_workspace_enables_clone(
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """Typing ``~/git/omnigent`` + Enter must enable "Clone & start".
+    """Typing ``~/git/omnigent`` must enable "Clone & start".
 
     The failure mode this catches: the form keeps the raw ``~/…`` text as its
     workspace value, ``isValidWorkspace`` rejects it, and the submit stays
-    greyed out even though Enter opened the tree browser at the typed path
-    and the host resolved it to a real, listable absolute directory.  The
-    user-facing contract is that committing a real directory — however it
-    was entered — leaves the form submittable.
+    greyed out even though the typed directory is real and listable.  The
+    user-facing contract is that typing a real directory — resolved against
+    the host's home — leaves the form submittable without opening the browser.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -196,26 +190,20 @@ def test_typed_tilde_workspace_enables_clone(
     # assertion's failure on the typed path alone, not on broken geometry.
     expect(submit).to_be_enabled(timeout=15_000)
 
-    # ── The user journey: manually type a directory and press Enter ───
+    # ── The user journey: manually type a directory (no Enter, no browser) ──
 
     page.get_by_test_id("fork-session-advanced-toggle").click()
     workspace_input = page.get_by_test_id("workspace-path-input")
     expect(workspace_input).to_have_value(_SRC_DIR)
 
     workspace_input.fill(_TYPED)
-    workspace_input.press("Enter")
 
-    # Enter commits the typed path: the tree browser opens at it and the
-    # host resolves it to the absolute directory.  The directory exists and
-    # is listable — nothing is wrong with what the user typed.
-    picker = page.get_by_test_id("workspace-picker")
-    expect(picker).to_be_visible()
-    expect(page.get_by_test_id("workspace-picker-path-input")).to_have_value(
-        _TYPED_ABS, timeout=10_000
-    )
-
-    # THE BUG: the submit must be enabled once a real, navigable directory
-    # has been typed and committed.  On the buggy build the form keeps the
-    # raw "~/…" text as its (invalid) workspace value, so the button stays
-    # greyed out until the browser's "Select" button is clicked.
+    # THE BUG: the submit must be enabled once a real ``~``-path has been
+    # typed.  The dialog resolves it against the host's home (from the home
+    # listing) to the absolute directory the server needs — no Enter, no tree
+    # browser.  On the buggy build the form keeps the raw "~/…" text as its
+    # (invalid) workspace value, so the button stays greyed out until the
+    # browser's "Select" button is clicked.
     expect(submit).to_be_enabled(timeout=5_000)
+    # The tree browser was never opened — resolution is purely from typing.
+    expect(page.get_by_test_id("workspace-picker")).not_to_be_visible()

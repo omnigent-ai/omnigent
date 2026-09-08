@@ -47,35 +47,19 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 // The tree browser only mounts when browsing; coding-fork tests rely on the
 // directory being prefilled from the source, so the real picker never opens —
-// stub it anyway to keep its filesystem fetch out of the test.
+// stub it anyway to keep its filesystem fetch out of the test. Its "Select"
+// button commits an absolute path (onSelect), the only way browsing feeds the
+// form now that typed ~-paths resolve directly.
 vi.mock("./WorkspacePicker", async (importActual) => ({
   ...(await importActual<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({
-    onNavigate,
-    onSelect,
-  }: {
-    onNavigate?: (p: string) => void;
-    onSelect: (p: string) => void;
-  }) => (
+  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
     <div data-testid="mock-workspace-picker">
-      <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
+      <button
+        type="button"
+        data-testid="mock-pick-workspace"
+        onClick={() => onSelect("/Users/a/git/omnigent")}
+      >
         pick
-      </button>
-      {/* Simulates the tree browser resolving the committed path (the host
-          expands "~") and then the user browsing one level deeper. */}
-      <button
-        type="button"
-        data-testid="mock-resolve-workspace"
-        onClick={() => onNavigate?.("/Users/a/git/omnigent")}
-      >
-        resolve
-      </button>
-      <button
-        type="button"
-        data-testid="mock-navigate-deeper"
-        onClick={() => onNavigate?.("/Users/a/git/omnigent/src")}
-      >
-        deeper
       </button>
     </div>
   ),
@@ -981,13 +965,11 @@ describe("ForkSessionDialog", () => {
       );
     });
 
-    it("enables the submit when the browser resolves a committed tilde path", async () => {
-      // The reported journey: type "~/git/omnigent" + Enter. The raw tilde
-      // value fails isValidWorkspace (absolute-only), but Enter opens the
-      // tree browser at it and the host resolves it to an absolute
-      // directory. The dialog must adopt that resolved path as the form
-      // value — without it the submit stayed greyed out until the user
-      // discovered the browser's "Select" button.
+    it("adopts an absolute path picked from the tree browser", async () => {
+      // The browse route: open the tree browser and click "Select". The
+      // picker commits an absolute path (onSelect), which enables the submit
+      // and launches on it. (Typed ~-paths resolve directly, tested above —
+      // this covers the still-live browser path.)
       forkSessionMock.mockResolvedValue({
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
@@ -996,24 +978,18 @@ describe("ForkSessionDialog", () => {
 
       openAdvanced();
       const input = screen.getByTestId("workspace-path-input");
-      fireEvent.change(input, { target: { value: "~/git/omnigent" } });
       // A tilde value alone is not submittable (the server never expands ~).
+      fireEvent.change(input, { target: { value: "~/git/omnigent" } });
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
 
       // Enter commits the typed path and opens the tree browser at it.
       fireEvent.keyDown(input, { key: "Enter" });
       expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
 
-      // The browser resolves "~/git/omnigent" to its absolute form; the
-      // dialog adopts it, so the form is submittable with no Select click.
-      fireEvent.click(screen.getByTestId("mock-resolve-workspace"));
+      // "Select" commits the browser's absolute path into the form.
+      fireEvent.click(screen.getByTestId("mock-pick-workspace"));
       expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/git/omnigent");
       expect(screen.getByTestId("fork-session-submit")).toBeEnabled();
-
-      // Browsing deeper must NOT silently rewrite the now-absolute value —
-      // changing it still takes the explicit "Select" click.
-      fireEvent.click(screen.getByTestId("mock-navigate-deeper"));
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/git/omnigent");
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));

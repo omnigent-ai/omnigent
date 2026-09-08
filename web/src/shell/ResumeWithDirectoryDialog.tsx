@@ -20,7 +20,6 @@ import {
 import {
   WorkspacePicker,
   isNavigablePath,
-  isUnresolvedWorkspacePath,
   resolveWorkspacePath,
   useResolvedHostHome,
 } from "./WorkspacePicker";
@@ -222,17 +221,6 @@ export function ResumeWithDirectoryDialog({
     setBrowseNonce((n) => n + 1);
   }
 
-  // A typed "~/…" path resolves against the host's home directly (see
-  // resolvedWorkspace), so the submit enables without browsing. This adopts
-  // the tree browser's resolved absolute path as a secondary route — a user
-  // who does open the browser while the value is still an unresolved tilde
-  // (e.g. before home loads) gets the absolute form written back. Once the
-  // value is absolute, browsing deeper no longer rewrites it — that still
-  // takes the explicit "Select" click.
-  function onPickerNavigate(path: string): void {
-    if (isUnresolvedWorkspacePath(workspace)) setWorkspace(path);
-  }
-
   async function handleBind(): Promise<void> {
     if (!selectedHostId || !workspaceValid) return;
     setSubmitting(true);
@@ -355,7 +343,6 @@ export function ResumeWithDirectoryDialog({
                       key={browseNonce}
                       hostId={selectedHostId}
                       initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}
-                      onNavigate={onPickerNavigate}
                       onSelect={(path) => {
                         setWorkspace(path);
                         setBrowsing(false);

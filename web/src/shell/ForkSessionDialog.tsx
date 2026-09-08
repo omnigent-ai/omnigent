@@ -77,7 +77,6 @@ import { getCliServerUrl } from "@/lib/host";
 import {
   WorkspacePicker,
   isNavigablePath,
-  isUnresolvedWorkspacePath,
   resolveWorkspacePath,
   useResolvedHostHome,
 } from "./WorkspacePicker";
@@ -975,17 +974,6 @@ export function ForkSessionForm({
     setBrowseNonce((n) => n + 1);
   }
 
-  // A typed "~/…" path resolves against the host's home directly (see
-  // resolvedWorkspace), so the submit enables without browsing. This adopts
-  // the tree browser's resolved absolute path as a secondary route — a user
-  // who does open the browser while the value is still an unresolved tilde
-  // (e.g. before home loads) gets the absolute form written back. Once the
-  // value is absolute, browsing deeper no longer rewrites it — that still
-  // takes the explicit "Select" click.
-  function onPickerNavigate(path: string): void {
-    if (isUnresolvedWorkspacePath(workspace)) setWorkspace(path);
-  }
-
   async function handleFork(): Promise<void> {
     if (!canSubmit) return;
     setSubmitting(true);
@@ -1383,7 +1371,6 @@ export function ForkSessionForm({
                             initialPath={
                               isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
                             }
-                            onNavigate={onPickerNavigate}
                             onSelect={(path) => {
                               setWorkspace(path);
                               setBrowsing(false);

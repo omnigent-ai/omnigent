@@ -33,36 +33,20 @@ vi.mock("./WorkspacePathField", () => ({
     />
   ),
 }));
-// Keep the real navigability helpers (the dialog's onNavigate guard depends on
-// them) but stub the picker itself — its filesystem fetch isn't under test.
-// The stub exposes buttons that simulate the browser resolving the committed
-// "~"-path to an absolute directory and then browsing one level deeper.
+// Keep the real navigability helpers but stub the picker itself — its
+// filesystem fetch isn't under test. Its "Select" button commits an absolute
+// path (onSelect), the only way browsing feeds the form now that typed
+// ~-paths resolve directly.
 vi.mock("./WorkspacePicker", async (importActual) => ({
   ...(await importActual<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({
-    onNavigate,
-    onSelect,
-  }: {
-    onNavigate?: (p: string) => void;
-    onSelect: (p: string) => void;
-  }) => (
+  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
     <div data-testid="mock-workspace-picker">
-      <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
+      <button
+        type="button"
+        data-testid="mock-pick-workspace"
+        onClick={() => onSelect("/Users/alice/git/omnigent")}
+      >
         pick
-      </button>
-      <button
-        type="button"
-        data-testid="mock-resolve-workspace"
-        onClick={() => onNavigate?.("/Users/alice/git/omnigent")}
-      >
-        resolve
-      </button>
-      <button
-        type="button"
-        data-testid="mock-navigate-deeper"
-        onClick={() => onNavigate?.("/Users/alice/git/omnigent/src")}
-      >
-        deeper
       </button>
     </div>
   ),
@@ -225,13 +209,12 @@ describe("SwitchHostDialog", () => {
     );
   });
 
-  it("enables the switch when the browser resolves a committed tilde path", async () => {
-    // Same journey as the Fork dialog: type "~/git/omnigent" + Enter. The raw
-    // tilde value fails isValidWorkspace (absolute-only), but committing it
-    // opens the tree browser, which resolves it to an absolute directory. The
-    // dialog must adopt that resolved path (through this dialog's distinct
-    // handleWorkspaceChange path, which also marks the field user-edited) so
-    // the switch enables without an explicit "Select" click.
+  it("adopts an absolute path picked from the tree browser", async () => {
+    // The browse route: type a ~-path (not yet submittable), open the tree
+    // browser via Enter, then "Select" commits the browser's absolute path
+    // through this dialog's distinct handleWorkspaceChange, enabling the
+    // switch. (Typed ~-paths resolve directly, tested above — this covers the
+    // still-live browser path.)
     renderDialog();
 
     const button = await screen.findByTestId("switch-host-button");
@@ -244,16 +227,10 @@ describe("SwitchHostDialog", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
 
-    // The browser resolves "~/git/omnigent" to its absolute form; the dialog
-    // adopts it, so the form is submittable with no Select click.
-    fireEvent.click(screen.getByTestId("mock-resolve-workspace"));
+    // "Select" commits the browser's absolute path into the form.
+    fireEvent.click(screen.getByTestId("mock-pick-workspace"));
     expect((input as HTMLInputElement).value).toBe("/Users/alice/git/omnigent");
     await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
-
-    // Browsing deeper must NOT silently rewrite the now-absolute value —
-    // changing it still takes the explicit "Select" click.
-    fireEvent.click(screen.getByTestId("mock-navigate-deeper"));
-    expect((input as HTMLInputElement).value).toBe("/Users/alice/git/omnigent");
 
     fireEvent.click(button);
     await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
