@@ -226,6 +226,7 @@ import {
   type QuotaBurstConfig,
   writeQuotaBurstConfig,
 } from "@/lib/quotaBurstConfig";
+import { QuotaStatusPanel } from "@/components/QuotaStatusPanel";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -1149,6 +1150,9 @@ function GeneralSection() {
       </div>
       <div className="flex flex-col gap-3">
         <h2 className="text-ui font-medium">Quota pacing</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <QuotaStatusPanel />
+        </div>
         <div className="rounded-xl border border-border bg-card p-4">
           <QuotaBurstControl />
         </div>
