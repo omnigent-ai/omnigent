@@ -72,6 +72,9 @@ _REAP_KILL_TIMEOUT_S = 10.0
 # Literal tmux empty option value. Passing this as an argv value clears
 # status segments and window formats; it is not an application sentinel.
 _TMUX_EMPTY_OPTION_VALUE = ""
+_MIN_TMUX_VERSION_ALLOW_PASSTHROUGH = (3, 3)
+_TMUX_VERSION_PROBE_TIMEOUT_S = 5.0
+_TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
 
 
 def _tmux_command_sequence(commands: list[list[str]]) -> list[str]:
@@ -95,6 +98,41 @@ def _tmux_command_sequence(commands: list[list[str]]) -> list[str]:
     return sequence
 
 
+def _tmux_version() -> tuple[int, int] | None:
+    """
+    Probe ``tmux -V`` for the ``(major, minor)`` version on ``PATH``.
+
+    Suffix letters are ignored, so ``"tmux 3.2a"`` reads as ``(3, 2)``.
+    This probes the same PATH-resolved ``tmux`` that
+    :meth:`TerminalInstance._tmux_base_cmd` invokes, so the answer describes
+    the server the launch will actually talk to.
+
+    Never raises. A missing binary, a non-zero exit, a hung probe, or
+    output without a version all read as ``None``, which callers must
+    treat as "assume the feature is unavailable" so an undetectable tmux
+    degrades instead of failing a launch.
+
+    :returns: ``(major, minor)``, e.g. ``(3, 3)``, or ``None`` when the
+        version cannot be determined.
+    """
+    try:
+        proc = subprocess.run(
+            ["tmux", "-V"],
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_VERSION_PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = _TMUX_VERSION_RE.search(proc.stdout)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def _tmux_managed_option_commands(
     scrollback: int,
     *,
@@ -107,6 +145,9 @@ def _tmux_managed_option_commands(
     :param scrollback: Tmux history limit, e.g. ``10000``.
     :param allow_passthrough: Whether to allow pane programs to send
         passthrough escape sequences to the real attached terminal.
+        Requested passthrough is dropped with a warning on tmux older
+        than :data:`_MIN_TMUX_VERSION_ALLOW_PASSTHROUGH`, which does not
+        know the option and would fail the launch over it.
     :param keep_alive_after_exit: When ``True``, keep the private tmux server
         alive after the pane's process exits (see
         :func:`_tmux_session_persistence_commands`). Opt-in because it changes
@@ -123,7 +164,19 @@ def _tmux_managed_option_commands(
     if keep_alive_after_exit:
         commands.extend(_tmux_session_persistence_commands())
     if allow_passthrough:
-        commands.append(["set-option", "-g", "allow-passthrough", "on"])
+        version = _tmux_version()
+        if version is not None and version >= _MIN_TMUX_VERSION_ALLOW_PASSTHROUGH:
+            commands.append(["set-option", "-g", "allow-passthrough", "on"])
+        else:
+            minimum = ".".join(str(part) for part in _MIN_TMUX_VERSION_ALLOW_PASSTHROUGH)
+            found = ".".join(str(part) for part in version) if version else "undetermined"
+            logger.warning(
+                "Skipping tmux 'allow-passthrough' (requires tmux >= %s, found %s); "
+                "passthrough-dependent features such as OSC 52 clipboard and inline "
+                "image protocols will not work in this terminal.",
+                minimum,
+                found,
+            )
     return commands
 
 
