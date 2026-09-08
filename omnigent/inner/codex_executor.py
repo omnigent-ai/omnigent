@@ -818,6 +818,7 @@ def _populate_codex_home_config(
     minimal_config: bool | None = None,
     inject_hooks: bool = False,
     extend_model_catalog: bool = False,
+    include_credentials: bool = True,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -863,6 +864,9 @@ def _populate_codex_home_config(
         its own catalog plus the gateway-only arms. Costs a ``codex debug
         models`` probe, so it is reserved for Smart Routing sessions whose
         turns/spawns can land on such an arm.
+    :param include_credentials: Bridge host credential stores. Signer-backed
+        workers set this to ``False`` because authentication stays exclusively
+        in the trusted signer process.
     """
     if not source_dir.is_dir():
         return
@@ -874,6 +878,10 @@ def _populate_codex_home_config(
             "yes",
         }
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
+    if not include_credentials:
+        symlink_files = tuple(
+            name for name in symlink_files if name not in {"auth.json", ".credentials.json"}
+        )
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
     if inject_hooks:
@@ -921,6 +929,11 @@ def _populate_codex_home_config(
                 )
 
     for filename in _CODEX_HOME_COPY_FILES:
+        if not include_credentials and filename == "config.toml":
+            # A host config may contain static provider credentials or auth
+            # commands. Signer-backed sessions rebuild their selected provider
+            # below from trusted generated overrides instead of copying it.
+            continue
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -2325,7 +2338,7 @@ class _CodexAppServerSession:
         """Start signer and worker transactionally."""
         try:
             await self._start_unchecked()
-        except Exception:
+        except BaseException:
             await self.close()
             raise
 
@@ -2338,7 +2351,7 @@ class _CodexAppServerSession:
             self._signer = signer
             try:
                 self._signer_readiness = await signer.start()
-            except Exception:
+            except BaseException:
                 with suppress(Exception):
                     await signer.close()
                 self._signer = None
@@ -2404,6 +2417,7 @@ class _CodexAppServerSession:
             config_source,
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
+            include_credentials=self._signer is None,
         )
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,
@@ -2474,7 +2488,7 @@ class _CodexAppServerSession:
                         "routing will not be enforced for this session",
                         exc_info=True,
                     )
-        except Exception:
+        except BaseException:
             await self.close()
             raise
 
@@ -3314,6 +3328,9 @@ class _CodexAppServerSession:
             raise
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error  # pragma: no cover - defensive
             logger.debug("Codex App Server reader loop ended: %s", exc)
+        finally:
+            if not self._closing:
+                await self._close_signer()
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None

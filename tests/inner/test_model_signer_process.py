@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import ssl
 import stat
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
+from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.relay import start_relay
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import (
@@ -19,7 +22,9 @@ from omnigent.inner.model_signer import (
     SignerLaunchConfig,
     SignerStartError,
     SubprocessModelSigner,
+    _parse_readiness,
 )
+from omnigent.inner.model_signer_service import _SignerRelay
 
 
 def _config(binding_id: str) -> SignerLaunchConfig:
@@ -64,6 +69,11 @@ with os.fdopen(fd, "rb", closefd=True) as stream:
 binding = config["binding_id"]
 if any("token" in key.lower() for key in config):
     raise SystemExit(9)
+if binding == "hang":
+    for line in sys.stdin:
+        if line.strip() == "shutdown":
+            break
+    raise SystemExit(0)
 if binding == "stderr":
     sys.stderr.write("SECRET_FROM_HELPER\\n")
     raise SystemExit(2)
@@ -145,6 +155,71 @@ async def test_helper_stderr_is_not_exposed_in_start_error(
         await signer.start()
 
     assert "SECRET_FROM_HELPER" not in str(raised.value)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="v1 signer uses config fd")
+async def test_cancelled_signer_start_terminates_child(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "signer_child.py"
+    _write_child(child)
+    monkeypatch.setattr(
+        "omnigent.inner.model_signer._signer_child_argv",
+        lambda: [sys.executable, str(child)],
+    )
+    signer = SubprocessModelSigner(_config("hang"))
+
+    start = asyncio.create_task(signer.start())
+    while signer._proc is None:
+        await asyncio.sleep(0)
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+
+    assert signer._proc.returncode is not None
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"relay_port": True},
+        {"placeholder": "oa_cred_valid\nSECRET_PROTOCOL_INJECTION"},
+    ],
+)
+def test_readiness_rejects_noncanonical_ipc_values(override: dict[str, object]) -> None:
+    payload: dict[str, object] = {
+        "status": "ready",
+        "relay_port": 43123,
+        "socket_path": "/private/signer/relay.sock",
+        "ca_bundle_path": "/private/signer/ca.pem",
+        "placeholder": "oa_cred_session",
+    }
+    payload.update(override)
+
+    with pytest.raises(SignerStartError, match="invalid readiness"):
+        _parse_readiness(json.dumps(payload).encode(), _config("ok"))
+
+
+async def test_signer_pins_validated_dns_result_and_rejects_authority_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay = object.__new__(_SignerRelay)
+    relay._route = _config("ok").routes[0]
+    relay._provider_port = None
+    resolve = AsyncMock(return_value="203.0.113.8")
+    monkeypatch.setattr(EgressProxy, "_assert_destination_allowed", resolve)
+
+    assert (
+        await relay._assert_destination_allowed("workspace.cloud.databricks.com", 443)
+        == "203.0.113.8"
+    )
+    resolve.assert_awaited_once_with("workspace.cloud.databricks.com", 443)
+
+    resolve.reset_mock()
+    with pytest.raises(PermissionError, match="outside the signer route"):
+        await relay._assert_destination_allowed("attacker.example", 443)
+    resolve.assert_not_awaited()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="v1 signer uses config fd")
@@ -269,6 +344,28 @@ async def test_real_signer_relays_only_placeholder_authorized_responses(
             json={"model": "fake"},
         )
         assert queried.status_code == 403
+
+        redirect = await client.post(
+            "https://model.test/v1/responses",
+            headers={"Authorization": f"Bearer {readiness.placeholder}"},
+            json={"test_redirect": "https://attacker.test/steal"},
+        )
+        assert redirect.status_code == 307
+        assert redirect.headers["location"] == "https://attacker.test/steal"
+
+    async with httpx.AsyncClient(
+        proxy=proxy,
+        verify=ssl.create_default_context(cafile=str(readiness.ca_bundle_path)),
+        trust_env=False,
+        follow_redirects=True,
+        timeout=10,
+    ) as redirecting_client:
+        with pytest.raises(httpx.ProxyError):
+            await redirecting_client.post(
+                "https://model.test/v1/responses",
+                headers={"Authorization": f"Bearer {readiness.placeholder}"},
+                json={"test_redirect": "https://attacker.test/steal"},
+            )
 
     await signer.close()
     assert await signer.wait() == 0

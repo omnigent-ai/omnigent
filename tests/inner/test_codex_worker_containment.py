@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -191,7 +193,13 @@ def test_signer_readiness_adds_only_relay_and_public_ca(
     )
     monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
     monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
-    worker_env = {"PATH": os.environ["PATH"], "CODEX_HOME": str(codex_home)}
+    worker_env = {
+        "PATH": os.environ["PATH"],
+        "CODEX_HOME": str(codex_home),
+        "DATABRICKS_BEARER": "host-bearer-secret",
+        "DATABRICKS_CLIENT_SECRET": "host-client-secret",
+        "DATABRICKS_CODEX_TOKEN": "host-codex-secret",
+    }
 
     worker = prepare_codex_worker(
         codex_path=str(codex),
@@ -213,6 +221,9 @@ def test_signer_readiness_adds_only_relay_and_public_ca(
     assert worker_env["HTTPS_PROXY"] == "http://127.0.0.1:43123"
     assert worker_env["OPENAI_API_KEY"] == readiness.placeholder
     assert worker_env["SSL_CERT_FILE"] == str(readiness.ca_bundle_path)
+    assert "DATABRICKS_BEARER" not in worker_env
+    assert "DATABRICKS_CLIENT_SECRET" not in worker_env
+    assert "DATABRICKS_CODEX_TOKEN" not in worker_env
     assert str(readiness.socket_path) not in worker_env.values()
     assert "token" not in str(policy.to_jsonable()).lower()
     worker.close()
@@ -449,3 +460,102 @@ def test_real_seatbelt_worker_cannot_write_outside_grants(tmp_path: Path) -> Non
 
     assert completed.returncode == 0, completed.stderr
     assert not escaped
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
+def test_real_seatbelt_worker_reads_only_public_signer_state_and_relay_network(
+    tmp_path: Path,
+) -> None:
+    unique = uuid.uuid4().hex
+    signer_public = Path(tempfile.mkdtemp(prefix="osp-", dir="/tmp")).resolve()
+    signer_private = Path(tempfile.mkdtemp(prefix="osr-", dir="/tmp")).resolve()
+    socket_path = signer_public / "relay.sock"
+    ca_bundle = signer_public / "ca-bundle.pem"
+    ca_bundle.write_text("PUBLIC CA", encoding="utf-8")
+    private_marker = signer_private / "bearer-token"
+    private_marker.write_text("PRIVATE SIGNER TOKEN", encoding="utf-8")
+    host_marker = Path.home() / f".omnigent-host-credential-{unique}"
+    host_marker.write_text("HOST CREDENTIAL", encoding="utf-8")
+
+    unix_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    unix_listener.bind(str(socket_path))
+    unix_listener.listen(1)
+    direct_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    direct_listener.bind(("127.0.0.1", 0))
+    direct_listener.listen(1)
+    direct_port = int(direct_listener.getsockname()[1])
+    relay_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    relay_probe.bind(("127.0.0.1", 0))
+    relay_port = int(relay_probe.getsockname()[1])
+    relay_probe.close()
+
+    codex = tmp_path / "codex"
+    codex.write_text(
+        "#!/usr/bin/python3\n"
+        "import pathlib, socket, sys\n"
+        f"for path in ({str(private_marker)!r}, {str(host_marker)!r}):\n"
+        "    try:\n"
+        "        pathlib.Path(path).read_bytes()\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    else:\n"
+        "        sys.exit(91)\n"
+        f"relay = socket.create_connection(('127.0.0.1', {relay_port}), timeout=3)\n"
+        "relay.close()\n"
+        "try:\n"
+        f"    direct = socket.create_connection(('127.0.0.1', {direct_port}), timeout=1)\n"
+        "except OSError:\n"
+        "    sys.exit(0)\n"
+        "direct.close()\n"
+        "sys.exit(92)\n",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    readiness = SignerReadiness(
+        relay_port=relay_port,
+        socket_path=socket_path,
+        ca_bundle_path=ca_bundle,
+        placeholder="oa_cred_session",
+    )
+    worker_env = {"PATH": os.environ["PATH"], "CODEX_HOME": str(codex_home)}
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=tmp_path,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                type="darwin_seatbelt",
+                allow_network=False,
+                cwd_hidden_scan_overflow="error",
+            ),
+        ),
+        spawn_env_names=list(worker_env),
+        signer_readiness=readiness,
+        worker_env=worker_env,
+    )
+
+    try:
+        completed = subprocess.run(
+            [worker.launch_path, "app-server"],
+            cwd=tmp_path,
+            env=worker_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        worker.close()
+        unix_listener.close()
+        direct_listener.close()
+        host_marker.unlink(missing_ok=True)
+        private_marker.unlink(missing_ok=True)
+        socket_path.unlink(missing_ok=True)
+        ca_bundle.unlink(missing_ok=True)
+        signer_public.rmdir()
+        signer_private.rmdir()
+
+    assert completed.returncode == 0, completed.stderr

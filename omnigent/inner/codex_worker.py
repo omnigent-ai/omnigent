@@ -20,6 +20,15 @@ from .sandbox import (
 )
 
 _FRAMEWORK_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+_BROKERED_AUTH_SECRET_ENV = frozenset(
+    {
+        "DATABRICKS_BEARER",
+        "DATABRICKS_CLIENT_SECRET",
+        "DATABRICKS_CODEX_TOKEN",
+        "DATABRICKS_TOKEN",
+        "OPENAI_API_KEY",
+    }
+)
 
 
 @dataclass
@@ -73,6 +82,8 @@ def prepare_codex_worker(
     staged_env = dict(worker_env) if worker_env is not None else None
     if signer_readiness is not None:
         assert staged_env is not None
+        for key in _BROKERED_AUTH_SECRET_ENV:
+            staged_env.pop(key, None)
         for key in ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
             staged_env.pop(key, None)
         apply_egress_env(
