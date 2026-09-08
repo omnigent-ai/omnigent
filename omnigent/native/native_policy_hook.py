@@ -661,6 +661,23 @@ def post_evaluate_with_retry(
                             file=sys.stderr,
                         )
                         continue
+                # A login redirect we could not re-mint through (no reauth,
+                # already retried, or the factory returned nothing) must fail
+                # closed with a clear reason. A 302→/oidc bounce is not a 4xx/5xx,
+                # so leaning on raise_for_status() / downstream JSON parsing to
+                # reject it is brittle across httpx versions and only surfaces a
+                # cryptic "empty/malformed response".
+                if resp.is_redirect:
+                    location = resp.headers.get("location", "")
+                    last_error = (
+                        f"Omnigent auth expired: HTTP {resp.status_code} login redirect"
+                        + (f" to {location}" if location else "")
+                    )
+                    print(
+                        f"omnigent {hook_label}: {last_error}; failing closed",
+                        file=sys.stderr,
+                    )
+                    return None, last_error
                 resp.raise_for_status()
                 return resp, None
         except httpx.HTTPStatusError as exc:
