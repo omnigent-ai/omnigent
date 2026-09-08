@@ -43,6 +43,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
+from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native._native_post_delivery import (
     append_dead_letter,
@@ -84,8 +85,9 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 # Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
-# stamped into each ``agent-<id>.meta.json``.
-_SUBAGENT_SPAWN_TOOL_NAME = "Agent"
+# stamped into each ``agent-<id>.meta.json``. Reuse the router's canonical set so
+# both the current ``Agent`` name and the still-supported ``Task`` alias match.
+_SUBAGENT_SPAWN_TOOL_NAMES = frozenset(AGENT_TOOL_NAMES)
 
 
 def _subagent_id_from_meta_path(meta_path: Path) -> str:
@@ -1400,7 +1402,7 @@ def _tool_use_ids_in_transcript(
             # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
             # Restricting to it keeps an unrelated tool-use id collision from
             # making a legitimate spawn look ambiguous.
-            if block.get("name") != _SUBAGENT_SPAWN_TOOL_NAME:
+            if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
                 continue
             tool_use_id = block.get("id")
             if isinstance(tool_use_id, str) and tool_use_id:

@@ -5056,6 +5056,7 @@ def _seed_subagent_on_disk(
     tool_use_id: str,
     transcript_records: list[dict[str, Any]] | None = None,
     spawn_transcript_path: Path | None = None,
+    spawn_tool_name: str = "Agent",
 ) -> Path:
     """
     Create the ``.meta.json`` + ``.jsonl`` pair Claude Code would
@@ -5078,6 +5079,8 @@ def _seed_subagent_on_disk(
         sub-agent has just been spawned).
     :param spawn_transcript_path: Transcript containing the spawning
         tool call. Defaults to the top-level transcript.
+    :param spawn_tool_name: Name on the spawning ``tool_use`` block.
+        Defaults to ``"Agent"``; pass ``"Task"`` to exercise the alias.
     :returns: Path to the sub-agent's ``.jsonl`` (handy for tests
         that append rows after the fact).
     """
@@ -5095,7 +5098,7 @@ def _seed_subagent_on_disk(
                             {
                                 "type": "tool_use",
                                 "id": tool_use_id,
-                                "name": "Agent",
+                                "name": spawn_tool_name,
                                 "input": {"description": description},
                             }
                         ],
@@ -5126,6 +5129,62 @@ def _seed_subagent_on_disk(
     else:
         jsonl_path.write_text("", encoding="utf-8")
     return jsonl_path
+
+
+async def test_subagent_watcher_registers_a_task_named_spawn(
+    tmp_path: Path,
+) -> None:
+    """A spawn recorded under the legacy ``Task`` name still registers.
+
+    ``Task`` was renamed to ``Agent`` in CLI 2.1.63 but remains a supported
+    alias, so a transcript may carry either name. Correlation gates all
+    registration, so missing the alias would strand every such sub-agent.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-worker",
+        agent_type="Explore",
+        description="spawned via the Task alias",
+        tool_use_id="toolu_task",
+        spawn_tool_name="Task",
+    )
+
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths == {"a-worker": "/v1/sessions/conv_root/events"}
+    assert state.subagents["a-worker"].child_conversation_id == "conv_a-worker"
+    assert state.subagents["a-worker"].parent_subagent_id is None
 
 
 async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
