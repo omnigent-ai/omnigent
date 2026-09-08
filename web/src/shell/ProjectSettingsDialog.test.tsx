@@ -308,10 +308,9 @@ describe("ProjectSettingsDialog", () => {
       ),
     );
 
-    // Open the agent picker dropdown (Radix opens on pointerdown), then the
-    // "Custom agents" submenu where composed agents are listed.
+    // Open the agent picker dropdown (Radix opens on pointerdown). Custom
+    // Agents are listed directly in their own section.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     expect(screen.getByTestId("new-chat-landing-agent-ag_1")).toBeInTheDocument();
     expect(screen.queryByTestId("new-chat-landing-agent-ag_nessie")).not.toBeInTheDocument();
     // And the stored default agent is pinned into discovery, so a
@@ -344,10 +343,8 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
     await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
 
-    // Switch the default to a plain bundle agent (under "Custom agents") → the
-    // model field goes away.
+    // Switch the default to a plain bundle Agent; the model field goes away.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_1"));
     await waitFor(() =>
       expect(screen.queryByTestId("project-settings-model")).not.toBeInTheDocument(),

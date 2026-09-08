@@ -51,6 +51,7 @@ export interface AvailableAgent {
   // session-discovered agents (custom uploads); absent on catalog agents
   // whose full data is already present from GET /v1/agents.
   sessionId?: string;
+  templateId?: string;
 }
 
 const DISPLAY_NAMES: Record<string, string> = {
@@ -116,6 +117,7 @@ interface SessionListItemWire {
   id: string;
   agent_id?: string | null;
   agent_name?: string | null;
+  labels?: Record<string, string>;
   // Session creation epoch — proxy for "when the user last ran this agent",
   // used to pick the newest among same-named uploads / templates.
   created_at?: number | null;
@@ -164,6 +166,7 @@ interface ScannedSessionAgent {
   agentId: string;
   agentName: string;
   sessionId: string;
+  templateId?: string;
   // Creation epoch of the session it was seen on — recency proxy for
   // newest-wins supersession. null when the server omits created_at.
   createdAt: number | null;
@@ -191,11 +194,19 @@ async function scanSessionAgents(): Promise<ScannedSessionAgent[]> {
     // Rows without an agent_name are orphaned (agent row deleted); skip
     // them, matching useAgents' sessions-derived list.
     if (!session.agent_id || !session.agent_name) continue;
-    if (seen.has(session.agent_id)) continue;
+    const existing = seen.get(session.agent_id);
+    if (existing) {
+      if (!existing.templateId && session.labels?.["omnigent:agent-template-id"])
+        existing.templateId = session.labels["omnigent:agent-template-id"];
+      continue;
+    }
     seen.set(session.agent_id, {
       agentId: session.agent_id,
       agentName: session.agent_name,
       sessionId: session.id,
+      ...(session.labels?.["omnigent:agent-template-id"]
+        ? { templateId: session.labels["omnigent:agent-template-id"] }
+        : {}),
       createdAt: session.created_at ?? null,
     });
   }
@@ -222,6 +233,9 @@ async function lookupPinnedAgent(agentId: string): Promise<AvailableAgent | null
       agentId: row.agent_id,
       agentName: row.agent_name,
       sessionId: row.id,
+      ...(row.labels?.["omnigent:agent-template-id"]
+        ? { templateId: row.labels["omnigent:agent-template-id"] }
+        : {}),
       createdAt: row.created_at ?? null,
     });
   } catch {
@@ -252,6 +266,7 @@ function sessionAgentFromScan(scanned: ScannedSessionAgent): AvailableAgent {
     harness: null,
     skills: [],
     sessionId: scanned.sessionId,
+    ...(scanned.templateId ? { templateId: scanned.templateId } : {}),
     // builtin/created_at intentionally omitted: session-derived agents never
     // seed the catalog, and their recency comes from the scanned session's
     // createdAt (used directly in the dedup), not from this object.

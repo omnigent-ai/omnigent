@@ -109,12 +109,12 @@ function toMCPInputs(entries: MCPFormEntry[]): MCPServerInput[] | undefined {
 }
 
 /**
- * Dialog for creating a custom agent from the new-session picker.
+ * Dialog for creating a reusable custom Agent.
  *
  * Collects a name, optional description, optional system instructions,
  * a harness choice, and zero or more MCP server declarations. On submit,
- * passes the agent configuration back to the parent via `onCreate` so it
- * can build a bundle and start a session with it.
+ * passes the Agent configuration back to the parent via `onCreate` so it
+ * can build and persist the bundle.
  */
 export function CreateAgentDialog({
   open,
@@ -123,7 +123,7 @@ export function CreateAgentDialog({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onCreate: (input: AgentBundleInput) => void;
+  onCreate: (input: AgentBundleInput) => void | Promise<void>;
 }) {
   const brainHarnessLabels = useBrainHarnessLabels();
   const harnessOptions = Object.entries(brainHarnessLabels).map(([value, label]) => ({
@@ -137,6 +137,8 @@ export function CreateAgentDialog({
   const [model, setModel] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   function reset() {
     setName("");
@@ -149,7 +151,9 @@ export function CreateAgentDialog({
   }
 
   function handleOpenChange(next: boolean) {
+    if (saving) return;
     if (!next) reset();
+    setError(null);
     onOpenChange(next);
   }
 
@@ -166,20 +170,28 @@ export function CreateAgentDialog({
     setMcpEntries((prev) => prev.map((e) => (e.key === key ? { ...e, ...patch } : e)));
   }
 
-  function handleSubmit() {
+  async function handleSubmit() {
     const trimmedName = name.trim();
-    if (!trimmedName) return;
+    if (!trimmedName || !model.trim() || saving) return;
+    setSaving(true);
+    setError(null);
 
-    onCreate({
-      name: trimmedName,
-      description: description.trim() || undefined,
-      instructions: instructions.trim() || undefined,
-      harness,
-      model: model.trim(),
-      mcpServers: toMCPInputs(mcpEntries),
-    });
-    reset();
-    onOpenChange(false);
+    try {
+      await onCreate({
+        name: trimmedName,
+        description: description.trim() || undefined,
+        instructions: instructions.trim() || undefined,
+        harness,
+        model: model.trim(),
+        mcpServers: toMCPInputs(mcpEntries),
+      });
+      reset();
+      onOpenChange(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Failed to save Agent");
+    } finally {
+      setSaving(false);
+    }
   }
 
   const canSubmit = name.trim().length > 0 && model.trim().length > 0;
@@ -194,9 +206,8 @@ export function CreateAgentDialog({
           <DialogTitle>Create custom agent</DialogTitle>
         </DialogHeader>
 
-        {/* px-1/-mx-1 give the fields' 3px focus ring room to paint:
-            overflow-y-auto also clips horizontally at the padding box. */}
-        <div className="-mx-1 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
+        {/* Reserve room for input focus rings inside the scroll container. */}
+        <div className="-mx-3 -my-2 flex min-h-0 flex-1 flex-col gap-4 overflow-x-hidden overflow-y-auto px-3 py-2">
           {/* Name */}
           <div className="flex flex-col gap-1.5">
             <label
@@ -318,13 +329,21 @@ export function CreateAgentDialog({
             ))}
           </div>
         </div>
-
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <DialogFooter>
-          <Button variant="ghost" onClick={() => handleOpenChange(false)}>
+          <Button variant="ghost" disabled={saving} onClick={() => handleOpenChange(false)}>
             Cancel
           </Button>
-          <Button data-testid="create-agent-submit" onClick={handleSubmit} disabled={!canSubmit}>
-            Create
+          <Button
+            data-testid="create-agent-submit"
+            onClick={handleSubmit}
+            disabled={!canSubmit || saving}
+          >
+            {saving ? "Saving…" : "Create"}
           </Button>
         </DialogFooter>
       </DialogContent>

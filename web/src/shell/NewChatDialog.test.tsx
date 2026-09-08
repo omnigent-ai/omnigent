@@ -1,6 +1,7 @@
 import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
@@ -38,6 +39,7 @@ import {
   useInstallingHarnesses,
   type Host,
 } from "@/hooks/useHosts";
+import { useCustomAgents } from "@/lib/customAgentsApi";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -95,6 +97,10 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 // "ready vs. one-more-step" wording can be asserted.
 const { showToastMock } = vi.hoisted(() => ({ showToastMock: vi.fn() }));
 vi.mock("@/components/ui/toast", () => ({ showToast: showToastMock }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  useCustomAgents: vi.fn(() => ({ data: [], isPending: false, error: null })),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -725,6 +731,11 @@ function mockAgents(agents: AvailableAgent[]) {
 // directory-session / runner-health / filesystem stubs, and a persisted
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
+  vi.mocked(useCustomAgents).mockReturnValue({
+    data: [],
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useCustomAgents>);
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
   useHostModelOptionsMock.mockReset();
@@ -2636,22 +2647,15 @@ describe("NewChatLandingScreen", () => {
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
     expect(
-      sandboxOption.compareDocumentPosition(hostItem!) & Node.DOCUMENT_POSITION_FOLLOWING,
+      sandboxOption.compareDocumentPosition(hostItem) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     // Picking the host restores the workspace flow (file-browser chip,
     // worktree chip) — the sandbox default doesn't wedge the normal path.
-    fireEvent.click(hostItem!);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
-    );
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
+    fireEvent.click(hostItem);
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy());
+    expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("New Sandbox");
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-repo-chip")).toBeNull();
     // And back: selecting the sandbox clears the host pick and swaps the
@@ -3876,104 +3880,87 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
   });
 });
 
-describe("NewChatLandingScreen custom-agent sandbox gating", () => {
-  beforeEach(setupLandingMocks);
+describe("NewChatLandingScreen custom Agent library", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    vi.mocked(useCustomAgents).mockReturnValue({
+      data: [
+        {
+          id: "ca_release_reviewer",
+          name: "Release reviewer",
+          description: "Checks release candidates",
+          harness: "codex",
+          model: null,
+          version: 2,
+          created_at: 10,
+          updated_at: 11,
+        },
+      ],
+      isPending: false,
+      error: null,
+    } as unknown as ReturnType<typeof useCustomAgents>);
+  });
   afterEach(() => {
     cleanup();
     localStorage.clear();
   });
 
-  // Select the managed sandbox as the target. The default mocks give one
-  // online host (auto-selected), so we open the host chip and pick the
-  // sandbox option pinned at the top.
-  async function selectSandbox(): Promise<void> {
+  it("selects a saved Agent from the picker without duplicating its session clone", () => {
+    mockAgents([
+      {
+        id: "ag_runtime_clone",
+        name: "Release reviewer",
+        display_name: "Release reviewer",
+        description: null,
+        harness: "codex",
+        skills: [],
+        sessionId: "conv_clone",
+        templateId: "ca_release_reviewer",
+      },
+    ]);
+    renderLanding();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-ag_runtime_clone")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ca_release_reviewer"));
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
+      "Release reviewer",
+    );
+  });
+
+  it("keeps a session clone selectable after its saved Agent is deleted", () => {
+    mockAgents([
+      {
+        id: "ag_orphaned_clone",
+        name: "Deleted template clone",
+        display_name: "Deleted template clone",
+        description: null,
+        harness: "codex",
+        skills: [],
+        sessionId: "conv_orphaned",
+        templateId: "ca_deleted",
+      },
+    ]);
+    renderLanding();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-ag_orphaned_clone")).toBeInTheDocument();
+  });
+
+  it("keeps saved Agents visible but disabled on managed sandboxes", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Sandbox"),
     );
-  }
 
-  it("hides 'Create custom agent' on a sandbox", async () => {
-    renderLanding({ managed_sandboxes_enabled: true });
-    await selectSandbox();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // The item is omitted entirely on a sandbox target.
-    expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
-  });
-
-  it("shows 'Create custom agent' on a host and opens the dialog", async () => {
-    renderLanding({ managed_sandboxes_enabled: true });
-    // The managed default is the sandbox even with a host present, so switch
-    // to the connected host (machine-1) first.
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    expect(screen.getByTestId("new-chat-landing-agent-ca_release_reviewer")).toHaveAttribute(
+      "aria-disabled",
+      "true",
     );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
-    fireEvent.click(hostItem!);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
-    );
-    // With no custom agents yet, the create item is a top-level row (no
-    // "Custom agents" submenu to hide it behind) and opens the dialog.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // No custom agents → no "Custom agents" submenu; create must be top-level.
-    expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
-    const createItem = screen.getByTestId("new-chat-landing-create-agent");
-    fireEvent.click(createItem);
-    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
-  });
-
-  // Switch the target to the connected host, then create + submit a pending
-  // custom agent from the dialog so it becomes the selected agent.
-  async function createAndSelectPendingAgentOnHost(): Promise<void> {
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    fireEvent.click(hostItem!);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
-    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
-    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
-    fireEvent.change(screen.getByTestId("create-agent-model"), {
-      target: { value: "claude-sonnet-4-20250514" },
-    });
-    fireEvent.click(screen.getByTestId("create-agent-submit"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent"),
-    );
-  }
-
-  it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
-    renderLanding({ managed_sandboxes_enabled: true });
-    await createAndSelectPendingAgentOnHost();
-    // Switch back to the sandbox: the pending pick can't run there, so the
-    // selection falls back to a real agent and the pending row disappears.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
-    );
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
-      "my-agent",
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-create-agent")).not.toBeInTheDocument();
   });
 });
 
@@ -4020,7 +4007,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   }
 
-  it("drills into the Custom agents page in place and returns via Back", () => {
+  it("lists Custom agents directly on mobile", () => {
     // A custom (non-builtin) agent lands in the Custom agents group.
     mockAgents([
       {
@@ -4042,16 +4029,13 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     ]);
     renderLanding();
     openPicker();
-    // The custom agent isn't inline — it's behind the "Custom agents" row.
-    expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
-    // Tapping drills into the page in place (Claude Code inline row is gone).
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     expect(screen.getByTestId("new-chat-landing-agent-ag_custom")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-agent-a1")).toBeNull();
-    // Back returns to the main list.
-    fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_custom"));
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "My Custom Agent",
+    );
   });
 
   it("drills into the More page for harnesses outside the supported set", () => {

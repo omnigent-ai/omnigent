@@ -245,6 +245,27 @@ POLICY_SCOPE_DEFAULT = "default"
 POLICY_SCOPE_SESSION = "session"
 
 
+class SqlCustomAgent(OmnigentBase):
+    """Private library entries; never operator-trusted runtime templates."""
+
+    __tablename__ = "custom_agents"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(256))
+    name: Mapped[str] = mapped_column(String(256))
+    description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    harness: Mapped[str] = mapped_column(String(128))
+    model: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    bundle_location: Mapped[str] = mapped_column(String(512))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
+    deleted_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    __table_args__ = (Index("ix_custom_agents_owner", "workspace_id", "owner_id", "deleted_at"),)
+
+
 class SqlAgent(OmnigentBase):
     """
     SQLAlchemy model for the ``agents`` table.

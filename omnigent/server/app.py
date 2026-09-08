@@ -65,6 +65,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -80,6 +81,7 @@ from omnigent.server.performance_metrics import (
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
+from omnigent.server.routes.custom_agents import create_custom_agents_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.extension_assets import create_extension_assets_router
@@ -1075,6 +1077,7 @@ def create_app(
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
+    custom_agents_store: CustomAgentsStore | None = None,
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
     debug_router_modules: list[str] | None = None,
@@ -2599,6 +2602,24 @@ def create_app(
         prefix="/v1",
         tags=["usage"],
     )
+    # User-owned bundles stay separate from operator-trusted template rows.
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    if custom_agents_store is None and isinstance(agent_store, SqlAlchemyAgentStore):
+        custom_agents_store = CustomAgentsStore(agent_store.storage_location)
+    if custom_agents_store is not None:
+        app.include_router(
+            create_custom_agents_router(
+                custom_agents_store,
+                artifact_store,
+                agent_store,
+                conversation_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["custom-agents"],
+        )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
     # built-in (session_id IS NULL) agents for the new-session picker.

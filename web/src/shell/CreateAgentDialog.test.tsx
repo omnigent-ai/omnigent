@@ -25,8 +25,9 @@ describe("CreateAgentDialog", () => {
     if (!scrollRegion) throw new Error("create-agent scroll region not found");
     // overflow-y-auto also clips horizontally at the padding box, so the
     // full-width fields need horizontal padding or their 3px focus ring is
-    // chopped at the container's left/right edges. -mx-1 keeps the fields
+    // chopped at the container's left/right edges. Negative margins keep the fields
     // visually aligned with the dialog header/footer.
-    expect(scrollRegion).toHaveClass("px-1", "-mx-1");
+    expect(scrollRegion).toHaveClass("px-3", "-mx-3", "py-2", "-my-2");
+    expect(scrollRegion).not.toContainElement(screen.getByTestId("create-agent-submit"));
   });
 });
