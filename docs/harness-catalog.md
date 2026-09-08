@@ -272,6 +272,56 @@ before trusting a harness:
   `vitest` and `tsc` fail there with a `styleText` import error. Run them in a
   `node:20-bookworm` container.
 
+## What Omnigent should add
+
+Ranked by how much they change what a user can actually do, from the evidence
+above. The first two are bugs whose absence silently costs work; the rest are
+capabilities the fleet has no substitute for today.
+
+**1. Deliver `initial_items` (issue #2, design in #7).** Today a session created
+with a first prompt never runs it, with no error. Every programmatic client has
+to know the folklore — create, then post the prompt separately — and one that
+does not simply hangs. This is the single cheapest fix with the widest blast
+radius, and the design seam already exists (`_on_runner_connect`).
+
+**2. Make the harness picker reflect the selected host (issue #6).** The picker
+currently offers five harnesses installed on no host and hides six that are
+installed, so the primary way a user chooses a harness is close to
+anti-correlated with what will start. `GET /v1/hosts` already returns the truth
+per host; the picker just does not consult it. `needs-auth` should be its own
+actionable state ("log in") rather than being collapsed into unavailable.
+
+**3. Surface pacing delay per session and per workstream.** Chat already shows
+*this* session's wait ("Waiting 12.3s for quota"), and the new panel shows
+window fullness — but nothing answers "why is my session the one waiting?" The
+next LLMQ release adds `workstream_pacing[]` to `/v1/snapshot` with
+`delay_seconds_for_default_estimate` per (window, workstream), which is exactly
+the missing number. Rendering it turns the panel from a fuel gauge into an
+explanation, and it is additive: the reduction in `quota_status.py` ignores
+unknown keys, so it can be adopted without a controller lockstep.
+
+**4. Attest agent identity at registration (issue #8).** Registry `agent_id`s
+are self-asserted, and on 2026-09-08 two sessions signed as each other for
+hours. Agents in this fleet hand off work, claim exclusive roles, and grant each
+other authority to push — a name anyone can assert is not a sound basis for any
+of that. This is the one item here that is a correctness problem for
+multi-agent operation rather than a convenience.
+
+**5. Expose harness capabilities in the UI, not just the API.** The registry
+knows, for all 26 harnesses, whether each supports subagents, resume,
+elicitation, streaming and image input — and since this branch the API serves
+it. Nothing renders it. A user picking a harness cannot see that
+`cursor-native` will not stream, or that eight harnesses declare
+`instruction_delivery: not-delivered`, meaning an agent's instructions silently
+do nothing. The data is already on the wire; this is a rendering job.
+
+Two things deliberately **not** on this list. Elicitation and
+resume-after-restart are marked "not exercised" above rather than proposed as
+work: until they are actually tested, any recommendation about them would be a
+guess. And the `/tmp` workspace failure (issue #3) is a real bug but a narrow
+one — it has an obvious workaround once known, which is why it ranks below
+items with no workaround.
+
 ## Reproducing
 
 Capability matrix, straight from the registry:
