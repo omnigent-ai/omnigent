@@ -14,9 +14,11 @@
  *   `POST /v1/projects` the sidebar performs.
  * - Pull requests come through the GitHub panel's query cache
  *   (`fetchGithubInfo`), throttled per session by `usePullRequests`.
- * - Card positions and per-canvas viewports live in localStorage
- *   (`canvasStorage.ts`), keyed by server identity; the server never learns
- *   the layout.
+ * - Card positions live in localStorage (`canvasStorage.ts`), keyed by server
+ *   identity; the server never learns the layout. The view itself is not
+ *   saved: every canvas opens fitted to its cards and stays fitted until the
+ *   user pans or zooms by hand.
+ * - The selected canvas lives in `?canvas=<id>` so a reload keeps the tab.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -27,6 +29,7 @@ import {
   ReactFlowProvider,
   useReactFlow,
   type NodeChange,
+  type Viewport,
 } from "@xyflow/react";
 import {
   Maximize2Icon,
@@ -37,6 +40,8 @@ import {
   ZoomOutIcon,
 } from "lucide-react";
 import {
+  CARD_HEIGHT,
+  CARD_WIDTH,
   MAIN_CANVAS_ID,
   mergeCanvasPositions,
   mergeSessionPositions,
@@ -45,17 +50,15 @@ import {
   sessionsOnCanvas,
   type CanvasPositions,
 } from "@/canvas/canvasLayout";
+import { useCanvasSessions } from "@/canvas/canvasSessions";
 import {
   readCanvasLayout,
-  withoutCanvas,
+  withoutPositions,
   withPosition,
   withPositions,
-  withViewport,
   writeCanvasLayout,
   type CanvasLayout,
-  type CanvasViewport,
 } from "@/canvas/canvasStorage";
-import { useCanvasSessions } from "@/canvas/canvasSessions";
 import { usePullRequests, type CanvasPullRequests } from "@/canvas/pullRequests";
 import { SessionCard, type SessionCardNode } from "@/canvas/SessionCard";
 import { Button } from "@/components/ui/button";
@@ -72,13 +75,9 @@ import "@xyflow/react/dist/style.css";
 const nodeTypes = { session: SessionCard };
 const proOptions = { hideAttribution: true };
 const FIT_VIEW = { padding: 0.2, maxZoom: 1 };
-const MIN_ZOOM = 0.2;
+const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 2.5;
-/** Above this many cards a fitted view is unreadable; open top-left at a legible zoom instead. */
-export const LARGE_CANVAS_SESSION_COUNT = 40;
-const READABLE_VIEWPORT = { x: 24, y: 24, zoom: 0.9 };
 const RESIZE_REFIT_DELAY_MS = 100;
-const VIEWPORT_SAVE_DELAY_MS = 250;
 const EMPTY_PROJECTS: ProjectSummary[] = [];
 /** Query parameter carrying the selected canvas so a reload lands on the same tab. */
 export const CANVAS_QUERY_PARAM = "canvas";
@@ -92,14 +91,25 @@ function sessionCountLabel(count: number): string {
   return count === 1 ? "1 session" : `${count} sessions`;
 }
 
-function CanvasControls({ onReset }: { onReset: () => void }) {
-  const { zoomIn, zoomOut, fitView } = useReactFlow();
+function CanvasControls({
+  onZoom,
+  onFit,
+  onReset,
+}: {
+  onZoom: () => void;
+  onFit: () => void;
+  onReset: () => void;
+}) {
+  const { zoomIn, zoomOut } = useReactFlow();
   return (
     <div className="absolute bottom-3 left-3 z-10 flex flex-col gap-1">
       <button
         type="button"
         className={CONTROL_CLASS}
-        onClick={() => void zoomIn({ duration: 200 })}
+        onClick={() => {
+          onZoom();
+          void zoomIn({ duration: 200 });
+        }}
         aria-label="Zoom in"
       >
         <ZoomInIcon className="size-4" />
@@ -107,17 +117,15 @@ function CanvasControls({ onReset }: { onReset: () => void }) {
       <button
         type="button"
         className={CONTROL_CLASS}
-        onClick={() => void zoomOut({ duration: 200 })}
+        onClick={() => {
+          onZoom();
+          void zoomOut({ duration: 200 });
+        }}
         aria-label="Zoom out"
       >
         <ZoomOutIcon className="size-4" />
       </button>
-      <button
-        type="button"
-        className={CONTROL_CLASS}
-        onClick={() => void fitView({ ...FIT_VIEW, duration: 200 })}
-        aria-label="Fit view"
-      >
+      <button type="button" className={CONTROL_CLASS} onClick={onFit} aria-label="Fit view">
         <Maximize2Icon className="size-4" />
       </button>
       <button
@@ -137,7 +145,7 @@ function CanvasSurface() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { trackClick } = useOmnigentAnalytics();
-  const { fitView, getViewport, setViewport } = useReactFlow();
+  const { fitView } = useReactFlow();
   const { sessions, loaded, loadingMore, complete, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
@@ -152,10 +160,11 @@ function CanvasSurface() {
   layoutRef.current ??= readCanvasLayout();
   // Live positions for every session, including unsaved grid slots.
   const positionsRef = useRef<CanvasPositions>({});
-  // True once the user pans or zooms by hand; auto-fits then stop overriding them.
+  // True once the user pans or zooms by hand; auto-fits then leave the view
+  // alone until the canvas changes.
   const viewportDirtyRef = useRef(false);
-  const initializedRef = useRef(false);
-  const viewportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The card set the view was last fitted to; a different set refits.
+  const fittedKeyRef = useRef<string | null>(null);
   const pendingProjectNameRef = useRef<string | null>(null);
   const flowContainerRef = useRef<HTMLDivElement>(null);
   const aliveRef = useRef(true);
@@ -164,7 +173,6 @@ function CanvasSurface() {
     aliveRef.current = true;
     return () => {
       aliveRef.current = false;
-      if (viewportTimerRef.current) clearTimeout(viewportTimerRef.current);
     };
   }, []);
 
@@ -188,47 +196,23 @@ function CanvasSurface() {
     }
   }, []);
 
-  const applyDefaultViewport = useCallback(
-    (sessionCount: number, duration = 0) => {
+  const fitCanvas = useCallback(
+    (duration = 0) => {
       viewportDirtyRef.current = false;
-      if (sessionCount > LARGE_CANVAS_SESSION_COUNT) {
-        void setViewport(READABLE_VIEWPORT, { duration });
-      } else {
-        void fitView({ ...FIT_VIEW, duration });
-      }
+      void fitView({ ...FIT_VIEW, duration });
     },
-    [fitView, setViewport],
+    [fitView],
   );
 
-  const containerSize = useCallback(() => {
-    const rect = flowContainerRef.current?.getBoundingClientRect();
-    return { width: Math.round(rect?.width ?? 0), height: Math.round(rect?.height ?? 0) };
+  const markViewportDirty = useCallback(() => {
+    viewportDirtyRef.current = true;
   }, []);
 
-  // Restore the same canvas point at the center even if the container resized.
-  const applyViewport = useCallback(
-    (saved: CanvasViewport | null, sessionCount: number) => {
-      requestAnimationFrame(() => {
-        if (!aliveRef.current) return;
-        const usable = saved !== null && saved.zoom >= MIN_ZOOM && saved.zoom <= MAX_ZOOM;
-        if (!usable) {
-          applyDefaultViewport(sessionCount);
-          return;
-        }
-        viewportDirtyRef.current = true;
-        const size = containerSize();
-        void setViewport(
-          {
-            x: saved.x + (size.width > 0 && saved.width ? (size.width - saved.width) / 2 : 0),
-            y: saved.y + (size.height > 0 && saved.height ? (size.height - saved.height) / 2 : 0),
-            zoom: saved.zoom,
-          },
-          { duration: 0 },
-        );
-      });
-    },
-    [applyDefaultViewport, containerSize, setViewport],
-  );
+  /** The next card set gets a fresh fit, even if the user had panned this one. */
+  const scheduleFit = useCallback(() => {
+    viewportDirtyRef.current = false;
+    fittedKeyRef.current = null;
+  }, []);
 
   const openSession = useCallback(
     (sessionId: string) => {
@@ -248,6 +232,10 @@ function CanvasSurface() {
         id: session.id,
         type: "session",
         position: positions[session.id],
+        // Fixed card size so fit-to-view can measure cards that are not rendered
+        // yet (onlyRenderVisibleElements draws only the ones in view).
+        initialWidth: CARD_WIDTH,
+        initialHeight: CARD_HEIGHT,
         data: {
           conversation: session,
           pullRequest: requests[session.id] ?? null,
@@ -274,6 +262,19 @@ function CanvasSurface() {
     setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
   }, [nodesFor, visibleSessions, pullRequests]);
 
+  // Keep every card in view until the user pans or zooms by hand: first paint,
+  // tab switches, cards arriving while loading, and Reset layout. Keyed on the
+  // card set so status-only updates never move the view. Runs after the flow
+  // has adopted the new nodes (its store update is a child effect).
+  useEffect(() => {
+    // The first render carries an empty node list; wait for real cards.
+    if (!loaded || nodes.length === 0) return;
+    const key = nodes.map((node) => node.id).join("\n");
+    if (key === fittedKeyRef.current) return;
+    fittedKeyRef.current = key;
+    if (!viewportDirtyRef.current) fitCanvas();
+  }, [fitCanvas, loaded, nodes]);
+
   // Mirror the selected canvas into the URL; Main keeps the URL clean.
   const writeCanvasParam = useCallback(
     (canvasId: string) => {
@@ -290,6 +291,18 @@ function CanvasSurface() {
     [setSearchParams],
   );
 
+  const selectCanvas = useCallback(
+    (canvasId: string) => {
+      if (activeCanvasRef.current === canvasId) return;
+      trackClick("canvas.tab");
+      activeCanvasRef.current = canvasId;
+      setActiveCanvas(canvasId);
+      writeCanvasParam(canvasId);
+      scheduleFit();
+    },
+    [scheduleFit, trackClick, writeCanvasParam],
+  );
+
   // A project canvas whose project was deleted (or a stale URL) falls back to Main.
   useEffect(() => {
     if (activeCanvas === MAIN_CANVAS_ID || projectsQuery.data === undefined) return;
@@ -297,7 +310,8 @@ function CanvasSurface() {
     activeCanvasRef.current = MAIN_CANVAS_ID;
     setActiveCanvas(MAIN_CANVAS_ID);
     writeCanvasParam(MAIN_CANVAS_ID);
-  }, [activeCanvas, projects, projectsQuery.data, writeCanvasParam]);
+    scheduleFit();
+  }, [activeCanvas, projects, projectsQuery.data, scheduleFit, writeCanvasParam]);
 
   // Once the full list is known, forget spots of sessions that no longer exist.
   useEffect(() => {
@@ -311,32 +325,6 @@ function CanvasSurface() {
       persist(withPositions(layout, pruned));
     }
   }, [complete, persist, sessions]);
-
-  // First paint: the saved Main viewport, else a fit. While pages are still
-  // arriving the canvas is treated as large so the view does not jump later.
-  useEffect(() => {
-    if (initializedRef.current || !loaded) return;
-    initializedRef.current = true;
-    applyViewport(
-      layoutRef.current?.viewports[activeCanvasRef.current] ?? null,
-      complete ? visibleSessions.length : LARGE_CANVAS_SESSION_COUNT + 1,
-    );
-  }, [applyViewport, complete, loaded, visibleSessions.length]);
-
-  const selectCanvas = useCallback(
-    (canvasId: string) => {
-      if (activeCanvasRef.current === canvasId) return;
-      trackClick("canvas.tab");
-      activeCanvasRef.current = canvasId;
-      setActiveCanvas(canvasId);
-      writeCanvasParam(canvasId);
-      applyViewport(
-        layoutRef.current?.viewports[canvasId] ?? null,
-        sessionsOnCanvas(sessions, canvasId, projects).length,
-      );
-    },
-    [applyViewport, projects, sessions, trackClick, writeCanvasParam],
-  );
 
   // A project created from the tab strip is selected once the list includes it.
   useEffect(() => {
@@ -362,9 +350,7 @@ function CanvasSurface() {
       }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        if (initializedRef.current && !viewportDirtyRef.current) {
-          applyDefaultViewport(visibleSessions.length);
-        }
+        if (loaded && !viewportDirtyRef.current) fitCanvas();
       }, RESIZE_REFIT_DELAY_MS);
     });
     observer.observe(container);
@@ -372,7 +358,7 @@ function CanvasSurface() {
       if (timer) clearTimeout(timer);
       observer.disconnect();
     };
-  }, [applyDefaultViewport, loaded, visibleSessions.length]);
+  }, [fitCanvas, loaded]);
 
   const onNodesChange = useCallback((changes: NodeChange<SessionCardNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
@@ -382,31 +368,15 @@ function CanvasSurface() {
     (_event: MouseEvent | TouchEvent, node: SessionCardNode) => {
       const position = { x: Math.round(node.position.x), y: Math.round(node.position.y) };
       positionsRef.current = { ...positionsRef.current, [node.id]: position };
-      if (!layoutRef.current) return;
-      persist(
-        withViewport(withPosition(layoutRef.current, node.id, position), activeCanvasRef.current, {
-          ...getViewport(),
-          ...containerSize(),
-        }),
-      );
+      if (layoutRef.current) persist(withPosition(layoutRef.current, node.id, position));
     },
-    [containerSize, getViewport, persist],
+    [persist],
   );
 
-  const onMoveEnd = useCallback(
-    (event: MouseEvent | TouchEvent | null, viewport: CanvasViewport) => {
-      // A null event is a programmatic move (fit / restore), not the user's view.
-      if (!initializedRef.current || event === null) return;
-      viewportDirtyRef.current = true;
-      if (viewportTimerRef.current) clearTimeout(viewportTimerRef.current);
-      const canvasId = activeCanvasRef.current;
-      viewportTimerRef.current = setTimeout(() => {
-        if (!layoutRef.current) return;
-        persist(withViewport(layoutRef.current, canvasId, { ...viewport, ...containerSize() }));
-      }, VIEWPORT_SAVE_DELAY_MS);
-    },
-    [containerSize, persist],
-  );
+  // A null event is a programmatic move (a fit), not the user's own view.
+  const onMoveEnd = useCallback((event: MouseEvent | TouchEvent | null, _viewport: Viewport) => {
+    if (event !== null) viewportDirtyRef.current = true;
+  }, []);
 
   const resetLayout = useCallback(() => {
     trackClick("canvas.reset-layout");
@@ -416,20 +386,10 @@ function CanvasSurface() {
       Object.entries(positionsRef.current).filter(([id]) => !removed.has(id)),
     ) as CanvasPositions;
     positionsRef.current = { ...kept, ...mergeSessionPositions(visibleSessions, {}) };
+    scheduleFit();
     setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
-    if (layoutRef.current) persist(withoutCanvas(layoutRef.current, activeCanvas, ids));
-    requestAnimationFrame(() => {
-      if (aliveRef.current) applyDefaultViewport(visibleSessions.length);
-    });
-  }, [
-    activeCanvas,
-    applyDefaultViewport,
-    nodesFor,
-    persist,
-    pullRequests,
-    trackClick,
-    visibleSessions,
-  ]);
+    if (layoutRef.current) persist(withoutPositions(layoutRef.current, ids));
+  }, [nodesFor, persist, pullRequests, scheduleFit, trackClick, visibleSessions]);
 
   const newSession = () => {
     trackClick("canvas.new-session");
@@ -571,7 +531,11 @@ function CanvasSurface() {
           {visibleSessions.length > 0 && (
             <Background color="var(--border)" bgColor="var(--background)" />
           )}
-          <CanvasControls onReset={resetLayout} />
+          <CanvasControls
+            onZoom={markViewportDirty}
+            onFit={() => fitCanvas(200)}
+            onReset={resetLayout}
+          />
         </ReactFlow>
         {emptyState}
         <Button

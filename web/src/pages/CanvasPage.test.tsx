@@ -14,7 +14,7 @@ import * as conversationsHook from "@/hooks/useConversations";
 import * as canvasSessions from "@/canvas/canvasSessions";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { canvasLayoutStorageKey, readCanvasLayout } from "@/canvas/canvasStorage";
-import { CanvasPage, LARGE_CANVAS_SESSION_COUNT } from "./CanvasPage";
+import { CanvasPage } from "./CanvasPage";
 
 const { flowProps, flowFitView, flowSetViewport, flowApi } = vi.hoisted(() => {
   const fitViewMock = vi.fn();
@@ -121,9 +121,9 @@ function LocationProbe() {
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
 }
 
-function renderPage(initialEntry = "/canvas") {
+function pageTree(initialEntry = "/canvas") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
@@ -141,8 +141,12 @@ function renderPage(initialEntry = "/canvas") {
           </Routes>
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+}
+
+function renderPage(initialEntry = "/canvas") {
+  return render(pageTree(initialEntry));
 }
 
 const PROJECTS: ProjectSummary[] = [
@@ -178,37 +182,49 @@ describe("CanvasPage", () => {
     expect(screen.getByTestId("flow-node-conv_2")).toBeInTheDocument();
     expect(screen.getByText("2 sessions")).toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Loading sessions" })).toBeInTheDocument();
-    // Pages still pending: open at the readable viewport instead of fitting a partial set.
-    await waitFor(() =>
-      expect(flowSetViewport).toHaveBeenCalledWith({ x: 24, y: 24, zoom: 0.9 }, { duration: 0 }),
-    );
-    expect(flowFitView).not.toHaveBeenCalled();
-  });
-
-  it("fits a completed small canvas and keeps the count quiet", async () => {
-    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
-      sessionsStub([conversation("conv_1", 1)]),
-    );
-    renderPage();
-    expect(screen.getByText("1 session")).toBeInTheDocument();
-    expect(screen.queryByRole("status", { name: "Loading sessions" })).toBeNull();
+    // Whatever has arrived is kept in view; later pages refit as they land.
     await waitFor(() => expect(flowFitView).toHaveBeenCalled());
     expect(flowSetViewport).not.toHaveBeenCalled();
   });
 
-  it("opens a large completed canvas at a readable viewport", async () => {
+  it("fits a completed canvas of any size and keeps the count quiet", async () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
-      sessionsStub(
-        Array.from({ length: LARGE_CANVAS_SESSION_COUNT + 1 }, (_, index) =>
-          conversation(`conv_${index}`, index),
-        ),
-      ),
+      sessionsStub(Array.from({ length: 600 }, (_, index) => conversation(`conv_${index}`, index))),
     );
     renderPage();
-    await waitFor(() =>
-      expect(flowSetViewport).toHaveBeenCalledWith({ x: 24, y: 24, zoom: 0.9 }, { duration: 0 }),
+    expect(screen.getByText("600 sessions")).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Loading sessions" })).toBeNull();
+    await waitFor(() => expect(flowFitView).toHaveBeenCalled());
+    expect(flowSetViewport).not.toHaveBeenCalled();
+    // Every card carries its size so the fit covers cards not yet rendered.
+    const nodes = flowProps.current?.nodes as { initialWidth: number; initialHeight: number }[];
+    expect(nodes).toHaveLength(600);
+    expect(nodes[0]).toMatchObject({ initialWidth: 280, initialHeight: 132 });
+  });
+
+  it("refits on a tab change or layout reset, but not on status-only updates", async () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    const rows = [
+      conversation("conv_main", 2),
+      conversation("conv_alpha", 1, { project_id: "proj_a" }),
+    ];
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
+    const { rerender } = renderPage();
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
+
+    // Same cards, new status: the view stays put.
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([{ ...rows[0], status: "running" }, rows[1]]),
     );
-    expect(flowFitView).not.toHaveBeenCalled();
+    rerender(pageTree());
+    expect(screen.getByTestId("flow-node-conv_main")).toBeInTheDocument();
+    expect(flowFitView).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(3));
   });
 
   it("groups sessions into Main and project canvases and switches between them", () => {
@@ -315,8 +331,7 @@ describe("CanvasPage", () => {
     act(() => {
       dragStop(new MouseEvent("mouseup"), { id: "conv_2", position: { x: 400.4, y: 120.6 } });
     });
-    expect(readCanvasLayout().positions.conv_2).toEqual({ x: 400, y: 121 });
-    expect(readCanvasLayout().viewports.main).toEqual({ x: 0, y: 0, zoom: 1, width: 0, height: 0 });
+    expect(readCanvasLayout()).toEqual({ positions: { conv_2: { x: 400, y: 121 } } });
     unmount();
 
     renderPage();
@@ -324,13 +339,11 @@ describe("CanvasPage", () => {
       expect(screen.getByTestId("flow-node-conv_2")).toHaveAttribute("data-x", "400"),
     );
     expect(screen.getByTestId("flow-node-conv_2")).toHaveAttribute("data-y", "121");
-    // The saved viewport wins over the default fit on the next mount.
-    await waitFor(() =>
-      expect(flowSetViewport).toHaveBeenCalledWith({ x: 0, y: 0, zoom: 1 }, { duration: 0 }),
-    );
+    // The restored layout is fitted like any other first paint.
+    await waitFor(() => expect(flowFitView).toHaveBeenCalled());
   });
 
-  it("resets only the active canvas's saved layout", () => {
+  it("resets only the active canvas's saved positions", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([
@@ -343,7 +356,6 @@ describe("CanvasPage", () => {
       JSON.stringify({
         version: 1,
         positions: { conv_main: [900, 900], conv_alpha: [50, 50] },
-        viewports: { main: { x: 1, y: 1, zoom: 1 }, proj_a: { x: 2, y: 2, zoom: 1 } },
       }),
     );
     renderPage();
@@ -352,20 +364,13 @@ describe("CanvasPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
 
     expect(screen.getByTestId("flow-node-conv_main")).toHaveAttribute("data-x", "0");
-    expect(readCanvasLayout()).toEqual({
-      positions: { conv_alpha: { x: 50, y: 50 } },
-      viewports: { proj_a: { x: 2, y: 2, zoom: 1 } },
-    });
+    expect(readCanvasLayout()).toEqual({ positions: { conv_alpha: { x: 50, y: 50 } } });
   });
 
   it("forgets saved spots of deleted sessions once the list is complete", () => {
     window.localStorage.setItem(
       canvasLayoutStorageKey(),
-      JSON.stringify({
-        version: 1,
-        positions: { conv_gone: [1, 1], conv_1: [7, 7] },
-        viewports: {},
-      }),
+      JSON.stringify({ version: 1, positions: { conv_gone: [1, 1], conv_1: [7, 7] } }),
     );
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("conv_1", 1)]),

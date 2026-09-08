@@ -5,9 +5,8 @@ import {
   LAYOUT_VERSION,
   MAX_SAVED_POSITIONS,
   readCanvasLayout,
-  withoutCanvas,
+  withoutPositions,
   withPosition,
-  withViewport,
   writeCanvasLayout,
 } from "./canvasStorage";
 
@@ -26,27 +25,24 @@ describe("canvas layout storage", () => {
     expect(readCanvasLayout()).toEqual(EMPTY_CANVAS_LAYOUT);
     window.localStorage.setItem(
       canvasLayoutStorageKey(),
-      JSON.stringify({ version: LAYOUT_VERSION + 1, positions: { a: [1, 2] }, viewports: {} }),
+      JSON.stringify({ version: LAYOUT_VERSION + 1, positions: { a: [1, 2] } }),
     );
     expect(readCanvasLayout()).toEqual(EMPTY_CANVAS_LAYOUT);
   });
 
-  it("round-trips positions and viewports, dropping malformed entries", () => {
-    writeCanvasLayout({
-      positions: { a: { x: 10.4, y: -20.6 }, b: { x: 5_000_000, y: 0 } },
-      viewports: { main: { x: 1, y: 2, zoom: 0.5, width: 800, height: 600 } },
-    });
+  it("round-trips positions, dropping malformed entries and ignoring unknown keys", () => {
+    writeCanvasLayout({ positions: { a: { x: 10.4, y: -20.6 }, b: { x: 5_000_000, y: 0 } } });
     const raw = JSON.parse(window.localStorage.getItem(canvasLayoutStorageKey()) ?? "{}") as {
       positions: Record<string, unknown>;
-      viewports: Record<string, unknown>;
+      viewports?: unknown;
     };
     raw.positions.broken = ["x", 1];
-    raw.viewports.broken = { x: 1, y: 2, zoom: 0 };
+    // Layouts saved before the view stopped being persisted carry this key.
+    raw.viewports = { main: { x: 1, y: 2, zoom: 0.5 } };
     window.localStorage.setItem(canvasLayoutStorageKey(), JSON.stringify(raw));
 
     expect(readCanvasLayout()).toEqual({
       positions: { a: { x: 10, y: -21 }, b: { x: 1_000_000, y: 0 } },
-      viewports: { main: { x: 1, y: 2, zoom: 0.5, width: 800, height: 600 } },
     });
   });
 
@@ -58,7 +54,7 @@ describe("canvas layout storage", () => {
         { x: index, y: 0 },
       ]),
     );
-    writeCanvasLayout({ positions, viewports: {} });
+    writeCanvasLayout({ positions });
     const stored = readCanvasLayout().positions;
     expect(Object.keys(stored)).toHaveLength(MAX_SAVED_POSITIONS);
     expect(stored.s0).toBeUndefined();
@@ -75,22 +71,14 @@ describe("canvas layout storage", () => {
     expect(layout.positions.a).toEqual({ x: 2, y: 3 });
   });
 
-  it("rounds saved viewports and forgets one canvas at a time", () => {
-    const layout = withViewport(
-      withViewport(EMPTY_CANVAS_LAYOUT, "main", { x: 1.6, y: 2.4, zoom: 0.98765 }),
-      "proj_a",
-      { x: 0, y: 0, zoom: 1, width: 100.4, height: 50.6 },
+  it("forgets only the given cards' spots", () => {
+    const placed = withPosition(
+      withPosition(EMPTY_CANVAS_LAYOUT, "onMain", { x: 1, y: 1 }),
+      "onProject",
+      { x: 2, y: 2 },
     );
-    expect(layout.viewports.main).toEqual({ x: 2, y: 2, zoom: 0.988 });
-    expect(layout.viewports.proj_a).toEqual({ x: 0, y: 0, zoom: 1, width: 100, height: 51 });
-
-    const placed = withPosition(withPosition(layout, "onMain", { x: 1, y: 1 }), "onProject", {
-      x: 2,
-      y: 2,
-    });
-    expect(withoutCanvas(placed, "main", ["onMain"])).toEqual({
+    expect(withoutPositions(placed, ["onMain"])).toEqual({
       positions: { onProject: { x: 2, y: 2 } },
-      viewports: { proj_a: { x: 0, y: 0, zoom: 1, width: 100, height: 51 } },
     });
   });
 });

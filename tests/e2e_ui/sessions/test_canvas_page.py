@@ -152,13 +152,23 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
     assert moved is not None
     assert abs(moved["x"] - before["x"]) > 60
 
+    # The view is fitted on every load, so compare the card's canvas coordinates
+    # (the node's translate) rather than where it sits on screen.
+    node = page.locator(".react-flow__node").first
+    dropped_at = node.evaluate("el => el.style.transform")
+    assert "translate(0px, 0px)" not in dropped_at
+
     page.reload()
     expect(page.get_by_test_id("session-card")).to_be_visible()
-    restored = page.get_by_test_id("session-card").bounding_box()
-    assert restored is not None
-    assert abs(restored["x"] - moved["x"]) < 2 and abs(restored["y"] - moved["y"]) < 2
+    expect(page.locator(".react-flow__node").first).to_have_css("transform", re.compile(".+"))
+    assert (
+        page.locator(".react-flow__node").first.evaluate("el => el.style.transform") == dropped_at
+    )
 
     page.get_by_role("button", name="Reset layout").click()
+    expect(page.locator(".react-flow__node").first).to_have_attribute(
+        "style", re.compile(r"translate\(0px, 0px\)")
+    )
     page.wait_for_function(
         "() => !(JSON.parse(localStorage.getItem("
         "`omnigent:canvas-layout:${location.origin}`) ?? '{}').positions ?? {}).only"
