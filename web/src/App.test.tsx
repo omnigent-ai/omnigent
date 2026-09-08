@@ -76,9 +76,13 @@ function renderUsageRoute(enabled: boolean) {
   );
 }
 
-function renderRoute(path: string, features: Record<string, boolean> = {}) {
+function renderRoute(
+  path: string,
+  features: Record<string, boolean> = {},
+  info: typeof FALLBACK_SERVER_INFO | "loading" = { ...FALLBACK_SERVER_INFO, features },
+) {
   return render(
-    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features }}>
+    <CapabilitiesProvider info={info}>
       <MemoryRouter initialEntries={[path]}>
         <App />
       </MemoryRouter>
@@ -87,7 +91,14 @@ function renderRoute(path: string, features: Record<string, boolean> = {}) {
 }
 
 describe("Canvas route", () => {
-  it("is not registered while the canvas feature is off", async () => {
+  it("shows a spinner, not 'not found', while server info is still loading", () => {
+    renderRoute("/canvas", {}, "loading");
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("not found")).toBeNull();
+    expect(screen.queryByText("canvas page")).toBeNull();
+  });
+
+  it("renders not found once server info says the canvas feature is off", async () => {
     renderRoute("/canvas");
     expect(await screen.findByText("not found")).toBeInTheDocument();
     expect(screen.queryByText("canvas page")).toBeNull();

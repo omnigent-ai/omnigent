@@ -111,6 +111,15 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
     expect(cards).to_contain_text("Review the release")
     page.screenshot(path=str(tmp_path / "canvas-project.png"))
 
+    # The selected canvas lives in the URL, so a reload lands on the same tab.
+    expect(page).to_have_url(re.compile(r"/canvas\?canvas=project-release$"))
+    page.reload()
+    expect(page.get_by_role("tab", name="Release", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(page.get_by_text("1 session", exact=True)).to_be_visible()
+    expect(cards).to_have_count(1)
+
     cards.dblclick()
     expect(page).to_have_url(re.compile(r"/c/project-session$"))
 

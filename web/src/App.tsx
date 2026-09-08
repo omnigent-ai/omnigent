@@ -1,9 +1,10 @@
-import { lazy, Suspense, type ComponentType } from "react";
+import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
-import { isFeatureEnabled } from "@/lib/capabilities";
+import { Spinner } from "@/components/ui/spinner";
+import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
@@ -64,6 +65,21 @@ const UsagePage = withPageView(
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+
+// A release-feature route stays registered so a hard load never falls through
+// to the catch-all "Page not found" while the /v1/info probe is in flight; the
+// gate is decided inside once the probe resolves.
+function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children: ReactNode }) {
+  const info = useServerInfo();
+  if (info === "loading") {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center">
+        <Spinner className="size-5 text-muted-foreground" aria-label="Loading" />
+      </div>
+    );
+  }
+  return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
+}
 
 interface AppProps {
   /**
@@ -153,13 +169,23 @@ function App({ basename }: AppProps = {}) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
-          {isFeatureEnabled(info, "canvas") && (
-            <Route path={`${prefix}/canvas`} element={<CanvasPage />} />
-          )}
+          <Route
+            path={`${prefix}/canvas`}
+            element={
+              <FeatureGatedPage feature="canvas">
+                <CanvasPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
-          {isFeatureEnabled(info, "usage_page") && (
-            <Route path={`${prefix}/usage`} element={<UsagePage />} />
-          )}
+          <Route
+            path={`${prefix}/usage`}
+            element={
+              <FeatureGatedPage feature="usage_page">
+                <UsagePage />
+              </FeatureGatedPage>
+            }
+          />
           {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section

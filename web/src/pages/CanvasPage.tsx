@@ -62,7 +62,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { useNavigate } from "@/lib/routing";
+import { useNavigate, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { NewProjectButton } from "@/shell/NewProjectButton";
 import { ProjectRowIcon } from "@/shell/ProjectPicker";
@@ -80,6 +80,8 @@ const READABLE_VIEWPORT = { x: 24, y: 24, zoom: 0.9 };
 const RESIZE_REFIT_DELAY_MS = 100;
 const VIEWPORT_SAVE_DELAY_MS = 250;
 const EMPTY_PROJECTS: ProjectSummary[] = [];
+/** Query parameter carrying the selected canvas so a reload lands on the same tab. */
+export const CANVAS_QUERY_PARAM = "canvas";
 
 const TAB_CLASS =
   "flex h-7 max-w-[200px] shrink-0 items-center gap-1.5 rounded-md px-2.5 text-ui text-muted-foreground transition-colors hover:bg-muted hover:text-foreground aria-selected:bg-brand-accent/10 aria-selected:text-foreground";
@@ -133,6 +135,7 @@ function CanvasControls({ onReset }: { onReset: () => void }) {
 
 function CanvasSurface() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { trackClick } = useOmnigentAnalytics();
   const { fitView, getViewport, setViewport } = useReactFlow();
   const { sessions, loaded, loadingMore, complete, error, refresh } = useCanvasSessions();
@@ -140,9 +143,11 @@ function CanvasSurface() {
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
-  const [activeCanvas, setActiveCanvas] = useState(MAIN_CANVAS_ID);
+  const [activeCanvas, setActiveCanvas] = useState(
+    () => searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID,
+  );
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
-  const activeCanvasRef = useRef(MAIN_CANVAS_ID);
+  const activeCanvasRef = useRef(activeCanvas);
   const layoutRef = useRef<CanvasLayout | null>(null);
   layoutRef.current ??= readCanvasLayout();
   // Live positions for every session, including unsaved grid slots.
@@ -269,13 +274,30 @@ function CanvasSurface() {
     setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
   }, [nodesFor, visibleSessions, pullRequests]);
 
-  // A project canvas whose project was deleted falls back to Main.
+  // Mirror the selected canvas into the URL; Main keeps the URL clean.
+  const writeCanvasParam = useCallback(
+    (canvasId: string) => {
+      setSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          if (canvasId === MAIN_CANVAS_ID) next.delete(CANVAS_QUERY_PARAM);
+          else next.set(CANVAS_QUERY_PARAM, canvasId);
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  // A project canvas whose project was deleted (or a stale URL) falls back to Main.
   useEffect(() => {
     if (activeCanvas === MAIN_CANVAS_ID || projectsQuery.data === undefined) return;
     if (projects.some((project) => projectCanvasId(project) === activeCanvas)) return;
     activeCanvasRef.current = MAIN_CANVAS_ID;
     setActiveCanvas(MAIN_CANVAS_ID);
-  }, [activeCanvas, projects, projectsQuery.data]);
+    writeCanvasParam(MAIN_CANVAS_ID);
+  }, [activeCanvas, projects, projectsQuery.data, writeCanvasParam]);
 
   // Once the full list is known, forget spots of sessions that no longer exist.
   useEffect(() => {
@@ -296,7 +318,7 @@ function CanvasSurface() {
     if (initializedRef.current || !loaded) return;
     initializedRef.current = true;
     applyViewport(
-      layoutRef.current?.viewports[MAIN_CANVAS_ID] ?? null,
+      layoutRef.current?.viewports[activeCanvasRef.current] ?? null,
       complete ? visibleSessions.length : LARGE_CANVAS_SESSION_COUNT + 1,
     );
   }, [applyViewport, complete, loaded, visibleSessions.length]);
@@ -307,12 +329,13 @@ function CanvasSurface() {
       trackClick("canvas.tab");
       activeCanvasRef.current = canvasId;
       setActiveCanvas(canvasId);
+      writeCanvasParam(canvasId);
       applyViewport(
         layoutRef.current?.viewports[canvasId] ?? null,
         sessionsOnCanvas(sessions, canvasId, projects).length,
       );
     },
-    [applyViewport, projects, sessions, trackClick],
+    [applyViewport, projects, sessions, trackClick, writeCanvasParam],
   );
 
   // A project created from the tab strip is selected once the list includes it.

@@ -121,14 +121,22 @@ function LocationProbe() {
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
 }
 
-function renderPage() {
+function renderPage(initialEntry = "/canvas") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <MemoryRouter initialEntries={["/canvas"]}>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <Routes>
-            <Route path="/canvas" element={<CanvasPage />} />
+            <Route
+              path="/canvas"
+              element={
+                <>
+                  <CanvasPage />
+                  <LocationProbe />
+                </>
+              }
+            />
             <Route path="*" element={<LocationProbe />} />
           </Routes>
         </MemoryRouter>
@@ -234,6 +242,31 @@ describe("CanvasPage", () => {
 
     fireEvent.click(within(tabs).getByRole("tab", { name: "Legacy" }));
     expect(screen.getByTestId("flow-node-conv_legacy")).toBeInTheDocument();
+  });
+
+  it("restores the selected canvas from the URL and writes tab changes back to it", () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_alpha", 2, { project_id: "proj_a" })]),
+    );
+    renderPage("/canvas?canvas=proj_a");
+
+    expect(screen.getByRole("tab", { name: "Alpha" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("flow-node-conv_alpha")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Legacy" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?canvas=name%3ALegacy");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Main" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/canvas$/);
+  });
+
+  it("falls back to Main when the URL names a canvas that no longer exists", () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    renderPage("/canvas?canvas=proj_gone");
+
+    expect(screen.getByRole("tab", { name: "Main" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/canvas$/);
   });
 
   it("shows explicit empty states per canvas", () => {
