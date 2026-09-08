@@ -1277,9 +1277,8 @@ def test_ui_setup_steps_omp_auth_is_ui_authable_and_tracked() -> None:
     assert steps[1].action == "auth"
     assert steps[1].command is None
     assert steps[1].status_key == "authed"
-    assert [s.as_dict() for s in hi.ui_setup_steps("oh-my-pi")] == [
-        s.as_dict() for s in steps
-    ]
+    assert [s.as_dict() for s in hi.ui_setup_steps("oh-my-pi")] == [s.as_dict() for s in steps]
+
 
 def test_ui_setup_steps_qwen_auth_stays_untracked_setup_fallback() -> None:
     """Qwen is env-auth (not UI-authable), so its auth step stays an untracked
