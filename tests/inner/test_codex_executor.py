@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -2654,6 +2655,61 @@ def test_populate_codex_skills_from_bundle_links_bundle_skills(tmp_path: Path) -
     assert (linked / "SKILL.md").is_file()
 
 
+def test_populate_codex_skills_copy_mode_materializes_real_directories(
+    tmp_path: Path,
+) -> None:
+    """``copy_skills=True`` copies each skill instead of symlinking it.
+
+    Sandbox backends re-expose only the staged ``skills/`` subtree, so its
+    entries must be self-contained: a symlink whose target is the (unmounted)
+    bundle directory dangles inside the tool namespace, reproducing the
+    discoverable-but-unreadable failure the copy mode exists to prevent.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    bundle_skills = tmp_path / "bundle"
+    target = tmp_path / "codex_home_skills"
+    _make_skill_dir(bundle_skills, "alpha")
+
+    _populate_codex_skills(target, "all", [bundle_skills], copy_skills=True)
+
+    staged = target / "alpha"
+    assert staged.is_dir() and not staged.is_symlink(), (
+        "copy mode still symlinks; the mounted skills subtree would dangle "
+        "into the unmounted bundle directory inside the sandbox"
+    )
+    assert (staged / "SKILL.md").read_text() == (bundle_skills / "alpha" / "SKILL.md").read_text()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="requires symlink support")
+def test_populate_codex_skills_copy_mode_keeps_skill_symlinks_as_links(
+    tmp_path: Path,
+) -> None:
+    """Copy mode must never dereference a symlink inside a skill directory.
+
+    The staged ``skills/`` subtree is re-exposed read-only inside sandboxes,
+    so following a link would materialize its out-of-bundle target — e.g. a
+    host credential file — into a mounted tree. Copied as a link, an escaping
+    target simply dangles inside the namespace and stays unreadable.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    secret = tmp_path / "host-secret.json"
+    secret.write_text('{"token": "never-copy-into-a-mounted-tree"}')
+    bundle_skills = tmp_path / "bundle"
+    skill_dir = _make_skill_dir(bundle_skills, "alpha")
+    (skill_dir / "creds").symlink_to(secret)
+
+    target = tmp_path / "codex_home_skills"
+    _populate_codex_skills(target, "all", [bundle_skills], copy_skills=True)
+
+    staged_link = target / "alpha" / "creds"
+    assert staged_link.is_symlink(), (
+        "copy mode dereferenced a skill symlink: the target's bytes were "
+        "materialized into the sandbox-mounted skills subtree"
+    )
+
+
 def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Path) -> None:
     """
     ``source_codex_home`` reads host skills from the resolved ``$CODEX_HOME``.
@@ -3812,8 +3868,14 @@ def test_find_codex_cli_delegates_to_shared_resolver(monkeypatch):
     assert captured == {"name": "codex", "env_var": "OMNIGENT_CODEX_PATH"}
 
 
-class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
-    """Regression tests for .codex-tmp fallback on read-only cwd."""
+class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
+    """The per-conversation CODEX_HOME must be staged outside the workspace.
+
+    Staging under the session cwd left an untracked dir dirtying the
+    user's clone and put the published skill paths under the sandbox's
+    hidden-dotdir mask, so homes now live under the well-known temp-dir
+    staging root regardless of cwd.
+    """
 
     def _run_start_and_capture_mkdtemp_dir(self, cwd: str) -> str:
         """Run ``_CodexAppServerSession.start()`` with *cwd* and return
@@ -3863,24 +3925,35 @@ class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
 
         return _run(_t())
 
-    def test_start_falls_back_to_tempdir_when_cwd_is_readonly(self):
-        """When cwd is ``/`` (read-only on macOS SSV), the codex home
-        must be placed under the system temp directory, not under
-        ``/.codex-tmp``.
+    def test_start_stages_home_under_the_staging_root_not_cwd(self):
+        """A writable cwd must NOT host the codex home: staging inside the
+        workspace dirties the user's clone and hides the published skill
+        paths behind the sandbox's hidden-dotdir mask.
         """
         import tempfile as _tempfile
 
-        dir_used = self._run_start_and_capture_mkdtemp_dir("/")
-        self.assertEqual(dir_used, _tempfile.gettempdir())
-
-    def test_start_uses_cwd_when_writable(self):
-        """When cwd is writable, .codex-tmp is placed there as before."""
-        import tempfile as _tempfile
+        from omnigent.inner.codex_staging import codex_home_staging_root
 
         with _tempfile.TemporaryDirectory() as writable_dir:
             dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
-            expected = str(Path(writable_dir) / ".codex-tmp")
-            self.assertEqual(dir_used, expected)
+            self.assertEqual(dir_used, str(codex_home_staging_root()))
+            self.assertFalse(dir_used.startswith(writable_dir))
+
+    def test_start_falls_back_to_tempdir_when_staging_root_uncreatable(self):
+        """An uncreatable staging root must not break session start — the
+        home falls back to the plain system temp directory.
+        """
+        import tempfile as _tempfile
+
+        with (
+            _tempfile.TemporaryDirectory() as writable_dir,
+            patch(
+                "omnigent.inner.codex_executor.codex_home_staging_root",
+                side_effect=OSError("unwritable temp dir"),
+            ),
+        ):
+            dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
+            self.assertEqual(dir_used, _tempfile.gettempdir())
 
 
 def test_run_turn_cli_config_passes_no_model_to_thread_create():
