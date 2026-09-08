@@ -1404,9 +1404,10 @@ def _subagent_parents_by_tool_use(
     """Correlate Claude spawn tool ids to their immediate transcript owner.
 
     Reads the root transcript and every ``agent-*.jsonl`` in full. The caller
-    only invokes this while new sub-agent meta files are appearing (a bounded,
-    transient window), so the re-read cost is paid during spawn bursts, not on
-    every idle poll.
+    only invokes this when unregistered meta files exist, so idle sessions pay
+    nothing. The common case is a transient spawn burst; the exception is an
+    orphan meta whose spawn record never lands, which keeps the transcripts
+    re-read on every poll until it appears (or the process restarts).
     """
     owners: dict[str, str | None] = {}
     ambiguous: set[str] = set()
@@ -1533,6 +1534,31 @@ async def _forward_available_subagents(
                     deferred.append((meta_path, meta, parent_subagent_id))
                     continue
                 if not parent_entry.child_conversation_id:
+                    # The parent was parked (registration exhausted its retries),
+                    # so its conversation will never exist and this child can never
+                    # attach. Park the child too rather than re-resolving it every
+                    # tick; the empty child id filters it out of the tail loops.
+                    if subagent_id not in updated.subagents:
+                        _logger.warning(
+                            "Parking claude-native sub-agent whose parent was "
+                            "dropped; parent_session=%s subagent_id=%s "
+                            "parent_subagent_id=%s",
+                            parent_session_id,
+                            subagent_id,
+                            parent_subagent_id,
+                        )
+                        updated = SubagentForwardState(
+                            subagents={
+                                **updated.subagents,
+                                subagent_id: SubagentEntry(
+                                    subagent_id=subagent_id,
+                                    child_conversation_id="",
+                                    parent_subagent_id=parent_subagent_id,
+                                ),
+                            }
+                        )
+                        await _write_subagent_forward_state_async(bridge_dir, updated)
+                        made_progress = True
                     continue
                 immediate_parent_session_id = parent_entry.child_conversation_id
             try:

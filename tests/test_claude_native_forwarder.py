@@ -5329,6 +5329,82 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
     assert restarted.subagents["b-grandchild"].parent_subagent_id == "a-child"
 
 
+async def test_subagent_watcher_parks_child_of_a_parked_parent(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A child whose parent was parked is parked too, not retried forever.
+
+    When a parent's registration exhausts its retries it is parked with an empty
+    ``child_conversation_id`` — its Omnigent conversation will never exist. A
+    child that resolves to that parent can therefore never attach; it must be
+    parked (and logged) rather than silently re-resolved on every poll.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    parent_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="z-parent",
+        agent_type="general-purpose",
+        description="parent worker",
+        tool_use_id="toolu_parent",
+    )
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-child",
+        agent_type="general-purpose",
+        description="nested child",
+        tool_use_id="toolu_child",
+        spawn_transcript_path=parent_transcript,
+    )
+    # The parent is already parked on disk (empty child id): its registration
+    # exhausted retries on an earlier tick.
+    parked = forwarder.SubagentForwardState(
+        subagents={
+            "z-parent": forwarder.SubagentEntry(
+                subagent_id="z-parent",
+                child_conversation_id="",
+                parent_subagent_id=None,
+            )
+        }
+    )
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=parked,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    # The child was parked, not registered: no start POST, empty child id,
+    # and the parked entry survives a state round-trip.
+    assert starts == 0
+    assert state.subagents["a-child"].child_conversation_id == ""
+    assert state.subagents["a-child"].parent_subagent_id == "z-parent"
+    assert forwarder._read_subagent_forward_state(bridge_dir) == state
+    assert "whose parent was dropped" in caplog.text
+
+
 async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spawn(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
