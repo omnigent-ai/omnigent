@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import ssl
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
+from omnigent.inner.egress.relay import start_relay
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import (
     SignerLaunchConfig,
@@ -123,3 +127,73 @@ async def test_helper_stderr_is_not_exposed_in_start_error(
         await signer.start()
 
     assert "SECRET_FROM_HELPER" not in str(raised.value)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="signer relay uses a Unix socket")
+async def test_real_signer_relays_only_placeholder_authorized_responses() -> None:
+    config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(
+            FrozenModelRoute(
+                method="POST",
+                host="model.test",
+                path="/v1/responses",
+            ),
+        ),
+    )
+    signer = SubprocessModelSigner(config)
+
+    readiness = await signer.start()
+    ready_payload = {
+        "relay_port": readiness.relay_port,
+        "socket_path": str(readiness.socket_path),
+        "ca_bundle_path": str(readiness.ca_bundle_path),
+        "placeholder": readiness.placeholder,
+    }
+    serialized_non_secret_state = json.dumps(
+        {"config": config.to_jsonable(), "readiness": ready_payload},
+        sort_keys=True,
+    )
+    assert "bearer_token" not in serialized_non_secret_state
+    assert "fake-provider-bearer" not in serialized_non_secret_state
+    assert readiness.ca_bundle_path.is_file()
+    assert {path.name for path in readiness.ca_bundle_path.parent.iterdir()} == {
+        "ca-bundle.pem",
+        "relay.sock",
+    }
+
+    ready = start_relay(readiness.relay_port, readiness.socket_path)
+    assert ready.wait(timeout=5)
+    proxy = f"http://127.0.0.1:{readiness.relay_port}"
+    async with httpx.AsyncClient(
+        proxy=proxy,
+        verify=ssl.create_default_context(cafile=str(readiness.ca_bundle_path)),
+        trust_env=False,
+        timeout=10,
+    ) as client:
+        response = await client.post(
+            "https://model.test/v1/responses",
+            headers={"Authorization": f"Bearer {readiness.placeholder}"},
+            json={"model": "fake"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"upstream_saw_fake_bearer": True}
+
+        missing = await client.post(
+            "https://model.test/v1/responses",
+            json={"model": "fake"},
+        )
+        assert missing.status_code == 403
+
+        queried = await client.post(
+            "https://model.test/v1/responses?debug=true",
+            headers={"Authorization": f"Bearer {readiness.placeholder}"},
+            json={"model": "fake"},
+        )
+        assert queried.status_code == 403
+
+    await signer.close()
+    assert await signer.wait() == 0
+    assert not readiness.socket_path.exists()
+    assert not readiness.ca_bundle_path.exists()

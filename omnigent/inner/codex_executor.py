@@ -2429,6 +2429,8 @@ class _CodexAppServerSession:
                 codex_home=self._codex_home_dir,
                 os_env=self._os_env_spec,
                 spawn_env_names=list(proc_env),
+                signer_readiness=self._signer_readiness,
+                worker_env=proc_env,
             )
             argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:

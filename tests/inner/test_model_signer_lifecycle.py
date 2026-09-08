@@ -99,6 +99,10 @@ async def test_signer_preflights_before_codex_state_and_worker_spawn(
 
     def _prepare(**kwargs: object) -> CodexWorkerLaunch:
         order.append("prepare-worker")
+        readiness = kwargs["signer_readiness"]
+        assert isinstance(readiness, SignerReadiness)
+        worker_env = kwargs["worker_env"]
+        assert isinstance(worker_env, dict)
         return CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)
 
     async def _spawn(*args: object, **kwargs: object) -> _Process:
