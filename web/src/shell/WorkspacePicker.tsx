@@ -239,10 +239,16 @@ export function useResolvedHostHome(hostId: string | null): string | null {
 /**
  * Expand a typed workspace value to the absolute path the server needs,
  * resolving a leading ``~`` against the host's home. Returns the absolute
- * path (already-absolute values pass through normalized), or ``null`` when
- * it can't be resolved yet — a ``~``-path whose home hasn't loaded, or an
- * unusable (relative / empty) value. Callers gate the submit on a non-null
- * result and launch with it.
+ * path, or ``null`` when it can't be resolved yet — a ``~``-path whose home
+ * hasn't loaded, or an unusable (relative / empty) value. Callers gate the
+ * submit on a non-null result and launch with it.
+ *
+ * A POSIX-absolute value is preserved verbatim (only trailing slashes are
+ * stripped, keeping root ``"/"``) — matching the prior ``normalizeWorkspacePath``
+ * so an existing accepted path is never rewritten. Only a ``~``-relative (or
+ * Windows drive) value goes through ``normalizeTypedPath``, which expands home
+ * and collapses slash runs; routing an absolute path through it would rewrite
+ * a typed leading ``"//foo"`` to ``"/foo"``.
  *
  * @param value Raw workspace text, e.g. ``"~/projects/app"`` or ``"/tmp"``.
  * @param home Resolved absolute home (see {@link useResolvedHostHome}), or
@@ -250,7 +256,12 @@ export function useResolvedHostHome(hostId: string | null): string | null {
  * @returns The absolute workspace, or ``null`` when unresolved/unusable.
  */
 export function resolveWorkspacePath(value: string, home: string | null): string | null {
-  return normalizeTypedPath(value, home);
+  const trimmed = value.trim();
+  if (trimmed.startsWith("/")) {
+    const stripped = trimmed.replace(/\/+$/, "");
+    return stripped === "" ? "/" : stripped;
+  }
+  return normalizeTypedPath(trimmed, home);
 }
 
 export function listingFilter(

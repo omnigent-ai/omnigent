@@ -267,6 +267,15 @@ describe("resolveWorkspacePath", () => {
   it("passes an already-absolute path through, no home needed", () => {
     expect(resolveWorkspacePath("/tmp/work", null)).toBe("/tmp/work");
     expect(resolveWorkspacePath("  /tmp/work/  ", null)).toBe("/tmp/work");
+    expect(resolveWorkspacePath("/", null)).toBe("/");
+  });
+
+  it("preserves an absolute path verbatim — no slash-run collapsing", () => {
+    // Absolute values must match the prior normalizeWorkspacePath (trailing
+    // slash strip only). Routing them through normalizeTypedPath would rewrite
+    // a typed leading "//foo" → "/foo" — a behavior change we avoid.
+    expect(resolveWorkspacePath("//foo", null)).toBe("//foo");
+    expect(resolveWorkspacePath("/a//b", null)).toBe("/a//b");
   });
 
   it("stays null for a tilde path until home resolves, and for unusable input", () => {
