@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ _READINESS_KEYS = frozenset(
     }
 )
 _AUTH_ERROR_KEYS = frozenset({"status", "code"})
+_PLACEHOLDER_RE = re.compile(r"oa_cred_[A-Za-z0-9_-]{1,256}\Z")
 
 
 class SignerStartError(RuntimeError):
@@ -83,11 +85,11 @@ class SignerReadiness:
     placeholder: str
 
     def __post_init__(self) -> None:
-        if not 1 <= self.relay_port <= 65535:
+        if type(self.relay_port) is not int or not 1 <= self.relay_port <= 65535:
             raise ValueError("signer relay port is invalid")
         if not self.socket_path.is_absolute() or not self.ca_bundle_path.is_absolute():
             raise ValueError("signer readiness paths must be absolute")
-        if not self.placeholder.startswith("oa_cred_"):
+        if _PLACEHOLDER_RE.fullmatch(self.placeholder) is None:
             raise ValueError("signer placeholder is malformed")
 
 
@@ -162,7 +164,7 @@ class SubprocessModelSigner:
             if len(line) > 16_384:
                 raise SignerStartError("model signer returned oversized readiness")
             readiness = _parse_readiness(line, self._config)
-        except Exception:
+        except BaseException:
             await self._abort()
             raise
         self._readiness = readiness
@@ -231,12 +233,19 @@ def _parse_readiness(line: bytes, config: SignerLaunchConfig) -> SignerReadiness
         raise SignerStartError("model signer returned invalid readiness fields")
     if payload.get("status") != "ready":
         raise SignerStartError("model signer did not become ready")
+    if (
+        type(payload["relay_port"]) is not int
+        or not isinstance(payload["socket_path"], str)
+        or not isinstance(payload["ca_bundle_path"], str)
+        or not isinstance(payload["placeholder"], str)
+    ):
+        raise SignerStartError("model signer returned invalid readiness values")
     try:
         return SignerReadiness(
-            relay_port=int(payload["relay_port"]),
-            socket_path=Path(str(payload["socket_path"])),
-            ca_bundle_path=Path(str(payload["ca_bundle_path"])),
-            placeholder=str(payload["placeholder"]),
+            relay_port=payload["relay_port"],
+            socket_path=Path(payload["socket_path"]),
+            ca_bundle_path=Path(payload["ca_bundle_path"]),
+            placeholder=payload["placeholder"],
         )
     except (TypeError, ValueError) as exc:
         raise SignerStartError("model signer returned invalid readiness values") from exc

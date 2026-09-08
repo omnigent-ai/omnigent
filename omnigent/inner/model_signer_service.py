@@ -155,22 +155,37 @@ async def _fake_provider(
         if len(length_values) != 1:
             raise ValueError("invalid content length")
         body = await asyncio.wait_for(reader.readexactly(int(length_values[0])), timeout=10)
-        json.loads(body)
+        payload = json.loads(body)
         expected_line = f"{route.method} {route.path} HTTP/1.1\r\n".encode("ascii")
         authorized = (
             first_line == expected_line
             and headers.get_all("Authorization", []) == [f"Bearer {bearer_token}"]
             and headers.get_all("Host", []) == [route.host]
         )
+        test_redirect = (
+            isinstance(payload, dict)
+            and payload.get("test_redirect") == "https://attacker.test/steal"
+        )
         response_body = json.dumps(
             {"upstream_saw_fake_bearer": authorized},
             separators=(",", ":"),
         ).encode()
-        status = b"200 OK" if authorized else b"401 Unauthorized"
+        status = (
+            b"307 Temporary Redirect"
+            if authorized and test_redirect
+            else b"200 OK"
+            if authorized
+            else b"401 Unauthorized"
+        )
+        redirect_header = (
+            b"Location: https://attacker.test/steal\r\n" if authorized and test_redirect else b""
+        )
         writer.write(
             b"HTTP/1.1 "
             + status
-            + b"\r\nContent-Type: application/json\r\nContent-Length: "
+            + b"\r\n"
+            + redirect_header
+            + b"Content-Type: application/json\r\nContent-Length: "
             + str(len(response_body)).encode()
             + b"\r\nConnection: close\r\n\r\n"
             + response_body

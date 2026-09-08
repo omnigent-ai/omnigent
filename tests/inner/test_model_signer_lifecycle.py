@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from omnigent.inner.codex_executor import _CodexAppServerSession
+from omnigent.inner.codex_executor import _CodexAppServerSession, _populate_codex_home_config
 from omnigent.inner.codex_worker import CodexWorkerLaunch
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.model_signer import SignerReadiness
@@ -28,6 +28,11 @@ class _Pipe:
 
     async def wait_closed(self) -> None:
         pass
+
+
+class _EofPipe(_Pipe):
+    async def read(self, size: int) -> bytes:
+        return b""
 
 
 class _Process:
@@ -73,6 +78,18 @@ class _Signer:
         self.order.append("signer-close")
         self.closed = True
         self.exited.set()
+
+
+class _BlockingSigner(_Signer):
+    def __init__(self, order: list[str]) -> None:
+        super().__init__(order)
+        self.starting = asyncio.Event()
+
+    async def start(self) -> SignerReadiness:
+        self.order.append("signer-start")
+        self.starting.set()
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
 
 
 def _session(tmp_path: Path, signer: _Signer) -> _CodexAppServerSession:
@@ -124,6 +141,53 @@ async def test_signer_preflights_before_codex_state_and_worker_spawn(
         "spawn-worker",
     ]
     await session.close()
+
+
+async def test_signer_backed_home_excludes_host_credential_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _Signer([])
+    process = _Process()
+    populate = Mock()
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", populate)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    session = _session(tmp_path, signer)
+    session._request = AsyncMock(return_value={"result": {}})
+
+    await session.start()
+
+    assert populate.call_args.kwargs["include_credentials"] is False
+    await session.close()
+
+
+def test_credential_exclusion_keeps_config_but_not_host_auth(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    (source / "auth.json").write_text('{"token":"host-secret"}', encoding="utf-8")
+    (source / ".credentials.json").write_text('{"token":"mcp-secret"}', encoding="utf-8")
+    (source / "config.toml").write_text(
+        'model_provider = "host"\n'
+        "[model_providers.host]\n"
+        'base_url = "https://untrusted.example"\n'
+        'experimental_bearer_token = "host-secret"\n',
+        encoding="utf-8",
+    )
+
+    _populate_codex_home_config(target, source, include_credentials=False)
+
+    assert not (target / "auth.json").exists()
+    assert not (target / ".credentials.json").exists()
+    assert not (target / "config.toml").exists()
 
 
 async def test_signer_preflight_failure_never_creates_codex_home_or_worker(
@@ -262,3 +326,31 @@ async def test_runner_close_invalidates_signer_before_terminating_worker(
     await session.close()
 
     assert order[-2:] == ["signer-close", "worker-terminate"]
+
+
+async def test_cancelled_start_closes_partially_started_signer(tmp_path: Path) -> None:
+    signer = _BlockingSigner([])
+    session = _session(tmp_path, signer)
+
+    start = asyncio.create_task(session.start())
+    await signer.starting.wait()
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+
+    assert signer.closed
+    assert session._signer is None
+
+
+async def test_worker_stdout_eof_invalidates_signer(tmp_path: Path) -> None:
+    signer = _Signer([])
+    process = _Process()
+    process.stdout = _EofPipe()
+    session = _session(tmp_path, signer)
+    session._signer = signer
+    session._proc = process
+
+    await session._reader_loop()
+
+    assert signer.closed
+    assert session._signer is None
