@@ -73,6 +73,7 @@ CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_MCP_REGISTRY = "mcp_registry"
+CAP_FILESYSTEM_ROOTS = "filesystem_roots"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -86,6 +87,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
     CAP_REFRESH_HARNESSES,
+    CAP_FILESYSTEM_ROOTS,
 ]
 
 
@@ -541,15 +543,16 @@ class HostListDirFrame:
 
     Used by ``GET /v1/hosts/{id}/filesystem/{path}`` to render the
     directory picker before any runner exists. The host owns ``~``
-    resolution; the server passes whatever the user supplied (or
-    ``~`` when the REST path is empty).
+    resolution. After this Host advertises filesystem-root support,
+    the server may use an empty path to request platform roots.
 
     :param request_id: Unique ID for correlating the result, e.g.
         ``"req_list_1"``.
     :param path: Absolute or tilde-prefixed directory path, e.g.
         ``"/Users/corey/projects"`` or ``"~/projects"``. Same rules
         as ``host.stat`` — the host expands ``~`` against its own
-        process owner's home.
+        process owner's home. An empty path is reserved for platform-root
+        enumeration after this Host advertised the capability.
     :param limit: Maximum entries to return per page,
         e.g. ``20``. Pagination is in-memory at the host since
         most directories fit easily in one page.

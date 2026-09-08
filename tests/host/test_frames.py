@@ -7,6 +7,7 @@ import json
 import pytest
 
 from omnigent.host.frames import (
+    CAP_FILESYSTEM_ROOTS,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -683,6 +684,7 @@ def test_hello_frame_round_trip() -> None:
         runners=["runner_token_aaa", "runner_token_bbb"],
         interactive_shells=["zsh", "bash"],
         connection_id="host-connection-1",
+        capabilities=[CAP_FILESYSTEM_ROOTS],
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -692,6 +694,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.interactive_shells == ["zsh", "bash"]
     assert decoded.connection_id == "host-connection-1"
+    assert CAP_FILESYSTEM_ROOTS in decoded.capabilities
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -712,6 +715,7 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []
     assert decoded.connection_id is None
+    assert CAP_FILESYSTEM_ROOTS not in decoded.capabilities
 
 
 def test_hello_frame_capabilities_round_trip() -> None:
@@ -743,6 +747,23 @@ def test_hello_frame_empty_runners() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.runners == []
+    assert CAP_FILESYSTEM_ROOTS not in decoded.capabilities
+
+
+def test_hello_frame_rejects_malformed_filesystem_roots_capability() -> None:
+    """Malformed capability metadata must not enable root enumeration."""
+    with pytest.raises(ValueError, match="capabilities"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.hello",
+                    "version": "0.1.0",
+                    "frame_protocol_version": 1,
+                    "name": "invalid-host",
+                    "capabilities": [CAP_FILESYSTEM_ROOTS, True],
+                }
+            )
+        )
 
 
 def test_launch_runner_frame_round_trip() -> None:
