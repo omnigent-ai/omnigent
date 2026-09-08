@@ -1,17 +1,9 @@
-import {
-  useEffect,
-  useRef,
-  useState,
-  type FormEvent,
-  type KeyboardEvent,
-  type ReactNode,
-} from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArchiveIcon,
   ChevronLeftIcon,
   EllipsisIcon,
   FolderInputIcon,
-  GitBranchIcon,
   InfoIcon,
   MailIcon,
   PencilIcon,
@@ -21,14 +13,6 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -43,22 +27,21 @@ import {
 import {
   PINNED_LABEL_KEY,
   type Conversation,
-  useArchiveConversation,
   useMoveToProject,
-  useRenameConversation,
-  useStopAndDeleteConversation,
   useTogglePinnedConversation,
 } from "@/hooks/useConversations";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { Link, useNavigate } from "@/lib/routing";
-import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
-import { showToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
+import {
+  DeleteSessionDialog,
+  RenameSessionDialog,
+  useArchiveSessionAction,
+} from "./SessionActionDialogs";
 
 interface HeaderConversationMenuProps {
   conversation: Conversation;
@@ -73,21 +56,6 @@ interface HeaderConversationMenuProps {
   workspaceItems?: ReactNode;
 }
 
-function ArchivedToast() {
-  return (
-    <span>
-      View archived sessions in{" "}
-      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
-        Settings
-      </Link>
-    </span>
-  );
-}
-
-function showArchivedToast() {
-  showToast(<ArchivedToast />);
-}
-
 export function HeaderConversationMenu({
   conversation,
   currentProject,
@@ -99,20 +67,15 @@ export function HeaderConversationMenu({
   onAgentInfo,
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
-  const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
-  const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
-  const archive = useArchiveConversation();
-  const deleteConversation = useStopAndDeleteConversation();
+  const archiveSession = useArchiveSessionAction();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
-  const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
-  const [deleteBranch, setDeleteBranch] = useState(false);
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
   const label = conversationDisplayLabel(conversation);
@@ -125,11 +88,6 @@ export function HeaderConversationMenu({
   const trackMobile = (componentId: string) => {
     if (isMobile) trackClick(componentId, "button");
   };
-  const gitBranch = conversation.git_branch ?? null;
-
-  useEffect(() => {
-    if (!renameOpen) setRenameTitle(conversation.title ?? "");
-  }, [conversation.title, renameOpen]);
 
   useEffect(() => {
     if (previousConversationId.current === conversation.id) return;
@@ -137,10 +95,8 @@ export function HeaderConversationMenu({
     setMenuOpen(false);
     setProjectPickerOpen(false);
     setRenameOpen(false);
-    setRenameTitle(conversation.title ?? "");
     setDeleteOpen(false);
-    setDeleteBranch(false);
-  }, [conversation.id, conversation.title]);
+  }, [conversation.id]);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -152,37 +108,9 @@ export function HeaderConversationMenu({
     moveToProject.mutate({ id: conversation.id, project });
   };
 
-  const submitRename = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const title = renameTitle.trim();
-    if (title && title !== (conversation.title ?? "")) {
-      rename.mutate({ id: conversation.id, title });
-    }
-    setRenameOpen(false);
-  };
-
-  const confirmDelete = () => {
-    setDeleteOpen(false);
-    setDeleteBranch(false);
-    navigate("/", { replace: true });
-    deleteConversation.mutate({
-      id: conversation.id,
-      deleteBranch: gitBranch !== null && deleteBranch,
-    });
-  };
-
   const archiveConversation = () => {
     closeMenu();
-    // The row leaves the sidebar optimistically (useArchiveConversation flips
-    // the cached `archived` flag in onMutate), and we're viewing the session
-    // being archived, so leave its chat surface now — synchronously, like
-    // confirmDelete — rather than in an onSuccess callback that fires a
-    // round-trip later with a stale active session.
-    navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: true });
-    // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
-    // and per-call mutate callbacks don't fire once their observer unmounts.
-    showArchivedToast();
+    archiveSession(conversation, true);
   };
 
   const mainItems = (
@@ -372,96 +300,16 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent>
-          <form onSubmit={submitRename}>
-            <DialogHeader>
-              <DialogTitle>Rename session</DialogTitle>
-              <DialogDescription>Choose a short name that is easy to find later.</DialogDescription>
-            </DialogHeader>
-            <input
-              autoFocus
-              aria-label="Session name"
-              data-testid="header-rename-conversation-input"
-              maxLength={USER_SESSION_TITLE_MAX_CHARS}
-              value={renameTitle}
-              onChange={(event) => setRenameTitle(event.target.value)}
-              onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-                if (event.key === "Escape") setRenameOpen(false);
-              }}
-              className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
-            />
-            <DialogFooter className="mt-4 border-t-0 bg-transparent">
-              <Button type="button" variant="ghost" onClick={() => setRenameOpen(false)}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={!renameTitle.trim() || rename.isPending}>
-                Rename
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
+      <RenameSessionDialog
+        conversation={conversation}
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+      />
+      <DeleteSessionDialog
+        conversation={conversation}
         open={deleteOpen}
-        onOpenChange={(open) => {
-          setDeleteOpen(open);
-          if (!open) setDeleteBranch(false);
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete conversation?</DialogTitle>
-            <DialogDescription>
-              <span className="font-medium break-all">{label}</span> and all of its history will be
-              removed. This cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-          {gitBranch !== null && (
-            <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-              <p className="text-sm text-muted-foreground">
-                Optionally clean up the git worktree. These actions are{" "}
-                <span className="font-semibold text-destructive">irreversible</span>.
-              </p>
-              <label className="flex cursor-pointer items-start gap-2 text-ui">
-                <input
-                  type="checkbox"
-                  data-testid="header-delete-branch-checkbox"
-                  checked={deleteBranch}
-                  onChange={(event) => setDeleteBranch(event.target.checked)}
-                  className="mt-0.5 size-4 shrink-0 accent-destructive"
-                />
-                <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0">
-                  Delete local branch{" "}
-                  <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
-                    {gitBranch}
-                  </code>
-                </span>
-              </label>
-            </div>
-          )}
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setDeleteOpen(false)}
-              disabled={deleteConversation.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              onClick={confirmDelete}
-              disabled={deleteConversation.isPending}
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        onOpenChange={setDeleteOpen}
+      />
     </>
   );
 }

@@ -19,17 +19,21 @@
 import type React from "react";
 import { useEffect, useMemo, useState } from "react";
 import {
+  ArchiveIcon,
+  ArchiveRestoreIcon,
   CalendarClockIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
   PanelRightIcon,
+  PencilIcon,
   SettingsIcon,
   SquarePenIcon,
+  Trash2Icon,
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
-import { useConversations } from "@/hooks/useConversations";
+import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -43,6 +47,11 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
+import {
+  DeleteSessionDialog,
+  RenameSessionDialog,
+  useArchiveSessionAction,
+} from "./SessionActionDialogs";
 
 export interface CommandPaletteProps {
   open: boolean;
@@ -51,6 +60,8 @@ export interface CommandPaletteProps {
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
   onToggleRightSidebar: () => void;
+  /** Owner-managed active session, or null on non-session/read-only routes. */
+  activeConversation?: Conversation | null;
 }
 
 interface ActionCommand {
@@ -103,11 +114,15 @@ export function CommandPalette({
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
+  activeConversation = null,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const archiveSession = useArchiveSessionAction();
 
   // Reset the query when the palette closes so it reopens clean.
   useEffect(() => {
@@ -122,10 +137,15 @@ export function CommandPalette({
     return () => clearTimeout(timer);
   }, [query]);
 
+  useEffect(() => {
+    setRenameOpen(false);
+    setDeleteOpen(false);
+  }, [activeConversation?.id]);
+
   const close = (): void => onOpenChange(false);
 
-  const actions = useMemo<ActionCommand[]>(
-    () => [
+  const actions = useMemo<ActionCommand[]>(() => {
+    const commands: ActionCommand[] = [
       {
         id: "new-chat",
         label: "New chat",
@@ -168,9 +188,38 @@ export function CommandPalette({
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
       },
-    ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
-  );
+    ];
+
+    if (activeConversation) {
+      commands.push(
+        {
+          id: "rename-session",
+          label: "Rename session",
+          icon: PencilIcon,
+          keywords: ["rename", "title", "retitle"],
+          run: () => setRenameOpen(true),
+        },
+        {
+          id: activeConversation.archived ? "unarchive-session" : "archive-session",
+          label: activeConversation.archived ? "Unarchive session" : "Archive session",
+          icon: activeConversation.archived ? ArchiveRestoreIcon : ArchiveIcon,
+          keywords: activeConversation.archived
+            ? ["unarchive", "restore", "show"]
+            : ["archive", "done", "hide", "clean up"],
+          run: () => archiveSession(activeConversation, !activeConversation.archived),
+        },
+        {
+          id: "delete-session",
+          label: "Delete session",
+          icon: Trash2Icon,
+          keywords: ["delete", "remove", "destroy"],
+          run: () => setDeleteOpen(true),
+        },
+      );
+    }
+
+    return commands;
+  }, [activeConversation, archiveSession, navigate, onToggleLeftSidebar, onToggleRightSidebar]);
 
   const filteredActions = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -336,6 +385,20 @@ export function CommandPalette({
           </CommandList>
         </Command>
       </DialogContent>
+      {activeConversation && (
+        <>
+          <RenameSessionDialog
+            conversation={activeConversation}
+            open={renameOpen}
+            onOpenChange={setRenameOpen}
+          />
+          <DeleteSessionDialog
+            conversation={activeConversation}
+            open={deleteOpen}
+            onOpenChange={setDeleteOpen}
+          />
+        </>
+      )}
     </Dialog>
   );
 }
