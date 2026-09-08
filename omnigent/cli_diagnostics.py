@@ -117,7 +117,14 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 #: userinfo (the lookahead keeps the ``@host`` part readable). The shared
 #: :func:`omnigent.process_logging.redact_log_text` filter does not cover
 #: URL userinfo, so :func:`redact_secrets` applies this pattern on top.
-_URL_USERINFO_PATTERN = re.compile(r"(://)[^/\s@]+(?=@)")
+#:
+#: The greedy ``\S+`` anchors on the *last* ``@`` in the whitespace-delimited
+#: token: passwords may legally contain ``/`` and ``@`` (SQLAlchemy accepts
+#: ``postgresql://user:p/ss@host``), so stopping at the first ``/`` or ``@``
+#: would leak the rest of the password. Anchoring on the last ``@`` can
+#: over-redact a credential-free URL whose path contains ``@``, which is the
+#: safe direction for surfaced log text.
+_URL_USERINFO_PATTERN = re.compile(r"(://)\S+(?=@)")
 
 _REDACTED = "[REDACTED]"
 

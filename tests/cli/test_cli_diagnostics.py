@@ -685,6 +685,29 @@ def test_redact_secrets_scrubs_url_userinfo() -> None:
     assert "db.example:5432/omnigent" in scrubbed  # target stays readable
 
 
+@pytest.mark.parametrize(
+    "password",
+    [
+        "p/ss",  # '/' inside the password — SQLAlchemy accepts this shape
+        "p@ss",  # '@' inside the password
+        "p@s/s@x",  # both, repeatedly
+    ],
+)
+def test_redact_secrets_scrubs_passwords_containing_separators(password: str) -> None:
+    """
+    Passwords may legally contain ``/`` and ``@``; the userinfo redaction must
+    anchor on the *last* ``@`` of the token so no fragment of such a password
+    survives into the surfaced text.
+    """
+    text = f"connect to postgresql+psycopg://user:{password}@db.example:5432/omnigent failed"
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    for fragment in ("ss", "s/s", password):
+        assert f"{fragment}@db.example" not in scrubbed  # no password fragment survives
+    assert "user:" not in scrubbed
+    assert "@db.example:5432/omnigent" in scrubbed  # target stays readable
+    assert "[REDACTED]@db.example" in scrubbed
+
+
 def test_main_surfaces_install_command_on_stderr_without_recovery_hint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
