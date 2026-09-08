@@ -270,28 +270,18 @@ def _run_harness_child(request: dict[str, Any]) -> None:
 
     _wire_child_stdio(os.environ.get(PROCESS_LOG_FILE_ENV_VAR))
 
-    # A directly-exec'd harness inherits the runner's cwd (the session
-    # workspace); a forked one would keep the zygote's cwd — the daemon's
-    # start directory, which may be a since-deleted transient worktree. chdir
-    # to the session workspace from the payload env so any getcwd() fallback
-    # in an executor roots at THIS session's workspace, matching direct exec.
+    # Match direct exec by running the harness in its session workspace.
     workspace = os.environ.get(RUNNER_WORKSPACE_ENV_VAR)
     if workspace:
         try:
             os.chdir(workspace)
         except OSError as exc:
-            # Best-effort, like direct exec (which never validates the
-            # workspace either): a vanished workspace leaves the child in the
-            # zygote's stable cwd rather than killing the fork. Surfaced in
-            # the harness log so a wrong-cwd session is diagnosable.
+            # The workspace may disappear after launch; keep the stable zygote cwd.
             sys.stderr.write(
                 f"zygote harness fork: cannot chdir to workspace {workspace!r}: {exc}\n"
             )
             sys.stderr.flush()
     else:
-        # Every real host/CLI runner sets the workspace var, so an unset value
-        # likely signals a misconfigured dispatch; surface it rather than
-        # silently leaving the child in the zygote's cwd.
         sys.stderr.write(
             "zygote harness fork: no workspace in payload env; staying in zygote cwd\n"
         )
