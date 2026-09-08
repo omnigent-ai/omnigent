@@ -13,8 +13,10 @@ import secrets
 import shutil
 import socket
 import ssl
+import stat
 import sys
 import tempfile
+import threading
 import weakref
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -878,6 +880,18 @@ def _pick_relay_port() -> int:
         probe.close()
 
 
+def _remove_owned_directory(path: Path | None, identity: tuple[int, int] | None) -> None:
+    """Remove only the exact directory created by this signer."""
+    if path is None or identity is None:
+        return
+    try:
+        current = path.lstat()
+    except OSError:
+        return
+    if stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == identity:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 async def _run(config_fd: int) -> int:
     binding_id, route, auth_profile = _load_config(config_fd)
     credential_lifecycle: CredentialLifecycle | None = None
@@ -904,15 +918,22 @@ async def _run(config_fd: int) -> int:
             await credential_lifecycle.close()
         raise
     public_dir: Path | None = None
+    private_identity: tuple[int, int] | None = None
+    public_identity: tuple[int, int] | None = None
     relay: _SignerRelay | None = None
     provider: asyncio.Server | None = None
     try:
+        private_stat = private_dir.lstat()
+        private_identity = (private_stat.st_dev, private_stat.st_ino)
         os.chmod(private_dir, 0o700)
         public_dir = Path(tempfile.mkdtemp(prefix="omnigent-model-signer-public-")).resolve()
+        public_stat = public_dir.lstat()
+        public_identity = (public_stat.st_dev, public_stat.st_ino)
         os.chmod(public_dir, 0o700)
         ca_cert, ca_key = ensure_ca(private_dir)
         ca_bundle = ensure_ca_bundle(ca_cert, public_dir)
-        os.chmod(ca_cert, 0o444)
+        os.chmod(ca_cert, 0o400)
+        os.chmod(ca_key, 0o600)
         os.chmod(ca_bundle, 0o444)
         placeholder = f"oa_cred_{secrets.token_urlsafe(24)}"
         provider_port: int | None = None
@@ -942,6 +963,7 @@ async def _run(config_fd: int) -> int:
         )
         socket_path = public_dir / "relay.sock"
         await relay.start_unix(socket_path)
+        os.chmod(socket_path, 0o600)
         readiness = {
             "status": "ready",
             "relay_port": _pick_relay_port(),
@@ -951,8 +973,8 @@ async def _run(config_fd: int) -> int:
         }
         sys.stdout.write(json.dumps(readiness, separators=(",", ":")) + "\n")
         sys.stdout.flush()
-        command = await asyncio.to_thread(sys.stdin.buffer.readline)
-        return 0 if command == b"shutdown\n" or command == b"" else 2
+        await asyncio.Future()
+        raise AssertionError("unreachable")
     finally:
         if relay is not None:
             await relay.stop()
@@ -961,9 +983,39 @@ async def _run(config_fd: int) -> int:
         if provider is not None:
             provider.close()
             await provider.wait_closed()
-        shutil.rmtree(private_dir, ignore_errors=True)
-        if public_dir is not None:
-            shutil.rmtree(public_dir, ignore_errors=True)
+        _remove_owned_directory(private_dir, private_identity)
+        _remove_owned_directory(public_dir, public_identity)
+
+
+async def _run_supervised(config_fd: int) -> int:
+    """Cancel initialization and cleanup as soon as runner stdin closes."""
+    loop = asyncio.get_running_loop()
+    command_future: asyncio.Future[bytes] = loop.create_future()
+
+    def _read_command() -> None:
+        command = sys.stdin.buffer.readline()
+
+        def _publish() -> None:
+            if not command_future.done():
+                command_future.set_result(command)
+
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_publish)
+
+    threading.Thread(target=_read_command, daemon=True).start()
+    run_task = asyncio.create_task(_run(config_fd))
+    done, _ = await asyncio.wait(
+        (run_task, command_future),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if command_future in done:
+        command = command_future.result()
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+        return 0 if command in (b"shutdown\n", b"") else 2
+    command_future.cancel()
+    return await run_task
 
 
 def main() -> int:
@@ -971,7 +1023,7 @@ def main() -> int:
     parser.add_argument("--config-fd", required=True, type=int)
     args = parser.parse_args()
     try:
-        return asyncio.run(_run(args.config_fd))
+        return asyncio.run(_run_supervised(args.config_fd))
     except ProviderAuthRequired:
         sys.stdout.write(
             json.dumps(

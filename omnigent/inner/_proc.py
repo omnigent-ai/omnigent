@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import subprocess
+import weakref
 from contextlib import suppress
 from typing import Protocol, TypedDict
 
@@ -82,6 +83,7 @@ _killpg_fn = getattr(os, "killpg", None)
 _getpgid_fn = getattr(os, "getpgid", None)
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 _CREATE_NEW_PROCESS_GROUP = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+_owned_process_groups: weakref.WeakKeyDictionary[object, int] = weakref.WeakKeyDictionary()
 
 
 class SpawnKwargs(TypedDict, total=False):
@@ -127,7 +129,29 @@ def spawn_kwargs() -> SpawnKwargs:
     return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
 
 
-def _killpg(pid: int, sig: int) -> bool:
+def remember_process_group(process: _ProcessLike) -> None:
+    """Remember the isolated group while its leader is still observable."""
+    pid = process.pid
+    if not IS_POSIX or pid is None or pid <= 1 or _getpgid_fn is None:
+        return
+    try:
+        pgid = _getpgid_fn(pid)
+        if pgid == pid and pgid != _getpgid_fn(0):
+            _owned_process_groups[process] = pgid
+    except (ProcessLookupError, PermissionError, OSError, TypeError):
+        return
+
+
+def _owned_process_group(process: _ProcessLike, *, remove: bool = False) -> int | None:
+    try:
+        if remove:
+            return _owned_process_groups.pop(process, None)
+        return _owned_process_groups.get(process)
+    except TypeError:
+        return None
+
+
+def _killpg(pid: int, sig: int, *, owned_pgid: int | None = None) -> bool:
     """
     POSIX fast path: signal the child's whole process group.
 
@@ -150,7 +174,7 @@ def _killpg(pid: int, sig: int) -> bool:
     if not IS_POSIX or _killpg_fn is None or _getpgid_fn is None:
         return False
     try:
-        target_pgid = _getpgid_fn(pid)
+        target_pgid = owned_pgid if owned_pgid is not None else _getpgid_fn(pid)
         # pgid <= 1 is never a real agent group: killpg(1, sig) is kill(-1,
         # sig) - a broadcast to every process this user may signal (it took
         # down the CI runner when a mocked pid coerced to 1) - and 0/negative
@@ -188,7 +212,7 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     :param process: A ``Popen``/``asyncio`` process handle, or ``None``.
     :param grace: Optional seconds to wait for the tree to exit after signaling.
     """
-    if process is None or process.returncode is not None:
+    if process is None:
         return
     pid = process.pid
     if pid is None:
@@ -196,7 +220,10 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
             process.terminate()
         return
 
-    if _killpg(pid, signal.SIGTERM):
+    owned_pgid = _owned_process_group(process)
+    if process.returncode is not None and owned_pgid is None:
+        return
+    if _killpg(pid, signal.SIGTERM, owned_pgid=owned_pgid):
         if grace:
             _wait_gone(pid, grace)
         return
@@ -220,7 +247,7 @@ def kill_tree(process: _ProcessLike | None) -> None:
     ``TerminateProcess`` (Windows). Use after a grace period when a graceful
     terminate did not take.
     """
-    if process is None or process.returncode is not None:
+    if process is None:
         return
     pid = process.pid
     if pid is None:
@@ -228,7 +255,10 @@ def kill_tree(process: _ProcessLike | None) -> None:
             process.kill()
         return
 
-    if _killpg(pid, _SIGKILL):
+    owned_pgid = _owned_process_group(process, remove=True)
+    if process.returncode is not None and owned_pgid is None:
+        return
+    if _killpg(pid, _SIGKILL, owned_pgid=owned_pgid):
         return
 
     procs = _walk_descendants(pid)

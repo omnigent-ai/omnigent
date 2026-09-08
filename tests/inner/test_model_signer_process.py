@@ -6,6 +6,7 @@ import asyncio
 import http.client
 import json
 import os
+import signal
 import socket
 import ssl
 import stat
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from omnigent.inner._proc import process_alive
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.relay import start_relay
 from omnigent.inner.model_egress import FrozenModelRoute
@@ -362,6 +364,41 @@ async def test_ucode_auth_preflight_returns_only_non_secret_readiness(
     assert await signer.wait() == 0
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX abrupt process death")
+async def test_sigkill_signer_during_ucode_preflight_reaps_helper_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "helper-child.pid"
+    ucode = tmp_path / "ucode"
+    ucode.write_text(
+        "#!/bin/sh\n"
+        f"(trap '' TERM; while true; do sleep 1; done) >/dev/null 2>&1 &\n"
+        f"printf '%s' \"$!\" > {child_pid_path}\n"
+        "trap '' TERM\n"
+        "while true; do sleep 1; done\n",
+        encoding="utf-8",
+    )
+    ucode.chmod(ucode.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
+    signer = SubprocessModelSigner(_ucode_config())
+
+    start = asyncio.create_task(signer.start())
+    while signer._proc is None or not child_pid_path.exists():
+        await asyncio.sleep(0.01)
+    signer_pid = signer._proc.pid
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    os.kill(signer_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    with pytest.raises(SignerStartError):
+        await start
+
+    for _ in range(300):
+        if not process_alive(child_pid):
+            break
+        await asyncio.sleep(0.02)
+    assert not process_alive(child_pid)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="signer relay uses a Unix socket")
 async def test_real_signer_relays_only_placeholder_authorized_responses(
     monkeypatch: pytest.MonkeyPatch,
@@ -384,8 +421,15 @@ async def test_real_signer_relays_only_placeholder_authorized_responses(
         ),
     )
     signer = SubprocessModelSigner(config)
+    private_before = set(Path("/tmp").glob("omnigent-model-signer-private-*"))
 
     readiness = await signer.start()
+    private_dirs = set(Path("/tmp").glob("omnigent-model-signer-private-*")) - private_before
+    assert len(private_dirs) == 1
+    private_dir = private_dirs.pop()
+    assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((private_dir / "ca.pem").stat().st_mode) == 0o400
+    assert stat.S_IMODE((private_dir / "ca-key.pem").stat().st_mode) == 0o600
     ready_payload = {
         "relay_port": readiness.relay_port,
         "socket_path": str(readiness.socket_path),
@@ -399,6 +443,9 @@ async def test_real_signer_relays_only_placeholder_authorized_responses(
     assert "bearer_token" not in serialized_non_secret_state
     assert "fake-provider-bearer" not in serialized_non_secret_state
     assert readiness.ca_bundle_path.is_file()
+    assert stat.S_IMODE(readiness.ca_bundle_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(readiness.ca_bundle_path.stat().st_mode) == 0o444
+    assert stat.S_IMODE(readiness.socket_path.stat().st_mode) == 0o600
     assert {path.name for path in readiness.ca_bundle_path.parent.iterdir()} == {
         "ca-bundle.pem",
         "relay.sock",
@@ -487,3 +534,4 @@ async def test_real_signer_relays_only_placeholder_authorized_responses(
     assert not marker.exists()
     assert not readiness.socket_path.exists()
     assert not readiness.ca_bundle_path.exists()
+    assert not private_dir.exists()

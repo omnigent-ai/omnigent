@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -44,6 +46,16 @@ class _Process:
         self.pid = 12345
 
     async def wait(self) -> int:
+        return self.returncode or 0
+
+
+class _TermIgnoringProcess(_Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.killed = asyncio.Event()
+
+    async def wait(self) -> int:
+        await self.killed.wait()
         return self.returncode or 0
 
 
@@ -167,6 +179,53 @@ async def test_signer_backed_home_excludes_host_credential_files(
     assert populate.call_args.kwargs["include_credentials"] is False
     assert populate.call_args.kwargs["minimal_config"] is True
     await session.close()
+
+
+async def test_signer_backed_home_is_private_and_outside_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _Signer([])
+    process = _Process()
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    session = _session(tmp_path, signer)
+    session._request = AsyncMock(return_value={"result": {}})
+
+    await session.start()
+
+    codex_home = session._codex_home_dir
+    assert codex_home is not None
+    assert not codex_home.is_relative_to(tmp_path)
+    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+    await session.close()
+    assert not codex_home.exists()
+
+
+async def test_signer_backed_home_rejects_symlink_temp_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real-temp"
+    real_root.mkdir(mode=0o700)
+    symlink_root = tmp_path / "temp-link"
+    symlink_root.symlink_to(real_root, target_is_directory=True)
+    signer = _Signer([])
+    monkeypatch.setattr("tempfile.gettempdir", lambda: os.fspath(symlink_root))
+    session = _session(tmp_path, signer)
+
+    with pytest.raises(OSError, match="unsafe signer session temp root"):
+        await session.start()
+
+    assert signer.closed
+    assert not list(real_root.iterdir())
 
 
 def test_credential_exclusion_keeps_config_but_not_host_auth(tmp_path: Path) -> None:
@@ -296,6 +355,44 @@ async def test_signer_exit_terminates_worker(
     await asyncio.sleep(0)
 
     terminate.assert_called_once_with(process)
+    await session.close()
+
+
+async def test_signer_exit_escalates_to_kill_for_term_ignoring_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _Signer([])
+    process = _TermIgnoringProcess()
+    terminate = Mock()
+
+    def _kill(proc: object) -> None:
+        assert proc is process
+        process.returncode = -9
+        process.killed.set()
+
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
+    monkeypatch.setattr("omnigent.inner.codex_executor._kill_process_tree", _kill)
+    monkeypatch.setattr("omnigent.inner.codex_executor._WORKER_SHUTDOWN_TIMEOUT_SECONDS", 0.01)
+    session = _session(tmp_path, signer)
+    session._request = AsyncMock(return_value={"result": {}})
+    await session.start()
+
+    signer.exited.set()
+    assert session._signer_watch_task is not None
+    await session._signer_watch_task
+
+    terminate.assert_called_once_with(process)
+    assert process.returncode == -9
     await session.close()
 
 
