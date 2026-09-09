@@ -60,8 +60,11 @@ class AgentCache:
         ):
             raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
         cache_root = self._cache_dir.resolve(strict=False)
-        path = (cache_root / f"{component}{suffix}").resolve(strict=False)
-        if path.parent != cache_root:
+        normalized_path = os.path.normpath(cache_root / f"{component}{suffix}")
+        if not normalized_path.startswith(os.path.join(cache_root, "")):
+            raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
+        path = Path(normalized_path)
+        if path.parent != cache_root or path.resolve(strict=False) != path:
             raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
         return path
 

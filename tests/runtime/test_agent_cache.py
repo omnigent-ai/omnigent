@@ -196,9 +196,49 @@ def test_evict_noop_for_uncached_agent(
     agent_cache.evict("never-loaded")
 
 
+def test_cache_operations_allow_symlinked_cache_root(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """The configured root may be a symlink; individual entries may not."""
+    target = tmp_path / "real-cache"
+    target.mkdir()
+    try:
+        cache_dir.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    agent_cache = AgentCache(artifact_store, cache_dir)
+    bundle_location = "agent-1/abc123"
+    bundle_bytes = _store_bundle(artifact_store, bundle_location)
+
+    loaded = agent_cache.load("agent-1", bundle_location)
+    assert loaded.workdir == target.resolve() / "agent-1"
+    assert agent_cache.load("agent-1", bundle_location).spec is loaded.spec
+    disk_cache = AgentCache(artifact_store, cache_dir)
+    assert disk_cache.load("agent-1", bundle_location).workdir == loaded.workdir
+    assert agent_cache.replace("agent-1", bundle_location, bundle_bytes).workdir == loaded.workdir
+    agent_cache.evict("agent-1")
+
+    assert not loaded.workdir.exists()
+    assert cache_dir.is_symlink()
+    assert target.is_dir()
+
+
 @pytest.mark.parametrize(
     "agent_id",
-    ["", ".", "..", "../outside", "nested/agent", r"..\outside", "/tmp/outside"],
+    [
+        "",
+        ".",
+        "..",
+        "../outside",
+        "nested/agent",
+        r"..\outside",
+        "/tmp/outside",
+        "agent\x00id",
+        r"C:\outside",
+        r"\\server\share\agent",
+    ],
 )
 def test_cache_operations_reject_unsafe_agent_ids(
     agent_cache: AgentCache,
@@ -216,26 +256,78 @@ def test_cache_operations_reject_unsafe_agent_ids(
     assert not cache_dir.exists()
 
 
-def test_cache_operations_reject_symlink_escape(
+@pytest.mark.parametrize("operation", ["load", "replace", "evict"])
+@pytest.mark.parametrize("target_name", ["outside", "cache-sibling", "cache/other-agent"])
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_cache_operations_reject_symlink_redirect(
     agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
     cache_dir: Path,
     tmp_path: Path,
+    operation: str,
+    target_name: str,
+    warm_cache: bool,
 ) -> None:
-    """An existing cache symlink cannot redirect a load outside the root."""
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    marker = outside / "marker"
-    marker.write_text("keep", encoding="utf-8")
+    """Neither cache tier can follow a symlink into another directory."""
     cache_dir.mkdir()
+    target = tmp_path / target_name
+    target.mkdir()
+    (target / "config.yaml").write_text(_MINIMAL_CONFIG, encoding="utf-8")
+    marker = target / "marker"
+    marker.write_text("keep", encoding="utf-8")
+    bundle_location = "linked-agent/abc123"
+    bundle_bytes = _store_bundle(artifact_store, bundle_location)
+    if warm_cache:
+        loaded = agent_cache.load("linked-agent", bundle_location)
+        loaded.workdir.rename(tmp_path / "original-agent")
+    cached_specs = dict(agent_cache._specs)
     try:
-        (cache_dir / "linked-agent").symlink_to(outside, target_is_directory=True)
+        (cache_dir / "linked-agent").symlink_to(target, target_is_directory=True)
     except OSError:
         pytest.skip("directory symlinks are unavailable")
 
     with pytest.raises(ValueError, match="unsafe agent id"):
-        agent_cache.load("linked-agent", "unused")
+        if operation == "load":
+            agent_cache.load("linked-agent", bundle_location)
+        elif operation == "replace":
+            agent_cache.replace("linked-agent", bundle_location, bundle_bytes)
+        else:
+            agent_cache.evict("linked-agent")
 
     assert marker.read_text(encoding="utf-8") == "keep"
+    assert agent_cache._specs == cached_specs
+    assert (cache_dir / "linked-agent").is_symlink()
+    assert not (cache_dir / "linked-agent_staging").exists()
+
+
+@pytest.mark.parametrize("target_name", ["outside", "cache-sibling", "cache/other-agent"])
+def test_replace_rejects_staging_symlink_redirect(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    tmp_path: Path,
+    target_name: str,
+) -> None:
+    """Reject redirected staging before changing either cache tier."""
+    bundle_location = "agent-1/abc123"
+    bundle_bytes = _store_bundle(artifact_store, bundle_location)
+    loaded = agent_cache.load("agent-1", bundle_location)
+    target = tmp_path / target_name
+    target.mkdir()
+    marker = target / "marker"
+    marker.write_text("keep", encoding="utf-8")
+    try:
+        (cache_dir / "agent-1_staging").symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="unsafe agent id"):
+        agent_cache.replace("agent-1", bundle_location, bundle_bytes)
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert (cache_dir / "agent-1_staging").is_symlink()
+    assert (loaded.workdir / "config.yaml").read_text(encoding="utf-8") == _MINIMAL_CONFIG
+    assert agent_cache.load("agent-1", bundle_location).spec is loaded.spec
 
 
 # ── env-var expansion is gated on provenance ──────────
