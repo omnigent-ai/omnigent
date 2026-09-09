@@ -157,6 +157,56 @@ async def test_repark_of_the_same_question_adopts_the_verdict():
 
 
 @pytest.mark.asyncio
+async def test_verdict_tombstone_without_a_fingerprint_fails_closed():
+    # A verdict tombstone whose producer could not fingerprint the
+    # answered question (e.g. the gap path found no valid pending
+    # prompt) must NOT fall back to adopt-by-id: a later, different
+    # question always carries a fingerprint, and adopting an unproven
+    # verdict would replay a stale approval onto it. Fail closed — the
+    # safe cost is one re-ask.
+    sid = "conv_unknown_fingerprint"
+    eid = "elicit_codex_99999999999999999999999999999999"
+    repark = S._harness_elicitation_request_fingerprint(_params("Run `rm -rf /`?"))
+    S._harness_pre_resolved_elicitations[eid] = S._PreResolvedHarnessElicitation(
+        session_id=sid,
+        created_at=time.time(),
+        result=ElicitationResult(action="accept"),
+        request_fingerprint=None,
+    )
+    try:
+        adopted = S._consume_pre_resolved_harness_elicitation(sid, eid, repark)
+        assert adopted is None, (
+            "a verdict tombstone with an unproven (None) fingerprint must fail "
+            "closed, not gate a re-park by id alone"
+        )
+        assert S._harness_pre_resolved_elicitations.get(eid) is None
+    finally:
+        S._harness_pre_resolved_elicitations.pop(eid, None)
+
+
+@pytest.mark.asyncio
+async def test_terminal_tombstone_without_a_fingerprint_still_adopts():
+    # ``result is None`` marks a terminal-side resolution: adopting it
+    # only tells the re-park the prompt was already answered elsewhere
+    # (fail-ask), never grants an approval, and its producer has no
+    # params to fingerprint — so it keeps adopt-by-id semantics.
+    sid = "conv_terminal_tombstone"
+    eid = "elicit_codex_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    repark = S._harness_elicitation_request_fingerprint(_params("Overwrite?"))
+    S._harness_pre_resolved_elicitations[eid] = S._PreResolvedHarnessElicitation(
+        session_id=sid,
+        created_at=time.time(),
+        result=None,
+        request_fingerprint=None,
+    )
+    try:
+        tomb = S._consume_pre_resolved_harness_elicitation(sid, eid, repark)
+        assert tomb is not None and tomb.result is None
+    finally:
+        S._harness_pre_resolved_elicitations.pop(eid, None)
+
+
+@pytest.mark.asyncio
 async def test_resolve_from_wrong_session_tombstones_nothing():
     # The ownership guard must cover the tombstone too: a foreign session's
     # resolve may neither settle the Future nor plant a verdict for the id.

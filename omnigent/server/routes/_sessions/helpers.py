@@ -1042,11 +1042,15 @@ def _consume_pre_resolved_harness_elicitation(
     :param elicitation_id: Harness elicitation id, e.g.
         ``"elicit_codex_abc123"``.
     :param request_fingerprint: Digest of the consuming re-park's request
-        params, or ``None`` to skip fingerprint matching. A tombstone
-        written against a possibly-zombie waiter carries the answered
-        question's digest; when both sides carry one and they differ,
-        the tombstone belongs to a DIFFERENT question that reused this
-        id, so it is dropped rather than replayed.
+        params, e.g. a sha256 hex string. A verdict-carrying tombstone
+        is adopted ONLY on a proven same-question match: both sides
+        must carry a fingerprint and they must be equal. Any other
+        combination (either side ``None``, or a mismatch) fails closed
+        — the tombstone is dropped and the prompt is re-published — so
+        a stale approval can never gate a DIFFERENT question that
+        reused this id. Terminal-side tombstones (``result is None``)
+        skip the check: adopting one only fail-asks, and their producer
+        has no params to fingerprint.
     :returns: The consumed tombstone when one matched this session
         (its ``result`` carries the web verdict to honor, or ``None``
         for a terminal-side resolution), or ``None`` when nothing was
@@ -1059,14 +1063,18 @@ def _consume_pre_resolved_harness_elicitation(
     if tombstone.session_id != session_id:
         _harness_pre_resolved_elicitations[elicitation_id] = tombstone
         return None
-    if (
-        tombstone.request_fingerprint is not None
-        and request_fingerprint is not None
-        and tombstone.request_fingerprint != request_fingerprint
+    if tombstone.result is not None and (
+        tombstone.request_fingerprint is None
+        or request_fingerprint is None
+        or tombstone.request_fingerprint != request_fingerprint
     ):
-        # Same id, different question: the id was reused after the
-        # answered request finished. The stale verdict must not gate the
-        # new question — drop it so the new prompt is published.
+        # A verdict is replayed only on a proven same-question match.
+        # A differing fingerprint means the id was reused by a LATER,
+        # different question; a missing fingerprint on either side
+        # means the match cannot be proven (e.g. the gap path found no
+        # valid pending prompt to digest). Both fail closed: drop the
+        # tombstone and let the new prompt be published — the safe cost
+        # is one re-ask, never a stale approval gating a new question.
         return None
     return tombstone
 

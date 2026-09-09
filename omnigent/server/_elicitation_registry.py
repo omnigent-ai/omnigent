@@ -82,12 +82,15 @@ class _PreResolvedHarnessElicitation:
         terminal-side resolution.
     :param request_fingerprint: Digest of the request params the verdict
         answered, copied from the parked waiter when the resolve found
-        one still registered. A re-park adopts the verdict only when its
-        own params produce the same digest, so a LATER, different
-        question that reuses the same harness id (harness request ids
-        recur) can never inherit a stale approval. ``None`` when the
-        producer had no params to fingerprint (nothing was parked);
-        those tombstones keep the legacy adopt-by-id semantics.
+        one still registered (or digested from the pending prompt on the
+        nothing-parked gap path). A re-park adopts a verdict-carrying
+        tombstone only when its own params produce the same digest, so a
+        LATER, different question that reuses the same harness id
+        (harness request ids recur) can never inherit a stale approval.
+        ``None`` when the producer had no params to fingerprint; a
+        verdict-carrying tombstone without a fingerprint fails closed at
+        consume time (dropped, prompt re-published) rather than falling
+        back to adopt-by-id.
     """
 
     session_id: str
