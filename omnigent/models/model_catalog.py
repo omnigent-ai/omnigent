@@ -889,7 +889,9 @@ def list_models_for_worker(
     if canonical_harness in {"pi", "pinative", "nativepi"}:
         listing = replace(
             listing,
-            models=tuple(model for model in listing.models if not unsupported_in_pi(model.id)),
+            models=tuple(
+                model for model in listing.models if not unsupported_in_pi(model.id.lower())
+            ),
         )
     if harness is None:
         return listing

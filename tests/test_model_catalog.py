@@ -721,6 +721,37 @@ def test_databricks_listing_filters_to_llm_wire_surfaces(
     )
 
 
+def test_pi_filter_drops_unsupported_models_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pi's unsupported-model filter matches regardless of the id's casing.
+
+    ``unsupported_in_pi`` takes the lowercased id; a listing spelling
+    ``gpt-oss`` with any uppercase letters must still be excluded for pi.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
+    _stub_workspace_creds(monkeypatch)
+    page = {
+        "model_services": [
+            _uc_service("system.ai.GPT-OSS-120b", ["mlflow/v1/chat/completions"]),
+            _uc_service("system.ai.claude-sonnet-4-6", ["anthropic/v1/messages"]),
+        ]
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Serve the UC model-services page."""
+        return httpx.Response(200, json=page)
+
+    listing = list_models_for_worker(
+        _worker_spec("pi"), "pi", transport=httpx.MockTransport(_handler)
+    )
+
+    assert {m.id for m in listing.models} == {"system.ai.claude-sonnet-4-6"}
+
+
 def test_databricks_listing_skips_explicitly_non_ready_endpoints(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
