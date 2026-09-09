@@ -73,7 +73,6 @@ import {
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { useGithubInfo } from "@/hooks/useGithub";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -764,15 +763,6 @@ export function AppShell() {
     enabled: canBrowseWorkspace,
   });
   const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
-  // The GitHub tab needs a git checkout on disk: hide it once the session's
-  // GitHub info resolves to "not a git repo" — that panel is a dead end. Other
-  // unavailable reasons keep the tab: `host_outdated` renders an actionable
-  // "update your host" prompt, and `no_os_env` is already covered by the Files
-  // gate. While the info is still loading the tab stays, matching the Files
-  // gate's no-flash default. Shares ChatPage's status-line query cache, so no
-  // extra fetch.
-  const githubInfoQuery = useGithubInfo(serverConversationId);
-  const showGithubTab = showFilesPanel && githubInfoQuery.data?.reason !== "not_a_git_repo";
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -783,11 +773,9 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab: workspace gate plus the resolved GitHub info — a
-        // non-git workspace hides the tab instead of opening a dead-end
-        // panel. The panel still renders the "gh not installed" /
-        // "not signed in" / "update your host" states for a real checkout.
-        github: showGithubTab,
+        // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
+        // other unavailable reasons are shown as empty states in the panel.
+        github: showFilesPanel,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
         // older desktop build predates the `browser*` bridge — both hide the
@@ -801,7 +789,7 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel, showGithubTab],
+    [showFilesPanel],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a

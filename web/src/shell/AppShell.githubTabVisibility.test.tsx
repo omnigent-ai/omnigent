@@ -1,10 +1,6 @@
-// The workspace rail's GitHub tab needs a git checkout behind it: for a
-// non-git workspace GET /resources/github resolves available:false
-// (not_a_git_repo) and the panel is a dead end ("This workspace isn't a git
-// repository."). AppShell must key the tab's availability off the resolved
-// GitHub info — not just the Files/workspace gate — so the tab is hidden
-// (and a remembered GitHub tab selection falls back) once the info resolves
-// unavailable.
+// The workspace rail's GitHub tab is shown whenever the workspace/Files gate is
+// open. Non-git workspaces (not_a_git_repo) show an empty state inside the panel
+// rather than hiding the tab entirely.
 
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
@@ -13,11 +9,11 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseGithubModule from "@/hooks/useGithub";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
@@ -141,7 +137,7 @@ function renderShell() {
 }
 
 describe("GitHub rail tab visibility", () => {
-  it("hides the GitHub tab when the workspace isn't a git repository", () => {
+  it("shows the GitHub tab even when the workspace isn't a git repository", () => {
     useGithubInfoMock.mockReturnValue({
       data: { object: "session.github.info", available: false, reason: "not_a_git_repo" },
       isLoading: false,
@@ -149,11 +145,11 @@ describe("GitHub rail tab visibility", () => {
 
     renderShell();
 
-    // The workspace gate is still on: Files renders, so the strip is up.
+    // The workspace gate is on: Files renders, so the strip is up — and the
+    // GitHub tab must also be present (its panel shows an empty state instead).
     expect(screen.getByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /^Agents/ })).toBeInTheDocument();
-    // ...but the GitHub tab must not — its panel would be a dead end.
-    expect(screen.queryByRole("tab", { name: "GitHub" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
   });
 
   it("shows the GitHub tab for a git workspace", () => {
@@ -189,21 +185,4 @@ describe("GitHub rail tab visibility", () => {
     expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
   });
 
-  it("falls back off a remembered GitHub tab when the workspace isn't a git repo", async () => {
-    // A session that previously had a git workspace can persist "github" as
-    // its selected rail tab; when the tab disappears the selection must
-    // converge onto the first still-available tab instead of stranding.
-    writeSessionWorkspaceState("conv_ws", { rightRailTab: "github" });
-    useGithubInfoMock.mockReturnValue({
-      data: { object: "session.github.info", available: false, reason: "not_a_git_repo" },
-      isLoading: false,
-    } as ReturnType<typeof useGithubInfo>);
-
-    renderShell();
-
-    expect(screen.queryByRole("tab", { name: "GitHub" })).toBeNull();
-    await waitFor(() =>
-      expect(screen.getByRole("tab", { name: /^Files$/ })).toHaveAttribute("aria-selected", "true"),
-    );
-  });
 });
