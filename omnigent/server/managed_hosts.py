@@ -1374,6 +1374,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "secret_mounts",
                     "pod_ready_timeout_s",
                     "runtime_class",
+                    "home_size_limit",
                 },
                 "sandbox.kubernetes",
             )
@@ -1397,6 +1398,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 raw, "kubernetes", "pod_ready_timeout_s"
             ),
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
+            home_size_limit=_parse_kubernetes_home_size_limit(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     elif provider == "microsandbox":
@@ -2463,6 +2465,17 @@ _K8S_LABEL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
 # Kubernetes resource quantity, e.g. "500m", "2", "1Gi", "1.5" — a number with
 # an optional binary/decimal suffix.
 _K8S_QUANTITY_RE = re.compile(r"^\d+(\.\d+)?([eE][-+]?\d+)?[a-zA-Z]{0,2}i?$")
+# Container resource fields ``sandbox.kubernetes.resources`` may carry per tier.
+# ``ephemeral-storage`` bounds the Pod's node-local disk (emptyDirs, container
+# writable layers, logs): its request lets the scheduler spread sandboxes by
+# disk and its limit makes the kubelet evict only the sandbox that exceeds it.
+_KUBERNETES_RESOURCE_FIELDS: frozenset[str] = frozenset({"cpu", "memory", "ephemeral-storage"})
+# Default ``sizeLimit`` of the writable-HOME emptyDir when
+# ``sandbox.kubernetes.home_size_limit`` is absent. Mirrors
+# ``_HOME_SIZE_LIMIT_DEFAULT`` in omnigent.onboarding.sandboxes.kubernetes
+# (kept in step by a test); the launcher module is imported lazily so the
+# server never pays for the kubernetes SDK at config-parse time.
+KUBERNETES_HOME_SIZE_LIMIT_DEFAULT: str = "8Gi"
 
 
 def _validate_dns1123_label(value: str | None, field: str) -> None:
@@ -2529,10 +2542,13 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
     """
     Extract and validate the optional ``sandbox.kubernetes.resources`` block.
 
-    Shape: ``{requests?: {cpu?, memory?}, limits?: {cpu?, memory?}}`` — every
-    level optional, each ``cpu`` / ``memory`` a non-empty Kubernetes quantity
-    string. Validated at parse time so an operator typo fails server startup
-    instead of the first managed launch; an omitted field keeps the default.
+    Shape: ``{requests?: {cpu?, memory?, ephemeral-storage?}, limits?: {cpu?,
+    memory?, ephemeral-storage?}}`` — every level optional, each field a
+    non-empty Kubernetes quantity string. Validated at parse time so an
+    operator typo fails server startup instead of the first managed launch; an
+    omitted ``cpu`` / ``memory`` keeps the launcher default, an omitted
+    ``ephemeral-storage`` stays unset (a namespace ``LimitRange`` may default
+    it).
 
     :param raw: The raw ``sandbox`` mapping.
     :returns: The validated resources block, or ``None`` when omitted.
@@ -2559,14 +2575,15 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
         if not isinstance(tier_value, dict):
             raise ValueError(
                 f"server config 'sandbox.kubernetes.resources.{tier}' must be a "
-                "mapping of 'cpu' / 'memory' to quantity strings"
+                "mapping of 'cpu' / 'memory' / 'ephemeral-storage' to quantity strings"
             )
         norm_tier: dict[str, str] = {}
         for field, field_value in tier_value.items():
-            if field not in ("cpu", "memory"):
+            if field not in _KUBERNETES_RESOURCE_FIELDS:
                 raise ValueError(
                     f"server config 'sandbox.kubernetes.resources.{tier}' has an "
-                    f"unknown key {field!r} (expected 'cpu' or 'memory')"
+                    f"unknown key {field!r} (expected 'cpu', 'memory' or "
+                    "'ephemeral-storage')"
                 )
             if not isinstance(field_value, str) or not field_value.strip():
                 raise ValueError(
@@ -2583,6 +2600,44 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
             norm_tier[field] = quantity
         normalized[tier] = norm_tier
     return normalized
+
+
+def _parse_kubernetes_home_size_limit(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.home_size_limit``.
+
+    The ``sizeLimit`` of the writable-HOME emptyDir every runner Pod mounts.
+    Three states, distinguished at parse time so the launcher receives a
+    resolved value:
+
+    - key absent → :data:`KUBERNETES_HOME_SIZE_LIMIT_DEFAULT`, so a stock
+      deployment is bounded without any config;
+    - explicit ``null`` → ``None``, an unbounded emptyDir (the pre-limit
+      behaviour, for operators whose nodes have ample nodefs);
+    - a Kubernetes quantity string (``"8Gi"``, ``"20Gi"``) → that limit.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The size limit, or ``None`` for unbounded.
+    :raises ValueError: When the field is present but not a quantity string.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None or "home_size_limit" not in section:
+        return KUBERNETES_HOME_SIZE_LIMIT_DEFAULT
+    value = section["home_size_limit"]
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "server config 'sandbox.kubernetes.home_size_limit' must be a Kubernetes "
+            "quantity string (e.g. '8Gi') or null for an unbounded HOME emptyDir"
+        )
+    quantity = value.strip()
+    if not _K8S_QUANTITY_RE.match(quantity):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.home_size_limit' is not a valid "
+            f"Kubernetes quantity: {value!r} (e.g. '8Gi', '20Gi')"
+        )
+    return quantity
 
 
 # Path prefixes a pvc_mounts mount_path may not overlap — neither sitting at
@@ -2830,6 +2885,7 @@ def _kubernetes_launcher_factory(
     secret_mounts: list[dict[str, object]] | None,
     pod_ready_timeout_s: int | None,
     runtime_class: str | None,
+    home_size_limit: str | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -2863,6 +2919,8 @@ def _kubernetes_launcher_factory(
     :param runtime_class: ``RuntimeClass`` name every runner Pod is scheduled
         under as ``spec.runtimeClassName`` (e.g. ``kata`` for micro-VM
         isolation), or ``None`` for the cluster's default runtime.
+    :param home_size_limit: Resolved ``sizeLimit`` for every runner Pod's
+        writable-HOME emptyDir, or ``None`` for an unbounded emptyDir.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -2893,6 +2951,7 @@ def _kubernetes_launcher_factory(
             secret_mounts=secret_mounts,
             pod_ready_timeout_s=pod_ready_timeout_s,
             runtime_class=runtime_class,
+            home_size_limit=home_size_limit,
         )
 
     return _build

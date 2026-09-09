@@ -316,6 +316,20 @@ def test_databricks_request_headers_org_only(token_dir) -> None:
     assert databricks_request_headers("https://single.databricks.com/api/2.0/omnigent") == {}
 
 
+def test_databricks_request_headers_explicit_org_wins(token_dir) -> None:
+    """The current URL selector overrides a stale stored workspace selector."""
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+
+    server = "https://acme.databricks.com/api/2.0/omnigent"
+    store_databricks_auth(
+        server_url=server,
+        workspace_host="https://acme.databricks.com",
+        org_id="111",
+    )
+
+    assert databricks_request_headers(server, org_id="222")["X-Databricks-Org-Id"] == "222"
+
+
 def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
     """The paired minter always emits the bearer and the ?o= header together.
 

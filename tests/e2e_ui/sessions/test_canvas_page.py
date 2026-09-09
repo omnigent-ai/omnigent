@@ -123,6 +123,16 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
     expect(page.get_by_text("1 session", exact=True)).to_be_visible()
     expect(cards).to_have_count(1)
 
+    # Leaving and coming back through the sidebar reopens the last selected canvas.
+    page.goto(live_server)
+    expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
+    page.get_by_test_id("canvas-nav").click()
+    expect(page).to_have_url(re.compile(r"/canvas\?canvas=project-release$"))
+    expect(page.get_by_role("tab", name="Release", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(cards).to_have_count(1)
+
     cards.dblclick()
     expect(page).to_have_url(re.compile(r"/c/project-session$"))
 
@@ -131,53 +141,67 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
     page: Page,
     live_server: str,
 ) -> None:
-    """A card dropped elsewhere keeps its spot after a reload; Reset layout regrids it."""
-    sessions = [_session("only", "Only session", 1)]
+    """A dropped card snaps to the grid and keeps its spot after a reload, while the card
+    left alone stays in its slot; Reset layout regrids the canvas."""
+    sessions = [_session("only", "Only session", 2), _session("other", "Other session", 1)]
     _stub_server_info(page, canvas=True)
     page.route("**/v1/sessions?*", _serve_list(sessions))
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))
 
     page.goto(f"{live_server}/canvas")
-    card = page.get_by_test_id("session-card")
+    card = page.get_by_test_id("session-card").filter(has_text="Only session")
+    other = page.locator(".react-flow__node").filter(has_text="Other session")
     expect(card).to_be_visible()
-    before = card.bounding_box()
-    assert before is not None
-
-    page.mouse.move(before["x"] + 20, before["y"] + 20)
-    page.mouse.down()
-    page.mouse.move(before["x"] + 140, before["y"] + 120, steps=8)
-    page.mouse.up()
-    # The layout entry is keyed by server and viewer; match on the prefix.
+    expect(other).to_be_visible()
+    # Both grid slots are saved as soon as the list is complete.
     read_layout = (
         "() => { const key = Object.keys(localStorage)"
         ".find(k => k.startsWith('omnigent:canvas-layout:')); "
         "return key ? JSON.parse(localStorage.getItem(key)) : null; }"
     )
     page.wait_for_function(
-        f"() => Object.keys((({read_layout})() ?? {{}}).positions ?? {{}}).length === 1"
+        f"() => Object.keys((({read_layout})() ?? {{}}).positions ?? {{}}).length === 2"
+    )
+    other_slot = other.evaluate("el => el.style.transform")
+    assert other_slot == "translate(320px, 0px)"
+    before = card.bounding_box()
+    assert before is not None
+
+    page.mouse.move(before["x"] + 20, before["y"] + 20)
+    page.mouse.down()
+    page.mouse.move(before["x"] + 140, before["y"] + 300, steps=8)
+    page.mouse.up()
+    page.wait_for_function(
+        f"() => JSON.stringify((({read_layout})() ?? {{}}).positions?.only) !== '[0,0]'"
     )
     moved = card.bounding_box()
     assert moved is not None
-    assert abs(moved["x"] - before["x"]) > 60
+    assert abs(moved["y"] - before["y"]) > 60
 
     # The view is fitted on every load, so compare the card's canvas coordinates
-    # (the node's translate) rather than where it sits on screen.
-    node = page.locator(".react-flow__node").first
+    # (the node's translate) rather than where it sits on screen. The drop snapped
+    # to the 32px lattice.
+    node = page.locator(".react-flow__node").filter(has_text="Only session")
     dropped_at = node.evaluate("el => el.style.transform")
-    assert "translate(0px, 0px)" not in dropped_at
+    match = re.fullmatch(r"translate\((-?\d+)px, (-?\d+)px\)", dropped_at)
+    assert match is not None, dropped_at
+    assert int(match.group(1)) % 32 == 0 and int(match.group(2)) % 32 == 0
+    assert dropped_at != "translate(0px, 0px)"
 
     page.reload()
-    expect(page.get_by_test_id("session-card")).to_be_visible()
-    expect(page.locator(".react-flow__node").first).to_have_css("transform", re.compile(".+"))
-    assert (
-        page.locator(".react-flow__node").first.evaluate("el => el.style.transform") == dropped_at
-    )
+    expect(page.get_by_test_id("session-card")).to_have_count(2)
+    node = page.locator(".react-flow__node").filter(has_text="Only session")
+    expect(node).to_have_css("transform", re.compile(".+"))
+    assert node.evaluate("el => el.style.transform") == dropped_at
+    # The card that was never moved did not slide into the vacated slot.
+    other = page.locator(".react-flow__node").filter(has_text="Other session")
+    assert other.evaluate("el => el.style.transform") == other_slot
 
     page.get_by_role("button", name="Reset layout").click()
-    expect(page.locator(".react-flow__node").first).to_have_attribute(
-        "style", re.compile(r"translate\(0px, 0px\)")
+    expect(node).to_have_attribute("style", re.compile(r"translate\(0px, 0px\)"))
+    page.wait_for_function(
+        f"() => JSON.stringify((({read_layout})() ?? {{}}).positions?.only) === '[0,0]'"
     )
-    page.wait_for_function(f"() => !((({read_layout})() ?? {{}}).positions ?? {{}}).only")
 
 
 def test_canvas_cards_follow_live_session_updates(page: Page, live_server: str) -> None:

@@ -8,11 +8,13 @@ import pytest
 
 from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.server.background_session_titles import (
+    BACKGROUND_SESSION_TITLES_HEADER,
     BACKGROUND_TITLE_MAX_CHARS,
     CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
     RunnerBackgroundTitleGenerator,
+    background_session_titles_enabled,
     normalize_background_title,
     prepare_background_session_title,
 )
@@ -47,6 +49,44 @@ async def test_prepare_background_title_for_eligible_session(db_uri: str) -> Non
     )
 
     assert pending is not None
+
+
+async def test_prepare_background_title_skips_when_user_setting_is_disabled(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(kind="default")
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Unused title"
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, generator),
+        conversation=conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ),
+        enabled=False,
+    )
+
+    assert pending is None
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({}, True),
+        ({BACKGROUND_SESSION_TITLES_HEADER: "on"}, True),
+        ({BACKGROUND_SESSION_TITLES_HEADER: "off"}, False),
+    ],
+)
+async def test_background_session_titles_enabled_defaults_on(
+    headers: dict[str, str],
+    expected: bool,
+) -> None:
+    assert background_session_titles_enabled(headers) is expected
 
 
 async def test_prepare_background_title_from_message(db_uri: str) -> None:

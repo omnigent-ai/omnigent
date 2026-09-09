@@ -55,6 +55,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_session_titles_enabled,
     background_title_prompt,
     prepare_background_session_title,
     schedule_background_child_task_summary,
@@ -1171,6 +1172,7 @@ def register_events_routes(
                 conversation_store,
                 created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
+                enabled=background_session_titles_enabled(request.headers),
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -1926,6 +1928,7 @@ def register_events_routes(
             coordinator=background_title_coordinator,
             conversation=conv,
             event=body,
+            enabled=background_session_titles_enabled(request.headers),
         )
         # Schedule display-name generation for child sessions (the
         # title coordinator skips children because their title is
@@ -1976,6 +1979,7 @@ def register_events_routes(
             created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.
             host_store=getattr(request.app.state, "host_store", None),

@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +26,13 @@ if TYPE_CHECKING:
     from omnigent.server.schemas import SessionEventInput
 
 _logger = logging.getLogger(__name__)
+
+BACKGROUND_SESSION_TITLES_HEADER = "x-omnigent-background-session-titles"
+
+
+def background_session_titles_enabled(headers: Mapping[str, str]) -> bool:
+    """Resolve the browser-local title preference from a request header."""
+    return headers.get(BACKGROUND_SESSION_TITLES_HEADER, "on").lower() != "off"
 
 
 def _background_session_title_harness_supported(harness: str | None) -> bool:
@@ -403,10 +410,12 @@ def prepare_background_session_title(
     coordinator: BackgroundSessionTitleCoordinator | None,
     conversation: Conversation,
     event: SessionEventInput,
+    enabled: bool = True,
 ) -> PendingBackgroundSessionTitle | None:
     """Prepare a guarded first-turn title attempt for a top-level session."""
     if (
-        coordinator is None
+        not enabled
+        or coordinator is None
         or conversation.title is not None
         or conversation.parent_conversation_id is not None
         or not _background_session_title_harness_supported(conversation.harness_override)
