@@ -4,7 +4,6 @@ import {
   FileIcon,
   GitCompareIcon,
   GitForkIcon,
-  GitPullRequestIcon,
   InfoIcon,
   ListIcon,
   PanelLeftIcon,
@@ -14,6 +13,7 @@ import {
   TerminalIcon,
   UserPlusIcon,
 } from "lucide-react";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -315,7 +315,7 @@ export function ChatHeader({
             onSelect={mobileMenu.onOpenGithub}
             className="gap-2.5 px-2.5 py-2 text-ui"
           >
-            <GitPullRequestIcon className="size-4" />
+            <GithubMono size={16} className="shrink-0" />
             GitHub
           </DropdownMenuItem>
         )}
