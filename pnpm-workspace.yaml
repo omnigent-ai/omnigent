@@ -7,9 +7,10 @@ packages:
   - 'sdks/web-extension'
   - 'examples/extensions/hello-page/web'
 
+# 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
+minimumReleaseAge: 10080
+
 settings:
-  # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
-  minimumReleaseAge: 10080
   autoInstallPeers: false
   strictPeerDependencies: false
 
