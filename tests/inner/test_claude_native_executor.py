@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
     TmuxSessionNotAdvertised,

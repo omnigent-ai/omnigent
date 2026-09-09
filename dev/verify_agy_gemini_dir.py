@@ -34,8 +34,8 @@ from typing import Any
 
 import httpx
 
-import omnigent.antigravity_native as agy_cli
-import omnigent.antigravity_native_bridge as bridge
+import omnigent.harnesses.antigravity_native.bridge as bridge
+import omnigent.harnesses.antigravity_native.main as agy_cli
 
 
 class _StubClient:

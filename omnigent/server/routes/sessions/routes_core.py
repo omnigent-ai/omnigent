@@ -30,9 +30,6 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.cost_plan import (
-    reserved_cost_control_keys,
-)
 from omnigent.db.utils import generate_agent_id
 from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import (
@@ -42,12 +39,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.model_override import validate_model_override
-from omnigent.reasoning_effort import (
-    EFFORT_CLEAR_VALUES,
-    EFFORT_VALUES,
-    validate_effort,
-)
+from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
@@ -194,9 +186,6 @@ from omnigent.server.schemas import (
     SessionSwitchAgentRequest,
     UpdateSessionRequest,
 )
-from omnigent.session_lifecycle import (
-    labels_with_closed_status,
-)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -212,6 +201,17 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.util.cost_plan import (
+    reserved_cost_control_keys,
+)
+from omnigent.util.reasoning_effort import (
+    EFFORT_CLEAR_VALUES,
+    EFFORT_VALUES,
+    validate_effort,
+)
+from omnigent.util.session_lifecycle import (
+    labels_with_closed_status,
+)
 from omnigent.version import VERSION
 
 
@@ -833,7 +833,7 @@ def register_core_routes(
         # here — it co-locates on the parent's runner.
         if parsed_metadata.host_id is not None and inherited_runner_id is None:
             from omnigent.harness_aliases import canonicalize_harness
-            from omnigent.model_catalog import spec_harness
+            from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
             await _bind_and_launch_on_caller_host(
@@ -2802,13 +2802,21 @@ def register_core_routes(
         # Push the forked session to this user's other open tabs.
         _announce_session_added(user_id, new_conv.id)
 
+        # Bound the response like the GET-session snapshot: newest item page,
+        # chronological. Clients navigate by the fork's id and hydrate the
+        # transcript via the paged items endpoint, so returning the whole
+        # copied history only made the user-blocked response scale with
+        # source size.
         fork_items = await asyncio.to_thread(
-            conversation_store.list_items, new_conv.id, limit=10000
+            conversation_store.list_items,
+            new_conv.id,
+            limit=100,
+            order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
         return _build_session_response(
             new_conv,
-            fork_items.data,
+            list(reversed(fork_items.data)),
             "idle",
             permission_level=level,
             last_task_error=None,

@@ -92,8 +92,8 @@ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultE
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
-from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
 )
@@ -2345,7 +2345,7 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
     # Keep the codex-native pre-turn bridge writes (write_mcp_bridge_config)
     # out of the real ``~/.omnigent/codex-native`` tree. The module documents
     # this monkeypatch as the supported test isolation point.
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
@@ -5873,7 +5873,7 @@ def _install_cancel_pane(
     alive: bool | None,
 ) -> _CancelPane | None:
     """Install a fake terminal registry for one native child's ``main`` pane."""
-    from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+    from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 
     agent = native_coding_agent_for_wrapper_label(wrapper_label)
     assert agent is not None, f"unknown wrapper {wrapper_label!r}"

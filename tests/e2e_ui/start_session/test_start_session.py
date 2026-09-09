@@ -619,16 +619,13 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_start_session_send_shows_busy_spinner(seeded_session: tuple[str, str]) -> None:
-    """Send shows a busy spinner while the create is in flight, then navigates.
+def test_start_session_navigates_while_create_is_pending(seeded_session: tuple[str, str]) -> None:
+    """Send immediately opens a temporary chat, then hydrates its real id.
 
-    The create awaits the backend (session bootstrap + git worktree setup)
-    before navigating, so the landing screen lingers for the whole round-trip.
-    Without feedback the Send button just goes inert and the typed message sits
-    in the composer, so the click reads as "frozen". This holds the create POST
-    open with a gate so that in-flight window is observable, and asserts the
-    Send button flips to a busy/spinning state (disabled + ``aria-busy`` +
-    "Starting session" label) before the response lands and navigation happens.
+    The create response is held so the test can verify the navigate-first
+    window: the landing composer is already gone, the URL uses a client-only
+    ``temp:`` id, and the optimistic prompt is visible in a read-only chat.
+    Releasing the response must replace that temporary URL with the real id.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_send_busy_spinner(base_url, session_id))
@@ -641,8 +638,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
         try:
             create_bodies: list[dict[str, Any]] = []
             # A gate the create handler awaits before responding, so the POST
-            # stays pending long enough to observe the button's busy state. The
-            # test opens it after asserting the spinner, letting navigation run.
+            # stays pending long enough to observe the temporary chat.
             release_create = asyncio.Event()
 
             async def handle_hosts(route: Route) -> None:
@@ -665,8 +661,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             async def handle_sessions(route: Route) -> None:
                 if route.request.method == "POST":
                     create_bodies.append(route.request.post_data_json)
-                    # Hold the create open so the composer stays in its
-                    # `creating` state — the window under test.
+                    # Hold the create open so the temp-id chat remains visible.
                     await release_create.wait()
                     await route.fulfill(
                         status=200,
@@ -704,67 +699,55 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            submit = page.get_by_test_id("new-chat-landing-submit")
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
-            # Idle with a message typed: enabled, not busy (arrow, no spin).
-            await expect(submit).to_be_enabled()
-            await expect(submit).to_have_attribute("aria-busy", "false")
+            await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await submit.click()
-
-            # The POST reached the server (proving we're truly in flight, not
-            # blocked by a disabled button) and the button shows the busy state.
+            # The create is still in flight, but the landing screen is gone and
+            # the optimistic prompt is already visible under a temporary URL.
             await _wait_until(lambda: len(create_bodies) == 1)
-            await expect(submit).to_be_disabled()
-            await expect(submit).to_have_attribute("aria-busy", "true")
-            await expect(submit).to_have_attribute("aria-label", "Starting session")
-            # Still on the landing screen — the "frozen"-looking window.
-            await expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
-
-            # Release the create: the flow completes and navigates to the
-            # session, so the landing composer unmounts.
-            release_create.set()
-            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(
-                0, timeout=30_000
+            await expect(page).to_have_url(
+                re.compile(rf"{re.escape(base_url)}/c/temp:[0-9a-f]{{32}}")
             )
+            assert "id" not in create_bodies[0]
+            assert re.fullmatch(
+                r"[0-9a-f]{32}",
+                create_bodies[0]["labels"]["omnigent.client_create_token"],
+            )
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(0)
+            composer = page.get_by_role("textbox", name="Message the agent")
+            await expect(composer).to_be_disabled()
+            await expect(composer).to_have_attribute("placeholder", "Starting the session…")
+            await expect(
+                page.get_by_test_id("message-bubble").get_by_text("set up the project", exact=True)
+            ).to_be_visible()
+
+            # Release the create: the same chat hydrates onto the real id.
+            release_create.set()
+            await expect(page).to_have_url(f"{base_url}/c/{session_id}", timeout=30_000)
         finally:
             await browser.close()
 
 
-def test_start_session_opens_before_the_create_responds(seeded_session: tuple[str, str]) -> None:
-    """Send opens the session on the stream's announcement, not the response.
+def test_start_session_ignores_uncorrelated_announcement_while_create_pending(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Only the exact create-token announcement resolves the temporary chat.
 
-    ``POST /v1/sessions`` doesn't answer until the host has finished spawning a
-    runner — a process boot, seconds of it — and the landing screen used to sit
-    on that whole wait before routing anywhere. But the server writes the
-    session row and announces it on ``WS /v1/sessions/updates`` almost
-    immediately, so the id is available long before the response is. This holds
-    the create POST open for the entire test and announces the session over the
-    stream: the chat page must open anyway.
-
-    A regression that goes back to awaiting the response would never leave the
-    landing screen here, since the create never answers.
-
-    The announcement is injected through a mocked updates socket rather than a
-    real create, because this suite has no host daemon for a host-bound create
-    to actually succeed against. The row carries the stubbed agent/host the
-    composer just asked for — that pairing is what the screen matches on to
-    tell its own new session apart from every other session the stream
-    announces to this user.
+    An uncorrelated top-level row leaves the temporary route in place. A row
+    carrying the POST's token resolves it while the HTTP response is pending.
     """
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_open_before_create_responds(base_url, session_id))
+    _run_in_fresh_loop(_drive_ignore_uncorrelated_announcement(base_url, session_id))
 
 
-async def _drive_open_before_create_responds(base_url: str, session_id: str) -> None:
+async def _drive_ignore_uncorrelated_announcement(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
             create_seen = asyncio.Event()
-            # Released only at teardown, so the create is pending for every
-            # assertion below.
             release_create = asyncio.Event()
+            create_body: dict[str, Any] = {}
             sockets: list[Any] = []
 
             def handle_updates(ws: Any) -> None:
@@ -793,6 +776,7 @@ async def _drive_open_before_create_responds(base_url: str, session_id: str) -> 
 
             async def handle_sessions(route: Route) -> None:
                 if route.request.method == "POST":
+                    create_body.update(route.request.post_data_json)
                     create_seen.set()
                     await release_create.wait()
                     await route.fulfill(
@@ -835,10 +819,7 @@ async def _drive_open_before_create_responds(base_url: str, session_id: str) -> 
             # The create is in flight and will stay that way.
             await _wait_until(create_seen.is_set)
 
-            # A brand-new session the page has never seen, on the agent and
-            # host the composer just asked for: the server's announcement of
-            # the row it wrote before starting the runner.
-            announced_id = "conv_announced_e2e"
+            announced_id = session_id
             sockets[0].send(
                 json.dumps(
                     {
@@ -861,13 +842,41 @@ async def _drive_open_before_create_responds(base_url: str, session_id: str) -> 
                 )
             )
 
-            # KEY ASSERTION: routed to the announced session while the create
-            # is still pending — the landing composer is gone and the URL is
-            # the announced id, not the one the (unanswered) create would
-            # eventually return.
-            await expect(page).to_have_url(f"{base_url}/c/{announced_id}", timeout=20_000)
+            # Stay on the already-open temp chat; never guess that the pushed
+            # row belongs to this request.
+            await expect(page).to_have_url(
+                re.compile(rf"{re.escape(base_url)}/c/temp:[0-9a-f]{{32}}")
+            )
             await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(0)
             assert not release_create.is_set(), "the create must still be unanswered here"
+
+            sockets[0].send(
+                json.dumps(
+                    {
+                        "type": "changed",
+                        "items": [
+                            {
+                                "id": announced_id,
+                                "object": "conversation",
+                                "parent_session_id": None,
+                                "title": None,
+                                "created_at": 1_800_000_000,
+                                "updated_at": 1_800_000_000,
+                                "labels": {
+                                    "omnigent.client_create_token": create_body["labels"][
+                                        "omnigent.client_create_token"
+                                    ]
+                                },
+                                "archived": False,
+                            }
+                        ],
+                    }
+                )
+            )
+            await expect(page).to_have_url(f"{base_url}/c/{session_id}", timeout=30_000)
+            assert not release_create.is_set(), "the matching push must win before HTTP"
+
+            release_create.set()
         finally:
             release_create.set()
             await browser.close()
@@ -2259,7 +2268,9 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
             assert body.get("labels") == {
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "pi-native-ui",
+                "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
             }, body
+            assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
             await browser.close()
 
@@ -2341,7 +2352,9 @@ async def _drive_antigravity_native_start(base_url: str, session_id: str) -> Non
             assert body.get("labels") == {
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "antigravity-native-ui",
+                "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
             }, body
+            assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
             await browser.close()
 
@@ -2433,7 +2446,9 @@ async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
             assert body.get("labels") == {
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "opencode-native-ui",
+                "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
             }, body
+            assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
             await browser.close()
 
@@ -2520,7 +2535,9 @@ async def _drive_kimi_native_start(base_url: str, session_id: str) -> None:
             assert body.get("labels") == {
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "kimi-native-ui",
+                "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
             }, body
+            assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
             await browser.close()
 

@@ -4,7 +4,7 @@ The native ``goose-native`` ("Goose") wrapper is terminal-first: a real
 ``goose session`` CLI runs in the session terminal, the SPA's **Terminal** view
 attaches to that live TUI over a WebSocket, and the SPA's **Chat** view renders
 the SAME canonical transcript the TUI prints. A native forwarder
-(:mod:`omnigent.goose_native_forwarder`) tails Goose's SQLite session store and
+(:mod:`omnigent.harnesses.goose_native.forwarder`) tails Goose's SQLite session store and
 mirrors the transcript back OUT as conversation items; web-composer messages are
 injected INTO the TUI's tmux pane by
 :class:`omnigent.inner.goose_native_executor.GooseNativeExecutor`. This suite is

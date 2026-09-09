@@ -15,9 +15,9 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import native_dispatch
-from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
@@ -144,7 +144,7 @@ async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> 
         return {"PI_BRIDGE": conversation_id}
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.pi_native_bridge.build_pi_native_spawn_env", _fake_build)
+        mp.setattr("omnigent.harnesses.pi_native.bridge.build_pi_native_spawn_env", _fake_build)
         async with httpx.AsyncClient(base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "pi-native",
@@ -174,7 +174,9 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
     transport = httpx.MockTransport(_labels_handler)
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.codex_native_bridge.build_codex_native_spawn_env", _fake_build)
+        mp.setattr(
+            "omnigent.harnesses.codex_native.bridge.build_codex_native_spawn_env", _fake_build
+        )
         async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "codex-native",
@@ -202,7 +204,9 @@ async def test_resolve_native_spawn_env_claude_uses_bridge_id_helper() -> None:
         return "claude_bridge_1"
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.claude_native_bridge.build_claude_native_spawn_env", _fake_build)
+        mp.setattr(
+            "omnigent.harnesses.claude_native.bridge.build_claude_native_spawn_env", _fake_build
+        )
         mp.setattr(
             "omnigent.runner.native.orchestration._claude_native_bridge_id_with_optional_labels",
             _fake_bridge_id,
@@ -235,8 +239,10 @@ async def test_resolve_native_spawn_env_hermes_writes_policy_hook_before_build()
         return {"HERMES_BRIDGE": session_id}
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.hermes_native_bridge.write_policy_hook_config", _fake_write)
-        mp.setattr("omnigent.hermes_native_bridge.build_hermes_native_spawn_env", _fake_build)
+        mp.setattr("omnigent.harnesses.hermes_native.bridge.write_policy_hook_config", _fake_write)
+        mp.setattr(
+            "omnigent.harnesses.hermes_native.bridge.build_hermes_native_spawn_env", _fake_build
+        )
         async with httpx.AsyncClient(base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "hermes-native",
@@ -2526,7 +2532,7 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
     # No bridge dir exists in this test; keep the lazy comment-relay start
     # from parking on the cold-bridge tools/list_changed wait.
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.post_tools_changed",
+        "omnigent.harnesses.claude_native.bridge.post_tools_changed",
         lambda *args, **kwargs: None,
     )
 

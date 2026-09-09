@@ -19,15 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import kimi_native_bridge
-from omnigent.inner import kimi_native_executor
-from omnigent.inner.executor import ExecutorError
-from omnigent.inner.kimi_native_executor import (
-    KimiNativeExecutor,
-    _content_to_text,
-    _latest_user_text,
-)
-from omnigent.kimi_native_bridge import (
+from omnigent.harnesses.kimi_native import bridge as kimi_native_bridge
+from omnigent.harnesses.kimi_native.bridge import (
     APPROVE_KEY,
     BRIDGE_DIR_ENV_VAR,
     DENY_KEY,
@@ -38,6 +31,13 @@ from omnigent.kimi_native_bridge import (
     inject_user_message,
     read_tmux_info,
     write_tmux_target,
+)
+from omnigent.inner import kimi_native_executor
+from omnigent.inner.executor import ExecutorError
+from omnigent.inner.kimi_native_executor import (
+    KimiNativeExecutor,
+    _content_to_text,
+    _latest_user_text,
 )
 from omnigent.llms.errors import RetryableLLMError
 
@@ -1315,7 +1315,7 @@ class TestRegistration:
         assert is_native_harness("native-kimi") is True
 
     def test_native_coding_agent_record(self) -> None:
-        from omnigent.native_coding_agents import native_coding_agent_for_harness
+        from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
         agent = native_coding_agent_for_harness("kimi-native")
         assert agent is not None

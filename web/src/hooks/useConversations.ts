@@ -34,6 +34,7 @@ import {
   PINNED_LABEL_KEY,
   PROJECT_FOLDER_FILTERS,
   PROJECT_LABEL_KEY,
+  recentlyCreatedSessions,
   removeIdsFromPages,
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -188,6 +189,14 @@ export interface Conversation {
    */
   archived?: boolean;
   /**
+   * Client-only: a `temp:` row shown while `createSession` is in flight (the
+   * navigate-first new-chat window). There is no server session behind it yet,
+   * so the sidebar disables per-row mutations (rename / delete / archive / pin /
+   * move) until it's rekeyed to the real id — otherwise they'd hit
+   * `/v1/sessions/temp:*`. Never set on a server row.
+   */
+  provisional?: boolean;
+  /**
    * Total review comments (any status) on this session. Together with
    * `comments_updated_at` it forms a change fingerprint: an add or edit
    * bumps the timestamp, a delete changes the count. SessionUpdatesProvider
@@ -312,30 +321,10 @@ function withoutDeletingSessions(page: ConversationsPage): ConversationsPage {
   };
 }
 
-// ── Recently-created keep-alive ───────────────────────────────────────
-//
-// The push stream inserts a just-created session into the sidebar instantly
-// (SessionUpdatesProvider → insertNewRowsIntoPages), but the create path also
-// fires a `["conversations"]` refetch, and on the search-indexed deployment
-// that fetch lags the write — so it comes back WITHOUT the new session and
-// replaces the cache, dropping the row until the index catches up (it flashes
-// in, then out). We keep the row in the first-page fetch until the index
-// reflects it — the additive mirror of the delete tombstone above.
-const recentlyCreatedSessions = new Map<string, Conversation>();
-
-/** Grace window for the server's async create reindex. */
-const CREATED_KEEPALIVE_MS = 60_000;
-
-/** Keep a just-created session in the first-page list fetch until it's indexed. */
-export function markRecentlyCreated(conv: Conversation): void {
-  recentlyCreatedSessions.set(conv.id, conv);
-  setTimeout(() => recentlyCreatedSessions.delete(conv.id), CREATED_KEEPALIVE_MS);
-}
-
-/** Clear the keep-alive map — exported for test cleanup (mirrors `unmarkSessionsDeleting`). */
-export function clearRecentlyCreated(): void {
-  recentlyCreatedSessions.clear();
-}
+// The recently-created keep-alive map + its mutators live in the leaf
+// `sessionListCache` module (so the chat store can arm it on optimistic create
+// without an import cycle); re-exported here for existing callers.
+export { markRecentlyCreated, clearRecentlyCreated } from "@/lib/sessionListCache";
 
 /**
  * Prepend recently-created rows the first page doesn't yet include (the index

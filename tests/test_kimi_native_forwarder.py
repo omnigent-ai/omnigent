@@ -23,9 +23,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-import omnigent._native_forwarder_health as forwarder_health
-import omnigent.kimi_native_forwarder as fwd
-from omnigent.kimi_native_forwarder import (
+import omnigent.harnesses.kimi_native.forwarder as fwd
+import omnigent.native._native_forwarder_health as forwarder_health
+from omnigent.harnesses.kimi_native.forwarder import (
     KimiWireItem,
     _discover_wire,
     _ForwardState,
@@ -1055,7 +1055,7 @@ class TestUsageSync:
         sync retries the persist, and the next successful write captures the
         current state. Replay after recovery stays idempotent.
         """
-        from omnigent import kimi_native_forwarder as fwd
+        from omnigent.harnesses.kimi_native import forwarder as fwd
 
         _no_window(monkeypatch)
         client = _RecordingClient()
@@ -1281,7 +1281,7 @@ class TestUsageSync:
 
         # A transient read failure hid the prior state at startup and persists
         # through the suspended row (recovery re-reads before dropping).
-        from omnigent import kimi_native_forwarder as fwd
+        from omnigent.harnesses.kimi_native import forwarder as fwd
 
         real_read = fwd._read_usage_state
         monkeypatch.setattr(fwd, "_read_usage_state", lambda _b: (None, False))
@@ -1350,7 +1350,7 @@ class TestUsageSync:
         )
         assert _write_usage_state(tmp_path, prior) is True
 
-        from omnigent import kimi_native_forwarder as fwd
+        from omnigent.harnesses.kimi_native import forwarder as fwd
 
         real_read = fwd._read_usage_state
         monkeypatch.setattr(fwd, "_read_usage_state", lambda _b: (None, False))
@@ -2914,7 +2914,7 @@ async def _drive_loop(
     pane_alive: Callable[[], bool] | None = None,
 ) -> None:
     """Run the real forwarder loop until *until* holds, then cancel it."""
-    from omnigent import kimi_native_forwarder as fwd
+    from omnigent.harnesses.kimi_native import forwarder as fwd
 
     _no_window(monkeypatch)
     monkeypatch.setattr(fwd.httpx, "AsyncClient", lambda **_kw: client)
@@ -3193,7 +3193,7 @@ class TestForwardLoopUsage:
         and still advances the cursor past every row (design ruling:
         transcript liveness wins over usage durability).
         """
-        from omnigent import kimi_native_forwarder as fwd
+        from omnigent.harnesses.kimi_native import forwarder as fwd
 
         home = tmp_path / "home"
         bridge = tmp_path / "bridge"

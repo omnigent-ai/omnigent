@@ -47,13 +47,21 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 // The tree browser only mounts when browsing; coding-fork tests rely on the
 // directory being prefilled from the source, so the real picker never opens —
-// stub it anyway to keep its filesystem fetch out of the test.
+// stub it anyway to keep its filesystem fetch out of the test. Its "Select"
+// button commits an absolute path (onSelect), the only way browsing feeds the
+// form now that typed ~-paths resolve directly.
 vi.mock("./WorkspacePicker", async (importActual) => ({
   ...(await importActual<typeof WorkspacePickerModule>()),
   WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
-    <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
-      pick
-    </button>
+    <div data-testid="mock-workspace-picker">
+      <button
+        type="button"
+        data-testid="mock-pick-workspace"
+        onClick={() => onSelect("/Users/a/git/omnigent")}
+      >
+        pick
+      </button>
+    </div>
   ),
 }));
 
@@ -913,6 +921,82 @@ describe("ForkSessionDialog", () => {
         "host_1",
         "conv_fork",
         "/Users/a/repo-worktrees/fix-1",
+        undefined,
+      );
+    });
+
+    it("enables the submit for a typed tilde path without opening the browser", async () => {
+      // The reported journey: type "~/git/omnigent" into the field and stop —
+      // no Enter, no browsing. A tilde path reads like a real directory but
+      // the server never expands ~, so the submit used to stay greyed unless
+      // the user discovered the tree browser. The dialog now resolves ~
+      // against the host's home (from the home listing) so the typed path is
+      // directly submittable.
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      // Home listing: the first entry's parent (/Users/a) resolves the host's
+      // home, so "~/git/omnigent" expands to "/Users/a/git/omnigent".
+      useHostFilesystemMock.mockReturnValue({
+        data: { entries: [{ name: "git", path: "/Users/a/git", type: "directory" }] },
+        isPlaceholderData: false,
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useHostFilesystem>);
+      renderDialog(CODING);
+
+      openAdvanced();
+      const input = screen.getByTestId("workspace-path-input");
+      fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+
+      // No Enter, no browser — the submit enables purely from the ~-resolve.
+      expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
+      await waitFor(() => expect(screen.getByTestId("fork-session-submit")).toBeEnabled());
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // Launched with the resolved absolute path, not the raw tilde.
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/git/omnigent",
+        undefined,
+      );
+    });
+
+    it("adopts an absolute path picked from the tree browser", async () => {
+      // The browse route: open the tree browser and click "Select". The
+      // picker commits an absolute path (onSelect), which enables the submit
+      // and launches on it. (Typed ~-paths resolve directly, tested above —
+      // this covers the still-live browser path.)
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(CODING);
+
+      openAdvanced();
+      const input = screen.getByTestId("workspace-path-input");
+      // A tilde value alone is not submittable (the server never expands ~).
+      fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+      expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+
+      // Enter commits the typed path and opens the tree browser at it.
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
+
+      // "Select" commits the browser's absolute path into the form.
+      fireEvent.click(screen.getByTestId("mock-pick-workspace"));
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/git/omnigent");
+      expect(screen.getByTestId("fork-session-submit")).toBeEnabled();
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/git/omnigent",
         undefined,
       );
     });

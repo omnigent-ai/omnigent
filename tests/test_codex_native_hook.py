@@ -10,14 +10,15 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import codex_native_hook, native_policy_hook
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native import hook as codex_native_hook
+from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
     prepare_bridge_dir,
     write_bridge_state,
     write_policy_hook_config,
 )
+from omnigent.native import native_policy_hook
 from tests.native_hook_helpers import make_failing_client
 
 
@@ -145,7 +146,9 @@ def bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     :param monkeypatch: pytest monkeypatch fixture.
     :returns: Prepared bridge directory.
     """
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-native"
+    )
     bdir = prepare_bridge_dir("bridge_test")
     write_bridge_state(
         bdir,
@@ -354,7 +357,9 @@ def test_missing_bridge_state_is_fail_open(
     block tools — the hook returns 0 with no verdict. ``_RaisesIfCalled``
     asserts the network was never reached.
     """
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-native"
+    )
     empty_dir = prepare_bridge_dir("bridge_no_state")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
 
@@ -486,7 +491,7 @@ def test_pre_tool_use_uses_relay_when_tool_relay_json_has_session_id(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Hook POSTs to relay /policies/evaluate when tool_relay.json has session_id."""
-    from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+    from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
 
     relay_token = "relay-tok-abc"
     relay_url = "http://127.0.0.1:19999"
@@ -521,7 +526,7 @@ def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_i
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Hook falls back to policy_hook.json when tool_relay.json has no session_id."""
-    from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+    from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
 
     # Relay present but no session_id — not policy-capable.
     (bridge_dir / _TOOL_RELAY_FILE).write_text(
@@ -1043,7 +1048,7 @@ def _install_fake_client(
     :returns: The stub the hook will use.
     """
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server.client_for_transport",
+        "omnigent.harnesses.codex_native.app_server.client_for_transport",
         lambda *args, **kwargs: client,
     )
     return client
@@ -1075,7 +1080,7 @@ def test_apply_thread_model_switches_in_codex_spelling(
     applied: str,
 ) -> None:
     """The thread switch and the config.toml mirror both speak codex."""
-    from omnigent.codex_native_bridge import read_codex_config_model
+    from omnigent.harnesses.codex_native.bridge import read_codex_config_model
 
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _FakeAppServerClient(_LIVE_CATALOG))
@@ -1101,7 +1106,7 @@ def test_apply_thread_model_declines_a_model_this_pane_cannot_serve(
     the authority: no row names the pick, no switch, and the reason is said out
     loud rather than being swallowed.
     """
-    from omnigent.codex_native_bridge import read_codex_config_model
+    from omnigent.harnesses.codex_native.bridge import read_codex_config_model
 
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _FakeAppServerClient(_LIVE_CATALOG))
@@ -1122,7 +1127,7 @@ def test_apply_thread_model_declines_when_the_catalog_cannot_be_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unreadable catalog proves nothing, so it is not proof of reachability."""
-    from omnigent.codex_native_bridge import read_codex_config_model
+    from omnigent.harnesses.codex_native.bridge import read_codex_config_model
 
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _FakeAppServerClient(None))
@@ -1235,7 +1240,7 @@ def test_route_turn_is_not_registered_for_a_session_that_cannot_route(
     the hook's routing round trip (25s worst case on a degraded server) only to
     be told the session does not route. The policy gate stays, unaffected.
     """
-    from omnigent.codex_native_app_server import _codex_policy_hooks_settings
+    from omnigent.harnesses.codex_native.app_server import _codex_policy_hooks_settings
 
     off = _codex_policy_hooks_settings(tmp_path, sys.executable, turn_routing=False)
     commands = [
@@ -1256,7 +1261,7 @@ def test_the_turn_router_advertisement_is_the_switch_for_the_hook(tmp_path: Path
     """The runner only advertises for a session that launched with routing on."""
     import os
 
-    from omnigent.codex_native_app_server import _turn_router_advertised
+    from omnigent.harnesses.codex_native.app_server import _turn_router_advertised
     from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
 
     assert _turn_router_advertised(tmp_path) is False

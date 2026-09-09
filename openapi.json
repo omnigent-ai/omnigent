@@ -2596,6 +2596,32 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostModelOptionsResponse": {
+        "description": "Pre-launch model choices resolved by a host harness.",
+        "properties": {
+          "models": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "routable_models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Routable Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models",
+          "routable_models"
+        ],
+        "title": "HostModelOptionsResponse",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -8488,6 +8514,20 @@
         "title": "UsageReport",
         "type": "object"
       },
+      "UserSettingsUpdate": {
+        "description": "Writable current-user settings.",
+        "properties": {
+          "background_session_titles_enabled": {
+            "title": "Background Session Titles Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "background_session_titles_enabled"
+        ],
+        "title": "UserSettingsUpdate",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -9609,12 +9649,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {},
-                    "type": "array"
-                  },
-                  "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HostModelOptionsResponse"
                 }
               }
             },
@@ -12478,7 +12513,7 @@
     },
     "/v1/sessions/{session_id}/policies/evaluate": {
       "post": {
-        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.claude_native_hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
+        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.harnesses.claude_native.hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
         "operationId": "evaluate_policy_v1_sessions__session_id__policies_evaluate_post",
         "parameters": [
           {
@@ -14100,6 +14135,48 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/preferences": {
+      "post": {
+        "description": "Apply the GitHub panel's account (and optional base) selection.\n\nPersists the choice \u2014 a per-workspace account preference in the user\nconfig, and `gh repo set-default` when a base is given \u2014 then returns the\nrefreshed `session.github.info`. Served by the runner when it's online,\nelse by the host over its tunnel (both run the same\n`github_resource.set_github_preference` against the local config +\nworkspace), so a preference change works with the runner asleep.\n\n**Returns:** The refreshed `session.github.info` object.",
+        "operationId": "set_session_github_preference_v1_sessions__session_id__resources_github_preferences_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Session Github Preference",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/terminals": {
       "get": {
         "description": "Return only terminal resources for a session.\n\nThe runner endpoint's pagination params (`limit` / `after` /\n`before` / `order`) are forwarded from the incoming query\nstring \u2014 without this, a client-requested `order=asc` (the web\nterminal tabs rely on creation order to keep the session's own\nterminal first) would be silently dropped and the runner's\n`desc` default would apply.\n\n**Returns:** `PaginatedList` of terminal resources.",
@@ -14587,6 +14664,74 @@
         "summary": "Get Usage",
         "tags": [
           "usage"
+        ]
+      }
+    },
+    "/v1/user-settings": {
+      "get": {
+        "operationId": "get_user_settings_v1_user_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Get User Settings V1 User Settings Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get User Settings",
+        "tags": [
+          "user_settings"
+        ]
+      },
+      "put": {
+        "operationId": "update_user_settings_v1_user_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserSettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Update User Settings V1 User Settings Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update User Settings",
+        "tags": [
+          "user_settings"
         ]
       }
     }

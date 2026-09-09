@@ -168,7 +168,7 @@ def same_arm(left: str | None, right: str | None) -> bool:
     :param right: A model id, or ``None``.
     :returns: ``True`` when both name the same arm.
     """
-    from omnigent.codex_model_vocabulary import comparable_model_id
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
 
     if not left or not right:
         return False
@@ -194,7 +194,7 @@ def claude_bridge_dir(session_id: str) -> Path:
     :param session_id: Session id, which is also the bridge id.
     :returns: The bridge directory path (may not exist yet).
     """
-    from omnigent.claude_native_bridge import bridge_dir_for_bridge_id
+    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
 
     return bridge_dir_for_bridge_id(session_id)
 
@@ -205,7 +205,7 @@ def codex_bridge_dir(session_id: str) -> Path:
     :param session_id: Session id, which is also the bridge id.
     :returns: The bridge directory path (may not exist yet).
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id
+    from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id
 
     return bridge_dir_for_bridge_id(session_id)
 
@@ -396,7 +396,7 @@ def codex_config_model(session_id: str) -> str | None:
     :param session_id: Session id.
     :returns: The top-level ``model`` value, or ``None``.
     """
-    from omnigent.codex_native_bridge import read_codex_config_model
+    from omnigent.harnesses.codex_native.bridge import read_codex_config_model
 
     return read_codex_config_model(codex_bridge_dir(session_id))
 
@@ -440,7 +440,7 @@ def rollout_turn_contexts(session_id: str) -> list[dict[str, Any]]:
     :returns: The decoded ``turn_context`` payloads in file order; empty when
         no rollout exists yet.
     """
-    from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
 
     sessions_dir = codex_home_for_bridge_dir(codex_bridge_dir(session_id)) / "sessions"
     rollouts = sorted(sessions_dir.rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime)

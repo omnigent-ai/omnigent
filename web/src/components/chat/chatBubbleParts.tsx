@@ -372,6 +372,11 @@ function useAgentTurnActive(): boolean {
  */
 export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
   if (blockedOn) {
+    // A "dialog open" block lives only in the terminal tab, so point the user
+    // there to respond rather than leaving the session looking hung.
+    if (blockedOn === "dialog open") {
+      return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
+    }
     return `Blocked on: ${blockedOn}`;
   }
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
@@ -498,10 +503,12 @@ export const BubbleView = memo(
     bubble,
     isLastAssistant = false,
     showsWorking = false,
+    actionsPersistent = false,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
+    actionsPersistent?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
@@ -524,12 +531,14 @@ export const BubbleView = memo(
         bubble={bubble}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
+        actionsPersistent={actionsPersistent}
       />
     );
   },
   (prev, next) =>
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
+    (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -769,10 +778,12 @@ function AssistantBubble({
   bubble,
   isLastAssistant = false,
   showsWorking = false,
+  actionsPersistent = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
+  actionsPersistent?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
@@ -863,7 +874,12 @@ function AssistantBubble({
         {/* Skipped on a fold-only bubble, when there is neither a timestamp nor
             actions, and on an error-only bubble. Order: actions, then timestamp. */}
         {!foldOnly && !errorOnly && (ts || markdownText) && (
-          <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <div
+            className={cn(
+              "flex items-center gap-3 py-1 opacity-40 transition-opacity md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+              !actionsPersistent && "md:opacity-0",
+            )}
+          >
             {markdownText && (
               <MessageActions>
                 <MessageAction

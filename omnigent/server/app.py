@@ -102,6 +102,7 @@ from omnigent.server.routes.sessions import (
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
+from omnigent.server.routes.user_settings import create_user_settings_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -766,7 +767,7 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     import inspect
     import tempfile
 
-    from omnigent.native_dispatch import resolve_hook
+    from omnigent.native.native_dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
 
     materialize = resolve_hook(provider, "materialize_agent_spec")
@@ -803,7 +804,7 @@ def _ensure_default_native_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     for agent in NATIVE_CODING_AGENTS:
         provider = native_provider_for_key(agent.key)
@@ -2724,6 +2725,11 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sharing"],
+    )
+    app.include_router(
+        create_user_settings_router(auth_provider, permission_store),
+        prefix="/v1",
+        tags=["user_settings"],
     )
 
     # First-class projects (owner-private session containers). Mounted only

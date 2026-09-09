@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import tomllib
 
-from omnigent.kimi_native_credentials import (
+from omnigent.harnesses.kimi_native.credentials import (
     KIMI_CODE_HOME_ENV_VAR,
     build_kimi_session_home,
     render_kimi_hooks_toml,
@@ -36,13 +36,13 @@ def test_render_hooks_toml_is_valid_and_complete() -> None:
     events = {h["event"] for h in parsed["hooks"]}
     assert events == {"PreToolUse", "PermissionRequest"}
     for hook in parsed["hooks"]:
-        assert "omnigent.kimi_native_hook" in hook["command"]
+        assert "omnigent.harnesses.kimi_native.hook" in hook["command"]
         assert "/tmp/b r" in hook["command"]  # space-bearing path round-trips
         # ``-I`` (isolated mode) is mandatory: kimi runs the hook with cwd set to
         # the session workspace, so without it a workspace containing its own
         # ``omnigent/`` shadows the install and the hook dies on ImportError
         # before publishing the approval card.
-        assert " -I -m omnigent.kimi_native_hook" in hook["command"]
+        assert " -I -m omnigent.harnesses.kimi_native.hook" in hook["command"]
         # Pinned above kimi's 30s default so the permission hook survives a slow
         # web verdict (else the injected keystroke never lands); 600 is kimi's
         # ceiling.

@@ -153,6 +153,16 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
+    def get_background_session_titles_enabled(self, user_id: str) -> bool:
+        """Return the user's background-title preference, defaulting to enabled."""
+        ...
+
+    @abstractmethod
+    def set_background_session_titles_enabled(self, user_id: str, enabled: bool) -> None:
+        """Persist the user's background-title preference."""
+        ...
+
+    @abstractmethod
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """Return every real user row, for the admin user list.
 

@@ -37,6 +37,8 @@ const mocks = vi.hoisted(() => ({
   projectNames: [] as string[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
+  getUserSettings: vi.fn(),
+  updateUserSettings: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -58,6 +60,10 @@ vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
+}));
+vi.mock("@/lib/userSettingsApi", () => ({
+  getUserSettings: mocks.getUserSettings,
+  updateUserSettings: mocks.updateUserSettings,
 }));
 vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
@@ -275,6 +281,30 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  beforeEach(() => {
+    mocks.getUserSettings.mockResolvedValue({ backgroundSessionTitlesEnabled: true });
+    mocks.updateUserSettings.mockImplementation(async (settings) => settings);
+  });
+
+  it("renders session auto-rename enabled by default", async () => {
+    renderPage("/settings/general");
+
+    expect(await screen.findByTestId("background-session-titles-toggle")).toBeChecked();
+  });
+
+  it("persists session auto-rename changes", async () => {
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("background-session-titles-toggle");
+
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(mocks.updateUserSettings).toHaveBeenCalledWith({
+        backgroundSessionTitlesEnabled: false,
+      }),
+    );
+    expect(toggle).not.toBeChecked();
+  });
   it("renders composer shortcut guidance as two accessible lines", () => {
     renderPage("/settings/general");
     const toggle = screen.getByTestId("composer-submit-with-mod-enter-toggle");

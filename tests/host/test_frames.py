@@ -17,6 +17,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
@@ -1611,6 +1612,34 @@ def test_fs_request_non_object_params_raises() -> None:
         decode_host_frame(
             '{"kind": "host.fs_request", "request_id": "r", "op": "changes", '
             '"workspace": "/w", "session_id": "s", "params": []}'
+        )
+
+
+def test_fs_write_round_trip() -> None:
+    """A host.fs_write_request round-trips op, workspace, session, and params.
+
+    The write frame carries the GitHub preference selection to the host when the
+    runner is offline; a dropped ``params`` would apply an empty selection.
+    """
+    original = HostFsWriteFrame(
+        request_id="req_fsw_1",
+        op="github_set_preference",
+        workspace="/Users/corey/project",
+        session_id="conv_abc123",
+        params={"account": "octocat", "remote": "origin"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsWriteFrame)
+    assert decoded == original
+
+
+def test_fs_write_non_object_params_raises() -> None:
+    """A non-object ``params`` on a write frame is rejected, like the read frame."""
+    with pytest.raises(ValueError, match="must be a JSON object: 'params'"):
+        decode_host_frame(
+            '{"kind": "host.fs_write_request", "request_id": "r", '
+            '"op": "github_set_preference", "workspace": "/w", "session_id": "s", '
+            '"params": []}'
         )
 
 

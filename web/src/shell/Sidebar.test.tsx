@@ -433,6 +433,22 @@ describe("Sidebar session list", () => {
     expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
   });
 
+  it("renders a provisional (temp:) row as a bare navigable link with no mutating actions", () => {
+    // A client-only temp row has no server session, so its per-row mutations
+    // (kebab: rename/delete/archive/move/share) must be suppressed — invoking
+    // them would POST to /v1/sessions/temp:* (Polly B-3).
+    mockConversations([
+      conv("temp:0a1b2c3d", "Claude Code", { title: "new chat", provisional: true }),
+    ]);
+    renderSidebar();
+
+    // Navigable: the row is still a link into the (soon-to-exist) conversation.
+    const link = screen.getByRole("link", { name: /new chat/ });
+    expect(link).toHaveAttribute("href", expect.stringContaining("/c/temp:0a1b2c3d"));
+    // But no action affordances until it's rekeyed to the real id.
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).not.toBeInTheDocument();
+  });
+
   it("uses the interface text token for session-list errors", () => {
     conversationsRef.current = [];
     useConvMock.mockReturnValue({
@@ -847,6 +863,27 @@ describe("Sidebar session list", () => {
     const usage = screen.getByTestId("usage-nav");
     expect(usage).toHaveAttribute("href", "/usage");
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("hides Canvas navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas");
+
+    expect(screen.queryByTestId("canvas-nav")).toBeNull();
+  });
+
+  it("renders and highlights the Canvas nav row without lighting New session", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { canvas: true },
+    });
+
+    const canvas = screen.getByTestId("canvas-nav");
+    expect(canvas).toHaveAttribute("href", "/canvas");
+    expect(canvas).toHaveAttribute("aria-current", "page");
+    expect(canvas).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("keeps filtering visible while session selection remains hover-revealed", () => {

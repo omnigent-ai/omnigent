@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import codex_native_bridge
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
@@ -48,7 +48,12 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Pat
 
     prefix = "mcp_servers.omnigent.args="
     raw = next(o[len(prefix) :] for o in overrides if o.startswith(prefix))
-    assert json.loads(raw)[:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
+    assert json.loads(raw)[:4] == [
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.bridge",
+        "serve-mcp",
+    ]
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
@@ -97,7 +102,9 @@ def bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     :param monkeypatch: pytest monkeypatch fixture.
     :returns: Prepared bridge directory.
     """
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-native"
+    )
     return prepare_bridge_dir("bridge_test")
 
 
@@ -476,9 +483,11 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
     prune the dir only when its owner is provably dead."""
     import os
 
-    from omnigent.codex_native_bridge import prepare_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import prepare_bridge_dir
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-native"
+    )
 
     bridge_dir = prepare_bridge_dir("bridge_owner")
 
@@ -494,11 +503,11 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     import subprocess
     import sys
 
-    from omnigent.codex_native_bridge import prune_orphaned_bridge_dirs
+    from omnigent.harnesses.codex_native.bridge import prune_orphaned_bridge_dirs
 
     root = tmp_path / "codex-native"
     root.mkdir(parents=True)
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
 
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()

@@ -20,14 +20,14 @@ from typing import Any
 from pydantic import ValidationError
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.model_override import validate_model_override
-from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
+from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.project_store import ProjectStore
+from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
 
 _logger = logging.getLogger(__name__)
 

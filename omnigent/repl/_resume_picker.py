@@ -61,15 +61,15 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
+from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 
 # Client-side persistent launch state. The picker reads this per row
 # to render workspace metadata for native wrapper sessions. Decoupled
 # from the heavy wrapper import graphs; these state modules have no
 # tmux / websocket dependencies.
-from omnigent.claude_native_state import read_launch_state as _read_claude_launch_state
-from omnigent.codex_native_state import read_launch_state as _read_codex_launch_state
-from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.harnesses.claude_native.state import read_launch_state as _read_claude_launch_state
+from omnigent.harnesses.codex_native.state import read_launch_state as _read_codex_launch_state
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 
 # Page size for the paginated picker.
 # Small enough that a 24-line terminal shows the whole page; big enough

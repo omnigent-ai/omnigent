@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.claude_model_vocabulary import (
+from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     claude_model_command_arg,
     model_vocabulary_env,
@@ -164,7 +164,7 @@ def test_prefix_fold_strips_the_namespace_but_keeps_the_context_marker() -> None
 
 def test_catalog_prefixes_match_the_routing_defaults() -> None:
     """This module duplicates the prefix list to stay stdlib-only; keep it equal."""
-    from omnigent.claude_model_vocabulary import _CATALOG_PREFIXES
+    from omnigent.models.claude_model_vocabulary import _CATALOG_PREFIXES
     from omnigent.server.smart_routing import MODEL_ID_PREFIXES
 
     assert _CATALOG_PREFIXES == MODEL_ID_PREFIXES

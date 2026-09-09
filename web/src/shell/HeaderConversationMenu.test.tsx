@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   archive: vi.fn(),
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
+  fork: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -75,7 +76,9 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
         conversation={CONVERSATION}
         currentProject={null}
         canShare
+        canFork
         onShare={() => {}}
+        onFork={mocks.fork}
         {...overrides}
       />
     </MemoryRouter>
@@ -118,6 +121,7 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -147,6 +151,15 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Mark as unread" }));
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
+  });
+
+  it("opens a full-history fork from the session menu", () => {
+    renderMenu();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(mocks.fork).toHaveBeenCalledOnce();
   });
 
   it("renames from the mobile Rename dialog", () => {
@@ -394,6 +407,7 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -414,6 +428,7 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
       "Rename",
       "Mark as unread",
       "Add to project",

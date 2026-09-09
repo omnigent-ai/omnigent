@@ -30,10 +30,12 @@ import {
   FolderMinusIcon,
   FolderOpenIcon,
   GitBranchIcon,
+  GitForkIcon,
   InboxIcon,
   ListChecksIcon,
   ListFilterIcon,
   LaptopIcon,
+  LayoutDashboardIcon,
   Loader2Icon,
   MailIcon,
   MessageCircleDashedIcon,
@@ -151,7 +153,6 @@ import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
-import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -175,6 +176,8 @@ import {
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
+import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
 import { NewProjectButton } from "./NewProjectButton";
@@ -193,8 +196,11 @@ import {
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
+  isOwnedByViewer,
+  sessionBelongsToProject,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
@@ -376,6 +382,7 @@ interface SidebarProps {
 function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
+  isCanvasPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
@@ -387,6 +394,7 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
+  const isCanvasPage = !isExtensionRoute && leaf === "canvas";
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
@@ -394,6 +402,7 @@ function useActiveNavItem(): {
   const isNewSessionRoute =
     activeConversationId == null &&
     !isInboxPage &&
+    !isCanvasPage &&
     !isTasksPage &&
     !isUsagePage &&
     !isExtensionRoute;
@@ -408,6 +417,7 @@ function useActiveNavItem(): {
   return {
     isNewChatPage,
     isInboxPage,
+    isCanvasPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -573,6 +583,7 @@ function SidebarImpl({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -756,6 +767,7 @@ function SidebarImpl({
   const {
     isNewChatPage,
     isInboxPage,
+    isCanvasPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -1168,6 +1180,17 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              {canvasEnabled && (
+                <PrimaryNavLink
+                  to="/canvas"
+                  label="Canvas"
+                  icon={LayoutDashboardIcon}
+                  active={isCanvasPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.canvas"
+                  testId="canvas-nav"
+                />
+              )}
               <ExtensionPrimaryNavigation
                 activePageId={activeExtensionPageId}
                 onNavigate={onNavClick}
@@ -1556,50 +1579,6 @@ interface ConversationListProps {
   getVisibleIdsRef: RefObject<() => string[]>;
 }
 
-// Ownership drives the My-vs-Shared split and every owner-only row action.
-// It is derived purely from the session's `owner` (the creator's user id),
-// NOT from `permission_level` — the sidebar carries no effective-level info,
-// so the server can list rows without resolving the caller's grant per
-// session. A `null`/absent owner (permissions disabled — the server emits
-// `owner` only when a permission store is wired) reads as owned, matching the
-// prior permissive-on-null stance; otherwise the viewer owns it iff they are
-// the owner. In single-user mode the owner grant is the reserved `"local"`
-// id, and `viewerId` is `"local"` too (see `useViewerId`), so it matches via
-// the equality branch. `viewerId` is `null` until identity resolves — treated
-// as "not the owner" for shared rows so they don't briefly flash into "My
-// sessions" before the id lands.
-function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
-  const owner = conversation.owner ?? null;
-  if (owner === null) return true;
-  return owner === viewerId;
-}
-
-// The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
-// (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
-// grant, which in single-user mode is the reserved `"local"` id — and
-// `getCurrentAuthorId` nulls `"local"` out (it's for author labels), which
-// would make the viewer's own sessions read as shared and vanish from the
-// default "My sessions" tab. `getCurrentUserId` keeps `"local"` and is the
-// identical real email in multi-user mode. It is synchronous (populated once
-// `resolveIdentity` has run — which `main.tsx` kicks off at boot), but on a
-// cold mount it can still be null for a tick, so we also await
-// `resolveIdentity()` and re-render when it lands. Keeping this reactive
-// (rather than a bare module read) means the My/Shared split settles correctly
-// the moment identity is known, without a manual refresh.
-function useViewerId(): string | null {
-  const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
-  useEffect(() => {
-    let cancelled = false;
-    void resolveIdentity().then(() => {
-      if (!cancelled) setViewerId(getCurrentUserId());
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return viewerId;
-}
-
 function ConversationList({
   conversationsQuery,
   scrollContainerRef,
@@ -1769,10 +1748,7 @@ function ConversationList({
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
       const inProject = notArchived.filter(
-        (c) =>
-          isOwnedByViewer(c, viewerId) &&
-          ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-          !pinnedIdSet.has(c.id),
+        (c) => sessionBelongsToProject(c, { id, name }, viewerId) && !pinnedIdSet.has(c.id),
       );
       inProject.forEach((c) => filedIds.add(c.id));
       return {
@@ -3148,6 +3124,7 @@ function ConversationMenuItems({
   moveToProject,
   stopSession,
   setShareOpen,
+  setForkOpen,
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
@@ -3177,6 +3154,7 @@ function ConversationMenuItems({
   moveToProject: ReturnType<typeof useMoveToProject>;
   stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
+  setForkOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
@@ -3284,6 +3262,10 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
+      <C.Item data-testid="fork-conversation" onSelect={() => setForkOpen(true)}>
+        <GitForkIcon className="size-3.5" />
+        Fork
+      </C.Item>
       {isOwner ? (
         <C.Item
           data-testid="rename-conversation"
@@ -3540,6 +3522,10 @@ function ConversationRowImpl({
 }) {
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
+  // A client-only `temp:` row (navigate-first create window): no server session
+  // yet, so per-row mutations are disabled until it's rekeyed to the real id —
+  // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
+  const isProvisionalRow = conversation.provisional === true;
   // Mobile has no real hover, so a tap that navigates would also trip the
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
@@ -3585,6 +3571,7 @@ function ConversationRowImpl({
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [forkOpen, setForkOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
@@ -3722,7 +3709,7 @@ function ConversationRowImpl({
   } = useDraggable({
     id: conversation.id,
     data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing,
+    disabled: !isOwner || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -3866,6 +3853,7 @@ function ConversationRowImpl({
     moveToProject,
     stopSession,
     setShareOpen,
+    setForkOpen,
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
@@ -3929,6 +3917,7 @@ function ConversationRowImpl({
       onDoubleClick={(e) => {
         if (selectionMode) return;
         if (!isOwner) return;
+        if (isProvisionalRow) return; // no rename before the real session exists
         e.preventDefault();
         // The dblclick's own second click was already recorded above, so
         // exactly ONE recent click means the first click landed on a different
@@ -3961,6 +3950,18 @@ function ConversationRowImpl({
       </div>
     </Link>
   );
+
+  // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
+  // context menu, pin, archive, drag) until the real session exists — those
+  // would POST to `/v1/sessions/temp:*`. Rekey to the real id (`hydrateLocal-
+  // Conversation`) drops `provisional` and the full row renders.
+  if (isProvisionalRow) {
+    return (
+      <li ref={rowRef} className="group relative">
+        {rowLink}
+      </li>
+    );
+  }
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
@@ -4235,6 +4236,17 @@ function ConversationRowImpl({
           onOpenChange={setShareOpen}
         />
       )}
+      {forkOpen && (
+        <ForkSessionDialog
+          sourceSessionId={conversation.id}
+          sourceTitle={conversation.title}
+          sourceWorkspace={conversation.workspace}
+          sourceHostId={conversation.host_id}
+          sourceGitBranch={conversation.git_branch}
+          open
+          onOpenChange={setForkOpen}
+        />
+      )}
       <Dialog
         open={deleteOpen}
         onOpenChange={(open) => {
@@ -4415,6 +4427,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "project_id",
   "owner",
   "pending_elicitations_count",
+  "provisional",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {

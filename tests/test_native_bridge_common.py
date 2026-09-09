@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent import native_bridge_common
+from omnigent.native import native_bridge_common
 
 
 def test_write_owner_pid_marker_records_current_pid(tmp_path: Path) -> None:
@@ -95,17 +95,19 @@ def test_reap_invokes_prune_for_every_native_agent(monkeypatch: pytest.MonkeyPat
         return _prune
 
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.prune_orphaned_bridge_dirs", _recorder("claude", 1)
+        "omnigent.harnesses.claude_native.bridge.prune_orphaned_bridge_dirs",
+        _recorder("claude", 1),
     )
     monkeypatch.setattr(
-        "omnigent.codex_native_bridge.prune_orphaned_bridge_dirs", _recorder("codex", 2)
+        "omnigent.harnesses.codex_native.bridge.prune_orphaned_bridge_dirs", _recorder("codex", 2)
     )
     monkeypatch.setattr(
-        "omnigent.antigravity_native_bridge.prune_orphaned_bridge_dirs",
+        "omnigent.harnesses.antigravity_native.bridge.prune_orphaned_bridge_dirs",
         _recorder("antigravity", 3),
     )
     monkeypatch.setattr(
-        "omnigent.opencode_native_bridge.prune_orphaned_bridge_dirs", _recorder("opencode", 4)
+        "omnigent.harnesses.opencode_native.bridge.prune_orphaned_bridge_dirs",
+        _recorder("opencode", 4),
     )
 
     total = native_bridge_common.reap_orphaned_native_bridge_dirs()
@@ -131,7 +133,9 @@ def test_reap_skips_agents_without_a_prune_and_bad_modules(
         called.append("claude")
         return 5
 
-    monkeypatch.setattr("omnigent.claude_native_bridge.prune_orphaned_bridge_dirs", _claude_prune)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.prune_orphaned_bridge_dirs", _claude_prune
+    )
 
     total = native_bridge_common.reap_orphaned_native_bridge_dirs()
 
@@ -150,8 +154,8 @@ def test_reap_isolates_a_failing_pruner(monkeypatch: pytest.MonkeyPatch) -> None
     def _ok() -> int:
         return 7
 
-    monkeypatch.setattr("omnigent.codex_native_bridge.prune_orphaned_bridge_dirs", _boom)
-    monkeypatch.setattr("omnigent.claude_native_bridge.prune_orphaned_bridge_dirs", _ok)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge.prune_orphaned_bridge_dirs", _boom)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.prune_orphaned_bridge_dirs", _ok)
 
     # codex raises but is swallowed; claude still runs and its count is returned.
     assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 7
@@ -180,7 +184,9 @@ def test_reap_isolates_a_module_that_raises_on_import(
         called.append("claude")
         return 3
 
-    monkeypatch.setattr("omnigent.claude_native_bridge.prune_orphaned_bridge_dirs", _claude_prune)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.prune_orphaned_bridge_dirs", _claude_prune
+    )
 
     # The broken module's import RuntimeError is swallowed; claude still runs.
     assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 3
