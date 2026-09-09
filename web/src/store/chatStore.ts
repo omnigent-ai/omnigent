@@ -1107,6 +1107,11 @@ export interface ChatState extends ConversationState, AppChatState, ChatActions 
 
 let queryClient: QueryClient | null = null;
 
+// Any semantic stream event makes a snapshot already in flight potentially
+// stale. Heartbeats are filtered before this revision is bumped.
+const streamEventRevisions = new Map<string, number>();
+conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+
 /**
  * Evict a conversation from the live registry.
  *
@@ -1401,6 +1406,7 @@ const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
+export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
 // A reverse proxy serves 404 for the stream route for the ~10-60s a backend
 // container takes to restart (upgrade, config change, re-seed bounce), so a
 // 404 mid-restart must not be treated as permanent. Bound the retries instead
@@ -3995,10 +4001,9 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
 /**
  * Reconcile the visible conversation's lifecycle from its persisted snapshot.
  *
- * A stream can keep receiving heartbeats while missing a real lifecycle event.
- * The byte-stall guard cannot detect that semantic gap, so periodically re-read
- * durable status while the stream remains open. If a live event changes the
- * entry during the fetch, discard the older snapshot.
+ * A stream pump can keep receiving heartbeats while missing a lifecycle event.
+ * Periodically re-read durable status, discarding a snapshot if any semantic
+ * stream event arrives during the fetch.
  */
 async function reconcileActiveSessionStatus(
   id: string,
@@ -4015,16 +4020,24 @@ async function reconcileActiveSessionStatus(
     return;
   }
   const stateBeforeFetch = get();
+  const revisionBeforeFetch = streamEventRevisions.get(id) ?? 0;
+  const snapshotController = new AbortController();
+  const abortSnapshot = () => snapshotController.abort();
+  controller.signal.addEventListener("abort", abortSnapshot, { once: true });
+  const snapshotTimeout = window.setTimeout(
+    abortSnapshot,
+    ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
+  );
   let session: Session;
   try {
-    session = await queryClient.fetchQuery({
-      queryKey: ["session", id],
-      queryFn: () => getSessionSlim(id),
-      staleTime: 0,
-      retry: false,
-    });
+    // This read must not join the shared React Query request: an older request
+    // could have started before the live event this reconciliation follows.
+    session = await getSessionSlim(id, { signal: snapshotController.signal });
   } catch {
     return;
+  } finally {
+    window.clearTimeout(snapshotTimeout);
+    controller.signal.removeEventListener("abort", abortSnapshot);
   }
   const current = get();
   if (
@@ -4032,6 +4045,7 @@ async function reconcileActiveSessionStatus(
     isConversationDisposed(id) ||
     conversationRegistry.getActive()?.id !== id ||
     get().abortController !== controller ||
+    (streamEventRevisions.get(id) ?? 0) !== revisionBeforeFetch ||
     current.sessionStatus !== stateBeforeFetch.sessionStatus ||
     current.status !== stateBeforeFetch.status ||
     current.activeResponse !== stateBeforeFetch.activeResponse ||
@@ -6610,6 +6624,9 @@ async function* tapSessionEvents(
   onElicitationResolved?: (elicitationId: string) => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
+    if (!isConversationDisposed(conversationId)) {
+      streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+    }
     handleSessionEvent(event, conversationId);
     if (event.type === "elicitation_resolved") {
       onElicitationResolved?.(event.elicitationId);
