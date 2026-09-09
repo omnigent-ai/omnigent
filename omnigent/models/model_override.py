@@ -244,6 +244,23 @@ def canonical_model_spelling(model: str) -> str:
     return model
 
 
+def is_mechanical_vendor_id(model: str) -> bool:
+    """
+    Report whether *model* is a mechanical vendor id, gateway-prefixed or not.
+
+    True for the ``claude/gpt/glm/kimi`` shapes of
+    :data:`_MECHANICAL_VENDOR_ID_RE`, with or without the ``databricks-``
+    prefix. Lets a caller tell a provider-qualified reference whose tail is a
+    recognizable model id (``someprovider/claude-opus-4-7``) from a model id
+    that itself contains a slash (``zai-org/GLM-4.7``).
+
+    :param model: A model id candidate, e.g. ``"databricks-claude-opus-4-7"``.
+    :returns: ``True`` for a recognizable vendor id shape.
+    """
+    bare = model.removeprefix(_DATABRICKS_MODEL_PREFIX)
+    return _MECHANICAL_VENDOR_ID_RE.fullmatch(bare) is not None
+
+
 def normalize_model_for_provider(model: str, provider_kind: str | None) -> str:
     """
     Mechanically localize *model* for the child's resolved provider.

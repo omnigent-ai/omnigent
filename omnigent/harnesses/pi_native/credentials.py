@@ -27,7 +27,7 @@ import shlex
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
@@ -40,7 +40,10 @@ from omnigent.databricks_ai_gateway import (
 from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
 from omnigent.models.model_metadata import ModelWireAPI
-from omnigent.models.model_override import normalize_model_for_provider
+from omnigent.models.model_override import (
+    is_mechanical_vendor_id,
+    normalize_model_for_provider,
+)
 from omnigent.models.pi_model_compatibility import (
     PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
     SYSTEM_AI_RESPONSES_KEYWORDS,
@@ -1020,6 +1023,41 @@ def _inline_family_order(model: str | None) -> tuple[str, ...]:
     return ("anthropic", "openai")
 
 
+# Family that natively serves each known model-family token. "other" ids are
+# absent on purpose: they carry no routing expectation, so their fallthrough
+# stays silent (the LiteLLM-passthrough intent).
+_FAMILY_FOR_MODEL_TOKEN = {"claude": "anthropic", "openai": "openai"}
+
+
+def _cross_family_routing_warning(
+    entry: ProviderEntry, family_name: str, model_id: str
+) -> str | None:
+    """Warn when a known-family model is served over the other family's wire.
+
+    The fallthrough in :func:`_inline_family_pi_provider` keeps
+    protocol-translating proxies working, but on a raw passthrough endpoint it
+    misroutes — e.g. a Claude id POSTed to the OpenAI ``/chat/completions``
+    surface 404s on every turn. The caller surfaces this as an advisory
+    banner; the session still launches, so translating proxies keep working.
+
+    :param entry: The resolved provider entry.
+    :param family_name: The family that actually serves the session.
+    :param model_id: The model id being registered.
+    :returns: The warning text, or ``None`` when routing is unsurprising.
+    """
+    expected = _FAMILY_FOR_MODEL_TOKEN.get(model_catalog.model_family_token(model_id))
+    if expected is None or expected == family_name:
+        return None
+    return (
+        f"The model '{model_id}' is normally served by a provider's '{expected}' "
+        f"family, but provider '{entry.name}' has no usable '{expected}' family "
+        f"configured, so the session was routed to its '{family_name}' endpoint. "
+        "If that endpoint does not serve this model, every turn will fail (for "
+        f"example with a 404). Add an '{expected}' family to the provider "
+        f"config, or pick a model its '{family_name}' family serves."
+    )
+
+
 def _gateway_pi_model_entry(
     model_id: str,
     *,
@@ -1151,12 +1189,14 @@ def _inline_family_pi_provider(
         resolved_model = model or entry.family_default_model(family_name)
         if not resolved_model:
             continue
-        # A session override can arrive as a Databricks-gateway id, which only the
-        # gateway routes; strip the mechanical prefix for a vendor-direct endpoint.
-        # A configured family default is exempt — it names an id its own endpoint
-        # serves, so a translating proxy's gateway-shaped default survives verbatim.
+        # A session override can arrive as a Databricks-gateway id, which only
+        # the gateway routes; strip the mechanical prefix for a vendor-direct
+        # (key-kind) endpoint. Gateway/local kinds pass through verbatim — they
+        # front arbitrary inventories (a proxy fronting the Databricks AI
+        # Gateway is addressed by the prefixed endpoint name). A configured
+        # family default is exempt — it names an id its own endpoint serves.
         if model is not None:
-            resolved_model = normalize_model_for_provider(resolved_model, KEY_KIND)
+            resolved_model = normalize_model_for_provider(resolved_model, entry.kind)
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
         # Anthropic API but rejected by the Databricks AI Gateway.
         resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
@@ -1172,6 +1212,9 @@ def _inline_family_pi_provider(
             model=resolved_model,
             api_key=api_key,
             auth_header=auth_header,
+            # Advisory when the model landed on the other family's wire; a raw
+            # passthrough endpoint rejects it, and silence reads as a hang.
+            credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
             extra_models=[model_entry],
         )
     return None
@@ -1198,8 +1241,25 @@ def resolve_pi_native_provider(
         own credentials.
     """
     selection = _split_pi_native_model_selection(model)
+    unmanaged_prefix_warning: str | None = None
     if selection is not None:
         _, model = selection
+    elif model and "/" in model:
+        prefix, _, bare = model.partition("/")
+        # A provider-qualified reference to a ~/.pi/agent provider this managed
+        # session cannot see (PI_CODING_AGENT_DIR is relocated per session).
+        # Only a recognizable vendor-id tail is treated as such; a slash-shaped
+        # model id (e.g. "zai-org/GLM-4.7") stays verbatim for its endpoint.
+        if prefix and is_mechanical_vendor_id(bare):
+            unmanaged_prefix_warning = (
+                f"The model override '{model}' names a Pi provider '{prefix}' "
+                "that managed Pi sessions cannot use (they run from a "
+                "per-session config, not ~/.pi/agent). The model "
+                f"'{bare}' was requested from the omnigent-configured provider "
+                "instead."
+            )
+            _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
+            model = bare
     try:
         config = config_loader()
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
@@ -1266,6 +1326,15 @@ def resolve_pi_native_provider(
                 resolved = _databricks_pi_provider(db_entry, model=model)
             if resolved is None:
                 _LOGGER.warning("pi-native: no usable provider found; Pi will use its own login.")
+        if resolved is not None and unmanaged_prefix_warning is not None:
+            resolved = replace(
+                resolved,
+                credential_warning=(
+                    unmanaged_prefix_warning
+                    if resolved.credential_warning is None
+                    else f"{unmanaged_prefix_warning}\n\n{resolved.credential_warning}"
+                ),
+            )
         return resolved
     except Exception:  # noqa: BLE001 — any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an
