@@ -5863,6 +5863,36 @@ def test_oversized_subagent_item_does_not_truncate_identifiers() -> None:
     assert fitted.item.data["name"] == name
 
 
+@pytest.mark.parametrize(
+    ("field_name", "kind"),
+    [("input", "input"), ("stdout", "output"), ("stderr", "output")],
+)
+def test_oversized_subagent_terminal_text_is_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    kind: str,
+) -> None:
+    """Large terminal commands and output are shrunk instead of dropped."""
+    monkeypatch.setattr(forwarder, "MAX_SUBAGENT_EVENT_BATCH_BYTES", 1024)
+    entry = forwarder._PendingSubagentItem(
+        item=ClaudeTranscriptItem(
+            source_id=f"oversized-terminal-{field_name}",
+            item_type="terminal_command",
+            data={"kind": kind, field_name: "x" * 2048},
+            response_id="resp-terminal",
+        )
+    )
+
+    fitted = forwarder._fit_subagent_item(entry)
+
+    assert fitted.drop_reason is None
+    assert fitted.item.data["kind"] == kind
+    terminal_text = fitted.item.data[field_name]
+    assert isinstance(terminal_text, str)
+    assert "content truncated by omnigent" in terminal_text
+    assert len(forwarder._encoded_subagent_batch([fitted])) <= 1024
+
+
 def test_subagent_batch_partitioning_encodes_items_linearly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6306,14 +6336,23 @@ async def test_individual_redrive_honors_not_confirmed_retry_budget(
         bridge_dir,
         forwarder.SubagentForwardState(subagents={"retry": entry}),
     )
+    batch_attempts = 0
     individual_attempts = 0
+    forward_successes = 0
+
+    def note_forward_success() -> None:
+        nonlocal forward_successes
+        forward_successes += 1
+
+    monkeypatch.setattr(forwarder, "_note_forward_success", note_forward_success)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal individual_attempts
+        nonlocal batch_attempts, individual_attempts
         body = json.loads(request.content.decode("utf-8"))
         if isinstance(body, list):
-            return httpx.Response(400, json={"error": "reject batch"})
-        individual_attempts += 1
+            batch_attempts += 1
+        else:
+            individual_attempts += 1
         return httpx.Response(
             503,
             json={"error": "subagent_delivery_not_confirmed"},
@@ -6327,7 +6366,7 @@ async def test_individual_redrive_honors_not_confirmed_retry_budget(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
-        for _ in range(2):
+        for _ in range(3):
             await forwarder._forward_one_subagent(
                 client=client,
                 parent_session_id="conv_parent",
@@ -6341,13 +6380,16 @@ async def test_individual_redrive_honors_not_confirmed_retry_budget(
                 batch_capability=forwarder._SessionEventBatchCapability(),
             )
 
+    assert batch_attempts == 2
     assert individual_attempts == 2
+    assert forward_successes == 0
     assert checkpoint.state.subagents["retry"].byte_offset == 10
     dead_letters = [
         json.loads(line)
         for line in (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
     ]
     assert [record["payload"]["source_id"] for record in dead_letters] == [item.source_id]
+    assert dead_letters[0]["reason"] == "delivery not confirmed after retries"
 
 
 @pytest.mark.asyncio
