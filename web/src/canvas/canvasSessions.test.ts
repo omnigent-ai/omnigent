@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import {
   applyLiveRows,
@@ -18,6 +19,10 @@ vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
   getCurrentUserId: vi.fn(() => null),
   resolveIdentity: vi.fn(async () => null),
+}));
+
+vi.mock("@/lib/host", () => ({
+  getOmnigentServerIdentity: vi.fn(() => "server-a"),
 }));
 
 function session(
@@ -62,6 +67,7 @@ function resolveViewer(viewerId = "me"): void {
 }
 
 beforeEach(() => {
+  vi.mocked(host.getOmnigentServerIdentity).mockReset().mockReturnValue("server-a");
   vi.mocked(identity.authenticatedFetch).mockReset();
   vi.mocked(identity.getCurrentUserId).mockReset().mockReturnValue(null);
   vi.mocked(identity.resolveIdentity).mockReset().mockResolvedValue(null);
@@ -270,6 +276,43 @@ describe("useCanvasSessions", () => {
     });
     await waitFor(() => expect(second.result.current.sessions.map((row) => row.id)).toEqual(["a"]));
     expect(second.result.current.networkConfirmed).toBe(true);
+  });
+
+  it("does not reuse an in-memory list after switching servers for the same viewer", async () => {
+    resolveViewer();
+    const client = new QueryClient();
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([session("same", 9)], null, false)),
+    );
+    const first = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(first.result.current.complete).toBe(true));
+    first.unmount();
+
+    vi.mocked(host.getOmnigentServerIdentity).mockReturnValue("server-b");
+    let resolvePage!: (value: Response) => void;
+    vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePage = resolve;
+      }),
+    );
+    const second = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+
+    expect(second.result.current).toMatchObject({ sessions: [], complete: false });
+    await waitFor(() => expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      resolvePage(jsonResponse(page([session("same", 9)], null, false)));
+    });
+    await waitFor(() => expect(second.result.current.networkConfirmed).toBe(true));
+
+    const keys = Array.from({ length: window.sessionStorage.length }, (_, index) =>
+      window.sessionStorage.key(index),
+    );
+    expect(keys).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/:server-a:me$/),
+        expect.stringMatching(/:server-b:me$/),
+      ]),
+    );
   });
 
   it("keeps a load that finishes after Canvas unmounts for the next visit", async () => {

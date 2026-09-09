@@ -46,6 +46,7 @@ export interface CanvasSessions {
 // QueryClient survives route changes; scoping the remembered list to it keeps
 // separate app roots and tests isolated while making revisits instantaneous.
 interface RememberedCanvasSessions {
+  serverId: string;
   viewerId: string;
   sessions: Conversation[];
   storedSignature: string | null;
@@ -58,13 +59,16 @@ interface StoredCanvasSessions {
   sessions: Conversation[];
 }
 
-function sessionCachePrefix(): string {
-  const server = getOmnigentServerIdentity() ?? "default";
-  return `${SESSION_CACHE_KEY_PREFIX}:${server}`;
+function currentServerId(): string {
+  return getOmnigentServerIdentity() ?? "default";
 }
 
-function sessionCacheKey(viewerId: string): string {
-  return `${sessionCachePrefix()}:${viewerId}`;
+function sessionCachePrefix(serverId: string = currentServerId()): string {
+  return `${SESSION_CACHE_KEY_PREFIX}:${serverId}`;
+}
+
+function sessionCacheKey(viewerId: string, serverId: string = currentServerId()): string {
+  return `${sessionCachePrefix(serverId)}:${viewerId}`;
 }
 
 function hasStoredSessionsForServer(): boolean {
@@ -90,10 +94,13 @@ function isStoredConversation(value: unknown): value is Conversation {
   );
 }
 
-function readStoredSessions(viewerId: string): Conversation[] | undefined {
+function readStoredSessions(
+  viewerId: string,
+  serverId: string = currentServerId(),
+): Conversation[] | undefined {
   if (typeof window === "undefined") return undefined;
   try {
-    const raw = window.sessionStorage.getItem(sessionCacheKey(viewerId));
+    const raw = window.sessionStorage.getItem(sessionCacheKey(viewerId, serverId));
     if (!raw) return undefined;
     const stored = JSON.parse(raw) as Partial<StoredCanvasSessions> | null;
     if (
@@ -138,12 +145,16 @@ function rememberedSessions(
   viewerId: string | null,
 ): Conversation[] | undefined {
   if (viewerId === null) return undefined;
+  const serverId = currentServerId();
   const remembered = completeSessionsByClient.get(queryClient);
-  if (remembered?.viewerId === viewerId) return remembered.sessions;
-  const stored = readStoredSessions(viewerId);
+  if (remembered?.serverId === serverId && remembered.viewerId === viewerId) {
+    return remembered.sessions;
+  }
+  const stored = readStoredSessions(viewerId, serverId);
   if (stored) {
     const signature = sessionSignature(stored);
     completeSessionsByClient.set(queryClient, {
+      serverId,
       viewerId,
       sessions: stored,
       storedSignature: signature,
@@ -154,19 +165,24 @@ function rememberedSessions(
 
 function rememberCompleteSessions(
   queryClient: QueryClient,
+  serverId: string,
   viewerId: string,
   sessions: Conversation[],
 ): void {
   const signature = sessionSignature(sessions);
   const previous = completeSessionsByClient.get(queryClient);
-  const storedSignature = previous?.viewerId === viewerId ? previous.storedSignature : null;
-  completeSessionsByClient.set(queryClient, { viewerId, sessions, storedSignature });
+  const storedSignature =
+    previous?.serverId === serverId && previous.viewerId === viewerId
+      ? previous.storedSignature
+      : null;
+  completeSessionsByClient.set(queryClient, { serverId, viewerId, sessions, storedSignature });
   if (storedSignature === signature) return;
   if (typeof window === "undefined") return;
   try {
     const stored: StoredCanvasSessions = { version: SESSION_CACHE_VERSION, sessions };
-    window.sessionStorage.setItem(sessionCacheKey(viewerId), JSON.stringify(stored));
+    window.sessionStorage.setItem(sessionCacheKey(viewerId, serverId), JSON.stringify(stored));
     completeSessionsByClient.set(queryClient, {
+      serverId,
       viewerId,
       sessions,
       storedSignature: signature,
@@ -387,6 +403,7 @@ export function useCanvasSessions(): CanvasSessions {
     }
     const request = (async () => {
       try {
+        const serverId = currentServerId();
         const viewerId = await resolveIdentity();
         await loadAllSessions(existing, (progress) => {
           const sessions = progress.hasMore
@@ -395,7 +412,7 @@ export function useCanvasSessions(): CanvasSessions {
           // Keep the completed list even if this page unmounted while loading.
           // A later Canvas visit can then paint the whole list immediately.
           if (!progress.hasMore && viewerId !== null) {
-            rememberCompleteSessions(queryClient, viewerId, sessions);
+            rememberCompleteSessions(queryClient, serverId, viewerId, sessions);
           }
           if (!aliveRef.current) return;
           sessionsRef.current = sessions;
@@ -464,11 +481,16 @@ export function useCanvasSessions(): CanvasSessions {
       sessionsRef.current = next;
       const viewerId = getCurrentUserId();
       if (completeRef.current && viewerId !== null) {
+        const serverId = currentServerId();
         const previous = completeSessionsByClient.get(queryClient);
         completeSessionsByClient.set(queryClient, {
+          serverId,
           viewerId,
           sessions: next,
-          storedSignature: previous?.viewerId === viewerId ? previous.storedSignature : null,
+          storedSignature:
+            previous?.serverId === serverId && previous.viewerId === viewerId
+              ? previous.storedSignature
+              : null,
         });
       }
       setState((current) => ({ ...current, sessions: next }));

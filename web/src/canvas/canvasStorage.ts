@@ -49,6 +49,7 @@ export function readActiveCanvas(viewerId: string | null): string | null {
 
 /** Remember the selected canvas. A failed write is not worth a warning: the URL carries it too. */
 export function writeActiveCanvas(canvasId: string, viewerId: string | null): void {
+  if (typeof window === "undefined") return;
   try {
     window.localStorage.setItem(activeCanvasStorageKey(viewerId), canvasId);
   } catch {
