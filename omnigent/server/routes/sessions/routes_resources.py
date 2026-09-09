@@ -73,6 +73,7 @@ from omnigent.server.routes._sessions.helpers import (
     FILE_CONTENT_CACHE_CONTROL,
     _ancestor_session_ids,
     _attachment_disposition,
+    _enforce_workspace_attachment_policy,
     _file_content_etag,
     _get_runner_client_for_resource_access,
     _if_none_match_matches,
@@ -1565,6 +1566,7 @@ def register_resources_routes(
                 content_type = ext_type
                 type_limit = attachment_upload_limit(content_type)
         upload_cap = None if type_limit is None else min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+        to_workspace = False
         if upload_cap is None:
             # Office documents, archives, and databases aren't inlinable, but a
             # filesystem-capable harness reads them off disk (see
@@ -1572,6 +1574,7 @@ def register_resources_routes(
             # them under their own cap; the global ceiling only backstops
             # base64 request inflation, which this path never incurs.
             upload_cap = workspace_materialize_upload_limit(file.filename)
+            to_workspace = upload_cap is not None
         if upload_cap is None:
             raise HTTPException(
                 status_code=415,
@@ -1579,6 +1582,12 @@ def register_resources_routes(
                     f"Unsupported attachment type '{content_type}'. Only images, "
                     "PDF, and text/code files can be attached."
                 ),
+            )
+        if to_workspace:
+            upload_cap = _enforce_workspace_attachment_policy(
+                file.filename,
+                session_id=session_id,
+                file_store=file_store,
             )
         content = await _read_upload_capped(file, upload_cap)
         stored = file_store.create(
