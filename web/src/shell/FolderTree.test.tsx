@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
@@ -302,6 +303,95 @@ describe("FolderTree double-click to open a folder", () => {
     fireEvent.doubleClick(folder);
 
     expect(folder).toBeInTheDocument();
+  });
+});
+
+describe("FolderTree directory search results", () => {
+  it("renders a matched directory as a folder row above matched files", () => {
+    // The server-side search returns files AND directories; directories sort
+    // first so a folder to open reads above the files sharing its name.
+    renderTree({
+      searchQuery: "src",
+      searchResults: [file("src/main.py"), dir("src")],
+    });
+
+    const rows = screen.getAllByRole("listitem");
+    // Folder row first (label carries the trailing slash), then the file.
+    expect(rows[0]).toHaveTextContent("src/");
+    expect(rows[1]).toHaveTextContent("src/main.py");
+  });
+
+  it("reveals the directory and exits search when a folder result is clicked", () => {
+    // Clicking a folder in search behaves like clicking one in the tree: the
+    // panel drops back to the tree (search cleared) with that folder expanded.
+    const onExitSearch = vi.fn();
+    const onFileSelect = vi.fn();
+    renderTree({
+      searchQuery: "src",
+      searchResults: [dir("src/components")],
+      onExitSearch,
+      onFileSelect,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /src\/components\// }));
+
+    expect(onExitSearch).toHaveBeenCalledTimes(1);
+    // A folder is not a file — it must not be opened in the viewer.
+    expect(onFileSelect).not.toHaveBeenCalled();
+  });
+
+  it("scrolls to and flashes the revealed folder, expanding only its ancestors", async () => {
+    // Search-mode is parent-controlled, so drive the whole flow through a
+    // wrapper that clears searchQuery on exit — the way FilesPanel does. The
+    // tree's own files show src/ containing sub/, so revealing "src/sub"
+    // expands the ancestor (src) but leaves the target (sub) collapsed, then
+    // scrolls it into view and flashes it.
+    // jsdom leaves scrollTo undefined; the virtualizer's scrollToIndex calls
+    // it, so define a no-op to keep the reveal effect from throwing.
+    Object.defineProperty(Element.prototype, "scrollTo", {
+      value: vi.fn(),
+      configurable: true,
+      writable: true,
+    });
+    lazyChildren.set("src", [dir("src/sub")]);
+
+    function Harness() {
+      const [query, setQuery] = useState("sub");
+      return (
+        <FolderTree
+          files={[dir("src")]}
+          isLoading={false}
+          isError={false}
+          error={null}
+          onFileSelect={vi.fn()}
+          conversationId="conv_reveal"
+          showHidden={false}
+          changedFiles={undefined}
+          sort="alpha"
+          searchQuery={query}
+          searchResults={[dir("src/sub")]}
+          onExitSearch={() => setQuery("")}
+        />
+      );
+    }
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+
+    // Click the folder result → exit search, expand ancestors, reveal the row.
+    fireEvent.click(screen.getByRole("button", { name: /src\/sub\// }));
+
+    // The tree is back: the target row appears (ancestor src auto-expanded so
+    // its lazy child sub/ renders) and carries the flash class while active.
+    const subRow = await screen.findByRole("button", { name: "sub/" });
+    const rowContainer = subRow.closest("div.group");
+    expect(rowContainer).toHaveClass("animate-user-msg-flash");
+    // The ancestor was auto-expanded (its lazy child rendered); the target
+    // itself stays collapsed, like clicking a folder in the tree.
+    expect(subRow).toHaveAttribute("aria-expanded", "false");
   });
 });
 

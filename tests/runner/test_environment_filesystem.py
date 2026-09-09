@@ -1351,25 +1351,27 @@ async def test_search_no_matches_returns_empty_list(
 
 
 @pytest.mark.asyncio
-async def test_search_returns_only_files_not_directories(
+async def test_search_returns_matching_directories(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET /search results contain only file-type entries, not directory entries.
+    """GET /search returns directory entries whose name/path matches the query.
 
-    The workspace has a 'src' directory; a query matching it by name must not
-    return it as a result — directories are not useful for file-open actions.
+    The workspace has a 'src' directory; a query matching it by name must
+    surface it as a directory-type entry so the UI can reveal the folder,
+    alongside any files under it.
     """
     resp = await client.get(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q=src"
     )
     assert resp.status_code == 200
-    for entry in resp.json()["data"]:
-        # Any directory entry in the results would indicate the search walk is
-        # including directories, which the UI cannot open.
-        assert entry["type"] == "file", (
-            f"Expected only file-type entries in search results, "
-            f"but got type={entry['type']!r} for path={entry['path']!r}."
-        )
+    entries = resp.json()["data"]
+    src = next((e for e in entries if e["path"] == "src"), None)
+    assert src is not None, f"Expected the 'src' directory in results, got: {entries}"
+    assert src["type"] == "directory", (
+        f"Expected 'src' to be a directory-type entry, got type={src['type']!r}."
+    )
+    # A directory has no byte size; bytes must be null for it.
+    assert src["bytes"] is None, "A directory entry must report null bytes."
 
 
 @pytest.mark.asyncio
@@ -1594,27 +1596,29 @@ async def test_search_glob_filters(
 
 
 @pytest.mark.asyncio
-async def test_search_glob_filter_returns_only_files(
+async def test_search_directory_match_honors_exclude_glob(
     glob_client: httpx.AsyncClient,
 ) -> None:
-    """A glob-scoped search returns file entries only, never directories.
+    """A directory match is dropped when an exclude glob prunes its subtree.
 
-    ``src/**`` matches the ``src/deep`` directory by path, but directories
-    must be filtered out so the UI only offers openable files. ``q=.`` matches
-    every file (all have extensions) so the include glob is what is exercised.
+    ``q=deep`` matches the ``src/deep`` directory by name. Without an exclude
+    it surfaces as a directory entry; with ``exclude=**/deep`` the subtree is
+    pruned from the walk so the directory itself never appears.
     """
-    resp = await glob_client.get(
-        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q=.&include=src/**"
-    )
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search"
+    resp = await glob_client.get(f"{base}?q=deep")
     assert resp.status_code == 200, resp.text
-    data = resp.json()["data"]
-    assert data, "q=.&include=src/** should match files under src/"
-    for entry in data:
-        # A directory entry would mean the file-type filter in search_files
-        # regressed; the UI cannot open directories.
-        assert entry["type"] == "file", (
-            f"Expected only file entries, got type={entry['type']!r} for {entry['path']!r}"
-        )
+    paths = {(e["path"], e["type"]) for e in resp.json()["data"]}
+    assert ("src/deep", "directory") in paths, (
+        f"q=deep should surface the src/deep directory, got {paths}"
+    )
+
+    resp = await glob_client.get(f"{base}?q=deep&exclude=**/deep")
+    assert resp.status_code == 200, resp.text
+    excluded = {e["path"] for e in resp.json()["data"]}
+    assert "src/deep" not in excluded, (
+        f"exclude=**/deep must prune the src/deep directory, got {excluded}"
+    )
 
 
 # ── Per-session filesystem registry (worktree) ──────────────────────────────
@@ -1806,6 +1810,56 @@ async def test_search_scan_budget_bounds_a_no_match_walk(
 
     assert entries == []
     assert truncated is True, "a budget-exhausted search must not look like 'no matches'"
+
+
+@pytest.mark.asyncio
+async def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep dependency subtree must not starve a later-sorted real directory.
+
+    Layout (``aaa`` sorts before ``zzz``)::
+
+        aaa/node_modules/<many files>   # deprioritized, huge
+        zzz/target/keep.txt             # the real match, deep and late
+
+    Reordering only *sibling* dirs isn't enough: without globally deferring the
+    ``node_modules`` subtree, the walk descends all of ``aaa/node_modules``
+    first and exhausts a tight budget before it ever reaches ``zzz/target`` —
+    so a query for ``target`` would come back empty. Deferring noise subtrees
+    lets the real tree be scanned first, so the match is found.
+    """
+    noise = tmp_path / "aaa" / "node_modules"
+    noise.mkdir(parents=True)
+    for i in range(40):
+        (noise / f"dep{i}.js").write_text("x")
+    target = tmp_path / "zzz" / "target"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("y")
+
+    # Budget large enough for the whole real tree but far smaller than the noise
+    # subtree, so a non-deferring walk would run out inside node_modules.
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET",
+        20,
+    )
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, _truncated = await fs.search_files("target")
+
+    paths = {e.path for e in entries}
+    assert "zzz/target" in paths, (
+        f"the real 'zzz/target' directory must be reached despite the earlier "
+        f"aaa/node_modules subtree, got {paths}"
+    )
 
 
 @pytest.mark.asyncio

@@ -326,61 +326,96 @@ class WorkspaceReader:
         exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
 
         results: list[_WorkspacePayload] = []
-        scanned = 0
+        # State the two-pass walk mutates via closures. A list holds `scanned`
+        # so the nested helpers can rebind it without a `nonlocal` per call.
+        deferred: list[str] = []
+        counters = {"scanned": 0}
         truncated = False
-        for dirpath, dirnames, filenames in os.walk(self._root):
+        stop = False
+
+        def rel(dirpath: str, name: str) -> str:
             rel_dir = os.path.relpath(dirpath, self._root)
-            # Prune excluded subtrees so a "**/node_modules" pattern
-            # avoids descending, matching the runner's search walk.
-            kept = []
-            for d in sorted(dirnames):
-                dp = os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, d))
-                if any(r.match(dp) for r in exc):
-                    continue
-                kept.append(d)
-            # Spend the scan budget on the real tree first, as the runner does.
-            kept.sort(key=lambda d: d in _DEFAULT_DEPRIORITIZED_DIRS)
-            dirnames[:] = kept
-            scanned += len(kept)
-            for fname in sorted(filenames):
-                # Counted per entry: a per-directory check lets one huge
-                # directory overshoot the budget before `truncated` trips.
-                scanned += 1
-                if scanned >= _SEARCH_SCAN_BUDGET:
-                    truncated = True
-                    break
-                p = os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, fname))
-                if exc and any(r.match(p) for r in exc):
-                    continue
-                if inc and not any(r.match(p) for r in inc):
-                    continue
-                if q not in fname.lower() and q not in p.lower():
-                    continue
-                try:
-                    st = (Path(dirpath) / fname).stat()
-                    size: int | None = st.st_size
-                    mtime: int | None = int(st.st_mtime)
-                except OSError:
-                    size = None
-                    mtime = None
-                results.append(
-                    {
-                        "id": p,
-                        "object": "session.environment.filesystem.entry",
-                        "name": fname,
-                        "path": p,
-                        "type": "file",
-                        "bytes": size,
-                        "modified_at": mtime,
-                    }
-                )
-                if len(results) >= limit:
-                    break
-            # A query matching little or nothing never fills the result cap,
-            # so the walk needs its own bound -- the same one the runner
-            # applies, so search behaves identically whether the agent is awake.
-            if truncated or len(results) >= limit:
-                break
+            return os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, name))
+
+        def match(dirpath: str, name: str, *, is_dir: bool) -> None:
+            # A directory carries no byte size; a file stats for size + mtime.
+            p = rel(dirpath, name)
+            if exc and any(r.match(p) for r in exc):
+                return
+            if inc and not any(r.match(p) for r in inc):
+                return
+            if q not in name.lower() and q not in p.lower():
+                return
+            try:
+                st = (Path(dirpath) / name).stat()
+                size: int | None = None if is_dir else st.st_size
+                mtime: int | None = int(st.st_mtime)
+            except OSError:
+                size = None
+                mtime = None
+            results.append(
+                {
+                    "id": p,
+                    "object": "session.environment.filesystem.entry",
+                    "name": name,
+                    "path": p,
+                    "type": "directory" if is_dir else "file",
+                    "bytes": size,
+                    "modified_at": mtime,
+                }
+            )
+
+        def scan(root: str, defer: bool) -> None:
+            # A query matching little or nothing never fills the result cap, so
+            # the walk needs its own bound. Counted per entry: a per-directory
+            # check lets one huge directory overshoot before `truncated` trips.
+            nonlocal truncated, stop
+            for dirpath, dirnames, filenames in os.walk(root):
+                kept = []
+                for d in sorted(dirnames):
+                    dp = rel(dirpath, d)
+                    if any(r.match(dp) for r in exc):
+                        continue
+                    if defer and d in _DEFAULT_DEPRIORITIZED_DIRS:
+                        # Match the dir now, but walk its subtree later (pass 2)
+                        # so it can't starve the real tree of scan budget.
+                        deferred.append(os.path.join(dirpath, d))
+                    kept.append(d)
+                dirnames[:] = [d for d in kept if not (defer and d in _DEFAULT_DEPRIORITIZED_DIRS)]
+                for dname in kept:
+                    counters["scanned"] += 1
+                    if counters["scanned"] >= _SEARCH_SCAN_BUDGET:
+                        truncated = True
+                        stop = True
+                        return
+                    match(dirpath, dname, is_dir=True)
+                    if len(results) >= limit:
+                        stop = True
+                        return
+                for fname in sorted(filenames):
+                    counters["scanned"] += 1
+                    if counters["scanned"] >= _SEARCH_SCAN_BUDGET:
+                        truncated = True
+                        stop = True
+                        return
+                    match(dirpath, fname, is_dir=False)
+                    if len(results) >= limit:
+                        stop = True
+                        return
+
+        # Pass 1 walks the real tree and defers dependency/cache subtrees;
+        # reordering siblings isn't enough, because a deep node_modules nested
+        # under an earlier-sorted real dir would still swallow the whole budget
+        # before the walk reached a later top-level dir. Pass 2 drains the
+        # deferred roots only if budget remains. Mirrors the runner's walk.
+        scan(str(self._root), True)
+        while deferred and not stop:
+            scan(deferred.pop(0), False)
+        # Deferred subtrees left unwalked because the budget ran out mean the
+        # scan was not exhaustive, so "no more matches" would be a lie.
+        if deferred and not stop:
+            truncated = True
+
         results.sort(key=lambda entry: cast(str, entry["path"]))
         return {
             "object": "list",

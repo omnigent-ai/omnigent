@@ -274,6 +274,54 @@ def test_search_exclude_glob_prunes_results(tmp_path: Path) -> None:
     assert paths == {"keep.py"}
 
 
+def test_search_returns_matching_directories(tmp_path: Path) -> None:
+    """A query matching a directory name surfaces it as a directory entry.
+
+    Mirrors the runner's ``/search`` so a folder can be revealed from the
+    Explore tab whether the runner or the host answers.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("src")
+
+    by_path = {e["path"]: e for e in result["data"]}
+    assert by_path["src"]["type"] == "directory"
+    # A directory has no byte size.
+    assert by_path["src"]["bytes"] is None
+
+
+def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep dependency subtree must not starve a later-sorted real directory.
+
+    ``aaa/node_modules/<many>`` sorts before ``zzz/target``; without globally
+    deferring the noise subtree, a tight budget is exhausted inside
+    node_modules before the walk reaches the real match. Mirrors the runner.
+    """
+    noise = tmp_path / "aaa" / "node_modules"
+    noise.mkdir(parents=True)
+    for i in range(40):
+        (noise / f"dep{i}.js").write_text("x")
+    target = tmp_path / "zzz" / "target"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("y")
+
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 20)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target")
+
+    paths = {e["path"] for e in result["data"]}
+    assert "zzz/target" in paths, (
+        f"the real 'zzz/target' directory must be reached despite the earlier "
+        f"aaa/node_modules subtree, got {paths}"
+    )
+
+
 # ── changes / diff (git mode) ─────────────────────────────────────────
 
 

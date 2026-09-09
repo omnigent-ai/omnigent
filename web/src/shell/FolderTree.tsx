@@ -1,4 +1,4 @@
-import { ChevronRightIcon, FileIcon } from "lucide-react";
+import { ChevronRightIcon, FileIcon, FolderIcon } from "lucide-react";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -372,6 +372,7 @@ export function FolderTree({
   searchError = null,
   browseLocation = "",
   onNavigateDir,
+  onExitSearch,
   scrollParentRef,
 }: {
   files: WorkspaceFile[] | undefined;
@@ -413,6 +414,12 @@ export function FolderTree({
    * matching Finder; a single click still just expands in place.
    */
   onNavigateDir?: (relativePath: string) => void;
+  /**
+   * Clear the active search query so the tree returns. Called after the user
+   * reveals a directory from the search results, mirroring a click on a folder
+   * in the tree: the panel drops back to the tree with that folder expanded.
+   */
+  onExitSearch?: () => void;
   /**
    * The scroll container the tree lives in (FilesPanel's `<section>`). When
    * provided, the virtualizer windows rows against THIS element so it shares
@@ -500,6 +507,34 @@ export function FolderTree({
     [cacheKey],
   );
 
+  // A directory just revealed from search results: the tree scrolls it into
+  // view and flashes a brief highlight so the eye can find it after the flat
+  // list collapses back to the tree. Cleared once the flash fades.
+  const [revealedPath, setRevealedPath] = useState<string | null>(null);
+  const revealFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Reveal a directory the user picked from search results: expand it and every
+  // ancestor (so the row is visible once the flat tree returns), then leave
+  // search mode. The lazy-fetch fixpoint (see `lazyPaths`) resolves each newly
+  // expanded level as its parent's listing lands; an effect below scrolls to
+  // and highlights the row once it appears.
+  const revealDirectory = useCallback(
+    (path: string) => {
+      setExpandedPaths((prev) => {
+        const next = new Set(prev);
+        const parts = path.split("/");
+        // Expand every ancestor, but not the target itself — revealing a folder
+        // scrolls to it collapsed, the way clicking it in the tree would.
+        for (let i = 1; i < parts.length; i++) next.add(parts.slice(0, i).join("/"));
+        if (cacheKey) expandedPathsCache.set(cacheKey, next);
+        return next;
+      });
+      setRevealedPath(path);
+      onExitSearch?.();
+    },
+    [cacheKey, onExitSearch],
+  );
+
   // Build the nested top-level tree once per files/sort/showHidden change.
   // Hoisted above the early returns (Rules of Hooks) and memoized so an
   // unrelated re-render (a background refetch toggling isFetching, a store tick)
@@ -551,6 +586,23 @@ export function FolderTree({
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
 
+  // Once a revealed directory's row exists in the flat tree (its ancestors'
+  // lazy listings have landed), smooth-scroll it into view and start the
+  // highlight flash. Runs when `flatRows` changes, so it fires on the render
+  // after each expansion level resolves — no-op until the target row appears.
+  useEffect(() => {
+    if (!revealedPath) return;
+    const index = flatRows.findIndex((r) => r.kind === "node" && r.key === revealedPath);
+    if (index === -1) return; // row not materialized yet; a later level is loading
+    rowVirtualizer.scrollToIndex(index, { align: "center", behavior: "smooth" });
+    // Clear once the shared flash animation (800ms) has played out.
+    if (revealFlashTimer.current) clearTimeout(revealFlashTimer.current);
+    revealFlashTimer.current = setTimeout(() => setRevealedPath(null), 800);
+    return () => {
+      if (revealFlashTimer.current) clearTimeout(revealFlashTimer.current);
+    };
+  }, [revealedPath, flatRows, rowVirtualizer]);
+
   // When a search query is active, render a flat filtered list instead of the tree.
   if (searchQuery.trim().length > 0) {
     if (isSearching && !searchResults) {
@@ -590,14 +642,24 @@ export function FolderTree({
         </p>
       );
     }
+    // Directories first (like the tree), then files — each group by the active
+    // sort. A folder is a place to go, so it reads better above the matched
+    // files sharing its name.
+    const orderedResults = [...visibleResults].sort((a, b) => {
+      const aDir = a.type === "directory";
+      const bDir = b.type === "directory";
+      if (aDir !== bDir) return aDir ? -1 : 1;
+      return compareChangedFiles(sort)(a, b);
+    });
     return (
       <TooltipProvider>
         <ul className="flex flex-col gap-0.5">
-          {[...visibleResults].sort(compareChangedFiles(sort)).map((file) => (
+          {orderedResults.map((file) => (
             <SearchResultRow
               key={file.path}
               file={file}
               onFileSelect={onFileSelect}
+              onRevealDir={revealDirectory}
               conversationId={conversationId}
               changedFileMap={changedFileMap}
             />
@@ -671,6 +733,7 @@ export function FolderTree({
                 changedFileMap={changedFileMap}
                 dirtyDirMap={dirtyDirMap}
                 onNavigateDir={onNavigateDir}
+                highlighted={row.kind === "node" && row.key === revealedPath}
               />
             )}
           </div>
@@ -824,14 +887,20 @@ function FileRowItem({
 function SearchResultRow({
   file,
   onFileSelect,
+  onRevealDir,
   conversationId,
   changedFileMap,
 }: {
   file: WorkspaceFile;
   onFileSelect: (path: string) => void;
+  /** Reveal a matched directory in the tree (expand it + ancestors). */
+  onRevealDir: (path: string) => void;
   conversationId: string | undefined;
   changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
 }) {
+  if (file.type === "directory") {
+    return <SearchDirRow file={file} onRevealDir={onRevealDir} />;
+  }
   return (
     <FileRowItem
       path={file.path}
@@ -842,6 +911,49 @@ function SearchResultRow({
       onFileSelect={onFileSelect}
       conversationId={conversationId}
     />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SearchDirRow — flat directory row used in search-results mode
+// ---------------------------------------------------------------------------
+
+/**
+ * A matched directory in search results. Clicking it reveals the folder in the
+ * tree (expands it and its ancestors, exits search) rather than opening a file
+ * — folders have nothing to show in the viewer. The full path is shown with
+ * rtl truncation and a trailing "/" so it reads as a directory.
+ */
+function SearchDirRow({
+  file,
+  onRevealDir,
+}: {
+  file: WorkspaceFile;
+  onRevealDir: (path: string) => void;
+}) {
+  return (
+    <li className="list-none">
+      <div className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 pl-2 hover:bg-muted">
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+          onClick={() => onRevealDir(file.path)}
+        >
+          <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 flex-1 truncate font-mono text-ui md:text-sm [direction:rtl]">
+            <bdi>{file.path}/</bdi>
+          </span>
+        </button>
+        <span
+          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+        >
+          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+            <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+            <CopyPathButton path={file.path} label="Copy folder path" revealOnHover />
+          </span>
+        </span>
+      </div>
+    </li>
   );
 }
 
@@ -896,6 +1008,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   changedFileMap,
   dirtyDirMap,
   onNavigateDir,
+  highlighted = false,
 }: {
   node: TreeNode;
   depth: number;
@@ -908,6 +1021,8 @@ const TreeNodeRow = memo(function TreeNodeRow({
   dirtyDirMap: Map<string, WorkspaceChangedFile["status"]>;
   /** Re-root onto a directory (double-click), path relative to the root. */
   onNavigateDir?: (relativePath: string) => void;
+  /** Briefly flash this row — used when a folder is revealed from search. */
+  highlighted?: boolean;
 }) {
   if (node.type === "file") {
     return (
@@ -937,7 +1052,12 @@ const TreeNodeRow = memo(function TreeNodeRow({
     // still spans everything up to the copy button, so the clickable area is
     // effectively unchanged.
     <div
-      className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
+      className={cn(
+        "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted",
+        // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
+        // from search catches the eye briefly, then settles.
+        highlighted && "animate-user-msg-flash",
+      )}
       style={{ paddingLeft: `${indentFor(depth)}px` }}
     >
       <IndentGuides depth={depth} />
