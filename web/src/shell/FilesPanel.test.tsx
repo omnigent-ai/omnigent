@@ -149,10 +149,15 @@ function environmentResult(
   } as unknown as ReturnType<typeof useWorkspaceEnvironment>;
 }
 
-function searchResult(files: WorkspaceFile[] | undefined = undefined, isFetching = false) {
+function searchResult(
+  files: WorkspaceFile[] | undefined = undefined,
+  isFetching = false,
+  isPlaceholderData = false,
+) {
   return {
     data: files,
     isFetching,
+    isPlaceholderData,
     isLoading: false,
     isError: false,
     error: null,
@@ -169,6 +174,7 @@ function renderPanel({
   workingDir = null,
   treeSearchResults = [],
   isSearching = false,
+  isSearchPlaceholder = false,
   reachable = null,
   onFileSelect = vi.fn(),
 }: {
@@ -181,6 +187,7 @@ function renderPanel({
   workingDir?: string | null;
   treeSearchResults?: WorkspaceFile[] | undefined;
   isSearching?: boolean;
+  isSearchPlaceholder?: boolean;
   reachable?: {
     unconfined: boolean;
     roots: { path: string; access: string; origin: string }[];
@@ -191,7 +198,7 @@ function renderPanel({
   useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
   useDirectoryMock.mockReturnValue(directoryResult());
   useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
-  useSearchMock.mockReturnValue(searchResult(treeSearchResults, isSearching));
+  useSearchMock.mockReturnValue(searchResult(treeSearchResults, isSearching, isSearchPlaceholder));
 
   return render(
     <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
@@ -795,6 +802,34 @@ describe("FilesPanel tree (Explore) search", () => {
     // on the flat result paths that prove search mode is active
     expect(screen.getByText((t) => t.includes("abc/test.md"))).toBeInTheDocument();
     expect(screen.getByText((t) => t.includes("src/main.py"))).toBeInTheDocument();
+  });
+
+  it("does not render stale results from a previous query while the new one loads", () => {
+    // React Query keeps the prior term's results (placeholderData) in `data`
+    // while the new term is fetching. Those must NOT render as if they matched
+    // the new query — a slow runner would otherwise show a previous search's
+    // answers. FilesPanel drops placeholder data, so the tree shows "Searching…".
+    vi.useFakeTimers();
+
+    renderPanel({
+      conversationId: "conv_tree_search_stale",
+      files: [file("src/App.tsx")],
+      // These are the PREVIOUS query's results, still in `data` as placeholder.
+      treeSearchResults: [file("stale/prev.md")],
+      isSearching: true,
+      isSearchPlaceholder: true,
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+      target: { value: "fresh" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    // The stale result must not appear; the loading state shows instead.
+    expect(screen.queryByText((t) => t.includes("stale/prev.md"))).toBeNull();
+    expect(screen.getByText("Searching…")).toBeInTheDocument();
   });
 
   it("drops back to the tree synchronously when a folder result is revealed", () => {

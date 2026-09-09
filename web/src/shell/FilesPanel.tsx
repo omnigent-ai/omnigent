@@ -608,7 +608,11 @@ export function FilesPanel({
             sort={changedSort}
             runnerWentOffline={runnerWentOffline}
             searchQuery={debouncedTreeSearch}
-            searchResults={treeSearchQuery.data}
+            // Suppress keep-previous placeholder data: while a new query is in
+            // flight React Query returns the PRIOR term's results (isPlaceholderData),
+            // which would otherwise render as if they matched the new term. Drop
+            // them so the tree shows "Searching…" until the real results land.
+            searchResults={treeSearchQuery.isPlaceholderData ? undefined : treeSearchQuery.data}
             isSearching={treeSearchQuery.isFetching}
             isSearchError={treeSearchQuery.isError}
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
