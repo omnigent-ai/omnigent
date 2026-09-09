@@ -15,9 +15,9 @@ directory, the session page opened in the SPA, the Workspace rail's Changes
 tab selected — with no request interception: the SPA hits the live server,
 which proxies to the live runner, which builds the filesystem registry for the
 real workspace path. The assertion encodes the CORRECT behavior: a non-git
-workspace has no git status to fail, so the panel must show the normal empty
-state ("No workspace changes yet") and never an error line. On a build with
-the stray-``.git`` bug the panel shows "Failed to load: 502 …" and this test
+workspace has no git status to fail, so the panel must settle to the non-git
+limited-tracking notice and never an error line. On a build with the
+stray-``.git`` bug the panel shows "Failed to load: 502 …" and this test
 fails there — the regression guard for the fix.
 """
 
@@ -97,11 +97,11 @@ def non_git_workspace_session(
                 respawned.wait(timeout=5)
 
 
-def test_non_git_workspace_under_stray_gitdir_shows_empty_changes(
+def test_non_git_workspace_under_stray_gitdir_settles_without_error(
     page: Page,
     non_git_workspace_session: tuple[str, str],
 ) -> None:
-    """The Changes tab shows the empty state for a non-git workspace, never a 502."""
+    """The Changes tab settles to the limited-tracking notice, never a 502."""
     base_url, session_id = non_git_workspace_session
 
     page.goto(f"{base_url}/c/{session_id}")
@@ -117,10 +117,11 @@ def test_non_git_workspace_under_stray_gitdir_shows_empty_changes(
     expect(changes_tab).to_have_attribute("aria-selected", "true")
 
     # A non-git workspace has no git status to fail: the panel must settle to
-    # the normal empty state. A build that misroots the workspace on the
-    # stray ``.git`` shows "Failed to load: 502 ..." here instead, so this
-    # assertion is what fails on the broken path.
-    expect(rail.get_by_text("No workspace changes yet")).to_be_visible(timeout=30_000)
+    # the limited-tracking notice (only agent file-tool edits are listed
+    # outside git). A build that misroots the workspace on the stray ``.git``
+    # shows "Failed to load: 502 ..." here instead, so this assertion is what
+    # fails on the broken path.
+    expect(rail.get_by_text("Limited change tracking")).to_be_visible(timeout=30_000)
 
     # And the failure line must never render for a non-git workspace.
     expect(rail.get_by_text(re.compile(r"^Failed to load:"))).to_have_count(0)

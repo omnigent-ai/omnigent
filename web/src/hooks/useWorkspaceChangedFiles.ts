@@ -13,6 +13,13 @@
 // Both hooks return `available: false` on 404 so the UI can degrade
 // gracefully when the runner has no OS environment for the session
 // (e.g. cloud-only agents).
+//
+// useWorkspaceChangedFiles additionally surfaces a tracking-completeness
+// signal (`trackingComplete` / `trackingReason`) from the runner's `tracking`
+// field. Git workspaces are complete; non-git workspaces track only the
+// agent's own file-tool edits (not native-CLI/shell/external writes), so the
+// panel can explain *why* the list may be partial instead of letting an empty
+// list read as a definitive "no changes".
 
 import { useCallback, useEffect, useRef } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -107,9 +114,26 @@ export interface WorkspaceChangedFile {
   lines_removed: number | null;
 }
 
+/**
+ * Why change tracking can't observe every edit, surfaced by the runner's
+ * `tracking.reason`. `non_git_workspace`: the workspace isn't a git repo, so
+ * only the agent's own file-tool edits are recorded. `no_workspace`: the
+ * session has no tracked workspace at all.
+ */
+export type WorkspaceChangesTrackingReason = "non_git_workspace" | "no_workspace";
+
 export interface WorkspaceChangedFilesResult {
   available: boolean;
   data: WorkspaceChangedFile[];
+  /**
+   * Whether the list captures every working-tree edit. `false` for non-git
+   * workspaces (only agent file-tool edits are tracked) and registry-less
+   * sessions. Defaults to `true` when the runner doesn't report `tracking`
+   * (older runner) so no spurious "limited" notice is shown.
+   */
+  trackingComplete: boolean;
+  /** Reason tracking is incomplete, or `null` when {@link trackingComplete}. */
+  trackingReason: WorkspaceChangesTrackingReason | null;
 }
 
 /**
@@ -207,6 +231,27 @@ interface ChangedFilesResponse {
     lines_removed: number | null;
   }[];
   has_more: boolean;
+  tracking?: {
+    complete: boolean;
+    reason: string | null;
+  };
+}
+
+/**
+ * Normalize the runner's `tracking` descriptor. Missing (older runner) →
+ * complete, so a server that can't report tracking never triggers the
+ * "limited tracking" notice. An unrecognized reason collapses to `null`.
+ */
+function parseTracking(tracking: ChangedFilesResponse["tracking"]): {
+  trackingComplete: boolean;
+  trackingReason: WorkspaceChangesTrackingReason | null;
+} {
+  if (!tracking) return { trackingComplete: true, trackingReason: null };
+  const reason =
+    tracking.reason === "non_git_workspace" || tracking.reason === "no_workspace"
+      ? tracking.reason
+      : null;
+  return { trackingComplete: tracking.complete !== false, trackingReason: reason };
 }
 
 async function fetchWorkspaceChangedFiles(
@@ -216,7 +261,7 @@ async function fetchWorkspaceChangedFiles(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/changes`,
   );
   if (res.status === 404) {
-    return { available: false, data: [] };
+    return { available: false, data: [], trackingComplete: true, trackingReason: null };
   }
   // The bound runner isn't connected. Throw the typed error so the panel
   // can show a reconnect hint — but only for the app's runner_unavailable
@@ -248,7 +293,7 @@ async function fetchWorkspaceChangedFiles(
     lines_added: e.lines_added ?? null,
     lines_removed: e.lines_removed ?? null,
   }));
-  return { available: true, data };
+  return { available: true, data, ...parseTracking(json.tracking) };
 }
 
 /**

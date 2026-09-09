@@ -9872,29 +9872,37 @@ def create_runner_app(
 
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
+        from omnigent.runtime.filesystem_registry import TRACKING_LIMIT_NO_WORKSPACE
+
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
-        try:
-            # ``list_changed_files`` shells out to ``git status`` synchronously,
-            # which on a large repo (cold untracked cache) can take seconds.
-            # Offload to a thread so it never blocks the event loop — a blocked
-            # loop can't answer the server's runner-stream relay probe and the
-            # session's first turn 503s with runner_unavailable.
-            raw_changes = (
-                await _asyncio.to_thread(
+        if session_registry is not None:
+            try:
+                # ``list_changed_files`` shells out to ``git status`` synchronously,
+                # which on a large repo (cold untracked cache) can take seconds.
+                # Offload to a thread so it never blocks the event loop — a blocked
+                # loop can't answer the server's runner-stream relay probe and the
+                # session's first turn 503s with runner_unavailable.
+                raw_changes = await _asyncio.to_thread(
                     session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
                 )
-                if session_registry is not None
-                else []
-            )
-        except GitStatusUnavailable as exc:
-            return JSONResponse(
-                status_code=500,
-                content={"error": {"code": "git_status_failed", "message": exc.reason}},
-            )
+            except GitStatusUnavailable as exc:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": {"code": "git_status_failed", "message": exc.reason}},
+                )
+            tracking_complete = session_registry.tracks_all_changes
+            tracking_reason = session_registry.tracking_limit_reason
+        else:
+            # No registry at all (runner has no workspace path): the list is
+            # always empty, so flag tracking as unavailable rather than letting
+            # the empty list read as a definitive "no changes".
+            raw_changes = []
+            tracking_complete = False
+            tracking_reason = TRACKING_LIMIT_NO_WORKSPACE
         data = [
             {
                 "object": "session.environment.filesystem.entry",
@@ -9910,7 +9918,19 @@ def create_runner_app(
         ]
         return JSONResponse(
             status_code=200,
-            content={"object": "list", "data": data, "has_more": False},
+            content={
+                "object": "list",
+                "data": data,
+                "has_more": False,
+                # Whether the list captures every working-tree edit.  Git
+                # workspaces are complete; non-git workspaces track only agent
+                # tool-call edits (``tracking.reason`` says why), so the UI can
+                # surface the limitation instead of an ambiguous empty list.
+                "tracking": {
+                    "complete": tracking_complete,
+                    "reason": tracking_reason,
+                },
+            },
         )
 
     @app.get(
