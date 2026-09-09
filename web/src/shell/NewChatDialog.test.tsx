@@ -3450,6 +3450,56 @@ describe("NewChatLandingScreen externally-queued attachments", () => {
 
     expect(useChatStore.getState().pendingComposerAttachments).toEqual([]);
   });
+
+  // Luna's finding (luna-landing-attachments-0803/REVIEW.md): the drain
+  // itself always kept two ranges of the same file distinct (the store key
+  // and the outbound "[Attached: ...]" marker both include the range), but
+  // the landing chip rendered only "@path" for every range of a file, with
+  // an identical "Remove path" accessible name on both -- a sighted user
+  // couldn't tell the chips apart, and a screen-reader user couldn't tell
+  // which "Remove" button removed which range.
+  it("shows a distinct visible range and remove label for two ranges of the same file", () => {
+    renderLanding();
+
+    act(() => {
+      useChatStore.getState().addComposerAttachment({
+        path: "src/a.ts",
+        isDir: false,
+        lineRange: { start: 2, end: 9 },
+      });
+      useChatStore.getState().addComposerAttachment({
+        path: "src/a.ts",
+        isDir: false,
+        lineRange: { start: 20, end: 30 },
+      });
+    });
+
+    expect(screen.getByText(":2-9")).toBeInTheDocument();
+    expect(screen.getByText(":20-30")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove src/a.ts:2-9" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove src/a.ts:20-30" })).toBeInTheDocument();
+  });
+
+  it("removing one range chip leaves the other range of the same file intact", () => {
+    renderLanding();
+    act(() => {
+      useChatStore.getState().addComposerAttachment({
+        path: "src/a.ts",
+        isDir: false,
+        lineRange: { start: 2, end: 9 },
+      });
+      useChatStore.getState().addComposerAttachment({
+        path: "src/a.ts",
+        isDir: false,
+        lineRange: { start: 20, end: 30 },
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove src/a.ts:2-9" }));
+
+    expect(screen.queryByText(":2-9")).not.toBeInTheDocument();
+    expect(screen.getByText(":20-30")).toBeInTheDocument();
+  });
 });
 
 // The "@"-file-mention browser on the launcher mirrors the in-session
