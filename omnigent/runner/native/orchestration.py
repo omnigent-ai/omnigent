@@ -458,6 +458,10 @@ class _CodexNativeLaunchConfig:
         still has work to do. False on a session something already routed —
         a web create that pinned the model before the pane launched — so the
         ``UserPromptSubmit`` hook is never registered and no prompt is held.
+    :param reasoning_effort: Persisted per-session effort, e.g. ``"ultra"``,
+        pinned into the private ``config.toml`` at launch so the thread (and
+        the TUI footer) start at it instead of the shared config's default.
+        ``None`` leaves Codex's configured effort in place.
     """
 
     workspace: Path
@@ -472,6 +476,7 @@ class _CodexNativeLaunchConfig:
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
+    reasoning_effort: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1004,6 +1009,22 @@ async def _codex_native_launch_config(
         not isinstance(external_session_id, str) or not external_session_id
     ):
         raise RuntimeError(f"Invalid external_session_id for Codex session {session_id!r}.")
+    from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS, validate_effort
+
+    reasoning_effort = snapshot.get("reasoning_effort")
+    if reasoning_effort is not None:
+        try:
+            reasoning_effort = validate_effort(reasoning_effort, "codex", CODEX_NATIVE_EFFORTS)
+        except ValueError:
+            # An effort codex cannot take must not sink the launch: keep the
+            # configured default, as the per-turn override does.
+            _logger.warning(
+                "Ignoring unsupported reasoning_effort %r for Codex session %s",
+                reasoning_effort,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            reasoning_effort = None
     # The session's stored workspace is the worktree path for worktree
     # sessions (set by _create_session_worktree), or the repo root
     # otherwise. Use it as the Codex terminal cwd so worktree sessions
@@ -1063,6 +1084,7 @@ async def _codex_native_launch_config(
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -4276,6 +4298,7 @@ async def _auto_create_codex_terminal(
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
         developer_instructions=_codex_developer_instructions,
+        reasoning_effort=launch_config.reasoning_effort,
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
