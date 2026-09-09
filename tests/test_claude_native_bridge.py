@@ -5219,6 +5219,26 @@ def test_post_tools_changed_normalizes_transport_errors(
     assert caught.value.__cause__ is transport_error
 
 
+def test_post_tools_changed_normalizes_server_info_read_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Reading the bridge advertisement can fail for reasons other than the file
+    being absent — a runner that has exhausted its file descriptors raises
+    ``OSError`` (EMFILE) on the read. That must arrive as the documented
+    ``RuntimeError`` so the fire-and-forget caller can swallow it instead of
+    leaving an unretrieved task exception behind.
+    """
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(side_effect=OSError(24, "Too many open files")),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to read the Claude native bridge server info"):
+        post_tools_changed(tmp_path)
+
+
 def test_post_tools_changed_preserves_programming_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
