@@ -424,6 +424,91 @@ def _seed_completed_tool_call(
     )
 
 
+def test_interjected_answer_starts_worked_fold_expanded(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A reply to a mid-response user message is visible after reload.
+
+    Native harnesses can persist a user steering message inside the response
+    already doing work. The assistant may answer that message, resume its prior
+    work, and finish with a separate wrap-up. The ordinary process/final split
+    puts the intermediate answer inside the ``Worked`` disclosure; it must start
+    open so the answer is visible, while preserving the user's ability to close
+    the disclosure.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    response_id = "resp_interjected_answer_1"
+
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="Waiting for the merge to finish.",
+        response_id=response_id,
+    )
+    _seed_user_message(
+        base_url,
+        session_id,
+        text="Does this conflict with the other change?",
+        response_id=response_id,
+    )
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="Checking the overlap.",
+        response_id=response_id,
+    )
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id="call_interjection_diff",
+        arguments='{"command": "git diff --stat"}',
+        output="No overlapping files.\n",
+    )
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="No code conflict.",
+        response_id=response_id,
+    )
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id="call_interjection_merge",
+        arguments='{"command": "git merge --continue"}',
+        output="Merge completed.\n",
+    )
+    _seed_assistant_message(
+        base_url,
+        session_id,
+        text="Merge complete.",
+        response_id=response_id,
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    continuation = page.locator(
+        _ASSISTANT_BUBBLE,
+        has=page.get_by_text("Merge complete.", exact=True),
+    ).first
+    expect(continuation).to_be_visible(timeout=20_000)
+    fold = continuation.locator(_FOLD)
+    expect(fold).to_be_visible()
+    trigger = fold.locator('[data-slot="collapsible-trigger"]').first
+    expect(trigger).to_have_attribute("aria-expanded", "true")
+    expect(continuation.get_by_text("No code conflict.", exact=True)).to_be_visible()
+
+    trigger.click()
+    expect(trigger).to_have_attribute("aria-expanded", "false")
+    expect(continuation.get_by_text("No code conflict.", exact=True)).to_be_hidden()
+    expect(continuation.get_by_text("Merge complete.", exact=True)).to_be_visible()
+
+
 def test_stepwise_step_edges_fold_once(
     page: Page,
     seeded_session: tuple[str, str],
