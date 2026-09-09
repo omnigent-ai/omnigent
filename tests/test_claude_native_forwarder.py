@@ -6159,6 +6159,98 @@ async def test_subagent_batch_failure_resumes_at_first_unsent_record(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_permanent_batch_failure_redrives_items_individually(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poison event cannot discard valid siblings from a failed batch."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-redrive.jsonl").write_text("{}\n", encoding="utf-8")
+    items = tuple(
+        ClaudeTranscriptItem(
+            source_id=source_id,
+            item_type="message",
+            data={"role": "assistant", "content": [{"type": "text", "text": source_id}]},
+            response_id="resp_redrive",
+        )
+        for source_id in ("before-poison", "poison", "after-poison")
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=3,
+        byte_offset=30,
+        current_response_id=None,
+        items=list(items),
+        record_items=tuple(
+            TranscriptRecordItems(next_byte_offset=(index + 1) * 10, items=(item,))
+            for index, item in enumerate(items)
+        ),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="redrive",
+        child_conversation_id="conv_child_redrive",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"redrive": entry}),
+    )
+    request_bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        if isinstance(body, list):
+            return httpx.Response(400, json={"error": "poison in batch"})
+        if body["type"] == "external_conversation_item":
+            if body["data"]["source_id"] == "poison":
+                return httpx.Response(400, json={"error": "poison"})
+            return httpx.Response(202, json={"queued": False, "item_id": "item-ok"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0,
+                max_permanent_attempts=1,
+            ),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    individual_source_ids = [
+        body["data"]["source_id"]
+        for body in request_bodies
+        if isinstance(body, dict) and body.get("type") == "external_conversation_item"
+    ]
+    assert individual_source_ids == ["before-poison", "poison", "after-poison"]
+    updated = checkpoint.state.subagents["redrive"]
+    assert updated.byte_offset == 30
+    assert updated.seen_source_ids == tuple(item.source_id for item in items)
+    dead_letters = [
+        json.loads(line)
+        for line in (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert [record["payload"]["source_id"] for record in dead_letters] == ["poison"]
+
+
+@pytest.mark.asyncio
 async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Path) -> None:
     """Independent child conversations are concurrent while each stays ordered."""
     bridge_dir = tmp_path / "bridge"
@@ -8989,7 +9081,7 @@ async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
         body = json.loads(request.content.decode("utf-8"))
         if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
-        if isinstance(body, list):
+        if isinstance(body, list) or body.get("type") == "external_conversation_item":
             return httpx.Response(400, json={"error": "nope"})
         return httpx.Response(202, json={})
 

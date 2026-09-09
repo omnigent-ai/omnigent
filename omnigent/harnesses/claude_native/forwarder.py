@@ -1763,7 +1763,9 @@ async def _forward_one_subagent(
         if item_retry_tracker.retry_delay_s(retry_key) is not None:
             break
         drop_reason = batch[0].drop_reason if len(batch) == 1 else None
-        dropped = drop_reason is not None
+        completed_items: list[_PendingSubagentItem] = []
+        delivered = False
+        stop_after_batch = False
         if drop_reason is not None:
             item = batch[0].item
             _logger.error(
@@ -1788,6 +1790,7 @@ async def _forward_one_subagent(
                 # Keep startup replay from retrying a payload that cannot fit.
                 http_status=413,
             )
+            completed_items.extend(batch)
         else:
             try:
                 await _post_external_conversation_items(
@@ -1813,10 +1816,9 @@ async def _forward_one_subagent(
                         extra={"session_id": parent_session_id},
                     )
                     break
-                dropped = True
-                _logger.error(
-                    "Dropping claude-native sub-agent transcript batch after permanent "
-                    "HTTP failures; child=%s items=%s attempts=%s http_status=%s",
+                _logger.warning(
+                    "Re-driving claude-native sub-agent transcript batch individually "
+                    "after HTTP failures; child=%s items=%s attempts=%s http_status=%s",
                     entry.child_conversation_id,
                     len(batch),
                     decision.attempts,
@@ -1825,38 +1827,76 @@ async def _forward_one_subagent(
                 )
                 for pending_item in batch:
                     item = pending_item.item
-                    append_dead_letter(
-                        bridge_dir,
-                        session_id=entry.child_conversation_id,
-                        event_type="external_conversation_item",
-                        payload={
-                            "source_id": item.source_id,
-                            "item_type": item.item_type,
-                            "item_data": item.data,
-                            "response_id": item.response_id,
-                        },
-                        reason="permanent HTTP failure after retries",
-                        delivered_ambiguous=False,
-                        http_status=_http_status_for_log(exc),
-                    )
+                    try:
+                        await _post_external_conversation_item(
+                            client,
+                            session_id=entry.child_conversation_id,
+                            item=item,
+                        )
+                    except httpx.HTTPError as item_exc:
+                        if not (
+                            _is_permanent_http_error(item_exc)
+                            or _is_subagent_delivery_not_confirmed(item_exc)
+                        ):
+                            stop_after_batch = True
+                            _logger.warning(
+                                "Failed to re-drive claude-native sub-agent transcript "
+                                "item; child=%s source_id=%s http_status=%s",
+                                entry.child_conversation_id,
+                                item.source_id,
+                                _http_status_for_log(item_exc),
+                                exc_info=True,
+                                extra={"session_id": parent_session_id},
+                            )
+                            break
+                        _logger.error(
+                            "Dropping claude-native sub-agent transcript item after "
+                            "individual rejection; child=%s source_id=%s http_status=%s",
+                            entry.child_conversation_id,
+                            item.source_id,
+                            _http_status_for_log(item_exc),
+                            extra={"session_id": parent_session_id},
+                        )
+                        append_dead_letter(
+                            bridge_dir,
+                            session_id=entry.child_conversation_id,
+                            event_type="external_conversation_item",
+                            payload={
+                                "source_id": item.source_id,
+                                "item_type": item.item_type,
+                                "item_data": item.data,
+                                "response_id": item.response_id,
+                            },
+                            reason="permanent HTTP failure after retries",
+                            delivered_ambiguous=False,
+                            http_status=_http_status_for_log(item_exc),
+                        )
+                    else:
+                        delivered = True
+                    completed_items.append(pending_item)
+            else:
+                completed_items.extend(batch)
+                delivered = True
         item_retry_tracker.clear(retry_key)
-        had_item = had_item or not dropped
-        for pending_item in batch:
+        had_item = had_item or delivered
+        for pending_item in completed_items:
             source_id = pending_item.item.source_id
             seen.add(source_id)
             seen_source_ids.append(source_id)
         completed_offsets = [
             pending_item.checkpoint_after
-            for pending_item in batch
+            for pending_item in completed_items
             if pending_item.checkpoint_after is not None
         ]
         new_entry = replace(
             new_entry,
             byte_offset=max(completed_offsets, default=new_entry.byte_offset),
             seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-            last_activity_ts=now if not dropped else new_entry.last_activity_ts,
+            last_activity_ts=now if delivered else new_entry.last_activity_ts,
         )
         await checkpoint.put(new_entry)
+        if stop_after_batch:
+            break
 
     desired_status: str | None = None
     if had_item:
