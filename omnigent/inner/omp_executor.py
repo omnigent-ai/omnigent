@@ -2079,7 +2079,7 @@ class OmpExecutor(Executor):
                 workspace_url,
                 self._databricks_token,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — metadata is best-effort; fall back to the yml catalog
             logger.warning(
                 "omp could not fetch Databricks model metadata; "
                 "the picker will show only the selected model",
@@ -2093,7 +2093,7 @@ class OmpExecutor(Executor):
                 model_catalog.catalog_model_entries,
                 "databricks",
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — enrichment is best-effort; the live list survives without it
             logger.info(
                 "omp could not enrich the live Databricks model list with MLflow metadata",
                 exc_info=True,
@@ -2280,7 +2280,7 @@ class OmpExecutor(Executor):
                 {"type": "get_available_thinking_levels", "id": "thinking_levels"},
                 "get_available_thinking_levels",
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — probe is best-effort; a failed probe just skips clamping
             logger.debug("OmpExecutor: get_available_thinking_levels failed", exc_info=True)
             return None
         data = response.get("data") if response else None
