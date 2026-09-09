@@ -3516,6 +3516,69 @@ describe("NewChatLandingScreen attachments", () => {
 
     expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
   });
+
+  /** A stub clipboardData carrying an optional pasted file plus plain text. */
+  function pasteClipboardData(opts: { file?: File; text?: string }) {
+    return {
+      items: opts.file ? [{ kind: "file", getAsFile: () => opts.file! }] : [],
+      getData: (type: string) => (type === "text/plain" ? (opts.text ?? "") : ""),
+    };
+  }
+
+  // jsdom doesn't expose a ClipboardEvent constructor, so a plain Event
+  // stands in and clipboardData is attached directly (same approach as the
+  // in-session composer's paste tests in ChatPage.composer.test.tsx).
+  function firePaste(target: HTMLElement, clipboardData: unknown) {
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { configurable: true, value: clipboardData });
+    fireEvent(target, event);
+  }
+
+  it("keeps pasted text and attaches a pasted image together", () => {
+    renderLanding();
+    const ta = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "look at this: " } });
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+
+    const file = new File([new Uint8Array(10)], "image.png", { type: "image/png" });
+    firePaste(ta, pasteClipboardData({ file, text: "a screenshot" }));
+
+    expect(ta.value).toBe("look at this: a screenshot");
+    expect(screen.getByRole("button", { name: "Remove image.png" })).toBeTruthy();
+  });
+
+  it("leaves the draft unchanged for a file-only paste", () => {
+    renderLanding();
+    const ta = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "draft text" } });
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    firePaste(ta, pasteClipboardData({ file }));
+
+    expect(ta.value).toBe("draft text");
+    expect(screen.getByRole("button", { name: "Remove shot.png" })).toBeTruthy();
+  });
+
+  it("persists pasted text into the landing draft across an unmount", () => {
+    // The landing draft has no dirty-flag gate (see NewChatDialog.tsx's
+    // unmount effect) — draftRef.current mirrors live state on every render,
+    // so whatever the paste handler puts in `message` rides along
+    // unconditionally. This proves the round trip end to end, through the
+    // same module-level draft a real navigation-away would populate.
+    renderLanding();
+    const ta = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    firePaste(ta, pasteClipboardData({ file, text: "a pasted caption" }));
+    expect(ta.value).toBe("a pasted caption");
+
+    cleanup();
+    // No resetLandingDraft() here — restoring from the same module-level
+    // singleton the unmount just wrote is exactly what's under test.
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("a pasted caption");
+  });
 });
 
 // The "@"-file-mention browser on the launcher mirrors the in-session
