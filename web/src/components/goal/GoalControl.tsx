@@ -49,7 +49,7 @@ export function GoalControl(props: GoalControlProps) {
             size="sm"
             variant={goal ? "secondary" : "ghost"}
             className={cn(
-              "h-9 gap-1.5 px-2 text-sm md:h-8",
+              "h-9 w-9 gap-0 px-0 text-sm sm:w-auto sm:gap-1.5 sm:px-2 md:h-8",
               goal && "border border-ring/30 text-foreground",
             )}
             disabled={!conversationId || (commandMode && readOnly)}
@@ -62,7 +62,7 @@ export function GoalControl(props: GoalControlProps) {
             onClick={() => setOpen(true)}
           >
             <TargetIcon className="size-3.5" />
-            <span>Goal</span>
+            <span className="hidden sm:inline">Goal</span>
           </Button>
         </TooltipTrigger>
         <TooltipContent>

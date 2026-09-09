@@ -3748,7 +3748,7 @@ function ComposerImpl({
                     size="sm"
                     variant={codexPlanMode ? "secondary" : "ghost"}
                     className={cn(
-                      "h-9 gap-1.5 px-2 text-sm md:h-8",
+                      "h-9 w-9 gap-0 px-0 text-sm sm:w-auto sm:gap-1.5 sm:px-2 md:h-8",
                       codexPlanMode && "border border-ring/30 text-foreground",
                     )}
                     disabled={isReadOnly || planModeBusy}
@@ -3764,7 +3764,7 @@ function ComposerImpl({
                     ) : (
                       <FileTextIcon className="size-3.5" />
                     )}
-                    <span>Plan</span>
+                    <span className="hidden sm:inline">Plan</span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>

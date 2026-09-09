@@ -72,6 +72,14 @@ describe("GoalControl", () => {
     expect(screen.getByTestId("goal-toggle")).toBeDisabled();
   });
 
+  it("collapses the visible Goal label below the small breakpoint", () => {
+    renderControl();
+
+    const button = screen.getByRole("button", { name: "View goal" });
+    expect(button).toHaveClass("w-9", "sm:w-auto");
+    expect(screen.getByText("Goal")).toHaveClass("hidden", "sm:inline");
+  });
+
   it("starts a command-backed goal", () => {
     const onStartGoal = vi.fn();
     render(

@@ -88,6 +88,24 @@ _MODEL_OPTIONS = [
     },
 ]
 
+_CODEX_MODEL_ID = "gpt-5.6-sol"
+_CODEX_MODEL_OPTIONS = [
+    {
+        "id": _CODEX_MODEL_ID,
+        "model": _CODEX_MODEL_ID,
+        "displayName": "GPT-5.6-Sol",
+        "defaultReasoningEffort": "high",
+        "supportedReasoningEfforts": [
+            {"reasoningEffort": "low", "description": "Low"},
+            {"reasoningEffort": "medium", "description": "Medium"},
+            {"reasoningEffort": "high", "description": "High"},
+            {"reasoningEffort": "xhigh", "description": "Extra high"},
+        ],
+        "isDefault": True,
+        "source": _DATABRICKS_SOURCE,
+    }
+]
+
 
 def _patch_session_as_databricks_claude_native(page: Page, session_id: str) -> None:
     """Shape the browser's session snapshot like the reporter's session.
@@ -117,6 +135,38 @@ def _patch_session_as_databricks_claude_native(page: Page, session_id: str) -> N
         payload["harness"] = "claude"
         payload["llm_model"] = _MODEL_ID
         payload["model_options"] = _MODEL_OPTIONS
+        payload["reasoning_effort"] = _EFFORT
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    page.route("**/v1/sessions/**", _handle)
+
+
+def _patch_session_as_databricks_codex_native(page: Page, session_id: str) -> None:
+    """Shape the browser snapshot like the compact Codex iOS composer.
+
+    :param page: Playwright page, before navigation.
+    :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
+    :returns: None.
+    """
+
+    def _handle(route: Route) -> None:
+        request = route.request
+        if urlparse(request.url).path != f"/v1/sessions/{session_id}" or request.method != "GET":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        payload["labels"] = {
+            **payload.get("labels", {}),
+            "omnigent.wrapper": "codex-native-ui",
+        }
+        payload["harness"] = "codex-native"
+        payload["llm_model"] = _CODEX_MODEL_ID
+        payload["model_options"] = _CODEX_MODEL_OPTIONS
         payload["reasoning_effort"] = _EFFORT
         route.fulfill(
             status=200,
@@ -258,3 +308,41 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         page.unroute_all(behavior="ignoreErrors")
         _release_gates(mock_llm_server_url)
         reset_mock_llm(mock_llm_server_url)
+
+
+def test_composer_compacts_plan_and_goal_labels_on_phone_width(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Phone widths preserve model space without dropping the config gear.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size(_IPHONE_VIEWPORT)
+    _patch_session_as_databricks_codex_native(page, session_id)
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+
+        plan = page.get_by_role("button", name="Enter Plan mode")
+        goal = page.get_by_role("button", name="Set Codex goal")
+        gear = page.get_by_role("button", name="Configure session")
+        expect(plan).to_be_visible(timeout=15_000)
+        expect(goal).to_be_visible(timeout=15_000)
+        expect(gear).to_be_visible(timeout=15_000)
+
+        plan_text = plan.locator("span", has_text="Plan")
+        goal_text = goal.locator("span", has_text="Goal")
+        expect(plan_text).to_be_hidden()
+        expect(goal_text).to_be_hidden()
+
+        page.set_viewport_size({"width": 800, "height": _IPHONE_VIEWPORT["height"]})
+        expect(plan_text).to_be_visible()
+        expect(goal_text).to_be_visible()
+        expect(gear).to_be_visible()
+    finally:
+        page.unroute_all(behavior="ignoreErrors")
