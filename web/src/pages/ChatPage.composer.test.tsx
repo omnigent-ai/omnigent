@@ -1489,12 +1489,12 @@ describe("Composer Codex Plan-mode control", () => {
     expect(button).toHaveAccessibleName("Exit Plan mode");
   });
 
-  it("collapses the visible Plan label below the small breakpoint", () => {
+  it("collapses the visible Plan label below the mobile breakpoint", () => {
     renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
 
     const button = screen.getByRole("button", { name: "Enter Plan mode" });
-    expect(button).toHaveClass("w-9", "sm:w-auto");
-    expect(within(button).getByText("Plan")).toHaveClass("hidden", "sm:inline");
+    expect(button).toHaveClass("w-9", "md:w-auto");
+    expect(within(button).getByText("Plan")).toHaveClass("hidden", "md:inline");
   });
 
   it("hides the control when the session is not Codex-native", () => {

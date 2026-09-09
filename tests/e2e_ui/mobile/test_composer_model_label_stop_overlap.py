@@ -340,6 +340,11 @@ def test_composer_compacts_plan_and_goal_labels_on_phone_width(
         expect(plan_text).to_be_hidden()
         expect(goal_text).to_be_hidden()
 
+        page.set_viewport_size({"width": 700, "height": _IPHONE_VIEWPORT["height"]})
+        expect(plan_text).to_be_hidden()
+        expect(goal_text).to_be_hidden()
+        expect(gear).to_be_visible()
+
         page.set_viewport_size({"width": 800, "height": _IPHONE_VIEWPORT["height"]})
         expect(plan_text).to_be_visible()
         expect(goal_text).to_be_visible()
