@@ -2443,12 +2443,14 @@ def read_transcript_items_since(
     Read Claude transcript records as Omnigent conversation items.
 
     Claude Code writes append-only JSONL records whose ``message``
-    payloads include user prompts, assistant text, native tool calls,
-    and native tool results. This parser intentionally renders no
-    conversation item for metadata records (title, file-history,
-    permission mode, system bookkeeping) or raw ``thinking`` blocks,
+    payloads include user prompts, assistant text, ``thinking``
+    blocks, native tool calls, and native tool results. This parser
+    intentionally renders no conversation item for metadata records
+    (title, file-history, permission mode, system bookkeeping),
     while translating the user-visible semantic records into Omnigent
-    item types the web UI already understands. Some metadata is still
+    item types the web UI already understands — ``thinking`` blocks
+    become ``reasoning`` items so the chat surfaces the same
+    reasoning context the TUI shows. Some metadata is still
     read for out-of-band mirroring rather than dropped outright — a
     ``custom-title`` record surfaces on
     :attr:`TranscriptReadResult.latest_custom_title`.
@@ -6990,6 +6992,25 @@ def _assistant_transcript_items_from_entry(
                         response_id=response_id,
                         text=text,
                         is_api_error=is_api_error,
+                    )
+                )
+            continue
+        if block_type == "thinking":
+            # Mirror the thought as a reasoning item so the chat offers the
+            # same expandable reasoning context the TUI renders. Redacted
+            # thinking carries no readable text anywhere, so it stays dropped.
+            thinking = block.get("thinking")
+            if isinstance(thinking, str) and thinking.strip():
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, item_index, "reasoning"),
+                        item_type="reasoning",
+                        data={
+                            "agent": agent_name,
+                            "summary": [],
+                            "content": [{"type": "reasoning_text", "text": thinking}],
+                        },
+                        response_id=response_id,
                     )
                 )
             continue

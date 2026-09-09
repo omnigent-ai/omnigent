@@ -3,7 +3,12 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseEvent, withStallGuard } from "./sse";
-import type { SessionStatusEvent, SessionSupersededEvent, TextDelta } from "./events";
+import type {
+  ReasoningDone,
+  SessionStatusEvent,
+  SessionSupersededEvent,
+  TextDelta,
+} from "./events";
 
 describe("withStallGuard", () => {
   beforeEach(() => {
@@ -130,6 +135,51 @@ describe("parseEvent — response.output_text.delta", () => {
 
   it("returns null when delta is not a string", () => {
     expect(parseEvent("response.output_text.delta", { delta: { text: "bad" } })).toBeNull();
+  });
+});
+
+describe("parseEvent — response.output_item.done (reasoning)", () => {
+  it("parses a persisted reasoning item into reasoning_done", () => {
+    // A settled thought mirrored by a native harness (claude-native
+    // thinking blocks) or persisted by an SDK turn. Content/summary
+    // blocks join with "\n\n", matching the history path
+    // (`itemsToBlocks.reasoningToBlock`).
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "it_1",
+        type: "reasoning",
+        response_id: "resp_1",
+        model: "claude-native-ui",
+        summary: [{ type: "summary_text", text: "a summary" }],
+        content: [
+          { type: "reasoning_text", text: "first thought" },
+          { type: "reasoning_text", text: "second thought" },
+        ],
+      },
+    });
+    expect(ev).toEqual({
+      type: "reasoning_done",
+      text: "first thought\n\nsecond thought",
+      summary: "a summary",
+      itemId: "it_1",
+      responseId: "resp_1",
+    } satisfies ReasoningDone);
+  });
+
+  it("drops a reasoning item with no readable text (redacted)", () => {
+    // Redacted reasoning carries only encrypted content — nothing a
+    // user could read on any surface, so no dead section is emitted.
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "it_1",
+        type: "reasoning",
+        response_id: "resp_1",
+        summary: [],
+        content: null,
+        encrypted_content: "opaque",
+      },
+    });
+    expect(ev).toBeNull();
   });
 });
 
