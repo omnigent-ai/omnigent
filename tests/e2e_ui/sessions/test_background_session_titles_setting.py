@@ -1,8 +1,8 @@
 """E2E: Settings → General background session-title preference.
 
-The toggle persists the user's server-side preference through
-``GET/PUT /v1/user-settings``. This covers the real browser and server round
-trip without launching an LLM title-generation turn.
+The toggle persists the user's browser-local preference through
+``localStorage``. This covers the real settings round trip without launching
+an LLM title-generation turn.
 """
 
 from __future__ import annotations

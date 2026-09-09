@@ -233,7 +233,7 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
 )
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
-_CODEX_REAUTH_HINT = "Codex needs you to re-authenticate. Run `codex login` and retry."
+_CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
 
 
 @dataclass

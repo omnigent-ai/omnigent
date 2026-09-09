@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import {
   applyLiveRows,
@@ -14,7 +15,15 @@ import {
   useCanvasSessions,
 } from "./canvasSessions";
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
+
+vi.mock("@/lib/host", () => ({
+  getOmnigentServerIdentity: vi.fn(() => "server-a"),
+}));
 
 function session(
   id: string,
@@ -52,8 +61,17 @@ function requestedQueries(): URLSearchParams[] {
     .mock.calls.map(([path]) => new URLSearchParams(String(path).split("?")[1]));
 }
 
+function resolveViewer(viewerId = "me"): void {
+  vi.mocked(identity.getCurrentUserId).mockReturnValue(viewerId);
+  vi.mocked(identity.resolveIdentity).mockResolvedValue(viewerId);
+}
+
 beforeEach(() => {
+  vi.mocked(host.getOmnigentServerIdentity).mockReset().mockReturnValue("server-a");
   vi.mocked(identity.authenticatedFetch).mockReset();
+  vi.mocked(identity.getCurrentUserId).mockReset().mockReturnValue(null);
+  vi.mocked(identity.resolveIdentity).mockReset().mockResolvedValue(null);
+  window.sessionStorage.clear();
 });
 
 afterEach(() => {
@@ -217,9 +235,209 @@ describe("useCanvasSessions", () => {
       resolvePage(jsonResponse(page([session("fresh", 9)], null, false)));
     });
     await waitFor(() => expect(result.current.complete).toBe(true));
+    expect(result.current.networkConfirmed).toBe(true);
     expect(result.current.sessions.map((row) => row.id)).toEqual(["fresh"]);
     expect(result.current.loadingMore).toBe(false);
     expect(result.current.error).toBeNull();
+  });
+
+  it("paints the last complete list at once on a later visit and refreshes quietly", async () => {
+    resolveViewer();
+    const client = new QueryClient();
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([session("a", 9), session("b", 8)], null, false)),
+    );
+    const first = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(first.result.current.complete).toBe(true));
+    first.unmount();
+
+    let resolvePage!: (value: Response) => void;
+    vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePage = resolve;
+      }),
+    );
+    const second = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+
+    // Every card from the previous visit is there before the refresh answers.
+    expect(second.result.current.sessions.map((row) => row.id)).toEqual(["a", "b"]);
+    expect(second.result.current).toMatchObject({
+      loaded: true,
+      complete: true,
+      networkConfirmed: false,
+    });
+    await waitFor(() => expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2));
+    expect(second.result.current.loadingMore).toBe(false);
+    // A remembered list means the refresh starts with a full page.
+    expect(requestedQueries()[1].get("limit")).toBe(String(SESSION_PAGE_LIMIT));
+
+    await act(async () => {
+      resolvePage(jsonResponse(page([session("a", 10)], null, false)));
+    });
+    await waitFor(() => expect(second.result.current.sessions.map((row) => row.id)).toEqual(["a"]));
+    expect(second.result.current.networkConfirmed).toBe(true);
+  });
+
+  it("does not reuse an in-memory list after switching servers for the same viewer", async () => {
+    resolveViewer();
+    const client = new QueryClient();
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([session("same", 9)], null, false)),
+    );
+    const first = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(first.result.current.complete).toBe(true));
+    first.unmount();
+
+    vi.mocked(host.getOmnigentServerIdentity).mockReturnValue("server-b");
+    let resolvePage!: (value: Response) => void;
+    vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePage = resolve;
+      }),
+    );
+    const second = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+
+    expect(second.result.current).toMatchObject({ sessions: [], complete: false });
+    await waitFor(() => expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      resolvePage(jsonResponse(page([session("same", 9)], null, false)));
+    });
+    await waitFor(() => expect(second.result.current.networkConfirmed).toBe(true));
+
+    const keys = Array.from({ length: window.sessionStorage.length }, (_, index) =>
+      window.sessionStorage.key(index),
+    );
+    expect(keys).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/:server-a:me$/),
+        expect.stringMatching(/:server-b:me$/),
+      ]),
+    );
+  });
+
+  it("keeps a load that finishes after Canvas unmounts for the next visit", async () => {
+    resolveViewer();
+    const client = new QueryClient();
+    let resolveLastPage!: (value: Response) => void;
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(jsonResponse(page([session("a", 9)], "a", true)))
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveLastPage = resolve;
+        }),
+      );
+
+    const first = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(first.result.current.sessions.map((row) => row.id)).toEqual(["a"]));
+    expect(first.result.current.complete).toBe(false);
+    first.unmount();
+
+    await act(async () => {
+      resolveLastPage(jsonResponse(page([session("b", 8)], null, false)));
+      await Promise.resolve();
+    });
+
+    // Keep the revisit refresh pending so this assertion only observes the cache.
+    vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(new Promise<Response>(() => {}));
+    const second = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+    expect(second.result.current.sessions.map((row) => row.id)).toEqual(["a", "b"]);
+    expect(second.result.current).toMatchObject({
+      loaded: true,
+      complete: true,
+      networkConfirmed: false,
+    });
+  });
+
+  it("restores the complete list from session storage after a page reload", async () => {
+    resolveViewer();
+    const firstClient = new QueryClient();
+    const liveShaped = session("a", 9);
+    delete (liveShaped as Partial<Conversation>).object;
+    delete (liveShaped as Partial<Conversation>).status;
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([liveShaped, session("b", 8)], null, false)),
+    );
+    const first = renderHook(() => useCanvasSessions(), { wrapper: wrapper(firstClient) });
+    await waitFor(() => expect(first.result.current.complete).toBe(true));
+    first.unmount();
+
+    // A new QueryClient models a full page reload; keep its refresh pending so
+    // the assertion can only pass from the persisted complete-list cache.
+    vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(new Promise<Response>(() => {}));
+    const second = renderHook(() => useCanvasSessions(), {
+      wrapper: wrapper(new QueryClient()),
+    });
+    expect(second.result.current.sessions.map((row) => row.id)).toEqual(["a", "b"]);
+    expect(second.result.current).toMatchObject({
+      loaded: true,
+      complete: true,
+      networkConfirmed: false,
+    });
+  });
+
+  it("waits for identity before reading a viewer-scoped reload cache", async () => {
+    resolveViewer();
+    const firstClient = new QueryClient();
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([session("a", 9), session("b", 8)], null, false)),
+    );
+    const first = renderHook(() => useCanvasSessions(), { wrapper: wrapper(firstClient) });
+    await waitFor(() => expect(first.result.current.complete).toBe(true));
+    first.unmount();
+
+    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+    vi.mocked(identity.resolveIdentity).mockResolvedValue("me");
+    const reloadedClient = new QueryClient();
+    reloadedClient.setQueryData(["conversations", "", true], {
+      pageParams: [undefined],
+      pages: [page([session("preview", 10)], null, false)],
+    });
+    vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(new Promise<Response>(() => {}));
+    const reloaded = renderHook(() => useCanvasSessions(), {
+      wrapper: wrapper(reloadedClient),
+    });
+
+    // Do not flash the short preview while the persisted cache's viewer resolves.
+    expect(reloaded.result.current).toMatchObject({ sessions: [], loaded: false });
+    await waitFor(() =>
+      expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(["a", "b"]),
+    );
+    expect(reloaded.result.current).toMatchObject({
+      loaded: true,
+      complete: true,
+      networkConfirmed: false,
+    });
+  });
+
+  it("resolves identity before fetching and never stores an authenticated list as anonymous", async () => {
+    let finishIdentity!: (viewerId: string) => void;
+    vi.mocked(identity.resolveIdentity).mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        finishIdentity = resolve;
+      }),
+    );
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([session("a", 9)], null, false)),
+    );
+
+    const { result } = renderHook(() => useCanvasSessions(), {
+      wrapper: wrapper(new QueryClient()),
+    });
+    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
+    expect(identity.authenticatedFetch).not.toHaveBeenCalled();
+    expect(window.sessionStorage.length).toBe(0);
+
+    await act(async () => {
+      finishIdentity("me");
+    });
+    await waitFor(() => expect(result.current.networkConfirmed).toBe(true));
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+    const keys = Array.from({ length: window.sessionStorage.length }, (_, index) =>
+      window.sessionStorage.key(index),
+    );
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(/:me$/);
+    expect(keys[0]).not.toContain(":anonymous");
   });
 
   it("mirrors a stream patch to the sidebar cache without re-fetching", async () => {

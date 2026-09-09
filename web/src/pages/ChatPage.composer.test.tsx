@@ -750,6 +750,41 @@ describe("Composer slash-command submit routing", () => {
     );
   });
 
+  it("keeps the label's truncation chain intact when the source tooltip wraps it", () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    // jsdom does no layout, so pin the CSS contract instead: the tooltip
+    // wrapper must be a shrinkable flex container (flex + min-w-0 + shrink),
+    // or the label's `truncate` never engages and a long model id runs under
+    // the Stop button on phone-width viewports.
+    const wrapper = screen.getByTestId("composer-model-source");
+    for (const cls of ["flex", "min-w-0", "shrink"]) {
+      expect(wrapper.classList.contains(cls), `wrapper is missing "${cls}"`).toBe(true);
+    }
+    const label = screen.getByTestId("composer-model-effort-label");
+    for (const cls of ["truncate", "min-w-0", "shrink"]) {
+      expect(label.classList.contains(cls), `label is missing "${cls}"`).toBe(true);
+    }
+  });
+
   it("labels subscription provenance instead of showing an unexplained CLI name", async () => {
     useChatStore.setState({ llmModel: "sonnet" });
     const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
@@ -1452,6 +1487,15 @@ describe("Composer Codex Plan-mode control", () => {
     const button = screen.getByTestId("codex-plan-mode-toggle");
     expect(button).toHaveAttribute("aria-pressed", "true");
     expect(button).toHaveAccessibleName("Exit Plan mode");
+  });
+
+  it("collapses the visible Plan label in a narrow composer", () => {
+    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+
+    expect(screen.getByTestId("composer-action-row")).toHaveClass("@container/composer-actions");
+    const button = screen.getByRole("button", { name: "Enter Plan mode" });
+    expect(button).toHaveClass("w-9", "@lg/composer-actions:w-auto");
+    expect(within(button).getByText("Plan")).toHaveClass("hidden", "@lg/composer-actions:inline");
   });
 
   it("hides the control when the session is not Codex-native", () => {

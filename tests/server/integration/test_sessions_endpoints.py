@@ -523,6 +523,125 @@ async def test_native_user_item_schedules_background_semantic_title(
     assert snapshot.json()["title"] == "Debug authentication timeout"
 
 
+@pytest.mark.parametrize("initial_message", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_native_transcript_preserves_browser_title_preference(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_message: bool,
+    enabled: bool,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    prompt = "please investigate the authentication timeout"
+    content = [{"type": "input_text", "text": prompt}]
+    message = {"type": "message", "data": {"role": "user", "content": content}}
+    generated = asyncio.Event()
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        generated.set()
+        return "Debug authentication timeout"
+
+    app.state.background_title_coordinator._generator = generator
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        payload = {
+            "agent_id": agent["id"],
+            "labels": {
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+            **({"initial_items": [message]} if initial_message else {}),
+        }
+        headers = {} if enabled else {"X-Omnigent-Background-Session-Titles": "off"}
+        created = await client.post("/v1/sessions", json=payload, headers=headers)
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        try:
+            if not initial_message:
+                posted = await client.post(
+                    f"/v1/sessions/{session_id}/events", json=message, headers=headers
+                )
+                assert posted.status_code == 202, posted.text
+            assert pending_inputs.has_pending(session_id)
+            echoed = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {"item_type": "message", "item_data": message["data"]},
+                },
+            )
+            assert echoed.status_code == 202, echoed.text
+            await app.state.background_title_coordinator.wait_for_idle()
+            assert generated.is_set() is enabled
+            snapshot = await client.get(f"/v1/sessions/{session_id}")
+            assert snapshot.json()["title"] == (
+                "Debug authentication timeout" if enabled else prompt
+            )
+            assert not pending_inputs.has_pending(session_id)
+        finally:
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+
+async def test_native_user_item_respects_background_title_header_opt_out(
+    client: httpx.AsyncClient,
+    app: Any,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    generated = asyncio.Event()
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        generated.set()
+        return "Should not appear"
+
+    app.state.background_title_coordinator._generator = generator
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        },
+        headers={"X-Omnigent-Background-Session-Titles": "off"},
+    )
+
+    assert response.status_code == 202, response.text
+    await app.state.background_title_coordinator.wait_for_idle()
+    assert not generated.is_set()
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "please investigate the authentication timeout"
+
+
 # ── GET /v1/sessions (list) ──────────────────────────────
 
 

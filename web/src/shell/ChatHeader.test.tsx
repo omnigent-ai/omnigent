@@ -54,6 +54,8 @@ const mobileMenu = {
   onOpenChanges: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
+  githubPanelOpen: false,
+  onOpenGithub: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
@@ -785,13 +787,22 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
+    // textContent includes it but it's invisible; the labels are what matters.
+    const svgTitleText = (el: Element) =>
+      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
+    expect(
+      screen
+        .getAllByRole("menuitem")
+        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
+    ).toEqual([
       "Pin",
       "Rename",
       "Mark as unread",
       "Add to project",
       "Files",
       "Changes",
+      "GitHub",
       "Agents1",
       "Archive",
       "Delete",
