@@ -104,10 +104,7 @@ def _configure_thinking_turn(
         json={
             "key": _CLAUDE_MOCK_MODEL,
             "match": match,
-            "responses": [
-                {"thinking": thinking, "text": text, "chunk_delay": _CHUNK_DELAY_S}
-            ]
-            * 4,
+            "responses": [{"thinking": thinking, "text": text, "chunk_delay": _CHUNK_DELAY_S}] * 4,
         },
         timeout=5.0,
     )
@@ -178,11 +175,7 @@ def _assistant_item_texts(base_url: str, session_id: str) -> list[str]:
         if not isinstance(content, list):
             continue
         texts.append(
-            " ".join(
-                str(block.get("text", ""))
-                for block in content
-                if isinstance(block, dict)
-            )
+            " ".join(str(block.get("text", "")) for block in content if isinstance(block, dict))
         )
     return texts
 
