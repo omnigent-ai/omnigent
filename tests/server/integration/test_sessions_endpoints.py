@@ -1241,10 +1241,11 @@ async def test_session_event_batch_is_ordered_and_idempotent(
     ]
 
 
-async def test_session_event_batch_rejects_body_over_one_mib(
+async def test_session_event_batch_rejects_body_over_ten_mib(
     client: httpx.AsyncClient,
 ) -> None:
     """The server independently enforces the exact encoded request limit."""
+    assert MAX_SESSION_EVENT_BATCH_BYTES == 10 * 1024 * 1024
     agent = await create_test_agent(client)
     parent = await _create_session(
         client,
@@ -1282,7 +1283,7 @@ async def test_session_event_batch_rejects_body_over_one_mib(
         ],
     )
     assert response.status_code == 400
-    assert "1 MiB" in response.text
+    assert "10 MiB" in response.text
 
 
 async def test_session_event_batch_rejects_empty_or_more_than_100_events(

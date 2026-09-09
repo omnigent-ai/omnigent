@@ -5809,6 +5809,7 @@ async def test_subagent_watcher_retries_failed_batch_from_checkpoint(
 
 def test_subagent_batches_obey_count_and_exact_byte_limits() -> None:
     """Batching counts the complete UTF-8 JSON body and truncates one huge item."""
+    assert forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES == 5 * 1024 * 1024
 
     def pending(index: int, text: str) -> forwarder._PendingSubagentItem:
         return forwarder._PendingSubagentItem(
@@ -5827,17 +5828,20 @@ def test_subagent_batches_obey_count_and_exact_byte_limits() -> None:
     assert [len(batch) for batch in tiny_batches] == [100, 100, 5]
 
     large_batches = forwarder._partition_subagent_batches(
-        [pending(1000, "€" * 200_000), pending(1001, "€" * 200_000)]
+        [pending(1000, "€" * 1_000_000), pending(1001, "€" * 1_000_000)]
     )
     assert [len(batch) for batch in large_batches] == [1, 1]
 
-    oversized = forwarder._partition_subagent_batches([pending(2000, "€" * 500_000)])
+    oversized = forwarder._partition_subagent_batches([pending(2000, "€" * 2_000_000)])
     assert len(oversized) == 1
     truncated_output = oversized[0][0].item.data["output"]
     assert isinstance(truncated_output, str)
     assert "content truncated by omnigent" in truncated_output
     for batch in [*tiny_batches, *large_batches, *oversized]:
-        assert len(forwarder._encoded_subagent_batch(batch)) <= 1024 * 1024
+        assert (
+            len(forwarder._encoded_subagent_batch(batch))
+            <= forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES
+        )
 
 
 def test_subagent_batch_partitioning_encodes_items_linearly(
@@ -5940,7 +5944,7 @@ async def test_untruncatable_subagent_item_is_dead_lettered_and_checkpointed(
     item = ClaudeTranscriptItem(
         source_id="oversized-untruncatable",
         item_type="message",
-        data={"x" * forwarder.MAX_SESSION_EVENT_BATCH_BYTES: 1},
+        data={"x" * forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES: 1},
         response_id="resp_oversized",
     )
     read_result = TranscriptReadResult(

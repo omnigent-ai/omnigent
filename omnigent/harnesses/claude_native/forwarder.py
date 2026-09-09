@@ -52,7 +52,6 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
 )
 from omnigent.session_event_batch import (
-    MAX_SESSION_EVENT_BATCH_BYTES,
     MAX_SESSION_EVENT_BATCH_EVENTS,
     encode_session_event_batch,
 )
@@ -64,6 +63,10 @@ _SUBAGENT_STATE_FILE = "subagent_forwarder.json"
 _DELTA_STATE_FILE = "message_deltas_forwarder.json"
 _COMPACTION_STATE_FILE = "compaction_forwarder.json"
 _HOOKS_FILE = "hooks.jsonl"
+
+# Keep child-history requests below the server's 10 MiB API ceiling to bound
+# per-request latency and retry cost while still accommodating large events.
+MAX_SUBAGENT_EVENT_BATCH_BYTES = 5 * 1024 * 1024
 
 # Cap on the ``persisted_seqs`` history kept in the durable compaction
 # state. Each entry is one completed compaction boundary; a session sees
@@ -1538,7 +1541,7 @@ def _truncated_batch_field(
 
 def _fit_subagent_item(entry: _PendingSubagentItem) -> _PendingSubagentItem:
     """Truncate a pathological item, or mark it for local dead-lettering."""
-    if len(_encoded_subagent_batch([entry])) <= MAX_SESSION_EVENT_BATCH_BYTES:
+    if len(_encoded_subagent_batch([entry])) <= MAX_SUBAGENT_EVENT_BATCH_BYTES:
         return entry
 
     working_data = copy.deepcopy(entry.item.data)
@@ -1568,7 +1571,7 @@ def _fit_subagent_item(entry: _PendingSubagentItem) -> _PendingSubagentItem:
                 ),
             )
             candidate = replace(entry, item=replace(entry.item, data=candidate_data))
-            if len(_encoded_subagent_batch([candidate])) <= MAX_SESSION_EVENT_BATCH_BYTES:
+            if len(_encoded_subagent_batch([candidate])) <= MAX_SUBAGENT_EVENT_BATCH_BYTES:
                 best = candidate
                 low = midpoint + 1
             else:
@@ -1582,7 +1585,7 @@ def _fit_subagent_item(entry: _PendingSubagentItem) -> _PendingSubagentItem:
         )
     return replace(
         entry,
-        drop_reason="encoded event exceeds 1 MiB and contains no truncatable text",
+        drop_reason="encoded event exceeds 5 MiB and contains no truncatable text",
     )
 
 
@@ -1607,7 +1610,7 @@ def _partition_subagent_batches(
         separator_bytes = 1 if current else 0
         if current and (
             len(current) >= MAX_SESSION_EVENT_BATCH_EVENTS
-            or current_bytes + separator_bytes + event_bytes > MAX_SESSION_EVENT_BATCH_BYTES
+            or current_bytes + separator_bytes + event_bytes > MAX_SUBAGENT_EVENT_BATCH_BYTES
         ):
             batches.append(current)
             current = [entry]
@@ -1648,8 +1651,8 @@ async def _post_external_conversation_item_batch(
 ) -> None:
     """Post and validate one array of source-keyed child transcript items."""
     encoded = _encoded_subagent_batch(items)
-    if len(encoded) > MAX_SESSION_EVENT_BATCH_BYTES:
-        raise ValueError("encoded session event batch exceeds 1 MiB")
+    if len(encoded) > MAX_SUBAGENT_EVENT_BATCH_BYTES:
+        raise ValueError("encoded session event batch exceeds the 5 MiB forwarder limit")
     response = await client.post(
         f"/v1/sessions/{session_id}/events",
         content=encoded,

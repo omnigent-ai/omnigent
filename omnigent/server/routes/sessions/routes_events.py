@@ -438,7 +438,7 @@ def register_events_routes(
                     )
                 if len(await request.body()) > MAX_SESSION_EVENT_BATCH_BYTES:
                     raise OmnigentError(
-                        "session event batch exceeds the 1 MiB request limit",
+                        "session event batch exceeds the 10 MiB request limit",
                         code=ErrorCode.INVALID_INPUT,
                     )
                 return [
