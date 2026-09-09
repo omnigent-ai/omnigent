@@ -30,13 +30,13 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.llms.context_window import ModelPricing
-from omnigent.native.event_batch import MAX_EXTERNAL_ITEM_BATCH_BYTES
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
+from omnigent.session_event_batch import MAX_SESSION_EVENT_BATCH_BYTES
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -1046,7 +1046,7 @@ async def test_external_subagent_start_mints_child_session(
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
 
 
-async def test_external_subagent_item_batch_is_ordered_and_idempotent(
+async def test_session_event_batch_is_ordered_and_idempotent(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1075,43 +1075,43 @@ async def test_external_subagent_item_batch_is_ordered_and_idempotent(
         },
     )
     child_id = start.json()["child_session_id"]
-    batch = {
-        "type": "external_conversation_item_batch",
-        "data": {
-            "items": [
-                {
-                    "source_id": "child-user:0:message",
-                    "item_type": "message",
-                    "response_id": "resp_child_user",
-                    "item_data": {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": "inspect logs"}],
-                    },
+    batch = [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "source_id": "child-user:0:message",
+                "item_type": "message",
+                "response_id": "resp_child_user",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect logs"}],
                 },
-                {
-                    "source_id": "child-assistant:0:message",
-                    "item_type": "message",
-                    "response_id": "resp_child_assistant",
-                    "item_data": {
-                        "role": "assistant",
-                        "agent": "claude-native-ui",
-                        "content": [{"type": "output_text", "text": "found it"}],
-                    },
-                },
-            ]
+            },
         },
-    }
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "source_id": "child-assistant:0:message",
+                "item_type": "message",
+                "response_id": "resp_child_assistant",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "found it"}],
+                },
+            },
+        },
+    ]
 
     first = await client.post(f"/v1/sessions/{child_id}/events", json=batch)
     assert first.status_code == 202, first.text
-    first_items = first.json()["items"]
-    assert [item["inserted"] for item in first_items] == [True, True]
+    first_items = first.json()
+    assert len(first_items) == 2
     published_after_first = len(published)
 
     retry = await client.post(f"/v1/sessions/{child_id}/events", json=batch)
     assert retry.status_code == 202, retry.text
-    retry_items = retry.json()["items"]
-    assert [item["inserted"] for item in retry_items] == [False, False]
+    retry_items = retry.json()
     assert [item["item_id"] for item in retry_items] == [item["item_id"] for item in first_items]
     assert len(published) == published_after_first
 
@@ -1122,7 +1122,7 @@ async def test_external_subagent_item_batch_is_ordered_and_idempotent(
     ]
 
 
-async def test_external_subagent_item_batch_rejects_body_over_one_mib(
+async def test_session_event_batch_rejects_body_over_one_mib(
     client: httpx.AsyncClient,
 ) -> None:
     """The server independently enforces the exact encoded request limit."""
@@ -1147,25 +1147,42 @@ async def test_external_subagent_item_batch_rejects_body_over_one_mib(
     child_id = start.json()["child_session_id"]
     response = await client.post(
         f"/v1/sessions/{child_id}/events",
-        json={
-            "type": "external_conversation_item_batch",
-            "data": {
-                "items": [
-                    {
-                        "source_id": "oversized:0:output",
-                        "item_type": "function_call_output",
-                        "response_id": "resp_oversized",
-                        "item_data": {
-                            "call_id": "toolu_oversized",
-                            "output": "x" * MAX_EXTERNAL_ITEM_BATCH_BYTES,
-                        },
-                    }
-                ]
-            },
-        },
+        json=[
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "source_id": "oversized:0:output",
+                    "item_type": "function_call_output",
+                    "response_id": "resp_oversized",
+                    "item_data": {
+                        "call_id": "toolu_oversized",
+                        "output": "x" * MAX_SESSION_EVENT_BATCH_BYTES,
+                    },
+                },
+            }
+        ],
     )
     assert response.status_code == 400
     assert "1 MiB" in response.text
+
+
+async def test_session_event_batch_rejects_empty_or_more_than_100_events(
+    client: httpx.AsyncClient,
+) -> None:
+    """Event arrays have explicit non-empty and count bounds."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    empty = await client.post(f"/v1/sessions/{session['id']}/events", json=[])
+    assert empty.status_code == 400
+    assert "must not be empty" in empty.text
+
+    too_many = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json=[{"type": "interrupt"} for _ in range(101)],
+    )
+    assert too_many.status_code == 400
+    assert "100-event limit" in too_many.text
 
 
 async def test_external_acp_subagent_start_mints_child_without_a_vendor_wrapper(

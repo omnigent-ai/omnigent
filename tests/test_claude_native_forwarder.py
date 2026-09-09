@@ -4975,7 +4975,7 @@ async def test_forwarder_posts_raw_todos_on_todo_write(tmp_path: Path) -> None:
 
 
 def _start_recording_server_with_responses(
-    response_for: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    response_for: Callable[[object], object] | None = None,
 ) -> tuple[_RecordingHTTPServer, threading.Thread, str]:
     """
     Start a local HTTP server that records POST bodies AND returns
@@ -4988,7 +4988,7 @@ def _start_recording_server_with_responses(
     that the forwarder reads back.
 
     :param response_for: Callback that takes the decoded request
-        body and returns the JSON dict to send back. ``None`` (the
+        body and returns the JSON value to send back. ``None`` (the
         default) responds with ``{}`` like the standard recorder.
     :returns: ``(server, thread, base_url)``.
     """
@@ -5605,7 +5605,7 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
 ) -> None:
     """
     After registering a sub-agent, the forwarder tails its
-    ``.jsonl`` and POSTs an ``external_conversation_item_batch`` to
+    ``.jsonl`` and POSTs an array of ``external_conversation_item`` events to
     the Omnigent child session id (not the parent's).
     """
     bridge_dir = tmp_path / "bridge"
@@ -5650,19 +5650,18 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         },
     )
 
-    def response_for(body: dict[str, Any]) -> dict[str, Any]:
+    def response_for(body: object) -> object:
         """Mint a known child id for the start event.
 
         :param body: Decoded request body.
         :returns: Response payload.
         """
-        if body.get("type") == "external_subagent_start":
+        if isinstance(body, list):
+            return [
+                {"queued": False, "item_id": f"item-{index}"} for index, _event in enumerate(body)
+            ]
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return {"queued": False, "child_session_id": "conv_child_beta"}
-        if body.get("type") == "external_conversation_item_batch":
-            return {
-                "queued": False,
-                "items": [{"source_id": item["source_id"]} for item in body["data"]["items"]],
-            }
         return {}
 
     server, _thread, base_url = _start_recording_server_with_responses(response_for)
@@ -5678,23 +5677,17 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         )
     )
     try:
-        # We need the start event plus one item batch addressed to the child.
+        # We need the start event plus one event array addressed to the child.
         child_path = "/v1/sessions/conv_child_beta/events"
-        child_requests: list[dict[str, Any]] = []
+        batch: list[dict[str, Any]] | None = None
         for _ in range(40):
             req = await _get_recorded_request(server)
-            if req["path"] == child_path:
-                child_requests.append(req)
-                if req["body"]["type"] == "external_conversation_item_batch":
-                    break
-        item_types = [r["body"]["type"] for r in child_requests]
-        assert "external_conversation_item_batch" in item_types
-        batch = next(
-            request["body"]
-            for request in child_requests
-            if request["body"]["type"] == "external_conversation_item_batch"
-        )
-        assert len(batch["data"]["items"]) == 2
+            if req["path"] == child_path and isinstance(req["body"], list):
+                batch = req["body"]
+                break
+        assert batch is not None
+        assert len(batch) == 2
+        assert all(event["type"] == "external_conversation_item" for event in batch)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -5761,18 +5754,18 @@ async def test_subagent_watcher_retries_failed_batch_from_checkpoint(
         """
         nonlocal batch_attempts
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") != "external_conversation_item_batch":
+        if not isinstance(body, list):
             return httpx.Response(202, json={})
         batch_attempts += 1
-        rows = body["data"]["items"]
-        for row in rows:
+        for event in body:
+            row = event["data"]
             item_data = row["item_data"]
             posted_items.append(f"{item_data['role']}:{item_data['content'][0]['text']}")
         if batch_attempts == 1:
             return httpx.Response(503, json={"error": "try again"})
         return httpx.Response(
             202,
-            json={"items": [{"source_id": row["source_id"]} for row in rows]},
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
         )
 
     item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
@@ -5886,17 +5879,16 @@ async def test_subagent_batch_failure_resumes_at_first_unsent_record(tmp_path: P
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal failed_second_batch
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") != "external_conversation_item_batch":
+        if not isinstance(body, list):
             return httpx.Response(202, json={})
-        rows = body["data"]["items"]
-        source_ids = [row["source_id"] for row in rows]
+        source_ids = [event["data"]["source_id"] for event in body]
         attempts.append(source_ids)
         if source_ids[0].startswith("sa-100:") and not failed_second_batch:
             failed_second_batch = True
             return httpx.Response(503, json={"error": "retry"})
         return httpx.Response(
             202,
-            json={"items": [{"source_id": source_id} for source_id in source_ids]},
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
         )
 
     tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
@@ -5978,7 +5970,7 @@ async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Pat
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal active, maximum_active
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") != "external_conversation_item_batch":
+        if not isinstance(body, list):
             return httpx.Response(202, json={})
         active += 1
         maximum_active = max(maximum_active, active)
@@ -5988,10 +5980,9 @@ async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Pat
             await release.wait()
         finally:
             active -= 1
-        rows = body["data"]["items"]
         return httpx.Response(
             202,
-            json={"items": [{"source_id": row["source_id"]} for row in rows]},
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
         )
 
     async with httpx.AsyncClient(
@@ -6067,16 +6058,18 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
-        if body.get("type") == "external_conversation_item_batch":
+        if isinstance(body, list):
             child_request_started.set()
             await release_child.wait()
-            rows = body["data"]["items"]
             return httpx.Response(
                 202,
-                json={"items": [{"source_id": row["source_id"]} for row in rows]},
+                json=[
+                    {"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)
+                ],
             )
         if (
             request.url.path == "/v1/sessions/conv_parent/events"
+            and isinstance(body, dict)
             and body.get("type") == "external_conversation_item"
         ):
             parent_item_forwarded.set()
@@ -8766,9 +8759,9 @@ async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
         :returns: Canned Omnigent response.
         """
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") == "external_subagent_start":
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
-        if body.get("type") == "external_conversation_item_batch":
+        if isinstance(body, list):
             return httpx.Response(400, json={"error": "nope"})
         return httpx.Response(202, json={})
 

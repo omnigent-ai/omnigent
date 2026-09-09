@@ -31,7 +31,6 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
-from omnigent.native.event_batch import MAX_EXTERNAL_ITEM_BATCH_BYTES
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -89,7 +88,6 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_COMPACTION_STATUS_VALUES,
-    _EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_MCP_STARTUP_STATUS_VALUES,
@@ -194,7 +192,6 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
-    _persist_external_conversation_item_batch,
     _persist_external_session_usage,
     _persist_host_launch_failure_turn,
     _persist_native_terminal_failure,
@@ -212,6 +209,10 @@ from omnigent.server.schemas import (
     SessionEventInput,
 )
 from omnigent.server.user_settings import background_session_titles_enabled_for_user
+from omnigent.session_event_batch import (
+    MAX_SESSION_EVENT_BATCH_BYTES,
+    MAX_SESSION_EVENT_BATCH_EVENTS,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
@@ -410,24 +411,41 @@ def register_events_routes(
     async def post_event(
         request: Request,
         session_id: str,
-        body: SessionEventInput,
-    ) -> dict[str, Any]:
+        body: SessionEventInput | list[SessionEventInput],
+    ) -> dict[str, bool | str] | list[dict[str, bool | str]]:
         """
         Route entry for :func:`_post_event_impl`.
 
-        A message counts as in flight for the whole request — including any
-        runner launch it triggers — so the session list reports a booting
-        session as running instead of idle.
+        A single object preserves the existing API. A top-level JSON array is
+        processed in order and returns one acknowledgement per event. Messages
+        count as in flight for the whole request, including runner launch.
         """
-        if (
-            body.type == _EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE
-            and len(await request.body()) > MAX_EXTERNAL_ITEM_BATCH_BYTES
-        ):
-            raise OmnigentError(
-                "external_conversation_item_batch exceeds the 1 MiB request limit",
-                code=ErrorCode.INVALID_INPUT,
-            )
         with contextlib.ExitStack() as in_flight:
+            if isinstance(body, list):
+                if not body:
+                    raise OmnigentError(
+                        "session event batch must not be empty",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if len(body) > MAX_SESSION_EVENT_BATCH_EVENTS:
+                    raise OmnigentError(
+                        "session event batch exceeds the 100-event limit",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if len(await request.body()) > MAX_SESSION_EVENT_BATCH_BYTES:
+                    raise OmnigentError(
+                        "session event batch exceeds the 1 MiB request limit",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                return [
+                    await _post_event_impl(
+                        request,
+                        session_id,
+                        event,
+                        in_flight=in_flight if event.type == "message" else None,
+                    )
+                    for event in body
+                ]
             return await _post_event_impl(
                 request,
                 session_id,
@@ -440,7 +458,7 @@ def register_events_routes(
         session_id: str,
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, bool | str]:
         """
         Submit a session event (input message, tool output,
         approval, or interrupt).
@@ -457,9 +475,6 @@ def register_events_routes(
         - ``"external_conversation_item"`` appends and streams a
           completed item observed outside the Omnigent task runtime,
           without starting or steering a task.
-        - ``"external_conversation_item_batch"`` atomically appends up to
-          100 source-keyed child-transcript items without starting or
-          steering a task.
         - ``"external_output_text_delta"`` publishes a transient
           ``response.output_text.delta`` event observed outside the
           Omnigent task runtime, without persisting an item or starting /
@@ -596,7 +611,6 @@ def register_events_routes(
             _STOP_SESSION_TYPE,
             _RETRY_SESSION_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
-            _EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
             _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
@@ -1191,14 +1205,6 @@ def register_events_routes(
                 user_id=user_id,
             )
             return {"queued": False, "item_id": item_id}
-        if body.type == _EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE:
-            batch_items = await _persist_external_conversation_item_batch(
-                session_id,
-                conv,
-                body,
-                conversation_store,
-            )
-            return {"queued": False, "items": batch_items}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
             _publish_external_output_text_delta(session_id, body)
             return {"queued": False}

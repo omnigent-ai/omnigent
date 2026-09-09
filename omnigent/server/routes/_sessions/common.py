@@ -34,7 +34,6 @@ from omnigent.harness_plugins import (
     PI_NATIVE_CODING_AGENT,
     harness_capabilities,
 )
-from omnigent.native.event_batch import EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
@@ -78,9 +77,6 @@ _EXTERNAL_ASSISTANT_MESSAGE_TYPE: str = "external_assistant_message"
 
 
 _EXTERNAL_CONVERSATION_ITEM_TYPE: str = "external_conversation_item"
-
-
-_EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE: str = EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE
 
 
 _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE: str = "external_output_text_delta"
@@ -462,7 +458,6 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _STOP_SESSION_TYPE,
     _RETRY_SESSION_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
-    _EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
@@ -921,7 +916,6 @@ __all__ = [
     "_EXTERNAL_CODEX_SUBAGENT_START_TYPE",
     "_EXTERNAL_COMPACTION_STATUS_TYPE",
     "_EXTERNAL_COMPACTION_STATUS_VALUES",
-    "_EXTERNAL_CONVERSATION_ITEM_BATCH_TYPE",
     "_EXTERNAL_CONVERSATION_ITEM_TYPE",
     "_EXTERNAL_ELICITATION_RESOLVED_TYPE",
     "_EXTERNAL_MCP_STARTUP_STATUS_VALUES",

@@ -51,10 +51,10 @@ from omnigent.native._native_post_delivery import (
     post_external_session_status,
     post_may_have_been_delivered,
 )
-from omnigent.native.event_batch import (
-    MAX_EXTERNAL_ITEM_BATCH_BYTES,
-    MAX_EXTERNAL_ITEM_BATCH_ITEMS,
-    encode_external_item_batch,
+from omnigent.session_event_batch import (
+    MAX_SESSION_EVENT_BATCH_BYTES,
+    MAX_SESSION_EVENT_BATCH_EVENTS,
+    encode_session_event_batch,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
@@ -1448,19 +1448,24 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     }
 
 
-def _external_item_batch_row(item: ClaudeTranscriptItem) -> dict[str, object]:
-    """Convert one parsed transcript item to the batch wire shape."""
+def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, object]:
+    """Convert one parsed transcript item to the existing event shape."""
     return {
-        "source_id": item.source_id,
-        "item_type": item.item_type,
-        "item_data": item.data,
-        "response_id": item.response_id,
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": item.source_id,
+            "item_type": item.item_type,
+            "item_data": item.data,
+            "response_id": item.response_id,
+        },
     }
 
 
 def _encoded_subagent_batch(items: Sequence[_PendingSubagentItem]) -> bytes:
     """Encode pending items using the exact bytes sent over HTTP."""
-    return encode_external_item_batch([_external_item_batch_row(entry.item) for entry in items])
+    return encode_session_event_batch(
+        [_external_conversation_item_event(entry.item) for entry in items]
+    )
 
 
 def _string_paths(value: object, path: tuple[str | int, ...] = ()) -> list[tuple[str | int, ...]]:
@@ -1523,7 +1528,7 @@ def _truncated_batch_field(
 
 def _fit_subagent_item(entry: _PendingSubagentItem) -> _PendingSubagentItem:
     """Truncate a pathological single item until its batch body fits 1 MiB."""
-    if len(_encoded_subagent_batch([entry])) <= MAX_EXTERNAL_ITEM_BATCH_BYTES:
+    if len(_encoded_subagent_batch([entry])) <= MAX_SESSION_EVENT_BATCH_BYTES:
         return entry
 
     working_data = copy.deepcopy(entry.item.data)
@@ -1553,7 +1558,7 @@ def _fit_subagent_item(entry: _PendingSubagentItem) -> _PendingSubagentItem:
                 ),
             )
             candidate = replace(entry, item=replace(entry.item, data=candidate_data))
-            if len(_encoded_subagent_batch([candidate])) <= MAX_EXTERNAL_ITEM_BATCH_BYTES:
+            if len(_encoded_subagent_batch([candidate])) <= MAX_SESSION_EVENT_BATCH_BYTES:
                 best = candidate
                 low = midpoint + 1
             else:
@@ -1578,8 +1583,8 @@ def _partition_subagent_batches(
         entry = _fit_subagent_item(raw_entry)
         candidate = [*current, entry]
         if current and (
-            len(candidate) > MAX_EXTERNAL_ITEM_BATCH_ITEMS
-            or len(_encoded_subagent_batch(candidate)) > MAX_EXTERNAL_ITEM_BATCH_BYTES
+            len(candidate) > MAX_SESSION_EVENT_BATCH_EVENTS
+            or len(_encoded_subagent_batch(candidate)) > MAX_SESSION_EVENT_BATCH_BYTES
         ):
             batches.append(current)
             current = [entry]
@@ -1610,7 +1615,7 @@ def _pending_items_from_records(
     return pending, safe_offset
 
 
-async def _post_external_conversation_item_batch(
+async def _post_external_conversation_items(
     client: httpx.AsyncClient,
     *,
     session_id: str,
@@ -1618,8 +1623,8 @@ async def _post_external_conversation_item_batch(
 ) -> None:
     """Post one exact-size-capped, source-keyed child transcript batch."""
     encoded = _encoded_subagent_batch(items)
-    if len(encoded) > MAX_EXTERNAL_ITEM_BATCH_BYTES:
-        raise ValueError("encoded external item batch exceeds 1 MiB")
+    if len(encoded) > MAX_SESSION_EVENT_BATCH_BYTES:
+        raise ValueError("encoded session event batch exceeds 1 MiB")
     response = await client.post(
         f"/v1/sessions/{session_id}/events",
         content=encoded,
@@ -1627,13 +1632,16 @@ async def _post_external_conversation_item_batch(
     )
     response.raise_for_status()
     try:
-        acknowledgements = response.json()["items"]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise httpx.HTTPError("external item batch response omitted acknowledgements") from exc
-    acknowledged_ids = [row.get("source_id") for row in acknowledgements if isinstance(row, dict)]
-    expected_ids = [entry.item.source_id for entry in items]
-    if acknowledged_ids != expected_ids:
-        raise httpx.HTTPError("external item batch acknowledgements were out of order")
+        acknowledgements = response.json()
+    except ValueError as exc:
+        raise httpx.HTTPError("session event batch response was not JSON") from exc
+    if not isinstance(acknowledgements, list) or len(acknowledgements) != len(items):
+        raise httpx.HTTPError("session event batch response omitted acknowledgements")
+    if any(
+        not isinstance(row, dict) or not isinstance(row.get("item_id"), str)
+        for row in acknowledgements
+    ):
+        raise httpx.HTTPError("session event batch response contained an invalid acknowledgement")
 
 
 async def _forward_one_subagent(
@@ -1681,7 +1689,7 @@ async def _forward_one_subagent(
             break
         dropped = False
         try:
-            await _post_external_conversation_item_batch(
+            await _post_external_conversation_items(
                 client,
                 session_id=entry.child_conversation_id,
                 items=batch,
