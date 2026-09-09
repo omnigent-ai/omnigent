@@ -1726,10 +1726,10 @@ def test_host_stop_session_list_timeout_points_at_force(
     assert "--daemon-only" in result.output
 
 
-def test_host_stop_force_terminates_after_session_list_timeout(
+def test_host_stop_force_skips_session_stop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``--force`` stops the daemon when the session pre-check times out."""
+    """``--force`` terminates immediately without making session API calls."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     _write_daemon_registry_record(
         tmp_path,
@@ -1741,10 +1741,7 @@ def test_host_stop_force_terminates_after_session_list_timeout(
     monkeypatch.setattr(
         cli,
         "_host_http_json",
-        lambda **kwargs: cli._HostHttpResult(
-            status_code=0,
-            body="ReadTimeout: The read operation timed out",
-        ),
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
     )
     terminated: list[str] = []
     monkeypatch.setattr(

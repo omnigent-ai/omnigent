@@ -10051,7 +10051,11 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     is_flag=True,
     help="Terminate daemon processes without first stopping sessions.",
 )
-@click.option("--force", is_flag=True, help="Continue after failures and use SIGKILL if needed.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Skip session draining and use SIGKILL if needed.",
+)
 @click.pass_context
 def host_stop(
     ctx: click.Context,
@@ -10068,7 +10072,7 @@ def host_stop(
         ``"https://example.databricksapps.com"``.
     :param all_targets: Whether to stop every known daemon target.
     :param daemon_only: Skip server-side session stop calls when ``True``.
-    :param force: Continue after failures and use SIGKILL if needed.
+    :param force: Skip session draining and use SIGKILL if needed.
     """
     if server is None:
         server = _host_group_option(ctx, "server")
@@ -10078,7 +10082,7 @@ def host_stop(
         return
     for record in records:
         stopped = 0
-        if not daemon_only:
+        if not daemon_only and not force:
             stopped = _stop_daemon_sessions(record, force=force)
         _terminate_daemon(record, force=force)
         click.echo(
