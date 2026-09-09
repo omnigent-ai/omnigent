@@ -1,11 +1,17 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { ViewModeToggle } from "./ViewModeToggle";
+import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
+
+const { isMobileMock } = vi.hoisted(() => ({ isMobileMock: vi.fn(() => false) }));
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: () => isMobileMock(),
+}));
 
 function makeCtx(overrides: Partial<TerminalFirstContextValue> = {}): TerminalFirstContextValue {
   return {
@@ -46,6 +52,29 @@ function terminalSegment() {
   return screen.getByRole("button", { name: /^terminal (view|is starting up…)$/i });
 }
 
+/** Renders the menu-items variant inside an open dropdown so the items mount. */
+function renderMenuItems(ctx: TerminalFirstContextValue | null) {
+  return render(
+    <TooltipProvider>
+      <DropdownMenu open>
+        <DropdownMenuContent>
+          {ctx ? (
+            <TerminalFirstContextProvider value={ctx}>
+              <ViewModeMenuItems />
+            </TerminalFirstContextProvider>
+          ) : (
+            <ViewModeMenuItems />
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </TooltipProvider>,
+  );
+}
+
+beforeEach(() => {
+  isMobileMock.mockReturnValue(false);
+});
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -61,6 +90,12 @@ describe("ViewModeToggle", () => {
 
   it("renders nothing for a non-terminal-first session", () => {
     const { container } = renderToggle(makeCtx({ isTerminalFirst: false }));
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing on mobile — the switch folds into the header kebab", () => {
+    isMobileMock.mockReturnValue(true);
+    const { container } = renderToggle(makeCtx());
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -166,5 +201,44 @@ describe("ViewModeToggle", () => {
     // there paints a squared grey box sandwiched between two capsules.
     renderToggle(makeCtx());
     expect(screen.getByTestId("view-mode-toggle")).toHaveClass("max-md:rounded-full");
+  });
+});
+
+describe("ViewModeMenuItems", () => {
+  it("renders Chat and Terminal entries for terminal-first sessions", () => {
+    renderMenuItems(makeCtx());
+    expect(screen.getByTestId("view-mode-menu-chat")).toBeVisible();
+    expect(screen.getByTestId("view-mode-menu-terminal")).toBeVisible();
+  });
+
+  it("renders nothing for a non-terminal-first session", () => {
+    renderMenuItems(makeCtx({ isTerminalFirst: false }));
+    expect(screen.queryByTestId("view-mode-menu-chat")).toBeNull();
+  });
+
+  it("renders nothing while a shell owns the main view", () => {
+    renderMenuItems(makeCtx({ isShellView: true, view: "terminal" }));
+    expect(screen.queryByTestId("view-mode-menu-chat")).toBeNull();
+  });
+
+  it("switches to the terminal view when its entry is chosen", () => {
+    const setView = vi.fn();
+    renderMenuItems(makeCtx({ setView, view: "chat" }));
+    fireEvent.click(screen.getByTestId("view-mode-menu-terminal"));
+    expect(setView).toHaveBeenCalledWith("terminal");
+  });
+
+  it("switches back to the chat view when its entry is chosen", () => {
+    const setView = vi.fn();
+    renderMenuItems(makeCtx({ setView, view: "terminal" }));
+    fireEvent.click(screen.getByTestId("view-mode-menu-chat"));
+    expect(setView).toHaveBeenCalledWith("chat");
+  });
+
+  it("shows a spinner on the Terminal entry while the terminal is coming up", () => {
+    renderMenuItems(makeCtx({ terminalsAvailable: false, terminalStartingUp: true }));
+    const terminal = screen.getByTestId("view-mode-menu-terminal");
+    expect(terminal).toHaveTextContent(/starting up/i);
+    expect(terminal.querySelector(".animate-spin")).not.toBeNull();
   });
 });
