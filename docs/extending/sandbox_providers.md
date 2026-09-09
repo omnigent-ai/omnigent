@@ -172,3 +172,30 @@ Providers declare their feature set via a `capabilities` property returning
 | `file_copy` | Supports copying files into the sandbox |
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
+
+## Network policy for harness bridge servers
+
+Native harnesses (e.g. `claude-native`) run small HTTP servers on the sandbox
+host — a tool relay and an MCP control ingress — that the harness's hook and
+helper subprocesses call back into. Sandboxes whose SSRF hardening denies
+loopback destinations unconditionally would make a loopback-only relay
+unreachable, so these servers advertise the host's routable local address when
+one exists (they listen on all interfaces; loopback consumers keep working)
+and draw their ports from a small stable pool that a network policy can
+allowlist by exact host+port:
+
+- **Default port pool:** `28700`–`28715`
+  (`omnigent.harnesses.claude_native.bridge.DEFAULT_BRIDGE_PORT_POOL`).
+  Several servers coexist per host (the MCP ingress plus one tool relay per
+  session), so allowlist the whole pool, not a single port. When the pool is
+  exhausted the servers fall back to an OS-assigned ephemeral port, which an
+  exact-port policy cannot cover.
+- **`OMNIGENT_BRIDGE_PORT_POOL`** overrides the pool: comma-separated ports
+  and inclusive ranges, e.g. `28700-28703,29000`.
+- **`OMNIGENT_BRIDGE_BIND_HOST`** pins the bind/advertise host. `127.0.0.1`
+  restores the loopback-only posture; `0.0.0.0` forces an all-interfaces bind
+  while advertising the detected routable address.
+
+Every endpoint on these servers (other than `GET /health`) requires a
+per-relay bearer token, so allowlisting their coordinates does not expose
+unauthenticated functionality.
