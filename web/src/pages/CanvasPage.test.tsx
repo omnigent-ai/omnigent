@@ -321,10 +321,7 @@ describe("CanvasPage", () => {
     rerender(pageTree());
 
     await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "Legacy" })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      ),
+      expect(screen.getByRole("tab", { name: "Legacy" })).toHaveAttribute("aria-selected", "true"),
     );
     expect(screen.getByTestId("location")).toHaveTextContent("/canvas?canvas=name%3ALegacy");
     expect(window.localStorage.getItem(activeCanvasStorageKey("me"))).toBe("name:Legacy");

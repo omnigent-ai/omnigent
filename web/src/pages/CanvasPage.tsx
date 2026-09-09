@@ -166,7 +166,7 @@ function CanvasSurface() {
   const [activeCanvas, setActiveCanvas] = useState(
     () =>
       searchParams.get(CANVAS_QUERY_PARAM) ??
-      (viewerId === null ? MAIN_CANVAS_ID : readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID),
+      (viewerId === null ? MAIN_CANVAS_ID : (readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID)),
   );
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const activeCanvasRef = useRef(activeCanvas);
