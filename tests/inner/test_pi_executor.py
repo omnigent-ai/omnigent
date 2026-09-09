@@ -40,8 +40,8 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
-from omnigent.model_catalog import ModelEntry
-from omnigent.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_catalog import ModelEntry
+from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -1406,6 +1406,52 @@ class TestPiRpcSession(unittest.TestCase):
 
         _run(_test())
 
+    def test_stdout_at_eof_false_while_reader_running(self):
+        # A read_line timeout while the reader is alive is idle, not EOF.
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            rpc._read_task = asyncio.create_task(asyncio.sleep(30))
+            try:
+                self.assertIsNone(await rpc.read_line(timeout=0.05))
+                self.assertFalse(rpc.stdout_at_eof())
+            finally:
+                rpc._read_task.cancel()
+                await asyncio.gather(rpc._read_task, return_exceptions=True)
+
+        _run(_test())
+
+    def test_stdout_at_eof_true_when_reader_finished_or_absent(self):
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            # Never started (spawn failed) — nothing more can arrive.
+            self.assertTrue(rpc.stdout_at_eof())
+            # Finished reader (process exited, pipe closed).
+            rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+            self.assertTrue(rpc.stdout_at_eof())
+
+        _run(_test())
+
+    def test_stdout_at_eof_false_until_buffered_lines_drained(self):
+        # A finished reader with lines still queued is not EOF yet: the
+        # buffered output (and the None sentinel) must be drained first.
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            rpc._line_queue.put_nowait('{"type": "agent_end"}')
+            rpc._line_queue.put_nowait(None)
+            rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+            self.assertFalse(rpc.stdout_at_eof())
+            self.assertEqual(await rpc.read_line(timeout=0.05), '{"type": "agent_end"}')
+            self.assertFalse(rpc.stdout_at_eof())
+            self.assertIsNone(await rpc.read_line(timeout=0.05))
+            self.assertTrue(rpc.stdout_at_eof())
+
+        _run(_test())
+
 
 # ---------------------------------------------------------------------------
 # PiExecutor constructor tests
@@ -2077,6 +2123,120 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("something went wrong", events[0].message)
+
+        _run(_test())
+
+    def test_stdout_idle_timeout_during_long_tool_call_keeps_waiting(self):
+        """A silent (>idle budget) tool call must not end the turn.
+
+        The stdout read times out repeatedly while pi's reader is still
+        running (long tool call producing no output); the turn must keep
+        waiting and complete when the final answer eventually arrives,
+        instead of dying with 'Pi process ended without response.'.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+            # A live reader task: pi is running, just silent.
+            fake_rpc._read_task = asyncio.create_task(asyncio.sleep(30))
+
+            async def feed_after_delay():
+                # Stay silent across several idle-timeout windows (the
+                # patched budget is 0.05s), then deliver the turn.
+                await asyncio.sleep(0.3)
+                for line in (
+                    json.dumps({"type": "response", "success": True}),
+                    json.dumps(
+                        {
+                            "type": "message_update",
+                            "assistantMessageEvent": {
+                                "type": "text_delta",
+                                "delta": "Done after long tool",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "agent_end", "messages": []}),
+                ):
+                    fake_rpc._line_queue.put_nowait(line)
+
+            feeder = asyncio.create_task(feed_after_delay())
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            try:
+                with patch(
+                    "omnigent.inner.pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S",
+                    0.05,
+                ):
+                    events = [
+                        e
+                        async for e in executor.run_turn(
+                            [{"role": "user", "content": "run the long task"}],
+                            [],
+                            "system",
+                        )
+                    ]
+            finally:
+                feeder.cancel()
+                fake_rpc._read_task.cancel()
+                await asyncio.gather(fake_rpc._read_task, return_exceptions=True)
+
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual(
+                errors,
+                [],
+                f"idle timeout with a live pi process ended the turn: {errors}",
+            )
+            turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(len(turn_complete), 1)
+            self.assertEqual(turn_complete[0].response, "Done after long tool")
+
+        _run(_test())
+
+    def test_stdout_eof_from_finished_reader_still_errors(self):
+        """A real pi death (reader finished, None sentinel) still errors."""
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc._line_queue.put_nowait(None)  # reader's EOF sentinel
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+            # Finished reader: the process exited and stdout closed.
+            fake_rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertIn("Pi process ended without response", events[0].message)
 
         _run(_test())
 
@@ -3004,7 +3164,7 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     ):
         executor = PiExecutor(gateway=True)
     with patch(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
         side_effect=RuntimeError("live listing unavailable"),
     ):
         assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
@@ -3033,7 +3193,7 @@ def test_profile_gateway_uses_discovered_model() -> None:
             return_value=SimpleNamespace(host="https://h.example.com", token="tok"),
         ),
         patch(
-            "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+            "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
             return_value=SimpleNamespace(families={"opus": "system.ai.claude-opus-5"}),
         ),
     ):
@@ -3052,11 +3212,11 @@ def test_catalog_default_is_registered_in_models_json() -> None:
         ),
         # Live discovery unavailable → the bundled catalog default is used.
         patch(
-            "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+            "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
             side_effect=RuntimeError("live listing unavailable"),
         ),
         patch(
-            "omnigent.model_catalog.resolve_catalog_model",
+            "omnigent.models.model_catalog.resolve_catalog_model",
             return_value=SimpleNamespace(model_id=catalog_default),
         ),
     ):
@@ -3108,11 +3268,11 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
-            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
             return_value=entries,
         ) as fetch,
         patch(
-            "omnigent.model_catalog.catalog_model_entries",
+            "omnigent.models.model_catalog.catalog_model_entries",
             return_value=(
                 ModelEntry(
                     id="databricks-gpt-next",
@@ -3147,7 +3307,7 @@ def test_gateway_wire_catalog_failure_is_cached() -> None:
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
-            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
             side_effect=OSError("offline"),
         ) as fetch,
     ):
@@ -3174,11 +3334,11 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
-            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
             return_value=entries,
         ),
         patch(
-            "omnigent.model_catalog.catalog_model_entries",
+            "omnigent.models.model_catalog.catalog_model_entries",
             side_effect=OSError("offline"),
         ),
     ):
@@ -3198,14 +3358,14 @@ def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
             return_value="gateway-token",
         ),
         patch(
-            "omnigent.pi_native_credentials.resolve_databricks_workspace",
+            "omnigent.harnesses.pi_native.credentials.resolve_databricks_workspace",
             return_value=SimpleNamespace(host="https://workspace.cloud.databricks.com"),
         ),
         patch(
-            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
             return_value=(),
         ) as fetch,
-        patch("omnigent.model_catalog.catalog_model_entries", return_value=()),
+        patch("omnigent.models.model_catalog.catalog_model_entries", return_value=()),
     ):
         executor = PiExecutor(
             gateway=True,
@@ -3229,7 +3389,7 @@ def test_generic_anthropic_gateway_skips_databricks_wire_catalog() -> None:
             "omnigent.inner.pi_executor._fetch_shell_command_token",
             return_value="provider-key",
         ),
-        patch("omnigent.model_catalog.fetch_databricks_model_service_entries") as fetch,
+        patch("omnigent.models.model_catalog.fetch_databricks_model_service_entries") as fetch,
     ):
         executor = PiExecutor(
             gateway=True,
@@ -4607,3 +4767,62 @@ def test_unsupported_effort_value_fails_the_turn() -> None:
     assert isinstance(events[0], ExecutorError)
     assert events[0].retryable is False
     assert "not supported by pi" in events[0].message
+
+
+def test_run_turn_prompt_command_includes_streaming_behavior():
+    """run_turn must include streamingBehavior='followUp' in the RPC prompt command.
+
+    Without it, a residual race against a still-alive Pi process (e.g. after an
+    interrupt where the reap races the slice) surfaces Pi's raw
+    'Agent is already processing' protocol error instead of queuing the prompt.
+    """
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor()
+
+    fake_rpc = _PiRpcSession()
+    fake_rpc._line_queue = asyncio.Queue()
+    fake_rpc.process = MagicMock()
+    fake_rpc.process.returncode = None
+    stdin = _FakeStreamWriter()
+    fake_rpc.process.stdin = stdin
+    fake_rpc._stderr_lines = []
+
+    for line in [
+        json.dumps({"type": "response", "success": True}),
+        json.dumps(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "hi"},
+            }
+        ),
+        json.dumps({"type": "agent_end", "messages": []}),
+    ]:
+        fake_rpc._line_queue.put_nowait(line)
+
+    async def fake_ensure_rpc(*args, **kwargs):
+        return fake_rpc
+
+    executor._ensure_rpc = fake_ensure_rpc
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn([{"role": "user", "content": "hello"}], [], "system")
+        ]
+
+    events = _run(_test())
+
+    turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(turn_complete) == 1
+
+    written = b"".join(stdin.data).decode()
+    commands = [json.loads(line) for line in written.splitlines() if line.strip()]
+    prompts = [c for c in commands if c.get("type") == "prompt"]
+    assert prompts, "expected run_turn to emit a prompt command"
+
+    cmd = prompts[0]
+    assert cmd.get("streamingBehavior") == "followUp", (
+        "RPC prompt command must include streamingBehavior='followUp' so a "
+        "residual race against a still-alive Pi process queues instead of "
+        f"surfacing the raw protocol error; got {cmd!r}"
+    )

@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import claude_native_message_display_hook as hook
-from omnigent.claude_native_bridge import read_message_deltas_from_offset
+from omnigent.harnesses.claude_native import message_display_hook as hook
+from omnigent.harnesses.claude_native.bridge import read_message_deltas_from_offset
 
 
 def _run_hook(
@@ -222,7 +222,7 @@ _HEAVY_IMPORTS = (
     "httpx",
     "omnigent.inner.databricks_executor",
     "omnigent.inner.datamodel",
-    "omnigent.model_catalog",
+    "omnigent.models.model_catalog",
     "omnigent.spec.parser",
     "pydantic",
 )
@@ -302,10 +302,10 @@ def test_package_lazy_exports_resolve_on_access() -> None:
 @pytest.mark.parametrize(
     ("module", "allowed"),
     [
-        ("omnigent.claude_native_message_display_hook", frozenset()),
-        ("omnigent.claude_native_status", frozenset()),
+        ("omnigent.harnesses.claude_native.message_display_hook", frozenset()),
+        ("omnigent.harnesses.claude_native.status", frozenset()),
         (
-            "omnigent.claude_native_hook",
+            "omnigent.harnesses.claude_native.hook",
             # The observer path (the most frequent invocation) is pure
             # stdlib + light bridge state: httpx and the policy machinery
             # are imported inside the subcommands that speak HTTP, and the

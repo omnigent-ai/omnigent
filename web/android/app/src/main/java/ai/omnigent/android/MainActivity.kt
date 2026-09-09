@@ -62,6 +62,12 @@ class MainActivity : AppCompatActivity() {
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
+    // Renderer-crash budget: crashes chained closer than RENDERER_CRASH_WINDOW_MS
+    // count toward a give-up threshold, so a reliably-crashing page can't loop
+    // forever. lastRendererCrashAt is the last crash's wall-clock time (the gap).
+    private var rendererCrashes = 0
+    private var lastRendererCrashAt = 0L
+
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
     // visible so it's always available as a recovery path (backward compatible
     // with older web builds). Theme-aware via brand colors (light/dark XML).
@@ -102,7 +108,6 @@ class MainActivity : AppCompatActivity() {
             callback?.onReceiveValue(uris.toTypedArray())
         }
 
-    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -130,30 +135,7 @@ class MainActivity : AppCompatActivity() {
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
-        webView =
-            WebView(this).apply {
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                settings.mediaPlaybackRequiresUserGesture = false
-
-                webViewClient =
-                    OmnigentWebViewClient(
-                        pinnedOrigin = { pinnedOrigin },
-                        shouldInjectBridgeAtPageReady = {
-                            bridgeTransportInstalled && bridgeScriptHandler == null
-                        },
-                        onPageReady = ::onPageReady,
-                        onLoginRequired = ::startLogin,
-                    )
-                webChromeClient =
-                    OmnigentWebChromeClient(
-                        onChooseFiles = ::chooseFiles,
-                        onPermission = ::handlePermissionRequest,
-                    )
-                setDownloadListener { downloadUrl, _, contentDisposition, mimeType, _ ->
-                    downloadFile(downloadUrl, contentDisposition, mimeType)
-                }
-            }
+        webView = buildWebView()
         // Wrap the WebView in a FrameLayout so the floating server-switcher
         // pill can sit on top of it. The pill uses the app's brand palette
         // (values/values-night colors.xml) so it adapts to light/dark mode.
@@ -189,49 +171,7 @@ class MainActivity : AppCompatActivity() {
         applySystemBarContrast()
         installBridge()
 
-        // Measure the OS safe area and push it into the page as CSS custom
-        // properties — Android WebView can't rely on `env(safe-area-inset-*)`
-        // alone (unreliable < API 30 and across OEM builds). Cached so the first
-        // post-load emit (in onPageReady) isn't lost to the pre-load race.
-        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-            // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
-            // manifest's adjustResize: the window no longer shrinks when the IME
-            // opens, so bottom-anchored web content (a chat composer, a terminal
-            // input) would sit BEHIND the keyboard. Resize the WebView ourselves —
-            // shrink its laid-out HEIGHT by the IME inset. It must be the view
-            // height (a bottom margin), not bottom padding: the CSS viewport
-            // (100vh / the visual viewport that fixed/sticky content anchors to)
-            // tracks the WebView's height, not its content box, so padding alone
-            // wouldn't reflow the composer above the keyboard. This is the
-            // adjustResize equivalent for an edge-to-edge window; the status/nav
-            // bars stay CSS safe-areas so content still draws behind them.
-            // Type.ime() is the real platform inset on API 30+; on 28-29 androidx
-            // backfills it from adjustResize's systemWindowInsets, so the resize
-            // still fires. If some pre-30 OEM reports none, the margin stays 0 and
-            // we simply degrade to the old (unresized) behavior — no regression.
-            (view.layoutParams as? ViewGroup.MarginLayoutParams)?.let { lp ->
-                if (lp.bottomMargin != ime.bottom) {
-                    lp.bottomMargin = ime.bottom
-                    view.layoutParams = lp
-                }
-            }
-            // Bottom safe-area: the nav bar when the keyboard is hidden; 0 while
-            // it's up (the resize already lifts content above the keyboard, and the
-            // keyboard covers the nav bar). Top/left/right are IME-independent.
-            val bottom = if (ime.bottom > 0) 0 else bars.bottom
-            lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
-            // Push the floating switch button below the status bar so it doesn't
-            // disappear under the notch/status icons on edge-to-edge layouts.
-            (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.topMargin = bars.top + (8 * dp).toInt()
-                switchButton.layoutParams = lp
-            }
-            emitInsets()
-            insets
-        }
-
+        attachInsetsListener(webView)
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {
@@ -278,6 +218,187 @@ class MainActivity : AppCompatActivity() {
 
         ensureNotificationPermission()
         webView.loadUrl(serverUrl)
+    }
+
+    /** Build a WebView wired with the shell's settings, clients, and listeners. */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun buildWebView(): WebView =
+        WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.mediaPlaybackRequiresUserGesture = false
+
+            webViewClient =
+                OmnigentWebViewClient(
+                    pinnedOrigin = { pinnedOrigin },
+                    shouldInjectBridgeAtPageReady = {
+                        bridgeTransportInstalled && bridgeScriptHandler == null
+                    },
+                    onPageReady = ::onPageReady,
+                    onLoginRequired = ::startLogin,
+                    onRendererGone = ::recoverFromRendererDeath,
+                )
+            webChromeClient =
+                OmnigentWebChromeClient(
+                    onChooseFiles = ::chooseFiles,
+                    onPermission = ::handlePermissionRequest,
+                )
+            setDownloadListener { downloadUrl, _, contentDisposition, mimeType, _ ->
+                downloadFile(downloadUrl, contentDisposition, mimeType)
+            }
+        }
+
+    /**
+     * Measure the OS safe area and push it into the page as CSS custom
+     * properties — Android WebView can't rely on `env(safe-area-inset-*)`
+     * alone (unreliable < API 30 and across OEM builds). Cached so the first
+     * post-load emit (in onPageReady) isn't lost to the pre-load race.
+     */
+    private fun attachInsetsListener(target: WebView) {
+        val dp = resources.displayMetrics.density
+        ViewCompat.setOnApplyWindowInsetsListener(target) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
+            // manifest's adjustResize: the window no longer shrinks when the IME
+            // opens, so bottom-anchored web content (a chat composer, a terminal
+            // input) would sit BEHIND the keyboard. Resize the WebView ourselves —
+            // shrink its laid-out HEIGHT by the IME inset. It must be the view
+            // height (a bottom margin), not bottom padding: the CSS viewport
+            // (100vh / the visual viewport that fixed/sticky content anchors to)
+            // tracks the WebView's height, not its content box, so padding alone
+            // wouldn't reflow the composer above the keyboard. This is the
+            // adjustResize equivalent for an edge-to-edge window; the status/nav
+            // bars stay CSS safe-areas so content still draws behind them.
+            // Type.ime() is the real platform inset on API 30+; on 28-29 androidx
+            // backfills it from adjustResize's systemWindowInsets, so the resize
+            // still fires. If some pre-30 OEM reports none, the margin stays 0 and
+            // we simply degrade to the old (unresized) behavior — no regression.
+            (view.layoutParams as? ViewGroup.MarginLayoutParams)?.let { lp ->
+                if (lp.bottomMargin != ime.bottom) {
+                    lp.bottomMargin = ime.bottom
+                    view.layoutParams = lp
+                }
+            }
+            // Bottom safe-area: the nav bar when the keyboard is hidden; 0 while
+            // it's up (the resize already lifts content above the keyboard, and the
+            // keyboard covers the nav bar). Top/left/right are IME-independent.
+            val bottom = if (ime.bottom > 0) 0 else bars.bottom
+            lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
+            // Push the floating switch button below the status bar so it doesn't
+            // disappear under the notch/status icons on edge-to-edge layouts.
+            (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.topMargin = bars.top + (8 * dp).toInt()
+                switchButton.layoutParams = lp
+            }
+            emitInsets()
+            insets
+        }
+    }
+
+    /**
+     * The WebView's renderer died; the instance can't render again, so always
+     * destroy it and swap in a fresh one — otherwise the framework kills the app.
+     * The crash budget only decides what the fresh view loads (the user's route,
+     * or an offline recovery page over budget), never whether we rebuild, so the
+     * server-switcher recovery paths always act on a live instance. In-page state
+     * (composer text, scroll) is lost either way; only the route is preserved.
+     *
+     * @param dead The WebView whose renderer died.
+     * @param didCrash True for a real crash, false for a system reclaim (which
+     *   never counts against the budget).
+     */
+    private fun recoverFromRendererDeath(
+        dead: WebView,
+        didCrash: Boolean,
+    ) {
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        // A late delivery for an already-replaced WebView must not tear down
+        // the healthy replacement.
+        if (dead !== webView) return
+
+        val serverUrl = ServerStore(this).currentServerUrl()
+        val lastUrl = dead.url
+        val loopExhausted = didCrash && !withinCrashBudget()
+        if (loopExhausted) authLog("renderer crash budget exhausted; showing recovery page")
+
+        val parent = dead.parent as? ViewGroup
+        val index = parent?.indexOfChild(dead) ?: 0
+        parent?.removeView(dead)
+        dead.destroy()
+
+        // The bridge and page-ready state died with the WebView; reset so
+        // installBridge() re-registers and the fresh document rebuilds them.
+        bridgeScriptHandler = null
+        bridgeTransportInstalled = false
+        pageLoaded = false
+        historyCleared = false
+
+        webView = buildWebView()
+        parent?.addView(webView, index)
+        attachInsetsListener(webView)
+        installBridge()
+        // A rebuilt view may miss the first inset dispatch; request one so the
+        // IME resize margin isn't stale if the keyboard was up at death.
+        ViewCompat.requestApplyInsets(webView)
+
+        if (loopExhausted) {
+            // Offline page (no network) so it can't re-trigger the crash.
+            webView.loadDataWithBaseURL(
+                null,
+                recoveryErrorHtml(serverUrl),
+                "text/html",
+                "utf-8",
+                null,
+            )
+            return
+        }
+
+        // Reload the user's route; a blank or foreign URL falls back to the root.
+        val reloadUrl =
+            if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
+        webView.loadUrl(reloadUrl)
+    }
+
+    /**
+     * Consume one unit of the crash budget, returning whether auto-reload may
+     * proceed. Gap-based: the counter resets only after a gap longer than
+     * [RENDERER_CRASH_WINDOW_MS], so crashes chained closer accumulate toward
+     * [MAX_RENDERER_CRASHES]. Not reset on page load — a load-then-crash loop
+     * loads fine every cycle, so a page-load reset would defeat the guard.
+     */
+    private fun withinCrashBudget(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastRendererCrashAt > RENDERER_CRASH_WINDOW_MS) {
+            rendererCrashes = 0
+        }
+        lastRendererCrashAt = now
+        rendererCrashes++
+        return rendererCrashes <= MAX_RENDERER_CRASHES
+    }
+
+    /**
+     * Self-contained recovery page for a crash loop. No network/assets so it
+     * can't reproduce the crash; its link returns to the server root.
+     */
+    private fun recoveryErrorHtml(serverUrl: String): String {
+        val escaped = serverUrl.replace("&", "&amp;").replace("\"", "&quot;")
+        return """
+            <!DOCTYPE html>
+            <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+              body { font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
+                     display: flex; flex-direction: column; align-items: center;
+                     justify-content: center; gap: 16px; padding: 24px; text-align: center; }
+              a.retry { padding: 12px 20px; border-radius: 8px; text-decoration: none;
+                        background: #2f6feb; color: #fff; font-weight: 600; }
+            </style></head>
+            <body>
+              <h2>Something went wrong</h2>
+              <p>The app hit a repeated display problem and stopped reloading on its own.</p>
+              <a class="retry" href="$escaped">Reload</a>
+            </body></html>
+            """.trimIndent()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -519,6 +640,11 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
+        // Cancel any in-flight login before pinning the new origin: the poll runs
+        // against the old server and its token must never land on the new origin's
+        // cookie store. cancel() also resets inFlight so the new server can start
+        // its own login immediately rather than waiting up to 5 minutes.
+        loginManager.cancel()
         removeBridge()
         pinnedOrigin = newOrigin
         pageLoaded = false
@@ -611,6 +737,8 @@ class MainActivity : AppCompatActivity() {
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
+        // Does NOT reset the crash budget: a load-then-crash loop fires onPageReady
+        // every cycle, so resetting here would defeat withinCrashBudget()'s guard.
         flushPendingActivation()
         emitInsets()
     }
@@ -785,5 +913,12 @@ class MainActivity : AppCompatActivity() {
         // (a few ms) always wins the race, short enough to not feel stuck if it
         // doesn't answer. Only the timer ever fires when the renderer is gone.
         const val BACK_FALLBACK_MS = 600L
+
+        // Renderer-crash budget. A handful of rebuilds absorbs transient crashes;
+        // beyond that within the window it's a crash loop, so stop auto-recovering
+        // rather than churn forever. Window bounds "rolling" so long-separated
+        // one-off crashes never accumulate.
+        const val MAX_RENDERER_CRASHES = 3
+        const val RENDERER_CRASH_WINDOW_MS = 60_000L
     }
 }

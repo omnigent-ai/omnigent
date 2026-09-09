@@ -116,7 +116,7 @@ def _patch_login_env(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param fake_httpx: Scripted httpx.get replacement.
     :param sdk_installed: What ``databricks_sdk_installed()`` reports.
-    :param cached_tokens: Successive ``_databricks_workspace_token``
+    :param cached_tokens: Successive workspace auth token
         results, e.g. ``[None, "tok"]`` for "no cached grant, then a
         token after ``databricks auth login`` runs". Defaults to a
         cached token on first try.
@@ -147,11 +147,14 @@ def _patch_login_env(
         lambda: sdk_installed,
     )
     tokens = list(cached_tokens if cached_tokens is not None else ["tok-cached"])
-    monkeypatch.setattr(
-        cli_mod,
-        "_databricks_workspace_token",
-        lambda workspace_host: tokens.pop(0),
-    )
+
+    def _auth_info(workspace_host: str) -> cli_mod._DatabricksWorkspaceAuthInfo | None:
+        token = tokens.pop(0)
+        if token is None:
+            return None
+        return cli_mod._DatabricksWorkspaceAuthInfo(token=token, profile_name=None)
+
+    monkeypatch.setattr(cli_mod, "_databricks_workspace_auth_info", _auth_info)
 
     login_calls: list[str] = []
 
@@ -276,6 +279,37 @@ def test_login_account_host_inherits_cli_selected_workspace(
     assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
 
 
+def test_login_workspace_hosted_uses_cli_workspace_id_without_metadata(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """Workspace-hosted login can route with only the CLI profile workspace id."""
+    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(
+                401,
+                headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'},
+                body={"error_code": 401, "message": "Credential was not sent"},
+            ),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    _patch_login_env(
+        monkeypatch,
+        fake_httpx=fake,
+        host_needs_selector=False,
+        default_workspace_id="1965859176160743",
+    )
+
+    result = CliRunner().invoke(cli_group, ["login", _WORKSPACE_API_URL])
+
+    assert result.exit_code == 0, result.output
+    assert fake.requests[-1]["params"] == {"o": "1965859176160743"}
+    assert load_databricks_org_id(_WORKSPACE_API_URL) == "1965859176160743"
+    assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
+
+
 @pytest.mark.parametrize(
     ("account_id", "workspace_id", "expected"),
     [
@@ -304,6 +338,7 @@ def test_databricks_host_needs_org_selector_reads_discovery_metadata(
         sdk_oauth,
         "get_host_metadata",
         lambda host: SimpleNamespace(account_id=account_id, workspace_id=workspace_id),
+        raising=False,
     )
     assert cli_mod._databricks_host_needs_org_selector("https://host.example") is expected
 
@@ -317,7 +352,7 @@ def test_databricks_host_needs_org_selector_swallows_discovery_failure(
     def _boom(host: str) -> object:
         raise ValueError("no route to host")
 
-    monkeypatch.setattr(sdk_oauth, "get_host_metadata", _boom)
+    monkeypatch.setattr(sdk_oauth, "get_host_metadata", _boom, raising=False)
     assert cli_mod._databricks_host_needs_org_selector("https://host.example") is False
 
 

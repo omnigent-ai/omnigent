@@ -6,10 +6,15 @@ import uuid
 
 import pytest
 
+from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.server.background_session_titles import (
+    BACKGROUND_SESSION_TITLES_HEADER,
+    BACKGROUND_TITLE_MAX_CHARS,
+    CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
     RunnerBackgroundTitleGenerator,
+    background_session_titles_enabled,
     normalize_background_title,
     prepare_background_session_title,
 )
@@ -46,6 +51,44 @@ async def test_prepare_background_title_for_eligible_session(db_uri: str) -> Non
     assert pending is not None
 
 
+async def test_prepare_background_title_skips_when_user_setting_is_disabled(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(kind="default")
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Unused title"
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, generator),
+        conversation=conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ),
+        enabled=False,
+    )
+
+    assert pending is None
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({}, True),
+        ({BACKGROUND_SESSION_TITLES_HEADER: "on"}, True),
+        ({BACKGROUND_SESSION_TITLES_HEADER: "off"}, False),
+    ],
+)
+async def test_background_session_titles_enabled_defaults_on(
+    headers: dict[str, str],
+    expected: bool,
+) -> None:
+    assert background_session_titles_enabled(headers) is expected
+
+
 async def test_prepare_background_title_from_message(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     agent_id = uuid.uuid4().hex
@@ -76,10 +119,9 @@ async def test_prepare_background_title_from_message(db_uri: str) -> None:
         prompt="please investigate the authentication timeout",
         agent_id=agent_id,
     )
-    assert pending.expected_seed_title == "please investigate the authentication timeout"
 
 
-async def test_prepare_background_title_from_slash_command(db_uri: str) -> None:
+async def test_slash_command_background_title_uses_persisted_seed(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conversation = store.create_conversation(kind="default")
 
@@ -97,7 +139,12 @@ async def test_prepare_background_title_from_slash_command(db_uri: str) -> None:
 
     assert pending is not None
     assert pending.request.prompt == "/grill-me review this plan"
-    assert pending.expected_seed_title == "/grill-me review this plan"
+    persisted = store.update_conversation(conversation.id, title="grill-me review this plan")
+    assert persisted is not None
+    pending.schedule(expected_seed_title=persisted.title)
+    await pending.coordinator.wait_for_idle()
+
+    assert store.get_conversation(conversation.id).title == "Review migration plan"
 
 
 @pytest.mark.parametrize("excluded_session", ["titled", "child"])
@@ -282,7 +329,61 @@ async def test_generated_title_is_normalized_before_rename(db_uri: str) -> None:
 async def test_title_normalizer_rejects_empty_and_oversized_output() -> None:
     assert normalize_background_title(None) is None
     assert normalize_background_title("   \n  ") is None
-    assert normalize_background_title("x" * 61) is None
+    assert normalize_background_title("x" * (BACKGROUND_TITLE_MAX_CHARS + 1)) is None
+
+
+async def test_custom_title_instructions_allow_longer_output(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Review configurable title limits")
+    generated = "x" * CUSTOM_BACKGROUND_TITLE_MAX_CHARS
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return generated
+
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        generator,
+        additional_instructions="Use a detailed structured title.",
+    )
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="review configurable title limits",
+        expected_seed_title="Review configurable title limits",
+    )
+    await coordinator.wait_for_idle()
+
+    assert store.get_conversation(session_id).title == generated
+    assert (
+        normalize_background_title(
+            "x" * (CUSTOM_BACKGROUND_TITLE_MAX_CHARS + 1),
+            max_chars=CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
+        )
+        is None
+    )
+
+
+async def test_custom_title_instructions_truncate_oversized_output(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Review configurable title limits")
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "x" * (CUSTOM_BACKGROUND_TITLE_MAX_CHARS + 1)
+
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        generator,
+        additional_instructions="Use a detailed structured title.",
+    )
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="review configurable title limits",
+        expected_seed_title="Review configurable title limits",
+    )
+    await coordinator.wait_for_idle()
+
+    expected = "x" * (CUSTOM_BACKGROUND_TITLE_MAX_CHARS - 1) + "…"
+    assert store.get_conversation(session_id).title == expected
+    assert len(expected) == CUSTOM_BACKGROUND_TITLE_MAX_CHARS
 
 
 async def test_manual_rename_wins_background_title_race(db_uri: str) -> None:
@@ -447,10 +548,25 @@ async def test_runner_generator_posts_session_configuration() -> None:
                 "harness_override": "claude-sdk",
                 "model_override": "claude-sonnet-4-6",
                 "sub_agent_name": None,
-                "additional_instructions": "Use the requested slug format.",
+                "additional_instructions": (
+                    "Use the requested slug format.\n"
+                    "Unless another language is explicitly requested, write the title "
+                    "in the same primary language as the user's message."
+                ),
             },
         )
     ]
+
+
+async def test_runner_generator_posts_language_rule_without_operator_customization() -> None:
+    client = _FakeRunnerClient()
+    generator = RunnerBackgroundTitleGenerator(_FakeRunnerRouter(client))  # type: ignore[arg-type]
+
+    await generator(BackgroundTitleRequest(session_id="conv_test", prompt="请修复登录超时"))
+
+    assert client.requests[0][1]["additional_instructions"] == (
+        FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
+    )
 
 
 async def test_schedule_is_one_shot_per_session(db_uri: str) -> None:

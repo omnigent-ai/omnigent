@@ -419,6 +419,41 @@ describe("ApprovalCard — approve & don't ask again (persistent allow rule)", (
   });
 });
 
+describe("ApprovalCard — Codex MCP persistence choices", () => {
+  it("renders advertised persistence modes and returns the selected mode in _meta", () => {
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        elicitationId="elic_codex_mcp"
+        message={'Allow the omnigent MCP server to run tool "sys_read_inbox"?'}
+        phase="codex_mcp_elicitation"
+        policyName="codex_native_mcp_elicitation"
+        contentPreview="{}"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        codexPersistModes={["session", "always"]}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    const sessionButton = screen.getByRole("button", { name: /approve for this session/i });
+    const alwaysButton = screen.getByRole("button", { name: /always allow/i });
+    expect(sessionButton).toBeDefined();
+    expect(alwaysButton).toBeDefined();
+
+    fireEvent.click(sessionButton);
+    expect(submitSpy).toHaveBeenCalledWith("elic_codex_mcp", "accept", undefined, {
+      persist: "session",
+    });
+
+    fireEvent.click(alwaysButton);
+    expect(submitSpy).toHaveBeenLastCalledWith("elic_codex_mcp", "accept", undefined, {
+      persist: "always",
+    });
+  });
+});
+
 describe("ApprovalCard — multi-choice options", () => {
   beforeEach(() => {
     useChatStore.setState({

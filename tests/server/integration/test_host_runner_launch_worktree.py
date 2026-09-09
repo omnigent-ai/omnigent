@@ -443,3 +443,40 @@ async def test_launch_runner_retry_succeeds_after_failed_launch(
     assert conv is not None
     assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-y"
     assert conv.git_branch == "feature/y"
+
+
+async def test_launch_runner_rollback_preserves_existing_branch(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A failed launch after an ``existing_branch`` recreate must NOT
+    delete the branch.
+
+    The deleted-worktree recreate path checks out a branch that predates
+    the request (it may carry unpushed commits). Rollback still removes
+    the just-recreated directory, but ``delete_branch`` must be False —
+    ``git branch -D`` here would destroy the user's work.
+    """
+    cap = register_host(launch_status="failed")
+    session_id = await _bare_session(client, "wt-existing-branch-rollback-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={"branch_name": "feature/x", "existing_branch": True},
+    )
+
+    assert resp.status_code == 502, resp.text
+    assert len(cap.create) == 1
+    assert cap.create[0].existing_branch is True
+    assert len(cap.remove) == 1, "rollback must still remove the recreated worktree dir"
+    assert cap.remove[0].delete_branch is False, (
+        "rollback of an existing-branch recreate must preserve the user's "
+        "pre-existing branch (unpushed commits would be lost)"
+    )
+    # The session is still fully unbound so a retry starts clean.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is None
+    assert conv.git_branch is None

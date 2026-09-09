@@ -199,6 +199,12 @@ _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
 
 
+# Current approval/sandbox mode of a live codex-native session. ``terminal_launch_args``
+# carries the persisted CLI form; this label is the read-back the web picker prefers,
+# mirroring ``_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY``.
+_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_native.approval_mode"
+
+
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE: str = "external_codex_collaboration_mode_change"
 
 
@@ -372,7 +378,19 @@ _browser_action_owners: dict[str, str] = {}  # -> issuing session_id (result POS
 _browser_action_claims: dict[str, str] = {}
 
 
+_browser_action_claim_events: dict[str, asyncio.Event] = {}
+
+
+# The Electron relay claims before doing browser work, so this only budgets
+# event delivery plus the claim round-trip. Keep it short enough that a generic
+# stream subscriber cannot recreate the old 30-second no-renderer stall.
+_BROWSER_ACTION_CLAIM_GRACE_S = 2.0
+
+
 _BROWSER_ACTION_AWAIT_S = 30.0
+
+
+_BROWSER_ACTION_NO_RENDERER_RESULT: dict[str, Any] = {"error": "no browser renderer is connected"}
 
 
 _BROWSER_ACTION_TIMEOUT_RESULT: dict[str, Any] = {
@@ -544,6 +562,12 @@ _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 
 
+# Sessions whose cached skills need a re-fetch but should keep serving until it
+# lands. A browser reload asks for one, and dropping the entry outright would
+# empty the composer's slash-command menu for the reload that requested it.
+_runner_skills_stale: set[str] = set()
+
+
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 
 
@@ -633,6 +657,21 @@ _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = 
 _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 
+# Sessions whose in-flight turn's assistant output a PHASE_LLM_RESPONSE
+# policy denied, mapped to the deny reason. Set by the policy-evaluate
+# route when it returns the DENY (the harness only errors the turn AFTER
+# the denied text already streamed and filled the relay's persistence
+# buffer), consumed by the relay's terminal text flush so the buffered
+# text persists as the deny sentinel instead of the denied content.
+# A plain dict, NOT an evicting cache: this is an enforcement decision,
+# and a silent eviction would downgrade a DENY into normal persistence.
+# Leak-safety comes from lifetime, not bounding — writes are gated on an
+# active relay for the session (routes_hooks), and the entry is popped at
+# every consume point, on each new turn, and when the relay task ends
+# (the relay's done-callback), so an entry can never outlive its relay.
+_llm_response_denied_turns: dict[str, str] = {}
+
+
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -685,9 +724,6 @@ _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
 
 
 _STOP_RUNNER_RESULT_TIMEOUT_S = 10.0
-
-
-_COMPACT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 # Derived from the fork_history capability axis (see harness_capabilities). A
@@ -831,6 +867,8 @@ __all__ = [
     "_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_APPROVAL_TYPE",
     "_BROWSER_ACTION_AWAIT_S",
+    "_BROWSER_ACTION_CLAIM_GRACE_S",
+    "_BROWSER_ACTION_NO_RENDERER_RESULT",
     "_BROWSER_ACTION_TIMEOUT_RESULT",
     "_CHILD_PREVIEW_LIMIT",
     "_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY",
@@ -849,6 +887,7 @@ __all__ = [
     "_CLAUDE_NATIVE_UI_LABEL_VALUE",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_KEY",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY",
     "_CODEX_NATIVE_COLLABORATION_MODES",
     "_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY",
     "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
@@ -863,7 +902,6 @@ __all__ = [
     "_CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_CODEX_NATIVE_WRAPPER_LABEL_VALUE",
-    "_COMPACT_LOCKS",
     "_COMPACT_TYPE",
     "_CURSOR_FORK_HISTORY_HARNESSES",
     "_CURSOR_NATIVE_HARNESS",
@@ -957,6 +995,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
     "_browser_action_registry",
@@ -964,6 +1003,7 @@ __all__ = [
     "_deferred_elicitation_clear_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
+    "_llm_response_denied_turns",
     "_logger",
     "_managed_launch_tasks",
     "_model_options_cache",
@@ -979,6 +1019,7 @@ __all__ = [
     "_runner_relay_tasks",
     "_runner_skills_cache",
     "_runner_skills_inflight",
+    "_runner_skills_stale",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

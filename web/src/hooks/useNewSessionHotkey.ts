@@ -1,18 +1,13 @@
 import { useEffect } from "react";
 
+import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
-
-function isMacPlatform(): boolean {
-  if (typeof navigator === "undefined") return false;
-  const uaData = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
-  const platform = uaData?.platform ?? navigator.platform ?? navigator.userAgent ?? "";
-  return /Mac|iPhone|iPad|iPod/i.test(platform);
-}
 
 /** True for Cmd+N on Apple platforms or Ctrl+N elsewhere, without extra modifiers. */
 export function isNewSessionHotkey(e: globalThis.KeyboardEvent, isMac = isMacPlatform()): boolean {
-  const platformModifier = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
-  if (!platformModifier || e.altKey || e.shiftKey || e.getModifierState("AltGraph")) return false;
+  if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey || e.getModifierState("AltGraph")) {
+    return false;
+  }
   return e.key === "n" || e.key === "N";
 }
 

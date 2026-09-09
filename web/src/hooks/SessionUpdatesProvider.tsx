@@ -17,19 +17,28 @@
 
 import { type ReactNode, useCallback, useEffect, useRef } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import {
+  isSessionArchiving,
+  isSessionDeleting,
+  markRecentlyCreated,
+} from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
+  PROJECT_LABEL_KEY,
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
+import { isTempConvId } from "@/lib/tempConversationId";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
 // action. 250 ms is short enough to feel live, long enough to batch the
@@ -55,24 +64,53 @@ function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
   activeId: string | undefined,
+  viewerId?: string | null,
 ): { missingIds: string[]; needsRefetch: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
-  const itemsById = new Map(items.map((item) => [item.id, nullsToUndefined(item)]));
+  const itemsById = new Map<string, SessionListWireItem>();
+  for (const item of items) {
+    if (isSessionDeleting(item.id)) continue;
+    itemsById.set(
+      item.id,
+      nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+    );
+  }
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   });
   for (const [key, data] of entries) {
+    const filters = filtersFromConversationQueryKey(key);
     const {
-      data: next,
+      data: merged,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filtersFromConversationQueryKey(key), activeId);
+    } = mergeItemsIntoPages(data, itemsById, filters, activeId);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
+    // Surface a brand-new watched session (a create here or elsewhere, a share)
+    // at the top now, instead of after the debounced refetch (which lags the
+    // search index). An unfiled row is fully placed → mark it found so it skips
+    // that refetch; a filed row can't be placed in its folder locally → leave it
+    // missing so the folder still reconciles via the scheduled refetch.
+    const missingHere = new Map([...itemsById].filter(([id]) => !found.has(id)));
+    const { data: next, inserted } = insertNewRowsIntoPages(
+      merged,
+      missingHere,
+      filters,
+      isSessionDeleting,
+      viewerId,
+    );
+    for (const row of inserted) {
+      if (row.project_id == null && !row.labels?.[PROJECT_LABEL_KEY]) foundAnywhere.add(row.id);
+      // Keep the new row in the list-fetch until the search index catches up,
+      // so the create-path refetch (or any reconcile) can't drop it before it's
+      // queryable — otherwise it flashes in and out. Mirrors the delete tombstone.
+      markRecentlyCreated(row);
+    }
     if (next !== data) queryClient.setQueryData(key, next);
   }
   // Each project folder fetches its own ["project-sessions", <name>] list, so
@@ -192,7 +230,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         }
       }
     }
-    sessionUpdatesSocket.setWatched(ids);
+    sessionUpdatesSocket.setWatched(ids.filter((id) => !isTempConvId(id)));
   }, [queryClient]);
 
   // Navigating to an off-sidebar child changes the open session without
@@ -316,6 +354,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             queryClient,
             frame.items,
             activeIdRef.current,
+            getCurrentUserId(),
           );
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas

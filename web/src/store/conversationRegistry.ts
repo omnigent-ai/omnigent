@@ -88,6 +88,9 @@ export type ConversationGetter = () => ConversationState;
 /** Notified whenever an entry's state changes, so the root store can mirror it. */
 type ChangeListener = (id: string) => void;
 
+/** Notified when an entry is disposed (released, evicted, or cleared). */
+type DisposeListener = (id: string) => void;
+
 /**
  * One conversation's live state and stream.
  *
@@ -115,6 +118,7 @@ export interface ConversationEntry {
 export class ConversationRegistry {
   private readonly entries = new Map<string, ConversationEntry>();
   private readonly listeners = new Set<ChangeListener>();
+  private readonly disposeListeners = new Set<DisposeListener>();
   /** Conversation currently on screen; exempt from eviction. */
   private activeId: string | null = null;
 
@@ -127,6 +131,17 @@ export class ConversationRegistry {
   subscribe(listener: ChangeListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to entry disposal (release / eviction / clear). Disposal is not a
+   * state change and never reaches `subscribe`, so anything that must run when a
+   * conversation goes away — settling its live telemetry spans — hooks here.
+   * Returns an unsubscribe function.
+   */
+  subscribeDisposed(listener: DisposeListener): () => void {
+    this.disposeListeners.add(listener);
+    return () => this.disposeListeners.delete(listener);
   }
 
   /** The entry for `id`, or `undefined` when not live. */
@@ -204,6 +219,44 @@ export class ConversationRegistry {
     this.activeId = null;
   }
 
+  /**
+   * Rename an entry `oldId` → `newId`, preserving its state — hydrates a
+   * client-only conversation (`temp:*`) onto its real id so the optimistic
+   * bubble carries over without a remount. `oldId` must be a stream-less local
+   * entry (no live SSE pump to transfer). If `newId` is already live, its entry
+   * wins but inherits any optimistic pending messages before the old one is
+   * disposed. No-op if `oldId` isn't live.
+   */
+  rekey(oldId: string, newId: string): void {
+    const old = this.entries.get(oldId);
+    if (old === undefined) return;
+    if (oldId === newId) return;
+    const existing = this.entries.get(newId);
+    if (existing !== undefined) {
+      const existingState = existing.getState();
+      const existingPendingIds = new Set(
+        existingState.pendingUserMessages.map((item) => item.tempId),
+      );
+      const missingPending = old
+        .getState()
+        .pendingUserMessages.filter((item) => !existingPendingIds.has(item.tempId));
+      if (missingPending.length > 0) {
+        existing.setState({
+          pendingUserMessages: [...missingPending, ...existingState.pendingUserMessages],
+        });
+      }
+      this.release(oldId);
+      if (this.activeId === oldId) this.activeId = newId;
+      return;
+    }
+    const next = this.createEntry(newId);
+    next.setState(old.getState());
+    this.entries.set(newId, next);
+    this.entries.delete(oldId);
+    old.dispose();
+    if (this.activeId === oldId) this.activeId = newId;
+  }
+
   /** Move `id` to the most-recently-viewed end of the LRU order. */
   private touch(id: string): void {
     const entry = this.entries.get(id);
@@ -277,6 +330,7 @@ export class ConversationRegistry {
         entry.disposed = true;
         // Ends the reconnect loop and cancels the in-flight fetch.
         state.abortController?.abort();
+        for (const listener of this.disposeListeners) listener(id);
       },
     };
     return entry;

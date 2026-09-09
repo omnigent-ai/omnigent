@@ -5,10 +5,11 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import native_policy_hook
-from omnigent.native_policy_hook import (
+from omnigent.native import native_policy_hook
+from omnigent.native.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
+    fail_ask_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
     post_evaluate_with_retry,
@@ -374,6 +375,51 @@ def test_fail_closed_unknown_event_fails_open() -> None:
     assert fail_closed_hook_output("SomeNewEvent") is None
 
 
+def test_fail_ask_pre_tool_use_returns_ask() -> None:
+    """
+    ``fail_ask_hook_output`` returns ``permissionDecision: "ask"`` for ``PreToolUse``.
+
+    Using ``"ask"`` explicitly prompts the user regardless of permission mode
+    (unlike ``None``, which fails open in ``bypassPermissions``/``acceptEdits``).
+    """
+    output = fail_ask_hook_output("PreToolUse")
+    assert output is not None
+    hook = output["hookSpecificOutput"]
+    assert hook["hookEventName"] == "PreToolUse"
+    assert hook["permissionDecision"] == "ask"
+    assert hook["permissionDecisionReason"]
+
+
+def test_fail_ask_pre_tool_use_with_detail_includes_detail() -> None:
+    """Detail string is appended to the ask reason."""
+    output = fail_ask_hook_output("PreToolUse", "server connection refused")
+    assert output is not None
+    assert "server connection refused" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_fail_ask_user_prompt_submit_still_fails_closed() -> None:
+    """
+    ``fail_ask_hook_output`` still blocks ``UserPromptSubmit``.
+
+    The request gate is the sole pre-turn enforcement point; a server
+    hiccup must not silently allow an over-budget or blocked request.
+    """
+    output = fail_ask_hook_output("UserPromptSubmit")
+    assert output is not None
+    assert output["decision"] == "block"
+    assert output["reason"]
+
+
+def test_fail_ask_post_tool_use_fails_open() -> None:
+    """``PostToolUse`` fails open under fail-ask, same as fail-closed."""
+    assert fail_ask_hook_output("PostToolUse") is None
+
+
+def test_fail_ask_unknown_event_fails_open() -> None:
+    """Unknown events fail open under fail-ask."""
+    assert fail_ask_hook_output("SomeNewEvent") is None
+
+
 def _resp(status: int, location: str | None = None) -> httpx.Response:
     """Build a fake response for re-auth classification tests."""
     headers = {"Location": location} if location else {}
@@ -537,12 +583,13 @@ def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    With no ``reauth`` callable, a login-redirect yields ``None`` (legacy).
+    With no ``reauth`` callable, a login-redirect fails closed with a clear reason.
 
-    Callers without a token source (e.g. codex/kimi today) see the same
-    behavior as before this change: ``raise_for_status`` rejects the 302 as a
-    non-retryable <500, the helper returns ``None``, and the caller fails
-    closed. Guards against the new branch altering that.
+    Callers without a token source (e.g. codex/kimi today) still fail closed on
+    a 302→/oidc bounce, but the helper rejects the redirect explicitly (rather
+    than leaning on ``raise_for_status``'s version-dependent 3xx handling and a
+    cryptic downstream "empty/malformed response"): it returns ``None`` with an
+    error that names the login redirect, and does not retry.
     """
     seen_headers: list[dict[str, str]] = []
     redirect = httpx.Response(
@@ -560,6 +607,7 @@ def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
     )
     assert resp is None
     assert error is not None
+    assert "login redirect" in error and "302" in error
     assert len(seen_headers) == 1  # one attempt; a 302 is not retried without reauth
 
 
@@ -570,8 +618,8 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
     When re-mint yields no token, the helper returns ``None`` (caller fails closed).
 
     Re-auth is best-effort: a ``reauth`` that returns ``None`` (no creds /
-    transient mint failure) must not loop — it falls through to
-    ``raise_for_status`` (302 → non-retryable) so the caller keeps the
+    transient mint failure) must not loop — the redirect is rejected explicitly
+    (returning ``None`` with a login-redirect error) so the caller keeps the
     fail-closed safety net.
     """
     seen_headers: list[dict[str, str]] = []
@@ -595,6 +643,7 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
     )
     assert resp is None
     assert error is not None
+    assert "login redirect" in error and "302" in error
     assert len(seen_headers) == 1  # one attempt only; no retry loop
 
 

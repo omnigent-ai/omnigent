@@ -1,7 +1,7 @@
 """E2E coverage for the chat-header session actions menu.
 
 The owner path exercises the real REST-backed rename flow from the header.
-The child path proves sub-agent breadcrumbs stay navigation-only.
+The child path proves the owner menu is replaced by a Fork-only menu.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Owner menu opens in order, renames the session, and stays off children."""
+    """Owner menu renames the session; children get only Fork."""
     base_url, session_id = seeded_session
     child_id: str | None = None
 
@@ -49,25 +49,37 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
         expect(trigger).to_be_visible(timeout=30_000)
         trigger.click()
 
+        # Desktop keeps "Rename" and "Add to project" in the kebab, alongside the
+        # breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag)
+        # shortcuts. "Add to project" is a submenu trigger, so its label carries
+        # the flyout's own items; match only the leading action label.
         menu_items = page.get_by_role("menuitem")
-        expect(menu_items).to_have_count(6)
-        assert menu_items.all_inner_texts() == [
+        expect(menu_items).to_have_count(7)
+        labels = [text.split("\n")[0] for text in menu_items.all_inner_texts()]
+        assert labels == [
             "Pin",
+            "Fork",
             "Rename",
             "Mark as unread",
             "Add to project",
             "Archive",
             "Delete",
         ]
+        # Dismiss the menu and wait for it to fully detach — Radix briefly puts
+        # `pointer-events: none` on the body while closing, which would swallow
+        # the title click that follows.
+        page.keyboard.press("Escape")
+        expect(page.get_by_role("menu")).to_have_count(0)
 
-        page.get_by_role("menuitem", name="Rename").click()
+        # Rename by clicking the breadcrumb title → inline input, Enter commits.
+        breadcrumb = page.get_by_role("navigation", name="Conversation")
+        page.get_by_test_id("header-title").click()
         rename_input = page.get_by_role("textbox", name="Session name")
         expect(rename_input).to_be_visible()
-        renamed_title = "Header menu renamed session"
+        renamed_title = "Header title renamed session"
         rename_input.fill(renamed_title)
-        page.get_by_role("button", name="Rename").click()
+        rename_input.press("Enter")
 
-        breadcrumb = page.get_by_role("navigation", name="Conversation")
         expect(breadcrumb.get_by_text(renamed_title, exact=True)).to_be_visible(timeout=15_000)
 
         agent_resp = httpx.get(
@@ -93,6 +105,11 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
             timeout=30_000
         )
         expect(page.get_by_test_id("header-conversation-actions")).to_have_count(0)
+        child_trigger = page.get_by_test_id("desktop-fork-actions-menu")
+        expect(child_trigger).to_be_visible()
+        child_trigger.click()
+        expect(page.get_by_role("menuitem")).to_have_count(1)
+        expect(page.get_by_role("menuitem", name="Fork", exact=True)).to_be_visible()
     finally:
         if child_id is not None:
             httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)

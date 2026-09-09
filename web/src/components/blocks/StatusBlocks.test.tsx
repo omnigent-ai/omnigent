@@ -56,95 +56,49 @@ describe("ErrorBanner", () => {
     expect(message).not.toHaveTextContent("terminal: claude:main");
   });
 
-  it("uses one stable leading slot across rest, hover, focus, and expanded states", () => {
+  it("disclosure chevron is always visible, rotates when expanded, hint hides on expand", () => {
     render(
       <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
     );
 
     const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
     expect(screen.getByTestId("error-leading-slot")).toHaveClass("h-[18px]", "w-[18px]");
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
-
-    fireEvent.mouseEnter(messageToggle);
+    // Chevron is present in rest state — no status icon.
     expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).toHaveClass(
       "text-muted-foreground",
       "group-hover/error:text-foreground",
     );
     expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+    // Expand hint is visible when collapsed.
+    expect(screen.getByText("Expand for details")).toBeInTheDocument();
 
-    fireEvent.mouseLeave(messageToggle);
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
-
-    fireEvent.keyDown(document, { key: "Tab" });
-    act(() => messageToggle.focus());
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
-    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
-
-    act(() => messageToggle.blur());
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    // Expand: chevron rotates, hint disappears.
     fireEvent.click(messageToggle);
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
+
+    // Collapse: chevron resets, hint reappears.
+    fireEvent.click(messageToggle);
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+    expect(screen.getByText("Expand for details")).toBeInTheDocument();
   });
 
-  it("restores the status icon after pointer expand, collapse, and mouse leave", () => {
+  it("expand and collapse toggle correctly via pointer clicks", () => {
     render(
       <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
     );
 
     const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
-    fireEvent.mouseEnter(messageToggle);
-    fireEvent.pointerDown(messageToggle);
-    fireEvent.focus(messageToggle);
-    fireEvent.pointerUp(messageToggle);
+    // Expand.
     fireEvent.click(messageToggle);
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
-
-    fireEvent.pointerDown(messageToggle);
-    fireEvent.pointerUp(messageToggle);
+    expect(screen.queryByText("Expand for details")).toBeNull();
+    // Collapse.
     fireEvent.click(messageToggle);
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
-
-    fireEvent.mouseLeave(messageToggle);
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+    expect(screen.getByText("Expand for details")).toBeInTheDocument();
   });
-
-  it.each([" ", "Enter"])(
-    "refreshes keyboard focus visibility after pointer focus and %j activation",
-    (key) => {
-      render(
-        <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
-      );
-
-      const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
-      fireEvent.pointerDown(messageToggle);
-      act(() => messageToggle.focus());
-      fireEvent.pointerUp(messageToggle);
-      fireEvent.mouseLeave(messageToggle);
-      expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-
-      fireEvent.keyDown(messageToggle, { key });
-      expect(screen.queryByTestId("error-status-icon")).toBeNull();
-      expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
-      fireEvent.click(messageToggle);
-      expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
-
-      fireEvent.keyDown(messageToggle, { key });
-      fireEvent.click(messageToggle);
-      expect(screen.queryByTestId("error-status-icon")).toBeNull();
-      expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
-
-      act(() => messageToggle.blur());
-      expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-      expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
-    },
-  );
 
   it("replaces the full banner during recovery and restores it after failure", async () => {
     let rejectRetry: ((error: Error) => void) | undefined;
@@ -169,6 +123,11 @@ describe("ErrorBanner", () => {
     expect(screen.queryByTestId("error-headline")).toBeNull();
     expect(reconnecting).toHaveClass("justify-center", "min-h-14");
     expect(status).toHaveTextContent(/^Reconnecting$/);
+    // The badge pairs the label with an animated spinner so the in-flight
+    // attempt reads as active work; the text stays the accessible label.
+    const spinner = reconnecting.querySelector(".animate-spin");
+    expect(spinner).not.toBeNull();
+    expect(spinner).toHaveAttribute("aria-hidden", "true");
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveAttribute("aria-atomic", "true");
     expect(status).toHaveClass("rounded-xl", "border-border", "bg-background");
@@ -176,13 +135,13 @@ describe("ErrorBanner", () => {
     expect(screen.queryByRole("button", { name: "Dismiss error message" })).toBeNull();
     expect(screen.queryByText("Message")).toBeNull();
     expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
 
     await act(async () => rejectRetry?.(new Error("Host is still offline")));
     expect(screen.getByTestId("error-headline")).toBeInTheDocument();
     expect(screen.queryByTestId("error-reconnecting")).toBeNull();
     expect(screen.getByRole("status")).toHaveTextContent("Retry failed: Host is still offline");
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("error-disclosure-icon")).toBeInTheDocument();
   });
 
   it("matches the prototype pill structure and diagnostics treatment", () => {
@@ -740,5 +699,34 @@ describe("routing decision — harness / scope / raw pick", () => {
     expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
     fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
     expect(screen.queryByText(/"router_source"/)).toBeNull();
+  });
+});
+
+describe("ErrorBanner — info level", () => {
+  it("renders a neutral notice pill with the code's headline and an info icon", () => {
+    render(
+      <ErrorBanner
+        message="Codex could not load this session's saved transcript."
+        source="harness"
+        code="codex_thread_reset"
+        level="info"
+      />,
+    );
+    const pill = screen.getByTestId("error-pill");
+    expect(pill).toHaveAttribute("data-level", "info");
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
+    );
+    expect(screen.getByTestId("error-headline")).not.toHaveClass("text-destructive");
+    // Disclosure chevron is always shown; destructive styling is on the headline, not the icon.
+    expect(screen.getByTestId("error-disclosure-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("text-destructive");
+    expect(screen.getByRole("button", { name: "Dismiss notice" })).toBeInTheDocument();
+  });
+
+  it("keeps the destructive pill as the default level", () => {
+    render(<ErrorBanner message="boom" source="execution" code="runner_error" />);
+    expect(screen.getByTestId("error-pill")).toHaveAttribute("data-level", "error");
+    expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
   });
 });

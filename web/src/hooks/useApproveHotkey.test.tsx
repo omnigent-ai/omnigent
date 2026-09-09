@@ -1,6 +1,7 @@
 // Cmd/Ctrl+Enter accepts the newest pending accept/decline prompt; skips
 // already-responded prompts and AskUserQuestion (which needs an explicit
-// choice); ignores bare Enter and Alt/Shift-modified Enter.
+// choice); platform-aware (only ⌘ on macOS, only Ctrl on Win/Linux); ignores
+// bare Enter and Alt/Shift-modified Enter.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -36,18 +37,60 @@ afterEach(() => {
 describe("useApproveHotkey", () => {
   const pending = { type: "elicitation", elicitationId: "e1", status: "pending" };
 
-  it("Cmd+Enter accepts the pending approval", () => {
-    blocks = [pending];
-    renderHook(() => useApproveHotkey());
+  const FIELD_SCHEMA = {
+    type: "object",
+    properties: { branch: { type: "string" } },
+    required: ["branch"],
+  };
+
+  it("does not accept a prompt that asks for fields", () => {
+    // The card disables Submit until the required fields are answered. A
+    // keystroke that accepts anyway walks around that gate and sends the
+    // server none of what it asked for.
+    blocks = [{ ...pending, requestedSchema: FIELD_SCHEMA }];
+    renderHook(() => useApproveHotkey(true));
+    press();
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  it("does not reach past a form to accept an older binary prompt", () => {
+    // The newest prompt is the one on screen. Accepting an older one while
+    // someone fills in a form approves something they cannot see.
+    blocks = [
+      { type: "elicitation", elicitationId: "old", status: "pending" },
+      { ...pending, elicitationId: "form", requestedSchema: FIELD_SCHEMA },
+    ];
+    renderHook(() => useApproveHotkey(true));
+    press();
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  it("still accepts a bare consent prompt that names no fields", () => {
+    blocks = [{ ...pending, requestedSchema: { type: "object" } }];
+    renderHook(() => useApproveHotkey(true));
     press();
     expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
   });
 
-  it("Ctrl+Enter also accepts (Win/Linux)", () => {
+  it("Cmd+Enter accepts the pending approval (macOS)", () => {
     blocks = [pending];
-    renderHook(() => useApproveHotkey());
+    renderHook(() => useApproveHotkey(true));
+    press();
+    expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
+  });
+
+  it("Ctrl+Enter accepts on Windows/Linux", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(false));
     press({ ctrlKey: true });
     expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
+  });
+
+  it("ignores Ctrl+Enter on macOS (only ⌘↵ fires there)", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    press({ ctrlKey: true });
+    expect(submitApproval).not.toHaveBeenCalled();
   });
 
   it("accepts the most recent pending approval", () => {
@@ -56,28 +99,28 @@ describe("useApproveHotkey", () => {
       { type: "text" },
       { type: "elicitation", elicitationId: "new", status: "pending" },
     ];
-    renderHook(() => useApproveHotkey());
+    renderHook(() => useApproveHotkey(true));
     press();
     expect(submitApproval).toHaveBeenCalledWith("new", "accept");
   });
 
   it("ignores already-responded prompts", () => {
     blocks = [{ type: "elicitation", elicitationId: "e1", status: "responded" }];
-    renderHook(() => useApproveHotkey());
+    renderHook(() => useApproveHotkey(true));
     press();
     expect(submitApproval).not.toHaveBeenCalled();
   });
 
   it("skips AskUserQuestion (needs an explicit choice)", () => {
     blocks = [{ type: "elicitation", elicitationId: "q1", status: "pending", askUserQuestion: {} }];
-    renderHook(() => useApproveHotkey());
+    renderHook(() => useApproveHotkey(true));
     press();
     expect(submitApproval).not.toHaveBeenCalled();
   });
 
   it("ignores bare Enter and Alt/Shift-modified Enter", () => {
     blocks = [pending];
-    renderHook(() => useApproveHotkey());
+    renderHook(() => useApproveHotkey(true));
     press({}); // bare Enter
     press({ metaKey: true, shiftKey: true });
     press({ metaKey: true, altKey: true });

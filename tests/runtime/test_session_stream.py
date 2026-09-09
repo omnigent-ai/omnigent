@@ -258,6 +258,26 @@ async def test_subscriber_slot_cleaned_up_on_exit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_has_subscribers_tracks_live_subscription() -> None:
+    """
+    ``has_subscribers`` is False with no subscriber, True while one is
+    registered, and False again after it exits.
+
+    Production breakage that causes this test to fail: the helper reads
+    the wrong registry (or a stale snapshot), so fail-fast callers (the
+    browser action bridge) either always fail fast — breaking the desktop
+    flow — or never do, restoring the 30 s headless stall.
+    """
+    assert session_stream.has_subscribers("conv_probe") is False
+    task = asyncio.create_task(_collect("conv_probe", expected=1))
+    await asyncio.sleep(0)
+    assert session_stream.has_subscribers("conv_probe") is True
+    session_stream.publish("conv_probe", {"type": "a"})
+    await asyncio.wait_for(task, timeout=2.0)
+    assert session_stream.has_subscribers("conv_probe") is False
+
+
+@pytest.mark.asyncio
 async def test_slow_subscriber_overflow_is_bounded_and_disconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -864,3 +884,46 @@ def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) 
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event("conv_1", {"type": "response.completed"})
     assert records == []
+
+
+@contextlib.contextmanager
+def _capturing_audit_logger() -> Iterator[list[logging.LogRecord]]:
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = session_stream.audit_event_logger()
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    handler = _Capture()
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+
+def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A terminal SSE event emits one first-class turn_finished audit row carrying
+    # the outcome + safe ids; a non-terminal event emits none.
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_audit_logger() as records:
+        session_stream._log_sse_event(
+            "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}}
+        )
+        session_stream._log_sse_event(
+            "conv_1", {"type": "response.failed", "error": {"code": "timeout", "message": "x"}}
+        )
+        session_stream._log_sse_event("conv_1", {"type": "response.output_text.delta"})
+
+    assert [r.event_name for r in records] == ["turn_finished", "turn_finished"]
+    completed = records[0]
+    assert completed.session_id == "conv_1"
+    assert completed.levelno == logging.INFO
+    assert completed.attributes == {"outcome": "completed", "response_id": "resp_1"}
+    failed = records[1]
+    assert failed.levelno == logging.WARNING
+    assert failed.attributes == {"outcome": "failed", "error_code": "timeout"}  # no message text

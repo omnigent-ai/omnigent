@@ -69,7 +69,7 @@ def test_stale_banner_on_runner_crash(
     live_server, session_id = seeded_session
     page.goto(f"{live_server}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill("Write a 500-word essay about the history of computing.")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -175,7 +175,7 @@ def test_silent_stream_stall_self_heals(
     )
 
     page.goto(f"{live_server}/c/{session_id}")
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
     for _ in range(100):
         if stream_opens:
             break
@@ -223,7 +223,7 @@ def test_silent_stream_stall_self_heals(
             pass
         page.wait_for_timeout(500)
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     composer.fill("Say hello")
     page.get_by_role("button", name="Send", exact=True).click()
     expect(

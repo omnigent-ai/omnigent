@@ -70,8 +70,10 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 
 # Interrupt and reap use SEPARATE budgets: the short slice keeps a wedged interrupt from
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
+# _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the
+# slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
 INTERRUPT_TIMEOUT_S = 3.0
-_INTERRUPT_SLICE_S = 1.5
+_INTERRUPT_SLICE_S = 3.0
 
 # Consecutive orphaned tool callbacks (no active turn context) before forcing a Tier-1 SDK reset.
 # Reset to zero at each ``run_turn`` start so a single late straggler never trips it.
@@ -312,6 +314,13 @@ class ExecutorAdapter(HarnessApp):
                                 error=event.message,
                             )
                             agent_span = None
+                        # Keep any usage the executor observed before the
+                        # failure: the scaffold's terminal-event builder reads
+                        # ctx.provider_usage, so the response.failed event still
+                        # carries context_tokens and the occupancy meter doesn't
+                        # freeze at the previous turn's value.
+                        if event.usage is not None:
+                            ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
                         raise RuntimeError(f"inner executor error: {detail}")

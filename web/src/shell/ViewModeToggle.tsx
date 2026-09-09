@@ -1,7 +1,6 @@
 import { Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "./TerminalFirstContext";
 
@@ -14,13 +13,15 @@ import { useTerminalFirst } from "./TerminalFirstContext";
  *
  * Self-gates to null when there's nothing to toggle:
  *   - non-terminal-first sessions,
- *   - the iOS shell (the switcher is the native Liquid Glass bar there),
  *   - a rail-opened shell owning the main view (isShellView) — its own
  *     close affordance is the way back to chat.
+ *
+ * Renders on every shell, including iOS — the native bottom pill is retired
+ * (AppShell pushes it hidden at boot), so the header is the one placement.
  */
 export function ViewModeToggle() {
   const ctx = useTerminalFirst();
-  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
+  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
 
   const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
@@ -34,8 +35,11 @@ export function ViewModeToggle() {
       // track is present — see MOBILE_GLASS_PILL.
       data-slot="view-mode-toggle"
       // Inset track: p-0.5 around two size-6 segments lands the control at
-      // 32px tall, matching the header's other controls.
-      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
+      // 32px tall, matching the header's other controls. On mobile the
+      // segments grow to the 44px tap-target floor and the padding drops so
+      // the track matches the pill's other 44px controls instead of
+      // stretching it.
+      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5 max-md:p-0"
     >
       <ViewModeSegment
         label="Chat view"
@@ -44,7 +48,7 @@ export function ViewModeToggle() {
         testId="view-mode-chat"
         componentId="chat.header.view_chat"
       >
-        <MessagesSquareIcon className="size-3.5" />
+        <MessagesSquareIcon className="size-3.5 max-md:size-5" />
       </ViewModeSegment>
       <ViewModeSegment
         label={terminalLabel}
@@ -54,9 +58,9 @@ export function ViewModeToggle() {
         componentId="chat.header.view_terminal"
       >
         {terminalStartingUp ? (
-          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+          <Loader2Icon className="size-3.5 animate-spin max-md:size-5" aria-hidden />
         ) : (
-          <TerminalIcon className="size-3.5" />
+          <TerminalIcon className="size-3.5 max-md:size-5" />
         )}
       </ViewModeSegment>
     </div>
@@ -98,7 +102,9 @@ function ViewModeSegment({
             data-testid={testId}
             componentId={componentId}
             className={cn(
-              "border-none",
+              // 44px tap-target floor on phones, matching the sibling header
+              // controls; icon-xs alone is a 24px hit box a finger misses.
+              "border-none max-md:size-11 max-md:rounded-full",
               active
                 ? "bg-background text-foreground shadow-sm hover:bg-background"
                 : "text-muted-foreground hover:bg-transparent hover:text-foreground",

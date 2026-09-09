@@ -45,7 +45,7 @@ import sys
 import tarfile
 import textwrap
 import time
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -139,7 +139,7 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
 # Populated by ``live_server`` so test-scoped fixtures can access the
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
-_server_state: dict[str, int | str] = {}
+_server_state: dict[str, object] = {}
 _WEB_DIR = _REPO_ROOT / "web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
@@ -756,63 +756,6 @@ def _write_codex_unknown_version_shim(directory: Path, codex_path: str) -> Path:
     return shim
 
 
-def _assert_service_worker_tombstone(build_output: Path) -> None:
-    """Fail if the built SPA ships anything but the tombstone service worker.
-
-    The PWA is retired: ``sw.js`` exists only to unregister workers still
-    installed in browsers, and the manifest/version sentinel must be gone. The
-    dangerous direction matters most — a worker that intercepted requests could
-    serve a stale shell and white-screen users after a deploy, and an unscoped
-    cache purge could delete Cache Storage belonging to a future feature.
-
-    Delete this guard together with ``sw-src/sw.js`` in 0.11.0.
-    """
-    if not (build_output / "index.html").is_file():
-        pytest.fail(f"SPA build is missing index.html at {build_output}")
-    if not (build_output / "sw.js").is_file():
-        pytest.fail(
-            f"SPA build is missing the tombstone sw.js at {build_output} — without it, "
-            "service workers already registered in browsers are never unregistered"
-        )
-    for name in ("manifest.webmanifest", "version.json"):
-        if (build_output / name).is_file():
-            pytest.fail(f"SPA build still emits the retired PWA asset {name}")
-    # Strip line comments first so prose that mentions these tokens can neither
-    # fake nor mask a regression.
-    sw = (build_output / "sw.js").read_text(encoding="utf-8")
-    sw_code = re.sub(r"//[^\n]*", "", sw)
-    if "registration.unregister" not in sw_code:
-        pytest.fail(
-            "sw.js does not call registration.unregister() — it must remove itself, "
-            "or the retired worker stays registered in users' browsers"
-        )
-    if "__BUILD_VERSION__" in sw:
-        pytest.fail(
-            "sw.js still carries the __BUILD_VERSION__ token but nothing substitutes "
-            "it any more; the tombstone is byte-stable and needs no fingerprint"
-        )
-    responders = sw_code.count("respondWith")
-    if responders:
-        pytest.fail(
-            f"sw.js has {responders} respondWith() call(s); the tombstone must intercept "
-            "nothing — any responder risks serving a stale shell after a deploy"
-        )
-    # The purge must match the retired worker's exact cache-name shape
-    # (`omnigent-pwa-<8 lowercase hex>`), not a bare prefix: a tombstone lingering
-    # in some browser must not be able to delete a future feature's Cache Storage
-    # even if that feature reuses the prefix. Checked by marker rather than
-    # structurally — the pattern is held in a const, so a same-line regex would
-    # only be asserting the current formatting.
-    if "caches.delete" in sw_code and not (
-        r"/^omnigent-pwa-[0-9a-f]{8}$/" in sw_code and ".filter(" in sw_code
-    ):
-        pytest.fail(
-            "sw.js deletes caches without filtering on the retired cache-name shape "
-            "/^omnigent-pwa-[0-9a-f]{8}$/ — the purge must not touch caches it does "
-            "not own, and a bare prefix match is too broad"
-        )
-
-
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
@@ -832,7 +775,6 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     if request.config.getoption("--ui-base-url"):
         return
     if request.config.getoption("--ui-skip-build"):
-        _assert_service_worker_tombstone(_BUILD_OUTPUT)
         return
 
     lock_path = _WEB_DIR / ".build.lock"
@@ -858,8 +800,6 @@ def built_spa(request: pytest.FixtureRequest) -> None:
             stdin=subprocess.DEVNULL,
             env=env,
         )
-
-    _assert_service_worker_tombstone(_BUILD_OUTPUT)
 
 
 def _spawn_runner_against_external_server(
@@ -1064,40 +1004,46 @@ def live_server(
     # instead of being shadowed by the worktree.
     apply_server_env(env, _REPO_ROOT)
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
-    proc = subprocess.Popen(
-        [
-            server_executable(),
-            # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
-            # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
-            # interpreter — a monkeypatch in the test process can't reach a
-            # subprocess. ``-c`` patches the module global before the CLI
-            # runs; the presence route reads it live at call time, so the
-            # presence-leave assertion in test_collab_realtime clears in ~1s
-            # instead of the prod 15s dwell (which only exists to absorb the
-            # ingress' ~5-min stream recycle a test server never hits).
-            # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
-            "-c",
-            "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-            + "from omnigent.cli import main; main()",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-            "--agent",
-            str(agent_yaml_path),
-        ],
-        env=env,
-        # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
-        # old server install via sys.path[0]. None (inherit) in normal runs.
-        cwd=compat_server_cwd(),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
+    server_argv = [
+        server_executable(),
+        # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
+        # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
+        # interpreter — a monkeypatch in the test process can't reach a
+        # subprocess. ``-c`` patches the module global before the CLI
+        # runs; the presence route reads it live at call time, so the
+        # presence-leave assertion in test_collab_realtime clears in ~1s
+        # instead of the prod 15s dwell (which only exists to absorb the
+        # ingress' ~5-min stream recycle a test server never hits).
+        # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
+        "-c",
+        "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+        + "from omnigent.cli import main; main()",
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--database-uri",
+        f"sqlite:///{db_path}",
+        "--artifact-location",
+        str(artifact_dir),
+        "--agent",
+        str(agent_yaml_path),
+    ]
+    server_cwd = compat_server_cwd()
+
+    def _spawn_server() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            server_argv,
+            env=env,
+            # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
+            # old server install via sys.path[0]. None (inherit) in normal runs.
+            cwd=server_cwd,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+    proc = _spawn_server()
     base_url = f"http://127.0.0.1:{port}"
 
     # Spawn the runner as a sibling subprocess (the server no longer
@@ -1125,36 +1071,39 @@ def live_server(
         stderr=subprocess.STDOUT,
     )
 
-    # Poll /health and the runner status until the server can
-    # actually route a turn. Time-based polling mirrors
-    # tests/_helpers/live_server.py:start_live_server — the
-    # alternative (asyncio.Event signalling) doesn't apply because
-    # the subprocess is opaque to this process.
-    deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-    ready = False
-    last_error = "not polled yet"
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            last_error = f"process exited early with code {proc.returncode}"
-            break
-        try:
-            resp = httpx.get(f"{base_url}/health", timeout=2)
-            if resp.status_code == 200:
-                status_resp = httpx.get(
-                    f"{base_url}/v1/runners/{runner_id}/status",
-                    timeout=2,
-                )
-                if status_resp.status_code == 200 and status_resp.json()["online"] is True:
-                    ready = True
-                    break
-                last_error = (
-                    f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
-                )
-            else:
-                last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
-        except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-        time.sleep(_HEALTH_POLL_INTERVAL_S)
+    def _wait_until_ready(
+        server_process: subprocess.Popen[bytes],
+        *,
+        timeout_s: float = _HEALTH_TIMEOUT_S,
+    ) -> tuple[bool, str]:
+        """Wait until this server generation can route through the runner."""
+        deadline = time.monotonic() + timeout_s
+        last_error = "not polled yet"
+        while time.monotonic() < deadline:
+            if server_process.poll() is not None:
+                return False, f"process exited early with code {server_process.returncode}"
+            try:
+                resp = httpx.get(f"{base_url}/health", timeout=2)
+                if resp.status_code == 200:
+                    status_resp = httpx.get(
+                        f"{base_url}/v1/runners/{runner_id}/status",
+                        timeout=2,
+                    )
+                    if status_resp.status_code == 200 and status_resp.json()["online"] is True:
+                        return True, "ready"
+                    last_error = (
+                        f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
+                    )
+                else:
+                    last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+        return False, last_error
+
+    # Poll /health and the runner status until the server can actually route a
+    # turn. The same readiness gate is reused after a server-only restart.
+    ready, last_error = _wait_until_ready(proc)
 
     if not ready:
         if runner_proc.poll() is None:
@@ -1183,6 +1132,7 @@ def live_server(
 
     _server_state["pid"] = proc.pid
     _server_state["runner_id"] = runner_id
+    _server_state["runner_pid"] = runner_proc.pid
     # Exposed so a test whose predecessor killed the shared runner (e.g.
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
@@ -1191,6 +1141,28 @@ def live_server(
     # Exposed so a test can seed a committed transcript straight into the
     # store (see :func:`seed_committed_turn`) instead of driving the LLM.
     _server_state["database_uri"] = f"sqlite:///{db_path}"
+
+    def _restart_server() -> None:
+        """Replace only the server process, preserving its runner and database."""
+        nonlocal proc
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        proc = _spawn_server()
+        ready, restart_error = _wait_until_ready(proc, timeout_s=120.0)
+        if not ready:
+            log_text = log_path.read_text() if log_path.exists() else ""
+            raise RuntimeError(
+                f"restarted server did not become ready on {base_url} "
+                f"(last_error={restart_error}).\n{log_text[-3000:]}"
+            )
+        _server_state["pid"] = proc.pid
+
+    _server_state["restart_server"] = _restart_server
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
@@ -1392,6 +1364,7 @@ def _ensure_runner_online(
                 f"log:\n{log_path.read_text()[-3000:]}"
             )
         if _online():
+            _server_state["runner_pid"] = proc.pid
             return proc
         time.sleep(_HEALTH_POLL_INTERVAL_S)
 
@@ -2434,7 +2407,7 @@ def _create_native_claude_session(
     """Register the ``claude-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent claude`` ships
-    (:func:`omnigent.claude_native._materialize_claude_agent_spec`) so the
+    (:func:`omnigent.harnesses.claude_native.main._materialize_claude_agent_spec`) so the
     fixture never drifts from production, and stamps the same wrapper /
     terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
     the CLI writes. The spec carries no ``spec_version``, so it is bundled
@@ -2467,7 +2440,7 @@ def _create_native_claude_session(
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.claude_native import _materialize_claude_agent_spec
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_claude_agent_spec(Path(_tmp))
@@ -2605,7 +2578,7 @@ def _create_native_codex_session(
     """Register the ``codex-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent codex`` ships
-    (:func:`omnigent.codex_native._materialize_codex_agent_spec`) so the
+    (:func:`omnigent.harnesses.codex_native.main._materialize_codex_agent_spec`) so the
     fixture never drifts from production, and stamps the same wrapper /
     terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
     the CLI writes. The spec carries no ``spec_version``, so it is bundled
@@ -2635,7 +2608,7 @@ def _create_native_codex_session(
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.codex_native import _materialize_codex_agent_spec
+    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_codex_agent_spec(Path(_tmp), model=model)
@@ -2852,6 +2825,7 @@ class MockedCodexNativeSession:
     base_url: str
     session_id: str
     sidecar: CodexResponsesSidecar
+    restart_server: Callable[[], None]
 
 
 def _write_mock_codex_provider_config(
@@ -2989,50 +2963,52 @@ def mocked_native_codex_session(
         "RUNNER_SERVER_URL": base_url,
     }
 
+    server_command = [
+        sys.executable,
+        "-c",
+        "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+        + "from omnigent.cli import main; main()",
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--database-uri",
+        f"sqlite:///{db_path}",
+        "--artifact-location",
+        str(artifact_dir),
+        "--agent",
+        str(agent_yaml_path),
+    ]
+
     log_handle = open(log_path, "w")  # noqa: SIM115
     runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
     proc: subprocess.Popen[bytes] | None = None
     runner_proc: subprocess.Popen[bytes] | None = None
     session_id: str | None = None
-    try:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-                + "from omnigent.cli import main; main()",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{db_path}",
-                "--artifact-location",
-                str(artifact_dir),
-                "--agent",
-                str(agent_yaml_path),
-            ],
+
+    def _spawn_server() -> subprocess.Popen[bytes]:
+        """Start one server generation against the fixture's durable store."""
+        return subprocess.Popen(
+            server_command,
             env=server_env,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=runner_env,
-            stdout=runner_log_handle,
-            stderr=subprocess.STDOUT,
-        )
 
+    def _wait_until_ready(
+        server_process: subprocess.Popen[bytes],
+        runner_process: subprocess.Popen[bytes],
+    ) -> None:
+        """Wait until both the server generation and surviving runner are ready."""
         deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        ready = False
         last_error = "not polled yet"
         while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                last_error = f"process exited early with code {proc.returncode}"
+            if server_process.poll() is not None:
+                last_error = f"process exited early with code {server_process.returncode}"
                 break
-            if runner_proc.poll() is not None:
-                last_error = f"runner exited early with code {runner_proc.returncode}"
+            if runner_process.poll() is not None:
+                last_error = f"runner exited early with code {runner_process.returncode}"
                 break
             try:
                 resp = httpx.get(f"{base_url}/health", timeout=2)
@@ -3042,8 +3018,7 @@ def mocked_native_codex_session(
                         timeout=2,
                     )
                     if status_resp.status_code == 200 and status_resp.json()["online"] is True:
-                        ready = True
-                        break
+                        return
                     last_error = (
                         f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
                     )
@@ -3052,20 +3027,48 @@ def mocked_native_codex_session(
             except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
             time.sleep(_HEALTH_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"mocked Codex e2e server did not become healthy within "
+            f"{_HEALTH_TIMEOUT_S:.0f}s on {base_url} "
+            f"(last_error={last_error}).\n"
+            f"Server log at {log_path}:\n"
+            f"{log_path.read_text()[-3000:] if log_path.exists() else ''}\n"
+            f"Runner log at {runner_log_path}:\n"
+            f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
+        )
 
-        if not ready:
-            raise RuntimeError(
-                f"mocked Codex e2e server did not become healthy within "
-                f"{_HEALTH_TIMEOUT_S:.0f}s on {base_url} "
-                f"(last_error={last_error}).\n"
-                f"Server log at {log_path}:\n"
-                f"{log_path.read_text()[-3000:] if log_path.exists() else ''}\n"
-                f"Runner log at {runner_log_path}:\n"
-                f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
-            )
+    try:
+        proc = _spawn_server()
+        runner_proc = subprocess.Popen(
+            [sys.executable, "-m", "omnigent.runner._entry"],
+            env=runner_env,
+            stdout=runner_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        _wait_until_ready(proc, runner_proc)
 
         session_id = _create_native_codex_session(base_url, runner_id, model=model)
-        yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
+
+        def _restart_server() -> None:
+            """Recycle only the server, preserving the runner and Codex turn."""
+            nonlocal proc
+            assert proc is not None
+            assert runner_proc is not None
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            proc = _spawn_server()
+            _wait_until_ready(proc, runner_proc)
+
+        yield MockedCodexNativeSession(
+            base_url=base_url,
+            session_id=session_id,
+            sidecar=sidecar,
+            restart_server=_restart_server,
+        )
     finally:
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
@@ -3123,7 +3126,7 @@ def _create_native_cursor_session(
     """Register the ``cursor-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent cursor`` ships
-    (:func:`omnigent.cursor_native._materialize_cursor_agent_spec`) so the
+    (:func:`omnigent.harnesses.cursor_native.main._materialize_cursor_agent_spec`) so the
     fixture never drifts from production, and stamps the same wrapper /
     terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
     the CLI writes. The spec carries no ``spec_version``, so it is bundled
@@ -3152,7 +3155,7 @@ def _create_native_cursor_session(
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.cursor_native import _materialize_cursor_agent_spec
+    from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_cursor_agent_spec(Path(_tmp))
@@ -3202,7 +3205,7 @@ def _create_native_goose_session(base_url: str, runner_id: str) -> str:
 
     Mirrors :func:`_create_native_cursor_session`: reuses the exact terminal-first
     spec ``omnigent goose`` ships
-    (:func:`omnigent.goose_native._materialize_goose_agent_spec`) and stamps the
+    (:func:`omnigent.harnesses.goose_native.main._materialize_goose_agent_spec`) and stamps the
     same wrapper / terminal-first labels. Binding triggers the runner's
     goose-native auto-bootstrap
     (:func:`omnigent.runner.app._auto_create_goose_terminal`), which launches
@@ -3223,7 +3226,7 @@ def _create_native_goose_session(base_url: str, runner_id: str) -> str:
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.goose_native import _materialize_goose_agent_spec
+    from omnigent.harnesses.goose_native.main import _materialize_goose_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_goose_agent_spec(Path(_tmp))
@@ -3292,7 +3295,7 @@ def _create_native_kiro_session(base_url: str, runner_id: str) -> str:
 
     Mirrors :func:`_create_native_goose_session`: reuses the terminal-first spec
     ``omnigent kiro`` ships
-    (:func:`omnigent.kiro_native._materialize_kiro_agent_spec`) and stamps the
+    (:func:`omnigent.harnesses.kiro_native.main._materialize_kiro_agent_spec`) and stamps the
     same wrapper / terminal-first labels. Binding triggers the runner's
     kiro-native auto-bootstrap
     (:func:`omnigent.runner.app._auto_create_kiro_terminal`), which launches the
@@ -3312,7 +3315,7 @@ def _create_native_kiro_session(base_url: str, runner_id: str) -> str:
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.kiro_native import _materialize_kiro_agent_spec
+    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_kiro_agent_spec(Path(_tmp), model=None)
@@ -3381,7 +3384,7 @@ def _create_native_hermes_session(base_url: str, runner_id: str) -> str:
 
     Mirrors :func:`_create_native_goose_session`: reuses the exact terminal-first
     spec ``omnigent hermes`` ships
-    (:func:`omnigent.hermes_native._materialize_hermes_agent_spec`) and stamps the
+    (:func:`omnigent.harnesses.hermes_native.main._materialize_hermes_agent_spec`) and stamps the
     same wrapper / terminal-first labels. Binding triggers the runner's
     hermes-native auto-bootstrap
     (:func:`omnigent.runner.app._auto_create_hermes_terminal`), which launches the
@@ -3401,7 +3404,7 @@ def _create_native_hermes_session(base_url: str, runner_id: str) -> str:
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.hermes_native import _materialize_hermes_agent_spec
+    from omnigent.harnesses.hermes_native.main import _materialize_hermes_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_hermes_agent_spec(Path(_tmp))
@@ -3510,7 +3513,7 @@ def native_cursor_approval_session(
 
     Identical to :func:`native_cursor_session` but omits the force/trust flag,
     so ``cursor-agent`` raises its real per-tool approval prompts. The runner-
-    side mirror (:mod:`omnigent.cursor_native_permissions`) surfaces those as
+    side mirror (:mod:`omnigent.harnesses.cursor_native.permissions`) surfaces those as
     web ``response.elicitation_request`` cards — what the approval-ordering test
     drives. The first-run workspace-trust modal is dismissed by the executor's
     inject path on the first composer turn.

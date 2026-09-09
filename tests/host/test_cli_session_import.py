@@ -160,7 +160,7 @@ def test_session_import_creates_session(tmp_path: Path) -> None:
 def test_session_import_falls_back_to_native_agent(tmp_path: Path) -> None:
     """When the exported agent_id 404s, import retries with the native agent."""
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
     native = native_coding_agent_for_harness("claude-native")
     assert native is not None
