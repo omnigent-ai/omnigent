@@ -49,6 +49,7 @@ _MAX_BODY_BYTES = 10 * 1024 * 1024
 _MAX_RESPONSE_BODY_BYTES = 64 * 1024 * 1024
 _RESPONSE_IDLE_TIMEOUT_SECONDS = 60.0
 _RESPONSE_TOTAL_TIMEOUT_SECONDS = 10 * 60.0
+_MAX_INTERIM_RESPONSES = 8
 _HEADER_NAME_RE = re.compile(rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 _STATUS_LINE_RE = re.compile(rb"HTTP/1\.1 ([1-5][0-9]{2})(?: ([\x20-\x7e]*))?\r\n\Z")
 _REQUEST_REJECTED_HEADERS = frozenset(
@@ -410,12 +411,24 @@ class _SignerRelay(EgressProxy):
         """Validate, sanitize, and stream one bounded upstream response."""
         started = asyncio.get_running_loop().time()
         try:
-            status_line = await self._read_response_part(
-                upstream_reader.readline(),
-                started=started,
-            )
-            headers_raw = await self._read_response_headers(upstream_reader, started=started)
-            response = _parse_strict_response_head(status_line, headers_raw)
+            interim_count = 0
+            while True:
+                status_line = await self._read_response_part(
+                    upstream_reader.readline(),
+                    started=started,
+                )
+                headers_raw = await self._read_response_headers(upstream_reader, started=started)
+                response = _parse_strict_response_head(status_line, headers_raw)
+                if response.status >= 200:
+                    break
+                interim_count += 1
+                if (
+                    response.status == 101
+                    or response.content_length is not None
+                    or response.chunked
+                    or interim_count > _MAX_INTERIM_RESPONSES
+                ):
+                    raise ValueError("unsupported upstream interim response")
         except (
             asyncio.IncompleteReadError,
             asyncio.LimitOverrunError,
@@ -430,7 +443,7 @@ class _SignerRelay(EgressProxy):
             reason = http.HTTPStatus(response.status).phrase
         except ValueError:
             reason = ""
-        no_body = response.status in (204, 304) or 100 <= response.status < 200
+        no_body = response.status in (204, 304)
         keep_alive = response.content_length is not None or no_body
         downstream_head = f"HTTP/1.1 {response.status} {reason}\r\n".encode("ascii")
         for name, value in response.headers:
@@ -457,7 +470,7 @@ class _SignerRelay(EgressProxy):
                     length=response.content_length,
                     started=started,
                 )
-            elif response.status in (204, 304) or 100 <= response.status < 200:
+            elif response.status in (204, 304):
                 body_bytes = 0
             else:
                 body_bytes = await self._relay_eof_body(

@@ -237,6 +237,51 @@ async def test_redirect_is_returned_without_an_upstream_follow() -> None:
     assert b"Location: https://other.test/path\r\n" in client.data
 
 
+async def test_interim_response_is_consumed_until_final_response() -> None:
+    relay = object.__new__(_SignerRelay)
+    relay._credential_source = Mock()
+    client = _Writer()
+    upstream = _reader(
+        b"HTTP/1.1 103 Early Hints\r\n"
+        b"Link: </model>; rel=preload\r\n\r\n"
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 2\r\n\r\n{}"
+    )
+
+    relayed, status, keep_alive = await relay._relay_response_observing_status(upstream, client)
+
+    assert status == 200
+    assert keep_alive
+    assert relayed == len(client.data)
+    assert bytes(client.data).startswith(b"HTTP/1.1 200 OK\r\n")
+    assert b"103 Early Hints" not in client.data
+
+
+async def test_switching_protocols_is_rejected_without_relay() -> None:
+    relay = object.__new__(_SignerRelay)
+    relay._credential_source = Mock()
+    client = _Writer()
+    upstream = _reader(
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+    )
+
+    assert await relay._relay_response_observing_status(upstream, client) == (0, 0, False)
+    assert not client.data
+
+
+async def test_excessive_interim_responses_are_rejected() -> None:
+    relay = object.__new__(_SignerRelay)
+    relay._credential_source = Mock()
+    client = _Writer()
+    upstream = _reader(
+        b"HTTP/1.1 103 Early Hints\r\n\r\n" * 9 + b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    )
+
+    assert await relay._relay_response_observing_status(upstream, client) == (0, 0, False)
+    assert not client.data
+
+
 async def test_client_disconnect_aborts_response_stream() -> None:
     relay = object.__new__(_SignerRelay)
     relay._credential_source = Mock()

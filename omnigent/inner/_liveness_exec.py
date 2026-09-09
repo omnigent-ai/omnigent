@@ -44,7 +44,13 @@ def _terminate_group(
     detached_reaper: bool = False,
 ) -> None:
     if detached_reaper and pgid == os.getpid() and hasattr(os, "fork"):
-        reaper_pid = os.fork()
+        try:
+            reaper_pid = os.fork()
+        except OSError:
+            # Resource exhaustion can make fork unavailable exactly when
+            # teardown is most important. Fall through to the bounded inline
+            # TERM/KILL path rather than abandoning the worker group.
+            reaper_pid = -1
         if reaper_pid == 0:
             with contextlib.suppress(OSError):
                 os.setsid()
@@ -54,10 +60,12 @@ def _terminate_group(
             with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                 os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
             os._exit(0)
-        # The detached reaper now owns bounded escalation. Do not return and
-        # accidentally let this group leader exit before TERM is delivered.
-        while True:
-            signal.pause()
+        if reaper_pid > 0:
+            # The detached reaper now owns bounded escalation. Do not return
+            # and accidentally let this group leader exit before TERM is
+            # delivered.
+            while True:
+                signal.pause()
     _signal_members(pgid, signal.SIGTERM)
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and _group_members(pgid):
