@@ -16,6 +16,7 @@ import asyncio
 import json
 import math
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,7 @@ from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
-from omnigent.session_event_batch import MAX_SESSION_EVENT_BATCH_BYTES
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -1245,7 +1246,7 @@ async def test_session_event_batch_rejects_body_over_ten_mib(
     client: httpx.AsyncClient,
 ) -> None:
     """The server independently enforces the exact encoded request limit."""
-    assert MAX_SESSION_EVENT_BATCH_BYTES == 10 * 1024 * 1024
+    assert MAX_SESSION_EVENT_REQUEST_BYTES == 10 * 1024 * 1024
     agent = await create_test_agent(client)
     parent = await _create_session(
         client,
@@ -1276,11 +1277,33 @@ async def test_session_event_batch_rejects_body_over_ten_mib(
                     "response_id": "resp_oversized",
                     "item_data": {
                         "call_id": "toolu_oversized",
-                        "output": "x" * MAX_SESSION_EVENT_BATCH_BYTES,
+                        "output": "x" * MAX_SESSION_EVENT_REQUEST_BYTES,
                     },
                 },
             }
         ],
+    )
+    assert response.status_code == 400
+    assert "10 MiB" in response.text
+
+
+async def test_session_event_body_limit_applies_without_content_length(
+    client: httpx.AsyncClient,
+) -> None:
+    """Chunked bodies are bounded before JSON or Pydantic parsing."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    chunk = b"x" * (1024 * 1024)
+
+    async def oversized_invalid_json() -> AsyncIterator[bytes]:
+        yield b'{"type":"interrupt","padding":"'
+        for _ in range(11):
+            yield chunk
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        content=oversized_invalid_json(),
+        headers={"content-type": "application/json"},
     )
     assert response.status_code == 400
     assert "10 MiB" in response.text

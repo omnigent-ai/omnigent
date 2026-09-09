@@ -860,8 +860,8 @@ Content-Type: application/json
   }
 }
 
-The request may also be a top-level JSON array of 1-100 events, with an
-encoded-body limit of 10 MiB:
+The encoded request-body limit is 10 MiB. The request may also be a top-level
+JSON array of 1-100 events:
 
 [
   {"type": "external_conversation_item", "data": {"source_id": "record-1", ...}},

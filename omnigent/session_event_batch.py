@@ -8,7 +8,7 @@ from typing import Any
 
 # Limit the encoded JSON request body itself, not just the sum of event text.
 # The count bound also keeps validation and dispatch work predictable.
-MAX_SESSION_EVENT_BATCH_BYTES = 10 * 1024 * 1024
+MAX_SESSION_EVENT_REQUEST_BYTES = 10 * 1024 * 1024
 MAX_SESSION_EVENT_BATCH_EVENTS = 100
 
 
