@@ -633,6 +633,23 @@ class SlackOmnigentService:
         except Exception:
             self._logger.warning("Failed to deliver re-login prompt thread=%s", turn.key.display())
 
+    async def _discard_unlaunched_session(
+        self, omnigent: OmnigentClient, session_id: str, turn: SlackTurn
+    ) -> None:
+        """Best-effort delete of a session whose runner launch failed.
+
+        A delete failure is logged and swallowed: the user's launch-failure
+        message must still be delivered.
+        """
+        try:
+            await omnigent.delete_session(session_id)
+        except Exception:
+            self._logger.warning(
+                "Failed to delete unlaunched session session_id=%s thread=%s",
+                session_id,
+                turn.key.display(),
+            )
+
     async def _ensure_session(self, turn: SlackTurn, omnigent: OmnigentClient) -> str | None:
         """Return the session id for this turn, creating one if needed.
 
@@ -670,9 +687,17 @@ class SlackOmnigentService:
                     session_id,
                 )
             else:
-                runner_id = await omnigent.launch_runner(
-                    session_id, workspace=turn.workspace or "", host_id=turn.host_id
-                )
+                try:
+                    runner_id = await omnigent.launch_runner(
+                        session_id, workspace=turn.workspace or "", host_id=turn.host_id
+                    )
+                except Exception:
+                    # The binding write below never runs when the launch fails,
+                    # so nothing could find this session again — delete it
+                    # rather than strand it on the server (a retry creates a
+                    # fresh one).
+                    await self._discard_unlaunched_session(omnigent, session_id, turn)
+                    raise
         except AuthRequiredError as exc:
             # Expired/lost token: DM a re-login button rather than a plain notice.
             self._logger.info(
