@@ -356,13 +356,22 @@ def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -
     config_path = codex_home / "config.toml"
     _materialize_config_symlink(config_path)
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    pin_line = f"model_reasoning_effort = {json.dumps(clamp_effort_for_model(effort, model))}"
+    clamped = clamp_effort_for_model(effort, model) or effort
+    pin_line = f"model_reasoning_effort = {json.dumps(clamped)}"
     lines = existing.splitlines()
     replaced = False
     for i, line in enumerate(lines):
         if line.startswith("["):
             break
-        if re.match(r"^model_reasoning_effort\s*=", line):
+        # Rewrite the value in place so the line's indentation and trailing
+        # comment survive, as the model pin's clamp does; a value the regex
+        # cannot parse (e.g. single-quoted) is replaced wholesale.
+        effort_match = _EFFORT_KEY_RE.match(line)
+        if effort_match:
+            lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
+            replaced = True
+            break
+        if re.match(r"^\s*model_reasoning_effort\s*=", line):
             lines[i] = pin_line
             replaced = True
             break

@@ -2204,6 +2204,38 @@ class TestPinCodexConfigEffort:
         assert 'model_reasoning_effort = "table-scoped-stays"' in lines
         assert "medium" not in "\n".join(lines)
 
+    @pytest.mark.parametrize(
+        ("existing", "expected"),
+        [
+            (
+                '  model_reasoning_effort = "medium"  # user default',
+                '  model_reasoning_effort = "ultra"  # user default',
+            ),
+            ("model_reasoning_effort = 'medium'", 'model_reasoning_effort = "ultra"'),
+        ],
+        ids=["indented-with-comment", "single-quoted"],
+    )
+    def test_rewrites_the_existing_line_in_place(
+        self, tmp_path: Path, existing: str, expected: str
+    ) -> None:
+        """An indented key keeps its indent and comment; an unparsable value is replaced whole.
+
+        Missing the indented spelling would insert a second top-level key, which
+        codex rejects as invalid TOML — the same regex the model pin uses to clamp
+        this line already tolerates it.
+        """
+        from omnigent.harnesses.codex_native.app_server import _pin_codex_config_effort
+
+        config = tmp_path / "config.toml"
+        config.write_text(f"{existing}\n[profiles.default]\nx = 1\n", encoding="utf-8")
+        _pin_codex_config_effort(tmp_path, "ultra", "gpt-5.6-sol")
+        lines = config.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == expected
+        assert sum("model_reasoning_effort" in line for line in lines) == 1
+        assert (
+            tomllib.loads(config.read_text(encoding="utf-8"))["model_reasoning_effort"] == "ultra"
+        )
+
     def test_inserts_effort_when_absent(self, tmp_path: Path) -> None:
         """A config with no top-level effort gains one before the first table."""
         from omnigent.harnesses.codex_native.app_server import _pin_codex_config_effort
