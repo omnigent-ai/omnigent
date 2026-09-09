@@ -218,4 +218,33 @@ describe("copyTextWithImage", () => {
 
     expect(writeText).toHaveBeenCalledWith("fallback text");
   });
+
+  it("rejects rather than blanking the clipboard when there is no text and ClipboardItem is unavailable", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    // ClipboardItem is left unstubbed — undefined in this environment.
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    await expect(copyTextWithImage("", vi.fn())).rejects.toThrow();
+
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it("rejects rather than blanking the clipboard when there is no text and clipboard.write rejects", async () => {
+    const write = vi.fn().mockRejectedValue(new Error("denied"));
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("ClipboardItem", StubClipboardItem);
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: { write, writeText },
+    });
+
+    await expect(
+      copyTextWithImage("", () => Promise.resolve(new Blob([], { type: "image/png" }))),
+    ).rejects.toThrow("denied");
+
+    expect(writeText).not.toHaveBeenCalled();
+  });
 });

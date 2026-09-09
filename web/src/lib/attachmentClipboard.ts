@@ -4,7 +4,7 @@
 
 import { dataUrlToFile } from "./designModePrompt";
 import { authenticatedFetch } from "./identity";
-import { imagePreview, type MessageContentBlock } from "./blocks";
+import { imagePreview, type ImageContentBlock, type MessageContentBlock } from "./blocks";
 
 /** Web file-content path for an uploaded session attachment. */
 export function sessionFileContentPath(sessionId: string, fileId: string): string {
@@ -40,30 +40,29 @@ function uploadedLoader(sessionId: string, fileId: string): () => Promise<Blob> 
 }
 
 /**
- * Loader for the first copyable image in `content`, or `null` when none of
- * its `input_image` blocks can be loaded.
+ * Loader for the message's first image, or `null` when that image can't be
+ * loaded.
  *
- * Walks blocks in order and classifies each with `imagePreview`: an
- * `uploaded` block needs `sessionId` to build its fetch path, an `inline`
- * block decodes straight from its data URI, and `pending` / `unavailable`
- * blocks are skipped in favor of a later image.
+ * Strictly the FIRST `input_image` block — never a later one. Copying a
+ * "first image" that turns out to be the second one (because the real first
+ * image was still uploading, or uploaded with no `sessionId` to fetch it, or
+ * inline but undecodable) would hand the user a different image than the one
+ * they meant to copy, with nothing telling them it was swapped. An
+ * unresolvable first image falls back to a text-only copy instead.
  */
 export function firstImageLoader(
   content: MessageContentBlock[],
   sessionId: string | null,
 ): (() => Promise<Blob>) | null {
-  for (const block of content) {
-    if (block.type !== "input_image") continue;
-    const preview = imagePreview(block);
-    if (preview.kind === "uploaded") {
-      if (!sessionId) continue;
-      return uploadedLoader(sessionId, preview.fileId);
-    }
-    if (preview.kind === "inline") {
-      const file = dataUrlToFile(preview.src, preview.alt);
-      if (!file) continue;
-      return () => toPngBlob(file);
-    }
+  const block = content.find((c): c is ImageContentBlock => c.type === "input_image");
+  if (!block) return null;
+  const preview = imagePreview(block);
+  if (preview.kind === "uploaded") {
+    return sessionId ? uploadedLoader(sessionId, preview.fileId) : null;
+  }
+  if (preview.kind === "inline") {
+    const file = dataUrlToFile(preview.src, preview.alt);
+    return file ? () => toPngBlob(file) : null;
   }
   return null;
 }

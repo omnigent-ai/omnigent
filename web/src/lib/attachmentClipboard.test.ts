@@ -95,6 +95,35 @@ describe("firstImageLoader", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
+  it("returns null when the first image has no session id, even though the second would resolve", () => {
+    // Strict first-image semantics: a resolvable second image must never be
+    // substituted for an unresolvable first one — that would silently copy a
+    // different image than the one the user meant to copy.
+    const loader = firstImageLoader(
+      [
+        { type: "input_image", file_id: "file_1", filename: "first.png" },
+        { type: "input_image", image_url: INLINE_PNG, filename: "second.png" },
+      ],
+      null,
+    );
+
+    expect(loader).toBeNull();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("returns null when the first image is still pending, even though the second would resolve", () => {
+    const loader = firstImageLoader(
+      [
+        { type: "input_image", file_id: "pending:first.png" },
+        { type: "input_image", image_url: INLINE_PNG, filename: "second.png" },
+      ],
+      "conv_1",
+    );
+
+    expect(loader).toBeNull();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
   it("rejects a non-PNG blob when there is no OffscreenCanvas to transcode with", async () => {
     // jsdom has neither createImageBitmap nor OffscreenCanvas, so the
     // transcode path itself is only reachable in a real browser (the e2e
