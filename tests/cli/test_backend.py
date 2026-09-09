@@ -489,6 +489,7 @@ def test_ensure_host_daemon_reuses_equivalent_host_identity(
         host_id="329c39d03aad39ccf2f8597d596676bd",
         config_sig=cli.server_config_signature(),
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "_load_existing_host_id", lambda: configured_host_id)
     torn_down: list[str] = []
@@ -627,6 +628,7 @@ def test_concurrent_ensure_host_daemon_elects_one_daemon(
     monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
     live_pids: set[int] = set()
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid in live_pids)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
 
     both_spawned = threading.Barrier(2)
     spawn_count = 0

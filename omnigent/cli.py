@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
 
 import click
+import psutil
 import yaml
 from pydantic import BaseModel, ConfigDict
 from rich import box
@@ -3127,17 +3128,15 @@ def _foreground_daemon_record(
     )
 
 
-_DAEMON_PID_START_TOLERANCE_S = 2.0
+_DAEMON_PID_START_TOLERANCE_S = 5.0
 
 
 def _describe_pid(pid: int) -> str:
     """Name what actually holds *pid* — user and command — for error copy.
 
-    Best-effort: any psutil failure degrades to the bare pid (#5095).
+    Best-effort: any psutil failure degrades to the bare pid.
     """
     try:
-        import psutil
-
         proc = psutil.Process(pid)
         user = proc.username()
         name = proc.name()
@@ -3147,28 +3146,30 @@ def _describe_pid(pid: int) -> str:
 
 
 def _pid_is_recorded_daemon(record: _HostDaemonRecord) -> bool:
-    """Whether *record*'s pid still names OUR daemon, not a recycled pid.
+    """Whether *record*'s pid still names the recorded daemon, not a recycled pid.
 
-    A bare existence check trusts the pid after a reboot: the kernel recycles
-    low pids, and a fresh system daemon can hold the recorded pid forever —
-    the host then refuses to start and ``host stop`` EPERMs trying to kill a
-    root process (#5095). The record's own ``started_at`` is the identity:
-    the pid counts as ours only when the process holding it was created at
-    (within a small tolerance of) the recorded start time. When the creation
-    time cannot be read (access denied), fall back to alive-only — the
-    terminate path's PermissionError handling still catches that case.
+    A bare existence check keeps trusting the pid after a reboot: the kernel
+    recycles low pids, and a fresh system daemon can then hold the recorded
+    pid forever — the host refuses to start and ``host stop`` tries to signal
+    an unrelated process. The record's own ``started_at`` is the identity: a
+    process created *after* the record's start time (beyond a small clock
+    tolerance) cannot be the daemon that wrote it. The check is one-sided on
+    purpose — a daemon always exists before it writes its record, so a
+    creation time *earlier* than ``started_at`` (even by minutes of slow
+    startup or sign-in) is still ours. Legacy records without a start time,
+    and pids whose creation time can't be read, fall back to alive-only.
     """
     if not _pid_alive(record.pid):
         return False
+    if record.started_at <= 0:
+        return True
     try:
-        import psutil
-
         created = psutil.Process(record.pid).create_time()
     except psutil.NoSuchProcess:
         return False
-    except Exception:  # noqa: BLE001 — unreadable create time: alive-only
+    except Exception:  # noqa: BLE001 — unreadable creation time: alive-only
         return True
-    return abs(created - record.started_at) <= _DAEMON_PID_START_TOLERANCE_S
+    return created <= record.started_at + _DAEMON_PID_START_TOLERANCE_S
 
 
 def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None:
@@ -3187,6 +3188,12 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
             return existing
         # Dead, or alive but not our daemon (pid recycled after a reboot):
         # the record is stale, not a conflict — prune it and start normally.
+        if _pid_alive(existing.pid):
+            click.echo(
+                f"Removing stale daemon record for {_host_display_url(existing.target)!r}: "
+                f"{_describe_pid(existing.pid)} is not this daemon (pid recycled).",
+                err=True,
+            )
         _delete_daemon_record(existing)
     if record.mode == "server" and record.server_url is not None:
         local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
@@ -9224,7 +9231,7 @@ def _base_daemon_status_payload(record: _HostDaemonRecord) -> _HostPayload:
         "mode": record.mode,
         "server_url": base_url,
         "pid": record.pid,
-        "process": "online" if _pid_alive(record.pid) else "offline",
+        "process": "online" if _pid_is_recorded_daemon(record) else "offline",
         "log_path": record.log_path,
         "host_id": host_id,
         "host_status": None,
@@ -9962,15 +9969,13 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     :raises click.ClickException: If the process stays alive.
     """
     if not _pid_is_recorded_daemon(record):
+        # Dead, or alive with a recycled pid (often another user's system
+        # daemon) — never signal it; the record is stale, so drop it.
         if _pid_alive(record.pid):
-            # Alive but not ours — a recycled pid (often another user's
-            # system daemon). Discard the stale record instead of refusing
-            # to start / crashing on stop (#5095).
-            _delete_daemon_record(record)
-            raise click.ClickException(
-                f"Daemon record for {record.target!r} was stale — "
-                f"{_describe_pid(record.pid)} is not an omnigent daemon. "
-                "Record removed; rerun the command."
+            click.echo(
+                f"Skipping stale daemon record for {_host_display_url(record.target)!r}: "
+                f"{_describe_pid(record.pid)} is not this daemon (pid recycled).",
+                err=True,
             )
         _delete_daemon_record(record)
         return
