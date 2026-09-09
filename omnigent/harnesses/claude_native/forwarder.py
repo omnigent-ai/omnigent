@@ -20,6 +20,7 @@ import httpx
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    OBSERVER_HOOK_STDERR_FILE,
     ClaudeHookRecord,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
@@ -63,6 +64,7 @@ _SUBAGENT_STATE_FILE = "subagent_forwarder.json"
 _DELTA_STATE_FILE = "message_deltas_forwarder.json"
 _COMPACTION_STATE_FILE = "compaction_forwarder.json"
 _HOOKS_FILE = "hooks.jsonl"
+_INVOCATION_SETTINGS_FILE = "claude-settings.json"
 
 # Keep child-history requests below the server's 10 MiB API ceiling to bound
 # per-request latency and retry cost while still accommodating large events.
@@ -105,6 +107,8 @@ def _subagent_id_from_meta_path(meta_path: Path) -> str:
 
 
 _DEFAULT_POLL_INTERVAL_S = 0.25
+_TRANSCRIPT_DISCOVERY_WARNING_S = 30.0
+_OBSERVER_HOOK_STDERR_READ_BYTES = 64 * 1024
 # Minimum spacing between permission-mode pane reads. Unlike the model mirror
 # (which reads a JSON file), this spawns a ``tmux capture-pane`` subprocess, so
 # it runs well below the poll interval; a mode switch is a human action and 2s
@@ -173,6 +177,106 @@ _HOOK_EVENT_TO_STATUS: dict[str, str] = {
 }
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _TranscriptDiscoveryDiagnostics:
+    """One-shot logging state while waiting for Claude's transcript path."""
+
+    started_at: float
+    warning_logged: bool = False
+    discovery_logged: bool = False
+
+
+def _diagnostic_file_size(path: Path) -> int | None:
+    """Return a diagnostic file's size, or ``None`` when it is unavailable."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _last_observer_hook_name(bridge_dir: Path) -> str | None:
+    """Return the last recorded observer hook name for diagnostics."""
+    try:
+        state = json.loads((bridge_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = state.get("last_hook_event_name") if isinstance(state, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _observe_transcript_discovery(
+    *,
+    bridge_dir: Path,
+    session_id: str,
+    transcript_path: Path | None,
+    diagnostics: _TranscriptDiscoveryDiagnostics,
+    now: float | None = None,
+) -> None:
+    """Log transcript discovery, or one actionable error when it never occurs."""
+    elapsed_s = (time.monotonic() if now is None else now) - diagnostics.started_at
+    if transcript_path is not None:
+        if not diagnostics.discovery_logged:
+            _logger.info(
+                "Claude transcript path discovered; forwarding can start after %.1fs; session=%s",
+                max(0.0, elapsed_s),
+                session_id,
+                extra={"session_id": session_id},
+            )
+            diagnostics.discovery_logged = True
+        return
+    if diagnostics.warning_logged or elapsed_s < _TRANSCRIPT_DISCOVERY_WARNING_S:
+        return
+
+    hooks_size = _diagnostic_file_size(bridge_dir / _HOOKS_FILE)
+    stderr_size = _diagnostic_file_size(bridge_dir / OBSERVER_HOOK_STDERR_FILE)
+    settings_present = (bridge_dir / _INVOCATION_SETTINGS_FILE).is_file()
+    _logger.error(
+        "Claude transcript forwarding has not started: no observer hook reported a "
+        "transcript path after %.0fs; session=%s last_hook=%s hooks_bytes=%s "
+        "observer_stderr_bytes=%s hook_settings=%s",
+        max(0.0, elapsed_s),
+        session_id,
+        _last_observer_hook_name(bridge_dir) or "none",
+        hooks_size if hooks_size is not None else "missing",
+        stderr_size if stderr_size is not None else "missing",
+        "present" if settings_present else "missing",
+        extra={"session_id": session_id},
+    )
+    diagnostics.warning_logged = True
+
+
+def _log_new_observer_hook_stderr(
+    *,
+    bridge_dir: Path,
+    session_id: str,
+    byte_offset: int,
+) -> int:
+    """Relay newly captured observer-hook stderr into session-scoped runner logs."""
+    path = bridge_dir / OBSERVER_HOOK_STDERR_FILE
+    try:
+        size = path.stat().st_size
+        if size < byte_offset:
+            byte_offset = 0
+        if size == byte_offset:
+            return byte_offset
+        with path.open("rb") as handle:
+            handle.seek(byte_offset)
+            raw = handle.read(_OBSERVER_HOOK_STDERR_READ_BYTES)
+            new_offset = handle.tell()
+    except OSError:
+        return byte_offset
+
+    output = raw.decode("utf-8", errors="replace").strip()
+    if output:
+        _logger.error(
+            "Claude observer hook wrote to stderr; session=%s stderr=%s",
+            session_id,
+            output,
+            extra={"session_id": session_id},
+        )
+    return new_offset
 
 
 @dataclass
@@ -949,6 +1053,8 @@ async def forward_claude_transcript_to_session(
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
     subagent_task: asyncio.Task[SubagentForwardState] | None = None
+    observer_stderr_offset = 0
+    transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
@@ -976,6 +1082,11 @@ async def forward_claude_transcript_to_session(
                     subagent_task = None
                 async with _forward_progress_timeout(client, _FORWARD_LOOP_STALL_DEADLINE_S):
                     current_session_id = read_active_session_id(bridge_dir) or session_id
+                    observer_stderr_offset = _log_new_observer_hook_stderr(
+                        bridge_dir=bridge_dir,
+                        session_id=current_session_id,
+                        byte_offset=observer_stderr_offset,
+                    )
                     if hook_state is None:
                         hook_state = await _ensure_hook_state(
                             bridge_dir,
@@ -1028,6 +1139,9 @@ async def forward_claude_transcript_to_session(
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
+                        transcript_diagnostics = _TranscriptDiscoveryDiagnostics(
+                            started_at=time.monotonic()
+                        )
                         # A rotated session is a fresh dedupe context — reseed
                         # so the new session's first model observation doesn't
                         # post against the prior session's baseline.
@@ -1068,6 +1182,9 @@ async def forward_claude_transcript_to_session(
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
+                        transcript_diagnostics = _TranscriptDiscoveryDiagnostics(
+                            started_at=time.monotonic()
+                        )
                         # A rotated session is a fresh dedupe context — reseed
                         # so the new session's first model observation doesn't
                         # post against the prior session's baseline.
@@ -1088,6 +1205,12 @@ async def forward_claude_transcript_to_session(
                     # context.json (one stat when nothing changed).
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
                     transcript_path = read_transcript_path(bridge_dir)
+                    _observe_transcript_discovery(
+                        bridge_dir=bridge_dir,
+                        session_id=current_session_id,
+                        transcript_path=transcript_path,
+                        diagnostics=transcript_diagnostics,
+                    )
                     if transcript_path is not None:
                         state = await _ensure_state_for_transcript(
                             bridge_dir=bridge_dir,

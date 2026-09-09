@@ -269,6 +269,100 @@ async def _wait_for_json_state(
     raise AssertionError(f"{path} did not reach expected state; last={last_payload!r}")
 
 
+def test_observer_hook_stderr_is_logged_incrementally(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hook process errors reach the session-scoped runner log exactly once."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    stderr_path = bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE
+    stderr_path.write_text("ModuleNotFoundError: No module named 'omnigent'\n", encoding="utf-8")
+    caplog.set_level(logging.ERROR, logger=forwarder.__name__)
+
+    offset = forwarder._log_new_observer_hook_stderr(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        byte_offset=0,
+    )
+    assert offset == stderr_path.stat().st_size
+    assert "No module named 'omnigent'" in caplog.text
+    assert caplog.records[-1].session_id == "conv_abc"
+
+    with stderr_path.open("a", encoding="utf-8") as handle:
+        handle.write("PermissionError: bridge directory is not writable\n")
+    offset = forwarder._log_new_observer_hook_stderr(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        byte_offset=offset,
+    )
+    assert offset == stderr_path.stat().st_size
+    assert caplog.text.count("No module named 'omnigent'") == 1
+    assert caplog.text.count("bridge directory is not writable") == 1
+
+    record_count = len(caplog.records)
+    assert (
+        forwarder._log_new_observer_hook_stderr(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            byte_offset=offset,
+        )
+        == offset
+    )
+    assert len(caplog.records) == record_count
+
+
+def test_missing_transcript_logs_actionable_snapshot_once(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A silent observer failure becomes a bounded, session-scoped error."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=100.0)
+    warning_at = diagnostics.started_at + forwarder._TRANSCRIPT_DISCOVERY_WARNING_S
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+
+    forwarder._observe_transcript_discovery(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        transcript_path=None,
+        diagnostics=diagnostics,
+        now=warning_at - 0.1,
+    )
+    assert "has not started" not in caplog.text
+
+    for now in (warning_at, warning_at + 30.0):
+        forwarder._observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            transcript_path=None,
+            diagnostics=diagnostics,
+            now=now,
+        )
+
+    failures = [record for record in caplog.records if "has not started" in record.getMessage()]
+    assert len(failures) == 1
+    assert failures[0].session_id == "conv_abc"
+    assert "last_hook=UserPromptSubmit" in failures[0].getMessage()
+    assert "observer_stderr_bytes=missing" in failures[0].getMessage()
+    assert "hook_settings=present" in failures[0].getMessage()
+
+    transcript_path = tmp_path / "claude-session.jsonl"
+    for now in (warning_at + 31.0, warning_at + 32.0):
+        forwarder._observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            transcript_path=transcript_path,
+            diagnostics=diagnostics,
+            now=now,
+        )
+    discoveries = [record for record in caplog.records if "path discovered" in record.getMessage()]
+    assert len(discoveries) == 1
+
+
 @pytest.mark.asyncio
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
