@@ -47,7 +47,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypedDict
@@ -121,6 +121,11 @@ class _CursorAgent(Protocol):
 _DEFAULT_CURSOR_MODEL = "auto-smart"
 _LEGACY_AUTO_MODEL = "auto"
 
+
+class UnresolvableCursorModelError(ValueError):
+    """A requested model id cannot be resolved to a Cursor model id."""
+
+
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
 # instead of blocking the SDK's daemon callback thread forever.
@@ -156,6 +161,80 @@ def _resolve_model(model: str | None) -> str:
     if model == _LEGACY_AUTO_MODEL:
         return _DEFAULT_CURSOR_MODEL
     return model
+
+
+async def _resolve_model_against_catalog(
+    client: object, requested: str, api_key: str | None
+) -> str:
+    """Resolve *requested* against the account's live model catalog.
+
+    The Cursor backend rejects unknown ids with an opaque ``invalid_argument``
+    error that kills the user's turn, so before dispatch the requested string
+    is checked against ``AsyncClient.list_models()`` — the account's own
+    catalog (the same listing the backend's error message points at):
+
+    - an id the catalog serves (case-insensitive) dispatches as that id;
+    - a display label matching exactly one catalog entry ("Composer" →
+      ``composer-2.5``) is mapped to its id, with a WARNING so the
+      substitution is observable;
+    - anything else raises :class:`UnresolvableCursorModelError` naming the
+      available ids — loud and actionable, instead of the backend's opaque
+      turn-killing failure.
+
+    The default auto-select is never validated (blocking it would break every
+    unpinned session), and an unavailable/failing listing degrades to
+    dispatching *requested* unverified with a WARNING (the backend still
+    validates) rather than blocking all turns.
+    """
+    if requested == _DEFAULT_CURSOR_MODEL:
+        return requested
+    list_models = getattr(client, "list_models", None)
+    if not callable(list_models):
+        logger.warning(
+            "CursorExecutor: SDK client exposes no list_models(); dispatching %r unverified.",
+            requested,
+        )
+        return requested
+    try:
+        listing = list_models(api_key=api_key)
+        raw = await listing if isinstance(listing, Awaitable) else listing
+        catalog: list[object] = list(raw) if isinstance(raw, Iterable) else []
+    except Exception:  # noqa: BLE001 — any listing failure degrades to backend-side validation
+        logger.warning(
+            "CursorExecutor: model listing failed; dispatching %r unverified.",
+            requested,
+            exc_info=True,
+        )
+        return requested
+    requested_cf = requested.casefold()
+    ids = [mid for entry in catalog if (mid := str(getattr(entry, "id", "") or ""))]
+    for mid in ids:
+        if mid.casefold() == requested_cf:
+            return mid
+    # Display-label mapping: the model switcher can persist the human label
+    # ("Composer") instead of the id. Map it when it names exactly one entry.
+    label_matches = sorted(
+        {
+            mid
+            for entry in catalog
+            if (mid := str(getattr(entry, "id", "") or ""))
+            and (name_cf := str(getattr(entry, "display_name", "") or "").casefold())
+            and (name_cf == requested_cf or name_cf.startswith(requested_cf + " "))
+        }
+    )
+    if len(label_matches) == 1:
+        logger.warning(
+            "CursorExecutor: resolved display label %r to model id %r.",
+            requested,
+            label_matches[0],
+        )
+        return label_matches[0]
+    ambiguous = f" (ambiguous label: matches {', '.join(label_matches)})" if label_matches else ""
+    raise UnresolvableCursorModelError(
+        f"{requested!r} is not a model id this Cursor account serves{ambiguous}. "
+        f"Available models: {', '.join(sorted(ids))}. Pick a model from the "
+        "model picker (or `cursor-agent models`)."
+    )
 
 
 def _first_of(data: Mapping[str, object], *keys: str, default: int = 0) -> int:
@@ -523,6 +602,10 @@ class _CursorSessionState:
     client: object | None = None  # cursor_sdk.AsyncClient
     agent: _CursorAgent | None = None  # cursor_sdk.AsyncAgent
     system_prompt: str | None = None
+    # The model string the turn requested (possibly a display label) and the
+    # catalog-resolved id actually dispatched; a next turn naming either one
+    # reuses the live agent instead of recreating it.
+    requested_model: str | None = None
     model: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
@@ -790,6 +873,11 @@ class CursorExecutor(Executor):
         async with _bridge_spawn_in_cwd(cwd):
             client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
+            # Validate/resolve the model against the account catalog BEFORE
+            # agent creation, so an unresolvable id (display label, typo)
+            # fails with an actionable error instead of the backend's opaque
+            # invalid_argument that would kill the turn.
+            model = await _resolve_model_against_catalog(client, model, self._api_key)
             local_kwargs: _JsonObject = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
@@ -816,6 +904,9 @@ class CursorExecutor(Executor):
             raise
         state.client = client
         state.agent = agent
+        # Persist the catalog-resolved id (not the requested label) so usage
+        # attribution and the next-turn reuse check see the real model.
+        state.model = model
 
     async def run_turn(
         self,
@@ -834,7 +925,7 @@ class CursorExecutor(Executor):
         # set would leave the initial custom_tools stale for the conversation).
         if state.agent is not None and (
             state.system_prompt != system_prompt
-            or state.model != model
+            or model not in (state.requested_model, state.model)
             or state.tools_fingerprint != tools_fp
         ):
             await self._close_state(state)
@@ -842,15 +933,30 @@ class CursorExecutor(Executor):
             self._session_states[session_key] = state
         is_first_turn = not state.has_sent_prompt
         state.system_prompt = system_prompt
-        state.model = model
+        if state.agent is None:
+            # Record the requested string only at creation so a live agent
+            # keeps matching both the original label and the resolved id.
+            state.requested_model = model
         state.tools_fingerprint = tools_fp
 
         try:
             await self._ensure_session(state, model, tools)
+        except UnresolvableCursorModelError as exc:
+            # The requested model can't be resolved against the account
+            # catalog — a user-facing selection problem, not an agent-startup
+            # failure; surface the actionable message unwrapped.
+            await self.close_session(session_key)
+            yield ExecutorError(message=str(exc))
+            return
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
             await self.close_session(session_key)
             yield ExecutorError(message=f"Failed to start cursor-sdk agent: {exc}")
             return
+
+        # From here on use the catalog-resolved id (set by _ensure_session) so
+        # usage/cost attribution names the model actually dispatched, not a
+        # display label like "Composer".
+        model = state.model or model
 
         prompt = _build_cursor_prompt(
             messages, is_first_turn=is_first_turn, system_prompt=system_prompt
