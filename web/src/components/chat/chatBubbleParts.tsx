@@ -68,7 +68,8 @@ import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routing
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
-import { copyText } from "@/lib/clipboard";
+import { copyText, copyTextWithImage } from "@/lib/clipboard";
+import { firstImageLoader, sessionFileContentPath } from "@/lib/attachmentClipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { SessionStatus } from "@/lib/types";
@@ -545,10 +546,11 @@ export const BubbleView = memo(
 /**
  * Copy-to-clipboard handler for a message bubble's "Copy" action.
  *
- * @param getText - Produces the text to copy at click time.
+ * @param getContent - Produces the text (and, for a user bubble with an
+ *   attached image, a loader for that image) to copy at click time.
  * @returns `{ isCopied, handleCopy }` for the action button.
  */
-function useCopyMessage(getText: () => string): {
+function useCopyMessage(getContent: () => { text: string; image?: () => Promise<Blob> }): {
   isCopied: boolean;
   handleCopy: () => void;
 } {
@@ -560,9 +562,10 @@ function useCopyMessage(getText: () => string): {
 
   const handleCopy = useCallback(() => {
     if (isCopied) return;
-    const text = getText();
-    if (!text) return;
-    copyText(text).then(
+    const { text, image } = getContent();
+    if (!text && !image) return;
+    const copied = image ? copyTextWithImage(text, image) : copyText(text);
+    copied.then(
       () => {
         setIsCopied(true);
         window.clearTimeout(timeoutRef.current);
@@ -575,7 +578,7 @@ function useCopyMessage(getText: () => string): {
         console.warn("Failed to copy message", error);
       },
     );
-  }, [getText, isCopied, isMobile]);
+  }, [getContent, isCopied, isMobile]);
 
   return { isCopied, handleCopy };
 }
@@ -610,7 +613,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const mentionedChips = extractAttachedPaths(bubble.content);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
-  const { isCopied, handleCopy } = useCopyMessage(() => text);
+  // The first attached image the clipboard can actually pull bytes from, so a
+  // copied prompt with a screenshot can paste back in full. Resolved once per
+  // render (not lazily inside the copy handler) so the render gates below and
+  // the click-time copy agree on whether one exists.
+  const imageLoader = firstImageLoader(bubble.content, sessionId);
+  const hasCopyableImage = imageLoader !== null;
+  const { isCopied, handleCopy } = useCopyMessage(() => ({
+    text,
+    image: imageLoader ?? undefined,
+  }));
   const ts = formatBubbleTimestamp(bubble.createdAtS);
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
@@ -675,9 +687,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                       <SessionImage
                         key={key}
                         path={
-                          sessionId
-                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(preview.fileId)}/content`
-                            : undefined
+                          sessionId ? sessionFileContentPath(sessionId, preview.fileId) : undefined
                         }
                         alt={preview.alt}
                         // Sizing lives in SessionImage, which reserves a matching
@@ -745,7 +755,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         </div>
         {/* Skip an empty row when there is neither a timestamp nor a copy
             action. 40%-visible on touch, hover/focus-reveal on desktop. */}
-        {(ts || text) && (
+        {(ts || text || hasCopyableImage) && (
           <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {ts && (
               <span
@@ -755,7 +765,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 {ts}
               </span>
             )}
-            {text && (
+            {(text || hasCopyableImage) && (
               <MessageActions>
                 <MessageAction
                   tooltip="Copy"
@@ -796,7 +806,9 @@ function AssistantBubble({
     s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
   );
   // Getter computes the markdown lazily at click time.
-  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
+  const { isCopied, handleCopy } = useCopyMessage(() => ({
+    text: collectBubbleMarkdown(bubble.items),
+  }));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
   const handleRetryError = useCallback(async () => {

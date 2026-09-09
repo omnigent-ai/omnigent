@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { copyText } from "./clipboard";
+import { copyText, copyTextWithImage } from "./clipboard";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -117,5 +117,105 @@ describe("copyText", () => {
 
     expect(writeText).toHaveBeenCalledWith("fallback text");
     expect(document.execCommand).toHaveBeenCalledWith("copy");
+  });
+});
+
+/** Records what it was constructed with, mirroring the real ClipboardItem
+ *  enough for these tests: a `types` list and the raw per-type data. */
+class StubClipboardItem {
+  types: string[];
+  data: Record<string, Blob | PromiseLike<Blob>>;
+  constructor(data: Record<string, Blob | PromiseLike<Blob>>) {
+    this.data = data;
+    this.types = Object.keys(data);
+  }
+}
+
+describe("copyTextWithImage", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("writes one item with both types, calling write before the image settles", async () => {
+    let resolveImage!: (blob: Blob) => void;
+    const loadImage = vi.fn(
+      () =>
+        new Promise<Blob>((resolve) => {
+          resolveImage = resolve;
+        }),
+    );
+    const written: StubClipboardItem[] = [];
+    const write = vi.fn((items: StubClipboardItem[]) => {
+      written.push(...items);
+      return Promise.resolve();
+    });
+    vi.stubGlobal("ClipboardItem", StubClipboardItem);
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: { write },
+    });
+
+    const result = copyTextWithImage("a screenshot", loadImage);
+
+    // The write must already have happened — proving it ran synchronously,
+    // not after the image promise resolved.
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(written).toHaveLength(1);
+    expect(written[0]!.types).toEqual(["text/plain", "image/png"]);
+
+    resolveImage(new Blob([], { type: "image/png" }));
+    await expect(result).resolves.toBeUndefined();
+    const image = await written[0]!.data["image/png"];
+    expect(image?.type).toBe("image/png");
+  });
+
+  it("omits text/plain when there is no text", async () => {
+    const written: StubClipboardItem[] = [];
+    const write = vi.fn((items: StubClipboardItem[]) => {
+      written.push(...items);
+      return Promise.resolve();
+    });
+    vi.stubGlobal("ClipboardItem", StubClipboardItem);
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: { write },
+    });
+
+    await expect(
+      copyTextWithImage("", () => Promise.resolve(new Blob([], { type: "image/png" }))),
+    ).resolves.toBeUndefined();
+
+    expect(written[0]!.types).toEqual(["image/png"]);
+  });
+
+  it("falls back to writeText when ClipboardItem is unavailable", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const write = vi.fn();
+    // ClipboardItem is left unstubbed — undefined in this environment.
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: { write, writeText },
+    });
+
+    await expect(copyTextWithImage("fallback text", vi.fn())).resolves.toBeUndefined();
+
+    expect(writeText).toHaveBeenCalledWith("fallback text");
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("falls back to writeText when clipboard.write rejects", async () => {
+    const write = vi.fn().mockRejectedValue(new Error("denied"));
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("ClipboardItem", StubClipboardItem);
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: { write, writeText },
+    });
+
+    await expect(
+      copyTextWithImage("fallback text", () => Promise.resolve(new Blob())),
+    ).resolves.toBeUndefined();
+
+    expect(writeText).toHaveBeenCalledWith("fallback text");
   });
 });

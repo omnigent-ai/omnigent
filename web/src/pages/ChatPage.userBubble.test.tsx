@@ -1,9 +1,19 @@
+import type * as ClipboardModule from "@/lib/clipboard";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { copyTextWithImage } from "@/lib/clipboard";
 import { BubbleView } from "./ChatPage";
+
+// Only copyTextWithImage is replaced — the plain-text copy tests below drive
+// the real copyText, stubbing navigator/document instead.
+vi.mock("@/lib/clipboard", async (importOriginal) => {
+  const actual = await importOriginal<typeof ClipboardModule>();
+  return { ...actual, copyTextWithImage: vi.fn().mockResolvedValue(undefined) };
+});
 
 // UserBubble renders its text through the same markdown renderer as the
 // assistant bubble (FilePathAwareMessageResponse → Streamdown). These tests
@@ -353,6 +363,40 @@ describe("UserBubble copy button", () => {
       }),
     );
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+  });
+
+  const INLINE_PNG =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+  it("copies the bubble text and an inline image together", async () => {
+    const { container } = renderBubble(
+      userBubble("look at this", {
+        content: [
+          { type: "input_text", text: "look at this" },
+          { type: "input_image", image_url: INLINE_PNG, filename: "shot.png" },
+        ],
+      }),
+    );
+
+    const button = container.querySelector('[data-component-id="chat.message.copy_user"]');
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+
+    await waitFor(() => expect(copyTextWithImage).toHaveBeenCalledTimes(1));
+    const [text, image] = vi.mocked(copyTextWithImage).mock.calls[0]!;
+    expect(text).toBe("look at this");
+    expect(typeof image).toBe("function");
+  });
+
+  it("renders a copy button for an attachment-only message when the image is copyable", () => {
+    // The gate widens for an inline image specifically: unlike the "uploaded"
+    // case above, an inline data URI needs no session id to be copyable.
+    renderBubble(
+      userBubble("", {
+        content: [{ type: "input_image", image_url: INLINE_PNG, filename: "shot.png" }],
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
   });
 });
 
