@@ -961,9 +961,7 @@ def test_read_transcript_items_since_mirrors_thinking_as_reasoning(tmp_path: Pat
     assert reasoning.data == {
         "agent": "claude-native-ui",
         "summary": [],
-        "content": [
-            {"type": "reasoning_text", "text": "the user wants the token verbatim"}
-        ],
+        "content": [{"type": "reasoning_text", "text": "the user wants the token verbatim"}],
     }
     assert reasoning.source_id.endswith(":0:reasoning"), (
         "reasoning items need a stable per-block source id so forwarder retries dedup"
