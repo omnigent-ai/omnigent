@@ -1,4 +1,4 @@
-"""The mobile header's Chat/Terminal switcher must not paint mismatched shapes.
+"""The mobile header switcher layers must fit inside its glass pill.
 
 On a phone (iOS report; any ``max-md`` viewport) the header's right-hand control
 cluster is a fully-rounded "liquid glass" pill (``MOBILE_GLASS_PILL`` in
@@ -7,20 +7,17 @@ the Chat/Terminal switcher (``web/src/shell/ViewModeToggle.tsx``): a grey track
 (``bg-muted/60``) around two segments, whose active segment renders as a
 fully-circular 44px bubble on mobile (``max-md:size-11 max-md:rounded-full``).
 
-The track, however, keeps its desktop corner radius on every breakpoint
-(``rounded-[var(--radius-lg)]`` = 8px) while ``max-md:p-0`` sizes it flush to
-the 44px segments — so the user sees three nested, clashing shapes: a round
-pill, a squared grey highlight, and a circular "selected" bubble inside it.
+The track's 8px rounded rectangle should remain visually distinct from the
+outer capsule and selected circle, but its grey paint must be inset from the
+glass edge instead of poking out beneath either round end.
 
 This test drives the reported journey — open a terminal-first session at an
 iPhone-sized viewport under the iOS shell bridge, tap between Terminal and Chat
 in the header switcher — then measures the rendered geometry of the three
-layers and asserts the shape contract the report implies: **every layer of the
-mobile switcher stack that paints a visible background must render as a capsule
-(fully-rounded ends)**, like the glass pill around it and the selected bubble
-inside it. A fix that rounds the grey track on mobile passes; so does one that
-stops painting the squared track there. Today the track paints 8px corners on
-a 44px-tall box, so the test fails on exactly the reported mismatch.
+layers and asserts their separate roles: the glass pill and selected segment
+stay capsules, the track element itself is transparent, and a grey 8px-radius
+rounded rectangle paints 4px inside it. The switcher and expanded kebab also
+keep symmetric glass rims at the pill's outer edges.
 
 The journey/bridge scaffolding mirrors ``test_ios_switcher_in_header.py`` (the
 same terminal-first precondition and iOS WKWebView bridge stub), so the failure
@@ -38,6 +35,9 @@ from playwright.sync_api import Page, Route, ViewportSize, expect
 # iPhone-sized viewport (matches the report's surface and keeps the SPA in the
 # max-md mobile header layout, where the glass pill and 44px segments render).
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
+_TRACK_INSET_PX = 4
+_TRACK_RADIUS_PX = 8
+_GEOMETRY_TOLERANCE_PX = 1.5
 _MIN_GLASS_RIM_PX = 4
 _RIM_SYMMETRY_TOLERANCE_PX = 1.5
 
@@ -63,13 +63,9 @@ window.omnigentNative = {
 };
 """
 
-# Measures the three nested layers of the header switcher stack: the glass
-# pill (the switcher's parent cluster), the grey track (view-mode-toggle), and
-# the active segment (aria-pressed=true). For each, resolves the computed
-# corner radii to px, clamps to what the box can actually render (half its
-# smaller side — the browser's used value for oversized radii), and reports
-# whether the layer paints a visible background and whether it renders as a
-# capsule (effective radius reaching half its height, within 1.5px).
+# Measures the glass pill, transparent track element, inset ::before track
+# paint, and active segment. Pseudo-elements have no DOMRect, so their box is
+# derived from the track and computed inset values.
 _MEASURE_LAYERS_JS = """
 () => {
   const track = document.querySelector('[data-testid="view-mode-toggle"]');
@@ -78,9 +74,19 @@ _MEASURE_LAYERS_JS = """
   const active = track.querySelector('button[aria-pressed="true"]');
   if (!active) return { error: "no active segment (aria-pressed=true)" };
 
-  const describe = (name, el) => {
-    const cs = getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
+  const describe = (name, el, pseudo = null) => {
+    const cs = getComputedStyle(el, pseudo);
+    const hostRect = el.getBoundingClientRect();
+    const inset = pseudo ? {
+      top: parseFloat(cs.top),
+      right: parseFloat(cs.right),
+      bottom: parseFloat(cs.bottom),
+      left: parseFloat(cs.left),
+    } : null;
+    const rect = pseudo ? {
+      width: hostRect.width - inset.left - inset.right,
+      height: hostRect.height - inset.top - inset.bottom,
+    } : hostRect;
     const radii = [
       "borderTopLeftRadius",
       "borderTopRightRadius",
@@ -121,6 +127,8 @@ _MEASURE_LAYERS_JS = """
       capsuleRadius,
       background: bg,
       alpha,
+      inset,
+      zIndex: cs.zIndex,
       // The track's grey is subtle by design — bg-muted/60 resolves to
       // ~3.5%-alpha black — yet clearly visible over the glass pill (it is
       // the "squared grey highlight" in the report), so "painted" must
@@ -131,11 +139,12 @@ _MEASURE_LAYERS_JS = """
   };
 
   return {
-    layers: [
-      describe("glass pill (header cluster)", pill),
-      describe("switcher track (view-mode-toggle)", track),
-      describe("active segment", active),
-    ],
+    layers: {
+      pill: describe("glass pill (header cluster)", pill),
+      track: describe("switcher track element", track),
+      trackPaint: describe("inset grey track paint", track, "::before"),
+      active: describe("active segment", active),
+    },
   };
 }
 """
@@ -216,17 +225,17 @@ def _route_agent_terminal(page: Page, session_id: str) -> None:
     page.route(terminal_list, _serve)
 
 
-def test_mobile_header_switcher_layers_share_the_pill_shape(
+def test_mobile_header_switcher_layers_fit_inside_the_glass_pill(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Every painted layer of the mobile header switcher must be a capsule.
+    """The switcher's distinct shapes must nest cleanly inside the glass pill.
 
     Journey (the report's): open a terminal-first session on an iPhone-sized
     iOS shell, look at the header's Chat/Terminal switcher, tap Terminal and
     then Chat. The glass pill and the circular selected bubble render as
-    capsules; the grey track between them must too (or stop painting), else
-    the user sees a squared grey highlight sandwiched between round shapes.
+    capsules; the grey track remains an inset 8px rounded rectangle rather
+    than painting flush beneath either circular end.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
@@ -260,34 +269,37 @@ def test_mobile_header_switcher_layers_share_the_pill_shape(
     measured = page.evaluate(_MEASURE_LAYERS_JS)
     assert "error" not in measured, f"could not measure switcher layers: {measured}"
     layers = measured["layers"]
-    for layer in layers:
+    for layer in layers.values():
         print(
-            f"[pill-shapes] {layer['name']}: {layer['width']:.0f}x{layer['height']:.0f}px, "
+            f"[switcher-layers] {layer['name']}: "
+            f"{layer['width']:.0f}x{layer['height']:.0f}px, "
             f"declared radius {layer['declaredRadius']:.1f}px, effective "
             f"{layer['effectiveRadius']:.1f}px of capsule {layer['capsuleRadius']:.1f}px, "
             f"bg {layer['background']} (alpha {layer['alpha']:.2f}) -> "
             f"painted={layer['painted']} capsule={layer['capsule']}"
         )
 
-    painted = [layer for layer in layers if layer["painted"]]
-    # The stack must actually exercise the contract: the glass pill and the
-    # active bubble paint backgrounds on mobile, so a fix cannot pass this
-    # test by accidentally unstyling the whole header.
-    assert len(painted) >= 2, f"expected the switcher stack to paint layers, got: {layers}"
+    pill = layers["pill"]
+    track = layers["track"]
+    track_paint = layers["trackPaint"]
+    active = layers["active"]
 
-    squared = [layer for layer in painted if not layer["capsule"]]
-    assert not squared, (
-        "Mobile header Chat/Terminal switcher paints squared layer(s) inside "
-        "the round glass pill: "
-        + "; ".join(
-            f"{layer['name']} renders {layer['effectiveRadius']:.1f}px corners on a "
-            f"{layer['height']:.0f}px-tall box (capsule needs "
-            f"~{layer['capsuleRadius']:.1f}px)"
-            for layer in squared
-        )
-        + ". Every painted layer of the switcher must render as a capsule, "
-        "matching the pill around it and the selected bubble inside it."
+    assert pill["painted"] and pill["capsule"], f"glass pill lost its capsule: {pill}"
+    assert active["painted"] and active["capsule"], (
+        f"selected switcher segment lost its circle: {active}"
     )
+    assert not track["painted"], f"mobile track element must be transparent: {track}"
+    assert track_paint["painted"], f"inset grey track paint is missing: {track_paint}"
+    assert not track_paint["capsule"], (
+        f"grey track should remain an inset rounded rectangle: {track_paint}"
+    )
+    assert abs(track_paint["declaredRadius"] - _TRACK_RADIUS_PX) <= _GEOMETRY_TOLERANCE_PX, (
+        f"grey track lost the {_TRACK_RADIUS_PX}px design-token radius: {track_paint}"
+    )
+    for edge, inset in track_paint["inset"].items():
+        assert abs(inset - _TRACK_INSET_PX) <= _GEOMETRY_TOLERANCE_PX, (
+            f"grey track {edge} inset is not {_TRACK_INSET_PX}px: {track_paint}"
+        )
 
     # The expanded kebab paints its full 44px background, so it needs the same
     # visible glass rim as the switcher track at the opposite end.

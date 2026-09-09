@@ -34,14 +34,10 @@ export function ViewModeToggle() {
       // Lets the mobile header pill inset itself only when this segmented
       // track is present — see MOBILE_GLASS_PILL.
       data-slot="view-mode-toggle"
-      // Inset track: p-0.5 around two size-6 segments lands the control at
-      // 32px tall, matching the header's other controls. On mobile the
-      // segments grow to the 44px tap-target floor and the padding drops so
-      // the track matches the pill's other 44px controls instead of
-      // stretching it — and the flush track must be a capsule like those
-      // segments and the glass pill, or its grey paints squared corners
-      // between two round shapes.
-      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5 max-md:rounded-full max-md:p-0"
+      // Desktop uses an inset track around 24px segments. Mobile keeps 44px
+      // hitboxes but moves only the grey paint inward, so its rounded rectangle
+      // stays inside the glass pill without enlarging the control.
+      className="relative isolate flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5 max-md:bg-transparent max-md:p-0 max-md:before:pointer-events-none max-md:before:absolute max-md:before:inset-1 max-md:before:-z-10 max-md:before:rounded-[var(--radius-lg)] max-md:before:bg-muted/60"
     >
       <ViewModeSegment
         label="Chat view"
