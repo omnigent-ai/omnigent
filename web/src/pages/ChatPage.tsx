@@ -37,6 +37,7 @@ import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import { insertTextAtCaret } from "@/lib/composerPaste";
 import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
@@ -3397,10 +3398,23 @@ function ComposerImpl({
         if (file) pastedFiles.push(file);
       }
     }
-    if (pastedFiles.length > 0) {
-      e.preventDefault();
-      addFiles(pastedFiles);
+    if (pastedFiles.length === 0) return;
+    // A controlled textarea would otherwise re-render from setFiles below and
+    // overwrite a native insertion with the stale React value, so the paste
+    // is always intercepted and, when there's text alongside the files, is
+    // replayed onto the draft ourselves.
+    e.preventDefault();
+    const ta = e.currentTarget;
+    const text = e.clipboardData.getData("text/plain");
+    if (text) {
+      const { next, caret } = insertTextAtCaret(value, ta.selectionStart, ta.selectionEnd, text);
+      setValue(next);
+      dirtyRef.current = true;
+      queueMicrotask(() => {
+        ta.setSelectionRange(caret, caret);
+      });
     }
+    addFiles(pastedFiles);
   };
 
   return (
