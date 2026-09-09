@@ -13,10 +13,14 @@ import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as canvasSessions from "@/canvas/canvasSessions";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
-import { canvasLayoutStorageKey, readCanvasLayout } from "@/canvas/canvasStorage";
+import {
+  activeCanvasStorageKey,
+  canvasLayoutStorageKey,
+  readCanvasLayout,
+} from "@/canvas/canvasStorage";
 import { CanvasPage } from "./CanvasPage";
 
-const { flowProps, flowFitView, flowSetViewport, flowApi } = vi.hoisted(() => {
+const { flowProps, flowFitView, flowSetViewport, flowApi, viewerIdRef } = vi.hoisted(() => {
   const fitViewMock = vi.fn();
   const setViewportMock = vi.fn(async () => true);
   return {
@@ -30,6 +34,7 @@ const { flowProps, flowFitView, flowSetViewport, flowApi } = vi.hoisted(() => {
       zoomIn: vi.fn(),
       zoomOut: vi.fn(),
     },
+    viewerIdRef: { current: null as string | null },
   };
 });
 
@@ -71,6 +76,7 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useProjects: vi.fn(),
 }));
 vi.mock("@/canvas/canvasSessions", () => ({ useCanvasSessions: vi.fn() }));
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => viewerIdRef.current }));
 vi.mock("@/hooks/useGithub", () => ({
   fetchGithubInfo: vi.fn(async () => ({ object: "session.github.info", available: false })),
 }));
@@ -157,6 +163,7 @@ const PROJECTS: ProjectSummary[] = [
 
 beforeEach(() => {
   window.localStorage.clear();
+  viewerIdRef.current = null;
   flowProps.current = null;
   flowFitView.mockClear();
   flowSetViewport.mockClear();
@@ -282,6 +289,7 @@ describe("CanvasPage", () => {
   });
 
   it("reopens the last selected canvas on a visit without a URL parameter", () => {
+    viewerIdRef.current = "me";
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     const { unmount } = renderPage();
     fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
@@ -298,6 +306,28 @@ describe("CanvasPage", () => {
     cleanup();
     renderPage();
     expect(screen.getByRole("tab", { name: "Legacy" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("waits for viewer identity before restoring a remembered canvas", async () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    window.localStorage.setItem(activeCanvasStorageKey(null), "proj_a");
+    window.localStorage.setItem(activeCanvasStorageKey("me"), "name:Legacy");
+    const { rerender } = renderPage();
+
+    expect(screen.getByRole("tab", { name: "Main" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/canvas$/);
+
+    viewerIdRef.current = "me";
+    rerender(pageTree());
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Legacy" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?canvas=name%3ALegacy");
+    expect(window.localStorage.getItem(activeCanvasStorageKey("me"))).toBe("name:Legacy");
   });
 
   it("falls back to Main when the URL names a canvas that no longer exists", () => {

@@ -160,9 +160,13 @@ function CanvasSurface() {
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
-  // The URL names the canvas; without it, reopen the one last selected here.
+  // The URL names the canvas; without it, reopen the viewer's last selection
+  // once identity is known. Never hydrate an authenticated view from the
+  // anonymous storage slot while embedded identity is still resolving.
   const [activeCanvas, setActiveCanvas] = useState(
-    () => searchParams.get(CANVAS_QUERY_PARAM) ?? readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID,
+    () =>
+      searchParams.get(CANVAS_QUERY_PARAM) ??
+      (viewerId === null ? MAIN_CANVAS_ID : readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID),
   );
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const activeCanvasRef = useRef(activeCanvas);
@@ -345,6 +349,8 @@ function CanvasSurface() {
       writeCanvasParam(activeCanvas);
     }
     if (
+      viewerId !== null &&
+      activeCanvasRef.current === activeCanvas &&
       projectsQuery.data !== undefined &&
       (activeCanvas === MAIN_CANVAS_ID ||
         projects.some((project) => projectCanvasId(project) === activeCanvas))
