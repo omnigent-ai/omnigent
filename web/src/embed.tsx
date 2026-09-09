@@ -67,6 +67,23 @@ import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
+import {
+  applyUiFontFamily,
+  applyUiFontScale,
+  readUiFontFamily,
+  readUiFontSizePx,
+} from "./lib/uiFontPreferences";
+import { loadCodeFontFamily, readCodeFontFamily } from "./lib/codeFontPreferences";
+
+// Restore the saved font preferences (and kick off any catalog webfont loads)
+// when the embed module loads. The UI/code font controls stay visible when
+// embedded (per-device readability prefs that don't conflict with host theming),
+// so a chosen font must be applied + fetched here just as standalone does in
+// main.tsx — otherwise the selection would only take effect on the next Settings
+// change. Guarded for SSR by the apply/load helpers.
+applyUiFontScale(readUiFontSizePx());
+applyUiFontFamily(readUiFontFamily());
+loadCodeFontFamily(readCodeFontFamily());
 
 export type { HtmlPreviewFrameProps, OmnigentHostConfig } from "./lib/host";
 export type { RoutingApi } from "./lib/routing";
