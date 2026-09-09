@@ -14,6 +14,7 @@ import {
   useState,
 } from "react";
 import {
+  ArchiveIcon,
   BotIcon,
   CheckIcon,
   WandSparklesIcon,
@@ -62,7 +63,12 @@ import {
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
-import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import {
+  attachmentKey,
+  classifyAttachment,
+  isWorkspaceDelivered,
+  validateAttachments,
+} from "@/lib/attachments";
 import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
@@ -3412,7 +3418,7 @@ function ComposerImpl(
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*,application/json"
+        accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {
@@ -3674,27 +3680,46 @@ function ComposerImpl(
               {/* File chips — shown below textarea when files are attached */}
               {files.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                  {files.map((file, i) => (
-                    <span
-                      key={attachmentKey(file)}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      {file.type.startsWith("image/") ? (
-                        <ImageIcon className="size-3 shrink-0" />
-                      ) : (
-                        <FileTextIcon className="size-3 shrink-0" />
-                      )}
-                      <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
-                      <button
-                        type="button"
-                        onClick={() => removeFile(i)}
-                        className="ml-0.5 rounded-full hover:text-foreground"
-                        aria-label={`Remove ${file.name || "image.png"}`}
+                  {files.map((file, i) => {
+                    const category = classifyAttachment(file);
+                    // Workspace-delivered files are written into the session's
+                    // workspace for the agent to open, not inlined into the model
+                    // context. Label them so the difference is visible before send.
+                    const toWorkspace = category !== null && isWorkspaceDelivered(category);
+                    return (
+                      <span
+                        key={attachmentKey(file)}
+                        className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                        title={
+                          toWorkspace
+                            ? `${file.name} will be placed in the session workspace for the agent to open`
+                            : undefined
+                        }
                       >
-                        <XIcon className="size-3" />
-                      </button>
-                    </span>
-                  ))}
+                        {toWorkspace ? (
+                          <ArchiveIcon className="size-3 shrink-0" />
+                        ) : file.type.startsWith("image/") ? (
+                          <ImageIcon className="size-3 shrink-0" />
+                        ) : (
+                          <FileTextIcon className="size-3 shrink-0" />
+                        )}
+                        <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
+                        {toWorkspace && (
+                          <span className="shrink-0 rounded-sm bg-background px-1 text-[10px] leading-4">
+                            workspace
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => removeFile(i)}
+                          className="ml-0.5 rounded-full hover:text-foreground"
+                          aria-label={`Remove ${file.name || "image.png"}`}
+                        >
+                          <XIcon className="size-3" />
+                        </button>
+                      </span>
+                    );
+                  })}
                 </div>
               )}
               {/* Rejected-attachment feedback: unsupported type or too large */}
