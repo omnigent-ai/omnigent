@@ -127,6 +127,25 @@ interface NativeShellApi {
    * hardcoding them. Absent on older shells. Returns an unsubscribe.
    */
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
+  /**
+   * Subscribe to OS-share file hand-offs (ACTION_SEND / ACTION_SEND_MULTIPLE
+   * on Android) delivered as base64-encoded payloads. The shell defers
+   * emission until its page has loaded and queues delivery until the first
+   * subscriber if none is registered yet (an app cold start races React
+   * mounting). Absent on older shells / outside Android. Returns an
+   * unsubscribe.
+   */
+  onSharedFiles?: (callback: (files: NativeSharedFile[]) => void) => () => void;
+}
+
+/** One OS-shared file, as delivered by the native shell's bridge. */
+export interface NativeSharedFile {
+  /** Suggested display name; the shell falls back to a generic name. */
+  name: string;
+  /** MIME type; the shell falls back to "application/octet-stream". */
+  mimeType: string;
+  /** Raw file bytes, base64-encoded (no data: URL prefix). */
+  base64: string;
 }
 
 export type ThemeSource = "light" | "dark" | "system";
@@ -584,6 +603,28 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
  * outside the Electron shell or under a shell too old to support in-app
  * navigation, so callers can register it unconditionally.
  */
+/**
+ * Subscribe to OS-share file hand-offs from the native Android shell (an
+ * ACTION_SEND / ACTION_SEND_MULTIPLE the user shared into the app). Files
+ * arrive base64-encoded; callers decode them into real `File` objects
+ * themselves (see `lib/shareFileIntake.ts`) so this module stays free of
+ * any web-store dependency.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside a shell that supports it, so callers can register it
+ * unconditionally.
+ */
+export function onNativeSharedFiles(callback: (files: NativeSharedFile[]) => void): () => void {
+  const native = nativeApi();
+  if (!native?.onSharedFiles) return () => {};
+  try {
+    return native.onSharedFiles(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onSharedFiles failed:", err);
+    return () => {};
+  }
+}
+
 export function onOpenPath(callback: (path: string) => void): () => void {
   const native = nativeApi();
   if (!native?.onOpenPath) return () => {};

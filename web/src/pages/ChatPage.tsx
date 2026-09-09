@@ -4417,6 +4417,9 @@ export function Composer({
   // than the draft silently winning and the share silently vanishing.
   const pendingComposerText = useChatStore((s) => s.pendingComposerText);
   const [shareBannerText, setShareBannerText] = useState<string | null>(null);
+  // Files handed off by an OS share (see shareFileIntake.ts); drained below
+  // into the same upload/attachment flow as a manual file pick.
+  const pendingComposerFiles = useChatStore((s) => s.pendingComposerFiles);
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
@@ -4992,6 +4995,17 @@ export function Composer({
     }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
+
+  // Drain an OS-shared file hand-off (see shareFileIntake.ts) through the
+  // same validated upload flow as a manual attach or drag-drop: rejected
+  // files surface the same attachmentError banner, accepted ones just
+  // append -- no autosend, no new UI, cancellation is the existing
+  // remove-attachment button.
+  useEffect(() => {
+    if (pendingComposerFiles === null) return;
+    addFiles(pendingComposerFiles);
+    useChatStore.getState().clearPendingComposerFiles();
+  }, [pendingComposerFiles]);
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();

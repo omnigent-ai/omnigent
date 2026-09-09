@@ -12,7 +12,10 @@ package ai.omnigent.android
  * transport object injected by `WebViewCompat.addWebMessageListener` only into
  * frames on the pinned origin. `notify()` resolves `true` optimistically (as on
  * iOS) since the post is fire-and-forget. native -> web is driven by
- * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here.
+ * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here
+ * — including `__omnigentNativeEmitSharedFiles`, fed by an OS Share
+ * (ACTION_SEND/ACTION_SEND_MULTIPLE) via [SharedFileReceiver] and
+ * `MainActivity.handleShareIntent`.
  */
 object NativeBridgeScript {
     val source: String =
@@ -201,6 +204,26 @@ object NativeBridgeScript {
             },
           });
 
+          // An OS share (ACTION_SEND/ACTION_SEND_MULTIPLE) can arrive before the
+          // React app has mounted its subscriber -- same cold-start race as
+          // notification activation above -- so queue it once and hand it to
+          // the FIRST subscriber, then clear it. The native side additionally
+          // defers this emit until its page has loaded (MainActivity's
+          // flushPendingSharedFiles), so this queue only needs to cover the
+          // page-loaded-but-React-not-yet-mounted gap.
+          const sharedFilesCallbacks = new Set();
+          let pendingSharedFiles = null;
+          Object.defineProperty(window, "__omnigentNativeEmitSharedFiles", {
+            configurable: false, enumerable: false, writable: false,
+            value(filesJson) {
+              let files;
+              try { files = JSON.parse(filesJson); } catch (_) { return; }
+              if (!Array.isArray(files) || files.length === 0) return;
+              if (sharedFilesCallbacks.size === 0) { pendingSharedFiles = files; return; }
+              for (const cb of sharedFilesCallbacks) { try { cb(files); } catch (_) {} }
+            },
+          });
+
           window.omnigentNative = Object.freeze({
             kind: "android",
             setColorScheme(scheme) {
@@ -249,6 +272,16 @@ object NativeBridgeScript {
               insetCallbacks.add(callback);
               if (lastInsets) { try { callback(lastInsets); } catch (_) {} }
               return () => insetCallbacks.delete(callback);
+            },
+            onSharedFiles(callback) {
+              if (typeof callback !== "function") return () => {};
+              sharedFilesCallbacks.add(callback);
+              if (pendingSharedFiles) {
+                const f = pendingSharedFiles;
+                pendingSharedFiles = null;
+                try { callback(f); } catch (_) {}
+              }
+              return () => sharedFilesCallbacks.delete(callback);
             },
           });
         })();

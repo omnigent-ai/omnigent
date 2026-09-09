@@ -40,6 +40,23 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!--
+              OS "Share to" target for a single file: EXTRA_STREAM carries the
+              content:// URI. Read by MainActivity.handleShareIntent /
+              SharedFileReceiver, queued into the composer's existing
+              upload/attachment flow (never autosent).
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <!-- Same, for a multi-file share (EXTRA_STREAM is an ArrayList<Uri>). -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
 
         <activity
