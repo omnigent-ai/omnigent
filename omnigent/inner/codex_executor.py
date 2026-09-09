@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,8 +33,11 @@ from collections.abc import (
 )
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
+
+from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -50,9 +54,10 @@ from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
-from ._subprocess_lifecycle import close_subprocess_transport
+from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
+from .codex_worker import CodexWorkerLaunch, prepare_codex_worker
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -76,6 +81,14 @@ from .executor import (
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
+from .model_auth import ProviderAuthRequired
+from .model_signer import (
+    ModelSignerSession,
+    SignerLaunchConfig,
+    SignerReadiness,
+    SignerStartError,
+    SubprocessModelSigner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +139,11 @@ _TURN_COMPLETED_DRAIN_SECONDS = 1.0
 # build that blocks (e.g. on stdin) must not stall session startup — on
 # timeout the probe kills the process and reports the version as unknown.
 _CODEX_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
+_WORKER_SHUTDOWN_TIMEOUT_SECONDS = 2.0
+_SIGNER_CLOSE_TIMEOUT_SECONDS = 10.0
+_WORKER_PREPARE_CLEANUP_TIMEOUT_SECONDS = 12.0
+_WORKER_SPAWN_CLEANUP_TIMEOUT_SECONDS = 5.0
+_WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 7.0
 _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
@@ -410,6 +428,35 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
+async def _codex_cli_version_text(codex_path: str) -> str | None:
+    """Return the exact version token reported by ``codex --version``."""
+    try:
+        proc = await _create_subprocess_exec(
+            codex_path,
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        with suppress(ProcessLookupError):
+            proc.kill()
+        with suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=1)
+        close_subprocess_transport(proc)
+        return None
+    match = re.fullmatch(
+        r"\s*codex-cli\s+(\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?)\s*",
+        stdout.decode("utf-8", errors="replace"),
+    )
+    return match.group(1) if match is not None else None
+
+
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     """
     Return the codex CLI version as a ``(major, minor, patch)`` tuple.
@@ -426,31 +473,40 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
         ``X.Y.Z`` token (caller treats ``None`` as "version unknown", not
         "too old").
     """
-    try:
-        proc = await _create_subprocess_exec(
-            codex_path,
-            "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-    except OSError:
+    raw = await _codex_cli_version_text(codex_path)
+    if raw is None:
         return None
-    try:
-        stdout, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        # A hung `codex --version` must not block session startup: kill it
-        # and report the version as unknown (the caller proceeds).
-        with suppress(ProcessLookupError):
-            proc.kill()
-        with suppress(Exception):
-            await proc.wait()
-        return None
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", stdout.decode("utf-8", errors="replace"))
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", raw)
     if match is None:
         return None
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+_BROKERED_CODEX_VERSION = Version("0.146.0")
+
+
+async def _require_brokered_codex_version(codex_path: str) -> None:
+    """Fail closed unless Codex uses the wire version tested for brokered auth."""
+    raw = await _codex_cli_version_text(codex_path)
+    try:
+        version = Version(raw) if raw is not None else None
+    except InvalidVersion:
+        version = None
+    if version != _BROKERED_CODEX_VERSION:
+        shown = raw or "unparseable"
+        raise RuntimeError(
+            "unsupported Codex wire version "
+            f"{shown}; brokered authentication requires exactly 0.146.0"
+        )
+
+
+def _codex_binary_identity(codex_path: str) -> tuple[int, int, int, int] | None:
+    """Return metadata that changes on normal executable replacement/update."""
+    try:
+        current = Path(codex_path).stat()
+    except OSError:
+        return None
+    return (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
 
 
 _ProcessPath: TypeAlias = str | bytes | os.PathLike[str] | os.PathLike[bytes]
@@ -464,6 +520,7 @@ async def _create_subprocess_exec(
     stderr: int | None = None,
     env: Mapping[str, str] | Mapping[bytes, bytes] | None = None,
     cwd: _ProcessPath | None = None,
+    pass_fds: tuple[int, ...] = (),
     start_new_session: bool = False,
     creationflags: int = 0,
 ) -> asyncio.subprocess.Process:
@@ -476,6 +533,7 @@ async def _create_subprocess_exec(
         stderr=stderr,
         env=env,
         cwd=cwd,
+        pass_fds=pass_fds,
         start_new_session=start_new_session,
         creationflags=creationflags,
     )
@@ -816,6 +874,7 @@ def _populate_codex_home_config(
     minimal_config: bool | None = None,
     inject_hooks: bool = False,
     extend_model_catalog: bool = False,
+    include_credentials: bool = True,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -861,6 +920,9 @@ def _populate_codex_home_config(
         its own catalog plus the gateway-only arms. Costs a ``codex debug
         models`` probe, so it is reserved for Smart Routing sessions whose
         turns/spawns can land on such an arm.
+    :param include_credentials: Bridge host credential stores. Signer-backed
+        workers set this to ``False`` because authentication stays exclusively
+        in the trusted signer process.
     """
     if not source_dir.is_dir():
         return
@@ -872,6 +934,12 @@ def _populate_codex_home_config(
             "yes",
         }
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
+    if not include_credentials:
+        symlink_files = tuple(
+            name
+            for name in symlink_files
+            if name not in {"auth.json", ".credentials.json", "memories_1.sqlite"}
+        )
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
     if inject_hooks:
@@ -919,6 +987,11 @@ def _populate_codex_home_config(
                 )
 
     for filename in _CODEX_HOME_COPY_FILES:
+        if not include_credentials and filename == "config.toml":
+            # A host config may contain static provider credentials or auth
+            # commands. Signer-backed sessions rebuild their selected provider
+            # below from trusted generated overrides instead of copying it.
+            continue
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -1850,6 +1923,28 @@ def _provider_codex_config_overrides(
     return overrides
 
 
+def _brokered_codex_config_overrides(
+    *,
+    model: str,
+    base_url: str,
+) -> list[str]:
+    """Pin Codex to the signer relay placeholder without a host auth command."""
+    provider_name = "omnigent_brokered"
+    return [
+        f"model={json.dumps(model)}",
+        f'model_provider="{provider_name}"',
+        "model_supports_reasoning_summaries=true",
+        (
+            f"model_providers.{provider_name}="
+            '{name="Omnigent Brokered",'
+            f"base_url={json.dumps(base_url)},"
+            'env_key="OPENAI_API_KEY",'
+            'wire_api="responses"}'
+        ),
+        'web_search="disabled"',
+    ]
+
+
 def _parse_optional_int(value: str | None) -> int | None:
     """Parse an optional integer env-var value.
 
@@ -2258,6 +2353,9 @@ class _CodexAppServerSession:
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
+        os_env: OSEnvSpec | None = None,
+        signer_factory: Callable[[], ModelSignerSession] | None = None,
+        provider_auth_authority: tuple[str, str] | None = None,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2268,9 +2366,20 @@ class _CodexAppServerSession:
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
+        self._os_env_spec = os_env
+        self._signer_factory = signer_factory
+        self._provider_auth_authority = provider_auth_authority
+        self._signer: ModelSignerSession | None = None
+        self._signer_readiness: SignerReadiness | None = None
+        self._signer_watch_task: asyncio.Task[None] | None = None
+        self._signer_exited = False
+        self._closing = False
+        self._cleaned = True
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._worker_census_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
         self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
         self._next_id = 1
@@ -2297,8 +2406,15 @@ class _CodexAppServerSession:
         self._fatal_gateway_error: _CodexGatewayError | None = None
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
+        self._worker_launch: CodexWorkerLaunch | None = None
+        self._worker_prepare_task: asyncio.Task[CodexWorkerLaunch] | None = None
+        self._worker_spawn_task: asyncio.Task[asyncio.subprocess.Process] | None = None
+        self._worker_launch_close_task: asyncio.Task[None] | None = None
+        self._containment_confirmed = False
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
+        self._codex_home_identity: tuple[int, int] | None = None
+        self._worker_liveness_fd: int | None = None
         # Most recent ``thread/tokenUsage/updated`` payload's ``last``
         # turn breakdown, mapped to the wire shape. Consumed (and cleared)
         # on the next ``turn/completed`` so each TurnComplete carries the
@@ -2309,23 +2425,59 @@ class _CodexAppServerSession:
         self._stdin_lock = asyncio.Lock()
 
     async def start(self) -> None:
+        """Start signer and worker transactionally."""
+        try:
+            await self._start_unchecked()
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _start_unchecked(self) -> None:
         if self._started:
             return
+        cleanup_task = self._cleanup_task
+        if cleanup_task is not None and not cleanup_task.done():
+            await asyncio.shield(cleanup_task)
+        self._cleaned = False
         self._loop = asyncio.get_running_loop()
+        if self._signer_factory is not None:
+            signer = self._signer_factory()
+            self._signer = signer
+            try:
+                self._signer_readiness = await signer.start()
+            except BaseException:
+                with suppress(Exception):
+                    await signer.close()
+                self._signer = None
+                self._signer_readiness = None
+                raise
+            self._signer_exited = False
+            self._signer_watch_task = asyncio.create_task(self._watch_signer())
         codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd and self._cwd != "/":
+        if self._signer is None and self._cwd and self._cwd != "/":
             try:
                 codex_home_root = Path(self._cwd) / ".codex-tmp"
                 codex_home_root.mkdir(parents=True, exist_ok=True)
             except OSError:
-                # The cwd may be on a read-only filesystem — e.g. macOS
-                # root ``/`` inherited from a runner whose working
-                # directory was never explicitly set.  Fall back to the
-                # system temp directory so the codex home is still writable.
                 codex_home_root = Path(tempfile.gettempdir())
+        elif self._signer is not None:
+            root_stat = codex_home_root.lstat()
+            unsafe_writable = bool(root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or codex_home_root.is_symlink()
+                or (unsafe_writable and not root_stat.st_mode & stat.S_ISVTX)
+            ):
+                raise OSError("unsafe signer session temp root")
         self._codex_home_dir = Path(
             tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
         )
+        home_stat = self._codex_home_dir.lstat()
+        self._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
+        os.chmod(self._codex_home_dir, 0o700)
+        home_stat = self._codex_home_dir.lstat()
+        if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
+            raise OSError("unsafe signer CODEX_HOME")
         # Populate the per-conversation CODEX_HOME's ``skills/`` subdir
         # based on the spec's ``skills:`` field. Codex auto-discovers
         # skills under ``$CODEX_HOME/skills/<name>/SKILL.md``; without
@@ -2368,14 +2520,23 @@ class _CodexAppServerSession:
             _populate_codex_home_config,
             self._codex_home_dir,
             config_source,
+            minimal_config=True if self._signer is not None else None,
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
+            include_credentials=self._signer is None,
         )
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,
             self._codex_config_overrides,
             retry_policy=self._retry_policy,
         )
+        if self._signer is not None:
+            self._codex_config_overrides.extend(
+                [
+                    f"sqlite_home={json.dumps(str(self._codex_home_dir))}",
+                    "features.memories=false",
+                ]
+            )
         if router_bridge_dir is not None:
             write_codex_router_hooks_file(
                 self._codex_home_dir,
@@ -2387,21 +2548,85 @@ class _CodexAppServerSession:
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
+        if self._signer is not None:
+            # Newer Codex builds keep some SQLite stores relative to HOME even
+            # when CODEX_HOME is set. Keep those stores inside the same private,
+            # sandbox-writable session directory and away from host ~/.codex.
+            proc_env["HOME"] = str(self._codex_home_dir)
+            proc_env["CFFIXED_USER_HOME"] = str(self._codex_home_dir)
+            proc_env["CODEX_SQLITE_HOME"] = str(self._codex_home_dir)
         try:
-            argv = [self._codex_path, "app-server"]
+            process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            # Active egress rules start a parent-side proxy and wait for its
+            # thread readiness. Keep that bounded synchronous setup off the
+            # shared executor loop, just like CODEX_HOME population above.
+            prepare_task = asyncio.create_task(
+                asyncio.to_thread(
+                    prepare_codex_worker,
+                    codex_path=self._codex_path,
+                    cwd=process_cwd,
+                    codex_home=self._codex_home_dir,
+                    os_env=self._os_env_spec,
+                    spawn_env_names=list(proc_env),
+                    signer_readiness=self._signer_readiness,
+                    worker_env=proc_env,
+                )
+            )
+            self._worker_prepare_task = prepare_task
+            worker_launch = await asyncio.shield(prepare_task)
+            if self._worker_prepare_task is prepare_task:
+                self._worker_prepare_task = None
+            if self._closing:
+                await asyncio.to_thread(worker_launch.close)
+                raise RuntimeError("Codex session closed during worker preparation")
+            self._worker_launch = worker_launch
+            argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
-            self._proc = await _create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=proc_env,
-                **_proc.spawn_kwargs(),
-                cwd=self._cwd or os.getcwd(),
-            )
+            spawn_argv = argv
+            pass_fds: tuple[int, ...] = ()
+            liveness_read_fd: int | None = None
+            await self._require_live_signer()
+            if self._worker_launch.sandboxed and os.name == "posix":
+                liveness_read_fd, self._worker_liveness_fd = os.pipe()
+                os.set_inheritable(liveness_read_fd, True)
+                spawn_argv = [
+                    sys.executable,
+                    str(Path(__file__).with_name("_liveness_exec.py")),
+                    "--liveness-fd",
+                    str(liveness_read_fd),
+                    *argv,
+                ]
+                pass_fds = (liveness_read_fd,)
+            try:
+                spawn_task = asyncio.create_task(
+                    _create_subprocess_exec(
+                        *spawn_argv,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=proc_env,
+                        pass_fds=pass_fds,
+                        **_proc.spawn_kwargs(),
+                        cwd=self._cwd or os.getcwd(),
+                    )
+                )
+                self._worker_spawn_task = spawn_task
+                proc = await asyncio.shield(spawn_task)
+                self._proc = proc
+                if self._worker_spawn_task is spawn_task:
+                    self._worker_spawn_task = None
+                _proc.remember_process_group(self._proc)
+                _proc.refresh_process_tree(self._proc)
+                if self._closing:
+                    raise RuntimeError("Codex session closed during worker spawn")
+                await self._require_live_signer()
+            finally:
+                if liveness_read_fd is not None:
+                    os.close(liveness_read_fd)
             self._reader_task = asyncio.create_task(self._reader_loop())
             self._stderr_task = asyncio.create_task(self._stderr_loop())
+            self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
             await self._request(
                 "initialize",
                 {
@@ -2414,6 +2639,7 @@ class _CodexAppServerSession:
                     },
                 },
             )
+            self._containment_confirmed = self._worker_launch.sandboxed
             self._started = True
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
@@ -2429,66 +2655,347 @@ class _CodexAppServerSession:
                         "routing will not be enforced for this session",
                         exc_info=True,
                     )
-        except Exception:
+        except BaseException:
             await self.close()
             raise
 
     async def close(self) -> None:
+        self._closing = True
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
-            if self._proc is not None and self._proc.returncode is None:
-                _terminate_process_tree(self._proc)
-            self._pending_requests.clear()
-            if self._proc is not None:
-                close_subprocess_transport(self._proc)
-            self._started = False
-            self._proc = None
-            self._reader_task = None
-            self._stderr_task = None
-            self._loop = None
-            self.thread_id = None
-            self.active_turn_id = None
-            self._cleanup_process_cwd()
+            self._close_cross_loop()
             return
 
-        if self._proc is not None and self._proc.returncode is None:
-            _terminate_process_tree(self._proc)
+        task = self._cleanup_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._close_same_loop())
+            self._cleanup_task = task
+        cancelled = False
+        while True:
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                _kill_process_tree(self._proc)
-                await self._proc.wait()
-        stdin = self._proc.stdin if self._proc is not None else None
-        if stdin is not None:
-            with suppress(Exception):
-                stdin.close()
-            with suppress(Exception):
-                await stdin.wait_closed()
-        for task in (self._reader_task, self._stderr_task):
-            if task is not None:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                # Mandatory cleanup owns bounded awaits. Preserve cancellation,
+                # but only deliver it after the worker and signer are contained.
+                cancelled = True
+                if task.done():
+                    break
+        if task.done():
+            # Propagate a cleanup bug to the caller; resource-specific expected
+            # failures are handled inside _close_same_loop so siblings still run.
+            task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    @property
+    def cleaned(self) -> bool:
+        """Whether all session-owned resources completed bounded cleanup."""
+        return self._cleaned
+
+    async def _close_same_loop(self) -> None:
+        self._closing = True
+        self._cleaned = False
+        cleanup_complete = True
+        proc = self._proc
+        worker_reaped = proc is None
+        readers_done = True
+        signer_close_task = asyncio.create_task(self._close_signer())
+        try:
+            # Closing this descriptor first also activates the independent
+            # parent-death wrapper while direct process teardown proceeds.
+            self._close_worker_liveness()
+
+            prepare_task = self._worker_prepare_task
+            if prepare_task is not None:
+                done, _pending = await asyncio.wait(
+                    {prepare_task},
+                    timeout=_WORKER_PREPARE_CLEANUP_TIMEOUT_SECONDS,
+                )
+                if done:
+                    self._worker_prepare_task = None
+                    try:
+                        prepared_launch = prepare_task.result()
+                    except BaseException:  # noqa: BLE001 - start owns task failure
+                        prepared_launch = None
+                    if prepared_launch is not None and self._worker_launch is None:
+                        self._worker_launch = prepared_launch
+                else:
+                    cleanup_complete = False
+
+            spawn_task = self._worker_spawn_task
+            if spawn_task is not None:
+                done, _pending = await asyncio.wait(
+                    {spawn_task},
+                    timeout=_WORKER_SPAWN_CLEANUP_TIMEOUT_SECONDS,
+                )
+                if done:
+                    self._worker_spawn_task = None
+                    try:
+                        spawned_proc = spawn_task.result()
+                    except BaseException:  # noqa: BLE001 - start owns task failure
+                        spawned_proc = None
+                    if spawned_proc is not None and self._proc is None:
+                        self._proc = spawned_proc
+                        _proc.remember_process_group(spawned_proc)
+                else:
+                    cleanup_complete = False
+
+            proc = self._proc
+            if proc is not None:
+                try:
+                    reaped = await terminate_subprocess(
+                        proc,
+                        terminate_timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                        kill_timeout=1,
+                        label="Codex app-server",
+                        terminate_tree=_terminate_process_tree,
+                        kill_tree=_kill_process_tree,
+                    )
+                except Exception:  # noqa: BLE001 - cleanup must continue
+                    logger.warning("Codex worker cleanup failed", exc_info=True)
+                    reaped = False
+                if not reaped:
+                    cleanup_complete = False
+                worker_reaped = reaped
+
+            stdin = proc.stdin if proc is not None else None
+            if stdin is not None:
+                with suppress(Exception):
+                    stdin.close()
+                with suppress(Exception):
+                    await asyncio.wait_for(stdin.wait_closed(), timeout=1)
+
+            _proc.refresh_process_tree(proc)
+            tasks = [
+                task
+                for task in (
+                    self._reader_task,
+                    self._stderr_task,
+                    self._worker_census_task,
+                )
+                if task is not None and task is not asyncio.current_task()
+            ]
+            for task in tasks:
                 task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
+            pending: set[asyncio.Task[None]] = set()
+            if tasks:
+                _done, pending = await asyncio.wait(tasks, timeout=1)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    cleanup_complete = False
+                    readers_done = False
+
+            for future in self._pending_requests.values():
+                if not future.done():
+                    future.cancel()
+            self._pending_requests.clear()
+            if proc is not None:
+                close_subprocess_transport(proc)
+
+            # Signer invalidation runs concurrently with worker teardown so a
+            # slow graceful signer shutdown cannot delay worker containment.
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(signer_close_task),
+                    timeout=_SIGNER_CLOSE_TIMEOUT_SECONDS,
+                )
+            if not signer_close_task.done() or self._signer is not None:
+                cleanup_complete = False
+
+            launch = self._worker_launch
+            self._containment_confirmed = False
+            if launch is not None:
+                launch_close_task = self._worker_launch_close_task
+                if launch_close_task is None:
+                    launch_close_task = asyncio.create_task(asyncio.to_thread(launch.close))
+                    self._worker_launch_close_task = launch_close_task
+                done, _pending = await asyncio.wait(
+                    {launch_close_task},
+                    timeout=_WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS,
+                )
+                if done:
+                    self._worker_launch_close_task = None
+                    try:
+                        launch_close_task.result()
+                    except Exception:  # noqa: BLE001 - cleanup must continue
+                        logger.warning("Codex worker launch cleanup failed", exc_info=True)
+                        cleanup_complete = False
+                    else:
+                        self._worker_launch = None
+                else:
+                    cleanup_complete = False
+        finally:
+            if not signer_close_task.done():
+                signer_close_task.cancel()
+                done, _pending = await asyncio.wait({signer_close_task}, timeout=1)
+                if not done:
+                    cleanup_complete = False
+            if proc is not None:
+                _kill_process_tree(proc)
+                close_subprocess_transport(proc)
+            self._started = False
+            self.thread_id = None
+            self.active_turn_id = None
+            self._recent_events.clear()
+            if worker_reaped:
+                self._proc = None
+            if readers_done:
+                self._reader_task = None
+                self._stderr_task = None
+                self._worker_census_task = None
+            if cleanup_complete:
+                self._loop = None
+                self._cleanup_process_cwd()
+                self._closing = False
+                self._cleaned = True
+            else:
+                # Retain ownership so close_session does not evict this state
+                # and a later close can retry the bounded cleanup.
+                self._closing = True
+                self._cleaned = False
+
+    def _close_cross_loop(self) -> None:
+        """Synchronous safety path used after the owning loop changed/died."""
+        self._closing = True
+        self._close_worker_liveness()
+        proc = self._proc
+        if proc is not None:
+            _terminate_process_tree(proc)
+            _kill_process_tree(proc)
+            close_subprocess_transport(proc)
+        signer = self._signer
+        signer_proc = getattr(signer, "_proc", None)
+        if signer_proc is not None:
+            _kill_process_tree(signer_proc)
+            close_subprocess_transport(signer_proc)
+        owner_loop = self._loop
+        tasks = [self._signer_watch_task, self._worker_census_task]
+        self._signer_watch_task = None
+        for task in tasks:
+            if task is not None:
+                if owner_loop is not None and owner_loop.is_running():
+                    owner_loop.call_soon_threadsafe(task.cancel)
+                else:
+                    task.cancel()
         for future in self._pending_requests.values():
             if not future.done():
                 future.cancel()
         self._pending_requests.clear()
-        if self._proc is not None:
-            close_subprocess_transport(self._proc)
         self._started = False
-        self._proc = None
-        self._reader_task = None
-        self._stderr_task = None
-        self._loop = None
         self.thread_id = None
         self.active_turn_id = None
         self._recent_events.clear()
+        self._cleanup_worker_launch()
         self._cleanup_process_cwd()
+        async_work_pending = any(
+            task is not None and not task.done()
+            for task in (
+                self._cleanup_task,
+                self._worker_prepare_task,
+                self._worker_spawn_task,
+                self._worker_launch_close_task,
+            )
+        )
+        # Signals and transport closure are the only safe operations after an
+        # event-loop handoff. Do not claim that wait/reap completed.
+        self._cleaned = proc is None and signer is None and not async_work_pending
+        self._closing = not self._cleaned
+        if self._cleaned:
+            self._reader_task = None
+            self._stderr_task = None
+            self._worker_census_task = None
+            self._loop = None
+            self._signer_readiness = None
+            self._signer_exited = False
+
+    async def _refresh_worker_census(self) -> None:
+        """Continuously pin descendants so a crashed wrapper cannot orphan them."""
+        proc = self._proc
+        if proc is None:
+            return
+        while self._proc is proc and proc.returncode is None:
+            _proc.refresh_process_tree(proc)
+            await asyncio.sleep(0.1)
+
+    async def _watch_signer(self) -> None:
+        signer = self._signer
+        if signer is None:
+            return
+        try:
+            await signer.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
+            logger.debug("model signer watcher failed", exc_info=True)
+        self._signer_exited = True
+        if not self._closing and self._proc is not None:
+            # Single-owner cleanup: do not race close() with a second
+            # terminate/wait/kill sequence over mutable self._proc.
+            self._closing = True
+            task = self._cleanup_task
+            if task is None or task.done():
+                task = asyncio.create_task(self._close_same_loop())
+                self._cleanup_task = task
+            await asyncio.shield(task)
+
+    async def _require_live_signer(self) -> None:
+        """Fail startup if the signer exited before or during worker spawn."""
+        if self._signer is None:
+            return
+        # Give a signer wait task whose process has already exited a chance to
+        # publish that state before crossing the worker-spawn boundary.
+        await asyncio.sleep(0)
+        task = self._signer_watch_task
+        if self._signer_exited or (task is not None and task.done()):
+            raise SignerStartError("model signer exited during worker startup")
+
+    async def _close_signer(self) -> None:
+        signer = self._signer
+        if signer is not None:
+            try:
+                await signer.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - cleanup state records failure
+                logger.warning("model signer close failed", exc_info=True)
+            else:
+                if self._signer is signer:
+                    self._signer = None
+        task = self._signer_watch_task
+        self._signer_watch_task = None
+        if task is not None and task is not asyncio.current_task() and not self._signer_exited:
+            task.cancel()
+            await asyncio.wait({task}, timeout=1)
+        self._signer_readiness = None
+        self._signer_exited = False
+
+    def _cleanup_worker_launch(self) -> None:
+        launch = self._worker_launch
+        self._worker_launch = None
+        self._containment_confirmed = False
+        if launch is not None:
+            launch.close()
 
     def _cleanup_process_cwd(self) -> None:
         if self._codex_home_dir is not None:
-            shutil.rmtree(self._codex_home_dir, ignore_errors=True)
+            try:
+                current = self._codex_home_dir.lstat()
+                identity = (current.st_dev, current.st_ino)
+                if stat.S_ISDIR(current.st_mode) and identity == self._codex_home_identity:
+                    shutil.rmtree(self._codex_home_dir, ignore_errors=True)
+            except OSError:
+                pass
             self._codex_home_dir = None
+            self._codex_home_identity = None
+
+    def _close_worker_liveness(self) -> None:
+        fd = self._worker_liveness_fd
+        self._worker_liveness_fd = None
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
 
     def _record_event(self, message: CodexMessage) -> None:
         self._recent_events.append(message)
@@ -2591,6 +3098,8 @@ class _CodexAppServerSession:
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
+        if self._containment_confirmed:
+            sandbox = "danger-full-access"
 
         # Fresh turn: forget any prior turn's gateway-error signals and clear
         # the shared watchdog slot so a resolved earlier failure can't be
@@ -2823,6 +3332,12 @@ class _CodexAppServerSession:
                         await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
                     except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
                         logger.debug("Codex auth-failure turn interrupt failed: %s", exc)
+                    if (
+                        fatal_gateway_error.code == 401
+                        and self._provider_auth_authority is not None
+                    ):
+                        host, profile = self._provider_auth_authority
+                        raise ProviderAuthRequired.for_authority(host, profile)
                     yield ExecutorError(
                         message=fatal_gateway_error.detail(model=model), retryable=False
                     )
@@ -3225,6 +3740,9 @@ class _CodexAppServerSession:
             raise
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error  # pragma: no cover - defensive
             logger.debug("Codex App Server reader loop ended: %s", exc)
+        finally:
+            if not self._closing:
+                await self._close_signer()
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
@@ -3291,6 +3809,7 @@ class _AppSessionFactory(Protocol):
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
+        os_env: OSEnvSpec | None,
     ) -> _CodexAppServerSession: ...
 
 
@@ -3305,6 +3824,8 @@ def _default_app_session_factory(
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    os_env: OSEnvSpec | None,
+    signer_launch_config: SignerLaunchConfig | None = None,
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
@@ -3316,6 +3837,17 @@ def _default_app_session_factory(
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
+        os_env=os_env,
+        signer_factory=(
+            (lambda: SubprocessModelSigner(signer_launch_config))
+            if signer_launch_config is not None
+            else None
+        ),
+        provider_auth_authority=(
+            (f"https://{signer_launch_config.routes[0].host}", signer_launch_config.auth_profile)
+            if signer_launch_config is not None and signer_launch_config.auth_profile is not None
+            else None
+        ),
     )
 
 
@@ -3341,6 +3873,7 @@ class CodexExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        signer_launch_config: SignerLaunchConfig | None = None,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -3413,6 +3946,9 @@ class CodexExecutor(Executor):
             empty so Codex sees no skills; a list exposes only the
             named skills (looked up across all sources, bundle wins
             on name conflict).
+        :param signer_launch_config: Trusted, non-secret signer authority.
+            When set, the default session factory creates a fresh signer for
+            each session and Codex is pinned to its endpoint and placeholder.
         """
         self._cwd = cwd
         self._os_env_spec = os_env
@@ -3431,6 +3967,8 @@ class CodexExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._signer_backed = signer_launch_config is not None
+        self._brokered_version_identity: tuple[int, int, int, int] | None = None
         resolved_codex = codex_path or _find_codex_cli()
         if not resolved_codex:
             raise ImportError(
@@ -3445,6 +3983,33 @@ class CodexExecutor(Executor):
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._env.update(self._retry_policy.codex_cli.env())
         self._codex_config_overrides: list[str] = []
+        if signer_launch_config is not None:
+            if os_env is None or os_env.sandbox is None or os_env.sandbox.type == "none":
+                raise OSError("signer-backed Codex worker requires an active sandbox")
+            if model is None:
+                raise ValueError("signer-backed Codex requires an explicit model")
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        model_provider_override,
+                        gateway_host,
+                        base_url_override,
+                        gateway_auth_command,
+                    )
+                )
+                or gateway
+            ):
+                raise ValueError(
+                    "signer-backed Codex uses only its trusted endpoint and cannot "
+                    "combine with gateway or provider overrides"
+                )
+            self._codex_config_overrides.extend(
+                _brokered_codex_config_overrides(
+                    model=model,
+                    base_url=signer_launch_config.endpoint,
+                )
+            )
         if model_provider_override is not None and gateway:
             # Both would fight over model_provider in the -c overrides; the
             # AP producer must emit exactly one routing mechanism.
@@ -3540,18 +4105,24 @@ class CodexExecutor(Executor):
                     auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
                 )
             )
-        if not enable_web_search:
+        if not enable_web_search and signer_launch_config is None:
             # Disable Codex's built-in web_search tool so the model can only reach
             # tools exposed by Omnigent as dynamicTools. The top-level web_search
             # key accepts "live", "cached", or "disabled".
             self._codex_config_overrides.append('web_search="disabled"')
         self._tool_executor: CodexToolExecutor | None = None
         self._session_states: dict[str, _CodexSessionState] = {}
-        self._app_session_factory: _AppSessionFactory = (
-            app_session_factory
-            if app_session_factory is not None
-            else _default_app_session_factory
-        )
+        self._app_session_factory: _AppSessionFactory
+        if app_session_factory is not None:
+            self._app_session_factory = app_session_factory
+        else:
+            self._app_session_factory = cast(
+                _AppSessionFactory,
+                partial(
+                    _default_app_session_factory,
+                    signer_launch_config=signer_launch_config,
+                ),
+            )
 
     def supports_streaming(self) -> bool:
         return True
@@ -3607,9 +4178,18 @@ class CodexExecutor(Executor):
         return await state.app_session.enqueue_message(content)
 
     async def close_session(self, session_key: str) -> None:
-        state = self._session_states.pop(session_key, None)
-        if state is not None and state.app_session is not None:
-            await state.app_session.close()
+        state = self._session_states.get(session_key)
+        if state is None or state.app_session is None:
+            return
+        app_session = state.app_session
+        completed = False
+        try:
+            await app_session.close()
+            completed = True
+        finally:
+            cleaned = bool(getattr(app_session, "cleaned", completed))
+            if cleaned and self._session_states.get(session_key) is state:
+                self._session_states.pop(session_key, None)
 
     async def close(self) -> None:
         keys = list(self._session_states.keys())
@@ -3623,10 +4203,15 @@ class CodexExecutor(Executor):
         signature: tuple[str | None, str, str, str],
         effective_cwd: str,
     ) -> _CodexAppServerSession:
-        if state.signature == signature and state.app_session is not None:
-            return state.app_session
         if state.app_session is not None:
-            await state.app_session.close()
+            existing = state.app_session
+            if state.signature == signature and not getattr(existing, "_closing", False):
+                return existing
+            await existing.close()
+            if not getattr(existing, "cleaned", True):
+                raise RuntimeError("previous Codex session cleanup is incomplete")
+            state.app_session = None
+            state.signature = None
         app_session = self._app_session_factory(
             codex_path=self._codex_path,
             cwd=effective_cwd,
@@ -3637,6 +4222,7 @@ class CodexExecutor(Executor):
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,
+            os_env=self._os_env_spec,
         )
         state.app_session = app_session
         state.signature = signature
@@ -3650,6 +4236,17 @@ class CodexExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
+        binary_identity = _codex_binary_identity(self._codex_path)
+        if self._signer_backed and (
+            binary_identity is None or binary_identity != self._brokered_version_identity
+        ):
+            # This probe must precede app-session construction: the latter
+            # creates and preflights the signer before launching the worker.
+            await _require_brokered_codex_version(self._codex_path)
+            validated_identity = _codex_binary_identity(self._codex_path)
+            if binary_identity is not None and validated_identity != binary_identity:
+                raise RuntimeError("Codex executable changed during brokered version validation")
+            self._brokered_version_identity = validated_identity
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
         # cfg.model (per-request /model override) wins over the spec default.
@@ -3712,5 +4309,9 @@ class CodexExecutor(Executor):
                 reasoning_effort=reasoning_effort,
             ):
                 yield event
+        except ProviderAuthRequired:
+            # Preserve the stable code and sanitized recovery detail through
+            # ExecutorAdapter into the response.failed envelope.
+            raise
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event
             yield ExecutorError(message=f"Codex executor error: {exc}")

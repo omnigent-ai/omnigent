@@ -1585,6 +1585,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     guardrails: GuardrailsSpec | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
+    # Operator-approved model-signing authority. Separate from sandbox
+    # egress_rules so generic network access cannot authorize credentials.
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False

@@ -82,6 +82,82 @@ def _seed_error_item(
     )
 
 
+def _install_error_stream(page: Page, session_id: str) -> None:
+    """Replace this session's SSE stream with a browser-controlled stream."""
+    page.add_init_script(
+        """
+        (sessionId => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            const streamPath = `/v1/sessions/${sessionId}/stream`;
+            if (new URL(url, window.location.origin).pathname === streamPath) {
+              const body = new ReadableStream({
+                start(controller) {
+                  window.__errorStreamController = controller;
+                },
+              });
+              return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { "content-type": "text/event-stream" },
+              }));
+            }
+            return originalFetch(input, init);
+          };
+        })(__SESSION_ID__)
+        """.replace("__SESSION_ID__", json.dumps(session_id))
+    )
+
+
+def _push_error_event(page: Page, payload: dict[str, object]) -> None:
+    """Publish one response.error frame to the browser-controlled stream."""
+    page.wait_for_function("window.__errorStreamController !== undefined")
+    page.evaluate(
+        """
+        payload => {
+          const frame = `event: response.error\\ndata: ${JSON.stringify(payload)}\\n\\n`;
+          window.__errorStreamController.enqueue(new TextEncoder().encode(frame));
+        }
+        """,
+        payload,
+    )
+
+
+def test_provider_auth_recovery_command_copies_to_clipboard(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A provider-auth failure exposes and copies its safe recovery command."""
+    base_url, session_id = seeded_session
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
+    _install_error_stream(page, session_id)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=15_000)
+
+    _push_error_event(
+        page,
+        {
+            "source": "execution",
+            "error": {
+                "code": "PROVIDER_AUTH_REQUIRED",
+                "message": "Your Databricks model credential is unavailable or expired.",
+                "title": "Sign in to continue",
+                "cause": "Omnigent could not obtain a model credential for this session.",
+                "remediation": "ucode configure",
+            },
+        },
+    )
+
+    pill = page.get_by_test_id("error-pill")
+    expect(pill).to_contain_text("Sign in to continue", timeout=10_000)
+    pill.click()
+    copy_button = pill.get_by_role("button", name="Copy recovery command")
+    expect(copy_button).to_be_visible()
+    copy_button.click()
+    expect(pill.get_by_role("button", name="Recovery command copied")).to_be_visible()
+    assert page.evaluate("() => navigator.clipboard.readText()") == "ucode configure"
+
+
 def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
     page: Page,
     seeded_session: tuple[str, str],

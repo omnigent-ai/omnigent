@@ -97,6 +97,8 @@ from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.model_egress import UCODE_SIGNER_BINDING_ID, registered_model_provider_binding
+from omnigent.inner.model_signer import SignerLaunchConfig
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -125,6 +127,9 @@ _ENV_AGENT_NAME = "HARNESS_CODEX_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CODEX_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CODEX_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+_ENV_SIGNER_PROVIDER = "HARNESS_CODEX_SIGNER_PROVIDER"
+_ENV_SIGNER_ENDPOINT = "HARNESS_CODEX_SIGNER_ENDPOINT"
+_ENV_MODEL_EGRESS = "HARNESS_CODEX_MODEL_EGRESS"
 
 # Truthy strings the wrap accepts for boolean env vars. Must
 # match the claude-sdk wrap's parser for consistency — operators
@@ -265,6 +270,60 @@ def _resolve_skills_filter() -> str | list[str]:
     return "all"
 
 
+def _resolve_signer_launch_config() -> SignerLaunchConfig | None:
+    """Build typed signer authority from the trusted workflow envelope."""
+    provider_id = os.environ.get(_ENV_SIGNER_PROVIDER, "").strip()
+    endpoint = os.environ.get(_ENV_SIGNER_ENDPOINT, "").strip()
+    raw_model_egress = os.environ.get(_ENV_MODEL_EGRESS, "").strip()
+    if not provider_id:
+        if endpoint or raw_model_egress:
+            raise ValueError("partial model signer configuration is not allowed")
+        return None
+    if provider_id != UCODE_SIGNER_BINDING_ID:
+        raise ValueError(f"unsupported model signer provider {provider_id!r}")
+    if _parse_truthy(_ENV_GATEWAY, default=False):
+        raise ValueError("signer-backed Codex conflicts with the legacy gateway mode")
+    if os.environ.get(_ENV_GATEWAY_AUTH_COMMAND):
+        raise ValueError("signer-backed Codex conflicts with a legacy gateway auth command")
+    if any(
+        os.environ.get(name)
+        for name in (
+            _ENV_GATEWAY_BASE_URL,
+            _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS,
+            _ENV_MODEL_PROVIDER,
+        )
+    ):
+        raise ValueError("signer-backed Codex conflicts with legacy provider overrides")
+    host = os.environ.get(_ENV_GATEWAY_HOST, "").strip()
+    profile = os.environ.get(_ENV_DATABRICKS_PROFILE, "").strip()
+    if not endpoint or not host or not profile:
+        raise ValueError("ucode signer requires trusted endpoint, host, and profile")
+    if not raw_model_egress:
+        raise ValueError("signer-backed Codex requires explicit model egress")
+    try:
+        model_egress = json.loads(raw_model_egress)
+    except json.JSONDecodeError as exc:
+        raise ValueError("model egress must be valid JSON") from exc
+    if (
+        not isinstance(model_egress, list)
+        or not model_egress
+        or not all(isinstance(rule, str) and rule for rule in model_egress)
+    ):
+        raise ValueError("model egress must be a non-empty string list")
+    provider = registered_model_provider_binding(
+        binding_id=provider_id,
+        trusted_session_endpoint=endpoint,
+        trusted_host=host,
+    )
+    return SignerLaunchConfig.from_trusted_authority(
+        binding_id=provider_id,
+        provider=provider,
+        trusted_session_endpoint=endpoint,
+        operator_model_egress=model_egress,
+        auth_profile=profile,
+    )
+
+
 def _build_codex_executor() -> Executor:
     """
     Construct a :class:`CodexExecutor` from env-var config.
@@ -287,15 +346,24 @@ def _build_codex_executor() -> Executor:
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
+    signer_launch_config = _resolve_signer_launch_config()
     return CodexExecutor(
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         codex_path=resolve_harness_path("codex"),
-        gateway=_parse_truthy(_ENV_GATEWAY, default=False),
-        databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
-        model_provider_override=os.environ.get(_ENV_MODEL_PROVIDER) or None,
-        gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
+        gateway=False
+        if signer_launch_config is not None
+        else _parse_truthy(_ENV_GATEWAY, default=False),
+        databricks_profile=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_DATABRICKS_PROFILE),
+        model_provider_override=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_MODEL_PROVIDER) or None,
+        gateway_host=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_HOST) or None,
         # Default ``True`` mirrors the inner CodexExecutor's
         # constructor default, which mirrors Codex's own
         # default. An operator who set the env var to ``"0"``
@@ -304,14 +372,20 @@ def _build_codex_executor() -> Executor:
         # Default ``False`` mirrors the inner executor's default
         # (native tools enabled).
         disable_native_tools=_parse_truthy(_ENV_DISABLE_NATIVE_TOOLS, default=False),
-        base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
-        gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
-        gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
-        or None,
+        base_url_override=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
+        gateway_auth_command=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
+        gateway_auth_refresh_interval_ms=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS) or None,
         retry_policy=_resolve_retry_policy(),
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
+        signer_launch_config=signer_launch_config,
     )
 
 

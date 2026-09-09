@@ -722,6 +722,8 @@ def _clone_policy_with(
         spawn_env_allowlist=(
             list(policy.spawn_env_allowlist) if policy.spawn_env_allowlist is not None else None
         ),
+        egress_relay_port=policy.egress_relay_port,
+        egress_socket_path=policy.egress_socket_path,
         deny_unix_socket_paths=(
             list(policy.deny_unix_socket_paths)
             if policy.deny_unix_socket_paths is not None
@@ -744,11 +746,6 @@ def _clone_policy_with(
                 else None
             )
         ),
-        # Egress fields are intentionally NOT preserved here — the
-        # ``with_additional_*`` helpers run BEFORE the egress proxy
-        # starts, so the source policy never carries egress fields.
-        # The egress fields are added later via ``dataclasses.replace``
-        # in ``_HelperProcessClient._start_egress_proxy_locked``.
     )
 
 
