@@ -7,7 +7,7 @@ and every dependency `resource` stanza — into the hand-tuned template
 are owned by the template; this script owns the bits that change every release.
 
 Resolution: `uv pip compile` computes the exact transitive closure of
-`omnigent[<extras>]==<version>` for each target platform (macOS arm + intel by
+`omnigent[<extras>]==<version>` for each target platform (Apple Silicon only by
 default — the brew tap's `brew test-bot` matrix). The per-platform closures are
 unioned; for each package we then fetch the sdist URL + sha256 from the PyPI JSON
 API and emit a `resource` stanza. Every package in the closure must publish an
@@ -41,11 +41,18 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Default brew build matrix: macOS Apple Silicon + Intel (the tap's
-# `brew test-bot` runs on macos-15 / macos-15-intel / macos-26). The union of the
-# two closures captures platform-marker deps needed on either arch. Add
-# `x86_64-unknown-linux-gnu` here if the tap re-enables Linux builds.
-DEFAULT_PLATFORMS = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+# Default brew build matrix: Apple Silicon only (the tap's `brew test-bot` runs on
+# macos-15 / macos-26). Intel is deliberately absent -- homebrew-core no longer
+# publishes `sequoia` bottles for rust, cryptography, libyaml, pydantic, rpds-py
+# or tmux, so an Intel build had to compile all of those first and test-bot
+# skipped the formula outright ("has unbottled dependencies"). Every release since
+# 0.6.0 shipped arm-only bottles. The template's `depends_on arch: :arm64` is what
+# makes that explicit to users; keep the two in sync.
+#
+# Resolutions are still unioned across whatever platforms are listed, so adding
+# `x86_64-apple-darwin` back (or `x86_64-unknown-linux-gnu` for Linux) restores
+# multi-arch behaviour, including the `on_arm`/`on_intel` wheel stanzas.
+DEFAULT_PLATFORMS = ["aarch64-apple-darwin"]
 # Extras bundled as resources. The base install already pulls the Claude and
 # OpenAI Agents harnesses; this adds the opt-in `cursor` harness (pure-Python
 # sdist). antigravity is NOT bundled — no sdist (platform wheels only), no
@@ -621,7 +628,7 @@ def main(argv: list[str]) -> int:
         "--python-platform",
         action="append",
         default=None,
-        help="uv target platform (repeatable). Default: macOS arm + intel.",
+        help="uv target platform (repeatable). Default: Apple Silicon only.",
     )
     ap.add_argument(
         "--extra",
