@@ -15,9 +15,10 @@ This test drives the reported journey — open a terminal-first session at an
 iPhone-sized viewport under the iOS shell bridge, tap between Terminal and Chat
 in the header switcher — then measures the rendered geometry of the three
 layers and asserts their separate roles: the glass pill and selected segment
-stay capsules, the track element itself is transparent, and a grey 8px-radius
-rounded rectangle paints 4px inside it. The switcher and expanded kebab also
-keep symmetric glass rims at the pill's outer edges.
+stay capsules, the track element itself is transparent, and a full-height grey
+8px-radius rounded rectangle paints 4px inside its horizontal ends. The
+switcher and expanded kebab also keep symmetric glass rims at the pill's outer
+edges.
 
 The journey/bridge scaffolding mirrors ``test_ios_switcher_in_header.py`` (the
 same terminal-first precondition and iOS WKWebView bridge stub), so the failure
@@ -35,7 +36,8 @@ from playwright.sync_api import Page, Route, ViewportSize, expect
 # iPhone-sized viewport (matches the report's surface and keeps the SPA in the
 # max-md mobile header layout, where the glass pill and 44px segments render).
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
-_TRACK_INSET_PX = 4
+_TRACK_HORIZONTAL_INSET_PX = 4
+_TRACK_VERTICAL_INSET_PX = 0
 _TRACK_RADIUS_PX = 8
 _GEOMETRY_TOLERANCE_PX = 1.5
 _MIN_GLASS_RIM_PX = 4
@@ -293,12 +295,22 @@ def test_mobile_header_switcher_layers_fit_inside_the_glass_pill(
     assert not track_paint["capsule"], (
         f"grey track should remain an inset rounded rectangle: {track_paint}"
     )
+    assert abs(track_paint["height"] - active["height"]) <= _GEOMETRY_TOLERANCE_PX, (
+        f"grey track and selected segment must remain equally tall: {layers}"
+    )
     assert abs(track_paint["declaredRadius"] - _TRACK_RADIUS_PX) <= _GEOMETRY_TOLERANCE_PX, (
         f"grey track lost the {_TRACK_RADIUS_PX}px design-token radius: {track_paint}"
     )
-    for edge, inset in track_paint["inset"].items():
-        assert abs(inset - _TRACK_INSET_PX) <= _GEOMETRY_TOLERANCE_PX, (
-            f"grey track {edge} inset is not {_TRACK_INSET_PX}px: {track_paint}"
+    expected_insets = {
+        "top": _TRACK_VERTICAL_INSET_PX,
+        "right": _TRACK_HORIZONTAL_INSET_PX,
+        "bottom": _TRACK_VERTICAL_INSET_PX,
+        "left": _TRACK_HORIZONTAL_INSET_PX,
+    }
+    for edge, expected in expected_insets.items():
+        inset = track_paint["inset"][edge]
+        assert abs(inset - expected) <= _GEOMETRY_TOLERANCE_PX, (
+            f"grey track {edge} inset is not {expected}px: {track_paint}"
         )
 
     # The expanded kebab paints its full 44px background, so it needs the same
