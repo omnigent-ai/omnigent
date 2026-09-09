@@ -904,6 +904,14 @@ Request body matches `SessionEventInput`:
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without
                                   starting a duplicate task
+      - "external_conversation_item_batch"
+                                — internal child-session history envelope;
+                                  atomically appends up to 100 source-keyed
+                                  items without starting a task. The encoded
+                                  request body is limited to 1 MiB. Payload:
+                                  `{items: [{source_id, item_type, item_data,
+                                  response_id}]}`. Repeating the same
+                                  `source_id` is idempotent.
       - "external_output_text_delta"
                                 — internal terminal-observed assistant
                                   text delta; publishes a transient
@@ -983,6 +991,8 @@ Request body matches `SessionEventInput`:
 {"queued": true}                            # regular queued item events
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
+{"queued": false, "items": [{"source_id": "...", "item_id": "...", "inserted": true}]}
+                                             # "external_conversation_item_batch"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
@@ -1015,6 +1025,12 @@ the session-scoped event carries the cancel intent for session-aware
 clients. The internal terminal-observed envelopes also bypass the
 queue: `external_conversation_item` appends/broadcasts an
 already-observed item and returns its stored `item_id`, while
+`external_conversation_item_batch` performs the equivalent ordered,
+retry-safe append for child-session history and returns one acknowledgement
+per source item. It is restricted to child sessions. Only newly inserted
+items are broadcast, so retrying after an ambiguous response cannot duplicate
+the transcript or live events. The batch is capped at 100 items and a 1 MiB
+encoded request body. Meanwhile,
 `external_output_text_delta` publishes a transient
 `response.output_text.delta` event without persisting. Its `data` is
 `{delta: string, message_id?: string, index?: integer, final?: boolean}`:

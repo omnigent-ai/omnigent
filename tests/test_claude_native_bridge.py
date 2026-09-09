@@ -1135,6 +1135,15 @@ def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: 
     assert noop.data["kind"] == "command"
     assert noop.data["output"] == stdout.strip()
 
+    byte_result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+    record_items = [item for record in byte_result.record_items for item in record.items]
+    assert record_items == byte_result.items
+
 
 def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:
     """

@@ -558,6 +558,19 @@ class ClaudeTranscriptItem:
 
 
 @dataclass(frozen=True)
+class TranscriptRecordItems:
+    """Parsed items and durable cursor for one complete JSONL record.
+
+    ``next_byte_offset`` is safe to persist only after every item in
+    ``items`` has been accepted by the server. Records that produce no visible
+    items are included so a forwarder can advance past them without rescanning.
+    """
+
+    next_byte_offset: int
+    items: tuple[ClaudeTranscriptItem, ...]
+
+
+@dataclass(frozen=True)
 class TranscriptReadResult:
     """
     Result of reading Claude transcript JSONL records.
@@ -582,6 +595,9 @@ class TranscriptReadResult:
         in the Claude Code pane writes. ``None`` when no such record was
         scanned. Claude's own auto-generated ``aiTitle`` is deliberately
         not surfaced here; Omnigent titles unnamed sessions itself.
+    :param record_items: Parsed items grouped by their complete source JSONL
+        record, with the byte offset immediately after each record. Native
+        child-transcript batching uses these boundaries for partial checkpoints.
     """
 
     line_cursor: int
@@ -591,6 +607,7 @@ class TranscriptReadResult:
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    record_items: tuple[TranscriptRecordItems, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2496,14 +2513,25 @@ def read_transcript_items_since_with_position(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    record_items: list[TranscriptRecordItems] = []
     for record in read_result.records:
+        parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         try:
             entry = json.loads(record.text)
         except json.JSONDecodeError:
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         if not isinstance(entry, dict):
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
@@ -2528,14 +2556,30 @@ def read_transcript_items_since_with_position(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        record_items.append(
+            TranscriptRecordItems(
+                next_byte_offset=record.next_byte_offset,
+                items=tuple(parsed),
+            )
+        )
+    items = _dedupe_compact_noop_echo(items)
+    retained_source_ids = {item.source_id for item in items}
+    record_items = [
+        TranscriptRecordItems(
+            next_byte_offset=record.next_byte_offset,
+            items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+        )
+        for record in record_items
+    ]
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=_dedupe_compact_noop_echo(items),
+        items=items,
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        record_items=tuple(record_items),
     )
 
 
@@ -2589,14 +2633,25 @@ def read_transcript_items_from_offset(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    record_items: list[TranscriptRecordItems] = []
     for record in read_result.records:
+        parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         try:
             entry = json.loads(record.text)
         except json.JSONDecodeError:
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         if not isinstance(entry, dict):
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
@@ -2622,14 +2677,30 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        record_items.append(
+            TranscriptRecordItems(
+                next_byte_offset=record.next_byte_offset,
+                items=tuple(parsed),
+            )
+        )
+    items = _dedupe_compact_noop_echo(items)
+    retained_source_ids = {item.source_id for item in items}
+    record_items = [
+        TranscriptRecordItems(
+            next_byte_offset=record.next_byte_offset,
+            items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+        )
+        for record in record_items
+    ]
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=_dedupe_compact_noop_echo(items),
+        items=items,
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        record_items=tuple(record_items),
     )
 
 

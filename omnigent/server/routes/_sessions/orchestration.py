@@ -59,6 +59,7 @@ from omnigent.host.frames import (
 )
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.event_batch import MAX_EXTERNAL_ITEM_BATCH_ITEMS
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -2212,6 +2213,14 @@ async def _persist_external_codex_subagent_start(
     )
 
 
+def _external_conversation_item_stable_id(session_id: str, source_id: str) -> str:
+    """Derive the store id shared by single and batched native item posts."""
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"omnigent-external-item:{session_id}:{source_id.strip()}",
+    ).hex
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -2259,12 +2268,7 @@ async def _persist_external_conversation_item(
                 code=ErrorCode.INVALID_INPUT,
             )
         item = item.model_copy(
-            update={
-                "stable_id": uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
-                ).hex
-            }
+            update={"stable_id": _external_conversation_item_stable_id(session_id, source_id)}
         )
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
@@ -2355,6 +2359,83 @@ async def _persist_external_conversation_item(
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
     return persisted.id
+
+
+async def _persist_external_conversation_item_batch(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> list[dict[str, Any]]:
+    """Persist one ordered, idempotent batch of native child-transcript items."""
+    if conv.parent_conversation_id is None:
+        raise OmnigentError(
+            "external conversation item batches are only supported for child sessions",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    rows = body.data.get("items")
+    if not isinstance(rows, list) or not rows:
+        raise OmnigentError(
+            "external_conversation_item_batch requires a non-empty data.items list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if len(rows) > MAX_EXTERNAL_ITEM_BATCH_ITEMS:
+        raise OmnigentError(
+            "external_conversation_item_batch exceeds the item-count limit",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    source_ids: list[str] = []
+    items: list[NewConversationItem] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise OmnigentError(
+                "external_conversation_item_batch items must be objects",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        source_id = row.get("source_id")
+        if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256:
+            raise OmnigentError(
+                "external_conversation_item_batch items require a source_id of 1-256 characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        normalized_source_id = source_id.strip()
+        source_ids.append(normalized_source_id)
+        item = _parse_external_conversation_item(
+            SessionEventInput(
+                type="external_conversation_item",
+                data={key: value for key, value in row.items() if key != "source_id"},
+            )
+        )
+        items.append(
+            item.model_copy(
+                update={
+                    "stable_id": _external_conversation_item_stable_id(
+                        session_id, normalized_source_id
+                    )
+                }
+            )
+        )
+    if len(set(source_ids)) != len(source_ids):
+        raise OmnigentError(
+            "external_conversation_item_batch source_ids must be unique",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, items)
+    acknowledgements: list[dict[str, Any]] = []
+    for source_id, persisted in zip(source_ids, persisted_items, strict=True):
+        if not persisted.deduplicated:
+            _publish_external_conversation_item(session_id, persisted)
+            _drive_terminal_resolved_elicitation(session_id, persisted)
+        acknowledgements.append(
+            {
+                "source_id": source_id,
+                "item_id": persisted.id,
+                "inserted": not persisted.deduplicated,
+            }
+        )
+    return acknowledgements
 
 
 def _build_skipped_kiro_items(
@@ -10068,6 +10149,7 @@ __all__ = [
     "_persist_external_antigravity_subagent_start",
     "_persist_external_codex_subagent_start",
     "_persist_external_conversation_item",
+    "_persist_external_conversation_item_batch",
     "_persist_external_session_usage",
     "_persist_host_launch_failure_turn",
     "_persist_model_change_note",

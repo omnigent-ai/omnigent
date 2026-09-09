@@ -5605,7 +5605,7 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
 ) -> None:
     """
     After registering a sub-agent, the forwarder tails its
-    ``.jsonl`` and POSTs ``external_conversation_item`` events to
+    ``.jsonl`` and POSTs an ``external_conversation_item_batch`` to
     the Omnigent child session id (not the parent's).
     """
     bridge_dir = tmp_path / "bridge"
@@ -5658,6 +5658,11 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         """
         if body.get("type") == "external_subagent_start":
             return {"queued": False, "child_session_id": "conv_child_beta"}
+        if body.get("type") == "external_conversation_item_batch":
+            return {
+                "queued": False,
+                "items": [{"source_id": item["source_id"]} for item in body["data"]["items"]],
+            }
         return {}
 
     server, _thread, base_url = _start_recording_server_with_responses(response_for)
@@ -5673,22 +5678,23 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         )
     )
     try:
-        # We need: the start event + at least one item event addressed
-        # to the child. Drain up to N requests and collect every
-        # request bound for the child's ``/events`` path.
+        # We need the start event plus one item batch addressed to the child.
         child_path = "/v1/sessions/conv_child_beta/events"
         child_requests: list[dict[str, Any]] = []
         for _ in range(40):
             req = await _get_recorded_request(server)
             if req["path"] == child_path:
                 child_requests.append(req)
-                if len(child_requests) >= 2:
+                if req["body"]["type"] == "external_conversation_item_batch":
                     break
-        assert len(child_requests) >= 2, (
-            f"only saw {len(child_requests)} requests to {child_path}: {child_requests!r}"
-        )
         item_types = [r["body"]["type"] for r in child_requests]
-        assert "external_conversation_item" in item_types
+        assert "external_conversation_item_batch" in item_types
+        batch = next(
+            request["body"]
+            for request in child_requests
+            if request["body"]["type"] == "external_conversation_item_batch"
+        )
+        assert len(batch["data"]["items"]) == 2
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -5697,19 +5703,15 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         server.server_close()
 
 
-async def test_subagent_watcher_retry_skips_previously_posted_items(
+async def test_subagent_watcher_retries_failed_batch_from_checkpoint(
     tmp_path: Path,
 ) -> None:
     """
-    Retrying a failed child item does not re-post earlier child items.
+    A rejected child batch leaves its byte cursor behind and retries in order.
 
-    The sub-agent watcher intentionally leaves ``byte_offset`` behind
-    when a later item fails, so the next poll re-reads the same JSONL
-    window. This test pins the durable ``seen_source_ids`` guard: item
-    A succeeds, item B fails once, and the retry must post only B.
-    Without that guard Omnigent live subscribers can see item A synced back
-    twice; the server no longer receives a ``source_id`` key that can
-    dedupe the post on AP's side.
+    The server commits a batch atomically and deduplicates source ids, so an
+    ambiguous response can safely retry the entire batch. The local cursor
+    advances only after the acknowledgement arrives.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -5748,27 +5750,30 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
         }
     )
     posted_items: list[str] = []
-    attempts_by_item: dict[str, int] = {}
+    batch_attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
-        Fail the assistant item once and accept everything else.
+        Fail the first batch and acknowledge its retry.
 
         :param request: Request issued by the forwarder.
         :returns: Canned Omnigent response.
         """
+        nonlocal batch_attempts
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") != "external_conversation_item":
+        if body.get("type") != "external_conversation_item_batch":
             return httpx.Response(202, json={})
-        item_data = body["data"]["item_data"]
-        role = item_data["role"]
-        text = item_data["content"][0]["text"]
-        item_key = f"{role}:{text}"
-        posted_items.append(item_key)
-        attempts_by_item[item_key] = attempts_by_item.get(item_key, 0) + 1
-        if item_key == "assistant:done" and attempts_by_item[item_key] == 1:
+        batch_attempts += 1
+        rows = body["data"]["items"]
+        for row in rows:
+            item_data = row["item_data"]
+            posted_items.append(f"{item_data['role']}:{item_data['content'][0]['text']}")
+        if batch_attempts == 1:
             return httpx.Response(503, json={"error": "try again"})
-        return httpx.Response(202, json={})
+        return httpx.Response(
+            202,
+            json={"items": [{"source_id": row["source_id"]} for row in rows]},
+        )
 
     item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
     async with httpx.AsyncClient(
@@ -5798,13 +5803,326 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
         )
 
-    assert posted_items == ["user:go", "assistant:done", "assistant:done"]
+    assert posted_items == ["user:go", "assistant:done", "user:go", "assistant:done"]
     child_state = second.subagents["retry1"]
     assert child_state.byte_offset == subagent_jsonl.stat().st_size
     assert set(child_state.seen_source_ids) == {
         "sa-user-retry:0:message",
         "sa-assistant-retry:0:message",
     }
+
+
+def test_subagent_batches_obey_count_and_exact_byte_limits() -> None:
+    """Batching counts the complete UTF-8 JSON body and truncates one huge item."""
+
+    def pending(index: int, text: str) -> forwarder._PendingSubagentItem:
+        return forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"source-{index}",
+                item_type="function_call_output",
+                data={"call_id": f"toolu_{index}", "output": text},
+                response_id="resp_batch",
+            ),
+            checkpoint_after=index + 1,
+        )
+
+    tiny_batches = forwarder._partition_subagent_batches(
+        [pending(index, "ok") for index in range(205)]
+    )
+    assert [len(batch) for batch in tiny_batches] == [100, 100, 5]
+
+    large_batches = forwarder._partition_subagent_batches(
+        [pending(1000, "€" * 200_000), pending(1001, "€" * 200_000)]
+    )
+    assert [len(batch) for batch in large_batches] == [1, 1]
+
+    oversized = forwarder._partition_subagent_batches([pending(2000, "€" * 500_000)])
+    assert len(oversized) == 1
+    truncated_output = oversized[0][0].item.data["output"]
+    assert isinstance(truncated_output, str)
+    assert "content truncated by omnigent" in truncated_output
+    for batch in [*tiny_batches, *large_batches, *oversized]:
+        assert len(forwarder._encoded_subagent_batch(batch)) <= 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_failure_resumes_at_first_unsent_record(tmp_path: Path) -> None:
+    """A failed second batch keeps the durable cursor after record 100."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    records = [
+        {
+            "isSidechain": True,
+            "type": "assistant",
+            "uuid": f"sa-{index}",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": f"item {index}"}],
+            },
+        }
+        for index in range(150)
+    ]
+    subagent_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="checkpoint",
+        agent_type="Explore",
+        description="large history",
+        tool_use_id="toolu_checkpoint",
+        transcript_records=records,
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "checkpoint": forwarder.SubagentEntry(
+                subagent_id="checkpoint",
+                child_conversation_id="conv_child_checkpoint",
+            )
+        }
+    )
+    attempts: list[list[str]] = []
+    failed_second_batch = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal failed_second_batch
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") != "external_conversation_item_batch":
+            return httpx.Response(202, json={})
+        rows = body["data"]["items"]
+        source_ids = [row["source_id"] for row in rows]
+        attempts.append(source_ids)
+        if source_ids[0].startswith("sa-100:") and not failed_second_batch:
+            failed_second_batch = True
+            return httpx.Response(503, json={"error": "retry"})
+        return httpx.Response(
+            202,
+            json={"items": [{"source_id": source_id} for source_id in source_ids]},
+        )
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        with subagent_jsonl.open("rb") as handle:
+            expected_offset = sum(len(handle.readline()) for _ in range(100))
+        assert first.subagents["checkpoint"].byte_offset == expected_offset
+        persisted = forwarder._read_subagent_forward_state(bridge_dir)
+        assert persisted.subagents["checkpoint"].byte_offset == expected_offset
+
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert second.subagents["checkpoint"].byte_offset == subagent_jsonl.stat().st_size
+    attempted_ids = [source_id for batch in attempts for source_id in batch]
+    assert all(attempted_ids.count(f"sa-{index}:0:message") == 1 for index in range(100))
+    assert all(attempted_ids.count(f"sa-{index}:0:message") == 2 for index in range(100, 150))
+
+
+@pytest.mark.asyncio
+async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Path) -> None:
+    """Independent child conversations are concurrent while each stays ordered."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    entries: dict[str, forwarder.SubagentEntry] = {}
+    for index in range(16):
+        subagent_id = f"parallel-{index}"
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id=subagent_id,
+            agent_type="Explore",
+            description="parallel backlog",
+            tool_use_id=f"toolu_parallel_{index}",
+            transcript_records=[
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": f"parallel-message-{index}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": str(index)}],
+                    },
+                }
+            ],
+        )
+        entries[subagent_id] = forwarder.SubagentEntry(
+            subagent_id=subagent_id,
+            child_conversation_id=f"conv_child_{index}",
+        )
+
+    active = 0
+    maximum_active = 0
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") != "external_conversation_item_batch":
+            return httpx.Response(202, json={})
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active == 8:
+            release.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+        rows = body["data"]["items"]
+        return httpx.Response(
+            202,
+            json={"items": [{"source_id": row["source_id"]} for row in rows]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await asyncio.wait_for(
+            forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=forwarder.SubagentForwardState(subagents=entries),
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            ),
+            timeout=3.0,
+        )
+    assert maximum_active == 8
+
+
+@pytest.mark.asyncio
+async def test_parent_output_forwards_while_child_history_is_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck child request cannot prevent the next live parent poll."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="blocked-child",
+        agent_type="Explore",
+        description="blocked history",
+        tool_use_id="toolu_blocked_child",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "blocked-child-item",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "old output"}],
+                },
+            }
+        ],
+    )
+    forwarder._write_subagent_forward_state(
+        bridge_dir,
+        forwarder.SubagentForwardState(
+            subagents={
+                "blocked-child": forwarder.SubagentEntry(
+                    subagent_id="blocked-child",
+                    child_conversation_id="conv_blocked_child",
+                )
+            }
+        ),
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    child_request_started = asyncio.Event()
+    release_child = asyncio.Event()
+    parent_item_forwarded = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if body.get("type") == "external_conversation_item_batch":
+            child_request_started.set()
+            await release_child.wait()
+            rows = body["data"]["items"]
+            return httpx.Response(
+                202,
+                json={"items": [{"source_id": row["source_id"]} for row in rows]},
+            )
+        if (
+            request.url.path == "/v1/sessions/conv_parent/events"
+            and body.get("type") == "external_conversation_item"
+        ):
+            parent_item_forwarded.set()
+        return httpx.Response(202, json={})
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(child_request_started.wait(), timeout=2.0)
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "fresh-parent-item",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "fresh output"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        await asyncio.wait_for(parent_item_forwarded.wait(), timeout=1.0)
+    finally:
+        release_child.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 async def test_subagent_watcher_skips_subagents_already_in_state(
@@ -8450,7 +8768,7 @@ async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
         body = json.loads(request.content.decode("utf-8"))
         if body.get("type") == "external_subagent_start":
             return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
-        if body.get("type") == "external_conversation_item":
+        if body.get("type") == "external_conversation_item_batch":
             return httpx.Response(400, json={"error": "nope"})
         return httpx.Response(202, json={})
 
@@ -9068,6 +9386,22 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forward_progress_timeout_resets_after_each_response() -> None:
+    """A healthy long drain is not cancelled while responses keep arriving."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.06)
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        async with forwarder._forward_progress_timeout(client, 0.1):
+            for _ in range(3):
+                await client.post("/events", json={})
+
+
+@pytest.mark.asyncio
 async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9121,7 +9455,7 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-    stall_warnings = [r for r in caplog.records if "iteration exceeded" in r.getMessage()]
+    stall_warnings = [r for r in caplog.records if "made no live progress" in r.getMessage()]
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
