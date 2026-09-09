@@ -236,6 +236,66 @@ def test_github_info_pr_via_commit_fork_fallback(
     assert any(c[0] == "api" and "daniellok-db/repo/commits/" in c[1] for c in calls)
 
 
+@pytest.mark.parametrize("configured_base", [False, True])
+@pytest.mark.parametrize(
+    "fork_result",
+    [
+        (0, "[]", ""),
+        (1, "", "Not Found"),
+        (0, "invalid JSON", ""),
+        (0, '{"message": "Not Found"}', ""),
+        (0, '[{"number": 1, "state": "closed"}]', ""),
+    ],
+)
+def test_github_info_resolves_pr_only_listed_in_base_repo(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_base: bool,
+    fork_result: tuple[int, str, str],
+) -> None:
+    _run(["git", "remote", "add", "origin", "git@github.com:acme/repo-dev.git"], repo)
+    _run(["git", "config", "branch.feature.remote", "origin"], repo)
+    if not configured_base:
+        _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    pr = {
+        "number": 77,
+        "title": "Fork PR",
+        "state": "OPEN",
+        "url": "https://github.com/acme/repo/pull/77",
+        "baseRefName": "main",
+        "headRefName": "alice/feature",
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if tuple(argv) == ("repo", "set-default", "--view") and configured_base:
+            return (0, "acme/repo\n", "")
+        if tuple(argv[:2]) == ("pr", "view") and "-R" in argv:
+            assert argv[2:5] == ["77", "-R", "acme/repo"]
+            return (0, json.dumps(pr), "")
+        if argv[0] == "api":
+            if argv[1].startswith("repos/acme/repo-dev/commits/"):
+                return fork_result
+            assert argv[1].startswith("repos/acme/repo/commits/")
+            rows = [{"number": 77, "state": "open", "base": {"repo": {"full_name": "acme/repo"}}}]
+            return (0, json.dumps(rows), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 77
+    assert info["pr"]["head_ref"] == "alice/feature"
+    assert info["repo"] == {"name_with_owner": "acme/repo"}
+    assert info["base_ref"] == "main"
+    if configured_base:
+        assert ("repo", "set-default", "acme/repo") not in calls
+
+
 def test_github_info_no_false_positive_on_default_branch(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -352,6 +412,17 @@ def test_commit_lookup_repo_prefers_tracking_remote(repo: Path) -> None:
     # With a tracking remote set, that wins.
     _run(["git", "config", "branch.feature.remote", "upstream"], repo)
     assert github_resource._commit_lookup_repo(str(repo)) == "acme/repo"
+
+
+def test_commit_lookup_repos_deduplicates_base_and_remotes(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _run(["git", "remote", "add", "origin", "git@github.com:acme/repo-dev.git"], repo)
+    _run(["git", "remote", "add", "upstream", "https://github.com/acme/repo.git"], repo)
+    _run(["git", "remote", "add", "mirror", "git@github.com:acme/repo.git"], repo)
+    _stub_gh(monkeypatch, {("repo", "set-default", "--view"): (0, "acme/repo\n", "")})
+
+    assert github_resource._commit_lookup_repos(str(repo)) == ["acme/repo", "acme/repo-dev"]
 
 
 def test_head_commit_shas_includes_head(repo: Path) -> None:
