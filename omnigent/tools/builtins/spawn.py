@@ -99,11 +99,10 @@ class SysSessionSendTool(Tool):
     - ``unknown sub-agent type`` — ``agent`` is not one of the
       declared sub-agent names.
     - a send to a child that is *still starting* its turn is refused
-      with a transient "still starting … retry" message — no active
-      turn exists to steer into yet, so retry once it is running. A send
-      to a child whose turn is already running is instead *steered* into
-      that turn (see the concurrency note in :meth:`description`), not
-      refused.
+      with a transient "still starting … retry" message — retry once it
+      is running. A send to a child whose turn is already running is not
+      refused: it is delivered as a tracked continuation (see the
+      concurrency note in :meth:`description`).
     - ``model`` / ``reasoning_effort`` rejections — these optional
       overrides are create-time-only and must be supported by the
       resolved child harness; invalid or continuation-time values fail loud.
@@ -142,11 +141,14 @@ class SysSessionSendTool(Tool):
             "sys_session_send tool_calls in the same response with a "
             "distinct task-based title for each independent session — "
             "they dispatch concurrently. Reusing a title continues the "
-            "same session: if its turn is idle this starts a new turn, and "
-            "if a turn is still running the message is steered into it (the "
-            "child picks it up as the turn yields) rather than starting a "
-            "second concurrent turn — so you can nudge a running sub-agent "
-            "instead of only cancelling it. "
+            "same session rather than starting a second concurrent turn: if "
+            "its turn is idle this starts a new turn; if a turn is still "
+            "running the message is delivered into that turn and consumed at "
+            "its next step boundary (so you can nudge a running sub-agent), "
+            "but a turn wedged inside a single long-running step won't see it "
+            "until it yields — cancel with sys_cancel_task if you need to "
+            "stop such a turn. Either way the reply arrives once via "
+            "sys_read_inbox; don't resend to await it. "
             "To attach previously-uploaded files, "
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
