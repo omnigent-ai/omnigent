@@ -1934,9 +1934,10 @@ def test_host_stop_undiscoverable_local_server_degrades_to_daemon_only(
 ) -> None:
     """A local daemon whose server vanished still stops without ``--force``.
 
-    A local-mode record with no healthy server to discover means the
-    detached server is gone; a plain ``host stop`` should still terminate
-    the daemon rather than error out.
+    A local-mode record with no healthy server to discover and a
+    confirmed-dead server process means the detached server is gone; a
+    plain ``host stop`` should still terminate the daemon rather than
+    error out.
     """
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     _write_daemon_registry_record(
@@ -1947,6 +1948,7 @@ def test_host_stop_undiscoverable_local_server_degrades_to_daemon_only(
         server_url=None,
     )
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_local_server_confirmed_dead", lambda: True)
     monkeypatch.setattr(
         cli,
         "_host_http_json",
@@ -1993,6 +1995,134 @@ def test_host_http_json_marks_connection_refused_unreachable(
     assert result.status_code == 0
     assert result.unreachable is True
     assert "ConnectError" in str(result.body)
+
+
+def test_host_stop_slow_local_server_with_live_pid_keeps_force_guidance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live-but-slow local server must not trigger the daemon-only degrade.
+
+    ``local_server_url_if_healthy`` returns ``None`` on any ``/health``
+    timeout or non-200 even while the server process is alive; that is a
+    slow server, not a gone one, so the stop must fail loudly with the
+    ``--force`` guidance instead of silently reaping the daemon and its
+    record.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_local_server_confirmed_dead", lambda: False)
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated despite a live server process"),
+    )
+
+    result = CliRunner().invoke(cli_group, ["host", "stop", "--server", ""])
+
+    assert result.exit_code != 0
+    assert "--force" in result.output
+
+
+def test_local_server_confirmed_dead_requires_dead_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a missing pidfile or a dead recorded PID counts as confirmed dead."""
+    import omnigent.host.local_server as local_server
+
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: None)
+    assert cli._local_server_confirmed_dead() is True
+
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    assert cli._local_server_confirmed_dead() is False
+
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: False)
+    assert cli._local_server_confirmed_dead() is True
+
+
+def test_host_http_json_loopback_timeout_is_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback timeout stays ``unreachable=False`` — slow is not gone."""
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+
+    class _TimingOutClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def __enter__(self) -> _TimingOutClient:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def request(self, *args: Any, **kwargs: Any) -> None:
+            raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(httpx, "Client", _TimingOutClient)
+
+    result = cli._host_http_json(
+        base_url="http://127.0.0.1:6767",
+        method="GET",
+        path="/v1/sessions",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert result.unreachable is False
+    assert "ReadTimeout" in str(result.body)
+
+
+def test_host_http_json_loopback_http_error_is_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback HTTP 500 stays ``unreachable=False`` — erroring is not gone."""
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+
+    class _Response:
+        status_code = 500
+
+        @staticmethod
+        def json() -> dict[str, str]:
+            return {"detail": "internal error"}
+
+    class _ErroringClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def __enter__(self) -> _ErroringClient:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def request(self, *args: Any, **kwargs: Any) -> _Response:
+            return _Response()
+
+    monkeypatch.setattr(httpx, "Client", _ErroringClient)
+
+    result = cli._host_http_json(
+        base_url="http://127.0.0.1:6767",
+        method="GET",
+        path="/v1/sessions",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 500
+    assert result.unreachable is False
 
 
 def test_host_http_json_remote_connect_failure_is_not_unreachable(

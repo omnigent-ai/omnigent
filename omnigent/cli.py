@@ -9197,6 +9197,26 @@ def _fetch_session_pages(
         after = page.last_id
 
 
+def _local_server_confirmed_dead() -> bool:
+    """
+    Report whether the recorded local server process is confirmed dead.
+
+    A failed ``/health`` probe alone must not count: a live-but-slow server
+    misses the 2s probe too, and ``local_server_url_if_healthy`` collapses
+    both cases to ``None``. Only a missing/malformed pidfile or a recorded
+    PID that no longer runs proves the server is gone rather than slow.
+
+    :returns: ``True`` when no recorded local server process is alive.
+    """
+    from omnigent.host.local_server import _read_local_server_pid_file
+
+    existing = _read_local_server_pid_file()
+    if existing is None:
+        return True
+    pid, _port = existing
+    return not _pid_alive(pid)
+
+
 def _sessions_for_daemon(
     record: _HostDaemonRecord,
     *,
@@ -9212,13 +9232,15 @@ def _sessions_for_daemon(
     """
     base_url = _daemon_base_url(record)
     if base_url is None:
-        # Local mode with no healthy server on record — the server is gone,
-        # not merely slow.
+        # Local mode with no healthy server on record. A failed ``/health``
+        # probe may just be a slow or briefly erroring server, so "gone" is
+        # claimed only when the recorded server process is confirmed dead;
+        # otherwise the caller keeps the loud ``--force`` guidance.
         return _DaemonSessionsResult(
             base_url=None,
             sessions=[],
             error="local Omnigent server is not reachable",
-            unreachable=True,
+            unreachable=_local_server_confirmed_dead(),
         )
     host_id = record.host_id or _load_existing_host_id()
     if not host_id:
