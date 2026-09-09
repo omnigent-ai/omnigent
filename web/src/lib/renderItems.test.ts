@@ -88,6 +88,222 @@ describe("buildBubbles — bubble grouping", () => {
     expect((asst.items[0] as Extract<RenderItem, { kind: "text" }>).text).toBe("Hi!");
   });
 
+  it("keeps a response expanded after a user interjects into that response", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_merge" }),
+        fullText: "Waiting for the merge bot.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_merge" }),
+        content: [{ type: "input_text", text: "Does this conflict?" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "checking", responseId: "resp_merge" }),
+        fullText: "Checking.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "tool", responseId: "resp_merge" }),
+        executions: [mkExec("shell", "call_1")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_merge" }),
+        fullText: "No conflict.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "cleanup", responseId: "resp_merge" }),
+        executions: [mkExec("shell", "call_2")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "done", responseId: "resp_merge" }),
+        fullText: "Merged.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    const continuation = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(continuation.items.map((item) => item.kind)).toEqual([
+      "text",
+      "tool",
+      "text",
+      "tool",
+      "text",
+    ]);
+    expect(continuation.defaultExpanded).toBe(true);
+  });
+
+  it("does not mark an ordinary next turn or anonymous live fragments as an interjection", () => {
+    const ordinary: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_1" }),
+        fullText: "First answer.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_2" }),
+        content: [{ type: "input_text", text: "Next question" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "work", responseId: "resp_2" }),
+        fullText: "Working.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "tool", responseId: "resp_2" }),
+        executions: [mkExec("shell", "call_1")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "done", responseId: "resp_2" }),
+        fullText: "Second answer.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const ordinaryReply = buildBubbles(ordinary, null)[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(ordinaryReply.defaultExpanded).toBeUndefined();
+
+    const anonymous = ordinary.map((block) => ({
+      ...block,
+      ctx: { ...block.ctx, responseId: "" },
+    })) as AnyBlock[];
+    const anonymousReply = buildBubbles(anonymous, null)[2] as Extract<
+      Bubble,
+      { kind: "assistant" }
+    >;
+    expect(anonymousReply.defaultExpanded).toBeUndefined();
+  });
+
+  it("does not detect an interjection across a completed-response marker", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_reused" }),
+        fullText: "First answer.",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "response_end",
+        ctx: ctx({ responseId: "resp_reused" }),
+        status: "completed",
+        response: { id: "resp_reused", status: "completed", model: "test" },
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_reused" }),
+        content: [{ type: "input_text", text: "Next question" }],
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_reused" }),
+        fullText: "Second answer.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    const reply = buildBubbles(blocks, null)[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(reply.defaultExpanded).toBeUndefined();
+  });
+
+  it("does not leak interjection expansion across system or response boundaries", () => {
+    const before: AnyBlock = {
+      type: "text_done",
+      ctx: ctx({ itemId: "before", responseId: "resp_reused" }),
+      fullText: "Waiting for work.",
+      hasCodeBlocks: false,
+    };
+    const human: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "question", responseId: "resp_reused" }),
+      content: [{ type: "input_text", text: "Does this conflict?" }],
+    };
+    const answer = (responseId: string): AnyBlock => ({
+      type: "text_done",
+      ctx: ctx({ itemId: `answer_${responseId}`, responseId }),
+      fullText: "Done.",
+      hasCodeBlocks: false,
+    });
+    const lastAssistant = (blocks: AnyBlock[]) =>
+      buildBubbles(blocks, null).filter(
+        (bubble): bubble is Extract<Bubble, { kind: "assistant" }> => bubble.kind === "assistant",
+      )[1]!;
+
+    const system: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "wake", responseId: "resp_reused" }),
+      content: [{ type: "input_text", text: "[System: timer timer_1 fired]" }],
+    };
+    expect(lastAssistant([before, system, answer("resp_reused")]).defaultExpanded).toBeUndefined();
+
+    const restarted: AnyBlock = {
+      type: "response_start",
+      ctx: ctx({ responseId: "resp_reused" }),
+      model: "test",
+      responseId: "resp_reused",
+      conversationId: null,
+    };
+    expect(
+      lastAssistant([before, human, restarted, answer("resp_reused")]).defaultExpanded,
+    ).toBeUndefined();
+
+    expect(lastAssistant([before, human, answer("resp_new")]).defaultExpanded).toBeUndefined();
+  });
+
+  it("detects an interjection identically through the incremental bubble cache", () => {
+    const cache = createBubbleCache();
+    const before: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "before", responseId: "resp_merge" }),
+        fullText: "Waiting for merge.",
+        hasCodeBlocks: false,
+      },
+    ];
+    buildBubbles(before, null, cache);
+    const withQuestion: AnyBlock[] = [
+      ...before,
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "question", responseId: "resp_merge" }),
+        content: [{ type: "input_text", text: "Does this conflict?" }],
+      },
+    ];
+    buildBubbles(withQuestion, null, cache);
+    const withAnswer: AnyBlock[] = [
+      ...withQuestion,
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "answer", responseId: "resp_merge" }),
+        fullText: "No conflict.",
+        hasCodeBlocks: false,
+      },
+    ];
+
+    expect(buildBubbles(withAnswer, null, cache)).toEqual(buildBubbles(withAnswer, null));
+    const reply = buildBubbles(withAnswer, null, cache)[2] as Extract<
+      Bubble,
+      { kind: "assistant" }
+    >;
+    expect(reply.defaultExpanded).toBe(true);
+  });
+
   it("propagates ctx.createdBy onto the user bubble", () => {
     const blocks: AnyBlock[] = [
       {
@@ -2943,6 +3159,12 @@ describe("bubblesEqual — React.memo comparator", () => {
     expect(bubblesEqual(assistant("Done", "streaming"), assistant("Done", "completed"))).toBe(
       false,
     );
+  });
+
+  it("reports not-equal when interjection expansion changes", () => {
+    const collapsed = assistant("Done", "completed") as Extract<Bubble, { kind: "assistant" }>;
+    const expanded: Bubble = { ...collapsed, defaultExpanded: true };
+    expect(bubblesEqual(collapsed, expanded)).toBe(false);
   });
 
   it("reports not-equal when the item count changes", () => {
