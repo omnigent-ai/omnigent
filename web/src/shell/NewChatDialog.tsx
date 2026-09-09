@@ -11,6 +11,7 @@ import {
   ChevronsUpDownIcon,
   GitBranchIcon,
   LockIcon,
+  ArchiveIcon,
   ArrowUpIcon,
   Loader2Icon,
   FileTextIcon,
@@ -72,7 +73,12 @@ import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/gi
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { randomUUID } from "@/lib/randomUUID";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import {
+  attachmentKey,
+  classifyAttachment,
+  isWorkspaceDelivered,
+  validateAttachments,
+} from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -5094,7 +5100,7 @@ export function NewChatLandingScreen() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept="image/*,application/pdf,text/*,application/json"
+              accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
               className="hidden"
               data-testid="new-chat-landing-file-input"
               onChange={(e) => {
@@ -5139,27 +5145,45 @@ export function NewChatLandingScreen() {
             {/* File chips — shown below the textarea when files are attached. */}
             {files.length > 0 && (
               <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                {files.map((file, i) => (
-                  <span
-                    key={attachmentKey(file)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    {file.type.startsWith("image/") ? (
-                      <ImageIcon className="size-3 shrink-0" />
-                    ) : (
-                      <FileTextIcon className="size-3 shrink-0" />
-                    )}
-                    <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
-                    <button
-                      type="button"
-                      onClick={() => removeFile(i)}
-                      className="ml-0.5 rounded-full hover:text-foreground"
-                      aria-label={`Remove ${file.name || "image.png"}`}
+                {files.map((file, i) => {
+                  const category = classifyAttachment(file);
+                  // Same delivery-mode label the in-session composer shows, so
+                  // the first message of a session reads like the rest.
+                  const toWorkspace = category !== null && isWorkspaceDelivered(category);
+                  return (
+                    <span
+                      key={attachmentKey(file)}
+                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                      title={
+                        toWorkspace
+                          ? `${file.name} will be placed in the session workspace for the agent to open`
+                          : undefined
+                      }
                     >
-                      <XIcon className="size-3" />
-                    </button>
-                  </span>
-                ))}
+                      {toWorkspace ? (
+                        <ArchiveIcon className="size-3 shrink-0" />
+                      ) : file.type.startsWith("image/") ? (
+                        <ImageIcon className="size-3 shrink-0" />
+                      ) : (
+                        <FileTextIcon className="size-3 shrink-0" />
+                      )}
+                      <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
+                      {toWorkspace && (
+                        <span className="shrink-0 rounded-sm bg-background px-1 text-[10px] leading-4">
+                          workspace
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => removeFile(i)}
+                        className="ml-0.5 rounded-full hover:text-foreground"
+                        aria-label={`Remove ${file.name || "image.png"}`}
+                      >
+                        <XIcon className="size-3" />
+                      </button>
+                    </span>
+                  );
+                })}
               </div>
             )}
             {/* Rejected-attachment feedback: unsupported type or too large */}

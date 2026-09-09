@@ -3473,13 +3473,13 @@ describe("NewChatLandingScreen attachments", () => {
   // the user never wanted.
   it("rejects an unsupported attachment instead of attaching it", () => {
     renderLanding();
-    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
-      target: { files: [zip] },
+      target: { files: [clip] },
     });
-    expect(screen.queryByText("photos.zip")).toBeNull();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
-      "only images, PDF, and text/code files are supported",
+      "archives, office documents, and databases are supported",
     );
   });
 
@@ -3487,12 +3487,12 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
-    fireEvent.drop(composer, { dataTransfer: fileDrag([ok, zip]) });
+    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.drop(composer, { dataTransfer: fileDrag([ok, clip]) });
     expect(screen.getByText("notes.txt")).toBeTruthy();
-    expect(screen.queryByText("photos.zip")).toBeNull();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
-      "photos.zip",
+      "clip.mp4",
     );
     // Removing the accepted chip clears the stale rejection notice too.
     fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
@@ -3504,9 +3504,9 @@ describe("NewChatLandingScreen attachments", () => {
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
     renderLanding();
-    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
-      target: { files: [zip] },
+      target: { files: [clip] },
     });
     expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
 

@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
+from omnigent.inner.native_attachments import MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
 from omnigent.runtime.content_resolver import (
     MAX_IMAGE_UPLOAD_BYTES,
     MAX_TEXT_UPLOAD_BYTES,
@@ -76,15 +77,67 @@ def test_upload_small_text_file_succeeds(upload_client: tuple[TestClient, str]) 
 
 
 def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) -> None:
-    """A pptx (binary office doc) is rejected with 415, not stored."""
+    """A type that is neither inlinable nor workspace-materializable is
+    rejected with 415, not stored."""
     client, session_id = upload_client
-    pptx_mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     resp = client.post(
         f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("deck.pptx", b"PK\x03\x04 fake pptx bytes", pptx_mime)},
+        files={"file": ("clip.mp4", b"\x00\x00\x00 fake mp4 bytes", "video/mp4")},
     )
     assert resp.status_code == 415, resp.text
     assert "Unsupported attachment type" in resp.text
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime"),
+    [
+        ("archive.zip", "application/zip"),
+        (
+            "deck.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        ("app.db", "application/octet-stream"),
+    ],
+)
+def test_upload_accepts_workspace_materialize_types(
+    upload_client: tuple[TestClient, str], filename: str, mime: str
+) -> None:
+    """Archives, office docs, and databases upload instead of 415ing — a
+    filesystem-capable harness reads them off disk rather than inlining them."""
+    client, session_id = upload_client
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": (filename, b"PK\x03\x04 fake bytes", mime)},
+    )
+    assert resp.status_code in (200, 201), resp.text
+    assert resp.json()["name"] == filename
+
+
+def test_upload_docx_mislabeled_as_zip_is_accepted(
+    upload_client: tuple[TestClient, str],
+) -> None:
+    """Office formats are zip containers, so browsers routinely report them as
+    application/zip. The extension decides, not the declared MIME."""
+    client, session_id = upload_client
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("report.docx", b"PK\x03\x04 fake docx bytes", "application/zip")},
+    )
+    assert resp.status_code in (200, 201), resp.text
+    assert resp.json()["name"] == "report.docx"
+
+
+def test_upload_rejects_oversized_workspace_materialize_file(
+    upload_client: tuple[TestClient, str],
+) -> None:
+    """A zip over the workspace-materialize per-file cap is rejected with 413."""
+    client, session_id = upload_client
+    oversized = b"\x00" * (MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES + 1)
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("huge.zip", oversized, "application/zip")},
+    )
+    assert resp.status_code == 413, resp.status_code
 
 
 def test_upload_rejects_oversized_image(upload_client: tuple[TestClient, str]) -> None:
@@ -155,3 +208,109 @@ async def test_read_upload_capped_rejects_one_over_limit() -> None:
     with _pytest.raises(HTTPException) as exc_info:
         await _read_upload_capped(_FakeUpload(b"x" * 101), 100)
     assert exc_info.value.status_code == 413
+
+
+def test_upload_rejects_an_extension_the_deployment_denies(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An operator can narrow the built-in allowlist without a code change.
+
+    Without this a deployment that must not accept archives has no way to
+    refuse them short of forking, which is what the issue's "allow deployments
+    to deny selected MIME types or extensions" requirement is for.
+    """
+    monkeypatch.setattr(
+        "omnigent.server.server_config.workspace_attachment_denied_extensions",
+        lambda: frozenset({".zip"}),
+    )
+    client, session_id = upload_client
+
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"PK\x03\x04 fake zip", "application/zip")},
+    )
+
+    assert resp.status_code == 415, resp.text
+    assert "not accepted by this deployment" in resp.text
+
+
+def test_upload_still_accepts_a_type_the_denylist_does_not_name(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The denylist narrows the allowlist precisely, not wholesale."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.workspace_attachment_denied_extensions",
+        lambda: frozenset({".zip"}),
+    )
+    client, session_id = upload_client
+
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("report.docx", b"PK\x03\x04 fake docx", "application/zip")},
+    )
+
+    assert resp.status_code in (200, 201), resp.text
+
+
+def test_upload_rejects_once_the_session_file_quota_is_spent(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The per-session file count is enforced across uploads, not per request.
+
+    Counting only the current upload would let a session accumulate unbounded
+    files in the sandbox one request at a time.
+    """
+    monkeypatch.setattr(
+        "omnigent.server.server_config.workspace_attachment_file_limit",
+        lambda: 2,
+    )
+    client, session_id = upload_client
+
+    for i in range(2):
+        ok = client.post(
+            f"/v1/sessions/{session_id}/resources/files",
+            files={"file": (f"a{i}.zip", b"PK\x03\x04 fake zip", "application/zip")},
+        )
+        assert ok.status_code in (200, 201), ok.text
+
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("third.zip", b"PK\x03\x04 fake zip", "application/zip")},
+    )
+
+    assert resp.status_code == 413, resp.text
+    assert "workspace attachments" in resp.text
+
+
+def test_inlined_attachments_do_not_spend_the_workspace_quota(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Images and text never reach the sandbox filesystem, so they must not
+    count against a quota that exists to bound sandbox disk use.
+    """
+    monkeypatch.setattr(
+        "omnigent.server.server_config.workspace_attachment_file_limit",
+        lambda: 1,
+    )
+    client, session_id = upload_client
+
+    for name in ("a.txt", "b.txt", "c.txt"):
+        filler = client.post(
+            f"/v1/sessions/{session_id}/resources/files",
+            files={"file": (name, b"hello", "text/plain")},
+        )
+        assert filler.status_code in (200, 201), filler.text
+
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("bundle.zip", b"PK\x03\x04 fake zip", "application/zip")},
+    )
+
+    assert resp.status_code in (200, 201), resp.text

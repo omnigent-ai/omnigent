@@ -27,6 +27,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
+from pathlib import PurePath
 from typing import Any, Literal, cast
 
 import httpx
@@ -281,6 +282,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
+from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.cost_plan import (
@@ -10159,6 +10161,99 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# Pages of a session's files scanned when totalling its workspace-materialized
+# attachments. Bounds the walk so a session with a very large file list cannot
+# turn one upload into an unbounded number of store reads; the per-session file
+# quota is far below this in every supported configuration.
+_WORKSPACE_QUOTA_SCAN_PAGES = 20
+_WORKSPACE_QUOTA_PAGE_SIZE = 100
+
+
+def _enforce_workspace_attachment_policy(
+    filename: str,
+    *,
+    session_id: str,
+    file_store: FileStore,
+) -> int:
+    """
+    Apply deployment policy to one workspace-materialized upload.
+
+    Enforces the operator denylist and the per-session file-count and total-byte
+    quotas before the body is read, so a rejected upload never buffers. The
+    runner re-checks its own quotas when it writes the file; this is the
+    authoritative gate that can answer with a clear HTTP status.
+
+    :param filename: The upload's original filename, e.g. ``"bundle.zip"``.
+    :param session_id: Owning session, whose existing attachments are counted.
+    :param file_store: Store used to total the session's current usage.
+    :returns: The per-file byte cap this upload must stay within.
+    :raises HTTPException: 415 when the extension is denied by configuration,
+        or 413 when the session's file-count or total-byte quota is exhausted.
+    """
+    from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+    from omnigent.server.server_config import (
+        workspace_attachment_denied_extensions,
+        workspace_attachment_file_limit,
+        workspace_attachment_total_bytes_limit,
+        workspace_attachment_upload_limit,
+    )
+
+    suffix = PurePath(filename).suffix.lower()
+    if suffix in workspace_attachment_denied_extensions():
+        raise HTTPException(
+            status_code=415,
+            detail=f"Attachments of type '{suffix}' are not accepted by this deployment.",
+        )
+
+    max_files = workspace_attachment_file_limit()
+    max_total_bytes = workspace_attachment_total_bytes_limit()
+
+    used_files = 0
+    used_bytes = 0
+    after: str | None = None
+    for _ in range(_WORKSPACE_QUOTA_SCAN_PAGES):
+        page = file_store.list(
+            session_id=session_id,
+            limit=_WORKSPACE_QUOTA_PAGE_SIZE,
+            after=after,
+            order="asc",
+        )
+        for stored in page.data:
+            # Count only the workspace-delivered files: inlined attachments
+            # never reach the sandbox filesystem and so spend none of this quota.
+            if workspace_materialize_upload_limit(stored.filename) is not None:
+                used_files += 1
+                used_bytes += stored.bytes
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+
+    if used_files + 1 > max_files:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"This session already holds {used_files} workspace attachments "
+                f"(limit {max_files}). Remove one before attaching another."
+            ),
+        )
+    if used_bytes >= max_total_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"This session's workspace attachments already use "
+                f"{used_bytes // (1024 * 1024)} MB of the "
+                f"{max_total_bytes // (1024 * 1024)} MB limit."
+            ),
+        )
+
+    # Cap this upload at whichever is smaller: the per-file limit, or the
+    # session's remaining budget. Without the second term a single upload could
+    # overshoot the session total by nearly a whole file.
+    per_file = workspace_attachment_upload_limit()
+    remaining = max_total_bytes - used_bytes
+    return min(per_file, remaining)
 
 
 async def _load_runner_skills(
