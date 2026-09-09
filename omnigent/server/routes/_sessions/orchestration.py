@@ -130,7 +130,6 @@ from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
     validate_session_model_metadata,
@@ -332,6 +331,7 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
     SkillSummary,
 )
+from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.spec.types import (
     AgentSpec,
     Phase,

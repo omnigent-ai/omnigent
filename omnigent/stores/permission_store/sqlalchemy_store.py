@@ -439,18 +439,28 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 "background_session_titles_enabled": enabled,
             }
             if self._engine.dialect.name == "sqlite":
-                stmt = sqlite_insert(SqlUser).values(**values).on_conflict_do_update(
-                    index_elements=["workspace_id", "id"],
-                    set_={"background_session_titles_enabled": enabled},
+                stmt = (
+                    sqlite_insert(SqlUser)
+                    .values(**values)
+                    .on_conflict_do_update(
+                        index_elements=["workspace_id", "id"],
+                        set_={"background_session_titles_enabled": enabled},
+                    )
                 )
             elif self._engine.dialect.name == "mysql":
-                stmt = mysql_insert(SqlUser).values(**values).on_duplicate_key_update(
-                    background_session_titles_enabled=enabled
+                stmt = (
+                    mysql_insert(SqlUser)
+                    .values(**values)
+                    .on_duplicate_key_update(background_session_titles_enabled=enabled)
                 )
             else:
-                stmt = pg_insert(SqlUser).values(**values).on_conflict_do_update(
-                    index_elements=["workspace_id", "id"],
-                    set_={"background_session_titles_enabled": enabled},
+                stmt = (
+                    pg_insert(SqlUser)
+                    .values(**values)
+                    .on_conflict_do_update(
+                        index_elements=["workspace_id", "id"],
+                        set_={"background_session_titles_enabled": enabled},
+                    )
                 )
             session.execute(stmt)
 

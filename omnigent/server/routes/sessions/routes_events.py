@@ -76,7 +76,6 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
@@ -209,6 +208,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
+from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
