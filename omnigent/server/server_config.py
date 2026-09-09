@@ -186,6 +186,77 @@ def copy_total_bytes_limit() -> int:
     return _config_positive_int("copy_max_total_bytes", MAX_COPY_TOTAL_BYTES)
 
 
+def workspace_attachment_upload_limit() -> int:
+    """Max byte size of a single workspace-materialized attachment.
+
+    Config key ``workspace_attachment_max_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES`.
+    """
+    from omnigent.inner.native_attachments import MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
+
+    return _config_positive_int(
+        "workspace_attachment_max_bytes", MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
+    )
+
+
+def workspace_attachment_file_limit() -> int:
+    """Max number of workspace-materialized attachments one session may hold.
+
+    Config key ``workspace_attachment_max_files``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_WORKSPACE_ATTACHMENTS`.
+    """
+    from omnigent.inner.native_attachments import MAX_SESSION_WORKSPACE_ATTACHMENTS
+
+    return _config_positive_int(
+        "workspace_attachment_max_files", MAX_SESSION_WORKSPACE_ATTACHMENTS
+    )
+
+
+def workspace_attachment_total_bytes_limit() -> int:
+    """Max summed bytes of workspace-materialized attachments per session.
+
+    Config key ``workspace_attachment_max_total_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES`.
+    """
+    from omnigent.inner.native_attachments import MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES
+
+    return _config_positive_int(
+        "workspace_attachment_max_total_bytes", MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES
+    )
+
+
+def workspace_attachment_denied_extensions() -> frozenset[str]:
+    """Extensions a deployment refuses to materialize, beyond the allowlist.
+
+    Config key ``workspace_attachment_denied_extensions``, a list of
+    extensions with or without the leading dot (``[".zip", "docx"]``).
+    Lets an operator narrow the built-in allowlist — e.g. deny archives
+    while still accepting office documents — without a code change.
+    Unparseable entries are skipped rather than failing the upload path.
+    """
+    raw = load_server_config().get("workspace_attachment_denied_extensions")
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, list):
+        logger.warning(
+            "server config workspace_attachment_denied_extensions=%r is not a list — ignoring",
+            raw,
+        )
+        return frozenset()
+    denied: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            logger.warning(
+                "server config workspace_attachment_denied_extensions entry %r is not a "
+                "non-empty string — skipping",
+                entry,
+            )
+            continue
+        value = entry.strip().lower()
+        denied.add(value if value.startswith(".") else f".{value}")
+    return frozenset(denied)
+
+
 def _branding_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     """Return the ``branding:`` mapping, or ``{}`` when absent/not a map."""
     section = config.get("branding")
