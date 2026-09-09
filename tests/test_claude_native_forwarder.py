@@ -9,8 +9,9 @@ import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -6323,6 +6324,201 @@ async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Pat
             timeout=3.0,
         )
     assert maximum_active == 8
+
+
+@pytest.mark.asyncio
+async def test_concurrent_subagent_502s_recover_without_phantom_completion(
+    tmp_path: Path,
+) -> None:
+    """A failed fan-out retries every child before any child can finish idle."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    old_activity = time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60
+    entries: dict[str, forwarder.SubagentEntry] = {}
+    for index in range(5):
+        subagent_id = f"recover-{index}"
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id=subagent_id,
+            agent_type="Explore",
+            description="concurrent retry",
+            tool_use_id=f"toolu_recover_{index}",
+            transcript_records=[
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": f"recover-message-{index}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": str(index)}],
+                    },
+                }
+            ],
+        )
+        entries[subagent_id] = forwarder.SubagentEntry(
+            subagent_id=subagent_id,
+            child_conversation_id=f"conv_recover_{index}",
+            last_activity_ts=old_activity,
+            last_status="running",
+        )
+
+    attempts: dict[str, int] = {}
+    statuses: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        child_id = request.url.path.split("/")[-2]
+        if isinstance(body, list):
+            attempts[child_id] = attempts.get(child_id, 0) + 1
+            if attempts[child_id] == 1:
+                return httpx.Response(502, text="bad gateway")
+            return httpx.Response(202, json=[{"item_id": f"item-{child_id}"}])
+        if body.get("type") == "external_session_status":
+            statuses.append((child_id, body["data"]["status"]))
+        return httpx.Response(202, json={})
+
+    tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=3,
+    )
+    state = forwarder.SubagentForwardState(subagents=entries)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        assert statuses == []
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        quiet_entries = {
+            subagent_id: replace(entry, last_activity_ts=old_activity)
+            for subagent_id, entry in state.subagents.items()
+        }
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents=quiet_entries),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert set(attempts.values()) == {2}
+    assert sorted(status for _, status in statuses) == ["idle"] * 5
+    assert all(entry.delivery_error is None for entry in state.subagents.values())
+
+
+@pytest.mark.asyncio
+async def test_persistent_subagent_502_ends_as_explicit_failure(tmp_path: Path) -> None:
+    """A child that exhausts 502 retries fails with recoverable dead letters."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagent_id = "persistent-502"
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id=subagent_id,
+        agent_type="Explore",
+        description="persistent outage",
+        tool_use_id="toolu_persistent_502",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "persistent-message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "lost output"}],
+                },
+            }
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            subagent_id: forwarder.SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id="conv_persistent_502",
+            )
+        }
+    )
+    statuses: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if isinstance(body, list):
+            return httpx.Response(502, text="bad gateway")
+        if body.get("type") == "external_session_status":
+            statuses.append(body["data"])
+        return httpx.Response(202, json={})
+
+    tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=2,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(2):
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=tracker,
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            )
+        failed_entry = replace(
+            state.subagents[subagent_id],
+            last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60,
+        )
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={subagent_id: failed_entry}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert statuses == [{"status": "failed", "output": forwarder._SUBAGENT_DROPPED_ITEM_REASON}]
+    assert state.subagents[subagent_id].delivery_error == forwarder._SUBAGENT_DROPPED_ITEM_REASON
+    persisted = forwarder._read_subagent_forward_state(bridge_dir)
+    assert (
+        persisted.subagents[subagent_id].delivery_error == forwarder._SUBAGENT_DROPPED_ITEM_REASON
+    )
+    dead_letters = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    assert len(dead_letters) == 1
+    assert json.loads(dead_letters[0])["http_status"] == 502
 
 
 @pytest.mark.asyncio
