@@ -237,8 +237,15 @@ export function loadFontByFamily(
   return { entry, ready: entry ? loadFont(entry) : Promise.resolve(false) };
 }
 
-/** Test-only: clear the in-flight/loaded dedup cache and injected-node index. */
+/**
+ * Test-only: clear the in-flight/loaded dedup cache and remove every node this
+ * loader injected, so a test starts from a clean DOM without hand-removing the
+ * `<link>`/`<style>` nodes itself.
+ */
 export function resetFontLoaderForTests(): void {
   loads.clear();
+  for (const nodes of injected.values()) {
+    for (const node of nodes) node.remove();
+  }
   injected.clear();
 }

@@ -25,11 +25,7 @@ import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
 import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
-import {
-  applyStoredUiFontSize,
-  applyUiFontFamily,
-  readUiFontFamily,
-} from "./lib/uiFontPreferences";
+import { restoreFontPreferences } from "./lib/restoreFontPreferences";
 import { migrateLegacyProjectFolderPagination } from "./lib/projectFolderPaginationPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
@@ -95,10 +91,10 @@ applyMobileAppTargetAttribute();
 // can never float it — on any route, chat or auth. No-op off the iOS shell.
 hideNativeChatTerminalBar();
 
-// Apply saved font preferences before first paint. Without a saved size, CSS
-// keeps its viewport-specific default.
-applyStoredUiFontSize();
-applyUiFontFamily(readUiFontFamily());
+// Apply the saved UI + code font preferences before first paint so there's no
+// flash, and kick off the catalog webfont loads so a chosen font is fetched on
+// boot rather than only on the next Settings change.
+restoreFontPreferences();
 
 // The standalone sidebar font size control was removed. Clear its legacy value
 // so sidebar items follow the shared desktop interface size.
