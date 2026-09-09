@@ -116,7 +116,8 @@ async def test_linux_bwrap_real_signer_relay_with_deterministic_worker(tmp_path:
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
         """#!/usr/bin/python3
-import json, os, sys, urllib.request
+import http.client, json, os, ssl, sys
+from urllib.parse import urlsplit
 if "--version" in sys.argv:
     print("codex-cli 0.146.0")
     raise SystemExit(0)
@@ -130,18 +131,31 @@ for line in sys.stdin:
         result = {"thread": {"id": "thread-bwrap"}}
     elif method == "turn/start":
         body = json.dumps({"model": "gpt-5.4-mini", "input": "probe"}).encode()
-        upstream = urllib.request.Request(
-            "https://model.test/v1/responses",
-            data=body,
-            headers={
+        proxy = urlsplit(os.environ["HTTPS_PROXY"])
+        tls = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
+        connection = http.client.HTTPSConnection(
+            proxy.hostname,
+            proxy.port,
+            timeout=10,
+            context=tls,
+        )
+        connection.set_tunnel("model.test", 443)
+        try:
+            connection.request(
+                "POST",
+                "/v1/responses",
+                body=body,
+                headers={
                 "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
                 "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(upstream, timeout=10) as response:
+                "Connection": "keep-alive",
+                },
+            )
+            response = connection.getresponse()
             assert response.status == 200
             assert b"BROKERED_E2E_OK" in response.read()
+        finally:
+            connection.close()
         result = {"turn": {"id": "turn-bwrap"}}
     else:
         result = {}

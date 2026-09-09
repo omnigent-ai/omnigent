@@ -428,10 +428,19 @@ async def test_real_signer_relays_only_placeholder_authorized_responses(
         ),
     )
     signer = SubprocessModelSigner(config)
-    private_before = set(Path("/tmp").glob("omnigent-model-signer-private-*"))
 
     readiness = await signer.start()
-    private_dirs = set(Path("/tmp").glob("omnigent-model-signer-private-*")) - private_before
+    public_ca = readiness.ca_bundle_path.read_bytes()
+    private_dirs: set[Path] = set()
+    temp_root = readiness.ca_bundle_path.parent.parent
+    for candidate in temp_root.glob("omnigent-model-signer-private-*"):
+        try:
+            if (candidate / "ca.pem").read_bytes() in public_ca:
+                private_dirs.add(candidate)
+        except OSError:
+            # Another xdist worker may tear down its signer while this process
+            # inspects the shared system temporary directory.
+            continue
     assert len(private_dirs) == 1
     private_dir = private_dirs.pop()
     assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
