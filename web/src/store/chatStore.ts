@@ -628,9 +628,15 @@ export interface AppChatState {
   pendingComposerAttachments: ComposerAttachment[];
   /**
    * Text queued into the active composer from outside it — e.g. an OS Share
-   * intent handed off via a `#shared-text=` URL fragment at boot. The
-   * composer drains this into its own input state on mount/change, the same
-   * way it drains {@link ChatState.pendingComposerAttachments}.
+   * intent handed off via a `#shared-text=` URL fragment (see
+   * `lib/shareIntake.ts`). This is a transient signal only: the durable copy
+   * lives in `sessionStorage` (survives the hard navigation an unauthenticated
+   * share round-trips through `/login`), and `useShareIntake` re-populates
+   * this field from there whenever `conversationId` becomes `null` again. The
+   * composer drains it into its own input state on mount/change — inserting
+   * into an empty draft, or offering a recoverable banner over a non-empty
+   * one (never silently discarding either) — the same way it drains
+   * {@link ChatState.pendingComposerAttachments}.
    */
   pendingComposerText: string | null;
   /**
@@ -1995,9 +2001,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // drained yet, so it can't bleed into the incoming composer (which drains
       // the store on mount).
       pendingComposerAttachments: [],
-      // Same reasoning: a queued share-intake text belongs to the composer
-      // that was active when it arrived, not whatever conversation this
-      // switch lands on.
+      // This transient flag is harmless to drop on a switch: the durable
+      // copy lives in sessionStorage (see shareIntake.ts's takePendingShareText),
+      // untouched by this reset, and useShareIntake re-queues it from there
+      // the next time conversationId becomes null again (a share's intended
+      // recipient is always the new-chat composer, never whatever
+      // conversation this switch happens to land on).
       pendingComposerText: null,
     });
     conversationRegistry.setActive(conversationId);

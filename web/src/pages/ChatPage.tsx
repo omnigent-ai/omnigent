@@ -39,6 +39,7 @@ import {
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { takePendingShareText } from "@/lib/shareIntake";
 import {
   Conversation,
   ConversationContent,
@@ -4409,9 +4410,13 @@ export function Composer({
   // cleared from the store so they aren't re-applied.
   const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
   // Text pushed in from outside the composer (e.g. an OS Share intent, see
-  // shareIntake.ts). Drained into ``value`` below, then cleared from the
-  // store so it isn't re-applied on the next render.
+  // shareIntake.ts). Drained into ``value`` below when the composer is
+  // empty, then cleared from the store so it isn't re-applied on the next
+  // render. When the composer already holds a draft, the text moves here
+  // instead -- a recoverable offer the user can insert or dismiss, rather
+  // than the draft silently winning and the share silently vanishing.
   const pendingComposerText = useChatStore((s) => s.pendingComposerText);
+  const [shareBannerText, setShareBannerText] = useState<string | null>(null);
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
@@ -4755,18 +4760,42 @@ export function Composer({
 
   // Drain externally-queued composer text (an OS Share intent, see
   // shareIntake.ts) the same way the attachment queue above is drained.
-  // Only fills an empty composer -- in-progress text the user already typed
-  // wins, same rule as the failed-send-draft restore below.
+  // An empty composer takes it immediately -- in-progress text the user
+  // already typed wins, same rule as the failed-send-draft restore below --
+  // but a non-empty draft does NOT silently discard the share: it moves to
+  // `shareBannerText`, a recoverable offer the user explicitly insert/appends
+  // or dismisses (see the callbacks and banner render below). Either way
+  // this only clears the transient store flag; the durable sessionStorage
+  // copy (see shareIntake.ts) is removed only once the text is actually
+  // inserted or explicitly dismissed, never merely because this effect ran.
   useEffect(() => {
     if (pendingComposerText === null) return;
     if (valueRef.current.trim() === "") {
       setValue(pendingComposerText);
       dirtyRef.current = true;
       if (!isMobileRef.current) textareaRef.current?.focus();
+      takePendingShareText();
+    } else {
+      setShareBannerText(pendingComposerText);
     }
     useChatStore.getState().clearPendingComposerText();
-    return () => useChatStore.getState().clearPendingComposerText();
   }, [pendingComposerText]);
+
+  /** Banner "Insert": appends (or, on an empty draft, sets) the offered share text. */
+  const acceptShareBanner = useCallback(() => {
+    if (shareBannerText === null) return;
+    setValue((prev) => (prev.trim() === "" ? shareBannerText : `${prev}\n${shareBannerText}`));
+    dirtyRef.current = true;
+    if (!isMobileRef.current) textareaRef.current?.focus();
+    takePendingShareText();
+    setShareBannerText(null);
+  }, [shareBannerText]);
+
+  /** Banner "Dismiss": an explicit discard, not a silent one. */
+  const dismissShareBanner = useCallback(() => {
+    takePendingShareText();
+    setShareBannerText(null);
+  }, []);
 
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
@@ -5508,6 +5537,33 @@ export function Composer({
         {attachmentError !== null && (
           <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
             {attachmentError}
+          </div>
+        )}
+        {/* Recoverable OS-share offer: shown instead of silently discarding
+            shared text when it arrived while the composer already held a
+            draft (see the drain effect above). Insert appends to the
+            existing draft; Dismiss is an explicit discard, not a silent one. */}
+        {shareBannerText !== null && (
+          <div className="flex items-center justify-between gap-2 px-4 pb-2 text-sm">
+            <span className="min-w-0 flex-1 truncate text-muted-foreground">
+              Shared text available: &ldquo;{shareBannerText}&rdquo;
+            </span>
+            <span className="flex shrink-0 gap-3">
+              <button
+                type="button"
+                onClick={acceptShareBanner}
+                className="font-medium text-primary hover:underline"
+              >
+                Insert
+              </button>
+              <button
+                type="button"
+                onClick={dismissShareBanner}
+                className="text-muted-foreground hover:underline"
+              >
+                Dismiss
+              </button>
+            </span>
           </div>
         )}
         {/* "@"-mention chips — one per tagged workspace file/folder. Each is
