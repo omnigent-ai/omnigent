@@ -226,7 +226,13 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     terminal-first TUI launched via ``omni hermes`` (tmux pane + bridge dir), not
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
-    approval-mirror unit tests.
+
+    ``omp`` is excluded for the same reason as ``hermes``: it requires the
+    ``omp`` CLI binary and authenticates through its own provider logins or
+    the generated ``models.yml`` gateway transport — not the shared
+    Databricks gateway/profile probe wiring this matrix drives. Its live
+    round-trip is covered by the dedicated
+    ``tests/e2e/omnigent/test_per_harness_omp.py`` suite.
 
     Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
     for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
@@ -254,6 +260,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        "omp",
         *ACP_CLI_HARNESSES,
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

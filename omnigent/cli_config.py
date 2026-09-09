@@ -492,15 +492,16 @@ def _credential_source_hint(entry: ProviderEntry, family: str) -> str | None:
     """
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
     )
 
     raw = entry.families.get(family)
-    if raw is None and family == PI_SURFACE:
-        # The pi surface carries no family block of its own — pi consumes
-        # the credential of whichever family it routes through (anthropic
-        # preferred), so describe that family's source instead.
+    if raw is None and family in (PI_SURFACE, OMP_SURFACE):
+        # The pi/omp surfaces carry no family block of their own — each
+        # consumes the credential of whichever family it routes through
+        # (anthropic preferred), so describe that family's source instead.
         for fam in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
             raw = entry.families.get(fam)
             if raw is not None:
@@ -574,6 +575,25 @@ def _family_credential_label(  # type: ignore[explicit-any]  # config is a yaml-
     return f"{base} ({hint})" if hint else base
 
 
+def _surface_claim_key(surface: str) -> tuple[int, str]:
+    """Order default-claiming so model families precede harness scopes.
+
+    The pi/omp surfaces resolve an *effective* default (explicit scope, else
+    the cross-family fallback), so the add/adopt loops must evaluate them
+    AFTER the families: a scope sorts alphabetically ("omp" < "openai"), and
+    claiming it before the family default exists needlessly pins the scope
+    (``default: [omp, openai]`` instead of ``default: true``), freezing the
+    scope to that provider when it would otherwise follow the family default
+    like pi does.
+
+    :param surface: A harness surface, e.g. ``"openai"`` or ``"omp"``.
+    :returns: Sort key with families first, scopes second, name within.
+    """
+    from omnigent.onboarding.provider_config import OMP_SURFACE, PI_SURFACE
+
+    return (surface in (PI_SURFACE, OMP_SURFACE), surface)
+
+
 def _configure_harness_add(family: str | None = None) -> str | None:
     """Run the interactive ``add a provider`` flow and persist the entry.
 
@@ -616,6 +636,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         CHAT_WIRE_API,
         CLI_CONFIG_KIND,
         DATABRICKS_KIND,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
         RESPONSES_WIRE_API,
@@ -629,7 +650,12 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     # user adds Databricks from a specific harness page, we configure ucode for
     # ONLY that harness (not all of claude/codex/pi) so ucode touches just the
     # one tool the user is wiring up.
-    _FAMILY_UCODE_AGENT = {ANTHROPIC_FAMILY: "claude", OPENAI_FAMILY: "codex", PI_SURFACE: "pi"}
+    _FAMILY_UCODE_AGENT = {
+        ANTHROPIC_FAMILY: "claude",
+        OPENAI_FAMILY: "codex",
+        PI_SURFACE: "pi",
+        OMP_SURFACE: "omp",
+    }
 
     # A flat, credential-aware menu: the user picks "OpenAI — API key" or
     # "Claude — subscription" directly (rather than a bare kind then
@@ -1061,9 +1087,10 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     # so a first provider "just works". An existing default is left alone —
     # the user changes defaults by selecting a provider in the harness tree
     # (per-surface, so a shared provider can default one harness, not both).
-    # The pi surface checks its *effective* default: a family default already
-    # drives pi via the fallback, so claiming the explicit pi scope then
-    # would silently re-route pi away from it.
+    # The pi/omp surfaces check their *effective* default: a family default
+    # already drives them via the fallback, so claiming an explicit scope then
+    # would silently re-route them away from it (families claim first — see
+    # :func:`_surface_claim_key`).
     parsed = load_providers({"providers": {name: entry}})[name]
     # Databricks routing is configured in ucode PER HARNESS (we only ran
     # `ucode configure` for the surface the user drilled into), so it must only
@@ -1074,7 +1101,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     if entry["kind"] == DATABRICKS_KIND and family is not None:
         default_families = [family]
     else:
-        default_families = sorted(provider_families(parsed))
+        default_families = sorted(provider_families(parsed), key=_surface_claim_key)
     became_default: list[str] = []
     for fam in default_families:
         cfg = _load_global_config()
@@ -1165,7 +1192,7 @@ def _promote_global_auth_to_provider() -> str | None:
         deep_merge_keys=("providers",),
     )
     parsed = load_providers({"providers": {name: entry}})[name]
-    for fam in sorted(provider_families(parsed)):
+    for fam in sorted(provider_families(parsed), key=_surface_claim_key):
         cfg = _load_global_config()
         # Effective check (matters for the pi surface): a default that
         # already drives the surface — explicitly or via pi's fallback —
@@ -3554,6 +3581,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
         GEMINI_FAMILY,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
         surface_default_provider,
@@ -3616,7 +3644,7 @@ def _run_configure_harnesses_interactive() -> None:
     _ACP_ADD = "\x00acp-add"
     _ACP_AGENT_PREFIX = "\x00acp-agent:"
     _ACP_CLI_PREFIX = "\x00acp-cli:"
-    families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
+    families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE]
 
     # Status glyph + Rich color per readiness kind: "ready" is a configured,
     # launchable harness (green ✓); "missing" is an absent CLI/SDK (red ✗);
@@ -3803,6 +3831,7 @@ def _run_configure_harnesses_interactive() -> None:
             )
 
         rows.append(_family_row(PI_SURFACE))
+        rows.append(_family_row(OMP_SURFACE))
 
         # Antigravity — native agy sign-in OR Gemini key (SDK extra is soft, like Cursor).
         if antigravity_api_key_configured(config) or any(

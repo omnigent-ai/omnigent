@@ -1270,6 +1270,16 @@ def test_ui_setup_steps_pi_auth_is_ui_authable_and_tracked() -> None:
     assert steps[1].status_key == "authed"
 
 
+def test_ui_setup_steps_omp_auth_is_ui_authable_and_tracked() -> None:
+    """omp is UI-authable like pi: its auth step opens the credential form."""
+    steps = hi.ui_setup_steps("omp")
+    assert [s.kind for s in steps] == ["install", "auth"]
+    assert steps[1].action == "auth"
+    assert steps[1].command is None
+    assert steps[1].status_key == "authed"
+    assert [s.as_dict() for s in hi.ui_setup_steps("oh-my-pi")] == [s.as_dict() for s in steps]
+
+
 def test_ui_setup_steps_qwen_auth_stays_untracked_setup_fallback() -> None:
     """Qwen is env-auth (not UI-authable), so its auth step stays an untracked
     ``omni setup`` signpost — the case that must NOT gain the form."""

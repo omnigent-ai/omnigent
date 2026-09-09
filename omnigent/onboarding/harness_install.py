@@ -62,6 +62,10 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY,
 # first-run ``run`` flow falls back to it, so it has install metadata too.
 PI_KEY = "pi"
 
+# Oh My Pi ships the ``omp`` binary (curl installer primary, npm
+# ``@oh-my-pi/pi-coding-agent`` as the one-click path).
+OMP_KEY = "omp"
+
 # Qwen Code uses npm installation and has login/logout commands similar to
 # other coding CLIs. The binary name is ``qwen``.
 QWEN_KEY = "qwen"
@@ -207,6 +211,17 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # ``pi >= 0.79.0``; older CLIs would prompt mid-session.
         min_version=_PI_MIN_VERSION,
     ),
+    OMP_KEY: HarnessInstallSpec(
+        "Oh My Pi",
+        "omp",
+        "@oh-my-pi/pi-coding-agent",
+        # No login/logout/status commands: omp authenticates per-provider
+        # (``omp auth-broker login <provider>`` or in-TUI ``/login``), so
+        # setup shows the auth hint instead of running a login step.
+        auth_hint="run `omp auth-broker login <provider>` or `/login` in omp",
+        # No min_version: the executor feature-detects ``--auto-approve``
+        # at runtime and degrades gracefully on older CLIs.
+    ),
     # Pin the install to the supported 1.18.x range: opencode-ai's npm ``latest``
     # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
     # version the runtime version-check (``check_opencode_version``,
@@ -336,6 +351,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
     "pi-native": PI_KEY,
+    # Oh My Pi (``harness: omp``, drives ``omp --mode rpc``) wraps the
+    # ``omp`` CLI.
+    OMP_KEY: OMP_KEY,
+    "oh-my-pi": OMP_KEY,
     # Kimi is multi-provider but binary-gated: cannot launch without the
     # ``kimi`` CLI on PATH. Listed here so ``required_cli_for_harness``
     # returns its install spec and ``missing_harness_cli`` fails loud
@@ -391,6 +410,7 @@ _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
     "claude": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    OMP_KEY: OMP_KEY,
     OPENCODE_KEY: OPENCODE_KEY,
     QWEN_KEY: QWEN_KEY,
 }
@@ -461,7 +481,9 @@ def ui_installable_harnesses() -> frozenset[str]:
 # (omnigent stores no key for them), so they are NOT credential-configurable.
 # ``pi`` consumes anthropic/openai and is handled by the host store-secret
 # handler, so it's included via its own key.
-_UI_CREDENTIAL_FAMILIES: frozenset[str] = frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_KEY})
+_UI_CREDENTIAL_FAMILIES: frozenset[str] = frozenset(
+    {ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_KEY, OMP_KEY}
+)
 
 
 def ui_credential_configurable_harnesses() -> frozenset[str]:
@@ -538,6 +560,18 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
         # "ready").
         title="Set up authentication",
         detail="Add an API key or a gateway so Pi can run.",
+        action="auth",
+        command=None,
+        status_key="authed",
+    ),
+    OMP_KEY: SetupStep(
+        kind="auth",
+        # Same neutral "set up auth" framing as pi — the dialog opens a
+        # form listing the ways to authenticate. omp has no subscription
+        # CLI login either (``command=None``), so the detail names only the
+        # applicable paths.
+        title="Set up authentication",
+        detail="Add an API key or a gateway so Oh My Pi can run.",
         action="auth",
         command=None,
         status_key="authed",
