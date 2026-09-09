@@ -15,8 +15,9 @@ journey against the live server by fulfilling the rename PATCH with that exact
 production rejection, then asserts what the user must observe:
 
 - the row does not keep the rejected title (rollback -- correct today), and
-- a visible failure signal appears (toast or alert -- MISSING today, the bug
-  this test guards), and
+- a visible failure signal appears carrying the server's reason and the
+  attempted title (toast or alert -- MISSING today, the bug this test
+  guards), and
 - the server never persisted the rejected title.
 
 The interception is asserted (``expect_response`` sees the 400 and the handler
@@ -128,6 +129,12 @@ def test_backend_rejected_rename_shows_failure_feedback(
     # (see the failed-delete toast); an inline alert would also satisfy this.
     feedback = page.get_by_test_id("toast").or_(page.get_by_role("alert")).first
     expect(feedback).to_be_visible(timeout=10_000)
+
+    # Visible is not enough: the signal must carry the validation error the
+    # backend gave and name the attempted title, so the user knows what was
+    # wrong and what to change.
+    expect(feedback).to_contain_text(_BACKEND_REJECTION["message"])
+    expect(feedback).to_contain_text(_REJECTED_TITLE)
 
     # And the server agrees the rename never landed -- the rejected title must
     # not have been persisted by some other path.

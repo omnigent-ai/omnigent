@@ -26,11 +26,14 @@ import {
   updateSession,
 } from "./sessionsApi";
 
-function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
+function mockJsonResponse(
+  body: unknown,
+  init?: { ok?: boolean; status?: number; statusText?: string },
+): Response {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
-    statusText: "OK",
+    statusText: init?.statusText ?? "OK",
     json: async () => body,
   } as unknown as Response;
 }
@@ -93,8 +96,10 @@ describe("apiErrorFromResponse", () => {
   });
 
   it("falls back to the status line when the body is not an error shape", async () => {
-    const err = await apiErrorFromResponse(mockJsonResponse({}, { ok: false, status: 404 }));
-    expect(err.message).toBe("404 OK");
+    const err = await apiErrorFromResponse(
+      mockJsonResponse({}, { ok: false, status: 404, statusText: "Not Found" }),
+    );
+    expect(err.message).toBe("404 Not Found");
     expect(err.code).toBeNull();
   });
 });
