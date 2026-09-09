@@ -15,20 +15,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
 
-/**
- * Row action buttons: compact icon buttons on desktop; on mobile (`max-md:`)
- * they grow to a 44px tap target (Apple HIG / WCAG target size) with a larger,
- * higher-contrast icon, matching the app's other mobile-adjusted controls.
- */
+/** Keep touch targets large without enlarging the visible glyphs. */
 const ACTION_BUTTON_CLASS =
   "flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground max-md:size-11 max-md:text-muted-foreground";
 
-/**
- * Lucide strokes scale with rendered size (2 units over a 24-unit viewBox), so
- * the grown 20px mobile icon thins its stroke (2 x 16/20 = 1.6) to keep the
- * same effective weight as the composer's 16px controls beside it.
- */
-const ACTION_ICON_CLASS = "size-3.5 max-md:size-5 max-md:stroke-[1.6]";
+const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
 
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */

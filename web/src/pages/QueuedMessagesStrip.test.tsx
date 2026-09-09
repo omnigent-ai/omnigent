@@ -95,7 +95,7 @@ describe("QueuedMessagesStrip", () => {
     expect(onSteer).toHaveBeenCalledWith("q_2");
   });
 
-  it("gives every row action a 44px mobile tap target with a larger icon", () => {
+  it("gives every row action a 44px mobile tap target with a composer-sized icon", () => {
     render(
       <TooltipProvider>
         <QueuedMessagesStrip
@@ -114,37 +114,9 @@ describe("QueuedMessagesStrip", () => {
       "Remove queued message",
     ]) {
       const button = screen.getByRole("button", { name });
-      // Mobile branch: a >=44px hit area (size-11) around a bigger icon, so
-      // the control is reliably tappable on a phone.
+      // Keep the 44px touch target while matching the composer's 16px glyphs.
       expect(button, name).toHaveClass("max-md:size-11");
-      expect(button.querySelector("svg"), name).toHaveClass("max-md:size-5");
-    }
-  });
-
-  it("keeps row action icon strokes at composer weight on mobile", () => {
-    render(
-      <TooltipProvider>
-        <QueuedMessagesStrip
-          messages={[msg("q_1", "first")]}
-          onDelete={vi.fn()}
-          onEdit={vi.fn()}
-          onSteer={vi.fn()}
-          onReorder={vi.fn()}
-        />
-      </TooltipProvider>,
-    );
-    for (const name of [
-      "Reorder queued message",
-      "Send queued message now",
-      "Edit queued message",
-      "Remove queued message",
-    ]) {
-      const icon = screen.getByRole("button", { name }).querySelector("svg");
-      // Lucide strokes scale with rendered size (2 units / 24-unit viewBox):
-      // at max-md:size-5 (20px) the default draws 1.67px vs 1.33px on the
-      // composer's 16px icons, so the grown icon must thin its stroke
-      // (2 x 16/20 = 1.6) to keep the same effective weight.
-      expect(icon, name).toHaveClass("max-md:stroke-[1.6]");
+      expect(button.querySelector("svg"), name).toHaveClass("max-md:size-4");
     }
   });
 
