@@ -10308,6 +10308,54 @@ async def test_claude_model_catalog_marks_the_enumerated_default(
     assert rows[1]["isDefault"] is True
 
 
+async def test_claude_model_catalog_honors_managed_replacement_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed replacement rows override Claude's headless alias output."""
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[{"id": "fable", "model": "fable", "displayName": "fable"}],
+            default_model="gateway-opus",
+            default_label="Opus",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_model_picker",
+        lambda: (("gateway-opus", "Opus"), ("gateway-sonnet", "Sonnet")),
+    )
+
+    assert await claude_native.claude_model_catalog(None) == [
+        {
+            "id": "gateway-opus",
+            "model": "gateway-opus",
+            "displayName": "Opus",
+            "isDefault": True,
+        },
+        {"id": "gateway-sonnet", "model": "gateway-sonnet", "displayName": "Sonnet"},
+    ]
+
+
+async def test_claude_model_catalog_keeps_managed_picker_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _failed_probe(config: object) -> None:
+        del config
+        return
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _failed_probe)
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_model_picker",
+        lambda: (("gateway-opus", "Opus"),),
+    )
+
+    assert await claude_native.claude_model_catalog(None) == [
+        {"id": "gateway-opus", "model": "gateway-opus", "displayName": "Opus"}
+    ]
+
+
 async def test_claude_model_catalog_appends_an_off_list_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1229,6 +1229,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     """
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
+    from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, _ = resolve_claude_launch("claude", [])
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
@@ -1239,6 +1240,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         claude_config.model if claude_config is not None else None,
         binary_identity(command),
         ambient_gateway,
+        claude_managed_model_picker() if claude_config is None else None,
     )
 
 
@@ -1261,10 +1263,16 @@ async def claude_model_catalog(
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows, or ``None`` when the probe failed.
     """
+    from omnigent.onboarding.ambient import claude_managed_model_picker
+
+    managed_picker = claude_managed_model_picker() if claude_config is None else ()
+    managed_rows: list[dict[str, object]] = [
+        {"id": model, "model": model, "displayName": label} for model, label in managed_picker
+    ]
     probe = await probe_claude_model_options(claude_config)
     if probe is None:
-        return None
-    rows = list(probe.alias_rows)
+        return managed_rows or None
+    rows = managed_rows or list(probe.alias_rows)
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
     ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
