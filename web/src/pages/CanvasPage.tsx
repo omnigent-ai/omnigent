@@ -432,8 +432,12 @@ function CanvasSurface() {
     trackClick("canvas.reset-layout");
     const ids = visibleSessions.map((session) => session.id);
     const removed = new Set(ids);
+    // A cached session list can be stale until the network confirms it. Start
+    // from the persisted map so resetting the visible canvas cannot discard
+    // saved spots for sessions that have not appeared yet.
+    const currentPositions = { ...layoutRef.current.positions, ...positionsRef.current };
     const kept = Object.fromEntries(
-      Object.entries(positionsRef.current).filter(([id]) => !removed.has(id)),
+      Object.entries(currentPositions).filter(([id]) => !removed.has(id)),
     ) as CanvasPositions;
     positionsRef.current = { ...kept, ...mergeSessionPositions(visibleSessions, {}) };
     scheduleFit();

@@ -406,6 +406,27 @@ describe("CanvasPage", () => {
     });
   });
 
+  it("keeps unloaded sessions' saved spots when resetting a cached canvas", () => {
+    window.localStorage.setItem(
+      canvasLayoutStorageKey(null),
+      JSON.stringify({
+        version: 1,
+        positions: { conv_cached_out: [11, 12], conv_1: [700, 700] },
+      }),
+    );
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 1)], { networkConfirmed: false }),
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
+
+    expect(readCanvasLayout(null).positions).toEqual({
+      conv_cached_out: { x: 11, y: 12 },
+      conv_1: { x: 0, y: 0 },
+    });
+  });
+
   it("resets only the active canvas's positions to grid slots", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
