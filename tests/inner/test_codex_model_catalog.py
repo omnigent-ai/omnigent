@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -117,6 +118,30 @@ def test_an_arm_codex_already_carries_is_not_duplicated() -> None:
 def test_write_is_skipped_without_a_codex_binary(tmp_path: Path) -> None:
     assert write_codex_model_catalog(tmp_path, codex_path=None, source_home=tmp_path) is None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_debug_model_discovery_is_explicitly_sessionless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The non-app-server catalog probe obeys the same discovery contract."""
+    captured_env: dict[str, str] = {}
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "a" * 32)
+    monkeypatch.setenv("HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID", "b" * 32)
+
+    def _run(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        del args
+        captured_env.update(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout=json.dumps(_catalog()), stderr="")
+
+    monkeypatch.setattr(codex_executor.subprocess, "run", _run)
+
+    assert (
+        codex_executor._probe_codex_model_catalog("/test/codex", tmp_path, timeout=1.0)
+        == _catalog()
+    )
+    assert captured_env["OMNIGENT_CODEX_LAUNCH_ROLE"] == "model-discovery"
+    assert "OMNIGENT_RUNNER_PRIMARY_SESSION_ID" not in captured_env
+    assert "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID" not in captured_env
 
 
 def test_the_cli_is_probed_once_per_host_process(

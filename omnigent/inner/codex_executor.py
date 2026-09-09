@@ -43,6 +43,12 @@ from omnigent.codex_model_vocabulary import (
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
 )
+from omnigent.codex_native_bridge import (
+    CODEX_LAUNCH_ROLE_ENV_VAR,
+    CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    CodexLaunchRole,
+    codex_launch_env,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
@@ -1338,6 +1344,8 @@ def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bo
 #: ``_clean_codex_env``'s filtered copy — so they must be allowed through it or
 #: both features silently never engage on the wrapped ``codex`` harness.
 _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
+    CODEX_LAUNCH_ROLE_ENV_VAR,
+    CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     CODEX_EXTENDED_CATALOG_ENV_VAR,
@@ -1531,13 +1539,15 @@ def _probe_codex_model_catalog(
     timeout: float,
 ) -> dict[str, Any] | None:
     """Run ``codex debug models``, returning ``None`` on any failure."""
+    probe_env = codex_launch_env(os.environ, role=CodexLaunchRole.MODEL_DISCOVERY)
+    probe_env["CODEX_HOME"] = str(source_home)
     try:
         completed = subprocess.run(
             [codex_path, "debug", "models"],
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "CODEX_HOME": str(source_home)},
+            env=probe_env,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:

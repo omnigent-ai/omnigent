@@ -33,7 +33,11 @@ if TYPE_CHECKING:
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.codex_model_vocabulary import codex_spawn_model
-from omnigent.codex_native_bridge import write_policy_hook_config
+from omnigent.codex_native_bridge import (
+    CodexLaunchRole,
+    codex_launch_env,
+    write_policy_hook_config,
+)
 from omnigent.codex_native_process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
@@ -765,7 +769,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
         codex_home.mkdir(mode=0o700)
         port = _allocate_loopback_port()
         listen_url = f"ws://127.0.0.1:{port}"
-        env = _clean_codex_env()
+        env = codex_launch_env(_clean_codex_env(), role=CodexLaunchRole.MODEL_DISCOVERY)
         for name in tuple(env):
             if name.startswith("OPENAI_") or name in {
                 "DATABRICKS_BEARER",
@@ -952,7 +956,7 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
         raise ImportError("Native Codex model probing requires the 'codex' CLI on PATH.")
     config_overrides = list(launch.config_overrides)
     pinned_model = launch.model
-    env = _clean_codex_env()
+    env = codex_launch_env(_clean_codex_env(), role=CodexLaunchRole.MODEL_DISCOVERY)
     if launch.profile is not None:
         databricks = await asyncio.to_thread(
             _databricks_launch_materialization, model=launch.model, profile=launch.profile
@@ -1168,6 +1172,7 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        serving_env = codex_launch_env(self.env, role=CodexLaunchRole.SESSION_SERVING)
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -1193,7 +1198,7 @@ class CodexNativeAppServer:
         # than symlinked over. The runner advertises it for auto-harness Smart
         # Routing sessions only, so its presence is also this session class's
         # signature — see ``ensure_session_router_quietly``.
-        router_bridge_dir = codex_router_bridge_dir(self.env)
+        router_bridge_dir = codex_router_bridge_dir(serving_env)
         if router_bridge_dir is not None:
             # A CLI too old for the spawn gate gets no routing hooks at all, so
             # routing no-ops instead of blocking the launch. Everything keyed
@@ -1224,7 +1229,7 @@ class CodexNativeAppServer:
             self.codex_home,
             config_source,
             inject_hooks=self.router_hooks_registered,
-            extend_model_catalog=codex_extended_catalog_requested(self.env),
+            extend_model_catalog=codex_extended_catalog_requested(serving_env),
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
@@ -1271,7 +1276,7 @@ class CodexNativeAppServer:
                 self.bridge_dir,
                 self.python_executable,
                 router_bridge_dir=router_bridge_dir,
-                router_session_id=codex_router_session_id(self.env),
+                router_session_id=codex_router_session_id(serving_env),
                 user_hooks_source=config_source / _CODEX_HOOKS_FILE,
                 # The runner only advertises a route-turn endpoint for a
                 # session that launched with Smart Routing on, so its presence
@@ -1297,7 +1302,7 @@ class CodexNativeAppServer:
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
         )
-        proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
+        proc_env = {**serving_env, "CODEX_HOME": str(self.codex_home)}
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
             self.proc = await asyncio.create_subprocess_exec(
