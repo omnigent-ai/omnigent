@@ -523,14 +523,14 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
     resolver_calls: list[tuple[str | None, str | None]] = []
-    cli_calls: list[tuple[str, Any, str | None]] = []
+    cli_calls: list[tuple[str, str | None, str | None]] = []
 
     async def resolve_harness_config(**kwargs: Any) -> tuple[str, dict[str, str] | None]:
         resolver_calls.append((kwargs["harness_override"], kwargs["model_override"]))
         return "codex-native", None
 
     async def generate_codex_title(context: BackgroundTitleContext) -> str:
-        cli_calls.append((context.prompt, context.model_override))
+        cli_calls.append((context.prompt, context.model_override, context.request_session_id))
         return "Debug authentication timeout"
 
     monkeypatch.setattr(
@@ -565,6 +565,7 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
         (
             "please investigate the authentication timeout",
             "gpt-5.4-mini",
+            "conv_test",
         )
     ]
     assert process_manager.get_client_calls == []
@@ -649,11 +650,14 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
             spawn_env={},
             process_manager=None,
             model_override="gpt-5.4-mini",
+            request_session_id="b" * 32,
         )
     )
 
     assert title == "Debug authentication timeout"
     assert captured["command"] == "codex"
+    assert captured["kwargs"]["env"]["OMNIGENT_CODEX_LAUNCH_ROLE"] == "session-serving"
+    assert captured["kwargs"]["env"]["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"] == "b" * 32
     args = captured["args"]
     assert args[0] == "exec"
     assert "--ephemeral" in args
@@ -679,6 +683,21 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     assert captured["codex_home_mode"] == 0o700
     assert captured["config_mode"] == 0o600
     assert captured["agents_exists"] is False
+
+
+@pytest.mark.asyncio
+async def test_codex_native_title_requires_explicit_request_identity() -> None:
+    """Title generation is serving inference and cannot masquerade as discovery."""
+    with pytest.raises(RuntimeError, match="title inference requires a request session identity"):
+        await codex_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="please investigate the authentication timeout",
+                harness="codex-native",
+                spawn_env={},
+                process_manager=None,
+                model_override="gpt-5.4-mini",
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -731,6 +750,7 @@ async def test_codex_native_title_kills_process_when_cancelled(
                 spawn_env={},
                 process_manager=None,
                 model_override="gpt-5.4-mini",
+                request_session_id="b" * 32,
             )
         )
     )

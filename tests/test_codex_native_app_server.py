@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -428,7 +429,72 @@ def test_build_codex_native_server_profile_error_names_profile(
             bridge_dir=tmp_path / "bridge",
             ap_server_url=None,
             ap_auth_headers={},
+            request_session_id="b" * 32,
         )
+
+
+def test_build_server_uses_explicit_identity_without_ambient_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Factory identity comes from its caller, never the inherited parent."""
+    monkeypatch.setattr("omnigent.codex_native_app_server._find_codex_cli", lambda: "codex")
+    monkeypatch.delenv("HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "a" * 32)
+    request_session_id = "b" * 32
+
+    server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        request_session_id=request_session_id,
+    )
+
+    assert server.env["OMNIGENT_CODEX_LAUNCH_ROLE"] == "session-serving"
+    assert server.env["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"] == request_session_id
+    assert "OMNIGENT_RUNNER_PRIMARY_SESSION_ID" not in server.env
+    assert os.environ["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == "a" * 32
+
+
+async def test_build_servers_keep_simultaneous_session_identities_separate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent factories cannot share hostile ambient session identity."""
+    monkeypatch.setattr("omnigent.codex_native_app_server._find_codex_cli", lambda: "codex")
+    monkeypatch.setenv("HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID", "c" * 32)
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "d" * 32)
+
+    async def _build(request_session_id: str, suffix: str) -> CodexNativeAppServer:
+        return await asyncio.to_thread(
+            build_codex_native_server,
+            socket_path=tmp_path / f"codex-{suffix}.sock",
+            codex_home=tmp_path / f"codex-home-{suffix}",
+            cwd=tmp_path,
+            model=None,
+            profile=None,
+            bridge_dir=tmp_path / f"bridge-{suffix}",
+            request_session_id=request_session_id,
+        )
+
+    session_ids = ("a" * 32, "b" * 32)
+    servers = await asyncio.gather(
+        _build(session_ids[0], "a"),
+        _build(session_ids[1], "b"),
+    )
+
+    assert (
+        tuple(server.env["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"] for server in servers)
+        == session_ids
+    )
+    assert all(
+        server.env["OMNIGENT_CODEX_LAUNCH_ROLE"] == "session-serving"
+        and "OMNIGENT_RUNNER_PRIMARY_SESSION_ID" not in server.env
+        for server in servers
+    )
+    assert os.environ["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"] == "c" * 32
+    assert os.environ["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == "d" * 32
 
 
 def test_build_codex_native_server_uses_profile_host_without_static_token(
@@ -480,6 +546,7 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
         model="test-model",
         profile="oss",
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
     )
@@ -513,6 +580,7 @@ def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
         model=None,
         profile=None,
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
     )
@@ -549,6 +617,7 @@ def test_build_codex_native_server_bypass_emits_full_access_config(
         model=None,
         profile=None,
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
         bypass_sandbox=True,
@@ -607,6 +676,7 @@ def test_build_codex_native_server_pins_profile_resolved_model(
         model=model,
         profile="oss",
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
     )
@@ -669,6 +739,7 @@ def test_launch_argv_and_config_pin_name_the_same_model(
         model=model,
         profile=profile,
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
         extra_config_overrides=list(extra_overrides) if extra_overrides else None,
@@ -855,6 +926,7 @@ def _test_app_server(
         config_overrides=[],
         cwd=workspace,
         bridge_dir=bridge_dir,
+        request_session_id=process_env["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"],
         python_executable="/new/python",
     )
 
@@ -1055,6 +1127,7 @@ async def test_serving_app_server_rejects_parent_only_identity(
         config_overrides=[],
         cwd=workspace,
         bridge_dir=tmp_path / "bridge",
+        request_session_id="",
         python_executable="/new/python",
     )
 

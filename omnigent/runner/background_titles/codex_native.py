@@ -33,6 +33,8 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
 
     model = context.model_override or _codex_native_model_from_spec(context.session_spec)
+    if not context.request_session_id:
+        raise RuntimeError("native Codex title inference requires a request session identity")
     # Thread the spec so a title exec honors spec-level auth too (#2744).
     launch = resolve_native_codex_launch(model=model, spec=context.session_spec)
     with tempfile.TemporaryDirectory(prefix="omnigent-codex-title-") as temp_dir:
@@ -53,6 +55,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             model=launch.model,
             profile=launch.profile,
             bridge_dir=temp_root / "bridge",
+            request_session_id=context.request_session_id,
             extra_config_overrides=launch.config_overrides,
         )
         native_server.config_overrides = materialize_codex_provider_config(

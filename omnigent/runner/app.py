@@ -3192,6 +3192,7 @@ def create_runner_app(
             model_override=body.model_override,
             session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
             additional_instructions=body.additional_instructions,
+            request_session_id=conversation_id,
         )
         try:
             title = await run_background_title(context)

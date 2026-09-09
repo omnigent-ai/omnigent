@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 from omnigent.cli_invocation import cli_invocation
 from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.codex_native_bridge import (
+    CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CodexLaunchRole,
     codex_launch_env,
     write_policy_hook_config,
@@ -1110,6 +1111,8 @@ class CodexNativeAppServer:
         ``Path("~/.omnigent/codex-native/<hash>")``. The policy hook
         subprocess is pointed at it via ``--bridge-dir`` and reads the
         session id + Omnigent coordinates from it.
+    :param request_session_id: Serving session identity supplied explicitly by
+        the caller that owns the session.
     :param ap_server_url: Omnigent server base URL the policy hook POSTs tool
         calls to, e.g. ``"http://127.0.0.1:8787"``. ``None`` registers
         and trusts the hook but writes no Omnigent coordinates, so the hook
@@ -1149,6 +1152,7 @@ class CodexNativeAppServer:
     config_overrides: list[str]
     cwd: Path
     bridge_dir: Path
+    request_session_id: str
     developer_instructions: str | None = None
     ap_server_url: str | None = None
     ap_auth_headers: dict[str, str] | None = None
@@ -1172,7 +1176,11 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
-        serving_env = codex_launch_env(self.env, role=CodexLaunchRole.SESSION_SERVING)
+        explicit_env = {
+            **self.env,
+            CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR: self.request_session_id,
+        }
+        serving_env = codex_launch_env(explicit_env, role=CodexLaunchRole.SESSION_SERVING)
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -2160,6 +2168,7 @@ def build_codex_native_server(
     model: str | None,
     profile: str | None,
     bridge_dir: Path,
+    request_session_id: str,
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     python_executable: str | None = None,
@@ -2180,6 +2189,8 @@ def build_codex_native_server(
         ``"<your-profile>"``.
     :param bridge_dir: Native Codex bridge directory; the policy hook is
         pointed at it and reads the session id + Omnigent coordinates from it.
+    :param request_session_id: Exact session identity owned by the serving
+        caller. Ambient request or runner-primary identity is never used.
     :param ap_server_url: Omnigent server base URL the policy hook POSTs tool
         calls to, e.g. ``"http://127.0.0.1:8787"``. ``None`` registers
         the hook but writes no Omnigent coordinates (hook no-ops).
@@ -2219,6 +2230,8 @@ def build_codex_native_server(
             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
         )
     env = _clean_codex_env()
+    env[CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR] = request_session_id
+    env = codex_launch_env(env, role=CodexLaunchRole.SESSION_SERVING)
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
@@ -2262,6 +2275,7 @@ def build_codex_native_server(
         config_overrides=config_overrides,
         cwd=cwd,
         bridge_dir=bridge_dir,
+        request_session_id=request_session_id,
         developer_instructions=developer_instructions,
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
