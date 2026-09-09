@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     encode_host_frame,
@@ -59,6 +60,7 @@ def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    codex_rate_limits: dict[str, object] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -78,6 +80,7 @@ def _make_hello(
             name=name,
             configured_harnesses=configured_harnesses,
             gateway_inference=gateway_inference,
+            codex_rate_limits=codex_rate_limits,
         )
     )
 
@@ -140,6 +143,7 @@ async def _connect_host(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    codex_rate_limits: dict[str, object] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -162,13 +166,20 @@ async def _connect_host(
     await comm.send_input(
         {
             "type": "websocket.receive",
-            "text": _make_hello(name, configured_harnesses, gateway_inference),
+            "text": _make_hello(name, configured_harnesses, gateway_inference, codex_rate_limits),
         },
     )
     while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
 
     return comm
+
+
+async def _refresh_rate_limits(comm: ApplicationCommunicator, snapshot: dict[str, object]) -> None:
+    frame = HostHarnessReadinessFrame(
+        configured_harnesses={"codex": True}, codex_rate_limits=snapshot
+    )
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(frame)})
 
 
 async def test_list_hosts_empty(
@@ -216,6 +227,52 @@ async def test_list_hosts_returns_connected_host(
     # field must be present and None so clients can tell it apart from
     # server-managed hosts without a schema sniff.
     assert hosts[0]["sandbox_provider"] is None
+
+
+async def test_codex_rate_limits_reconnect_refresh_and_staleness(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import hosts as hosts_module
+
+    now = int(time.time())
+    snapshot: dict[str, object] = {"captured_at": now, "limits": [{"limit_id": "codex", "windows": [{"kind": "primary", "used_percent": 11.0, "window_duration_mins": 300}]}]}  # fmt: skip  # noqa: E501
+    app, registry, _hs, _cs = host_api_app
+    comm = await _connect_host(app, registry, codex_rate_limits=snapshot)
+    path = f"/v1/hosts/{_HOST_ID}/codex-rate-limits"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(path)
+        assert response.json() == {"rate_limits": snapshot}
+        assert response.headers["cache-control"] == "private, no-store"
+        monkeypatch.setattr(hosts_module, "now_epoch", lambda: now + 3601)
+        assert (await client.get(path)).json() == {"rate_limits": None}
+        refreshed = {**snapshot, "captured_at": now + 3601}
+        await _refresh_rate_limits(comm, refreshed)
+        for _ in range(50):
+            response = await client.get(path)
+            if response.json()["rate_limits"] is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert response.json() == {"rate_limits": refreshed}
+        future = {**snapshot, "captured_at": now + 3902}
+        await _refresh_rate_limits(comm, future)
+        async with asyncio.timeout(2):
+            while registry.get(_HOST_ID).hello.codex_rate_limits != future:
+                await asyncio.sleep(0.01)
+        assert (await client.get(path)).json() == {"rate_limits": None}
+
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        async with asyncio.timeout(2):
+            while registry.get(_HOST_ID) is not None:
+                await asyncio.sleep(0.01)
+        assert (await client.get(path)).json() == {"rate_limits": None}
+
+        comm = await _connect_host(app, registry)
+        assert (await client.get(path)).json() == {"rate_limits": None}
+        assert (
+            await client.get("/v1/hosts/00000000000000000000000000000000/codex-rate-limits")
+        ).status_code == 404
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(
@@ -905,10 +962,15 @@ async def test_get_host_403_wrong_owner(
             "/v1/hosts/294391bc835cde1130ef2a02dcd2b7b3",
             headers={"x-test-user": "bob@test.com"},
         )
+        quota_resp = await client.get(
+            "/v1/hosts/294391bc835cde1130ef2a02dcd2b7b3/codex-rate-limits",
+            headers={"x-test-user": "bob@test.com"},
+        )
     assert resp.status_code == 403, (
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+    assert quota_resp.status_code == 403
 
 
 async def test_launch_runner_403_wrong_owner(

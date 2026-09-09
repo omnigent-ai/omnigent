@@ -790,6 +790,9 @@ class _RecordingWS:
         self.sent.append(data)
         self.first_send.set()
 
+    async def recv(self) -> str:
+        raise asyncio.CancelledError
+
 
 async def _cancel(task: asyncio.Task[None]) -> None:
     """Cancel *task* and await its unwinding, swallowing the cancellation."""
@@ -892,6 +895,39 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
     _cleanup_host(host)
 
 
+async def test_host_publishes_codex_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot = {"captured_at": 1, "limits": [{"limit_id": "codex", "windows": [{"kind": "primary", "used_percent": 5.0, "window_duration_mins": 300}]}]}  # fmt: skip  # noqa: E501
+    monkeypatch.setattr(
+        "omnigent.host.connect.read_rate_limits",
+        lambda: asyncio.sleep(0, result=snapshot),
+    )
+    host, ws = _make_host_process(), _RecordingWS()
+    host._configured_harnesses = {"codex": True}
+    task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), 2)
+    finally:
+        await _cancel(task)
+    assert getattr(decode_host_frame(ws.sent[0]), "codex_rate_limits", None) == snapshot
+    with pytest.raises(asyncio.CancelledError):
+        await host._serve_frames(ws)  # type: ignore[arg-type]
+    assert getattr(decode_host_frame(ws.sent[1]), "codex_rate_limits", None) == snapshot
+    host._codex_rate_limits = None
+    ws, probed = _RecordingWS(), asyncio.Event()
+
+    async def lose_readiness() -> dict[str, object]:
+        host._configured_harnesses = {"codex": False, "pi": True}
+        probed.set()
+        return snapshot
+
+    monkeypatch.setattr("omnigent.host.connect.read_rate_limits", lose_readiness)
+    task = asyncio.create_task(host._codex_rate_limits_loop(ws))
+    await asyncio.wait_for(probed.wait(), 2)
+    await asyncio.sleep(0)
+    await _cancel(task)
+    assert ws.sent == [] and host._codex_rate_limits is None
+
+
 async def test_live_host_full_refresh_detects_auth_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -929,9 +965,12 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
 ) -> None:
     """A periodic full refresh sends nothing when the readiness map is unchanged."""
     calls = {"n": 0}
+    refreshed = threading.Event()
 
     def _unchanged_map() -> dict[str, str]:
         calls["n"] += 1
+        if calls["n"] >= 2:
+            refreshed.set()
         return {"codex": "needs-auth"}
 
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unchanged_map)
@@ -947,11 +986,7 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
 
     task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
-        # Let at least two full refreshes recompute-and-compare before stopping.
-        for _ in range(400):
-            if calls["n"] >= 2:
-                break
-            await asyncio.sleep(0.005)
+        assert await asyncio.to_thread(refreshed.wait, 2.0)
     finally:
         await _cancel(task)
 

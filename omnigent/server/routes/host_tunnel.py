@@ -570,6 +570,8 @@ async def _receive_loop(
             conn.hello.gateway_inference = (
                 dict(frame.gateway_inference) if frame.gateway_inference is not None else None
             )
+            if frame.codex_rate_limits is not None:
+                conn.hello.codex_rate_limits = frame.codex_rate_limits
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if on_host_update is not None:
                 try:

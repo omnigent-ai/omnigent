@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.harnesses.codex_native.rate_limits import validate_rate_limits
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
@@ -120,6 +121,7 @@ class HostHelloFrame:
     gateway_inference: dict[str, bool] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    codex_rate_limits: _JsonObject | None = None
 
 
 @dataclass
@@ -152,6 +154,7 @@ class HostHarnessReadinessFrame:
 
     configured_harnesses: dict[str, HarnessAvailability]
     gateway_inference: dict[str, bool] | None = None
+    codex_rate_limits: _JsonObject | None = None
 
 
 @dataclass
@@ -1078,6 +1081,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "gateway_inference": frame.gateway_inference,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "codex_rate_limits": frame.codex_rate_limits,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1095,6 +1099,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.HARNESS_READINESS.value,
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
+                "codex_rate_limits": frame.codex_rate_limits,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -1600,7 +1605,15 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        codex_rate_limits=_optional_rate_limits(msg),
     )
+
+
+def _optional_rate_limits(msg: _JsonObject) -> _JsonObject | None:
+    try:
+        return validate_rate_limits(msg.get("codex_rate_limits"))
+    except ValueError:
+        return None
 
 
 def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
@@ -1618,6 +1631,7 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     return HostHarnessReadinessFrame(
         configured_harnesses=configured_harnesses,
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        codex_rate_limits=_optional_rate_limits(msg),
     )
 
 
