@@ -5702,9 +5702,9 @@ async def test_subagent_watcher_retries_failed_batch_from_checkpoint(
     """
     A rejected child batch leaves its byte cursor behind and retries in order.
 
-    The server commits a batch atomically and deduplicates source ids, so an
-    ambiguous response can safely retry the entire batch. The local cursor
-    advances only after the acknowledgement arrives.
+    The server deduplicates source ids, so an ambiguous response can safely
+    retry the entire batch even if some entries were already applied. The local
+    cursor advances only after the acknowledgement arrives.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -5836,6 +5836,73 @@ def test_subagent_batches_obey_count_and_exact_byte_limits() -> None:
     assert "content truncated by omnigent" in truncated_output
     for batch in [*tiny_batches, *large_batches, *oversized]:
         assert len(forwarder._encoded_subagent_batch(batch)) <= 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_subagent_batches_fall_back_once_for_older_server(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server that rejects event arrays receives individual events thereafter."""
+
+    def pending(index: int) -> forwarder._PendingSubagentItem:
+        return forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"fallback-{index}",
+                item_type="message",
+                data={
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": str(index)}],
+                },
+                response_id="resp_fallback",
+            )
+        )
+
+    bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        bodies.append(body)
+        if isinstance(body, list):
+            return httpx.Response(
+                422,
+                json={
+                    "detail": [
+                        {
+                            "type": "model_attributes_type",
+                            "loc": ["body"],
+                            "msg": "Input should be a valid dictionary",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(202, json={"queued": False, "item_id": "item_fallback"})
+
+    capability = forwarder._SessionEventBatchCapability()
+    caplog.set_level(logging.INFO)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_child_one",
+            items=[pending(1), pending(2)],
+            batch_capability=capability,
+        )
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_child_two",
+            items=[pending(3), pending(4)],
+            batch_capability=capability,
+        )
+
+    assert capability.supported is False
+    assert len([body for body in bodies if isinstance(body, list)]) == 1
+    individual_source_ids = {
+        body["data"]["source_id"] for body in bodies if isinstance(body, dict)
+    }
+    assert individual_source_ids == {"fallback-1", "fallback-2", "fallback-3", "fallback-4"}
+    assert "does not accept session event arrays" in caplog.text
 
 
 @pytest.mark.asyncio

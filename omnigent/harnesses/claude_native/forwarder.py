@@ -457,6 +457,13 @@ class _PendingSubagentItem:
     checkpoint_after: int | None = None
 
 
+@dataclass
+class _SessionEventBatchCapability:
+    """Cache whether this server accepts arrays at the session-events route."""
+
+    supported: bool | None = None
+
+
 class _SubagentStateCheckpoint:
     """Serialize concurrent child cursor updates into one durable state file."""
 
@@ -895,6 +902,7 @@ async def forward_claude_transcript_to_session(
     subagent_start_retries = _PostRetryTracker()
     subagent_item_retries = _PostRetryTracker()
     subagent_status_retries = _PostRetryTracker()
+    session_event_batch_capability = _SessionEventBatchCapability()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1141,6 +1149,7 @@ async def forward_claude_transcript_to_session(
                                     start_retry_tracker=subagent_start_retries,
                                     item_retry_tracker=subagent_item_retries,
                                     status_retry_tracker=subagent_status_retries,
+                                    batch_capability=session_event_batch_capability,
                                 ),
                                 name=f"claude-child-history-{current_session_id}",
                             )
@@ -1615,13 +1624,13 @@ def _pending_items_from_records(
     return pending, safe_offset
 
 
-async def _post_external_conversation_items(
+async def _post_external_conversation_item_batch(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     items: Sequence[_PendingSubagentItem],
 ) -> None:
-    """Post one exact-size-capped, source-keyed child transcript batch."""
+    """Post and validate one array of source-keyed child transcript items."""
     encoded = _encoded_subagent_batch(items)
     if len(encoded) > MAX_SESSION_EVENT_BATCH_BYTES:
         raise ValueError("encoded session event batch exceeds 1 MiB")
@@ -1644,6 +1653,51 @@ async def _post_external_conversation_items(
         raise httpx.HTTPError("session event batch response contained an invalid acknowledgement")
 
 
+async def _post_external_conversation_items(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    items: Sequence[_PendingSubagentItem],
+    batch_capability: _SessionEventBatchCapability,
+) -> None:
+    """Post a child batch, falling back when an older server rejects arrays."""
+
+    async def _post_individually() -> None:
+        for entry in items:
+            await _post_external_conversation_item(
+                client,
+                session_id=session_id,
+                item=entry.item,
+            )
+
+    if batch_capability.supported is False:
+        await _post_individually()
+        return
+    try:
+        await _post_external_conversation_item_batch(
+            client,
+            session_id=session_id,
+            items=items,
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 422:
+            raise
+        # Servers predating event arrays validate this route as one
+        # SessionEventInput and reject a top-level list with 422.
+        if batch_capability.supported is not False:
+            _logger.info(
+                "Omnigent server does not accept session event arrays; "
+                "forwarding child transcript items individually"
+            )
+        batch_capability.supported = False
+        await _post_individually()
+    else:
+        # Do not overwrite False: another concurrent request may already have
+        # reached an old server while this request was in flight.
+        if batch_capability.supported is None:
+            batch_capability.supported = True
+
+
 async def _forward_one_subagent(
     *,
     client: httpx.AsyncClient,
@@ -1655,6 +1709,7 @@ async def _forward_one_subagent(
     checkpoint: _SubagentStateCheckpoint,
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
+    batch_capability: _SessionEventBatchCapability,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
@@ -1693,6 +1748,7 @@ async def _forward_one_subagent(
                 client,
                 session_id=entry.child_conversation_id,
                 items=batch,
+                batch_capability=batch_capability,
             )
         except httpx.HTTPError as exc:
             decision = item_retry_tracker.record_failure(retry_key, exc)
@@ -1890,6 +1946,7 @@ async def _forward_available_subagents(
     start_retry_tracker: _PostRetryTracker,
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
+    batch_capability: _SessionEventBatchCapability | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -1918,12 +1975,16 @@ async def _forward_available_subagents(
     :param status_retry_tracker: Backoff tracker for failed
         ``external_session_status`` POSTs (keyed by
         ``status:<child_id>``).
+    :param batch_capability: Process-local cache of whether the server accepts
+        event arrays. A new cache is created for direct callers that omit it.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
     subagents_dir = _subagents_dir_for_transcript(transcript_path)
     if not subagents_dir.is_dir():
         return state
+    if batch_capability is None:
+        batch_capability = _SessionEventBatchCapability()
 
     # ── Register newly-appeared sub-agents ──────────────
     # ``glob`` is sync; offload to a thread so we don't stat the
@@ -2116,6 +2177,7 @@ async def _forward_available_subagents(
                 checkpoint=checkpoint,
                 item_retry_tracker=item_retry_tracker,
                 status_retry_tracker=status_retry_tracker,
+                batch_capability=batch_capability,
             )
 
     entries = list(updated.subagents.values())
