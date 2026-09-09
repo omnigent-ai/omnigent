@@ -493,3 +493,25 @@ async def test_relaunch_re_resolution_keeps_a_zip_routable_to_the_workspace() ->
     assert resolved is not None
     assert resolved["file_data"] == _ZIP_DATA_URI
     assert workspace_materialize_upload_limit(str(resolved["filename"])) is not None
+
+
+def test_client_server_workspace_extension_parity() -> None:
+    """
+    The two workspace-materialize allowlists must name the same extensions.
+
+    The client gate runs before upload, so a type the server accepts but the
+    client omits is unreachable from the web UI: the file is rejected at
+    paste/drop time and the server code never runs. The existing text/code
+    parity test only covers the client-to-server direction, which leaves that
+    failure silent.
+    """
+    from omnigent.inner.native_attachments import _WORKSPACE_MATERIALIZE_EXTENSIONS
+
+    ts_path = Path(__file__).resolve().parents[2] / "web" / "src" / "lib" / "attachments.ts"
+    if not ts_path.exists():
+        pytest.skip("web/src/lib/attachments.ts not present (server-only checkout)")
+    block = ts_path.read_text().split("WORKSPACE_MATERIALIZE_EXTENSIONS = new Set([")[1]
+    client_exts = set(re.findall(r'"(\.[a-z0-9]+)"', block.split("]")[0]))
+
+    assert client_exts, "could not parse client WORKSPACE_MATERIALIZE_EXTENSIONS"
+    assert client_exts == set(_WORKSPACE_MATERIALIZE_EXTENSIONS)
