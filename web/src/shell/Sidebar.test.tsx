@@ -169,6 +169,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import * as identity from "@/lib/identity";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -338,6 +339,72 @@ const TEST_EXTENSION: ExtensionCatalogItem = {
 };
 
 describe("Sidebar session list", () => {
+  it.each([null, 1, 2, 3, 4])(
+    "marks shared sessions regardless of permission level %s",
+    (level) => {
+      mockConversations([
+        conv("shared_session", "Claude Code", {
+          owner: "other@example.com",
+          permission_level: level,
+        }),
+        conv("private_session", "Claude Code"),
+      ]);
+      renderSidebar();
+      selectSessionFilter("all");
+
+      const sharedRow = screen.getByText("shared_session").closest("li")!;
+      const indicator = within(sharedRow).getByRole("img", { name: "Shared session" });
+      expect(indicator).toHaveAttribute("title", "Shared with you");
+      expect(indicator).toHaveClass("w-6", "justify-center");
+      expect(indicator).toHaveClass("absolute", "right-1");
+      expect(
+        within(screen.getByText("private_session").closest("li")!).queryByRole("img"),
+      ).toBeNull();
+    },
+  );
+
+  it("keeps the session state rightmost when a shared icon is also present", () => {
+    mockConversations([
+      conv("shared_running", "Claude Code", {
+        owner: "other@example.com",
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+    selectSessionFilter("all");
+
+    const row = screen.getByText("shared_running").closest("li")!;
+    expect(within(row).getByRole("img", { name: "Shared session" })).toHaveClass("right-8");
+    expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
+  });
+
+  it("does not mark the viewer's own sessions or sessions without ownership metadata", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      mockConversations([
+        conv("owned_session", "Claude Code", { owner: "viewer@example.com" }),
+        conv("null_owner", "Claude Code", { owner: null }),
+        conv("missing_owner", "Claude Code"),
+      ]);
+      renderSidebar();
+      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
+  it("keeps the shared indicator on pinned sessions across filters", () => {
+    mockConversations([conv("shared_pin", "Claude Code", { owner: "other@example.com" })]);
+    seedPins(["shared_pin"]);
+    renderSidebar();
+
+    for (const filter of ["mine", "shared", "all", "archived"] as const) {
+      selectSessionFilter(filter);
+      const pinned = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinned).getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+    }
+  });
+
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
     renderSidebar();
@@ -364,6 +431,22 @@ describe("Sidebar session list", () => {
     const label = screen.getByText("debug the login redirect");
     expect(label).toHaveClass("italic", "text-muted-foreground");
     expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
+  });
+
+  it("renders a provisional (temp:) row as a bare navigable link with no mutating actions", () => {
+    // A client-only temp row has no server session, so its per-row mutations
+    // (kebab: rename/delete/archive/move/share) must be suppressed — invoking
+    // them would POST to /v1/sessions/temp:* (Polly B-3).
+    mockConversations([
+      conv("temp:0a1b2c3d", "Claude Code", { title: "new chat", provisional: true }),
+    ]);
+    renderSidebar();
+
+    // Navigable: the row is still a link into the (soon-to-exist) conversation.
+    const link = screen.getByRole("link", { name: /new chat/ });
+    expect(link).toHaveAttribute("href", expect.stringContaining("/c/temp:0a1b2c3d"));
+    // But no action affordances until it's rekeyed to the real id.
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).not.toBeInTheDocument();
   });
 
   it("uses the interface text token for session-list errors", () => {
@@ -780,6 +863,27 @@ describe("Sidebar session list", () => {
     const usage = screen.getByTestId("usage-nav");
     expect(usage).toHaveAttribute("href", "/usage");
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("hides Canvas navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas");
+
+    expect(screen.queryByTestId("canvas-nav")).toBeNull();
+  });
+
+  it("renders and highlights the Canvas nav row without lighting New session", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { canvas: true },
+    });
+
+    const canvas = screen.getByTestId("canvas-nav");
+    expect(canvas).toHaveAttribute("href", "/canvas");
+    expect(canvas).toHaveAttribute("aria-current", "page");
+    expect(canvas).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("keeps filtering visible while session selection remains hover-revealed", () => {

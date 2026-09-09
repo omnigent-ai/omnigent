@@ -1730,7 +1730,7 @@ async def test_delete_reaped_managed_session_removes_durable_host(
         sandbox_id="sb-reaped-delete",
         expected_updated_at=host.updated_at,
     )
-    assert env.host_store.mark_terminating_sandbox_terminated(
+    assert env.host_store.mark_sandbox_terminated(
         host.host_id,
         sandbox_id="sb-reaped-delete",
     )

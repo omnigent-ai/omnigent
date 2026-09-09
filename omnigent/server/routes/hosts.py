@@ -446,6 +446,13 @@ class StoreHarnessCredentialRequest(BaseModel):
     env_var: str | None = None
 
 
+class HostModelOptionsResponse(BaseModel):
+    """Pre-launch model choices resolved by a host harness."""
+
+    models: list[dict[str, Any]]
+    routable_models: list[str]
+
+
 class LaunchRunnerRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/runners``.
 
@@ -667,7 +674,7 @@ def create_hosts_router(
         request: Request,
         host_id: str,
         harness: str,
-    ) -> dict[str, list[Any]]:
+    ) -> HostModelOptionsResponse:
         """Return pre-launch model choices resolved by the selected host.
 
         A preview of the host's ambient default catalog, not a binding
@@ -696,21 +703,18 @@ def create_hosts_router(
             )
         models = result.get("models")
         routable = result.get("routable_models")
-        payload: dict[str, Any] = {
-            "models": models if isinstance(models, list) else [],
+        return HostModelOptionsResponse(
+            models=(
+                [model for model in models if isinstance(model, dict)]
+                if isinstance(models, list)
+                else []
+            ),
             # Every id the harness's endpoint routes: the picker names one
             # row per model, while a launch takes an exact id.
-            "routable_models": (
+            routable_models=(
                 [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
             ),
-        }
-        # An honest empty answer carries the reason (e.g. "the codex model
-        # probe failed — see the host log") so the picker can say WHY it is
-        # empty instead of a generic "Models unavailable".
-        error = result.get("error")
-        if isinstance(error, str) and error:
-            payload["error"] = error
-        return payload
+        )
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(

@@ -10,18 +10,16 @@ from typing import Any
 
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-    codex_native_bridge,
-    cursor_native,
-    cursor_native_bridge,
-    kiro_native,
-    kiro_native_bridge,
-)
-from omnigent.claude_native_bridge import (
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
-from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.cursor_native import main as cursor_native
+from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.harnesses.kiro_native import main as kiro_native
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -67,7 +65,7 @@ class _RecordingCodexAppServerClient:
     Test double for Codex app-server JSON-RPC controls.
 
     :param transport: Transport passed to
-        :func:`omnigent.codex_native_app_server.client_for_transport`, e.g.
+        :func:`omnigent.harnesses.codex_native.app_server.client_for_transport`, e.g.
         ``"ws://127.0.0.1:1234"``.
     :param client_name: App-server client name, e.g.
         ``"omnigent-codex-native-runner"``.
@@ -156,7 +154,7 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     204 as a no-op. The update is a next-turn setting: it is valid even when
     no active turn id is recorded.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "524fe55f9d5a7f66fec5c5401a930b84"
@@ -265,8 +263,8 @@ async def test_events_codex_native_plan_mode_change_preserves_developer_instruct
     real HTTP path end-to-end and asserts the current value is read back
     and threaded through to ``thread/settings/update``.
     """
-    from omnigent import codex_native_app_server
-    from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
 
     conv_id = "6f2f8f7f6a3b4c5d9e0f1a2b3c4d5e6f"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -379,7 +377,7 @@ async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
     plan-mode preservation feature exists to prevent. The tri-state read
     must refuse to guess instead.
     """
-    from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
 
     conv_id = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -684,8 +682,9 @@ async def test_opencode_native_model_options_uses_cli_catalog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from omnigent import opencode_native_app_server, opencode_native_bridge
-    from omnigent.opencode_native_bridge import OpenCodeNativeBridgeState
+    from omnigent.harnesses.opencode_native import app_server as opencode_native_app_server
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "conv_opencode_native_model_options"
@@ -758,7 +757,7 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     is still creating its app-server bridge; that would permanently hide the
     Web UI model picker for the session.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
     conv_id = "d2f0a2d856bc03c1674d3d634b4f250c"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -848,7 +847,7 @@ async def test_codex_native_model_options_query_model_list(
     session, so the model named by the session's ``config.toml`` — the one
     the pane launched on — wins when the list offers it.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "68ba0a62ebe928d26adf37c8974ce1eb"
@@ -1034,10 +1033,12 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     marked, both reads agree (the second is the session cache), and the
     launch-time config resolution is shared — the spec resolves once.
     """
-    from omnigent.claude_native import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
     conv_id = "6a416804870ed618cc8908f5cebab937"
     claude_spec = AgentSpec(
         spec_version=1,
@@ -1063,7 +1064,9 @@ async def test_claude_native_model_options_use_session_launch_catalog(
         resolved_specs.append(spec)
         return config
 
-    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve
+    )
     probe_calls: list[int] = []
 
     async def _probe(claude_config: object) -> ClaudeModelProbe:
@@ -1086,7 +1089,7 @@ async def test_claude_native_model_options_use_session_launch_catalog(
             default_label="Opus 4.10",
         )
 
-    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
 
     async def _fake_auto_create(
         session_id: str,
@@ -1162,11 +1165,13 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     lifetime. The store's single-flight probe survives the inline wait
     expiring — the second read joins it instead of restarting it.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.runner import app as runner_app_module
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
 
     conv_id = "9c527915981fe729dd9a19a6dfcbca49"
     claude_spec = AgentSpec(
@@ -1185,7 +1190,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         model="system.ai.claude-opus-4-10",
     )
     monkeypatch.setattr(
-        "omnigent.claude_native.resolve_native_claude_config",
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
         lambda *, spec: config,
     )
     release = asyncio.Event()
@@ -1197,7 +1202,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         nonlocal probe_calls
         probe_calls += 1
         await release.wait()
-        from omnigent.claude_native import ClaudeModelProbe
+        from omnigent.harnesses.claude_native.main import ClaudeModelProbe
 
         return ClaudeModelProbe(
             alias_rows=[{"id": "sonnet[1m]", "model": "claude-sonnet-5[1m]"}],
@@ -1205,7 +1210,9 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
             default_label=None,
         )
 
-    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _slow_probe)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.probe_claude_model_options", _slow_probe
+    )
     monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
 
     async def _fake_auto_create(
@@ -1288,7 +1295,7 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
     """
     import click
 
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     conv_id = "7b527915981fe729dd9a19a6dfcbca48"
     claude_spec = AgentSpec(
@@ -1305,7 +1312,9 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
         del spec
         raise click.ClickException("Databricks profile 'p' exposes no Claude model services.")
 
-    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve
+    )
 
     async def _fake_auto_create(
         session_id: str,
@@ -1355,15 +1364,17 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     a runner restart: an expired entry re-reads the store instead of serving
     the rows it cached at first read, and a warm store costs no new probe.
     """
-    from omnigent import model_catalog_store
-    from omnigent.claude_native import (
+    from omnigent.harnesses.claude_native.main import (
         ClaudeModelProbe,
         ClaudeNativeUcodeConfig,
         claude_catalog_fingerprint,
     )
+    from omnigent.models import model_catalog_store
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
     monkeypatch.setattr("omnigent.runner.app._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0)
     conv_id = "8c1f2e3d4a5b46c7d8e9f0a1b2c3d4e5"
     claude_spec = AgentSpec(
@@ -1386,7 +1397,9 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
         del spec
         return config
 
-    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve
+    )
     probe_calls: list[int] = []
 
     async def _probe(claude_config: object) -> ClaudeModelProbe:
@@ -1400,7 +1413,7 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
             default_label="Opus 4.10",
         )
 
-    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
 
     async def _fake_auto_create(
         session_id: str,
@@ -1466,10 +1479,12 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
     the config a launch resolved must retire rows listed under the previous
     one rather than serving them until the cache TTL passes.
     """
-    from omnigent.claude_native import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
     conv_id = "9d2e3f4a5b6c47d8e9f0a1b2c3d4e5f6"
     claude_spec = AgentSpec(
         spec_version=1,
@@ -1492,7 +1507,9 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
         del spec
         return _config("system.ai.claude-opus-4-10")
 
-    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", _resolve
+    )
 
     async def _probe(claude_config: ClaudeNativeUcodeConfig) -> ClaudeModelProbe:
         return ClaudeModelProbe(
@@ -1501,7 +1518,7 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
             default_label="Opus",
         )
 
-    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
     recorders: list[Any] = []
 
     async def _fake_auto_create(
@@ -1625,7 +1642,7 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
     3. The session is NOT added to ``_interrupted_sessions``; no marker in
        ``_session_histories``.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
@@ -1773,7 +1790,7 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
     3. The session is NOT added to ``_interrupted_sessions``; no marker leaks
        into ``_session_histories``.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
@@ -1920,7 +1937,7 @@ async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_tu
     Codex TUI's startup interrupt — ``turn/interrupt`` with an empty turn
     id — instead of doing nothing.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = f"36ea25fd09df4a2d85136100fbecd3e9{event_type}"
@@ -2056,7 +2073,7 @@ async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
     send the startup interrupt (empty turn id, best-effort, first) and
     flip the bridge's pending servers to ``cancelled``.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "14fb6a0dde97fc0f7a58a84e1be2c538"
@@ -2171,7 +2188,7 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     An idle codex-native session must not send spurious ``turn/interrupt``
     requests to the app-server on every Stop press.
     """
-    from omnigent import codex_native_app_server
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "5cb0fd92163581dee07e5462a93d5021"
@@ -2276,7 +2293,7 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
     2. An ``interrupt_*`` payload is written to the session's bridge inbox.
     3. NO ``[System: interrupted]`` marker is persisted (the floor never ran).
     """
-    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
@@ -2379,7 +2396,7 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     """
     import json as _json
 
-    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "conv_pi_native_model_change"

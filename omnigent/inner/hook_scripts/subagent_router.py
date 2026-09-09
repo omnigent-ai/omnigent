@@ -1,7 +1,7 @@
 """Shared subagent-routing decision logic for harness hooks.
 
 Stdlib-only on purpose (bar the equally light
-:mod:`omnigent.claude_model_vocabulary`): the Claude-native hook runs as
+:mod:`omnigent.models.claude_model_vocabulary`): the Claude-native hook runs as
 a per-spawn subprocess (``python -I -m
 omnigent.inner.hook_scripts.claude_router_hook``) and blocks the spawn,
 so importing anything heavier would show up as spawn latency. The
@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from omnigent.claude_model_vocabulary import (
+from omnigent.models.claude_model_vocabulary import (
     CLAUDE_MODEL_ALIASES,
     alias_pins,
     claude_model_alias,

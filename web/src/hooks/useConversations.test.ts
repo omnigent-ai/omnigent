@@ -2,7 +2,7 @@
 // query-invalidation contract of the stop mutation hook.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
@@ -29,7 +29,7 @@ import {
   useStopSession,
   useTogglePinnedConversation,
   fetchPinnedConversations,
-  unmarkSessionsDeleting,
+  clearSessionTombstones,
   markRecentlyCreated,
   clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
@@ -60,10 +60,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  // Optimistic delete hides ids from every list fetch until the delete
-  // settles, in module-level state that would otherwise leak into the next
-  // test (which reuses the same ids against a fresh cache).
-  unmarkSessionsDeleting();
+  clearSessionTombstones();
   // Same for the recently-created keep-alive.
   clearRecentlyCreated();
 });
@@ -2367,6 +2364,14 @@ describe("useMoveToProject", () => {
 });
 
 describe("useArchiveConversation", () => {
+  const staleListPage = {
+    object: "list",
+    data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 5 }],
+    first_id: "conv_a",
+    last_id: "conv_a",
+    has_more: true,
+  };
+
   it("PATCHes archived, overlays the flag optimistically, and doesn't race the reindex", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
@@ -2474,6 +2479,100 @@ describe("useArchiveConversation", () => {
       .pages[0].data;
     expect(rows[0].archived).toBe(false);
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("does not restore a row with a concurrent delete in flight", async () => {
+    let settleArchive = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleArchive = resolve;
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+    const del = renderHook(() => useStopAndDeleteConversation(), { wrapper });
+    const cachedRow = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((row) => row.id === "conv_a");
+
+    archive.result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    let settleDelete = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleDelete = resolve;
+        }),
+    );
+    del.result.current.mutate({ id: "conv_a" });
+    await waitFor(() => expect(cachedRow()).toBeUndefined());
+
+    settleArchive(mockResponse({ error: "late" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(archive.result.current.isError).toBe(true));
+    expect(cachedRow()).toBeUndefined();
+
+    settleDelete(mockResponse({ id: "conv_a", deleted: true }));
+    await waitFor(() => expect(del.result.current.isSuccess).toBe(true));
+  });
+
+  it("filters stale refetches without stopping pagination", async () => {
+    let settlePatch = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settlePatch = resolve;
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const seeded = infinitePage([conversation({ id: "conv_a" })]);
+    seeded.pages[0].has_more = true;
+    queryClient.setQueryData(["conversations", "", false], seeded);
+    const cancelSpy = vi.spyOn(queryClient, "cancelQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const list = renderHook(() => useConversations("", false), { wrapper });
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+
+    archive.result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", false] }));
+    const first = list.result.current.data!.pages[0];
+    expect(first.data).toEqual([]);
+    expect(first.last_id).toBe("conv_a");
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [conversation({ id: "conv_other" })],
+        first_id: "conv_other",
+        last_id: "conv_other",
+        has_more: false,
+      }),
+    );
+    await act(() => list.result.current.fetchNextPage());
+    expect(fetchMock.mock.calls[2][0]).toContain("after=conv_a");
+
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    const archivedList = renderHook(() => useConversations("", true), { wrapper });
+    await waitFor(() => expect(archivedList.result.current.data).toBeDefined());
+    expect(archivedList.result.current.data!.pages[0].data[0].archived).toBe(true);
+
+    settlePatch(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    await waitFor(() => expect(archive.result.current.isSuccess).toBe(true));
   });
 });
 

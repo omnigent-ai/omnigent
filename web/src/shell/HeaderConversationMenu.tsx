@@ -12,6 +12,7 @@ import {
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
+  GitForkIcon,
   InfoIcon,
   MailIcon,
   PencilIcon,
@@ -64,9 +65,11 @@ interface HeaderConversationMenuProps {
   conversation: Conversation;
   currentProject: string | null;
   canShare: boolean;
+  canFork: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   onShare: () => void;
+  onFork: () => void;
   hasAgentInfo?: boolean;
   onAgentInfo?: () => void;
   /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
@@ -92,9 +95,11 @@ export function HeaderConversationMenu({
   conversation,
   currentProject,
   canShare,
+  canFork,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
+  onFork,
   hasAgentInfo = false,
   onAgentInfo,
   workspaceItems = null,
@@ -214,6 +219,16 @@ export function HeaderConversationMenu({
           Share
         </DropdownMenuItem>
       )}
+      {canFork && (
+        <DropdownMenuItem
+          data-testid="header-fork-conversation"
+          className={itemClass}
+          onSelect={onFork}
+        >
+          <GitForkIcon className="size-3.5" />
+          Fork
+        </DropdownMenuItem>
+      )}
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"
@@ -329,9 +344,9 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:rounded-full"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full"
           >
-            <EllipsisIcon className={isMobile ? "size-4" : "size-3.5"} />
+            <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent

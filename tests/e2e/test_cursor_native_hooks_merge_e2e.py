@@ -5,7 +5,7 @@ that already carries a project-scoped ``.cursor/hooks.json`` (e.g. Universe's
 ``preToolUse`` policy hook) fully replaced that file with Omnigent's
 session-specific ``stop`` usage hook, destroying the user's existing hooks.
 The destructive write happens during the runner-side terminal launch
-(``write_hooks_config`` in :mod:`omnigent.cursor_native_bridge`, called from
+(``write_hooks_config`` in :mod:`omnigent.harnesses.cursor_native.bridge`, called from
 ``omnigent/runner/native/orchestration.py``) — *before* the cursor executable
 is resolved and before any model turn.
 
@@ -146,8 +146,8 @@ def test_cursor_native_launch_preserves_existing_hooks_json(
         stop_commands = [
             entry.get("command", "") for entry in hooks.get("stop", []) if isinstance(entry, dict)
         ]
-        assert any("cursor_native_usage" in command for command in stop_commands), (
-            "launch never registered Omnigent's cursor_native_usage stop hook in "
+        assert any("cursor_native.usage" in command for command in stop_commands), (
+            "launch never registered Omnigent's cursor_native usage stop hook in "
             f".cursor/hooks.json — cannot observe the rewrite; file was:\n{raw}"
         )
 

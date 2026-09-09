@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
+import time
 import weakref
 from collections.abc import Callable
 from typing import Any, Literal, cast
@@ -12,9 +13,13 @@ from typing import Any, Literal, cast
 import httpx
 from fastapi import (
     APIRouter,
+    HTTPException,
     Request,
 )
 from fastapi.responses import StreamingResponse
+from fastapi.routing import APIRoute
+from starlette.datastructures import Headers
+from starlette.types import Message, Receive, Scope, Send
 
 from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
@@ -55,6 +60,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_session_titles_enabled,
     background_title_prompt,
     prepare_background_session_title,
     schedule_background_child_task_summary,
@@ -168,11 +174,13 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
+    _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
+    reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -208,11 +216,13 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
-from omnigent.session_lifecycle import (
-    is_session_closed,
+from omnigent.session_event_batch import (
+    MAX_SESSION_EVENT_BATCH_EVENTS,
+    MAX_SESSION_EVENT_REQUEST_BYTES,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S, runner_seen_is_fresh
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -222,6 +232,9 @@ from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedE
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+from omnigent.util.session_lifecycle import (
+    is_session_closed,
+)
 
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
@@ -239,6 +252,46 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
         _EXTERNAL_SESSION_USAGE_TYPE,
     }
 )
+
+
+def _event_body_too_large() -> HTTPException:
+    """Build the shared error for an oversized session-event request."""
+    return HTTPException(
+        status_code=400,
+        detail="session event request exceeds the 10 MiB limit",
+    )
+
+
+class _SessionEventBodyLimitRoute(APIRoute):
+    """Reject oversized event bodies before FastAPI parses them."""
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Enforce the encoded request limit from headers and ASGI chunks."""
+        if scope["type"] != "http":
+            await super().handle(scope, receive, send)
+            return
+
+        content_length = Headers(scope=scope).get("content-length")
+        if content_length is not None:
+            try:
+                declared_bytes = int(content_length)
+            except ValueError:
+                declared_bytes = 0
+            if declared_bytes > MAX_SESSION_EVENT_REQUEST_BYTES:
+                raise _event_body_too_large()
+
+        received_bytes = 0
+
+        async def receive_bounded() -> Message:
+            nonlocal received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > MAX_SESSION_EVENT_REQUEST_BYTES:
+                    raise _event_body_too_large()
+            return message
+
+        await super().handle(scope, receive_bounded, send)
 
 
 def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
@@ -385,6 +438,8 @@ def register_events_routes(
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
+    event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
+
     def _has_runner_created_by_authority(request: Request, conv: Any) -> bool:
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token:
@@ -394,7 +449,7 @@ def register_events_routes(
         runner_id = getattr(conv, "runner_id", None)
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
-    @router.post(
+    @event_router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
         include_in_schema=False,
@@ -406,22 +461,48 @@ def register_events_routes(
     async def post_event(
         request: Request,
         session_id: str,
-        body: SessionEventInput,
-    ) -> dict[str, bool | str]:
+        body: SessionEventInput | list[SessionEventInput],
+    ) -> dict[str, bool | str] | list[dict[str, bool | str]]:
         """
         Route entry for :func:`_post_event_impl`.
 
-        A message counts as in flight for the whole request — including any
-        runner launch it triggers — so the session list reports a booting
-        session as running instead of idle.
+        A single object preserves the existing API. A top-level JSON array is
+        processed in order and returns one acknowledgement per event when all
+        entries succeed. Batch execution is not atomic: if an entry fails,
+        earlier entries remain applied, later entries are not attempted, and
+        the error response does not include acknowledgements from earlier
+        entries. Messages count as in flight for the whole request, including
+        runner launch.
         """
         with contextlib.ExitStack() as in_flight:
+            if isinstance(body, list):
+                if not body:
+                    raise OmnigentError(
+                        "session event batch must not be empty",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if len(body) > MAX_SESSION_EVENT_BATCH_EVENTS:
+                    raise OmnigentError(
+                        "session event batch exceeds the 100-event limit",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                return [
+                    await _post_event_impl(
+                        request,
+                        session_id,
+                        event,
+                        in_flight=in_flight if event.type == "message" else None,
+                    )
+                    for event in body
+                ]
             return await _post_event_impl(
                 request,
                 session_id,
                 body,
                 in_flight=in_flight if body.type == "message" else None,
             )
+
+    router.include_router(event_router)
 
     async def _post_event_impl(
         request: Request,
@@ -996,6 +1077,47 @@ def register_events_routes(
                     # reused per-session relay task and later swallow a genuine
                     # runner_disconnected as a quiet idle.
                     _intentional_stop_sessions.discard(session_id)
+            if not stop_delivered:
+                # False-success backstop. The stop reached NO live runner
+                # (``_stop_session_via_runner`` returned False, so there was
+                # no tunnel to deliver to). That path treats "no runner bound"
+                # as a no-op success — correct for an already-idle session,
+                # but WRONG for an orphaned one whose persisted status is
+                # still running/waiting: the runner died (a server replica
+                # outlived it, a crashed host, a graceful disconnect
+                # mid-turn), so nothing is left to emit the terminal edge, and
+                # returning 2xx below would report a stop that never actually
+                # settled the session. Reconcile that exact case to idle so
+                # the success we return is honest. (A host-spawned session
+                # whose runner is still live hits ``stop_delivered=True``
+                # above and its tunnel-drop disconnect handler publishes the
+                # terminal edge, so it never reaches here.)
+                #
+                # Only fire when the runner is confirmed gone from every
+                # replica: no live tunnel here (that's WHY the stop couldn't
+                # be delivered) AND ``runner_last_seen`` stale past the TTL,
+                # so a runner merely mid-reconnect — or alive on another
+                # replica — inside the grace window is left untouched.
+                stop_connectivity = await asyncio.to_thread(
+                    conversation_store.get_session_connectivity, [session_id]
+                )
+                stop_conn = stop_connectivity.get(session_id)
+                if (
+                    stop_conn is not None
+                    and stop_conn.runner_id is not None
+                    and not runner_seen_is_fresh(stop_conn.runner_last_seen)
+                    and _session_status_from_cache(
+                        session_id,
+                        stop_conv.live_status if stop_conv is not None else None,
+                    )
+                    == "running"
+                ):
+                    await asyncio.to_thread(
+                        reconcile_orphaned_running_status,
+                        session_id,
+                        conversation_store,
+                        int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                    )
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
@@ -1171,6 +1293,7 @@ def register_events_routes(
                 conversation_store,
                 created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
+                enabled=background_session_titles_enabled(request.headers),
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -1926,6 +2049,7 @@ def register_events_routes(
             coordinator=background_title_coordinator,
             conversation=conv,
             event=body,
+            enabled=background_session_titles_enabled(request.headers),
         )
         # Schedule display-name generation for child sessions (the
         # title coordinator skips children because their title is
@@ -1961,7 +2085,7 @@ def register_events_routes(
                 created_by=created_by,
             )
             if pending_background_title is not None:
-                pending_background_title.schedule()
+                pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
@@ -1976,12 +2100,13 @@ def register_events_routes(
             created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.
             host_store=getattr(request.app.state, "host_store", None),
         )
         if pending_background_title is not None:
-            pending_background_title.schedule()
+            pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True}
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id

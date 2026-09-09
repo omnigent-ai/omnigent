@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
+import re
 import secrets
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
@@ -56,8 +59,8 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
-from omnigent.model_metadata import concrete_reported_model
-from omnigent.native_coding_agents import (
+from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
 )
@@ -65,6 +68,11 @@ from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
     PolicyResult,
+)
+from omnigent.runner.mcp_execution_registry import (
+    MCP_OPERATION_ID_PARAM,
+    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
@@ -109,6 +117,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_session_titles_enabled,
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
@@ -329,10 +338,6 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
     SkillSummary,
 )
-from omnigent.session_lifecycle import (
-    labels_with_closed_status,
-    title_without_closed_marker,
-)
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -356,6 +361,32 @@ from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedE
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
+from omnigent.util.session_lifecycle import (
+    labels_with_closed_status,
+    title_without_closed_marker,
+)
+
+
+def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
+    """
+    Digest one elicitation's request params for tombstone matching.
+
+    Harness elicitation ids can recur for DIFFERENT questions (e.g. the
+    codex id derives from a JSON-RPC request id that a later request may
+    reuse), so a verdict tombstone written against a possibly-zombie
+    waiter carries this digest and a re-park adopts it only for the same
+    logical question.
+
+    :param params: The elicitation's request params.
+    :returns: A sha256 hex digest of the canonicalized params, e.g.
+        ``"9f86d081..."``.
+    """
+    canonical = json.dumps(
+        params.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 async def _publish_and_wait_for_harness_elicitation(
@@ -423,11 +454,13 @@ async def _publish_and_wait_for_harness_elicitation(
     # ``serverRequest/resolved`` notification. Raced below so the wait
     # ends promptly without relying on the web verdict or on disconnect
     # detection (unreliable behind the Databricks Apps proxy).
+    request_fingerprint = _harness_elicitation_request_fingerprint(params)
     parked = _ParkedHarnessElicitation(
         session_id=session_id,
         tool_name=tool_name,
         tool_input=tool_input,
         resolved_elsewhere=asyncio.Event(),
+        request_fingerprint=request_fingerprint,
     )
     _harness_elicitation_registry[elicitation_id] = future
     _harness_elicitation_owners[elicitation_id] = session_id
@@ -440,7 +473,9 @@ async def _publish_and_wait_for_harness_elicitation(
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
     try:
-        tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
+        tombstone = _consume_pre_resolved_harness_elicitation(
+            session_id, elicitation_id, request_fingerprint
+        )
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
             return tombstone.result
@@ -1108,6 +1143,7 @@ def _build_session_response(
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
+        share_workspace_files=conv.share_workspace_files,
         context_window=context_window,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
@@ -1840,15 +1876,40 @@ async def _resolve_elicitation(
         if _harness_elicitation_owners.get(elicitation_id) == session_id:
             result_payload = {k: v for k, v in data.items() if k != "elicitation_id"}
             try:
-                harness_future.set_result(
-                    ElicitationResult.model_validate(result_payload),
-                )
+                verdict_result = ElicitationResult.model_validate(result_payload)
             except ValidationError:
                 _logger.warning(
                     "Invalid approval payload for %r",
                     elicitation_id,
                     exc_info=True,
                 )
+            else:
+                harness_future.set_result(verdict_result)
+                # The waiter may be a zombie: a proxy can sever the
+                # long-poll client-side while holding the backend
+                # connection open, so the verdict set above is written to
+                # a connection nobody reads and disconnect detection never
+                # fires. Tombstone the verdict too, so a re-park of the
+                # same stable id adopts it instead of re-asking; a verdict
+                # that WAS delivered leaves a tombstone that ages out
+                # unconsumed (session-checked, TTL-pruned). The parked
+                # waiter's request fingerprint rides along so a LATER,
+                # different question reusing the id can't inherit it.
+                _parked_for_fingerprint = _harness_parked_elicitations.get(elicitation_id)
+                _prune_pre_resolved_harness_elicitations()
+                _harness_pre_resolved_elicitations[elicitation_id] = (
+                    _PreResolvedHarnessElicitation(
+                        session_id=session_id,
+                        created_at=time.time(),
+                        result=verdict_result,
+                        request_fingerprint=(
+                            _parked_for_fingerprint.request_fingerprint
+                            if _parked_for_fingerprint is not None
+                            else None
+                        ),
+                    )
+                )
+                _prune_pre_resolved_harness_elicitations()
     elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
@@ -1859,11 +1920,25 @@ async def _resolve_elicitation(
         except ValidationError:
             pre_resolved = None
         if pre_resolved is not None:
+            # The pending index still holds the answered prompt (the
+            # resolved fan-out below drains it), so fingerprint the
+            # tombstone with the question's params: a later, different
+            # question that reuses this id must not inherit the verdict.
+            gap_fingerprint: str | None = None
+            pending_entry = pending_elicitations.lookup(elicitation_id)
+            if pending_entry is not None and pending_entry[0] == session_id:
+                try:
+                    gap_fingerprint = _harness_elicitation_request_fingerprint(
+                        ElicitationRequestParams.model_validate(pending_entry[1].get("params"))
+                    )
+                except ValidationError:
+                    gap_fingerprint = None
             _prune_pre_resolved_harness_elicitations()
             _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
                 session_id=session_id,
                 created_at=time.time(),
                 result=pre_resolved,
+                request_fingerprint=gap_fingerprint,
             )
             _prune_pre_resolved_harness_elicitations()
     # Wake a currently-parked long-poll via resolved_elsewhere, not only its
@@ -2215,6 +2290,7 @@ async def _persist_external_conversation_item(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    enabled: bool = True,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -2237,6 +2313,29 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _parse_external_conversation_item(body)
+    # An at-least-once producer (the native transcript forwarders) retries a
+    # timed-out POST it cannot know the disposition of, so the item's id is
+    # derived from its ``source_id`` and the append is idempotent — the
+    # dedupe check rides the append's own transaction, under its
+    # conversation lock, costing the hot path no extra query. A dedupe hit
+    # comes back flagged so the duplicate's side effects are unwound below
+    # (no re-broadcast, and a wrongly-drained pending input is restored).
+    source_id = body.data.get("source_id")
+    if source_id is not None:
+        if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256:
+            raise OmnigentError(
+                "external_conversation_item data.source_id must be a "
+                "non-empty string of at most 256 characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        item = item.model_copy(
+            update={
+                "stable_id": uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
+                ).hex
+            }
+        )
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -2246,6 +2345,7 @@ async def _persist_external_conversation_item(
     # Claude (not a queued web message) and has no pending entry, so
     # draining for it would hand the queued message's uploads to the marker.
     cleared_pending_id: str | None = None
+    drained: pending_inputs.DrainedInput | None = None
     skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
@@ -2272,26 +2372,54 @@ async def _persist_external_conversation_item(
             # bubble then disappear once the committed item arrived.
             if drained.created_by is not None and item.created_by is None:
                 item = item.model_copy(update={"created_by": drained.created_by})
+            # A web client that sends stable_id gets store-level idempotency:
+            # use it directly as the item id so the append is a no-op on retry.
+            # source_id from the forwarder takes precedence when both are set.
+            if drained.stable_id is not None and item.stable_id is None:
+                item = item.model_copy(update={"stable_id": drained.stable_id})
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
-    for skipped in skipped_kiro_pending:
-        await _persist_skipped_kiro_pending_input(
-            session_id,
-            skipped,
-            conversation_store,
-        )
+    # Build the batch: skipped Kiro entries first (their positions must
+    # precede the matched item to match broadcast order), then the anchor.
+    # Each skipped entry gets a pair of items (user message + error) with
+    # stable IDs derived from pending_id, so the whole batch is idempotent
+    # under the append lock — no separate has_item probe needed. When the
+    # anchor is already persisted (a forwarder retry), append returns every
+    # item as deduplicated and the queue entries are restored below.
+    skipped_new_items = _build_skipped_kiro_items(session_id, skipped_kiro_pending)
+    batch = [*skipped_new_items, item]
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+        enabled=enabled and (drained is None or drained.background_titles_enabled),
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    persisted = persisted_items[-1]
+    if persisted.deduplicated:
+        # A re-post of an already-committed item: nothing new to render or
+        # title. Every pending entry consumed above belongs to a LATER user
+        # message — restore in original queue order (skipped entries preceded
+        # the match; restore prepends, so reverse).
+        for entry in reversed([*skipped_kiro_pending, drained]):
+            if entry is not None:
+                pending_inputs.restore(session_id, entry)
+        return persisted.id
+    # Not a duplicate: publish side effects for each skipped Kiro pair.
+    # Items are [user0, error0, user1, error1, ...]; 2 per skipped entry.
+    for i, skipped in enumerate(skipped_kiro_pending):
+        persisted_user = persisted_items[i * 2]
+        persisted_error = persisted_items[i * 2 + 1]
+        if not persisted_user.deduplicated:
+            _publish_input_consumed(
+                session_id, persisted_user, cleared_pending_id=skipped.pending_id
+            )
+            _publish_external_conversation_item(session_id, persisted_error)
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
-        pending_background_title.schedule()
-    persisted = persisted_items[0]
+        pending_background_title.schedule(expected_seed_title=conv.title)
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -2299,41 +2427,53 @@ async def _persist_external_conversation_item(
     return persisted.id
 
 
-async def _persist_skipped_kiro_pending_input(
+def _build_skipped_kiro_items(
     session_id: str,
-    skipped: pending_inputs.DrainedInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """Persist a Kiro web input that never appeared in Kiro's JSONL transcript."""
-    turn_id = generate_task_id()
-    user_item = NewConversationItem(
-        type="message",
-        response_id=turn_id,
-        data=MessageData(role="user", content=skipped.content),
-        created_by=skipped.created_by,
-    )
-    error = ErrorData(
-        source="execution",
-        code="kiro_native_prompt_not_recorded",
-        message=(
-            "Kiro did not accept this web message into its structured session transcript. "
-            "The native terminal may have shown the underlying error."
-        ),
-    )
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [
-            user_item,
-            NewConversationItem(type="error", response_id=turn_id, data=error),
-        ],
-    )
-    _publish_input_consumed(
-        session_id,
-        persisted_items[0],
-        cleared_pending_id=skipped.pending_id,
-    )
-    _publish_external_conversation_item(session_id, persisted_items[1])
+    skipped_entries: list[pending_inputs.DrainedInput],
+) -> list[NewConversationItem]:
+    """
+    Build ``NewConversationItem`` pairs for Kiro web inputs not in the transcript.
+
+    Each skipped entry produces ``[user_message, error_item]``. Stable IDs
+    derived from ``pending_id`` make each pair idempotent under the batch
+    append so no pre-flight has_item probe is needed — if the anchor item
+    is already persisted (a forwarder retry), these items are too, and
+    append returns the whole batch deduplicated.
+    """
+    items: list[NewConversationItem] = []
+    for skipped in skipped_entries:
+        turn_id = generate_task_id()
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=turn_id,
+                data=MessageData(role="user", content=skipped.content),
+                created_by=skipped.created_by,
+                stable_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-skipped-kiro-user:{session_id}:{skipped.pending_id}",
+                ).hex,
+            )
+        )
+        items.append(
+            NewConversationItem(
+                type="error",
+                response_id=turn_id,
+                data=ErrorData(
+                    source="execution",
+                    code="kiro_native_prompt_not_recorded",
+                    message=(
+                        "Kiro did not accept this web message into its structured session "
+                        "transcript. The native terminal may have shown the underlying error."
+                    ),
+                ),
+                stable_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-skipped-kiro-error:{session_id}:{skipped.pending_id}",
+                ).hex,
+            )
+        )
+    return items
 
 
 async def _enrich_terminal_status_with_subagent_output(
@@ -4616,7 +4756,7 @@ def _routed_turn_model_spelling(
     options = _model_options_cache.get(session_id)
     if not options:
         return model
-    from omnigent.claude_model_vocabulary import (
+    from omnigent.models.claude_model_vocabulary import (
         claude_model_command_arg,
         model_vocabulary_env,
     )
@@ -5638,6 +5778,7 @@ async def _dispatch_session_event_to_runner_impl(
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
+    background_titles_enabled: bool = True,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -5752,8 +5893,20 @@ async def _dispatch_session_event_to_runner_impl(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
+        raw_stable_id = body.data.get("stable_id")
+        web_stable_id = (
+            raw_stable_id
+            if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+            else None
+        )
         pending_id: str | None = (
-            pending_inputs.record(session_id, content, created_by=created_by)
+            pending_inputs.record(
+                session_id,
+                content,
+                created_by=created_by,
+                stable_id=web_stable_id,
+                background_titles_enabled=background_titles_enabled,
+            )
             if isinstance(content, list) and content
             else None
         )
@@ -7927,7 +8080,7 @@ def _spawn_pins_its_harness(
         return True
     if not body.sub_agent_name:
         return False
-    from omnigent.model_catalog import spec_harness
+    from omnigent.models.model_catalog import spec_harness
 
     sub_spec = _resolve_subagent_spec(
         agent=agent,
@@ -8876,6 +9029,7 @@ async def _create_session_from_existing_agent(
                     coordinator=background_title_coordinator,
                     conversation=conv,
                     event=item,
+                    enabled=background_session_titles_enabled(request.headers),
                 )
                 await _dispatch_session_event_to_runner(
                     conv.id,
@@ -8889,9 +9043,10 @@ async def _create_session_from_existing_agent(
                     created_by=_attribution_user(user_id),
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
+                    background_titles_enabled=background_session_titles_enabled(request.headers),
                 )
                 if pending_background_title is not None:
-                    pending_background_title.schedule()
+                    pending_background_title.schedule(expected_seed_title=conv.title)
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was
     # built, so a fresh read is what keeps the create response current.
@@ -9119,7 +9274,23 @@ async def _handle_mcp_tools_call(
     arguments: dict[str, Any] = params.get("arguments") or {}
     request_state_str: str | None = params.get("requestState")
     input_responses: dict[str, Any] = params.get("inputResponses") or {}
+    operation_id_value = params.get(MCP_OPERATION_ID_PARAM)
+    if operation_id_value is not None and not (
+        isinstance(operation_id_value, str) and 1 <= len(operation_id_value) <= 128
+    ):
+        return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
+    operation_id = cast("str | None", operation_id_value)
     is_retry = request_state_str is not None
+
+    def _runner_execute_body(
+        execute_params: dict[str, Any],
+        *,
+        step: str,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        if operation_id is not None:
+            body["_omnigent_operation"] = {"id": operation_id, "step": step}
+        return body
 
     _logger.debug(
         "MCP tools/call: session=%r tool=%r is_retry=%r",
@@ -9350,16 +9521,25 @@ async def _handle_mcp_tools_call(
 
         exec_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",
-            json={
-                "method": "tools/call",
-                "params": {"name": namespaced_name, "arguments": arguments},
-            },
+            json=_runner_execute_body(
+                {"name": namespaced_name, "arguments": arguments},
+                step="initial",
+            ),
             # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
             timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
         )
         exec_resp.raise_for_status()
         exec_data = exec_resp.json()
+    except ConnectionError as exc:
+        _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
+        if operation_id is not None:
+            return _mcp_error_response(
+                rpc_id,
+                RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+            )
+        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
     except Exception as exc:  # noqa: BLE001
         _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
         return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
@@ -9415,19 +9595,28 @@ async def _handle_mcp_tools_call(
         try:
             retry_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
-                json={
-                    "method": "tools/call",
-                    "params": {
+                json=_runner_execute_body(
+                    {
                         "name": namespaced_name,
                         "arguments": arguments,
                         "inputResponses": elicitation_responses,
                         "requestState": mcp_request_state,
                     },
-                },
+                    step="elicitation-response",
+                ),
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
             )
             retry_resp.raise_for_status()
             exec_data = retry_resp.json()
+        except ConnectionError as exc:
+            _logger.warning("Runner MCP retry detached: %s", exc, exc_info=True)
+            if operation_id is not None:
+                return _mcp_error_response(
+                    rpc_id,
+                    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+                )
+            return _mcp_error_response(rpc_id, -32000, "Runner MCP retry failed.")
         except Exception as exc:  # noqa: BLE001
             _logger.warning("Runner MCP retry failed: %s", exc, exc_info=True)
             return _mcp_error_response(rpc_id, -32000, "Runner MCP retry failed.")
@@ -9662,8 +9851,8 @@ async def _get_session_snapshot(
 
     Centralizes the create/get response building so both endpoints
     return identical projections. The lifecycle ``status`` is
-    derived from the relay-fed ``_session_status_cache`` (the tasks
-    table has been removed).
+    derived from the relay-fed ``_session_status_cache``, falling back to
+    the persisted relay status after a server recycle (the tasks table is gone).
 
     :param conv_store: The conversation store to read from.
     :param session_id: Session/conversation identifier,
@@ -9755,7 +9944,10 @@ async def _get_session_snapshot(
             ),
         )
 
-    status = _session_status_from_cache(session_id)
+    # A server recycle clears this cache while the persisted relay status survives.
+    # Prefer it because native injection can finish before an external harness turn,
+    # making the runner's generic active-turn probe report a false ``idle``.
+    status = _session_status_from_cache(session_id, conv.live_status)
     if status == "idle":
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a
@@ -9990,7 +10182,6 @@ __all__ = [
     "_persist_native_cumulative_usage",
     "_persist_native_terminal_failure",
     "_persist_session_event",
-    "_persist_skipped_kiro_pending_input",
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",

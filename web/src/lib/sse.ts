@@ -18,6 +18,7 @@ import type {
   ElicitationResolved,
   ErrorEvent,
   MessageDone,
+  ReasoningDone,
   NativeToolCall,
   OutputFileDone,
   PolicyDenied,
@@ -502,7 +503,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
 
   // Compaction.
   if (eventType === "response.compaction.in_progress") {
-    return { type: "compaction_in_progress" } satisfies CompactionInProgress;
+    const startedAt = data.started_at;
+    return {
+      type: "compaction_in_progress",
+      ...(typeof startedAt === "number" ? { startedAtS: startedAt } : {}),
+    } satisfies CompactionInProgress;
   }
   if (eventType === "response.compaction.completed") {
     const tt = data.total_tokens;
@@ -1188,6 +1193,23 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies MessageDone;
   }
 
+  if (itemType === "reasoning") {
+    // Same join as the history path (`itemsToBlocks.reasoningToBlock`)
+    // so live and reloaded transcripts render the thought identically.
+    const text = joinedBlockText(rec.content);
+    const summary = joinedBlockText(rec.summary);
+    // Redacted/empty reasoning has no readable text anywhere — nothing
+    // to render, so don't emit a dead reasoning section.
+    if (!text && !summary) return null;
+    return {
+      type: "reasoning_done",
+      text,
+      summary,
+      itemId,
+      responseId,
+    } satisfies ReasoningDone;
+  }
+
   if (itemType === "error") {
     return {
       type: "error",
@@ -1265,8 +1287,21 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies NativeToolCall;
   }
 
-  // Compaction items, reasoning items, etc. — skip.
+  // Compaction items, etc. — skip.
   return null;
+}
+
+/** Join `{text}` blocks the way `itemsToBlocks` does (`"\n\n"`). */
+function joinedBlockText(raw: unknown): string {
+  if (!Array.isArray(raw)) return "";
+  return raw
+    .map((b) =>
+      b && typeof b === "object" && !Array.isArray(b)
+        ? String((b as Record<string, unknown>).text ?? "")
+        : "",
+    )
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function parseResponse(data: Record<string, unknown>): Response {

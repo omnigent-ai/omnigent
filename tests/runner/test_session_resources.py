@@ -1282,8 +1282,10 @@ async def test_create_terminal_publishes_bridge_tmux_target(
     the terminal existed, but the launch request failed with a 500
     while trying to write ``tmux.json``.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
 
     resp = await client.post(
         "/v1/sessions/conv_abc/resources/terminals",
@@ -1299,7 +1301,7 @@ async def test_create_terminal_publishes_bridge_tmux_target(
     )
 
     assert resp.status_code == 200
-    from omnigent.claude_native_bridge import bridge_dir_for_conversation_id
+    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_conversation_id
 
     derived = bridge_dir_for_conversation_id("conv_abc")
     payload = json.loads((derived / "tmux.json").read_text(encoding="utf-8"))
@@ -1321,8 +1323,10 @@ async def test_create_terminal_ignores_client_supplied_bridge_path(
     below win, and ``tmux.json`` (which carries a live tmux socket)
     would land under it instead of the session-derived directory.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
 
     attacker_path = tmp_path / "attacker-controlled-dir"
     attacker_path.mkdir()
@@ -1342,7 +1346,7 @@ async def test_create_terminal_ignores_client_supplied_bridge_path(
 
     assert resp.status_code == 200
     assert not (attacker_path / "tmux.json").exists()
-    from omnigent.claude_native_bridge import bridge_dir_for_conversation_id
+    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_conversation_id
 
     derived = bridge_dir_for_conversation_id("conv_abc")
     assert (derived / "tmux.json").exists()

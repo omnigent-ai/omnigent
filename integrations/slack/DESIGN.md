@@ -122,6 +122,13 @@ generator already running".
   only), the newest server message is recovered as a last resort — guarded so it
   can't resurrect a prior turn's message (baseline compare) or re-post an answer
   an earlier sealed segment already showed (`already_delivered`).
+- **Paragraph-break boundary, id-bearing or id-less.** A new assistant message
+  inside a turn gets a paragraph break so back-to-back messages don't run
+  together. An id-bearing harness (claude-native) is authoritative: a
+  `message_id` change IS the boundary. The in-process harness (claude-sdk)
+  never sets one, so `_AnswerReply` falls back to `mark_message_end()` —
+  raised when the server commits a message (`response.output_item.done`) —
+  consulted only when both the current and prior `message_id` are `None`.
 
 ## Elicitations (tool approvals & questions): pure-push
 

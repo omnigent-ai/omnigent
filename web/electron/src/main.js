@@ -1263,6 +1263,29 @@ function loadServerUrl(win, serverUrl, routePath) {
 }
 
 /**
+ * Detach the window's embedded-browser view whenever the shell's main frame
+ * commits a new document (`did-navigate`: a reload, the session-expiry
+ * reload's login-page redirect, an SSO hop). The committing navigation tears
+ * down the SPA renderer WITHOUT running BrowserPane's unmount detach, so the
+ * native WebContentsView would keep painting over the new page — the
+ * workspace sign-in page, and the app again after re-login. Detach, not
+ * destroy: the views stay alive for their agents, and a re-mounted pane
+ * re-attaches via browser-set-active. Same-document navigations don't emit
+ * `did-navigate`, so normal SPA routing never trips this.
+ *
+ * @param {BrowserWindow} win
+ */
+function registerBrowserViewDetachOnNavigate(win) {
+  win.webContents.on("did-navigate", () => {
+    try {
+      windows.get(win)?.browserRegistry?.setActive?.(null);
+    } catch {
+      /* registry already torn down */
+    }
+  });
+}
+
+/**
  * Wire server-load failure fallbacks for a shell window.
  *
  * @param {BrowserWindow} win
@@ -1526,6 +1549,7 @@ function createWindow(targetUrl, opts = {}) {
   win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
 
   registerNavigationFallbacks(win);
+  registerBrowserViewDetachOnNavigate(win);
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop

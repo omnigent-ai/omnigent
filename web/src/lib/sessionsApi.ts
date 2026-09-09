@@ -16,6 +16,7 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
+import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -168,6 +169,8 @@ interface SessionResponseWire {
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
   subagent_routing_override?: "on" | "off" | null;
+  /** Owner opt-in: view-level collaborators may browse workspace files. */
+  share_workspace_files?: boolean;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -330,6 +333,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
+    shareWorkspaceFiles: wire.share_workspace_files ?? false,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
@@ -488,7 +492,11 @@ export async function createSession(
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -682,7 +690,10 @@ export async function createBundledSession(
   form.append("bundle", bundle);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: form,
   });
   if (!res.ok) {
@@ -929,6 +940,11 @@ export async function updateSession(
     codexApprovalMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
+    /**
+     * Owner opt-in that lets people with view (read-only) access browse the
+     * workspace files. Owner-only server-side. `true`/`false` set or clear it.
+     */
+    shareWorkspaceFiles?: boolean;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -955,6 +971,9 @@ export async function updateSession(
   }
   if ("subagentRoutingOverride" in updates) {
     body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
+  }
+  if (updates.shareWorkspaceFiles !== undefined) {
+    body.share_workspace_files = updates.shareWorkspaceFiles;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
@@ -1158,7 +1177,10 @@ export async function postEvent(
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(event),
   });
   // Throw a typed ApiError (not the bare status line) so callers can branch

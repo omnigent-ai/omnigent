@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import model_catalog_store as store
+from omnigent.models import model_catalog_store as store
 
 _ROWS = [
     {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},

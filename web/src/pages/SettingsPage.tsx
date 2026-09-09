@@ -41,6 +41,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
@@ -104,7 +105,7 @@ import {
   fetchGithubStatus,
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
-import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -225,6 +226,10 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
+import {
+  readBackgroundSessionTitlesEnabled,
+  writeBackgroundSessionTitlesEnabled,
+} from "@/lib/backgroundSessionTitlesPreferences";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -238,34 +243,6 @@ const PoliciesPage = lazy(() =>
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
 );
-
-/**
- * The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
- * (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
- * grant, which in single-user mode is the reserved `"local"` id — and
- * `getCurrentAuthorId` nulls `"local"` out (it's for author labels), which
- * would make the viewer's own sessions read as shared and vanish from the
- * default "My sessions" tab. `getCurrentUserId` keeps `"local"` and is the
- * identical real email in multi-user mode. It is synchronous (populated once
- * `resolveIdentity` has run — which `main.tsx` kicks off at boot), but on a
- * cold mount it can still be null for a tick, so we also await
- * `resolveIdentity()` and re-render when it lands. Keeping this reactive
- * (rather than a bare module read) means the My/Shared split settles correctly
- * the moment identity is known, without a manual refresh.
- */
-function useViewerId(): string | null {
-  const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
-  useEffect(() => {
-    let cancelled = false;
-    void resolveIdentity().then(() => {
-      if (!cancelled) setViewerId(getCurrentUserId());
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return viewerId;
-}
 
 /**
  * Settings content panel. The section nav lives in the sidebar card
@@ -1300,6 +1277,40 @@ function ComposerSendShortcutControl() {
   );
 }
 
+function BackgroundSessionTitlesControl() {
+  const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeBackgroundSessionTitlesEnabled(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Automatically name new sessions
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Generate a concise title in the background after the first message. Turn this off to keep
+          the default session name.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="background-session-titles-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.background_session_titles"
+      />
+    </div>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   return (
@@ -1311,6 +1322,10 @@ function GeneralSection() {
           <div className="mt-4 border-t border-border pt-4">
             <AlwaysSteerControl />
           </div>
+        </div>
+        <h2 className="mt-3 text-ui font-medium">Sessions</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <BackgroundSessionTitlesControl />
         </div>
       </div>
     </Section>

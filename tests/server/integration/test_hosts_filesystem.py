@@ -290,6 +290,31 @@ async def test_host_model_options_returns_prelaunch_catalog(
     }
 
 
+async def test_host_model_options_probe_failure_returns_bad_gateway(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """A failed host probe is a structured non-OK HTTP response."""
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex-native"] = {
+        "status": "failed",
+        "error": "the codex model probe failed — see the host log",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+        )
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "the codex model probe failed — see the host log"}
+
+
 async def test_list_filesystem_returns_paginated_entries(
     fs_setup: tuple[
         FastAPI,

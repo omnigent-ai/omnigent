@@ -304,6 +304,22 @@ export interface MessageDone {
 }
 
 /**
+ * A persisted reasoning item from `output_item.done` (type `reasoning`).
+ * Produced with no preceding reasoning deltas by native transcript
+ * mirrors (e.g. claude-native thinking blocks); delta-streaming
+ * harnesses may also publish it after the streamed section.
+ */
+export interface ReasoningDone {
+  type: "reasoning_done";
+  /** Joined raw reasoning text from the item's `content` blocks. */
+  text: string;
+  /** Joined summary text from the item's `summary` blocks. */
+  summary: string;
+  itemId: string;
+  responseId: string;
+}
+
+/**
  * Slash-command item from `output_item.done` (type `slash_command`).
  * Lifted from `SlashCommandItem`; reducer produces a `SlashCommandBlock`.
  */
@@ -413,6 +429,13 @@ export interface ErrorEvent {
 /** `response.compaction.in_progress` — server started compacting. */
 export interface CompactionInProgress {
   type: "compaction_in_progress";
+  /**
+   * Unix epoch seconds when the server first saw this compaction in
+   * progress. Stable across the repeated progress events a long compaction
+   * emits, so the elapsed counter can anchor to the true start — including
+   * after a page reload. Absent when the emitter doesn't track it.
+   */
+  startedAtS?: number;
 }
 
 /** `response.compaction.completed` — compaction finished successfully. */
@@ -943,6 +966,7 @@ export type StreamEvent =
   | RoutingDecision
   | TerminalCommandEvent
   | MessageDone
+  | ReasoningDone
   | OutputFileDone
   | RetryEvent
   | ErrorEvent

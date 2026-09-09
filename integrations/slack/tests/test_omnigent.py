@@ -153,6 +153,59 @@ async def test_client_create_and_submit_request_shapes() -> None:
 
 
 @respx.mock
+async def test_create_session_managed_asks_the_server_to_provision_a_host() -> None:
+    # A managed session sends ONLY the host_type switch: the server picks the
+    # sandbox's host and workspace, and 422s a caller that supplies either.
+    create = respx.post("http://omnigent.test/v1/sessions").mock(
+        return_value=httpx.Response(201, json={"id": "conv_m"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        session_id = await client.create_session("ag_1", "Slack C/1", host_type="managed")
+    finally:
+        await client.aclose()
+
+    assert session_id == "conv_m"
+    assert create.calls.last.request.read() == (
+        b'{"agent_id":"ag_1","title":"Slack C/1","host_type":"managed"}'
+    )
+
+
+@respx.mock
+async def test_managed_host_support_reads_the_server_capability_probe() -> None:
+    info = respx.get("http://omnigent.test/v1/info").mock(
+        return_value=httpx.Response(
+            200, json={"managed_sandboxes_enabled": True, "sandbox_provider": "modal"}
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        supported = await client.managed_host_support()
+    finally:
+        await client.aclose()
+
+    assert supported == (True, "modal")
+    assert info.calls.call_count == 1
+
+
+@respx.mock
+async def test_managed_host_support_reports_unsupported_when_probe_fails() -> None:
+    # An unreadable /v1/info must NOT advertise managed sandboxes: setup would
+    # then offer an option the server rejects with a 422 at first message.
+    respx.get("http://omnigent.test/v1/info").mock(return_value=httpx.Response(500))
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        supported = await client.managed_host_support()
+    finally:
+        await client.aclose()
+
+    assert supported == (False, None)
+
+
+@respx.mock
 async def test_check_health_probes_health_endpoint() -> None:
     health = respx.get("http://omnigent.test/health").mock(
         return_value=httpx.Response(200, json={"status": "ok"})
@@ -187,6 +240,11 @@ async def test_validate_returns_agents_and_online_hosts() -> None:
             },
         )
     )
+    respx.get("http://omnigent.test/v1/info").mock(
+        return_value=httpx.Response(
+            200, json={"managed_sandboxes_enabled": False, "sandbox_provider": None}
+        )
+    )
     client = OmnigentClient("http://omnigent.test")
 
     try:
@@ -196,6 +254,8 @@ async def test_validate_returns_agents_and_online_hosts() -> None:
 
     assert [a["id"] for a in validated.agents] == ["ag_1"]
     assert [h["host_id"] for h in validated.online_hosts] == ["h_on"]
+    assert validated.managed_hosts is False
+    assert validated.managed_host_provider is None
 
 
 @respx.mock
@@ -814,6 +874,83 @@ async def test_client_raises_runner_unavailable() -> None:
         await client.aclose()
 
     assert raised is True
+
+
+@respx.mock
+async def test_run_turn_relaunches_a_runner_only_for_an_external_session() -> None:
+    # A session whose runner died reports 503 runner_unavailable on submit. For
+    # an EXTERNAL host the client launches a fresh runner and retries the turn.
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": {"code": "runner_unavailable"}}),
+            httpx.Response(202, json={}),
+        ]
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(
+            200,
+            text=(
+                'data: {"type":"response.output_text.delta","delta":"back"}\n\n'
+                'data: {"type":"session.status","status":"idle","response_id":"r1"}\n\n'
+            ),
+        )
+    )
+    launch = respx.post("http://omnigent.test/v1/hosts/host_1/runners").mock(
+        return_value=httpx.Response(200, json={"runner_id": "runner_2"})
+    )
+    respx.get("http://omnigent.test/v1/runners/runner_2/status").mock(
+        return_value=httpx.Response(200, json={"online": True})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn(
+                "conv_1", "go", workspace="/home/u", host_id="host_1"
+            )
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    assert deltas == ["back"]
+    assert launch.called
+
+
+@respx.mock
+async def test_run_turn_never_launches_a_runner_for_a_managed_session() -> None:
+    # The server owns a managed session's sandbox and rebinds its runner itself.
+    # There is no host of ours to launch on, so the client must surface the
+    # failure rather than POST a runner onto a host it doesn't own.
+    respx.post("http://omnigent.test/v1/sessions/conv_m/events").mock(
+        return_value=httpx.Response(503, json={"error": {"code": "runner_unavailable"}})
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_m/stream").mock(
+        return_value=httpx.Response(200, text="")
+    )
+    hosts = respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
+    )
+    launch = respx.post(url__regex=r"http://omnigent\.test/v1/hosts/[^/]+/runners").mock(
+        return_value=httpx.Response(200, json={"runner_id": "runner_2"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        raised = False
+        try:
+            async for _event in client.run_turn("conv_m", "go", host_type="managed"):
+                pass
+        except RunnerUnavailableError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised is True
+    # No runner launch, and no host was even shopped for one.
+    assert not launch.called
+    assert not hosts.called
 
 
 @respx.mock

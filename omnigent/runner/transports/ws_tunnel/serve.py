@@ -59,8 +59,8 @@ from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
 )
-from omnigent.suspend_watch import watch_for_resume
-from omnigent.tls import client_ssl_context
+from omnigent.util.suspend_watch import watch_for_resume
+from omnigent.util.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
 
@@ -386,6 +386,17 @@ async def serve_tunnel(
         nonlocal woke_from_suspend
         woke_from_suspend = True
 
+    async def _notify_reconnected() -> None:
+        if on_reconnect is None:
+            return
+        try:
+            await on_reconnect()
+        except Exception:
+            _logger.exception(
+                "on_reconnect callback failed",
+                extra={"session_id": runner_primary_session_id()},
+            )
+
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
             # A shutdown requested between reconnect attempts (no live
@@ -394,14 +405,7 @@ async def serve_tunnel(
         connected_this_attempt = False
         disconnect_error: BaseException | None = None
         auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
-        if ever_connected and on_reconnect is not None:
-            try:
-                await on_reconnect()
-            except Exception:
-                _logger.exception(
-                    "on_reconnect callback failed",
-                    extra={"session_id": runner_primary_session_id()},
-                )
+        reconnecting = ever_connected
         retry_reason = "connection closed cleanly"
         recycle = False
         try:
@@ -417,6 +421,7 @@ async def serve_tunnel(
                 shutdown_event=shutdown_event,
                 on_graceful_shutdown=on_graceful_shutdown,
                 on_connected=_mark_connected,
+                on_ready=_notify_reconnected if reconnecting else None,
                 on_resume_note=_note_resume_from_suspend,
                 direct_attach_port=direct_attach_port,
                 direct_attach_token=direct_attach_token,
@@ -458,7 +463,7 @@ async def serve_tunnel(
                     # Show the display form (workspace /omnigent URL, ?o=
                     # when known), not the internal API mount; it round-trips
                     # through `omnigent login` to the same server.
-                    from omnigent.server_url import display_server_url
+                    from omnigent.util.server_url import display_server_url
 
                     raise RuntimeError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
@@ -486,7 +491,7 @@ async def serve_tunnel(
                             # --host`, which would need the workspace host,
                             # not the server URL (for workspace-hosted
                             # servers the API mount is the wrong --host).
-                            from omnigent.server_url import display_server_url
+                            from omnigent.util.server_url import display_server_url
 
                             login_hint = (
                                 f"run `omnigent login {display_server_url(server_url)}` "
@@ -763,6 +768,7 @@ async def _serve_tunnel_once(
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     on_connected: Callable[[], None] | None = None,
+    on_ready: Callable[[], Awaitable[None]] | None = None,
     on_resume_note: Callable[[], None] | None = None,
     direct_attach_port: int | None = None,
     direct_attach_token: str | None = None,
@@ -793,6 +799,9 @@ async def _serve_tunnel_once(
     :param on_connected: Optional sync callback fired once the WS
         upgrade is accepted. ``serve_tunnel`` uses it to distinguish a
         runner that has authenticated from one that never has.
+    :param on_ready: Optional async callback fired after the hello frame is
+        sent. ``serve_tunnel`` uses it to run reconnect work only after the
+        new server connection is ready.
     :param on_resume_note: Optional sync callback fired when a wake from
         system suspend is detected on this connection (just before the dead
         socket is aborted). ``serve_tunnel`` uses it to force a prompt
@@ -857,6 +866,8 @@ async def _serve_tunnel_once(
             direct_attach_port=direct_attach_port,
             direct_attach_token=direct_attach_token,
         )
+        if on_ready is not None:
+            await on_ready()
         _logger.info(
             "runner %s connected to %s",
             runner_id,

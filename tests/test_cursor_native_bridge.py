@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`omnigent.cursor_native_bridge` composer handling.
+"""Unit tests for :mod:`omnigent.harnesses.cursor_native.bridge` composer handling.
 
 Focused on the leftover-draft clear (:func:`_clear_composer`) and its use by
 :func:`inject_user_message`. cursor-agent restores the interrupted prompt into
@@ -15,8 +15,8 @@ from pathlib import Path
 import click
 import pytest
 
-from omnigent import cursor_native_bridge
-from omnigent.cursor_native_bridge import write_tmux_target
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.cursor_native.bridge import write_tmux_target
 
 _SOCK = "/tmp/example/cursor.sock"
 _TARGET = "cursor:0.0"
@@ -336,7 +336,7 @@ class TestHooksConfig:
         # The recorder is invoked isolated (-I) on the usage module, with the
         # absolute bridge dir baked in so it writes where the forwarder reads.
         assert "-I" in command
-        assert "omnigent.cursor_native_usage" in command
+        assert "omnigent.harnesses.cursor_native.usage" in command
         assert "record-usage" in command
         assert "/tmp/bridge" in command
         assert command.startswith("/usr/bin/python3")
@@ -386,7 +386,9 @@ class TestHooksConfig:
         stop_commands = [entry["command"] for entry in payload["hooks"]["stop"]]
         assert "./scripts/notify-done.sh" in stop_commands
         # ...and Omnigent's usage stop hook is registered alongside them.
-        assert any("omnigent.cursor_native_usage" in command for command in stop_commands)
+        assert any(
+            "omnigent.harnesses.cursor_native.usage" in command for command in stop_commands
+        )
 
     def test_write_hooks_config_replaces_stale_usage_hook(self, tmp_path: Path) -> None:
         import json
@@ -400,7 +402,7 @@ class TestHooksConfig:
         usage_commands = [
             entry["command"]
             for entry in payload["hooks"]["stop"]
-            if "omnigent.cursor_native_usage" in entry["command"]
+            if "omnigent.harnesses.cursor_native.usage" in entry["command"]
         ]
         # Relaunching must not accumulate recorders pointing at dead bridge dirs.
         assert len(usage_commands) == 1
@@ -419,7 +421,9 @@ class TestHooksConfig:
         payload = json.loads(path.read_text())
         assert payload["version"] == 1
         stop_commands = [entry["command"] for entry in payload["hooks"]["stop"]]
-        assert any("omnigent.cursor_native_usage" in command for command in stop_commands)
+        assert any(
+            "omnigent.harnesses.cursor_native.usage" in command for command in stop_commands
+        )
 
 
 class TestMcpBridgeConfigSecureDir:

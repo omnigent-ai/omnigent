@@ -5,12 +5,18 @@
 // covered separately in sessionListCache.test.ts; here we mock the socket
 // and assert exactly which ids reach `setWatched`.
 
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import {
+  clearSessionTombstones,
+  useArchiveConversation,
+  type Conversation,
+  type ConversationsPage,
+} from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -91,6 +97,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  clearSessionTombstones();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -116,6 +123,13 @@ describe("SessionUpdatesProvider watch-set", () => {
     seedConversations(client, ["conv_open", "conv_b"]);
     renderProvider(client, ["/c/conv_open"]);
     expect(lastWatched()).toEqual(["conv_b", "conv_open"]);
+  });
+
+  it("does not send client-only temp ids in the watch-set", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_real", "temp:12345678"]);
+    renderProvider(client, ["/c/temp:12345678"]);
+    expect(lastWatched()).toEqual(["conv_real"]);
   });
 
   it("re-pushes the watch-set with the new open id on navigation", () => {
@@ -302,6 +316,65 @@ describe("SessionUpdatesProvider fingerprint pruning", () => {
     // got reverted, and unbounding the map. First sight must re-fire.
     act(() => handler({ type: "changed", items: [wireItem("conv_b", 1, 1_000)] }));
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["comments", "conv_b"] });
+  });
+});
+
+describe("SessionUpdatesProvider archive tombstone", () => {
+  it("does not let a stale changed frame resurrect an archiving row", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ ...conv("conv_a"), archived: true, updated_at: 10 }),
+      }),
+    );
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a", "conv_b"]);
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", true], {
+      pages: [
+        {
+          data: [{ ...conv("conv_c"), archived: true }],
+          first_id: "conv_c",
+          last_id: "conv_c",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    });
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+
+    archive.result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => {
+      expect(
+        client
+          .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+          .pages[0].data.map((row) => row.id),
+      ).toEqual(["conv_b"]);
+    });
+
+    act(() =>
+      handler({
+        type: "changed",
+        items: [{ ...conv("conv_a"), archived: false, title: "Late edit" }],
+      }),
+    );
+    expect(
+      client
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data.map((row) => row.id),
+    ).toEqual(["conv_b"]);
+    expect(
+      client
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((row) => row.id === "conv_a"),
+    ).toMatchObject({ title: "Late edit", archived: true });
+    await waitFor(() => expect(archive.result.current.isSuccess).toBe(true));
   });
 });
 
