@@ -16,6 +16,7 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
+import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -168,6 +169,8 @@ interface SessionResponseWire {
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
   subagent_routing_override?: "on" | "off" | null;
+  /** Owner opt-in: view-level collaborators may browse workspace files. */
+  share_workspace_files?: boolean;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -330,6 +333,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
+    shareWorkspaceFiles: wire.share_workspace_files ?? false,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
@@ -488,7 +492,11 @@ export async function createSession(
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -516,15 +524,116 @@ export interface LocalImportResult {
 }
 
 /**
- * Import the caller's most recent local transcripts via `POST /v1/imports/local`.
- * The chosen host reads + normalizes its own transcripts over the tunnel (the
- * transcripts live on that machine, not the server); already-imported sessions
- * are skipped. `source` is a specific harness or "all" for every harness at once.
+ * Import local transcripts from a chosen host. The
+ * host reads + normalizes its own transcripts over the tunnel (they live on
+ * that machine, not the server); already-imported sessions are skipped.
+ * Passing `sessionId` loads that exact session from `source` without listing
+ * local history. Otherwise, `source` may be "all" for every harness at once.
+ *
+ * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
+ * `onSession` fires for each newly imported session as its frame lands, so
+ * callers list sessions live instead of waiting out the whole batch. A
+ * mid-stream host failure throws after the sessions read so far have been
+ * delivered through `onSession`. Against a server too old to have the streaming
+ * endpoint (404), it falls back to the buffered `POST /v1/imports/local`, which
+ * returns the whole tally at once (`onSession` then fires for every session
+ * together). Either way the resolved {@link LocalImportResult} carries the
+ * final tally.
  */
 export async function importLocalSessions(
   hostId: string,
   source: ImportSourceSelector,
   limit: number,
+  onSession?: (session: ImportedSessionRef) => void,
+  sessionId?: string,
+): Promise<LocalImportResult> {
+  const body = { host_id: hostId, source, limit, session_id: sessionId };
+  const res = await authenticatedFetch("/v1/imports/local/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify(body),
+  });
+  // Older server without the streaming endpoint: fall back to the buffered
+  // import so a newer client still works against it.
+  if (res.status === 404) {
+    if (sessionId !== undefined) {
+      throw new Error("Direct session import is not supported by this server.");
+    }
+    return importLocalSessionsBuffered(hostId, source, limit, onSession);
+  }
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  if (res.body === null) throw new Error("Import failed: no response stream.");
+
+  const sessions: ImportedSessionRef[] = [];
+  let imported = 0;
+  let alreadyImported = 0;
+  let failed = 0;
+  let errorMessage: string | null = null;
+
+  const handleLine = (line: string): void => {
+    let evt: Record<string, unknown>;
+    try {
+      evt = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (evt.event === "session") {
+      const id = typeof evt.session_id === "string" ? evt.session_id : "";
+      if (!id) return;
+      const ref: ImportedSessionRef = {
+        id,
+        title: typeof evt.title === "string" ? evt.title : null,
+      };
+      sessions.push(ref);
+      onSession?.(ref);
+    } else if (evt.event === "done") {
+      imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
+      alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
+      failed = typeof evt.failed === "number" ? evt.failed : 0;
+    } else if (evt.event === "error") {
+      errorMessage = typeof evt.message === "string" ? evt.message : "Import failed. Try again.";
+    }
+  };
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+  try {
+    for (;;) {
+      // Sequential by design: each read waits for the next NDJSON chunk.
+      // eslint-disable-next-line no-await-in-loop
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx = buf.indexOf("\n");
+      while (idx !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (line) handleLine(line);
+        idx = buf.indexOf("\n");
+      }
+    }
+    const tail = buf.trim();
+    if (tail) handleLine(tail);
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+
+  if (errorMessage !== null) throw new Error(errorMessage);
+  return { imported, alreadyImported, failed, sessions };
+}
+
+/**
+ * Buffered local import via `POST /v1/imports/local` — the pre-streaming shape,
+ * kept as the fallback for a server without the streaming endpoint. Delivers
+ * every imported session through `onSession` at once (no live list) so callers
+ * behave the same as the streaming path, just without the incremental fill.
+ */
+async function importLocalSessionsBuffered(
+  hostId: string,
+  source: ImportSourceSelector,
+  limit: number,
+  onSession?: (session: ImportedSessionRef) => void,
 ): Promise<LocalImportResult> {
   const res = await authenticatedFetch("/v1/imports/local", {
     method: "POST",
@@ -537,11 +646,13 @@ export async function importLocalSessions(
     failed: number;
     sessions: { session_id: string; title: string | null }[];
   }>(res);
+  const sessions = wire.sessions.map((s) => ({ id: s.session_id, title: s.title }));
+  for (const s of sessions) onSession?.(s);
   return {
     imported: wire.imported,
     alreadyImported: wire.already_imported,
     failed: wire.failed,
-    sessions: wire.sessions.map((s) => ({ id: s.session_id, title: s.title })),
+    sessions,
   };
 }
 
@@ -557,7 +668,10 @@ export async function importLocalSessions(
  *
  * @param bundle - The agent bundle as a `File` (`.tar.gz`).
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
- * @returns The created session's id.
+ *   A `project_id` files the session into that project atomically at create
+ *   and lets the server default-fill absent fields from the project config.
+ * @returns The created session's id, plus any non-fatal project-consistency
+ *   `warnings` the server attached to a `project_id` create.
  */
 export async function createBundledSession(
   bundle: File,
@@ -565,17 +679,21 @@ export async function createBundledSession(
     host_id?: string;
     host_type?: string;
     workspace?: string;
+    project_id?: string;
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
   } = {},
-): Promise<{ id: string }> {
+): Promise<{ id: string; warnings?: { code?: string; message?: string }[] }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: form,
   });
   if (!res.ok) {
@@ -585,8 +703,11 @@ export async function createBundledSession(
   // The multipart response uses `session_id` (CreatedSessionResponse),
   // while the JSON path uses `id` (SessionResponse). Normalize to `id`
   // so callers don't need to care which path was taken.
-  const body = (await res.json()) as { session_id: string };
-  return { id: body.session_id };
+  const body = (await res.json()) as {
+    session_id: string;
+    warnings?: { code?: string; message?: string }[];
+  };
+  return { id: body.session_id, warnings: body.warnings };
 }
 
 /**
@@ -808,8 +929,22 @@ export async function updateSession(
      * promise means the mode really changed.
      */
     claudePermissionMode?: string;
+    /**
+     * Codex-native approval mode to switch a RUNNING session to, one of
+     * `"ask-for-approval"`, `"approve-for-me"`, `"full-access"`, `"read-only"`
+     * (Codex's `/permissions` presets; the set is codex-version-dependent).
+     * Rejected by the server unless the session is codex-native, and the PATCH
+     * fails unless the runner confirms Codex applied it via its `/permissions`
+     * popup — so a resolved promise means the mode really changed.
+     */
+    codexApprovalMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
+    /**
+     * Owner opt-in that lets people with view (read-only) access browse the
+     * workspace files. Owner-only server-side. `true`/`false` set or clear it.
+     */
+    shareWorkspaceFiles?: boolean;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -828,11 +963,17 @@ export async function updateSession(
   if (updates.claudePermissionMode !== undefined) {
     body.permission_mode = updates.claudePermissionMode;
   }
+  if (updates.codexApprovalMode !== undefined) {
+    body.approval_mode = updates.codexApprovalMode;
+  }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
   }
   if ("subagentRoutingOverride" in updates) {
     body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
+  }
+  if (updates.shareWorkspaceFiles !== undefined) {
+    body.share_workspace_files = updates.shareWorkspaceFiles;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
@@ -1036,7 +1177,10 @@ export async function postEvent(
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(event),
   });
   // Throw a typed ApiError (not the bare status line) so callers can branch

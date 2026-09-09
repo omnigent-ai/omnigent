@@ -6,7 +6,7 @@ one encrypted secret blob + non-secret metadata per
 only thing encrypted (via a :class:`~omnigent.stores.credential_store.secret_cipher.SecretCipher`);
 it is the sole place ciphertext ⇄ plaintext crosses, so callers work with plain
 :class:`~omnigent.entities.ProviderConnection` entities. Provider-specific
-typed façades (e.g. :class:`~omnigent.server.github_store.GithubConnectionStore`)
+typed façades (e.g. :class:`~omnigent.connections.github.GithubConnectionStore`)
 sit on top of this. See ``designs/CREDENTIAL_STORE.md``.
 """
 

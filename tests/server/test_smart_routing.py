@@ -275,7 +275,7 @@ def test_model_family_agrees_with_the_shared_token_rule(model: str, expected: st
     :param model: Model id under test.
     :param expected: The family it must land in.
     """
-    from omnigent.model_override import model_family_mismatch
+    from omnigent.models.model_override import model_family_mismatch
     from omnigent.server.smart_routing import _model_family
 
     assert _model_family(model) == expected
@@ -2413,8 +2413,8 @@ def test_task_v1_claude_arms_follows_a_configured_menu() -> None:
 
 
 def test_parse_routing_tables_reads_every_table() -> None:
-    from omnigent.reasoning_effort import ModelEffortCaps
     from omnigent.server.smart_routing import parse_routing_tables
+    from omnigent.util.reasoning_effort import ModelEffortCaps
 
     tables = parse_routing_tables(
         {

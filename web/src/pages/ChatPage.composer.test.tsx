@@ -4,7 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -23,6 +23,12 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     useWorkspaceDirectory: () => ({ data: undefined }),
   };
 });
+
+// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// (default: no PR) so bare Composer renders don't need a QueryClientProvider.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: () => ({ data: undefined }),
+}));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
@@ -704,6 +710,103 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getByTestId("composer-config-model")).toBeTruthy();
   });
 
+  it("shows the model connection from both the model label and session gear", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    const source = screen.getByTestId("composer-model-source");
+    expect(source).toHaveTextContent("Sonnet 4.6");
+    expect(source).not.toHaveTextContent("Workspace");
+    fireEvent.focus(source);
+    const tooltip = await screen.findByTestId("composer-model-source-tooltip");
+    expect(tooltip).toHaveTextContent("Connection: Databricks · production-west");
+    expect(tooltip).not.toHaveTextContent("acme.cloud.databricks.com");
+    expect(tooltip).not.toHaveTextContent("Profile:");
+    expect(tooltip).not.toHaveTextContent("Host:");
+
+    fireEvent.blur(source);
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const gearTooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(gearTooltip).toHaveTextContent("Connection: Databricks · production-west");
+    expect(gearTooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
+      gearTooltip.textContent?.indexOf("Effort:") ?? -1,
+    );
+  });
+
+  it("keeps the label's truncation chain intact when the source tooltip wraps it", () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    // jsdom does no layout, so pin the CSS contract instead: the tooltip
+    // wrapper must be a shrinkable flex container (flex + min-w-0 + shrink),
+    // or the label's `truncate` never engages and a long model id runs under
+    // the Stop button on phone-width viewports.
+    const wrapper = screen.getByTestId("composer-model-source");
+    for (const cls of ["flex", "min-w-0", "shrink"]) {
+      expect(wrapper.classList.contains(cls), `wrapper is missing "${cls}"`).toBe(true);
+    }
+    const label = screen.getByTestId("composer-model-effort-label");
+    for (const cls of ["truncate", "min-w-0", "shrink"]) {
+      expect(label.classList.contains(cls), `label is missing "${cls}"`).toBe(true);
+    }
+  });
+
+  it("labels subscription provenance instead of showing an unexplained CLI name", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: { kind: "subscription", label: "Subscription", name: "claude" },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.focus(screen.getByTestId("composer-model-source"));
+    const tooltip = await screen.findByTestId("composer-model-source-tooltip");
+    expect(tooltip).toHaveTextContent("Connection: Claude subscription");
+    expect(tooltip).not.toHaveTextContent("Authentication");
+  });
+
   it("does not open an empty Claude config modal while the live catalog loads", () => {
     const onSend = vi.fn();
     render(
@@ -904,6 +1007,10 @@ describe("Composer model/effort label", () => {
       selectedEffort: "high",
       costControlModeOverride: "on",
     });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: { kind: "subscription", label: "Subscription", name: "claude" },
+    }));
     renderWithTooltips(
       <Composer
         {...composerProps({
@@ -912,12 +1019,14 @@ describe("Composer model/effort label", () => {
           modelPickerKind: "claude",
           showModels: true,
           costRoutingEligible: true,
+          codexModelOptions: options,
         })}
       />,
     );
     expect(label()).toHaveTextContent("Smart Routing");
     expect(label()).not.toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
+    expect(screen.queryByTestId("composer-model-source")).toBeNull();
   });
 
   it("renders the reported model, never the request or the sticky", () => {
@@ -1191,6 +1300,75 @@ describe("Composer model/effort label", () => {
     // The real effort still renders — only the leaked model was suppressed.
     expect(label()).toHaveTextContent("High");
   });
+
+  it("opens the config modal when the label half of the pill is clicked", async () => {
+    // The pill-wide hover highlight advertises one clickable control, so the
+    // label half must perform the same action as the gear beside it.
+    useChatStore.setState({ llmModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+
+    fireEvent.click(label());
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+  });
+
+  it("keeps the label click inert when the session is read-only", () => {
+    // Mirrors the gear's soft-disable: a read-only viewer gets no config modal
+    // from either pill half, and aria-disabled drops the pill's hover
+    // highlight so no dead affordance is advertised.
+    useChatStore.setState({ llmModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+          readOnlyReason: "Mirrored transcript",
+        })}
+      />,
+    );
+
+    expect(label()).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(label());
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("stays a non-interactive read-out when no gear renders beside it", () => {
+    // SDK/bundle identity fallback with no config surface: there's no modal
+    // to open, no button in the pill, and thus no hover highlight to honor.
+    useChatStore.setState({
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      sessionHarness: "pi",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "polly" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+
+    expect(screen.queryByTestId("composer-config-gear")).toBeNull();
+    expect(label().tagName).toBe("SPAN");
+  });
 });
 
 describe("Composer effort slash-command visibility", () => {
@@ -1311,6 +1489,15 @@ describe("Composer Codex Plan-mode control", () => {
     expect(button).toHaveAccessibleName("Exit Plan mode");
   });
 
+  it("collapses the visible Plan label in a narrow composer", () => {
+    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+
+    expect(screen.getByTestId("composer-action-row")).toHaveClass("@container/composer-actions");
+    const button = screen.getByRole("button", { name: "Enter Plan mode" });
+    expect(button).toHaveClass("w-9", "@lg/composer-actions:w-auto");
+    expect(within(button).getByText("Plan")).toHaveClass("hidden", "@lg/composer-actions:inline");
+  });
+
   it("hides the control when the session is not Codex-native", () => {
     render(<Composer {...composerProps({ showCodexPlanMode: false })} />);
     expect(screen.queryByTestId("codex-plan-mode-toggle")).toBeNull();
@@ -1366,6 +1553,55 @@ describe("Composer claude-native permission mode", () => {
     );
 
     expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
+  });
+});
+
+describe("Composer codex-native approval mode", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ codexApprovalMode: "" });
+  });
+
+  it("shows the Approvals row with the current mode inside the gear modal", async () => {
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "approve-for-me" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Approve for me");
+  });
+
+  it("follows a live store change while the modal is open and untouched", async () => {
+    // Repro: the mode changes externally (a TUI /permissions switch arrives as
+    // a session.codex_approval_mode SSE) while the gear modal is open. The open
+    // picker must update, not stay on the value it snapshotted on open.
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "approve-for-me" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Approve for me");
+
+    act(() => {
+      useChatStore.setState({ codexApprovalMode: "full-access" });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Full Access"),
+    );
+  });
+
+  it("shows the placeholder until a mode is known", async () => {
+    // Label-only reader: an unset mode reads as the placeholder, never a guess.
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Set in Codex");
   });
 });
 
@@ -1743,6 +1979,9 @@ describe("Composer reply-quote focus", () => {
 describe("Composer file-attachment focus", () => {
   beforeEach(() => {
     useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    // Drafts persist per conversation: without this, a file attached by one
+    // test is restored into the next one's composer.
+    clearSessionDrafts();
   });
 
   afterEach(() => {
@@ -1783,6 +2022,50 @@ describe("Composer file-attachment focus", () => {
     fireEvent.change(fileInput(), { target: { files: [bad] } });
 
     expect(document.activeElement).not.toBe(ta);
+  });
+
+  // The drop target is the chat column (``[data-chat-surface]``, SessionLayout),
+  // which the composer resolves from its own card. Unhandled, a drop on the
+  // transcript makes the browser navigate away to render the file.
+  it("attaches a file dropped elsewhere in the chat column", () => {
+    render(
+      <div data-chat-surface>
+        <div data-testid="transcript">transcript</div>
+        <Composer {...composerProps()} />
+      </div>,
+    );
+    const transcript = screen.getByTestId("transcript");
+    // ``types`` is the only file signal available mid-drag.
+    fireEvent.dragEnter(transcript, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.getByTestId("file-drop-overlay")).toBeTruthy();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.drop(transcript, { dataTransfer: { types: ["Files"], files: [file] } });
+
+    // getAllBy: the chip pairs the visible name with a hover title.
+    expect(screen.getAllByText("shot.png").length).toBeGreaterThan(0);
+    expect(screen.queryByTestId("file-drop-overlay")).toBeNull();
+  });
+
+  // Outside the column — sidebar, workspace rail — a file drag is not an
+  // attachment.
+  it("ignores a file dropped outside the chat column", () => {
+    render(
+      <div>
+        <div data-chat-surface>
+          <Composer {...composerProps()} />
+        </div>
+        <div data-testid="sidebar">sidebar</div>
+      </div>,
+    );
+    const sidebar = screen.getByTestId("sidebar");
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+
+    fireEvent.dragEnter(sidebar, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.queryByTestId("file-drop-overlay")).toBeNull();
+    fireEvent.drop(sidebar, { dataTransfer: { types: ["Files"], files: [file] } });
+
+    expect(screen.queryByText("shot.png")).toBeNull();
   });
 
   it("clears the rejection notice once the user types", () => {

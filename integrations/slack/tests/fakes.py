@@ -215,6 +215,7 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     # Setup / validation.
     ("GET", "/health", True),
     ("GET", "/v1/me", True),
+    ("GET", "/v1/info", True),
     ("GET", "/v1/agents", True),
     ("GET", "/v1/hosts", True),
     ("GET", "/v1/hosts/{host_id}/filesystem", True),
@@ -247,6 +248,9 @@ OMNIGENT_RESPONSE_FIELDS: dict[str, tuple[str, ...]] = {
     "SessionResponse": ("harness", "agent_name"),
     # GET /v1/agents → PaginatedList (list_agents reads .data).
     "PaginatedList": ("data",),
+    # GET /v1/info → ServerInfoResponse (managed_host_support gates the setup
+    # menu's managed-sandbox option on these two).
+    "ServerInfoResponse": ("managed_sandboxes_enabled", "sandbox_provider"),
 }
 
 
@@ -293,6 +297,10 @@ class FakeOmnigentServer:
         self.hosts: list[dict[str, Any]] = [
             {"host_id": "h1", "name": "Host One", "status": "online"}
         ]
+        # Managed-sandbox capability reported by GET /v1/info — the gate that
+        # decides whether setup offers a server-provisioned host at all.
+        self.managed_sandboxes_enabled = False
+        self.sandbox_provider: str | None = None
         self.session_id = "conv_1"
         self.runner_id = "runner_1"
         self.harness = "claude-native"
@@ -366,6 +374,20 @@ class FakeOmnigentServer:
             return httpx.Response(401, json={"login_url": "/login"})
 
         respx_mock.get(b + "/v1/me").mock(side_effect=_me)
+
+        # Capability probe (unauthed): whether the server provisions managed
+        # sandboxes, and which provider labels the setup menu entry.
+        def _info(request: httpx.Request) -> httpx.Response:
+            self._record(request)
+            return httpx.Response(
+                200,
+                json={
+                    "managed_sandboxes_enabled": self.managed_sandboxes_enabled,
+                    "sandbox_provider": self.sandbox_provider,
+                },
+            )
+
+        respx_mock.get(b + "/v1/info").mock(side_effect=_info)
 
         def _device_authorize(request: httpx.Request) -> httpx.Response:
             self._record(request)

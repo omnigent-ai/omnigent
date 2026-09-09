@@ -54,6 +54,12 @@ _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
 _TRUNCATION_MARKER = "[output truncated by omnigent:"
 
 
+def test_default_idle_watchdog_allows_one_hour_progress_free_calls() -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    assert _scaffold._DEFAULT_TURN_IDLE_TIMEOUT_S == 3600.0
+
+
 @dataclass
 class _ParsedSSEEvent:
     """
@@ -1861,7 +1867,7 @@ async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
     Fails on the unfixed watchdog (reason omits the forwarder cause); passes
     once the watchdog reads ``_native_forwarder_health``.
     """
-    from omnigent import _native_forwarder_health as health
+    from omnigent.native import _native_forwarder_health as health
     from omnigent.runtime.harnesses import _scaffold
 
     class _WedgedApp(HarnessApp):

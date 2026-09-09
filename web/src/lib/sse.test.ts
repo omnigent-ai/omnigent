@@ -300,3 +300,40 @@ describe("parseEvent — session.mcp_startup", () => {
     ).toBeNull();
   });
 });
+
+describe("parseEvent — response.output_item.done error level", () => {
+  it("lifts level: info onto the error event and omits it otherwise", () => {
+    const item = {
+      id: "err_1",
+      response_id: "resp_1",
+      type: "error",
+      source: "harness",
+      code: "codex_thread_reset",
+      message: "Codex started a fresh thread.",
+    };
+    const info = parseEvent("response.output_item.done", { item: { ...item, level: "info" } });
+    expect(info).toMatchObject({
+      type: "error",
+      error: { code: "codex_thread_reset", level: "info" },
+    });
+    const plain = parseEvent("response.output_item.done", { item });
+    const plainError = plain?.type === "error" ? plain.error : null;
+    expect(plainError).not.toBeNull();
+    expect(plainError).not.toHaveProperty("level");
+  });
+});
+
+describe("parseEvent — response.compaction.in_progress", () => {
+  it("threads started_at so the elapsed counter anchors to the true start", () => {
+    // The server stamps every re-announcement of a long compaction with the
+    // FIRST report's wall-clock time; parse must surface it or the spinner
+    // restarts from each event's receive time (and from ~0 after a reload).
+    const ev = parseEvent("response.compaction.in_progress", { started_at: 1_700_000_123 });
+    expect(ev).toEqual({ type: "compaction_in_progress", startedAtS: 1_700_000_123 });
+  });
+
+  it("omits startedAtS when the emitter does not track a start", () => {
+    const ev = parseEvent("response.compaction.in_progress", {});
+    expect(ev).toEqual({ type: "compaction_in_progress" });
+  });
+});

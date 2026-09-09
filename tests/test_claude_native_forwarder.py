@@ -23,17 +23,19 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-import omnigent.claude_native_forwarder as forwarder
-from omnigent.claude_native_bridge import (
+import omnigent.harnesses.claude_native.forwarder as forwarder
+from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
+    TranscriptReadResult,
+    TranscriptRecordItems,
     prepare_bridge_dir,
     read_active_session_id,
     record_hook_event,
     write_active_session_id,
 )
-from omnigent.claude_native_forwarder import (
+from omnigent.harnesses.claude_native.forwarder import (
     CompactionForwardState,
     _claim_standalone_completion,
     _consume_pending_compaction,
@@ -46,7 +48,7 @@ from omnigent.claude_native_forwarder import (
     _reset_compaction_skip_stats,
     forward_claude_transcript_to_session,
 )
-from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 
 @pytest.fixture(autouse=True)
@@ -58,8 +60,8 @@ def _allow_tmp_path_as_bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
 
 
 class _RecordingHTTPServer(ThreadingHTTPServer):
@@ -280,7 +282,7 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     hook cursor past the clear record so the next poll does not fork
     again from the same hook line.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -416,7 +418,7 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
     is cleanup only; the executor active-session guard prevents stale
     old-session writes from reaching tmux.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -515,7 +517,7 @@ async def test_clear_hook_transfer_failure_does_not_loop(
     rotation must still consume the clear hook so the forwarder's next poll does
     not re-rotate and create another replacement session every tick.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -709,7 +711,7 @@ async def test_clear_hook_consumes_hook_rotated_session_without_duplicate_fork(
     It annotates the hook record so the background forwarder only
     advances its durable cursor and resets transcript state.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -778,7 +780,7 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
     active bridge session, clear the old runner binding, and advance
     the hook cursor so the same hook line is not processed again.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -798,7 +800,9 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("omnigent.claude_native_bridge.time.time", lambda: 1779922393.245)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.time.time", lambda: 1779922393.245
+    )
     record_hook_event(
         bridge_dir,
         {
@@ -912,7 +916,7 @@ async def test_fork_hook_consumes_hook_rotated_session_without_duplicate_fork(
     cursor and seeds transcript state past Claude's copied fork
     history.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -1001,7 +1005,7 @@ async def test_resume_seen_claude_fork_does_not_create_second_omnigent_fork(
     alone as a fresh `/fork` command after the hook recorded that the
     incoming Claude session had already been seen.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -1205,6 +1209,9 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         "terminal_command",
         "terminal_command",
     ]
+    # Every item carries its server-side idempotency key: a retried or
+    # concurrently re-posted record must dedupe on the server.
+    assert all(isinstance(item.get("source_id"), str) and item["source_id"] for item in posted)
     assert posted[0]["item_data"] == {
         "role": "user",
         "content": [{"type": "input_text", "text": "read TODO"}],
@@ -1701,6 +1708,105 @@ async def test_forwarder_posts_compaction_in_progress_on_precompact_hook(
 
 
 @pytest.mark.asyncio
+async def test_compact_refusal_in_progress_precedes_failed_same_poll(
+    tmp_path: Path,
+) -> None:
+    """
+    A same-poll ``/compact`` refusal posts ``in_progress`` BEFORE ``failed``.
+
+    Regression for the stranded spinner: the ``PreCompact`` hook (→
+    ``in_progress``, which raises the spinner) is forwarded AFTER transcript
+    items each poll, and Claude writes the refusal (transcript) and the
+    ``PreCompact`` (hook) close enough to land in one poll. If the dismissal
+    fired during the transcript phase it would clear nothing, then the hook
+    would raise a spinner that never clears. The dismissal is deferred to
+    after the hook phase, so the ordered posts are ``in_progress`` then
+    ``failed`` — a net-dismissed spinner.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    # The two records Claude writes for a declined /compact: the command echo
+    # and the standalone refusal stdout.
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "compact-cmd",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/compact</command-name>\n<command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "local_command",
+                        "uuid": "compact-stdout",
+                        "isMeta": False,
+                        "content": (
+                            "<local-command-stdout>Not enough messages to compact."
+                            "</local-command-stdout>"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Collect compaction-status posts until both edges are seen.
+        statuses: list[str] = []
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "failed" not in statuses and asyncio.get_running_loop().time() < deadline:
+            request = await _get_recorded_request(server)
+            if request["body"].get("type") == "external_compaction_status":
+                statuses.append(request["body"]["data"]["status"])
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    # in_progress (spinner raised by the hook) must land before failed
+    # (the deferred dismissal), so the net effect is a dismissed spinner.
+    assert statuses == ["in_progress", "failed"], (
+        f"expected in_progress then failed, got {statuses!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_forwarder_posts_compaction_completed_on_compact_session_start(
     tmp_path: Path,
 ) -> None:
@@ -2100,7 +2206,7 @@ async def test_forwarder_start_at_end_uses_byte_offset_for_new_lines(
         raise AssertionError("start_at_end should seed and poll with byte offsets")
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.read_transcript_items_since_with_position",
+        "omnigent.harnesses.claude_native.forwarder.read_transcript_items_since_with_position",
         _fail_line_cursor_reader,
     )
 
@@ -2252,7 +2358,7 @@ async def test_forwarder_waits_for_missing_fresh_transcript_without_warning(
             "transcript_path": str(transcript_path),
         },
     )
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
@@ -2908,7 +3014,7 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         "_forward_available_items",
         _fail_once_forward_available_items,
     )
-    caplog.set_level(logging.ERROR, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.ERROR, logger="omnigent.harnesses.claude_native.forwarder")
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
@@ -2933,6 +3039,8 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         thread.join(timeout=5.0)
 
     assert "Claude transcript forwarder loop failed" in caplog.text
+    assert "session=conv_abc" in caplog.text
+    assert str(bridge_dir) not in caplog.text
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_data"] == {
         "role": "assistant",
@@ -3563,9 +3671,12 @@ async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         for model in (
+            "<synthetic>",
             "databricks-claude-opus-4-8",
+            "<synthetic>",
             "databricks-claude-opus-4-9",
             "databricks-claude-opus-4-9[1m]",
+            " <synthetic> ",
         ):
             await forwarder._post_model_change_if_new(
                 client, session_id="conv_abc", dedupe=dedupe, model=model
@@ -3576,6 +3687,7 @@ async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) 
         "databricks-claude-opus-4-9",
         "databricks-claude-opus-4-9[1m]",
     ]
+    assert dedupe.observed_model == "databricks-claude-opus-4-9[1m]"
 
 
 @pytest.mark.asyncio
@@ -4164,7 +4276,7 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
         + "\n",
         encoding="utf-8",
     )
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
     validated = forwarder._validated_transcript_state(
         forwarder.TranscriptForwardState(
@@ -4175,7 +4287,6 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
             seen_source_ids=("old-source",),
             cursor_fingerprint=None,
         ),
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_abc",
     )
 
@@ -4191,7 +4302,8 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
     )
     assert "cursor missing fingerprint" in caplog.text
     assert "conv_abc" in caplog.text
-    assert str(tmp_path / "bridge") in caplog.text
+    assert str(tmp_path / "bridge") not in caplog.text
+    assert str(transcript_path) not in caplog.text
 
 
 def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_reset(
@@ -4220,7 +4332,7 @@ def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_re
         + "\n",
         encoding="utf-8",
     )
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
     pre_existing_seen = ("already-sent-id-1", "already-sent-id-2")
     state = forwarder.TranscriptForwardState(
@@ -4234,7 +4346,6 @@ def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_re
 
     validated = forwarder._validated_transcript_state(
         state,
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_fresh",
     )
 
@@ -4305,7 +4416,7 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
     )
     transcript_path.write_text(replacement_content, encoding="utf-8")
 
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
 
     pre_existing_seen = ("item-a", "item-b", "item-c")
     state = forwarder.TranscriptForwardState(
@@ -4319,7 +4430,6 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
 
     validated = forwarder._validated_transcript_state(
         state,
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_replaced",
     )
 
@@ -4339,6 +4449,9 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
 
     # Warning logged because the fingerprint genuinely changed.
     assert "cursor fingerprint changed" in caplog.text
+    assert "session=conv_replaced" in caplog.text
+    assert str(tmp_path / "bridge") not in caplog.text
+    assert str(transcript_path) not in caplog.text
 
 
 # ── supervise_forwarder ────────────────────────────────────────────
@@ -4426,6 +4539,8 @@ async def test_supervise_forwarder_restarts_after_crash(
     # skips the post-iteration sleep.
     assert sleeps == [forwarder._SUPERVISOR_INITIAL_BACKOFF_S]
     assert "Claude transcript forwarder crashed" in caplog.text
+    assert "session=conv_abc" in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -4862,7 +4977,7 @@ async def test_forwarder_posts_raw_todos_on_todo_write(tmp_path: Path) -> None:
 
 
 def _start_recording_server_with_responses(
-    response_for: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    response_for: Callable[[object], object] | None = None,
 ) -> tuple[_RecordingHTTPServer, threading.Thread, str]:
     """
     Start a local HTTP server that records POST bodies AND returns
@@ -4875,7 +4990,7 @@ def _start_recording_server_with_responses(
     that the forwarder reads back.
 
     :param response_for: Callback that takes the decoded request
-        body and returns the JSON dict to send back. ``None`` (the
+        body and returns the JSON value to send back. ``None`` (the
         default) responds with ``{}`` like the standard recorder.
     :returns: ``(server, thread, base_url)``.
     """
@@ -4942,6 +5057,8 @@ def _seed_subagent_on_disk(
     description: str,
     tool_use_id: str,
     transcript_records: list[dict[str, Any]] | None = None,
+    spawn_transcript_path: Path | None = None,
+    spawn_tool_name: str = "Agent",
 ) -> Path:
     """
     Create the ``.meta.json`` + ``.jsonl`` pair Claude Code would
@@ -4962,9 +5079,36 @@ def _seed_subagent_on_disk(
         rows to seed into the sub-agent's ``.jsonl``. ``None`` /
         empty leaves the transcript empty (the common case when a
         sub-agent has just been spawned).
+    :param spawn_transcript_path: Transcript containing the spawning
+        tool call. Defaults to the top-level transcript.
+    :param spawn_tool_name: Name on the spawning ``tool_use`` block.
+        Defaults to ``"Agent"``; pass ``"Task"`` to exercise the alias.
     :returns: Path to the sub-agent's ``.jsonl`` (handy for tests
         that append rows after the fact).
     """
+    spawn_path = spawn_transcript_path or transcript_path
+    with spawn_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "isSidechain": spawn_path != transcript_path,
+                    "type": "assistant",
+                    "uuid": f"spawn-{subagent_id}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": spawn_tool_name,
+                                "input": {"description": description},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
     subagents_dir.mkdir(parents=True, exist_ok=True)
     meta_path = subagents_dir / f"agent-{subagent_id}.meta.json"
@@ -4987,6 +5131,62 @@ def _seed_subagent_on_disk(
     else:
         jsonl_path.write_text("", encoding="utf-8")
     return jsonl_path
+
+
+async def test_subagent_watcher_registers_a_task_named_spawn(
+    tmp_path: Path,
+) -> None:
+    """A spawn recorded under the legacy ``Task`` name still registers.
+
+    ``Task`` was renamed to ``Agent`` in CLI 2.1.63 but remains a supported
+    alias, so a transcript may carry either name. Correlation gates all
+    registration, so missing the alias would strand every such sub-agent.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-worker",
+        agent_type="Explore",
+        description="spawned via the Task alias",
+        tool_use_id="toolu_task",
+        spawn_tool_name="Task",
+    )
+
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths == {"a-worker": "/v1/sessions/conv_root/events"}
+    assert state.subagents["a-worker"].child_conversation_id == "conv_a-worker"
+    assert state.subagents["a-worker"].parent_subagent_id is None
 
 
 async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
@@ -5074,12 +5274,340 @@ async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
         server.server_close()
 
 
+async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
+    tmp_path: Path,
+) -> None:
+    """Nested Claude agents register under their immediate Omnigent parent."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    parent_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="z-parent",
+        agent_type="general-purpose",
+        description="parent worker",
+        tool_use_id="toolu_parent",
+    )
+    child_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-child",
+        agent_type="general-purpose",
+        description="nested child",
+        tool_use_id="toolu_child",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "nested-child-output",
+                "message": {"role": "assistant", "content": "working"},
+            }
+        ],
+        spawn_transcript_path=parent_transcript,
+    )
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": "mirrored-nested-spawn",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_child",
+                                "name": "Agent",
+                                "input": {"description": "nested child"},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+        assert start_paths == {
+            "z-parent": "/v1/sessions/conv_root/events",
+            "a-child": "/v1/sessions/conv_z-parent/events",
+        }
+        assert state.subagents["z-parent"].parent_subagent_id is None
+        assert state.subagents["a-child"].parent_subagent_id == "z-parent"
+
+        reconstructed = forwarder._read_subagent_forward_state(bridge_dir)
+        assert reconstructed == state
+
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id="b-grandchild",
+            agent_type="Explore",
+            description="second nested level",
+            tool_use_id="toolu_grandchild",
+            spawn_transcript_path=child_transcript,
+        )
+        restarted = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=reconstructed,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths["b-grandchild"] == "/v1/sessions/conv_a-child/events"
+    assert restarted.subagents["b-grandchild"].parent_subagent_id == "a-child"
+
+
+async def test_subagent_watcher_parks_child_of_a_parked_parent(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A child whose parent was parked is parked too, not retried forever.
+
+    When a parent's registration exhausts its retries it is parked with an empty
+    ``child_conversation_id`` — its Omnigent conversation will never exist. A
+    child that resolves to that parent can therefore never attach; it must be
+    parked (and logged) rather than silently re-resolved on every poll.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    parent_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="z-parent",
+        agent_type="general-purpose",
+        description="parent worker",
+        tool_use_id="toolu_parent",
+    )
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-child",
+        agent_type="general-purpose",
+        description="nested child",
+        tool_use_id="toolu_child",
+        spawn_transcript_path=parent_transcript,
+    )
+    # The parent is already parked on disk (empty child id): its registration
+    # exhausted retries on an earlier tick.
+    parked = forwarder.SubagentForwardState(
+        subagents={
+            "z-parent": forwarder.SubagentEntry(
+                subagent_id="z-parent",
+                child_conversation_id="",
+                parent_subagent_id=None,
+            )
+        }
+    )
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=parked,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    # The child was parked, not registered: no start POST, empty child id,
+    # and the parked entry survives a state round-trip.
+    assert starts == 0
+    assert state.subagents["a-child"].child_conversation_id == ""
+    assert state.subagents["a-child"].parent_subagent_id == "z-parent"
+    assert forwarder._read_subagent_forward_state(bridge_dir) == state
+    assert "whose parent was dropped" in caplog.text
+
+    # No dead letter: a replay would re-post the child under the root session and
+    # flatten the hierarchy, so the child is parked (WARNING only), not recorded
+    # for replay.
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+
+
+async def test_subagent_watcher_defers_a_spawn_owned_by_two_transcripts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawn id claimed by two agent transcripts is dropped as ambiguous.
+
+    Attribution is trustworthy only when a spawn `tool_use` id has a single
+    owner. If the same id appears in two `agent-*.jsonl` transcripts, the owner
+    can't be resolved, so it must be dropped (not guessed) and the agent
+    deferred rather than mis-attributed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    # Seed a normal agent (spawn lands in the root transcript, owner=None); then
+    # write the SAME spawn tool-use id into an agent transcript too, so the id
+    # resolves to two conflicting owners (root and that agent) and is dropped.
+    jsonl_path = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-worker",
+        agent_type="Explore",
+        description="ambiguous spawn",
+        tool_use_id="toolu_dup",
+    )
+    other_owner = jsonl_path.parent / "agent-owner-two.jsonl"
+    other_owner.write_text(
+        json.dumps(
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "dup-spawn",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_dup", "name": "Agent"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert starts == 0
+    assert "a-worker" not in state.subagents
+    assert "no resolved parent" in caplog.text
+
+
+async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spawn(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A meta whose spawn record no transcript owns is deferred, not registered.
+
+    Claude can flush ``agent-<id>.meta.json`` before the spawning ``tool_use``
+    record lands in a transcript. The watcher must skip such an agent (retry next
+    tick) and log the miss so a spawn record that never arrives is diagnosable.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    (subagents_dir / "agent-orphan.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "Explore",
+                "description": "spawn record not flushed yet",
+                "toolUseId": "toolu_missing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (subagents_dir / "agent-orphan.jsonl").write_text("", encoding="utf-8")
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert starts == 0
+    assert "orphan" not in state.subagents
+    assert "no resolved parent" in caplog.text
+    assert "toolu_missing" in caplog.text
+
+
 async def test_subagent_watcher_forwards_transcript_items_to_child_session(
     tmp_path: Path,
 ) -> None:
     """
     After registering a sub-agent, the forwarder tails its
-    ``.jsonl`` and POSTs ``external_conversation_item`` events to
+    ``.jsonl`` and POSTs an array of ``external_conversation_item`` events to
     the Omnigent child session id (not the parent's).
     """
     bridge_dir = tmp_path / "bridge"
@@ -5124,13 +5652,17 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         },
     )
 
-    def response_for(body: dict[str, Any]) -> dict[str, Any]:
+    def response_for(body: object) -> object:
         """Mint a known child id for the start event.
 
         :param body: Decoded request body.
         :returns: Response payload.
         """
-        if body.get("type") == "external_subagent_start":
+        if isinstance(body, list):
+            return [
+                {"queued": False, "item_id": f"item-{index}"} for index, _event in enumerate(body)
+            ]
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return {"queued": False, "child_session_id": "conv_child_beta"}
         return {}
 
@@ -5147,22 +5679,17 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         )
     )
     try:
-        # We need: the start event + at least one item event addressed
-        # to the child. Drain up to N requests and collect every
-        # request bound for the child's ``/events`` path.
+        # We need the start event plus one event array addressed to the child.
         child_path = "/v1/sessions/conv_child_beta/events"
-        child_requests: list[dict[str, Any]] = []
+        batch: list[dict[str, Any]] | None = None
         for _ in range(40):
             req = await _get_recorded_request(server)
-            if req["path"] == child_path:
-                child_requests.append(req)
-                if len(child_requests) >= 2:
-                    break
-        assert len(child_requests) >= 2, (
-            f"only saw {len(child_requests)} requests to {child_path}: {child_requests!r}"
-        )
-        item_types = [r["body"]["type"] for r in child_requests]
-        assert "external_conversation_item" in item_types
+            if req["path"] == child_path and isinstance(req["body"], list):
+                batch = req["body"]
+                break
+        assert batch is not None
+        assert len(batch) == 2
+        assert all(event["type"] == "external_conversation_item" for event in batch)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -5171,19 +5698,15 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         server.server_close()
 
 
-async def test_subagent_watcher_retry_skips_previously_posted_items(
+async def test_subagent_watcher_retries_failed_batch_from_checkpoint(
     tmp_path: Path,
 ) -> None:
     """
-    Retrying a failed child item does not re-post earlier child items.
+    A rejected child batch leaves its byte cursor behind and retries in order.
 
-    The sub-agent watcher intentionally leaves ``byte_offset`` behind
-    when a later item fails, so the next poll re-reads the same JSONL
-    window. This test pins the durable ``seen_source_ids`` guard: item
-    A succeeds, item B fails once, and the retry must post only B.
-    Without that guard Omnigent live subscribers can see item A synced back
-    twice; the server no longer receives a ``source_id`` key that can
-    dedupe the post on AP's side.
+    The server deduplicates source ids, so an ambiguous response can safely
+    retry the entire batch even if some entries were already applied. The local
+    cursor advances only after the acknowledgement arrives.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -5222,27 +5745,30 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
         }
     )
     posted_items: list[str] = []
-    attempts_by_item: dict[str, int] = {}
+    batch_attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
-        Fail the assistant item once and accept everything else.
+        Fail the first batch and acknowledge its retry.
 
         :param request: Request issued by the forwarder.
         :returns: Canned Omnigent response.
         """
+        nonlocal batch_attempts
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") != "external_conversation_item":
+        if not isinstance(body, list):
             return httpx.Response(202, json={})
-        item_data = body["data"]["item_data"]
-        role = item_data["role"]
-        text = item_data["content"][0]["text"]
-        item_key = f"{role}:{text}"
-        posted_items.append(item_key)
-        attempts_by_item[item_key] = attempts_by_item.get(item_key, 0) + 1
-        if item_key == "assistant:done" and attempts_by_item[item_key] == 1:
+        batch_attempts += 1
+        for event in body:
+            row = event["data"]
+            item_data = row["item_data"]
+            posted_items.append(f"{item_data['role']}:{item_data['content'][0]['text']}")
+        if batch_attempts == 1:
             return httpx.Response(503, json={"error": "try again"})
-        return httpx.Response(202, json={})
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
 
     item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
     async with httpx.AsyncClient(
@@ -5272,13 +5798,644 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
         )
 
-    assert posted_items == ["user:go", "assistant:done", "assistant:done"]
+    assert posted_items == ["user:go", "assistant:done", "user:go", "assistant:done"]
     child_state = second.subagents["retry1"]
     assert child_state.byte_offset == subagent_jsonl.stat().st_size
     assert set(child_state.seen_source_ids) == {
         "sa-user-retry:0:message",
         "sa-assistant-retry:0:message",
     }
+
+
+def test_subagent_batches_obey_count_and_exact_byte_limits() -> None:
+    """Batching counts the complete UTF-8 JSON body and truncates one huge item."""
+    assert forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES == 5 * 1024 * 1024
+
+    def pending(index: int, text: str) -> forwarder._PendingSubagentItem:
+        return forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"source-{index}",
+                item_type="function_call_output",
+                data={"call_id": f"toolu_{index}", "output": text},
+                response_id="resp_batch",
+            ),
+            checkpoint_after=index + 1,
+        )
+
+    tiny_batches = forwarder._partition_subagent_batches(
+        [pending(index, "ok") for index in range(205)]
+    )
+    assert [len(batch) for batch in tiny_batches] == [100, 100, 5]
+
+    large_batches = forwarder._partition_subagent_batches(
+        [pending(1000, "€" * 1_000_000), pending(1001, "€" * 1_000_000)]
+    )
+    assert [len(batch) for batch in large_batches] == [1, 1]
+
+    oversized = forwarder._partition_subagent_batches([pending(2000, "€" * 2_000_000)])
+    assert len(oversized) == 1
+    truncated_output = oversized[0][0].item.data["output"]
+    assert isinstance(truncated_output, str)
+    assert "content truncated by omnigent" in truncated_output
+    for batch in [*tiny_batches, *large_batches, *oversized]:
+        assert (
+            len(forwarder._encoded_subagent_batch(batch))
+            <= forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES
+        )
+
+
+def test_subagent_batch_partitioning_encodes_items_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Byte accounting never re-encodes the growing batch prefix."""
+
+    entries = [
+        forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"linear-{index}",
+                item_type="message",
+                data={"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                response_id="resp_linear",
+            )
+        )
+        for index in range(20)
+    ]
+    encoded_item_count = 0
+    original_encode = forwarder._encoded_subagent_batch
+
+    def record_encode(items: list[forwarder._PendingSubagentItem]) -> bytes:
+        nonlocal encoded_item_count
+        encoded_item_count += len(items)
+        return original_encode(items)
+
+    monkeypatch.setattr(forwarder, "_encoded_subagent_batch", record_encode)
+
+    batches = forwarder._partition_subagent_batches(entries)
+
+    assert batches == [entries]
+    assert encoded_item_count == 2 * len(entries)
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_partitioning_runs_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Child-history JSON sizing does not block the live forwarding loop."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-worker.jsonl").write_text("", encoding="utf-8")
+    entry = forwarder.SubagentEntry(
+        subagent_id="worker",
+        child_conversation_id="conv_child_worker",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"worker": entry}),
+    )
+    event_loop_thread = threading.current_thread()
+    partition_threads: list[threading.Thread] = []
+    original_partition = forwarder._partition_subagent_batches
+
+    def record_partition(
+        items: list[forwarder._PendingSubagentItem],
+    ) -> list[list[forwarder._PendingSubagentItem]]:
+        partition_threads.append(threading.current_thread())
+        return original_partition(items)
+
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(forwarder, "_partition_subagent_batches", record_partition)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_request),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    assert partition_threads
+    assert all(thread is not event_loop_thread for thread in partition_threads)
+
+
+@pytest.mark.asyncio
+async def test_untruncatable_subagent_item_is_dead_lettered_and_checkpointed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One impossible item cannot livelock every later child-history poll."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-oversized.jsonl").write_text("{}\n", encoding="utf-8")
+    item = ClaudeTranscriptItem(
+        source_id="oversized-untruncatable",
+        item_type="message",
+        data={"x" * forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES: 1},
+        response_id="resp_oversized",
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=3,
+        current_response_id=None,
+        items=[item],
+        record_items=(TranscriptRecordItems(next_byte_offset=3, items=(item,)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="oversized",
+        child_conversation_id="conv_child_oversized",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"oversized": entry}),
+    )
+
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_request),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    updated = checkpoint.state.subagents["oversized"]
+    assert updated.byte_offset == 3
+    assert updated.seen_source_ids == (item.source_id,)
+    dead_letter = json.loads(
+        (bridge_dir / "dead_letter.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert dead_letter["payload"]["source_id"] == item.source_id
+    assert "no truncatable text" in dead_letter["reason"]
+    assert dead_letter["http_status"] == 413
+
+
+@pytest.mark.asyncio
+async def test_subagent_batches_fall_back_once_for_older_server(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server that rejects event arrays receives individual events thereafter."""
+
+    def pending(index: int) -> forwarder._PendingSubagentItem:
+        return forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"fallback-{index}",
+                item_type="message",
+                data={
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": str(index)}],
+                },
+                response_id="resp_fallback",
+            )
+        )
+
+    bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        bodies.append(body)
+        if isinstance(body, list):
+            return httpx.Response(
+                422,
+                json={
+                    "detail": [
+                        {
+                            "type": "model_attributes_type",
+                            "loc": ["body"],
+                            "msg": "Input should be a valid dictionary",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(202, json={"queued": False, "item_id": "item_fallback"})
+
+    capability = forwarder._SessionEventBatchCapability()
+    caplog.set_level(logging.INFO)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_child_one",
+            items=[pending(1), pending(2)],
+            batch_capability=capability,
+        )
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_child_two",
+            items=[pending(3), pending(4)],
+            batch_capability=capability,
+        )
+
+    assert capability.supported is False
+    assert len([body for body in bodies if isinstance(body, list)]) == 1
+    individual_source_ids = {
+        body["data"]["source_id"] for body in bodies if isinstance(body, dict)
+    }
+    assert individual_source_ids == {"fallback-1", "fallback-2", "fallback-3", "fallback-4"}
+    assert "does not accept session event arrays" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_failure_resumes_at_first_unsent_record(tmp_path: Path) -> None:
+    """A failed second batch keeps the durable cursor after record 100."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    records = [
+        {
+            "isSidechain": True,
+            "type": "assistant",
+            "uuid": f"sa-{index}",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": f"item {index}"}],
+            },
+        }
+        for index in range(150)
+    ]
+    subagent_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="checkpoint",
+        agent_type="Explore",
+        description="large history",
+        tool_use_id="toolu_checkpoint",
+        transcript_records=records,
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "checkpoint": forwarder.SubagentEntry(
+                subagent_id="checkpoint",
+                child_conversation_id="conv_child_checkpoint",
+            )
+        }
+    )
+    attempts: list[list[str]] = []
+    failed_second_batch = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal failed_second_batch
+        body = json.loads(request.content.decode("utf-8"))
+        if not isinstance(body, list):
+            return httpx.Response(202, json={})
+        source_ids = [event["data"]["source_id"] for event in body]
+        attempts.append(source_ids)
+        if source_ids[0].startswith("sa-100:") and not failed_second_batch:
+            failed_second_batch = True
+            return httpx.Response(503, json={"error": "retry"})
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        with subagent_jsonl.open("rb") as handle:
+            expected_offset = sum(len(handle.readline()) for _ in range(100))
+        assert first.subagents["checkpoint"].byte_offset == expected_offset
+        persisted = forwarder._read_subagent_forward_state(bridge_dir)
+        assert persisted.subagents["checkpoint"].byte_offset == expected_offset
+
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert second.subagents["checkpoint"].byte_offset == subagent_jsonl.stat().st_size
+    attempted_ids = [source_id for batch in attempts for source_id in batch]
+    assert all(attempted_ids.count(f"sa-{index}:0:message") == 1 for index in range(100))
+    assert all(attempted_ids.count(f"sa-{index}:0:message") == 2 for index in range(100, 150))
+
+
+@pytest.mark.asyncio
+async def test_permanent_batch_failure_redrives_items_individually(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poison event cannot discard valid siblings from a failed batch."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-redrive.jsonl").write_text("{}\n", encoding="utf-8")
+    items = tuple(
+        ClaudeTranscriptItem(
+            source_id=source_id,
+            item_type="message",
+            data={"role": "assistant", "content": [{"type": "text", "text": source_id}]},
+            response_id="resp_redrive",
+        )
+        for source_id in ("before-poison", "poison", "after-poison")
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=3,
+        byte_offset=30,
+        current_response_id=None,
+        items=list(items),
+        record_items=tuple(
+            TranscriptRecordItems(next_byte_offset=(index + 1) * 10, items=(item,))
+            for index, item in enumerate(items)
+        ),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="redrive",
+        child_conversation_id="conv_child_redrive",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"redrive": entry}),
+    )
+    request_bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        if isinstance(body, list):
+            return httpx.Response(400, json={"error": "poison in batch"})
+        if body["type"] == "external_conversation_item":
+            if body["data"]["source_id"] == "poison":
+                return httpx.Response(400, json={"error": "poison"})
+            return httpx.Response(202, json={"queued": False, "item_id": "item-ok"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0,
+                max_permanent_attempts=1,
+            ),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    individual_source_ids = [
+        body["data"]["source_id"]
+        for body in request_bodies
+        if isinstance(body, dict) and body.get("type") == "external_conversation_item"
+    ]
+    assert individual_source_ids == ["before-poison", "poison", "after-poison"]
+    updated = checkpoint.state.subagents["redrive"]
+    assert updated.byte_offset == 30
+    assert updated.seen_source_ids == tuple(item.source_id for item in items)
+    dead_letters = [
+        json.loads(line)
+        for line in (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert [record["payload"]["source_id"] for record in dead_letters] == ["poison"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Path) -> None:
+    """Independent child conversations are concurrent while each stays ordered."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    entries: dict[str, forwarder.SubagentEntry] = {}
+    for index in range(16):
+        subagent_id = f"parallel-{index}"
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id=subagent_id,
+            agent_type="Explore",
+            description="parallel backlog",
+            tool_use_id=f"toolu_parallel_{index}",
+            transcript_records=[
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": f"parallel-message-{index}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": str(index)}],
+                    },
+                }
+            ],
+        )
+        entries[subagent_id] = forwarder.SubagentEntry(
+            subagent_id=subagent_id,
+            child_conversation_id=f"conv_child_{index}",
+        )
+
+    active = 0
+    maximum_active = 0
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        body = json.loads(request.content.decode("utf-8"))
+        if not isinstance(body, list):
+            return httpx.Response(202, json={})
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active == 8:
+            release.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await asyncio.wait_for(
+            forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=forwarder.SubagentForwardState(subagents=entries),
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            ),
+            timeout=3.0,
+        )
+    assert maximum_active == 8
+
+
+@pytest.mark.asyncio
+async def test_parent_output_forwards_while_child_history_is_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck child request cannot prevent the next live parent poll."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="blocked-child",
+        agent_type="Explore",
+        description="blocked history",
+        tool_use_id="toolu_blocked_child",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "blocked-child-item",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "old output"}],
+                },
+            }
+        ],
+    )
+    forwarder._write_subagent_forward_state(
+        bridge_dir,
+        forwarder.SubagentForwardState(
+            subagents={
+                "blocked-child": forwarder.SubagentEntry(
+                    subagent_id="blocked-child",
+                    child_conversation_id="conv_blocked_child",
+                )
+            }
+        ),
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    child_request_started = asyncio.Event()
+    release_child = asyncio.Event()
+    parent_item_forwarded = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if isinstance(body, list):
+            child_request_started.set()
+            await release_child.wait()
+            return httpx.Response(
+                202,
+                json=[
+                    {"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)
+                ],
+            )
+        if (
+            request.url.path == "/v1/sessions/conv_parent/events"
+            and isinstance(body, dict)
+            and body.get("type") == "external_conversation_item"
+        ):
+            parent_item_forwarded.set()
+        return httpx.Response(202, json={})
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(child_request_started.wait(), timeout=2.0)
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "fresh-parent-item",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "fresh output"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        await asyncio.wait_for(parent_item_forwarded.wait(), timeout=1.0)
+    finally:
+        release_child.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 async def test_subagent_watcher_skips_subagents_already_in_state(
@@ -5586,6 +6743,122 @@ async def test_effort_sync_swallows_patch_failure() -> None:
     # Attempted exactly once and the 503 swallowed (no exception escaped the await).
     assert len(captured) == 1
     assert captured[0].method == "PATCH"
+
+
+async def _run_dismiss_stranded_spinner(
+    *,
+    bridge_dir: Path,
+    seq: int,
+    status: int = 200,
+) -> list[_CapturedRequest]:
+    """
+    Drive ``_maybe_dismiss_stranded_compaction_spinner`` against a mock AP.
+
+    :param bridge_dir: Bridge dir holding the compaction state.
+    :param seq: The refused compaction's ``PreCompact`` seq to dismiss.
+    :param status: HTTP status the mock endpoint returns.
+    :returns: Every request the helper issued, in order.
+    """
+    captured: list[_CapturedRequest] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the request and return a canned response."""
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        captured.append(_CapturedRequest(method=request.method, path=request.url.path, body=body))
+        return httpx.Response(status, json={"queued": False})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._maybe_dismiss_stranded_compaction_spinner(
+            client, session_id="conv_x", bridge_dir=bridge_dir, seq=seq
+        )
+    return captured
+
+
+async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> None:
+    """
+    A ``/compact`` refusal posts ``failed`` and drops the refused token.
+
+    Claude fired ``PreCompact`` (raising the spinner) but declined to
+    compact, so no completion signal follows. The forwarder must dismiss
+    the "Compacting…" spinner with ``external_compaction_status: failed``
+    and clear the dangling ``PreCompact`` token for that seq.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq)
+
+    assert captured == [
+        _CapturedRequest(
+            method="POST",
+            path="/v1/sessions/conv_x/events",
+            body={"type": "external_compaction_status", "data": {"status": "failed"}},
+        )
+    ], f"expected one failed compaction-status POST, got {captured!r}"
+    # Dangling token cleared so a later genuine compaction reconciles cleanly.
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
+
+
+async def test_compact_refusal_without_pending_token_no_ops(tmp_path: Path) -> None:
+    """
+    A refusal whose ``PreCompact`` was missed posts nothing.
+
+    No pending token means the ``PreCompact`` was never observed, so no
+    spinner is up and a ``failed`` post would be spurious.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=1)
+
+    assert captured == [], f"expected no POST without a pending token, got {captured!r}"
+
+
+async def test_compact_refusal_does_not_dismiss_a_different_compaction(tmp_path: Path) -> None:
+    """
+    A stale refusal seq never dismisses a later genuine compaction's token.
+
+    Regression for the flag-leak hazard: a refusal armed for seq N must not
+    fire against a fresh seq N+1 minted by a subsequent real ``/compact`` —
+    doing so would clear that live spinner and discard its boundary token.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A genuine, later compaction is pending (seq 1); the refusal we're
+    # flushing was armed for a missed earlier compaction (seq 0).
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    live_seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=live_seq - 1)
+
+    assert captured == [], f"a stale refusal seq must post nothing, got {captured!r}"
+    # The genuine compaction's token is untouched.
+    assert forwarder._read_compaction_state(bridge_dir).pending.seq == live_seq
+
+
+async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
+    """A failed dismissal POST is best-effort — attempted, logged, never raised."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq, status=503)
+
+    # Attempted once, the 503 swallowed. The token is still cleared (the
+    # spinner-owning PreCompact will never complete regardless).
+    assert len(captured) == 1
+    assert captured[0].method == "POST"
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
 
 
 def test_usage_from_status_state_surfaces_cumulative_cost() -> None:
@@ -6769,7 +8042,7 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
 
     with (
         patch(
-            "omnigent.claude_native_forwarder.read_claude_session_id",
+            "omnigent.harnesses.claude_native.forwarder.read_claude_session_id",
             return_value="claude-uuid-1",
         ),
         patch(
@@ -6825,7 +8098,7 @@ async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path
 
     with (
         patch(
-            "omnigent.claude_native_forwarder.read_claude_session_id",
+            "omnigent.harnesses.claude_native.forwarder.read_claude_session_id",
             return_value=None,
         ),
     ):
@@ -6886,7 +8159,7 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
 
     persist_mock = AsyncMock(side_effect=_persist_side_effect)
     with patch(
-        "omnigent.claude_native_forwarder._persist_native_compaction_item",
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
         persist_mock,
     ):
         task = asyncio.create_task(
@@ -6960,7 +8233,7 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     server, thread, base_url = _start_recording_server()
     persist_mock = AsyncMock()
     with patch(
-        "omnigent.claude_native_forwarder._persist_native_compaction_item",
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
         persist_mock,
     ):
         task = asyncio.create_task(
@@ -7040,7 +8313,9 @@ async def test_missing_compact_session_start_still_persists_from_transcript(
     )
 
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_missing_hook",
@@ -7074,7 +8349,9 @@ async def test_normal_hook_after_transcript_does_not_double_persist(tmp_path: Pa
     await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
 
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         # Transcript path persists first.
         await _handle_compact_summary_item(
             AsyncMock(),
@@ -7113,7 +8390,9 @@ async def test_failed_boundary_post_is_retried_not_consumed(tmp_path: Path) -> N
         side_effect=httpx.HTTPStatusError("bad", request=request, response=response)
     )
 
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
+    ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_retry",
@@ -7145,7 +8424,10 @@ async def test_restart_reattach_does_not_repersist_completed_boundary(tmp_path: 
     # Durable state as it would exist after a completed compaction: seq 1
     # persisted, but a stale pending token for the same seq lingers (e.g.
     # crash between POST success and mark). The persisted set must win.
-    from omnigent.claude_native_forwarder import _PendingCompaction, _write_compaction_state
+    from omnigent.harnesses.claude_native.forwarder import (
+        _PendingCompaction,
+        _write_compaction_state,
+    )
 
     _write_compaction_state(
         bridge_dir,
@@ -7157,7 +8439,9 @@ async def test_restart_reattach_does_not_repersist_completed_boundary(tmp_path: 
     )
 
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_restart",
@@ -7182,7 +8466,9 @@ async def test_repeated_compactions_persist_distinct_boundaries(tmp_path: Path) 
     bridge_dir.mkdir()
     persist = _persist_mock()
 
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         # First compaction.
         await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
         await _handle_compact_summary_item(
@@ -7222,7 +8508,9 @@ async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> 
     bridge_dir.mkdir()  # no _note_precompact — no pending token
 
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_historical",
@@ -7253,8 +8541,13 @@ async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
     ambiguous = AsyncMock(side_effect=httpx.ReadError("connection dropped mid-response"))
 
     with (
-        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ambiguous),
-        patch("omnigent.claude_native_forwarder.post_may_have_been_delivered", return_value=True),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", ambiguous
+        ),
+        patch(
+            "omnigent.harnesses.claude_native.forwarder.post_may_have_been_delivered",
+            return_value=True,
+        ),
     ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
@@ -7306,7 +8599,9 @@ async def test_precompact_and_summary_same_poll_persists_boundary(tmp_path: Path
 
     # The summary in the same poll now finds the token and persists once.
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_same_poll",
@@ -7390,7 +8685,7 @@ async def test_standalone_completion_hook_persists_without_pending(tmp_path: Pat
     assert state.pending.seq == 1
 
     # After the caller persists and marks it done, the boundary is recorded.
-    from omnigent.claude_native_forwarder import _mark_compaction_persisted
+    from omnigent.harnesses.claude_native.forwarder import _mark_compaction_persisted
 
     await _mark_compaction_persisted(bridge_dir, seq)
     final = _read_compaction_state(bridge_dir)
@@ -7415,7 +8710,9 @@ async def test_completion_hook_after_transcript_persist_is_absorbed(tmp_path: Pa
     await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
 
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         # Transcript path persists the boundary; arms expect_completion_ack.
         await _handle_compact_summary_item(
             AsyncMock(),
@@ -7456,7 +8753,9 @@ async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
     bridge_dir.mkdir()  # no PreCompact, no persisted boundary
 
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_miss",
@@ -7471,13 +8770,15 @@ async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
     assert forwarder._compaction_skip_stats.expected_skip == 0
 
     # A skip AFTER a boundary was persisted is an expected replay, not a miss.
-    from omnigent.claude_native_forwarder import _write_compaction_state
+    from omnigent.harnesses.claude_native.forwarder import _write_compaction_state
 
     _write_compaction_state(
         bridge_dir,
         CompactionForwardState(pending=None, last_seq=1, persisted_seqs=(1,)),
     )
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_miss",
@@ -7513,7 +8814,9 @@ async def test_stale_completion_ack_does_not_swallow_a_later_boundary(
     await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
 
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
+    ):
         # Compaction A persists via the transcript path → arms the ack for A's seq.
         await _handle_compact_summary_item(
             AsyncMock(),
@@ -7559,7 +8862,7 @@ async def test_completion_ack_armed_for_unpersisted_seq_biases_to_persist(
     duplicate — so the path biases to persisting a fresh boundary rather than
     silently absorbing the hook.
     """
-    from omnigent.claude_native_forwarder import _write_compaction_state
+    from omnigent.harnesses.claude_native.forwarder import _write_compaction_state
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -7620,7 +8923,7 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
         # The best-effort spinner status post is orthogonal to the durable
         # persist under test; stub it so the client mock stays quiet.
         with patch(
-            "omnigent.claude_native_forwarder._post_external_compaction_status",
+            "omnigent.harnesses.claude_native.forwarder._post_external_compaction_status",
             AsyncMock(return_value=None),
         ):
             return await forwarder._forward_available_status_events(
@@ -7637,7 +8940,9 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
 
     # Poll 1: persist fails → cursor is held BEFORE the compaction hook record,
     # a pending token is minted, and no boundary is marked persisted.
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
+    with patch(
+        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
+    ):
         after_fail = await _run_once(start_state)
     assert failing.await_count == 1
     assert after_fail.event_cursor == start_state.event_cursor  # cursor held
@@ -7649,7 +8954,7 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
     # Poll 2 (retry): the same hook record is re-seen; the persist succeeds and
     # re-consumes the SAME seq (idempotent), marking exactly one boundary.
     ok = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ok):
+    with patch("omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", ok):
         after_ok = await _run_once(after_fail)
     assert ok.await_count == 1
     persisted = _read_compaction_state(bridge_dir)
@@ -7774,9 +9079,9 @@ async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
         :returns: Canned Omnigent response.
         """
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") == "external_subagent_start":
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
-        if body.get("type") == "external_conversation_item":
+        if isinstance(body, list) or body.get("type") == "external_conversation_item":
             return httpx.Response(400, json={"error": "nope"})
         return httpx.Response(202, json={})
 
@@ -8394,6 +9699,22 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forward_progress_timeout_resets_after_each_response() -> None:
+    """A healthy long drain is not cancelled while responses keep arriving."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.06)
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        async with forwarder._forward_progress_timeout(client, 0.1):
+            for _ in range(3):
+                await client.post("/events", json={})
+
+
+@pytest.mark.asyncio
 async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8423,7 +9744,7 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
 
     monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_on_first_call)
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native_forwarder"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder"):
         task = asyncio.create_task(
             forward_claude_transcript_to_session(
                 base_url="http://127.0.0.1:9",
@@ -8447,7 +9768,7 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-    stall_warnings = [r for r in caplog.records if "iteration exceeded" in r.getMessage()]
+    stall_warnings = [r for r in caplog.records if "made no live progress" in r.getMessage()]
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None

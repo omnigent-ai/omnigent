@@ -8,7 +8,11 @@ loops, no file I/O.
 The expression receives the full ``PolicyEvent`` dict as an
 ``event`` variable and must return a map with a ``result`` key
 (``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
-``"reason"`` key. Non-map returns abstain.
+``"reason"`` and/or ``"state_updates"`` key. Non-map returns abstain.
+``state_updates`` must be a list of maps shaped
+``{"key": string, "action": "set"|"increment"|"delete"|"append", "value": any}``.
+``value`` is required for ``set``, ``increment``, and ``append``, and ignored
+for ``delete``.
 
 Register statically in an agent's YAML, or dynamically on a running
 session via the policy API.
@@ -58,6 +62,7 @@ CEL reference: https://cel.dev/overview/cel-overview
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 
 try:
     import celpy
@@ -87,8 +92,12 @@ def cel_policy(
 
     The expression must return a map with a ``result`` key
     (``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
-    ``"reason"`` key. Returning ``None`` or a map without a
-    valid ``result`` abstains (ALLOW).
+    ``"reason"`` and/or ``"state_updates"`` key. Returning ``None``
+    or a map without a valid ``result`` abstains (ALLOW).
+    ``state_updates`` must be a list of maps shaped
+    ``{"key": string, "action": "set"|"increment"|"delete"|"append", "value": any}``.
+    ``value`` is required for ``set``, ``increment``, and ``append``,
+    and ignored for ``delete``.
 
     :param expression: CEL expression evaluated per policy event.
         The ``event`` variable is the full
@@ -98,6 +107,11 @@ def cel_policy(
             event.type == "tool_call"
               ? {"result": "ASK", "reason": "Approve?"}
               : {"result": "ALLOW"}
+
+            {"result": "ALLOW",
+             "state_updates": [
+                 {"key": "call_count", "action": "increment", "value": 1}
+             ]}
 
     :param reason: Fallback reason for DENY/ASK results when
         the map omits a ``"reason"`` key, e.g.
@@ -122,6 +136,7 @@ def cel_policy(
     prog = env.program(ast)
     _result_key = celpy.celtypes.StringType("result")
     _reason_key = celpy.celtypes.StringType("reason")
+    _state_updates_key = celpy.celtypes.StringType("state_updates")
 
     def evaluate(event: PolicyEvent) -> PolicyResponse | None:
         # llm_client is a live object used by Python policy callables;
@@ -160,9 +175,46 @@ def cel_policy(
             out["reason"] = str(result[_reason_key])
         elif verdict != "ALLOW":
             out["reason"] = reason
+        if _state_updates_key in result:
+            state_updates = _plain_cel_value(result[_state_updates_key])
+            if not isinstance(state_updates, list):
+                raise TypeError("CEL policy: state_updates must be a list of maps.")
+            out["state_updates"] = state_updates  # type: ignore[typeddict-item]
         return out
 
     return evaluate
+
+
+def _plain_cel_value(value: object) -> object:
+    """
+    Convert CEL wrapper values back to JSON-like Python values.
+
+    :param value: A value returned from ``celpy`` evaluation.
+    :returns: A plain ``dict``/``list``/scalar value suitable for
+        :class:`FunctionPolicy` response coercion.
+    """
+    if celpy is not None:
+        if isinstance(value, celpy.celtypes.BoolType):
+            return bool(value)
+        if isinstance(value, celpy.celtypes.NullType):
+            return None
+        if isinstance(value, celpy.celtypes.StringType):
+            return str(value)
+        if isinstance(value, celpy.celtypes.BytesType):
+            return bytes(value)
+        if isinstance(value, (celpy.celtypes.IntType, celpy.celtypes.UintType)):
+            return int(value)
+        if isinstance(value, celpy.celtypes.DoubleType):
+            return float(value)
+    if isinstance(value, Mapping):
+        return {str(_plain_cel_value(k)): _plain_cel_value(v) for k, v in value.items()}
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, Sequence):
+        return [_plain_cel_value(item) for item in value]
+    return value
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
@@ -179,7 +231,10 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                 "Evaluate a CEL (Common Expression Language) expression against "
                 "every policy event. The expression receives the full event as "
                 '`event` and must return a map with `result` ("DENY", "ASK", or '
-                '"ALLOW") and optional `reason` keys. '
+                '"ALLOW") plus optional `reason` and/or `state_updates` keys. '
+                "`state_updates` must be a list of maps with `key`, `action`, "
+                'and `value`; valid actions are "set", "increment", "delete", '
+                'and "append". `value` is ignored for "delete". '
                 "CEL is non-Turing-complete and side-effect-free."
             ),
             "params_schema": {
@@ -190,7 +245,13 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                         "description": (
                             "CEL expression. The `event` variable holds the PolicyEvent dict. "
                             "Must return a map: "
-                            '{"result": "DENY"|"ASK"|"ALLOW", "reason": "..."}. '
+                            '{"result": "DENY"|"ASK"|"ALLOW", "reason": "...", '
+                            '"state_updates": [...]}. '
+                            "`state_updates` must be a list of maps shaped "
+                            '{"key": string, "action": '
+                            '"set"|"increment"|"delete"|"append", "value": any}; '
+                            "`value` is required for set/increment/append and ignored "
+                            "for delete. "
                             "Event fields: "
                             'event.type ("request"|"tool_call"|"tool_result"|'
                             '"response"|"llm_request"|"llm_response"|"output_logged"); '

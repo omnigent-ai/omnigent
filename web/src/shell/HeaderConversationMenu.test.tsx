@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   archive: vi.fn(),
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
+  fork: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -75,7 +76,9 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
         conversation={CONVERSATION}
         currentProject={null}
         canShare
+        canFork
         onShare={() => {}}
+        onFork={mocks.fork}
         {...overrides}
       />
     </MemoryRouter>
@@ -118,6 +121,7 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -147,6 +151,15 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Mark as unread" }));
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
+  });
+
+  it("opens a full-history fork from the session menu", () => {
+    renderMenu();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(mocks.fork).toHaveBeenCalledOnce();
   });
 
   it("renames from the mobile Rename dialog", () => {
@@ -377,7 +390,9 @@ describe("HeaderConversationMenu", () => {
     mocks.isMobile = true;
     renderMenu();
     const mobileTrigger = screen.getByRole("button", { name: "Conversation actions" });
-    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-4");
+    // 44px tap-target floor on phones, matching the sibling header controls.
+    expect(mobileTrigger).toHaveClass("max-md:size-11");
+    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-5");
     openMenu();
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
   });
@@ -392,6 +407,7 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -412,6 +428,7 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
+      "Fork",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -433,6 +450,27 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     // The entries bring exactly one separator of their own.
     expect(screen.getAllByRole("separator")).toHaveLength(baseSeparators + 1);
+  });
+
+  it("keeps the page touchable while the mobile menu is open (non-modal)", () => {
+    // Modal mode sets pointer-events:none on <body>, leaving the menu as the
+    // only touch target; browser touch-target adjustment then snaps outside
+    // taps onto the menu, so on a phone it can never be dismissed. Mobile must
+    // run non-modal so an outside tap lands on real content and closes it.
+    mocks.isMobile = true;
+    renderMenu();
+    openMenu();
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).not.toBe("none");
+  });
+
+  it("stays modal on desktop, where outside clicks are precise", () => {
+    renderMenu();
+    openMenu();
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).toBe("none");
   });
 
   it("wears the mobile glass surface and a round trigger", () => {

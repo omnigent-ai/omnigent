@@ -25,6 +25,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
+from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -50,10 +51,14 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import resolve_host_launch
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
+from omnigent.server.routes._workspace_validation import (
+    _is_windows_absolute_path,
+    restore_host_filesystem_url_path,
+)
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import Host, HostStore, host_is_live
+from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -81,29 +86,10 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
 
 
-def _host_absent_error(host: Host) -> OmnigentError:
-    """Classify a "host not on this replica" miss for a host-scoped route.
-
-    Every ``/v1/hosts/{id}/*`` route reaches the host over its live tunnel in
-    the local (this-replica) ``HostRegistry``. When replicas are sharded by
-    host, a request keyed to ``host_id`` can land on a replica that doesn't
-    hold the tunnel — the same wrong-replica case ``RunnerRouter`` handles for
-    runner dispatch (see ``_runner_absent_code``). Tell the two apart using the
-    host record the caller already loaded:
-
-    - still **live** (online + fresh heartbeat) → up on some replica, just not
-      here → :data:`~ErrorCode.WRONG_REPLICA` (400) so the client re-addresses
-      WITHOUT the key.
-    - otherwise → genuinely offline → ``CONFLICT`` (409).
-
-    :param host: The host's persistent record (owner-checked by the caller).
-    :returns: The ``OmnigentError`` to raise; the global handler maps its code
-        to the HTTP status and the ``{"error": {"code": ...}}`` body the
-        client's re-address matches on.
-    """
-    if host_is_live(host):
-        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
-    return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+# ``/v1/hosts/{id}/*`` routes share the wrong-replica-vs-offline classification
+# with the runner-launch and import paths; the one implementation lives in
+# ``_host_launch`` so the sites can't drift.
+_host_absent_error = host_absent_error
 
 
 async def _proxy_model_options(
@@ -460,6 +446,13 @@ class StoreHarnessCredentialRequest(BaseModel):
     env_var: str | None = None
 
 
+class HostModelOptionsResponse(BaseModel):
+    """Pre-launch model choices resolved by a host harness."""
+
+    models: list[dict[str, Any]]
+    routable_models: list[str]
+
+
 class LaunchRunnerRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/runners``.
 
@@ -681,7 +674,7 @@ def create_hosts_router(
         request: Request,
         host_id: str,
         harness: str,
-    ) -> dict[str, list[Any]]:
+    ) -> HostModelOptionsResponse:
         """Return pre-launch model choices resolved by the selected host.
 
         A preview of the host's ambient default catalog, not a binding
@@ -710,21 +703,18 @@ def create_hosts_router(
             )
         models = result.get("models")
         routable = result.get("routable_models")
-        payload: dict[str, Any] = {
-            "models": models if isinstance(models, list) else [],
+        return HostModelOptionsResponse(
+            models=(
+                [model for model in models if isinstance(model, dict)]
+                if isinstance(models, list)
+                else []
+            ),
             # Every id the harness's endpoint routes: the picker names one
             # row per model, while a launch takes an exact id.
-            "routable_models": (
+            routable_models=(
                 [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
             ),
-        }
-        # An honest empty answer carries the reason (e.g. "the codex model
-        # probe failed — see the host log") so the picker can say WHY it is
-        # empty instead of a generic "Models unavailable".
-        error = result.get("error")
-        if isinstance(error, str) and error:
-            payload["error"] = error
-        return payload
+        )
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(
@@ -1004,6 +994,10 @@ def create_hosts_router(
                 detail=f"host failed to launch runner: {result.get('error')}",
             )
 
+        # The runner is bound to a session carried in the body (not the request
+        # path); the middleware promotes a bag session_id to the audit row's
+        # session_id column. Host is an attribute.
+        add_audit_attrs(session_id=body.session_id, host_id=host_id, runner_id=runner_id)
         return {
             "runner_id": runner_id,
             "status": "launching",
@@ -1083,10 +1077,10 @@ def create_hosts_router(
             504 (timeout), 502 (host I/O).
         """
         # FastAPI's :path converter strips the leading slash from
-        # the URL match. Re-add it unless the path is tilde-prefixed
-        # (~/foo stays tilde-prefixed; /Users/x becomes Users/x → /Users/x).
-        if not path.startswith("~"):
-            path = "/" + path
+        # the URL match. Re-add it for POSIX paths; leave tilde,
+        # Windows drive-letter, and UNC paths alone (prefixing /
+        # would turn C:/Users/me into /C:/Users/me).
+        path = restore_host_filesystem_url_path(path)
         return await _list_host_filesystem(
             request=request,
             host_id=host_id,
@@ -1225,7 +1219,7 @@ def create_hosts_router(
             )
         # Absolute or tilde-prefixed only — the host needs a path it can
         # resolve on its own; a relative path has no stable meaning here.
-        if not path.startswith(("/", "~")):
+        if not (path.startswith(("/", "~", "\\\\")) or _is_windows_absolute_path(path)):
             raise HTTPException(
                 status_code=400,
                 detail="path must be absolute or tilde-prefixed",

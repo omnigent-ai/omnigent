@@ -118,6 +118,13 @@ describe("SessionUpdatesProvider watch-set", () => {
     expect(lastWatched()).toEqual(["conv_b", "conv_open"]);
   });
 
+  it("does not send client-only temp ids in the watch-set", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_real", "temp:12345678"]);
+    renderProvider(client, ["/c/temp:12345678"]);
+    expect(lastWatched()).toEqual(["conv_real"]);
+  });
+
   it("re-pushes the watch-set with the new open id on navigation", () => {
     // Navigating between off-sidebar children doesn't touch the
     // conversations cache, so the watch-set must re-push from the activeId

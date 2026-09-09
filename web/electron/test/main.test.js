@@ -268,6 +268,16 @@ describe("setup clipboard IPC wiring", () => {
   });
 });
 
+describe("macOS activation wiring", () => {
+  it("counts tracked shell windows instead of utility windows", () => {
+    assert.match(liveCode, /app\.on\("activate"[\s\S]{0,500}windows\.size === 0/);
+    assert.doesNotMatch(
+      liveCode,
+      /app\.on\("activate"[\s\S]{0,500}BrowserWindow\.getAllWindows\(\)\.length === 0/,
+    );
+  });
+});
+
 describe("managed server preference wiring", () => {
   it("exposes managed servers only through the setup-page bridge", () => {
     assert.match(
@@ -304,6 +314,47 @@ describe("managed server preference wiring", () => {
   it("renders organization-provided servers separately on setup", () => {
     assert.match(setupSource, /Provided by your organization/);
     assert.match(setupSource, /setup\s*\.getManagedServers\(\)/);
+  });
+});
+
+describe("Databricks-internal local-host CLI wiring", () => {
+  it("selects isaac omni only behind the internal flag and Databricks server gate", () => {
+    assert.match(
+      liveCode,
+      /function hostCliCommand\(serverUrl\)[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
+    );
+  });
+
+  it("uses the selected command for identity availability and every host action", () => {
+    assert.match(
+      liveCode,
+      /host-get-identity[\s\S]{0,350}Boolean\(hostCliCommand\(senderServerUrl\(event\)\)\)/,
+    );
+    assert.match(
+      liveCode,
+      /host-control[\s\S]{0,450}const cliCommand = hostCliCommand\(serverUrl\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, serverUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, serverUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, serverUrl\)/,
+    );
+  });
+
+  it("disables CLI customization in main and explains managed policy in the setup dialog", () => {
+    assert.match(
+      liveCode,
+      /omnigent:set-cli-path[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true[\s\S]{0,80}accepted:\s*false/,
+    );
+    assert.match(
+      liveCode,
+      /omnigent:browse-cli-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)\) return null/,
+    );
+    assert.match(
+      liveCode,
+      /omnigent:cli-reset-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true/,
+    );
+    assert.match(setupSource, /cliGear\.hidden = false/);
+    assert.match(setupSource, /cliManaged\.hidden = !cliCustomizationDisabled/);
+    assert.match(setupSource, /cliPathInput\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /cliBrowse\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /cliRedetect\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /Managed by your organization/);
   });
 });
 
@@ -469,11 +520,15 @@ describe("navigation fallback wiring (src/main.js)", () => {
     harness.cleanup();
   });
 
-  it("registers navigation fallbacks when createWindow builds a window", () => {
+  it("registers navigation fallbacks when createWindow builds a window", async () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
 
     const win = harness.api.createWindow("https://host.example/ml/omnigents");
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Unavailable");
+    // loadSetupPage defers its navigation a tick (see main.js loadSetupPage).
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
 
     assert.equal(win, harness.win);
     assert.equal(harness.hasListener("did-fail-load"), true);
@@ -784,11 +839,19 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
 // carries httpResponseCode for main-frame navigations — fall back to setup
 // with ?error=&url= the same way the net-error path does.
 describe("HTTP error status fallback (src/main.js)", () => {
-  it("routes a 404 to the setup error surface with the mounted server URL", (t) => {
+  // loadSetupPage defers its navigation to the next tick (see main.js), so the
+  // fallback's loadFile lands a macrotask after the event is emitted.
+  const flush = () =>
+    new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+  it("routes a 404 to the setup error surface with the mounted server URL", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
     harness.emit("did-navigate", "https://host.example/ml/omnigents/health", 404, "Not Found");
+    await flush();
 
     assert.equal(harness.calls.loadFile.length, 1);
     assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
@@ -797,11 +860,12 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.equal(params.get("url"), "https://host.example/ml/omnigents");
   });
 
-  it("routes a 503 to the same setup error surface", (t) => {
+  it("routes a 503 to the same setup error surface", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Service Unavailable");
+    await flush();
 
     assert.equal(harness.calls.loadFile.length, 1);
     const params = new URLSearchParams(harness.calls.loadFile[0][1].search);
@@ -809,17 +873,18 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.equal(params.get("url"), "https://host.example/ml/omnigents");
   });
 
-  it("does not fall back for successful or redirect navigations", (t) => {
+  it("does not fall back for successful or redirect navigations", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 200, "OK");
     harness.emit("did-navigate", "https://host.example/ml/omnigents/login", 302, "Found");
+    await flush();
 
     assert.deepEqual(harness.calls.loadFile, []);
   });
 
-  it("ignores a duplicate failure after the first fallback unpins the window", (t) => {
+  it("ignores a duplicate failure after the first fallback unpins the window", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
@@ -829,11 +894,12 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.equal(harness.api.windows.get(harness.win).origin, null);
     // Unpinning makes the origin guard reject re-entry.
     harness.emit("did-navigate", failedUrl, 503, "Service Unavailable");
+    await flush();
 
     assert.equal(harness.calls.loadFile.length, 1);
   });
 
-  it("keeps the network-error fallback and ignores ERR_ABORTED", (t) => {
+  it("keeps the network-error fallback and ignores ERR_ABORTED", async (t) => {
     const harness = loadNavigationHarness();
     t.after(harness.cleanup);
 
@@ -844,11 +910,13 @@ describe("HTTP error status fallback (src/main.js)", () => {
       "https://host.example/ml/omnigents/",
       true,
     );
+    await flush();
     assert.equal(harness.calls.loadFile.length, 1);
 
     const aborted = loadNavigationHarness();
     t.after(aborted.cleanup);
     aborted.emit("did-fail-load", -3, "ABORTED", "https://host.example/ml/omnigents/", true);
+    await flush();
     assert.deepEqual(aborted.calls.loadFile, []);
   });
 });

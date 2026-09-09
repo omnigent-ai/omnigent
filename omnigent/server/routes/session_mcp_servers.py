@@ -17,6 +17,7 @@ import httpx
 import yaml
 from fastapi import APIRouter, Request, Response, status
 
+from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import session_stream
@@ -124,6 +125,7 @@ def create_session_mcp_servers_router(
         )
         await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
+        add_audit_attrs(server_name=body.name)
         return _summary_from_spec(spec, body.name)
 
     @router.put("/sessions/{session_id}/agent/mcp-servers/{server_name}")
@@ -144,6 +146,7 @@ def create_session_mcp_servers_router(
         )
         await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
+        add_audit_attrs(server_name=server_name)
         return _summary_from_spec(spec, body.name)
 
     @router.delete(
@@ -166,6 +169,7 @@ def create_session_mcp_servers_router(
         )
         await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
+        add_audit_attrs(server_name=server_name)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _editable_agent(request: Request, session_id: str) -> Agent:

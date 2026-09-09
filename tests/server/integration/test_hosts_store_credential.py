@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -132,14 +133,11 @@ async def cred_setup(
     comm = await _connect_mock_host(app, registry)
     received: list[HostStoreSecretFrame] = []
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            # An idle receive timeout cancels the ASGI app; teardown owns cancellation.
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -184,11 +182,13 @@ async def cred_setup(
     try:
         yield app, registry, received, replies
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
@@ -286,13 +286,18 @@ async def test_store_gateway_forwards_base_url(
     assert received[0].wire_api == "chat"
 
 
+@pytest.mark.parametrize(
+    "idle_seconds", [pytest.param(0.0, id="immediate"), pytest.param(0.75, id="idle")]
+)
 async def test_adopt_forwards_env_var_without_secret(
     cred_setup: tuple[
         FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
     ],
+    idle_seconds: float,
 ) -> None:
     """An adopt request forwards the env var name and no secret value."""
     app, _reg, received, _replies = cred_setup
+    await asyncio.sleep(idle_seconds)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/codex/credential",

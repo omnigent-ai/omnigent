@@ -32,6 +32,7 @@ import {
   useState,
 } from "react";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
+import { isTempConvId } from "@/store/chatStore";
 import { useConversations } from "@/hooks/useConversations";
 import { type RunnerHealthInput, useRunnerHealth } from "@/hooks/useRunnerHealth";
 import { useSession } from "@/hooks/useSession";
@@ -61,7 +62,12 @@ export function RunnerHealthProvider({ children }: { children: ReactNode }) {
   // cover it. Fold the open session into the fallback poll set so it
   // resolves to a real liveness state even when off-sidebar. Its snapshot
   // is already cached by the chat stream bind, so this is a cache hit.
-  const activeSession = useSession(useActiveConversationId()).session;
+  // A client-only temp id (`temp:*`, mid-create) has no server session — skip
+  // the fetch so it doesn't hit `/v1/sessions/temp:*` during the create window.
+  const activeConversationId = useActiveConversationId();
+  const activeSession = useSession(
+    isTempConvId(activeConversationId) ? undefined : activeConversationId,
+  ).session;
   const activeId = activeSession?.id;
 
   // Sessions registered by transient views (e.g. the new-session dialog)

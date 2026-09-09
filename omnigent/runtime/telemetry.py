@@ -540,6 +540,92 @@ def trace_id_from_response_id(response_id: str) -> str:
     return hex_part
 
 
+# Dispatch-scoped copies of the caller's W3C trace context. The `omnigent
+# run` entrypoint captures the ambient TRACEPARENT/TRACESTATE into these so
+# only a deliberate dispatch propagates the caller's trace into the spawned
+# server/runner/harness tree. A long-lived server that merely inherited a
+# wrapper's stale TRACEPARENT must NOT funnel every future session into
+# that one trace, so raw TRACEPARENT is never consulted directly here.
+# The OMNIGENT_OTEL_ prefix rides the existing env allowlists across the
+# host->runner and daemon boundaries; long-lived daemons strip these two
+# explicitly so a reused daemon can't replay a stale dispatch context.
+DISPATCH_TRACEPARENT_ENV_VAR = "OMNIGENT_OTEL_DISPATCH_TRACEPARENT"
+DISPATCH_TRACESTATE_ENV_VAR = "OMNIGENT_OTEL_DISPATCH_TRACESTATE"
+
+
+def capture_dispatch_trace_context() -> None:
+    """
+    Bless the ambient ``TRACEPARENT`` as this dispatch's caller context.
+
+    Called by the ``omnigent run`` CLI entrypoint (a one-shot dispatch on
+    behalf of the invoking client). Copies ``TRACEPARENT`` /
+    ``TRACESTATE`` into the dispatch-scoped env vars, which child
+    processes (server, runner, harness) inherit — so their spans join the
+    dispatching client's trace via :func:`dispatching_client_context`.
+
+    Runners spawned by the persistent host daemon do not see these vars
+    (the daemon scrubs them so it can't replay a stale dispatch context
+    across reuses), so runs in that topology keep response-derived traces
+    — a deliberate safe trade-off until the caller context travels
+    per-dispatch on the frame layer.
+
+    Clears any inherited dispatch vars first, so only the ambient
+    ``TRACEPARENT`` of *this* dispatch — never a stale value from a parent
+    process — can propagate.
+    """
+    os.environ.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
+    os.environ.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
+    traceparent = os.environ.get("TRACEPARENT", "").strip()
+    if not traceparent:
+        return
+    os.environ[DISPATCH_TRACEPARENT_ENV_VAR] = traceparent
+    tracestate = os.environ.get("TRACESTATE", "").strip()
+    if tracestate:
+        os.environ[DISPATCH_TRACESTATE_ENV_VAR] = tracestate
+
+
+def dispatching_client_context() -> Context | None:
+    """
+    Extract the dispatching client's trace context from the environment.
+
+    A wrapper that starts a span and serializes its W3C context into the
+    ``TRACEPARENT`` (and optionally ``TRACESTATE``) environment variable
+    before invoking ``omnigent run`` expects the run's spans to join its
+    trace. The run entrypoint blesses those values into dispatch-scoped
+    env vars (:func:`capture_dispatch_trace_context`), which survive by
+    inheritance into the server, runner, and harness processes, so every
+    component sees the same caller context.
+
+    :returns: The extracted :class:`~opentelemetry.context.Context` when
+        this dispatch carries a valid, sampled caller ``TRACEPARENT``,
+        else ``None`` — unset, malformed, or unsampled contexts fall back
+        to the response-derived trace. "Malformed" refers to the
+        traceparent; an invalid ``TRACESTATE`` is dropped by the
+        propagator while the parent is kept. (An unsampled caller context
+        would make the default ``ParentBased`` sampler drop every omnigent
+        span; the operator opted into telemetry, so keep exporting on
+        omnigent's own trace instead of going dark.)
+    """
+    traceparent = os.environ.get(DISPATCH_TRACEPARENT_ENV_VAR, "").strip()
+    if not traceparent:
+        return None
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    carrier = {"traceparent": traceparent}
+    tracestate = os.environ.get(DISPATCH_TRACESTATE_ENV_VAR, "").strip()
+    if tracestate:
+        carrier["tracestate"] = tracestate
+    ctx = TraceContextTextMapPropagator().extract(carrier)
+    # A malformed traceparent extracts to no span; an unsampled one would
+    # suppress all span export. Treat both as absent so the
+    # response-derived trace path still applies.
+    span_context = otel_trace.get_current_span(ctx).get_span_context()
+    if not span_context.is_valid or not span_context.trace_flags.sampled:
+        return None
+    return ctx
+
+
 @contextmanager
 def trace_context_for_response(
     response_id: str,
@@ -549,13 +635,21 @@ def trace_context_for_response(
     """
     Set the active trace context for a workflow invocation.
 
-    Derives the W3C trace ID from ``root_response_id`` (if set) or
-    ``response_id``, then injects a synthetic ``traceparent`` header via
-    the W3C TraceContext propagator to make any span started inside the
-    context manager inherit this trace ID.
+    When the dispatching client passed a W3C trace context via the
+    ``TRACEPARENT`` environment variable, that context is extracted and
+    attached so every span started inside the context manager joins the
+    caller's trace — the cross-service view (dispatcher → runner →
+    harness) is one trace instead of disjoint ones.
 
-    For root invocations pass only ``response_id``; the trace ID is
-    derived from it so direct response-ID → trace-ID lookup works.
+    Otherwise, derives the W3C trace ID from ``root_response_id`` (if
+    set) or ``response_id``, then injects a synthetic ``traceparent``
+    header via the W3C TraceContext propagator to make any span started
+    inside the context manager inherit this trace ID.
+
+    For root invocations pass only ``response_id``; on the fallback
+    path the trace ID is derived from it so direct response-ID →
+    trace-ID lookup works (when a caller context applies, spans ride
+    the caller's trace ID instead, so that lookup does not).
     For sub-agent invocations pass both ``response_id`` (the
     sub-agent's own ID, exposed as ``task.id`` on the span) and
     ``root_response_id`` (the root of the spawn tree, used as the
@@ -565,22 +659,25 @@ def trace_context_for_response(
         e.g. ``"resp_d8e9f0a1..."``.
     :param root_response_id: The root response ID if this is a
         sub-agent invocation, otherwise ``None``.
-    :raises ValueError: If ``response_id`` (or ``root_response_id``
-        when set) cannot be parsed.
+    :raises ValueError: If no caller ``TRACEPARENT`` applies and
+        ``response_id`` (or ``root_response_id`` when set) cannot be
+        parsed.
     """
     from opentelemetry import context
     from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-    effective = root_response_id or response_id
-    trace_id_hex = trace_id_from_response_id(effective)
+    ctx = dispatching_client_context()
+    if ctx is None:
+        effective = root_response_id or response_id
+        trace_id_hex = trace_id_from_response_id(effective)
 
-    # Inject a synthetic traceparent to pin all spans to the response-derived
-    # trace ID. The dummy parent span ID (1000000000000001) is a sentinel —
-    # it never matches any real span so the agent span is effectively the
-    # root for display purposes, even though it has a non-null parent_id in
-    # the OTLP payload.
-    traceparent = f"00-{trace_id_hex}-{SENTINEL_PARENT_SPAN_ID:016x}-01"
-    ctx = TraceContextTextMapPropagator().extract({"traceparent": traceparent})
+        # Inject a synthetic traceparent to pin all spans to the response-derived
+        # trace ID. The dummy parent span ID (1000000000000001) is a sentinel —
+        # it never matches any real span so the agent span is effectively the
+        # root for display purposes, even though it has a non-null parent_id in
+        # the OTLP payload.
+        traceparent = f"00-{trace_id_hex}-{SENTINEL_PARENT_SPAN_ID:016x}-01"
+        ctx = TraceContextTextMapPropagator().extract({"traceparent": traceparent})
     token = context.attach(ctx)
     try:
         yield

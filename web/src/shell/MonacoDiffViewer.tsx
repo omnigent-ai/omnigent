@@ -25,7 +25,23 @@ import {
 } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 import { attachEditorScrollRestore } from "./useScrollRestore";
+import type { monaco } from "./monacoSetup";
 import "./monacoCodeEditor.css";
+
+// Monaco's find contribution isn't a public export, so we reach it by its
+// registered id and describe only the slice we drive: whether the find widget
+// is open, close it, and subscribe to open/close changes. Mirrors
+// MonacoCodeEditor's wiring, applied to the diff's modified-side editor.
+const FIND_CONTROLLER_ID = "editor.contrib.findController";
+interface FindController extends monaco.editor.IEditorContribution {
+  getState: () => {
+    readonly isRevealed: boolean;
+    onFindReplaceStateChange: (listener: (e: { isRevealed: boolean }) => void) => {
+      dispose: () => void;
+    };
+  };
+  closeFindWidget: () => void;
+}
 
 interface MonacoDiffViewerProps {
   /** File content before this session (null = new file). */
@@ -47,6 +63,19 @@ interface MonacoDiffViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** In-progress comment body; clicking away won't clear an active draft. */
   pendingBodyRef?: React.RefObject<string>;
+  /**
+   * Toolbar / Cmd+F "Find in file" toggle. The diff mirrors Monaco's native
+   * find widget (on the modified side) to it: true opens find, false closes it.
+   * Cmd+F is driven through this flag rather than Monaco's own keybinding so it
+   * fires even when the editor lacks DOM focus — the case that breaks in the
+   * managed (same-root embed) host.
+   */
+  searchOpen?: boolean;
+  /**
+   * Called when the find widget is closed from within Monaco (Escape or the
+   * widget's ✕) so the owning toggle resets and the next Cmd+F re-opens it.
+   */
+  onSearchHandled?: () => void;
 }
 
 /**
@@ -69,6 +98,8 @@ export function MonacoDiffViewer({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  searchOpen,
+  onSearchHandled,
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const lang = detectLang(path);
@@ -103,6 +134,10 @@ export function MonacoDiffViewer({
   // The diff editor itself — its updateOptions propagates the code font to both
   // panes (per-pane updateOptions would only re-font one side).
   const diffEditorRef = useRef<Parameters<DiffOnMount>[0] | null>(null);
+  // The two text models, captured on mount so we can dispose them ourselves on
+  // unmount (see the teardown effect and keepCurrent* on <DiffEditor>).
+  const originalModelRef = useRef<ReturnType<CodeEditorInstance["getModel"]>>(null);
+  const modifiedModelRef = useRef<ReturnType<CodeEditorInstance["getModel"]>>(null);
   const [mounted, setMounted] = useState(false);
 
   // The diff scrolls inside Monaco, so its offset is cached per conversation +
@@ -116,6 +151,9 @@ export function MonacoDiffViewer({
       diffEditorRef.current = diffEditor;
       const modified = diffEditor.getModifiedEditor();
       modifiedEditorRef.current = modified;
+      // Capture both models so the teardown effect can dispose them itself.
+      originalModelRef.current = diffEditor.getOriginalEditor()?.getModel() ?? null;
+      modifiedModelRef.current = modified.getModel();
       // Align the modified model's offsets with the raw "after" char offsets that
       // comment anchors use (CRLF files would otherwise be counted as LF).
       modified
@@ -139,11 +177,65 @@ export function MonacoDiffViewer({
 
   useEffect(
     () => () => {
+      // @monaco-editor/react's DiffEditor disposes the text models before the
+      // diff widget on unmount, which the bundled Monaco rejects with "TextModel
+      // got disposed before DiffEditorWidget model got reset". We take model
+      // disposal over via keepCurrent* on <DiffEditor>: detach the widget's
+      // model first, then dispose the two models here. Guarded because our
+      // cleanup and the library's own run in an unspecified order.
+      try {
+        diffEditorRef.current?.setModel(null);
+      } catch {
+        // Widget already disposed by the library — nothing to reset.
+      }
+      try {
+        originalModelRef.current?.dispose();
+      } catch {
+        // Already disposed.
+      }
+      try {
+        modifiedModelRef.current?.dispose();
+      } catch {
+        // Already disposed.
+      }
       modifiedEditorRef.current = null;
       diffEditorRef.current = null;
+      originalModelRef.current = null;
+      modifiedModelRef.current = null;
     },
     [],
   );
+
+  // Mirror the "Find in file" toggle to Monaco's native find widget on the
+  // modified side. Gated on `mounted` so a Cmd+F pressed while the lazy chunk
+  // was still loading isn't dropped. `searchOpen` true opens find; false closes
+  // it. The controller drives the close directly so re-toggling is a real close,
+  // not a second open.
+  useEffect(() => {
+    if (!mounted) return;
+    const editor = modifiedEditorRef.current;
+    if (!editor) return;
+    if (searchOpen) {
+      editor.getAction("actions.find")?.run();
+    } else {
+      const controller = editor.getContribution<FindController>(FIND_CONTROLLER_ID);
+      if (controller?.getState().isRevealed) controller.closeFindWidget();
+    }
+  }, [mounted, searchOpen]);
+
+  // Reflect a find close initiated inside Monaco (Escape or the widget's ✕) back
+  // to the owning toggle, so its state matches the visible widget and the next
+  // Cmd+F re-opens instead of no-opping.
+  useEffect(() => {
+    if (!mounted) return;
+    const controller =
+      modifiedEditorRef.current?.getContribution<FindController>(FIND_CONTROLLER_ID);
+    if (!controller) return;
+    const sub = controller.getState().onFindReplaceStateChange((e) => {
+      if (e.isRevealed && !controller.getState().isRevealed) onSearchHandled?.();
+    });
+    return () => sub.dispose();
+  }, [mounted, onSearchHandled]);
 
   // Apply live code-font changes to both diff panes. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new
@@ -226,6 +318,11 @@ export function MonacoDiffViewer({
             modified={after ?? ""}
             options={options}
             onMount={handleMount}
+            // We dispose the models ourselves on unmount, in the correct order
+            // (see the teardown effect). Without this the library disposes them
+            // before the diff widget and Monaco throws.
+            keepCurrentOriginalModel
+            keepCurrentModifiedModel
           />
         )}
       </div>

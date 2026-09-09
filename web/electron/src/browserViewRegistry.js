@@ -21,6 +21,37 @@ const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
 
+/**
+ * Storage partition for one conversation's browser view. Every view MUST get
+ * its own partition: with none, Electron places the view on
+ * `session.defaultSession`, sharing one cookie/localStorage/cache store across
+ * all agents and the main window (agent A's login bleeds into agent B's view).
+ * Deliberately NOT `persist:`-prefixed — an in-memory partition keeps
+ * agent-visited cookies off disk and leaves nothing to clean up when a
+ * conversation is deleted, while Electron still reuses the same in-memory
+ * session for the name within an app run (a reopened view keeps its login).
+ *
+ * `scope` namespaces the partition per REGISTRY (i.e. per shell window):
+ * Electron sessions are app-global, but conversation ids are only unique per
+ * server — two windows connected to different servers could carry the same
+ * conversationId and would otherwise share a cookie jar.
+ *
+ * `conversationId` is interpolated raw. Production ids are opaque 32-character
+ * UUID hex strings; encode them if that contract ever loosens.
+ *
+ * @param {string} scope Registry-unique namespace (one per shell window).
+ * @param {string} conversationId
+ * @returns {string}
+ */
+function agentPartition(scope, conversationId) {
+  return `omnigent-agent-${scope}-${conversationId}`;
+}
+
+// Monotonic per-process counter: each registry (shell window) gets a distinct
+// default partition scope. In-memory partitions never outlive the process, so
+// no cross-run uniqueness is needed.
+let registrySeq = 0;
+
 function createBrowserViewRegistry({
   WebContentsViewCtor, // (opts) => new WebContentsView(opts) — injectable for tests
   createBoundsController, // bounds-controller factory (createBrowserViewBoundsController)
@@ -35,6 +66,9 @@ function createBrowserViewRegistry({
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   cap = DEFAULT_CAP,
+  // Partition namespace for this registry's views — see agentPartition.
+  // Injectable so tests can pin it; defaults to a per-instance unique value.
+  partitionScope = `w${++registrySeq}`,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
@@ -113,6 +147,8 @@ function createBrowserViewRegistry({
     }
     const view = WebContentsViewCtor({
       webPreferences: {
+        // Per-conversation storage isolation — see agentPartition.
+        partition: agentPartition(partitionScope, conversationId),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
@@ -426,5 +462,6 @@ function createBrowserViewRegistry({
 
 module.exports = {
   createBrowserViewRegistry,
+  agentPartition,
   DEFAULT_CAP,
 };

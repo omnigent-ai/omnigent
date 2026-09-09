@@ -51,6 +51,30 @@ final class ServerURLTests: XCTestCase {
   }
 }
 
+final class AppDeviceSupportTests: XCTestCase {
+  func testAppSupportsIPhoneAndIPad() throws {
+    let deviceFamilies = try XCTUnwrap(
+      Bundle.main.object(forInfoDictionaryKey: "UIDeviceFamily") as? [Int])
+
+    XCTAssertEqual(deviceFamilies, [1, 2])
+  }
+
+  func testIPadSupportsAllOrientations() throws {
+    let orientations = try XCTUnwrap(
+      Bundle.main.object(forInfoDictionaryKey: "UISupportedInterfaceOrientations~ipad")
+        as? [String])
+
+    XCTAssertEqual(
+      Set(orientations),
+      Set([
+        "UIInterfaceOrientationPortrait",
+        "UIInterfaceOrientationPortraitUpsideDown",
+        "UIInterfaceOrientationLandscapeLeft",
+        "UIInterfaceOrientationLandscapeRight",
+      ]))
+  }
+}
+
 final class AppPrivacyInfoTests: XCTestCase {
   func testPrivacyUsageDescriptionsArePresent() throws {
     for key in [
