@@ -76,6 +76,7 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
         "external_session_id": session_id,
         "workspace": "/repo",
         "title": None,
+        "project_name": None,
         "force": False,
         "items": [
             {
@@ -112,6 +113,37 @@ def test_import_command_sends_force_override(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert json.loads(route.calls.last.request.content)["force"] is True
     assert "conv_replaced" in result.output
+
+
+@respx.mock
+def test_import_command_sends_project_name(tmp_path: Path) -> None:
+    """--project asks the server to file the import into a named project."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345680"
+    _write_claude_transcript(tmp_path, session_id, text="hello")
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_projected", "status": "imported", "item_count": 1},
+        )
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "import",
+                "--harness",
+                "claude",
+                "--session",
+                session_id,
+                "--project",
+                "Migrated chats",
+            ],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls.last.request.content)["project_name"] == "Migrated chats"
 
 
 def test_import_command_rejects_cursor() -> None:

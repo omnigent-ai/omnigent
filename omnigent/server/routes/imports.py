@@ -8,6 +8,7 @@ import json
 import logging
 import secrets
 import threading
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal, cast, get_args
@@ -85,7 +86,9 @@ class ImportSessionRequest(BaseModel):
 
     ``project_id`` files the imported session into a first-class project the
     caller owns, with the same ownership, default-fill, and mismatch-warning
-    semantics as ``POST /v1/sessions``.
+    semantics as ``POST /v1/sessions``. ``project_name`` is the by-name
+    alternative: the caller's project of that name, find-or-created; ignored
+    when ``project_id`` is set.
     """
 
     source: ImportSource
@@ -94,6 +97,7 @@ class ImportSessionRequest(BaseModel):
     title: str | None = Field(default=None, max_length=512)
     force: bool = False
     project_id: str | None = None
+    project_name: str | None = Field(default=None, max_length=100)
     items: list[ImportItemInput] = Field(min_length=1, max_length=_MAX_IMPORT_ITEMS)
 
     @field_validator("external_session_id")
@@ -130,6 +134,9 @@ class LocalImportRequest(BaseModel):
     source: ImportSource | Literal["all"]
     limit: int = Field(default=10, ge=1, le=100)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    # File every session in this batch into the caller's project of this name,
+    # find-or-created (same semantics as /imports project_name).
+    project_name: str | None = Field(default=None, max_length=100)
 
     @field_validator("session_id")
     @classmethod
@@ -403,6 +410,39 @@ def create_imports_router(
             raise
         return conversation.id, title
 
+    async def _resolve_project(*, project_name: str | None, user_id: str | None) -> str | None:
+        """Find, or create, a project of this name owned by the caller.
+
+        Returns the project id to file an imported session under, or ``None``
+        when there is no name to resolve, projects aren't available, or the
+        caller is unauthenticated (a project needs an owner). Names are unique
+        per owner but only via a store-side pre-check, so a concurrent create
+        can lose the race with ``ALREADY_EXISTS`` — that just means the project
+        now exists, so re-read and reuse it.
+        """
+        name = (project_name or "").strip()
+        if not name or project_store is None or user_id is None:
+            return None
+
+        def _find() -> str | None:
+            for proj in project_store.list(user_id=user_id):
+                if proj.name == name:
+                    return proj.id
+            return None
+
+        existing = await asyncio.to_thread(_find)
+        if existing is not None:
+            return existing
+        try:
+            created = await asyncio.to_thread(
+                project_store.create, uuid.uuid4().hex, name, user_id, None
+            )
+            return created.id
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.ALREADY_EXISTS:
+                raise
+            return await asyncio.to_thread(_find)
+
     @router.post(
         "/imports",
         response_model=ImportSessionResponse,
@@ -442,6 +482,11 @@ def create_imports_router(
         if existing is not None:
             await conversation_store.delete_conversation(existing.id)
 
+        # An explicit project_id wins; otherwise file under the named project
+        # (find-or-created).
+        project_id = body.project_id or await _resolve_project(
+            project_name=body.project_name, user_id=user_id
+        )
         session_id, _title = await _persist_import(
             source=body.source,
             external_session_id=body.external_session_id,
@@ -449,7 +494,7 @@ def create_imports_router(
             workspace=body.workspace,
             user_id=user_id,
             native_title=body.title,
-            project_id=body.project_id,
+            project_id=project_id,
         )
 
         response.status_code = 201
@@ -506,6 +551,9 @@ def create_imports_router(
         counts["imported"] = 0
         counts["already_imported"] = 0
         counts["failed"] = 0
+        # Resolve the batch's target project once; every imported session in the
+        # batch is filed into it.
+        project_id = await _resolve_project(project_name=body.project_name, user_id=user_id)
         # Set by the stream to the count of sessions the host couldn't read (no
         # frame arrives for them); folded into ``failed`` after the loop.
         stats: dict[str, int] = {}
@@ -557,6 +605,7 @@ def create_imports_router(
                     workspace=workspace if isinstance(workspace, str) else None,
                     user_id=user_id,
                     native_title=native_title if isinstance(native_title, str) else None,
+                    project_id=project_id,
                     host_id=body.host_id,
                 )
             except (OmnigentError, ValueError):

@@ -6255,12 +6255,21 @@ class _SessionImportResult:
     is_flag=True,
     help="Replace a previously imported chat from the same harness session.",
 )
+@click.option(
+    "--project",
+    "project_name",
+    default=None,
+    metavar="NAME",
+    help="File the imported chat(s) into a project of this name, creating it if "
+    "one you own does not already exist.",
+)
 def import_session_command(
     harness: str,
     source_session_id: str | None,
     recent_session_count: int | None,
     server: str | None,
     force: bool,
+    project_name: str | None,
 ) -> None:
     """Import chats from supported local coding harnesses.
 
@@ -6279,6 +6288,7 @@ def import_session_command(
       omnigent import --harness qwen --session <session-id>
       omnigent import --harness claude --last 10
       omnigent import --harness claude --session <session-id> --force
+      omnigent import --harness claude --last 10 --project "Migrated chats"
     """
     import httpx
 
@@ -6351,6 +6361,7 @@ def import_session_command(
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
             "title": imported.native_title,
+            "project_name": project_name,
             "force": force,
             "items": [
                 {
