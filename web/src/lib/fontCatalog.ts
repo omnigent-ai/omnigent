@@ -90,59 +90,38 @@ function nerdFace(path: string): readonly FontFaceAsset[] {
   return [{ url: `${NERD_FONTS_BASE}/${path}`, weight: "400", format: "truetype" }];
 }
 
+/**
+ * A Google Fonts CSS2 catalog entry: label mirrors the family, `id` is the
+ * stable slug, and the stylesheet href is built from the family + weights. Keeps
+ * the ~13 Google entries from repeating the family name four times each.
+ */
+function googleFont(
+  category: FontCategory,
+  id: string,
+  family: string,
+  weights: readonly number[],
+): FontCatalogEntry {
+  return {
+    id,
+    label: family,
+    family,
+    category,
+    source: "google-css2",
+    cssUrl: googleCss2Url(family, weights),
+  };
+}
+
 // ---- Sans (UI/chrome) -----------------------------------------------------
 
 const SANS_FONTS: readonly FontCatalogEntry[] = [
   // System default: no face to load — the empty family maps to --font-sans.
   { id: "system-ui", label: "System default", family: "", category: "sans", source: "bundled" },
-  {
-    id: "inter",
-    label: "Inter",
-    family: "Inter",
-    category: "sans",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Inter", [400, 500, 600, 700]),
-  },
-  {
-    id: "roboto",
-    label: "Roboto",
-    family: "Roboto",
-    category: "sans",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Roboto", [400, 500, 700]),
-  },
-  {
-    id: "open-sans",
-    label: "Open Sans",
-    family: "Open Sans",
-    category: "sans",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Open Sans", [400, 600, 700]),
-  },
-  {
-    id: "lato",
-    label: "Lato",
-    family: "Lato",
-    category: "sans",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Lato", [400, 700]),
-  },
-  {
-    id: "source-sans-3",
-    label: "Source Sans 3",
-    family: "Source Sans 3",
-    category: "sans",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Source Sans 3", [400, 600, 700]),
-  },
-  {
-    id: "geist",
-    label: "Geist",
-    family: "Geist",
-    category: "sans",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Geist", [400, 500, 600, 700]),
-  },
+  googleFont("sans", "inter", "Inter", [400, 500, 600, 700]),
+  googleFont("sans", "roboto", "Roboto", [400, 500, 700]),
+  googleFont("sans", "open-sans", "Open Sans", [400, 600, 700]),
+  googleFont("sans", "lato", "Lato", [400, 700]),
+  googleFont("sans", "source-sans-3", "Source Sans 3", [400, 600, 700]),
+  googleFont("sans", "geist", "Geist", [400, 500, 600, 700]),
 ];
 
 // ---- Fixed width (general monospace UI) -----------------------------------
@@ -157,67 +136,20 @@ const FIXED_WIDTH_FONTS: readonly FontCatalogEntry[] = [
     category: "fixedWidth",
     source: "bundled",
   },
-  {
-    id: "ibm-plex-mono",
-    label: "IBM Plex Mono",
-    family: "IBM Plex Mono",
-    category: "fixedWidth",
-    source: "google-css2",
-    cssUrl: googleCss2Url("IBM Plex Mono", [400, 500, 600, 700]),
-  },
-  {
-    id: "roboto-mono",
-    label: "Roboto Mono",
-    family: "Roboto Mono",
-    category: "fixedWidth",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Roboto Mono", [400, 500, 700]),
-  },
-  {
-    id: "space-mono",
-    label: "Space Mono",
-    family: "Space Mono",
-    category: "fixedWidth",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Space Mono", [400, 700]),
-  },
+  googleFont("fixedWidth", "ibm-plex-mono", "IBM Plex Mono", [400, 500, 600, 700]),
+  googleFont("fixedWidth", "roboto-mono", "Roboto Mono", [400, 500, 700]),
+  googleFont("fixedWidth", "space-mono", "Space Mono", [400, 700]),
 ];
 
 // ---- Code (editor + terminal) ---------------------------------------------
 
 const CODE_FONTS: readonly FontCatalogEntry[] = [
-  {
-    id: "jetbrains-mono",
-    label: "JetBrains Mono",
-    family: "JetBrains Mono",
-    category: "code",
-    source: "google-css2",
-    cssUrl: googleCss2Url("JetBrains Mono", [400, 500, 700]),
-  },
-  {
-    id: "fira-code",
-    label: "Fira Code",
-    family: "Fira Code",
-    category: "code",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Fira Code", [400, 500, 700]),
-  },
-  {
-    id: "source-code-pro",
-    label: "Source Code Pro",
-    family: "Source Code Pro",
-    category: "code",
-    source: "google-css2",
-    cssUrl: googleCss2Url("Source Code Pro", [400, 500, 700]),
-  },
-  {
-    id: "ibm-plex-mono-code",
-    label: "IBM Plex Mono",
-    family: "IBM Plex Mono",
-    category: "code",
-    source: "google-css2",
-    cssUrl: googleCss2Url("IBM Plex Mono", [400, 500, 600, 700]),
-  },
+  googleFont("code", "jetbrains-mono", "JetBrains Mono", [400, 500, 700]),
+  googleFont("code", "fira-code", "Fira Code", [400, 500, 700]),
+  googleFont("code", "source-code-pro", "Source Code Pro", [400, 500, 700]),
+  // Shares the fixedWidth IBM Plex Mono stylesheet URL (same family + weights),
+  // so the loader dedupes them by resource identity — distinct id, one fetch.
+  googleFont("code", "ibm-plex-mono-code", "IBM Plex Mono", [400, 500, 600, 700]),
   // Cascadia Code isn't a Google Fonts family we bundle; deliver its @font-face
   // from the Fontsource CDN (latin subset, regular + bold).
   {

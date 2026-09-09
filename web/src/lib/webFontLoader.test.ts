@@ -34,8 +34,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // resetFontLoaderForTests removes the nodes it injected, so no hand-cleanup.
   resetFontLoaderForTests();
-  for (const node of document.querySelectorAll("[data-omnigent-font]")) node.remove();
   vi.restoreAllMocks();
 });
 
@@ -291,6 +291,26 @@ describe("webFontLoader — no-ops", () => {
   it("does not fetch the empty system-default family", async () => {
     await expect(loadFont(getFontById("system-ui") as FontCatalogEntry)).resolves.toBe(true);
     expect(fontsLoadCalls.length).toBe(0);
+  });
+});
+
+describe("webFontLoader — resetFontLoaderForTests cleans up the DOM", () => {
+  it("removes injected <link> and <style> nodes it owns", async () => {
+    const pLink = loadFont(inter()); // injects a <link>
+    const pStyle = loadFont(nerd()); // injects a <style>
+    await flush();
+    // Let the stylesheet parse + both readiness probes resolve so the loads
+    // settle before we reset (rather than leaving promises dangling).
+    fireLinkLoads();
+    await flush();
+    fontsLoadCalls.forEach((c) => c.deferred.resolve([{}]));
+    await Promise.all([pLink, pStyle]);
+    expect(links().length).toBe(1);
+    expect(styles().length).toBe(1);
+
+    resetFontLoaderForTests();
+    // The nodes the loader tracked are gone without any hand-removal.
+    expect(document.querySelectorAll("[data-omnigent-font]").length).toBe(0);
   });
 });
 
