@@ -417,8 +417,12 @@ def register_events_routes(
         Route entry for :func:`_post_event_impl`.
 
         A single object preserves the existing API. A top-level JSON array is
-        processed in order and returns one acknowledgement per event. Messages
-        count as in flight for the whole request, including runner launch.
+        processed in order and returns one acknowledgement per event when all
+        entries succeed. Batch execution is not atomic: if an entry fails,
+        earlier entries remain applied, later entries are not attempted, and
+        the error response does not include acknowledgements from earlier
+        entries. Messages count as in flight for the whole request, including
+        runner launch.
         """
         with contextlib.ExitStack() as in_flight:
             if isinstance(body, list):
