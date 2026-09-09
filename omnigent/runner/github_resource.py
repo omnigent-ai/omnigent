@@ -39,8 +39,11 @@ Design notes:
   that differs from the local checkout and leaves no upstream tracking, ``gh``'s
   branch-name lookup misses. The pushed commit is the invariant that still links
   the checkout to its PR, so the fallback asks GitHub which PR a pushed commit
-  belongs to (``repos/{owner}/{repo}/commits/{sha}/pulls``), checking the configured
-  base and checkout remotes because a fork may not list upstream PRs — see
+  belongs to (``repos/{owner}/{repo}/commits/{sha}/pulls``). Which repo in the
+  fork network lists the PR varies (live github.com lists an open cross-fork PR
+  on the head fork's endpoint, not its base repo's — and the branch may have been
+  pushed to a remote that isn't tracking/origin), so every candidate is queried:
+  the configured base plus each checkout remote — see
   :func:`_resolve_pr_via_commit`.
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
@@ -450,9 +453,13 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     (``repos/{owner}/{repo}/commits/{sha}/pulls``), so it finds the PR even when a
     stacking tool (git-stack, ``git pp``) pushed under a remote branch name that
     differs from the checkout, or a fork PR whose head ``gh`` can't name. The
-    PR may only be listed in its base repository, not the fork holding the pushed
-    branch, so check the configured base and other checkout remotes too. Return
-    the response's base repo so subsequent reads target the PR's actual home.
+    repo whose endpoint lists a PR varies across the fork network (live
+    github.com lists an open cross-fork PR on the head fork's endpoint only,
+    while a merged one appears on the base's too — and the branch may have been
+    pushed to a remote that isn't tracking/origin), so every candidate repo is
+    queried: the configured base plus each checkout remote. The response names
+    the PR's own base repo — returned so the caller fetches the PR from the
+    right place regardless of the local ``gh repo set-default``.
 
     Only **open** PRs are accepted. For a commit already on the default branch
     (master/main, or any merged tip) the endpoint returns the *merged* PR that
