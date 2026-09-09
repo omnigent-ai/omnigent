@@ -1491,7 +1491,13 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
   const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
+  const [replyConversationId, setReplyConversationId] = useState(conversationId);
   const nextReplyQuoteId = useRef(0);
+
+  if (replyConversationId !== conversationId) {
+    setReplyConversationId(conversationId);
+    setReplyQuotes([]);
+  }
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
