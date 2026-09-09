@@ -773,9 +773,7 @@ def test_databricks_listing_skips_explicitly_non_ready_endpoints(
         # declares no config harness must filter like its canonical
         # sibling — an unrecognized spelling silently disables the
         # filter and lists wrong-family models.
-        pytest.param(
-            "claude_sdk", {"system.ai.claude-sonnet-4-6"}, id="claude-sdk-executor-type"
-        ),
+        pytest.param("claude_sdk", {"system.ai.claude-sonnet-4-6"}, id="claude-sdk-executor-type"),
         pytest.param("claude-sdk", {"system.ai.claude-sonnet-4-6"}, id="claude-sdk-spelling"),
         pytest.param(
             "codex",
@@ -1285,11 +1283,7 @@ def test_listing_failure_reported_and_not_cached(
             return httpx.Response(503, json={"error": "temporarily unavailable"})
         return httpx.Response(
             200,
-            json={
-                "model_services": [
-                    _uc_service("system.ai.gpt-5-4", ["openai/v1/responses"])
-                ]
-            },
+            json={"model_services": [_uc_service("system.ai.gpt-5-4", ["openai/v1/responses"])]},
         )
 
     # Use codex-native to test generic UC-listing failure/retry behavior.

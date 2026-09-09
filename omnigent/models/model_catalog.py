@@ -659,9 +659,7 @@ def _databricks_prefix_provider(spec: AgentSpec) -> ResolvedModelProvider | None
         legacy Databricks or Unity Catalog model prefix.
     """
     model = spec.executor.model
-    if isinstance(model, str) and model.startswith(
-        ("databricks-", "databricks/", "system.ai.")
-    ):
+    if isinstance(model, str) and model.startswith(("databricks-", "databricks/", "system.ai.")):
         return ResolvedModelProvider(
             kind=DATABRICKS_KIND,
             profile=os.environ.get("DATABRICKS_CONFIG_PROFILE"),
