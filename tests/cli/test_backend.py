@@ -1969,7 +1969,7 @@ def test_host_stop_undiscoverable_local_server_degrades_to_daemon_only(
 def test_host_http_json_marks_connection_refused_unreachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A connect failure is classified unreachable; the result carries it.
+    """A loopback connect failure is classified unreachable.
 
     Binds and releases a loopback port so nothing is listening, then
     requests it: the ``ConnectError`` must surface as ``status_code=0``
@@ -1993,6 +1993,89 @@ def test_host_http_json_marks_connection_refused_unreachable(
     assert result.status_code == 0
     assert result.unreachable is True
     assert "ConnectError" in str(result.body)
+
+
+def test_host_http_json_remote_connect_failure_is_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect failure against a remote host keeps ``unreachable=False``.
+
+    DNS hiccups, network blips, or TLS faults can be transient against a
+    live remote server, so the auto-degrade must stay restricted to
+    loopback targets; remote failures keep the loud ``--force`` guidance.
+    """
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+
+    class _RefusingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def __enter__(self) -> _RefusingClient:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def request(self, *args: Any, **kwargs: Any) -> None:
+            raise httpx.ConnectError("[Errno -2] Name or service not known")
+
+    monkeypatch.setattr(httpx, "Client", _RefusingClient)
+
+    result = cli._host_http_json(
+        base_url="https://server.example.com",
+        method="GET",
+        path="/v1/sessions",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert result.unreachable is False
+    assert "ConnectError" in str(result.body)
+
+
+def test_fetch_session_pages_mid_pagination_failure_is_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-pagination connect failure is never classified unreachable.
+
+    A server that already served page one is provably alive, so a failure
+    on a later page must surface as a plain error (keeping the ``--force``
+    guidance) rather than triggering the daemon-only degrade and silently
+    skipping the already-listed live sessions.
+    """
+    calls: list[str | None] = []
+
+    def _fake_host_http_json(**kwargs: Any) -> cli._HostHttpResult:
+        after = kwargs["params"].get("after")
+        calls.append(after)
+        if after is None:
+            return cli._HostHttpResult(
+                status_code=200,
+                body={
+                    "data": [{"id": "conv_abc123", "status": "running"}],
+                    "last_id": "conv_abc123",
+                    "has_more": True,
+                },
+            )
+        return cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        )
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake_host_http_json)
+
+    result = cli._fetch_session_pages(
+        base_url="http://127.0.0.1:6767",
+        connected_only=False,
+    )
+
+    assert calls == [None, "conv_abc123"]
+    assert result.error is not None
+    assert result.unreachable is False
 
 
 def test_host_stop_session_stops_only_named_sessions(
