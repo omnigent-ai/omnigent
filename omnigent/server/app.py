@@ -2725,7 +2725,6 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
-
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.
     if project_store is not None:
@@ -3234,6 +3233,36 @@ def create_app(
                 type(auth_provider).__name__,
             )
 
+        # Client-credentials grant (RFC 6749 §4.4): a machine client mints a
+        # delegated, path-scoped token with no browser in the loop. It is a
+        # grant_type BRANCH of the one /oauth/token mounted below, never a
+        # second router on that path — FastAPI resolves first-match-wins, so a
+        # duplicate route would be shadowed with no warning. Opt-in and
+        # default-off: the factory returns None unless a machine client is
+        # configured and its principal passes the admin vetting.
+        # See designs/CLIENT_CREDENTIALS.md.
+        handle_client_credentials = None
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+            "oidc",
+            "accounts",
+        ):
+            from omnigent.server.routes.client_credentials import (
+                create_client_credentials_handler,
+            )
+
+            handle_client_credentials = create_client_credentials_handler(
+                auth_provider, permission_store
+            )
+            if handle_client_credentials is not None and device_grant_store is None:
+                # Both /oauth/token mounts below require the grant store, so
+                # without one there is no endpoint to carry this branch.
+                handle_client_credentials = None
+                _logger.warning(
+                    "client-credentials: a machine client is configured, but this "
+                    "deploy has no permission store, so /oauth/token is not mounted "
+                    "and the grant cannot answer. Configure a permission store."
+                )
+
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
         # OMNIGENT_DEVICE_GRANT_ENABLED. Supported in accounts and oidc
         # modes (both own a server-minted session cookie). Header mode has
@@ -3257,7 +3286,11 @@ def create_app(
             from omnigent.server.routes.device_auth import create_device_auth_router
 
             app.include_router(
-                create_device_auth_router(auth_provider, device_grant_store),
+                create_device_auth_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=handle_client_credentials,
+                ),
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
@@ -3292,7 +3325,11 @@ def create_app(
             from omnigent.server.routes.device_auth import create_oauth_token_router
 
             app.include_router(
-                create_oauth_token_router(auth_provider, device_grant_store),
+                create_oauth_token_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=handle_client_credentials,
+                ),
                 tags=["oauth"],
             )
             _logger.info("login-grant: /oauth/token + /oauth/revoke enabled")

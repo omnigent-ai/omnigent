@@ -111,6 +111,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_session_titles_enabled,
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
@@ -2218,6 +2219,7 @@ async def _persist_external_conversation_item(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    enabled: bool = True,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -2321,6 +2323,7 @@ async def _persist_external_conversation_item(
         coordinator=background_title_coordinator,
         conversation=conv,
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+        enabled=enabled and (drained is None or drained.background_titles_enabled),
     )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
     persisted = persisted_items[-1]
@@ -5704,6 +5707,7 @@ async def _dispatch_session_event_to_runner_impl(
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
+    background_titles_enabled: bool = True,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -5826,7 +5830,11 @@ async def _dispatch_session_event_to_runner_impl(
         )
         pending_id: str | None = (
             pending_inputs.record(
-                session_id, content, created_by=created_by, stable_id=web_stable_id
+                session_id,
+                content,
+                created_by=created_by,
+                stable_id=web_stable_id,
+                background_titles_enabled=background_titles_enabled,
             )
             if isinstance(content, list) and content
             else None
@@ -8950,6 +8958,7 @@ async def _create_session_from_existing_agent(
                     coordinator=background_title_coordinator,
                     conversation=conv,
                     event=item,
+                    enabled=background_session_titles_enabled(request.headers),
                 )
                 await _dispatch_session_event_to_runner(
                     conv.id,
@@ -8963,6 +8972,7 @@ async def _create_session_from_existing_agent(
                     created_by=_attribution_user(user_id),
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
+                    background_titles_enabled=background_session_titles_enabled(request.headers),
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule()

@@ -226,6 +226,10 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
+import {
+  readBackgroundSessionTitlesEnabled,
+  writeBackgroundSessionTitlesEnabled,
+} from "@/lib/backgroundSessionTitlesPreferences";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -1273,6 +1277,40 @@ function ComposerSendShortcutControl() {
   );
 }
 
+function BackgroundSessionTitlesControl() {
+  const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeBackgroundSessionTitlesEnabled(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Automatically name new sessions
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Generate a concise title in the background after the first message. Turn this off to keep
+          the default session name.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="background-session-titles-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.background_session_titles"
+      />
+    </div>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   return (
@@ -1284,6 +1322,10 @@ function GeneralSection() {
           <div className="mt-4 border-t border-border pt-4">
             <AlwaysSteerControl />
           </div>
+        </div>
+        <h2 className="mt-3 text-ui font-medium">Sessions</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <BackgroundSessionTitlesControl />
         </div>
       </div>
     </Section>

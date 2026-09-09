@@ -9,6 +9,7 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 
 const mocks = vi.hoisted(() => ({
@@ -275,6 +276,25 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  beforeEach(() => {
+    localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
+  });
+
+  it("renders session auto-rename enabled by default", async () => {
+    renderPage("/settings/general");
+
+    expect(await screen.findByTestId("background-session-titles-toggle")).toBeChecked();
+  });
+
+  it("persists session auto-rename changes", async () => {
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("background-session-titles-toggle");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+  });
   it("renders composer shortcut guidance as two accessible lines", () => {
     renderPage("/settings/general");
     const toggle = screen.getByTestId("composer-submit-with-mod-enter-toggle");
