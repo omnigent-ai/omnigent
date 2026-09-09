@@ -160,18 +160,11 @@ describe("ViewModeToggle", () => {
     expect(screen.getByTestId("view-mode-toggle")).toHaveClass("max-md:p-0");
   });
 
-  it("insets the mobile track paint without shrinking its hitboxes", () => {
+  it("rounds the track into a capsule on mobile", () => {
+    // With max-md:p-0 the grey track sits flush to the fully-round 44px
+    // segments inside the round glass pill; keeping the 8px desktop radius
+    // there paints a squared grey box sandwiched between two capsules.
     renderToggle(makeCtx());
-    expect(screen.getByTestId("view-mode-toggle")).toHaveClass(
-      "relative",
-      "isolate",
-      "max-md:bg-transparent",
-      "max-md:before:absolute",
-      "max-md:before:inset-x-1",
-      "max-md:before:inset-y-0",
-      "max-md:before:-z-10",
-      "max-md:before:rounded-[var(--radius-lg)]",
-      "max-md:before:bg-muted/60",
-    );
+    expect(screen.getByTestId("view-mode-toggle")).toHaveClass("max-md:rounded-full");
   });
 });
