@@ -38,6 +38,8 @@ from playwright.sync_api import Page, Route, ViewportSize, expect
 # iPhone-sized viewport (matches the report's surface and keeps the SPA in the
 # max-md mobile header layout, where the glass pill and 44px segments render).
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
+_MIN_GLASS_RIM_PX = 4
+_RIM_SYMMETRY_TOLERANCE_PX = 1.5
 
 # Minimal stand-in for the iOS WKWebView bridge (``window.omnigentNative``
 # injected by ``web/ios``), copied from test_ios_switcher_in_header.py. Runs
@@ -134,6 +136,22 @@ _MEASURE_LAYERS_JS = """
       describe("switcher track (view-mode-toggle)", track),
       describe("active segment", active),
     ],
+  };
+}
+"""
+
+_MEASURE_EDGE_RIMS_JS = """
+() => {
+  const track = document.querySelector('[data-testid="view-mode-toggle"]');
+  const menu = document.querySelector('[data-testid="header-conversation-actions"]');
+  const pill = track?.parentElement;
+  if (!track || !menu || !pill) return { error: "switcher pill controls not found" };
+  const pillRect = pill.getBoundingClientRect();
+  const trackRect = track.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  return {
+    leading: trackRect.left - pillRect.left,
+    trailing: pillRect.right - menuRect.right,
   };
 }
 """
@@ -269,4 +287,21 @@ def test_mobile_header_switcher_layers_share_the_pill_shape(
         )
         + ". Every painted layer of the switcher must render as a capsule, "
         "matching the pill around it and the selected bubble inside it."
+    )
+
+    # The expanded kebab paints its full 44px background, so it needs the same
+    # visible glass rim as the switcher track at the opposite end.
+    menu = page.get_by_test_id("header-conversation-actions")
+    expect(menu).to_be_visible()
+    menu.click()
+    expect(menu).to_have_attribute("aria-expanded", "true")
+    page.wait_for_timeout(300)
+
+    rims = page.evaluate(_MEASURE_EDGE_RIMS_JS)
+    assert "error" not in rims, f"could not measure switcher pill rims: {rims}"
+    print(f"[pill-rims] leading={rims['leading']:.1f}px, trailing={rims['trailing']:.1f}px")
+    assert rims["leading"] >= _MIN_GLASS_RIM_PX, f"switcher track lacks a glass rim: {rims}"
+    assert rims["trailing"] >= _MIN_GLASS_RIM_PX, f"expanded kebab lacks a glass rim: {rims}"
+    assert abs(rims["leading"] - rims["trailing"]) <= _RIM_SYMMETRY_TOLERANCE_PX, (
+        f"switcher pill edge rims are asymmetric: {rims}"
     )
