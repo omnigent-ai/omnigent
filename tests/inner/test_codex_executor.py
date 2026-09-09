@@ -1024,6 +1024,34 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_signature_change_cannot_replace_incompletely_cleaned_session(self):
+        async def _t():
+            existing = AsyncMock()
+            existing._closing = True
+            existing.cleaned = False
+            factory = AsyncMock()
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                app_session_factory=factory,
+            )
+            state = _CodexSessionState(
+                app_session=existing,
+                signature=(None, "old", "old", "old"),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "cleanup is incomplete"):
+                await executor._ensure_app_session(
+                    state,
+                    signature=(None, "new", "new", "new"),
+                    effective_cwd="/tmp",
+                )
+
+            existing.close.assert_awaited_once_with()
+            factory.assert_not_called()
+            self.assertIs(state.app_session, existing)
+
+        _run(_t())
+
     def test_close_session_closes_app_session(self):
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
@@ -1041,6 +1069,28 @@ class TestCodexExecutor(unittest.TestCase):
             ]
             await executor.close_session("s1")
             self.assertTrue(fake_session.closed)
+
+        _run(_t())
+
+    def test_close_session_removes_cleaned_state_when_cancellation_is_reraised(self):
+        async def _t():
+            class _CancelledCleanSession:
+                cleaned = True
+
+                async def close(self) -> None:
+                    raise asyncio.CancelledError
+
+            executor = CodexExecutor(codex_path="/bin/echo")
+            app_session = _CancelledCleanSession()
+            executor._session_states["s1"] = _CodexSessionState(
+                app_session=app_session,  # type: ignore[arg-type]
+                signature=(None, "", "", ""),
+            )
+
+            with self.assertRaises(asyncio.CancelledError):
+                await executor.close_session("s1")
+
+            self.assertEqual(executor._session_states, {})
 
         _run(_t())
 
@@ -3678,8 +3728,10 @@ async def test_codex_cli_version_times_out_and_kills_proc(
         b"codex-cli 0.140.0-alpha.19\n",
         b"codex-cli 0.140.0\n",
         b"codex-cli 0.141.0\n",
+        b"codex-cli 0.146.1-alpha.1\n",
         b"codex-cli 0.146.1\n",
         b"codex-cli 1.0.0\n",
+        b"dependency 0.146.0 codex-cli 0.146.0\n",
     ],
 )
 async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_launch(

@@ -68,6 +68,24 @@ export const ClassifiedError: Story = {
   ),
 };
 
+export const ProviderAuthRequired: Story = {
+  render: () => (
+    <ErrorBanner
+      message="Your Databricks model credential is unavailable or expired."
+      source="execution"
+      code="PROVIDER_AUTH_REQUIRED"
+      title="Sign in to continue"
+      cause="Omnigent could not obtain a model credential for this session."
+      remediation="ucode configure"
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Sign in to continue" }),
+    );
+  },
+};
+
 export const TerminalErrorExpanded: Story = {
   render: () => (
     <ErrorBanner message={terminalError} source="execution" code="required_terminal_exited" />

@@ -12,8 +12,10 @@ import contextlib
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import psutil
 import pytest
@@ -205,6 +207,51 @@ def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> 
     assert sent == []
 
 
+def test_identity_census_skips_reused_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    reused = Mock()
+    reused.create_time.return_value = 200.0
+    monkeypatch.setattr(_proc.psutil, "Process", lambda pid: reused)
+
+    _proc._signal_identities({43210: 100.0}, force=True)
+
+    reused.kill.assert_not_called()
+
+
+def test_kill_tree_does_not_adopt_reused_reaped_leader_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ReapedProcess:
+        pid = 43210
+        returncode = 0
+
+        def kill(self) -> None:
+            raise AssertionError("must not kill a reused PID")
+
+    process = _ReapedProcess()
+    reused = Mock(pid=process.pid)
+    reused.create_time.return_value = 200.0
+    reused.children.return_value = []
+    sent: list[tuple[int, int]] = []
+    _proc._owned_process_groups[process] = process.pid
+    _proc._owned_process_identities[process] = {process.pid: 100.0}
+    monkeypatch.setattr(_proc.psutil, "Process", lambda pid: reused)
+    monkeypatch.setattr(
+        _proc,
+        "_getpgid_fn",
+        lambda pid: 99999 if pid == 0 else process.pid,
+    )
+    monkeypatch.setattr(
+        _proc,
+        "_killpg_fn",
+        lambda pgid, sig: sent.append((pgid, sig)),
+    )
+
+    _proc.kill_tree(process)
+
+    assert sent == []
+    reused.kill.assert_not_called()
+
+
 def test_terminate_tree_stops_the_process() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
     # Bind to the live PID so psutil pins its creation time; a recycled PID
@@ -216,6 +263,49 @@ def test_terminate_tree_stops_the_process() -> None:
     # A reaped PID raises NoSuchProcess, which also means it isn't running.
     with contextlib.suppress(psutil.NoSuchProcess):
         assert not handle.is_running() or handle.status() == psutil.STATUS_ZOMBIE
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid is POSIX-only")
+def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "setsid-child.pid"
+    script = (
+        "import os, pathlib, time\n"
+        "path = pathlib.Path(os.environ['CHILD_PID_PATH'])\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    path.write_text(str(os.getpid()))\n"
+        "    while True: time.sleep(1)\n"
+        "while True: time.sleep(1)\n"
+    )
+    env = {**os.environ, "CHILD_PID_PATH": str(child_pid_path)}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        env=env,
+        **_proc.spawn_kwargs(),
+    )
+    _proc.remember_process_group(proc)
+    child_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while not child_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert child_pid_path.exists()
+        child_pid = int(child_pid_path.read_text())
+
+        _proc.kill_tree(proc)
+        proc.wait(timeout=5)
+
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(child_pid)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if child_pid is not None and _proc.process_alive(child_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(child_pid).kill()
 
 
 # --------------------------------------------------------------------------

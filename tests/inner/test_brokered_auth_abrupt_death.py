@@ -24,6 +24,7 @@ def test_sigkill_runner_reaps_signer_worker_helpers_and_socket(tmp_path: Path) -
         "import os, signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "if os.fork() == 0:\n"
+        "    os.setsid()\n"
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "    while True: time.sleep(1)\n"
         "while True: time.sleep(1)\n",

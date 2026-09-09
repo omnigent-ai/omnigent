@@ -8,10 +8,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .datamodel import OSEnvSpec
-from .egress.controller import apply_egress_env
+from .egress.controller import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .model_signer import SignerReadiness
 from .sandbox import (
+    cleanup_private_tmpdir,
     create_exec_launcher,
+    create_private_tmpdir,
     get_backend,
     resolve_sandbox,
     with_additional_read_roots,
@@ -38,14 +40,23 @@ class CodexWorkerLaunch:
     launch_path: str
     sandboxed: bool
     _owned_launcher: Path | None = None
+    _egress_handle: EgressProxyHandle | None = None
+    _egress_tmpdir: Path | None = None
 
     def close(self) -> None:
-        """Delete the generated launcher, if any."""
+        """Release the generated launcher and generic egress relay."""
         launcher = self._owned_launcher
         self._owned_launcher = None
         if launcher is not None:
             with contextlib.suppress(OSError):
                 launcher.unlink()
+        handle = self._egress_handle
+        self._egress_handle = None
+        if handle is not None:
+            handle.stop()
+        tmpdir = self._egress_tmpdir
+        self._egress_tmpdir = None
+        cleanup_private_tmpdir(tmpdir)
 
 
 def prepare_codex_worker(
@@ -71,6 +82,14 @@ def prepare_codex_worker(
         return CodexWorkerLaunch(launch_path=codex_path, sandboxed=False)
     if signer_readiness is not None and worker_env is None:
         raise ValueError("signer-backed Codex worker requires an owned worker environment")
+    sandbox_spec = os_env.sandbox
+    egress_rules = (
+        list(sandbox_spec.egress_rules or [])
+        if signer_readiness is None and sandbox_spec is not None
+        else []
+    )
+    if egress_rules and worker_env is None:
+        raise ValueError("egress-filtered Codex worker requires an owned worker environment")
 
     codex_dir = Path(codex_path).resolve(strict=False).parent
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
@@ -93,19 +112,13 @@ def prepare_codex_worker(
             auth_token=None,
         )
         staged_env["OPENAI_API_KEY"] = signer_readiness.placeholder
-    policy = with_spawn_env_allowlist(
-        policy,
-        list(staged_env) if staged_env is not None else spawn_env_names,
-    )
-    # Model traffic is enabled later only through the signer relay.
-    policy = replace(
-        policy,
-        allow_network=False,
-        egress_relay_port=(signer_readiness.relay_port if signer_readiness is not None else None),
-        egress_socket_path=(
-            str(signer_readiness.socket_path) if signer_readiness is not None else None
-        ),
-    )
+        # Model traffic is enabled only through the trusted signer relay.
+        policy = replace(
+            policy,
+            allow_network=False,
+            egress_relay_port=signer_readiness.relay_port,
+            egress_socket_path=str(signer_readiness.socket_path),
+        )
 
     backend = get_backend(policy.backend_type)
     probe_argv = [codex_path, "app-server"]
@@ -120,12 +133,61 @@ def prepare_codex_worker(
             f"Sandbox backend {policy.backend_type!r} cannot contain the Codex worker at spawn"
         )
 
-    launcher = Path(create_exec_launcher(codex_path, policy))
-    if staged_env is not None and worker_env is not None:
-        worker_env.clear()
-        worker_env.update(staged_env)
-    return CodexWorkerLaunch(
-        launch_path=str(launcher),
-        sandboxed=True,
-        _owned_launcher=launcher,
-    )
+    egress_handle: EgressProxyHandle | None = None
+    egress_tmpdir: Path | None = None
+    launcher: Path | None = None
+    try:
+        if egress_rules:
+            assert staged_env is not None
+            assert sandbox_spec is not None
+            for key in ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+                staged_env.pop(key, None)
+            egress_tmpdir = create_private_tmpdir()
+            policy = with_additional_write_roots(policy, [egress_tmpdir])
+            egress_handle = start_egress_proxy(
+                rules=egress_rules,
+                tmpdir=egress_tmpdir,
+                allow_private_destinations=sandbox_spec.egress_allow_private_destinations,
+                # Codex has no helper config channel that keeps this value out
+                # of its environment. Match the terminal path: relay access is
+                # tokenless, while destination/method/path policy remains strict.
+                require_auth=False,
+            )
+            apply_egress_env(
+                staged_env,
+                relay_port=egress_handle.relay_port,
+                ca_bundle_path=egress_handle.ca_bundle_path,
+                auth_token=None,
+            )
+            policy = replace(
+                policy,
+                allow_network=False,
+                egress_relay_port=egress_handle.relay_port,
+                egress_socket_path=str(egress_handle.socket_path),
+            )
+
+        # Compute this after proxy variables are staged so the sandbox does
+        # not prune HTTP_PROXY or the CA bundle variables at exec time.
+        policy = with_spawn_env_allowlist(
+            policy,
+            list(staged_env) if staged_env is not None else spawn_env_names,
+        )
+        launcher = Path(create_exec_launcher(codex_path, policy))
+        if staged_env is not None and worker_env is not None:
+            worker_env.clear()
+            worker_env.update(staged_env)
+        return CodexWorkerLaunch(
+            launch_path=str(launcher),
+            sandboxed=True,
+            _owned_launcher=launcher,
+            _egress_handle=egress_handle,
+            _egress_tmpdir=egress_tmpdir,
+        )
+    except BaseException:
+        if launcher is not None:
+            with contextlib.suppress(OSError):
+                launcher.unlink()
+        if egress_handle is not None:
+            egress_handle.stop()
+        cleanup_private_tmpdir(egress_tmpdir)
+        raise

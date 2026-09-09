@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import _proc
+from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .egress.rules import is_dns_safe_host
 
 PROVIDER_AUTH_REQUIRED = "PROVIDER_AUTH_REQUIRED"
@@ -233,21 +234,35 @@ async def mint_ucode_token(*, host: str, profile: str) -> str:
         return _parse_token(stdout, proc.returncode)
     except asyncio.CancelledError:
         if proc is not None:
+            # Deliver TERM synchronously before the first cancellation point.
             _proc.terminate_tree(proc)
+            cleanup_task = asyncio.create_task(
+                terminate_subprocess(
+                    proc,
+                    terminate_timeout=2,
+                    kill_timeout=1,
+                    label="ucode credential helper",
+                )
+            )
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            _proc.kill_tree(proc)
-            with contextlib.suppress(Exception):
-                await proc.wait()
+                cleanup_task.result()
+            close_subprocess_transport(proc)
         raise
     except (OSError, ValueError, asyncio.TimeoutError):
         if proc is not None:
-            _proc.terminate_tree(proc)
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            _proc.kill_tree(proc)
-            with contextlib.suppress(Exception):
-                await proc.wait()
+                await terminate_subprocess(
+                    proc,
+                    terminate_timeout=2,
+                    kill_timeout=1,
+                    label="ucode credential helper",
+                )
+            close_subprocess_transport(proc)
         raise ProviderAuthRequired.for_authority(host, profile) from None
     finally:
         for fd in (liveness_read_fd, liveness_write_fd):
