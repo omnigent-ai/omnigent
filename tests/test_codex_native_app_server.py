@@ -2582,6 +2582,51 @@ async def test_codex_native_launch_config_reads_reasoning_effort(
     assert config.reasoning_effort == expected
 
 
+@pytest.mark.parametrize(
+    ("model", "expected_effort"),
+    [("gpt-5.6-sol", "ultra"), (None, "ultra"), ("glm-5-2", "medium")],
+    ids=["sol", "no-model", "clamped"],
+)
+async def test_apply_codex_thread_effort_updates_the_loaded_thread(
+    monkeypatch: pytest.MonkeyPatch, model: str | None, expected_effort: str
+) -> None:
+    """
+    The persisted effort reaches a resumed thread via ``thread/settings/update``.
+
+    A resumed thread runs the rollout's recorded effort — none after a runner
+    restart rebuilt the rollout, the source's on a forked clone — so the launch
+    re-applies the session's effort (clamped to the model's ladder) once the
+    thread has started, instead of leaving the TUI at ``default`` until a web
+    turn happens to send one.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    class _FakeClient:
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            assert ws_url == "ws://127.0.0.1:9876"
+            assert client_name == "omnigent-codex-native-effort"
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            requests.append((method, params))
+            return {"result": {}}
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+    await codex_native_app_server.apply_codex_thread_effort(
+        "ws://127.0.0.1:9876", "thread_abc", "ultra", model=model
+    )
+    assert requests == [
+        ("thread/settings/update", {"threadId": "thread_abc", "effort": expected_effort})
+    ]
+
+
 async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

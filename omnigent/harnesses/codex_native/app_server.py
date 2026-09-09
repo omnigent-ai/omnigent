@@ -3403,6 +3403,43 @@ async def preload_codex_thread_for_resume(
         await client.close()
 
 
+async def apply_codex_thread_effort(
+    transport: str,
+    thread_id: str,
+    effort: str,
+    *,
+    model: str | None = None,
+) -> None:
+    """
+    Set a loaded thread's reasoning effort via ``thread/settings/update``.
+
+    A resumed thread takes its effort from the rollout, not ``config.toml``.
+    After a runner restart the rollout is the cold-resume synthesis (no effort
+    recorded), and a forked clone's rollout carries the SOURCE's effort, so the
+    thread — and the TUI footer — would sit at the wrong level until a web turn
+    re-applied the session's effort. This is that re-application, run once the
+    thread has started.
+
+    :param transport: App-server transport, e.g. ``"ws://127.0.0.1:9876"``.
+    :param thread_id: Loaded Codex thread id, e.g. ``"019e96aa-..."``.
+    :param effort: Session-persisted effort, e.g. ``"ultra"``.
+    :param model: Model the thread runs, or ``None``; the effort is clamped to
+        a level that model accepts.
+    :raises Exception: If the app-server rejects the update.
+    """
+    from omnigent.util.reasoning_effort import clamp_effort_for_model
+
+    client = client_for_transport(transport, client_name="omnigent-codex-native-effort")
+    await client.connect()
+    try:
+        await client.request(
+            "thread/settings/update",
+            {"threadId": thread_id, "effort": clamp_effort_for_model(effort, model)},
+        )
+    finally:
+        await client.close()
+
+
 def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     """
     Build terminal env overrides for the native Codex TUI.
