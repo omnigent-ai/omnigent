@@ -709,6 +709,11 @@ stop = False
 def match_dir(dirpath, dname):
     dfull = os.path.join(dirpath, dname)
     dp = os.path.relpath(dfull, start)
+    # Every dir reaching here already passed the exc filter in scan()'s kept
+    # loop; re-checking keeps match_dir/match_file symmetric so a future
+    # refactor of that pre-filter can't silently leak excluded dirs.
+    if exc and any(r.match(dp) for r in exc):
+        return
     if inc and not any(r.match(dp) for r in inc):
         return
     if q not in dname.lower() and q not in dp.lower():
@@ -746,13 +751,19 @@ def scan(root, defer):
     for dirpath, dirnames, filenames in os.walk(root):
         kept = []
         for d in sorted(dirnames):
-            dp = os.path.relpath(os.path.join(dirpath, d), start)
+            full = os.path.join(dirpath, d)
+            dp = os.path.relpath(full, start)
             if any(r.match(dp) for r in exc):
                 continue
             if defer and d in depri:
                 # Match the dir itself now, but walk its subtree later (pass 2)
-                # so it can't starve the real tree of scan budget.
-                deferred.append(os.path.join(dirpath, d))
+                # so it can't starve the real tree of scan budget. Never defer a
+                # symlinked dir: os.walk(root) follows a top-level symlink, so a
+                # committed 'node_modules -> ..' would let pass 2 escape the
+                # workspace. os.walk(followlinks=False) never crosses symlinks
+                # mid-tree; deferring only real dirs keeps that boundary intact.
+                if not os.path.islink(full):
+                    deferred.append(full)
             kept.append(d)
         dirnames[:] = [d for d in kept if not (defer and d in depri)]
         for dname in kept:

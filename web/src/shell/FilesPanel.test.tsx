@@ -80,6 +80,16 @@ function file(path: string, bytes = 10): WorkspaceFile {
   };
 }
 
+function dir(path: string): WorkspaceFile {
+  return {
+    bytes: null,
+    modified_at: null,
+    name: path.split("/").at(-1) ?? path,
+    path,
+    type: "directory",
+  };
+}
+
 function changedFile(
   path: string,
   status: WorkspaceChangedFile["status"] = "modified",
@@ -785,6 +795,40 @@ describe("FilesPanel tree (Explore) search", () => {
     // on the flat result paths that prove search mode is active
     expect(screen.getByText((t) => t.includes("abc/test.md"))).toBeInTheDocument();
     expect(screen.getByText((t) => t.includes("src/main.py"))).toBeInTheDocument();
+  });
+
+  it("drops back to the tree synchronously when a folder result is revealed", () => {
+    // Revealing a folder from search must clear the DEBOUNCED query too, not
+    // just the raw input — FolderTree renders search mode off the debounced
+    // value, so clearing only the raw query would leave the flat results up for
+    // the 300ms window and the reveal scroll would target unmounted rows. We
+    // assert the results list is gone WITHOUT advancing timers.
+    vi.useFakeTimers();
+
+    renderPanel({
+      conversationId: "conv_tree_reveal_exits_search",
+      files: [file("src/App.tsx"), dir("src")],
+      treeSearchResults: [dir("src")],
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+      target: { value: "src" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    // Search mode is active: the folder shows as a result row (trailing slash).
+    const folderResult = screen.getByRole("button", { name: /src\// });
+    fireEvent.click(folderResult);
+
+    // No timer advance here. If exitTreeSearch only cleared the raw query, the
+    // debounced value would still be "src" and search mode would persist. The
+    // hook must now be called with an empty query (tree mode) right away.
+    expect(
+      useSearchMock.mock.calls.at(-1)?.[1],
+      "revealing a folder must clear the debounced query immediately",
+    ).toBe("");
   });
 
   it("returns to the tree view when the search query is cleared", () => {

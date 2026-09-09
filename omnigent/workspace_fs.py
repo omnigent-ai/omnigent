@@ -326,7 +326,7 @@ class WorkspaceReader:
         exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
 
         results: list[_WorkspacePayload] = []
-        # State the two-pass walk mutates via closures. A list holds `scanned`
+        # State the two-pass walk mutates via closures. A dict holds `scanned`
         # so the nested helpers can rebind it without a `nonlocal` per call.
         deferred: list[str] = []
         counters = {"scanned": 0}
@@ -373,13 +373,20 @@ class WorkspaceReader:
             for dirpath, dirnames, filenames in os.walk(root):
                 kept = []
                 for d in sorted(dirnames):
+                    full = os.path.join(dirpath, d)
                     dp = rel(dirpath, d)
                     if any(r.match(dp) for r in exc):
                         continue
                     if defer and d in _DEFAULT_DEPRIORITIZED_DIRS:
                         # Match the dir now, but walk its subtree later (pass 2)
-                        # so it can't starve the real tree of scan budget.
-                        deferred.append(os.path.join(dirpath, d))
+                        # so it can't starve the real tree of scan budget. Never
+                        # defer a symlinked dir: os.walk(root) follows a top-level
+                        # symlink, so a committed 'node_modules -> ..' would let
+                        # pass 2 escape the workspace. os.walk(followlinks=False)
+                        # never crosses symlinks mid-tree; deferring only real
+                        # dirs keeps that boundary intact.
+                        if not os.path.islink(full):
+                            deferred.append(full)
                     kept.append(d)
                 dirnames[:] = [d for d in kept if not (defer and d in _DEFAULT_DEPRIORITIZED_DIRS)]
                 for dname in kept:

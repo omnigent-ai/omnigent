@@ -387,6 +387,17 @@ export function FilesPanel({
     return () => clearTimeout(timer);
   }, [treeSearch, treeInclude, treeExclude]);
 
+  // Exit search when a folder is revealed from the results. Clears BOTH the raw
+  // and debounced queries: FolderTree renders search mode off the debounced
+  // value, so clearing only `treeSearch` would leave the flat results list up
+  // for the ~300ms debounce window — during which the tree's reveal scroll
+  // fires against rows that aren't mounted yet and never re-fires. Clearing the
+  // debounced value too drops back to the tree synchronously so the scroll lands.
+  const exitTreeSearch = useCallback(() => {
+    setTreeSearch("");
+    setDebouncedTreeSearch("");
+  }, []);
+
   // Only fire search queries on the Explore tab. The include/exclude globs
   // narrow an active text query; globs alone do not search.
   const treeSearchQuery = useWorkspaceFileSearch(
@@ -603,7 +614,7 @@ export function FilesPanel({
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
             browseLocation={locationParam}
             onNavigateDir={navigateToChild}
-            onExitSearch={() => setTreeSearch("")}
+            onExitSearch={exitTreeSearch}
             scrollParentRef={scrollRef}
           />
         )}

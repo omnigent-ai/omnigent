@@ -322,6 +322,31 @@ def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
     )
 
 
+def test_search_does_not_follow_symlinked_deprioritized_dir(tmp_path: Path) -> None:
+    """A symlinked noise dir must not let the walk escape the workspace root.
+
+    Mirrors the runner: the deferred second pass walks each noise root directly,
+    and ``os.walk`` follows a top-level symlink, so a committed ``node_modules``
+    symlink pointing outside the workspace would disclose the target's contents.
+    Deferring only real directories preserves the ``followlinks=False`` boundary.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("leaked")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "node_modules").symlink_to(outside, target_is_directory=True)
+    reader = WorkspaceReader(ws)
+
+    result = reader.search("secret")
+
+    paths = {e["path"] for e in result["data"]}
+    assert not any("secret" in p for p in paths), (
+        f"search must not descend a symlinked node_modules and leak the target's "
+        f"contents, got {paths}"
+    )
+
+
 # ── changes / diff (git mode) ─────────────────────────────────────────
 
 

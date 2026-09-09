@@ -1863,6 +1863,44 @@ async def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
 
 
 @pytest.mark.asyncio
+async def test_search_does_not_follow_symlinked_deprioritized_dir(
+    tmp_path: Path,
+) -> None:
+    """A symlinked deprioritized dir must not let the walk escape the workspace.
+
+    The deferred second pass walks each noise root directly, and ``os.walk``
+    follows a *top-level* symlink. A committed ``node_modules`` symlink pointing
+    outside the workspace would otherwise disclose file names/sizes/mtimes from
+    the target — content the single-pass ``os.walk(followlinks=False)`` could
+    never reach. Deferring only real directories preserves that boundary.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("leaked")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    # A committed noise-named symlink pointing at the sibling outside/ dir.
+    (ws / "node_modules").symlink_to(outside, target_is_directory=True)
+
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(ws),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, _truncated = await fs.search_files("secret")
+
+    paths = {e.path for e in entries}
+    assert not any("secret" in p for p in paths), (
+        f"search must not descend a symlinked node_modules and leak the target's "
+        f"contents, got {paths}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_scoped_search_reports_the_matched_files_own_size(tmp_path: Path) -> None:
     """A scoped search must stat the file it actually matched.
 
