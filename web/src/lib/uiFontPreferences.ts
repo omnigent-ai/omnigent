@@ -21,6 +21,8 @@
 
 import { getStyleRoot } from "./host";
 
+import { loadFontByFamily } from "./webFontLoader";
+
 const STORAGE_KEY = "omnigent:ui-font-size";
 
 export const UI_FONT_SIZE_DEFAULT = 14;
@@ -208,5 +210,11 @@ export function applyUiFontFamily(name: string): void {
     root.style.removeProperty("--ui-font-family");
     return;
   }
+  // Kick a webfont load when the name matches a catalog family so the glyphs
+  // actually arrive (fire-and-forget: the CSS var is set now and font-display:
+  // swap paints the face once it lands). A non-catalog name is left to the OS —
+  // the existing free-text behavior. The `, var(--font-sans)` fallback covers
+  // the gap before load and any name that never resolves.
+  void loadFontByFamily(normalized);
   root.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
 }

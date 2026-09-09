@@ -12,6 +12,8 @@
 // (editor.updateOptions / term.options + refit) so a Settings change lands live
 // without a reload or reconnect.
 
+import { loadFontByFamily } from "./webFontLoader";
+
 const SIZE_STORAGE_KEY = "omnigent:code-font-size";
 const FAMILY_STORAGE_KEY = "omnigent:code-font-family";
 const WEIGHT_STORAGE_KEY = "omnigent:code-font-weight";
@@ -181,6 +183,30 @@ export function writeCodeFontFamily(name: string): void {
   // Broadcast the intended value, not a storage re-read: a failed write must
   // still live-apply the new family to mounted editors/terminals.
   emit({ sizePx: readCodeFontSizePx(), family, weight: readCodeFontWeight() });
+  // If the family is a catalog font that needs fetching, load it and re-emit
+  // once its glyphs are ready. The first emit applies the family to the widgets
+  // immediately (fallback stack paints); the second, post-load emit makes them
+  // re-measure/refit against the real glyph cell so the editor/terminal pick up
+  // the newly-available face. No-ops for bundled/system/non-catalog families.
+  loadCodeFontFamily(family);
+}
+
+/**
+ * Load the webfont for a code family (if it's a catalog font that needs
+ * fetching) and re-emit the current code font once its glyphs are ready, so
+ * mounted Monaco/xterm widgets re-measure against the real cell metrics. A
+ * bundled/system/non-catalog family, or an SSR context, is a no-op. Exposed for
+ * boot-time restore in main.tsx / embed.tsx.
+ */
+export function loadCodeFontFamily(family: string): void {
+  const normalized = normalizeCodeFontFamily(family);
+  const { entry, ready } = loadFontByFamily(normalized);
+  if (!entry) return;
+  void ready.then(() => {
+    // Re-read live prefs at resolution time: if the user changed the family
+    // again while this was loading, don't clobber the newer choice.
+    emit(readCodeFont());
+  });
 }
 
 /**
