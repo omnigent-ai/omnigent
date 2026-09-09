@@ -4052,7 +4052,13 @@ def post_tools_changed(
     :raises RuntimeError: If the bridge server is not ready, cannot
         be reached, or rejects the notification.
     """
-    server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+    try:
+        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+    except OSError as exc:
+        # Reading the advertisement can fail for reasons other than the file
+        # being absent — fd exhaustion is the one seen in the wild. Callers
+        # treat this notification as best-effort and only expect RuntimeError.
+        raise RuntimeError(f"failed to read the Claude native bridge server info: {exc}") from exc
     token = server.get("token")
     url = server.get("url")
     if not isinstance(token, str) or not isinstance(url, str):

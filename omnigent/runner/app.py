@@ -7209,10 +7209,15 @@ def create_runner_app(
                 await asyncio.get_running_loop().run_in_executor(
                     None, post_tools_changed, bridge_dir
                 )
-            except RuntimeError:
+            except (RuntimeError, OSError):
+                # Fire-and-forget below, so anything escaping here resurfaces as
+                # an unretrieved task exception at ERROR. Re-advertising the tool
+                # list is best-effort; a stale list costs one turn, a dead task
+                # loop costs the session.
                 _logger.debug(
                     "tools-changed notification skipped for session=%s (bridge server not ready)",
                     session_id,
+                    exc_info=True,
                     extra={"session_id": session_id},
                 )
 
