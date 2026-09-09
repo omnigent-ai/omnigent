@@ -116,6 +116,45 @@ def normalized_model_id(model: str) -> str:
     return prefix_folded_model_id(model).removesuffix("[1m]")
 
 
+#: The suffix Claude Code reads as "run this model with the 1M context
+#: window". Client-side only: the CLI strips it before any request and
+#: translates it into the 1M-context beta header, so the gateway never
+#: sees the literal spelling.
+LONG_CONTEXT_MARKER = "[1m]"
+
+#: Claude families whose served models take the 1M-context beta. Haiku is
+#: 200K-only, and fable's long-context support is unverified on the
+#: gateways we route to, so neither is ever spelled with the marker.
+_LONG_CONTEXT_FAMILIES: frozenset[str] = frozenset({"opus", "sonnet"})
+
+
+def model_id_with_1m_marker(model_id: str) -> str:
+    """Spell a served Claude id the way Claude Code unlocks its 1M window.
+
+    Claude Code sizes a session's context window client-side by testing
+    the effective model id for the ``[1m]`` marker; an unmarked id caps
+    the session at the CLI's 200K default even when the model and gateway
+    serve 1M. Catalogs hold bare ids and nothing upstream constructs the
+    marker, so launch config must add it when building alias pins and the
+    launch model.
+
+    :param model_id: A served model id, e.g. ``"system.ai.claude-opus-5"``.
+    :returns: The marked spelling for long-context Claude families
+        (``"system.ai.claude-opus-5[1m]"``); unchanged otherwise —
+        non-Claude ids, bare family aliases, 200K-only families, and
+        already-marked ids all pass through.
+    """
+    spelled = model_id.strip()
+    if not spelled or spelled.lower().endswith(LONG_CONTEXT_MARKER):
+        return model_id
+    canonical = canonical_claude_id(spelled)
+    if canonical is None:
+        return model_id
+    if _LONG_CONTEXT_FAMILIES.isdisjoint(_SEGMENT_RE.split(canonical)):
+        return model_id
+    return f"{spelled}{LONG_CONTEXT_MARKER}"
+
+
 def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Read the session's alias → model-id pinning.
 

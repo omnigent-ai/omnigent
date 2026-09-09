@@ -5,6 +5,7 @@ import pytest
 from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     claude_model_command_arg,
+    model_id_with_1m_marker,
     model_vocabulary_env,
     normalized_model_id,
     prefix_folded_model_id,
@@ -287,3 +288,37 @@ def test_served_canonical_overrides_keep_the_first_of_two_equal_spellings() -> N
     assert served_canonical_overrides(["databricks-claude-opus-4-8", "gw-claude-opus-4-8"]) == {
         "claude-opus-4-8": "databricks-claude-opus-4-8"
     }
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        # Long-context families get the marker Claude Code sizes the 1M
+        # window from; without it the session caps at the CLI's 200K default.
+        pytest.param("system.ai.claude-opus-5", "system.ai.claude-opus-5[1m]", id="opus"),
+        pytest.param("system.ai.claude-sonnet-5", "system.ai.claude-sonnet-5[1m]", id="sonnet"),
+        pytest.param(
+            "databricks-claude-opus-4-8",
+            "databricks-claude-opus-4-8[1m]",
+            id="older-generation-too",
+        ),
+        # Haiku is 200K-only and fable's long-context support is unverified.
+        pytest.param("databricks-claude-haiku-4-5", "databricks-claude-haiku-4-5", id="haiku"),
+        pytest.param("databricks-claude-fable-5", "databricks-claude-fable-5", id="fable"),
+        # Already-marked spellings never double up, whatever the case.
+        pytest.param(
+            "system.ai.claude-opus-5[1m]", "system.ai.claude-opus-5[1m]", id="already-marked"
+        ),
+        pytest.param(
+            "system.ai.claude-opus-5[1M]", "system.ai.claude-opus-5[1M]", id="upper-case-marker"
+        ),
+        # Bare family aliases resolve through the pins, which carry the
+        # marker themselves; non-Claude ids have no 1M spelling at all.
+        pytest.param("opus", "opus", id="bare-alias"),
+        pytest.param("databricks-gpt-5-5", "databricks-gpt-5-5", id="non-claude"),
+        pytest.param("", "", id="empty"),
+    ],
+)
+def test_model_id_with_1m_marker(model: str, expected: str) -> None:
+    """Only served long-context Claude ids gain the ``[1m]`` spelling."""
+    assert model_id_with_1m_marker(model) == expected

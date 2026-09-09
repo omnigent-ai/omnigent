@@ -117,6 +117,7 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    model_id_with_1m_marker,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
@@ -2740,6 +2741,15 @@ def _ucode_config_for_profile(
                 )
             claude_models = live_models
 
+    # Claude Code sizes the context window from the effective id's [1m]
+    # marker (stripped client-side before any request), and the catalog
+    # holds bare ids — so spell the long-context families with the marker
+    # everywhere this config pins or launches them.
+    claude_models = {
+        tier: model_id_with_1m_marker(model_id) for tier, model_id in claude_models.items()
+    }
+    routable_models = tuple(model_id_with_1m_marker(model_id) for model_id in routable_models)
+
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
@@ -2807,9 +2817,11 @@ def _ucode_config_for_profile(
         api_key_helper=_profile_pinned_auth_command(
             agent_state.auth_command, workspace_url, profile
         ),
-        model=default_model
-        or configured_default
-        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        model=model_id_with_1m_marker(
+            default_model
+            or configured_default
+            or model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+        ),
         routable_models=routable_models,
     )
 
@@ -2915,17 +2927,20 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
     # rejects. The ``models:`` map's flat tier keys (``opus``/``sonnet``/…)
     # pin their aliases directly; ``models.default`` pins its own family's
     # alias when nothing else declared that family.
+    # Long-context families are pinned and launched in the [1m] spelling
+    # Claude Code needs to size the window at 1M (see model_id_with_1m_marker).
     pin_env: dict[str, str] = {}
     for alias, env_var in ALIAS_MODEL_ENV_VARS.items():
         pinned = family.models.get(alias)
         if isinstance(pinned, str) and pinned.strip():
-            pin_env[env_var] = pinned.strip()
-    if family.default_model:
-        default_alias = claude_model_alias(family.default_model, env={})
+            pin_env[env_var] = model_id_with_1m_marker(pinned.strip())
+    default_model = model_id_with_1m_marker(family.default_model) if family.default_model else None
+    if default_model:
+        default_alias = claude_model_alias(default_model, env={})
         base_alias = (default_alias or "").partition("[")[0]
         default_env_var = ALIAS_MODEL_ENV_VARS.get(base_alias)
         if default_env_var:
-            pin_env.setdefault(default_env_var, family.default_model)
+            pin_env.setdefault(default_env_var, default_model)
     return ClaudeNativeUcodeConfig(
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
@@ -2939,13 +2954,13 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
             ),
         },
         api_key_helper=api_key_helper,
-        model=family.default_model,
+        model=default_model,
         # The declared models are exactly what this entry can route.
         routable_models=tuple(
             dict.fromkeys(
                 [
                     *pin_env.values(),
-                    *([family.default_model] if family.default_model else []),
+                    *([default_model] if default_model else []),
                 ]
             )
         ),

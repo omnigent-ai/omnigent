@@ -344,7 +344,9 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             # tool search on (it rides on the advanced-tool-use beta).
         },
         api_key_helper="printf token",
-        model="databricks-claude-opus-test",
+        # Opus is a long-context family, so the launch model carries the
+        # [1m] marker Claude Code sizes the 1M window from.
+        model="databricks-claude-opus-test[1m]",
     )
 
 
@@ -434,7 +436,9 @@ def test_ucode_config_for_profile_sets_model_tier_env_vars(
     ``ANTHROPIC_DEFAULT_SONNET_MODEL``, and ``ANTHROPIC_DEFAULT_HAIKU_MODEL``
     vars are injected into the terminal env so that Claude Code's ``/model``
     picker natively shows Databricks gateway model IDs instead of normalising
-    them to canonical Anthropic names.
+    them to canonical Anthropic names. Long-context families (opus/sonnet)
+    are pinned in the ``[1m]`` spelling that unlocks Claude Code's 1M window;
+    haiku (200K-only) and fable stay bare.
     """
     from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
 
@@ -467,8 +471,8 @@ def test_ucode_config_for_profile_sets_model_tier_env_vars(
 
     assert config is not None
     assert config.env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "databricks-claude-fable-5"
-    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-7"
-    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-7[1m]"
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6[1m]"
     assert config.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "databricks-claude-haiku-4-5"
 
 
@@ -506,7 +510,7 @@ def test_ucode_config_for_profile_sets_only_present_tier_env_vars(
     config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
-    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6[1m]"
     assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in config.env
     assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in config.env
     assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in config.env
@@ -550,8 +554,8 @@ def test_ucode_config_for_profile_sets_custom_model_option_for_second_sonnet(
     config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
-    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
-    assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-sonnet-5"
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6[1m]"
+    assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-sonnet-5[1m]"
     assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Sonnet 5"
 
 
@@ -695,25 +699,27 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
 
     assert config is not None
     assert first_config is not None
-    assert first_config.model == "system.ai.claude-sonnet-5"
+    # Long-context families are spelled with the [1m] marker Claude Code
+    # sizes the 1M window from; display names and default detection strip it.
+    assert first_config.model == "system.ai.claude-sonnet-5[1m]"
     assert calls == [
         ("https://example.databricks.com", "token"),
         ("https://example.databricks.com", "token"),
     ]
-    assert config.model == "system.ai.claude-sonnet-5"
-    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-10"
-    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-5"
+    assert config.model == "system.ai.claude-sonnet-5[1m]"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-10[1m]"
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-5[1m]"
     assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in config.env
     assert claude_native.claude_native_model_options(config) == [
         {
             "id": "opus",
-            "model": "system.ai.claude-opus-4-10",
+            "model": "system.ai.claude-opus-4-10[1m]",
             "displayName": "Opus 4.10",
             "isDefault": False,
         },
         {
             "id": "sonnet",
-            "model": "system.ai.claude-sonnet-5",
+            "model": "system.ai.claude-sonnet-5[1m]",
             "displayName": "Sonnet 5",
             "isDefault": True,
         },
@@ -1042,8 +1048,9 @@ def test_ucode_config_uses_cached_models_when_live_refresh_fails(
     config = claude_native._ucode_config_for_profile("test-profile")
 
     assert config is not None
-    assert config.model == "system.ai.claude-opus-4-8"
-    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8"
+    # The cached mapping survives, spelled with the [1m] long-context marker.
+    assert config.model == "system.ai.claude-opus-4-8[1m]"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8[1m]"
 
 
 def test_ucode_config_rejects_authoritative_empty_live_catalog(
@@ -7852,13 +7859,15 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper(
     # the harness probe resolve ``sonnet`` to the entry's model.
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+        # Sonnet is a long-context family, so the pin carries the [1m]
+        # marker Claude Code sizes the 1M window from.
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6[1m]",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
     # Static key delivered via the apiKeyHelper, never the env (allowlist).
     assert cfg.api_key_helper == "printf %s sk-ant-test"
-    assert cfg.model == "claude-sonnet-4-6"
-    assert cfg.routable_models == ("claude-sonnet-4-6",)
+    assert cfg.model == "claude-sonnet-4-6[1m]"
+    assert cfg.routable_models == ("claude-sonnet-4-6[1m]",)
 
 
 def test_provider_config_for_native_claude_pins_declared_tier_models(
@@ -7899,17 +7908,19 @@ def test_provider_config_for_native_claude_pins_declared_tier_models(
     assert cfg is not None
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-5",
+        # Sonnet gains the [1m] long-context marker; haiku (200K-only)
+        # stays bare.
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-5[1m]",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
         # The default's own family (opus) had no explicit key, so the
-        # default pins it — bracket markers ride along verbatim.
+        # default pins it — an already-marked spelling never doubles up.
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
     assert cfg.model == "system.ai.claude-opus-4-8[1m]"
     assert set(cfg.routable_models) == {
         "system.ai.claude-opus-4-8[1m]",
-        "system.ai.claude-sonnet-5",
+        "system.ai.claude-sonnet-5[1m]",
         "system.ai.claude-haiku-4-5",
     }
 
@@ -7942,7 +7953,52 @@ def test_provider_config_for_native_claude_explicit_tier_key_beats_the_default(
 
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
-    assert cfg.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-5"
+    assert cfg.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-5[1m]"
+
+
+def test_provider_config_marks_long_context_models_for_the_1m_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1M-capable pins and the launch model carry the ``[1m]`` marker.
+
+    Claude Code sizes the context window client-side from the effective
+    model id's ``[1m]`` marker, so a launch that pins and launches the
+    bare catalog id caps every session at the CLI's 200K default even
+    when the model and gateway serve 1M. The builder must construct the
+    marked spelling for opus/sonnet — and must NOT mark 200K-only haiku.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "key",
+                    "anthropic": {
+                        "base_url": "https://gw.example/anthropic",
+                        "api_key": "test-key",
+                        "models": {
+                            "default": "system.ai.claude-opus-5",
+                            "opus": "system.ai.claude-opus-5",
+                            "sonnet": "system.ai.claude-sonnet-5",
+                            "haiku": "system.ai.claude-haiku-4-5",
+                        },
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-5[1m]"
+    assert cfg.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-5[1m]"
+    assert cfg.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-4-5"
+    # The launch model is the effective id Claude Code gates the window on,
+    # so it needs the marker too — pins alone don't cover an exact-id launch.
+    assert cfg.model == "system.ai.claude-opus-5[1m]"
 
 
 def test_provider_config_for_native_claude_uses_auth_command_verbatim(
