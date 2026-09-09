@@ -40,10 +40,7 @@ from omnigent.databricks_ai_gateway import (
 from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
 from omnigent.models.model_metadata import ModelWireAPI
-from omnigent.models.model_override import (
-    is_mechanical_vendor_id,
-    normalize_model_for_provider,
-)
+from omnigent.models.model_override import normalize_model_for_provider
 from omnigent.models.pi_model_compatibility import (
     PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
     SYSTEM_AI_RESPONSES_KEYWORDS,
@@ -1050,10 +1047,11 @@ def _cross_family_routing_warning(
         return None
     return (
         f"The model '{model_id}' is normally served by a provider's '{expected}' "
-        f"family, but provider '{entry.name}' has no usable '{expected}' family "
-        f"configured, so the session was routed to its '{family_name}' endpoint. "
+        f"family, but provider '{entry.name}' could not serve it that way (its "
+        f"'{expected}' family is missing, or lacks a base URL, credential, or "
+        f"model), so the session was routed to its '{family_name}' endpoint. "
         "If that endpoint does not serve this model, every turn will fail (for "
-        f"example with a 404). Add an '{expected}' family to the provider "
+        f"example with a 404). Add a usable '{expected}' family to the provider "
         f"config, or pick a model its '{family_name}' family serves."
     )
 
@@ -1244,22 +1242,6 @@ def resolve_pi_native_provider(
     unmanaged_prefix_warning: str | None = None
     if selection is not None:
         _, model = selection
-    elif model and "/" in model:
-        prefix, _, bare = model.partition("/")
-        # A provider-qualified reference to a ~/.pi/agent provider this managed
-        # session cannot see (PI_CODING_AGENT_DIR is relocated per session).
-        # Only a recognizable vendor-id tail is treated as such; a slash-shaped
-        # model id (e.g. "zai-org/GLM-4.7") stays verbatim for its endpoint.
-        if prefix and is_mechanical_vendor_id(bare):
-            unmanaged_prefix_warning = (
-                f"The model override '{model}' names a Pi provider '{prefix}' "
-                "that managed Pi sessions cannot use (they run from a "
-                "per-session config, not ~/.pi/agent). The model "
-                f"'{bare}' was requested from the omnigent-configured provider "
-                "instead."
-            )
-            _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
-            model = bare
     try:
         config = config_loader()
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
@@ -1277,6 +1259,25 @@ def resolve_pi_native_provider(
                 "surface; Pi will use its own login."
             )
             return None
+        if selection is None and model and "/" in model:
+            prefix, _, bare = model.partition("/")
+            providers = config.get("providers")
+            # A picker override can arrive qualified by the omnigent provider
+            # name ("rpw-fable/databricks-claude-fable-5-1"); registering it
+            # verbatim renders a slash id no endpoint serves. Split only when
+            # the prefix names a configured provider — any other slash id is
+            # the endpoint's own model naming (e.g. "openai/gpt-4o" on
+            # OpenRouter, "zai-org/GLM-4.7") and must stay verbatim.
+            if bare and isinstance(providers, dict) and prefix in providers:
+                if prefix != entry.name:
+                    unmanaged_prefix_warning = (
+                        f"The model override '{model}' names provider "
+                        f"'{prefix}', but this Pi session is served by "
+                        f"provider '{entry.name}'; the model '{bare}' was "
+                        f"requested from '{entry.name}' instead."
+                    )
+                    _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
+                model = bare
         if entry.kind == DATABRICKS_KIND:
             resolved = _databricks_pi_provider(entry, model=model)
         elif entry.kind == CLI_CONFIG_KIND:

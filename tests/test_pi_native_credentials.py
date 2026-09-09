@@ -1302,21 +1302,16 @@ def test_other_token_fallthrough_stays_silent() -> None:
     assert provider.credential_warning is None
 
 
-# ── Provider-qualified overrides: an unmanaged ``provider/`` prefix with a
-#    recognizable vendor-id tail is stripped with a warning; a slash-shaped
-#    model id stays verbatim. ───────────────────────────────────────────────
+# ── Provider-qualified overrides: a ``provider/`` prefix naming a configured
+#    omnigent provider selects that provider's model; any other slash id is
+#    the endpoint's own model naming and stays verbatim. ────────────────────
 
 
-def test_unmanaged_pi_provider_prefix_stripped_with_warning() -> None:
-    """An unmanaged ``provider/`` prefix is stripped, warned about, and never
-    registered verbatim as a literal model id.
-
-    Managed Pi sessions relocate ``PI_CODING_AGENT_DIR`` and never read
-    ``~/.pi/agent``, so a user-Pi-provider prefix cannot resolve.
-    """
-    config = {
+def _rpw_fable_anthropic_gateway() -> dict[str, object]:
+    """A ``kind: gateway`` pi default whose anthropic family serves Claude."""
+    return {
         "providers": {
-            "corp-gateway": {
+            "rpw-fable": {
                 "kind": "gateway",
                 "default": ["pi"],
                 "anthropic": {
@@ -1327,24 +1322,66 @@ def test_unmanaged_pi_provider_prefix_stripped_with_warning() -> None:
             }
         }
     }
+
+
+def test_provider_qualified_override_split_to_configured_provider() -> None:
+    """An override qualified by the configured provider's name is split.
+
+    The web model picker emits ``<provider>/<model>`` values qualified by the
+    omnigent provider name; registering that verbatim renders a slash id no
+    endpoint serves. Splitting is silent: the named provider is exactly the
+    one serving the session.
+    """
     provider = creds.resolve_pi_native_provider(
-        model="rpw-fable/databricks-claude-fable-5-1", config_loader=lambda: config
+        model="rpw-fable/databricks-claude-fable-5-1",
+        config_loader=_rpw_fable_anthropic_gateway,
     )
     assert provider is not None
-    # Prefix stripped; the gateway-kind provider keeps the id verbatim.
+    # Prefix split; the gateway-kind provider keeps the id verbatim.
     assert provider.model == "databricks-claude-fable-5-1"
-    assert provider.credential_warning is not None
-    assert "rpw-fable" in provider.credential_warning
+    assert provider.credential_warning is None
     cfg = provider.to_models_config()
     ids = [m["id"] for prov in cfg["providers"].values() for m in prov["models"]]
     assert not [mid for mid in ids if "/" in mid]
 
 
-def test_slash_model_id_without_vendor_tail_is_not_split() -> None:
-    """A slash-shaped model id whose tail is no vendor id survives untouched.
+def test_override_qualified_by_other_configured_provider_warns() -> None:
+    """Naming a configured provider other than the serving one warns.
 
-    ``zai-org/GLM-4.7`` is the endpoint's own model naming (org/model), not a
-    Pi provider reference — no strip, no warning.
+    The session is served by the pi-default provider, so a model picked from
+    another configured provider is requested from the default instead — say
+    so rather than silently reinterpreting the value.
+    """
+    config = _rpw_fable_anthropic_gateway()
+    config["providers"]["other-gw"] = {
+        "kind": "gateway",
+        "anthropic": {
+            "base_url": "https://other.invalid/anthropic",
+            "api_key": "test-key",
+            "models": {"default": "databricks-claude-fable-5-1"},
+        },
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="other-gw/databricks-claude-fable-5-1", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.model == "databricks-claude-fable-5-1"
+    assert provider.credential_warning is not None
+    assert "other-gw" in provider.credential_warning
+    assert "rpw-fable" in provider.credential_warning
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["zai-org/GLM-4.7", "openai/gpt-4o", "moonshotai/kimi-k2.6"],
+)
+def test_vendor_namespaced_model_id_is_not_split(model_id: str) -> None:
+    """A slash id whose prefix is no configured provider survives untouched.
+
+    OpenRouter/LiteLLM-style endpoints route by vendor-namespaced ids
+    (``openai/gpt-4o``, ``moonshotai/kimi-k2.6``, ``zai-org/GLM-4.7``); the
+    prefix is the endpoint's model namespace, not a provider reference — no
+    strip, no warning.
     """
     config = {
         "providers": {
@@ -1355,16 +1392,37 @@ def test_slash_model_id_without_vendor_tail_is_not_split() -> None:
                     "base_url": "https://api.deepinfra.com/v1/openai",
                     "api_key": "sk-test",
                     "wire_api": "chat",
-                    "models": {"default": "zai-org/GLM-4.7"},
+                    "models": {"default": model_id},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(model=model_id, config_loader=lambda: config)
+    assert provider is not None
+    assert provider.model == model_id
+    assert provider.credential_warning is None
+
+
+def test_vendor_namespaced_claude_id_is_not_split() -> None:
+    """``anthropic/claude-…`` on an anthropic family passes through verbatim."""
+    config = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://openrouter.invalid/anthropic",
+                    "api_key": "sk-test",
+                    "models": {"default": "anthropic/claude-opus-4-8"},
                 },
             }
         }
     }
     provider = creds.resolve_pi_native_provider(
-        model="zai-org/GLM-4.7", config_loader=lambda: config
+        model="anthropic/claude-opus-4-8", config_loader=lambda: config
     )
     assert provider is not None
-    assert provider.model == "zai-org/GLM-4.7"
+    assert provider.model == "anthropic/claude-opus-4-8"
     assert provider.credential_warning is None
 
 

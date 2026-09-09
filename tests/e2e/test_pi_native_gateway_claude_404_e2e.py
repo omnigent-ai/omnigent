@@ -304,27 +304,29 @@ def test_facet_a_openai_only_gateway_claude_model_not_silently_openai() -> None:
 # Facet B -- unmanaged provider/ prefix registered verbatim                   #
 # --------------------------------------------------------------------------- #
 def test_facet_b_unmanaged_provider_prefix_not_registered_verbatim() -> None:
-    """B: a ``provider/`` override with an unmanaged prefix must not be
+    """B: an override qualified by the configured provider's name must not be
     registered verbatim as a literal model id.
 
-    Report's regression test B: assert the rendered ``models.json`` never
-    contains a model id carrying an unmanaged ``provider/`` prefix. Fails now
-    (id is ``rpw-fable/databricks-claude-fable-5-1``); passes once the resolver
-    strips-and-warns or rejects the unmanaged prefix.
+    Report's regression test B: the web model picker emits
+    ``<provider>/<model>`` values qualified by the omnigent provider name
+    (here ``corp-gateway``); assert the rendered ``models.json`` never
+    contains a model id carrying that ``provider/`` prefix. Fails on the
+    buggy build (the id is registered verbatim, a slash id no endpoint
+    serves); passes once the resolver splits the configured-provider prefix.
+    Slash ids whose prefix is no configured provider are the endpoint's own
+    model naming (e.g. ``zai-org/GLM-4.7``) and stay verbatim.
     """
     models_json, _ = _render_runner_models_json(
-        model="rpw-fable/databricks-claude-fable-5-1", with_anthropic=False
+        model="corp-gateway/databricks-claude-fable-5-1", with_anthropic=False
     )
     ids = _model_ids(models_json)
     slashed = [mid for mid in ids if "/" in mid]
     assert not slashed, (
-        "An override carrying an unmanaged 'provider/' prefix "
-        "('rpw-fable/databricks-claude-fable-5-1') was registered verbatim as a "
-        f"literal model id in the rendered models.json: {slashed!r}. Managed pi "
-        "sessions relocate PI_CODING_AGENT_DIR and never read ~/.pi/agent, so "
-        "this slash id has no provider and every turn 404s. The fix must "
-        "strip-and-warn or reject unmanaged provider/ prefixes in "
-        "resolve_pi_native_provider."
+        "An override qualified by the configured provider's name "
+        "('corp-gateway/databricks-claude-fable-5-1') was registered verbatim "
+        f"as a literal model id in the rendered models.json: {slashed!r}. The "
+        "endpoint serves no such slash id, so every turn 404s. The fix must "
+        "split a configured-provider prefix in resolve_pi_native_provider."
     )
 
 
