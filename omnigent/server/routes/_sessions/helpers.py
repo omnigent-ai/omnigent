@@ -6725,11 +6725,12 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["harness_override"] = conv.harness_override
 
     try:
-        await runner_client.post(
+        response = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
         )
+        response.raise_for_status()
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -6971,10 +6972,14 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param accepted: Whether the runner accepted responsibility for
+        processing the event. ``False`` for a native terminal-start
+        failure that the AP persists as a completed failure turn.
     """
 
     item_id: str | None
     pending_id: str | None
+    accepted: bool
 
 
 def _extract_persistent_item_from_sse(

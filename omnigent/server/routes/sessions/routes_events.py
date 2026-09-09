@@ -61,9 +61,8 @@ from omnigent.server.auth import (
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     background_session_titles_enabled,
-    background_title_prompt,
     prepare_background_session_title,
-    schedule_background_child_task_summary,
+    schedule_background_child_task_summary_for_event,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
@@ -2051,23 +2050,6 @@ def register_events_routes(
             event=body,
             enabled=background_session_titles_enabled(request.headers),
         )
-        # Schedule display-name generation for child sessions (the
-        # title coordinator skips children because their title is
-        # the stable spawn-or-continue key).
-        if (
-            conv.parent_conversation_id is not None
-            and conv.task_summary is None
-            and background_title_coordinator is not None
-        ):
-            _prompt_for_display = background_title_prompt(body)
-            if _prompt_for_display:
-                schedule_background_child_task_summary(
-                    coordinator=background_title_coordinator,
-                    session_id=session_id,
-                    prompt=_prompt_for_display,
-                    agent_id=conv.agent_id,
-                    sub_agent_name=conv.sub_agent_name,
-                )
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
                 raise OmnigentError(
@@ -2083,6 +2065,11 @@ def register_events_routes(
                 agent=_agent,
                 has_mcp_servers=_has_mcp_servers,
                 created_by=created_by,
+            )
+            schedule_background_child_task_summary_for_event(
+                coordinator=background_title_coordinator,
+                conversation=conv,
+                event=body,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
@@ -2105,8 +2092,16 @@ def register_events_routes(
             # serves this turn; absent, routing keeps its default posture.
             host_store=getattr(request.app.state, "host_store", None),
         )
-        if pending_background_title is not None:
-            pending_background_title.schedule(expected_seed_title=conv.title)
+        if dispatch.accepted:
+            # Child titles are stable spawn-or-continue keys, so derive a separate
+            # display summary only after the prompt was accepted by the runner.
+            schedule_background_child_task_summary_for_event(
+                coordinator=background_title_coordinator,
+                conversation=conv,
+                event=body,
+            )
+            if pending_background_title is not None:
+                pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True}
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id

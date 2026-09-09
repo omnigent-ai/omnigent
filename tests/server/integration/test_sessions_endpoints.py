@@ -484,6 +484,457 @@ async def test_initial_item_schedules_background_semantic_title(
     assert snapshot.json()["title"] == "Debug authentication timeout"
 
 
+async def test_child_initial_item_and_followup_send_schedule_one_task_summary(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[BackgroundTitleRequest] = []
+    generator_started = asyncio.Event()
+    release_generator = asyncio.Event()
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        requests.append(request)
+        generator_started.set()
+        await release_generator.wait()
+        return "Investigate authentication timeout"
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    try:
+        create_response = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "title": "researcher:researcher-1",
+                "initial_items": [
+                    {
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "please investigate the authentication timeout",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+        assert create_response.status_code == 201, create_response.text
+        child_id = create_response.json()["id"]
+        await asyncio.wait_for(generator_started.wait(), timeout=5)
+
+        send_response = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue investigating"}],
+                },
+            },
+        )
+        assert send_response.status_code == 202, send_response.text
+    finally:
+        release_generator.set()
+        await fake_runner.aclose()
+
+    await coordinator.wait_for_idle()
+    assert len(requests) == 1
+    assert requests[0].session_id == child_id
+    assert requests[0].prompt == "please investigate the authentication timeout"
+    children_response = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    child = next(item for item in children_response.json()["data"] if item["id"] == child_id)
+    assert child["task_summary"] == "Investigate authentication timeout"
+
+
+async def test_runnerless_child_initial_item_defers_summary_until_send(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        requests.append(request)
+        return "Investigate authentication timeout"
+
+    app.state.background_title_coordinator._generator = generator
+    runner_available = False
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient | None:
+        return fake_runner if runner_available else None
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    try:
+        response = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "title": "researcher:researcher-1",
+                "initial_items": [
+                    {
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "please investigate the authentication timeout",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 201, response.text
+        child_id = response.json()["id"]
+        await app.state.background_title_coordinator.wait_for_idle()
+        assert requests == []
+
+        runner_available = True
+        send_response = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue investigating"}],
+                },
+            },
+        )
+        assert send_response.status_code == 202, send_response.text
+    finally:
+        await fake_runner.aclose()
+
+    await app.state.background_title_coordinator.wait_for_idle()
+    assert len(requests) == 1
+    assert requests[0].session_id == child_id
+    assert requests[0].prompt == "please investigate the authentication timeout"
+    children_response = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    child = next(item for item in children_response.json()["data"] if item["id"] == child_id)
+    assert child["task_summary"] == "Investigate authentication timeout"
+
+
+async def test_failed_child_dispatch_does_not_schedule_task_summary(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        requests.append(request)
+        return "Unused summary"
+
+    async def reject_dispatch(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("runner rejected event")
+
+    app.state.background_title_coordinator._generator = generator
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._dispatch_session_event_to_runner",
+        reject_dispatch,
+    )
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    create_response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "researcher:researcher-1",
+        },
+    )
+    assert create_response.status_code == 201, create_response.text
+    child = create_response.json()
+    try:
+        with pytest.raises(RuntimeError, match="runner rejected event"):
+            await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Investigate timeout"}],
+                    },
+                },
+            )
+    finally:
+        await fake_runner.aclose()
+
+    await app.state.background_title_coordinator.wait_for_idle()
+    assert requests == []
+
+
+async def test_rejected_child_prompt_does_not_replace_later_accepted_summary_prompt(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[BackgroundTitleRequest] = []
+    event_attempts = 0
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        requests.append(request)
+        return "Investigate accepted prompt"
+
+    def handle_runner_request(request: httpx.Request) -> httpx.Response:
+        nonlocal event_attempts
+        if request.url.path.endswith("/events"):
+            event_attempts += 1
+            if event_attempts == 1:
+                return httpx.Response(503, json={"detail": "runner rejected first prompt"})
+        return httpx.Response(202, json={"queued": True})
+
+    app.state.background_title_coordinator._generator = generator
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_runner_request),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "researcher:researcher-1",
+        },
+    )
+    assert created.status_code == 201, created.text
+    child = created.json()
+    try:
+        rejected = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Rejected prompt"}],
+                },
+            },
+        )
+        assert rejected.status_code >= 400, rejected.text
+
+        accepted = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Accepted prompt"}],
+                },
+            },
+        )
+        assert accepted.status_code == 202, accepted.text
+    finally:
+        await fake_runner.aclose()
+
+    await app.state.background_title_coordinator.wait_for_idle()
+    assert [request.prompt for request in requests] == ["Accepted prompt"]
+
+
+async def test_native_terminal_boot_failure_does_not_schedule_task_summary(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+
+    requests: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        requests.append(request)
+        return "Unused summary"
+
+    app.state.background_title_coordinator._generator = generator
+
+    def handle_runner_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/terminals"):
+            return httpx.Response(
+                503,
+                json={"error": "harness_spawn_failed", "detail": "terminal boot failed"},
+            )
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_runner_request),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        agent = await create_test_agent(client, name="claude-native-child")
+        parent = await _create_session(client, agent["id"])
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "title": "claude:claude-1",
+                "labels": {
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "claude-code-native-ui",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        child_id = created.json()["id"]
+        posted = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Investigate timeout"}],
+                },
+            },
+        )
+        assert posted.status_code == 202, posted.text
+
+    await app.state.background_title_coordinator.wait_for_idle()
+    assert requests == []
+    children_response = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    child = next(item for item in children_response.json()["data"] if item["id"] == child_id)
+    assert child["task_summary"] is None
+
+
+async def test_rejected_child_skill_does_not_schedule_task_summary(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+
+    requests: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        requests.append(request)
+        return "Unused summary"
+
+    app.state.background_title_coordinator._generator = generator
+
+    def handle_runner_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/skills/resolve"):
+            payload = json.loads(request.content)
+            skill = SkillSpec(
+                name="investigate",
+                description="Investigate a problem.",
+                content="Find the root cause.",
+            )
+            return httpx.Response(
+                200,
+                json={"meta_text": format_skill_meta_text(skill, payload.get("arguments", ""))},
+            )
+        if request.url.path.endswith("/events"):
+            return httpx.Response(503, json={"detail": "runner rejected skill"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_runner_request),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        agent = await create_test_agent(
+            client,
+            name="skill-child",
+            skills=[
+                {
+                    "name": "investigate",
+                    "description": "Investigate a problem.",
+                    "content": "Find the root cause.",
+                }
+            ],
+        )
+        parent = await _create_session(client, agent["id"])
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "title": "researcher:researcher-1",
+            },
+        )
+        assert created.status_code == 201, created.text
+        child = created.json()
+
+        response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "slash_command",
+                "data": {
+                    "kind": "skill",
+                    "name": "investigate",
+                    "arguments": "authentication timeout",
+                },
+            },
+        )
+        assert response.status_code >= 400, response.text
+
+    await app.state.background_title_coordinator.wait_for_idle()
+    assert requests == []
+
+
 async def test_native_user_item_schedules_background_semantic_title(
     client: httpx.AsyncClient,
     app: Any,

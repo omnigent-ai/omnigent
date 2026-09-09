@@ -925,13 +925,13 @@ class ConversationStore(ABC):
         conversation_id: str,
         task_summary: str,
     ) -> Conversation | None:
-        """Set a human-readable task summary on a sub-agent conversation.
+        """Set the first human-readable task summary on a sub-agent conversation.
 
         :param conversation_id: Conversation to update.
         :param task_summary: Short task-derived label, e.g.
             ``"Investigate auth token refresh"``.
         :returns: The updated conversation, or ``None`` when the row
-            does not exist.
+            does not exist or already has a task summary.
         """
         ...
 

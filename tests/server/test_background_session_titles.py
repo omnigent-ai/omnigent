@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
 from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.server.background_session_titles import (
     BACKGROUND_SESSION_TITLES_HEADER,
@@ -17,6 +18,7 @@ from omnigent.server.background_session_titles import (
     background_session_titles_enabled,
     normalize_background_title,
     prepare_background_session_title,
+    schedule_background_child_task_summary_for_event,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -27,6 +29,16 @@ pytestmark = pytest.mark.asyncio
 def _seed_session(store: SqlAlchemyConversationStore, title: str) -> str:
     conversation = store.create_conversation(kind="default", title=title)
     return conversation.id
+
+
+def _seed_child_session(store: SqlAlchemyConversationStore) -> str:
+    parent = store.create_conversation(kind="default", title="parent")
+    child = store.create_conversation(
+        kind="default",
+        title="researcher:researcher-1",
+        parent_conversation_id=parent.id,
+    )
+    return child.id
 
 
 async def test_prepare_background_title_for_eligible_session(db_uri: str) -> None:
@@ -591,6 +603,252 @@ async def test_schedule_is_one_shot_per_session(db_uri: str) -> None:
 
     assert calls == 1
     assert store.get_conversation(session_id).title == "Debug authentication timeout"
+
+
+async def test_task_summary_retry_uses_latest_prompt_without_seed(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_child_session(store)
+    prompts: list[str] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str | None:
+        prompts.append(request.prompt)
+        if len(prompts) == 1:
+            return None
+        return "Investigate authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    coordinator.schedule_task_summary(
+        session_id=session_id,
+        prompt="please investigate the authentication timeout",
+    )
+    await coordinator.wait_for_idle()
+    coordinator.schedule_task_summary(
+        session_id=session_id,
+        prompt="continue investigating",
+    )
+    await coordinator.wait_for_idle()
+
+    assert prompts == [
+        "please investigate the authentication timeout",
+        "continue investigating",
+    ]
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    assert conversation.task_summary == "Investigate authentication timeout"
+
+
+async def test_task_summary_retry_uses_earliest_persisted_seed_prompt(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_child_session(store)
+    store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="seed",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "Ignore me"}],
+                    agent="researcher",
+                ),
+            ),
+            NewConversationItem(
+                type="slash_command",
+                response_id="seed",
+                data=SlashCommandData(
+                    agent="researcher",
+                    kind="skill",
+                    name="investigate",
+                    arguments="auth timeout",
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="seed",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "Later user prompt"}],
+                ),
+            ),
+        ],
+    )
+    prompts: list[str] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        prompts.append(request.prompt)
+        return "Investigate authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    coordinator.schedule_task_summary(session_id=session_id, prompt="Fallback prompt")
+    await coordinator.wait_for_idle()
+
+    assert prompts == ["/investigate auth timeout"]
+
+
+async def test_task_summary_ignores_undelivered_persisted_prompt(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_child_session(store)
+    store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn_rejected",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "Rejected prompt"}],
+                ),
+            )
+        ],
+    )
+    prompts: list[str] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        prompts.append(request.prompt)
+        return "Investigate accepted prompt"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    coordinator.schedule_task_summary(session_id=session_id, prompt="Accepted prompt")
+    await coordinator.wait_for_idle()
+
+    assert prompts == ["Accepted prompt"]
+
+
+async def test_task_summary_prefers_first_accepted_prompt_over_persisted_skill(
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_child_session(store)
+    prompts: list[str] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        prompts.append(request.prompt)
+        return "Investigate authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    coordinator.schedule_task_summary(session_id=session_id, prompt="Native pending prompt")
+    store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="slash_command",
+                response_id="turn_later",
+                data=SlashCommandData(
+                    agent="researcher",
+                    kind="skill",
+                    name="investigate",
+                    arguments="later task",
+                ),
+            )
+        ],
+    )
+    await coordinator.wait_for_idle()
+
+    assert prompts == ["Native pending prompt"]
+
+
+async def test_completed_task_summary_skips_stale_reschedule(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_child_session(store)
+    stale_conversation = store.get_conversation(session_id)
+    assert stale_conversation is not None
+    calls = 0
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        nonlocal calls
+        calls += 1
+        return "Investigate authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    assert schedule_background_child_task_summary_for_event(
+        coordinator=coordinator,
+        conversation=stale_conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Initial prompt"}],
+            },
+        ),
+    )
+    await coordinator.wait_for_idle()
+    assert schedule_background_child_task_summary_for_event(
+        coordinator=coordinator,
+        conversation=stale_conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Follow-up prompt"}],
+            },
+        ),
+    )
+    await coordinator.wait_for_idle()
+
+    assert calls == 1
+
+
+async def test_concurrent_task_summary_writers_keep_first_completed_summary(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_child_session(store)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    first_can_finish = asyncio.Event()
+    second_can_finish = asyncio.Event()
+    prompts: list[str] = []
+
+    async def first_generator(request: BackgroundTitleRequest) -> str:
+        prompts.append(request.prompt)
+        first_started.set()
+        await first_can_finish.wait()
+        return f"Summary for {request.prompt}"
+
+    async def second_generator(request: BackgroundTitleRequest) -> str:
+        prompts.append(request.prompt)
+        second_started.set()
+        await second_can_finish.wait()
+        return f"Summary for {request.prompt}"
+
+    first = BackgroundSessionTitleCoordinator(store, first_generator)
+    second = BackgroundSessionTitleCoordinator(store, second_generator)
+    first.schedule_task_summary(session_id=session_id, prompt="Initial prompt")
+    await asyncio.wait_for(first_started.wait(), timeout=5)
+    second.schedule_task_summary(session_id=session_id, prompt="Follow-up prompt")
+    await asyncio.wait_for(second_started.wait(), timeout=5)
+    second_can_finish.set()
+    await second.wait_for_idle()
+    first_can_finish.set()
+    await first.wait_for_idle()
+
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    assert prompts == ["Initial prompt", "Follow-up prompt"]
+    assert conversation.task_summary == "Summary for Follow-up prompt"
+
+
+async def test_child_task_summary_ignores_assistant_message(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_child_session(store)
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Unused summary"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    scheduled = schedule_background_child_task_summary_for_event(
+        coordinator=coordinator,
+        conversation=conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "assistant",
+                "content": [{"type": "input_text", "text": "Do not summarize me"}],
+            },
+        ),
+    )
+
+    assert scheduled is False
 
 
 async def test_generation_concurrency_is_bounded(db_uri: str) -> None:

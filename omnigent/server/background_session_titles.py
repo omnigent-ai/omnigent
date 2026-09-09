@@ -7,12 +7,14 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
+    MessageData,
+    SlashCommandData,
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
@@ -20,7 +22,7 @@ from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE
 from omnigent.stores.conversation_store import ConversationStore
 
 if TYPE_CHECKING:
-    from omnigent.entities.conversation import Conversation
+    from omnigent.entities.conversation import Conversation, ConversationItem
     from omnigent.runner.routing import RunnerRouter
     from omnigent.server.schemas import SessionEventInput
 
@@ -61,6 +63,7 @@ _TITLE_WRAPPERS = "'\"`“”‘’"
 _TRAILING_PUNCTUATION = re.compile(r"[.!?;:,]+$")
 BACKGROUND_TITLE_MAX_CHARS = DEFAULT_GENERATED_TITLE_MAX_CHARS
 CUSTOM_BACKGROUND_TITLE_MAX_CHARS = USER_SESSION_TITLE_MAX_CHARS
+_TASK_SUMMARY_PROMPT_MAX_CHARS = 4000
 
 
 def normalize_background_title(
@@ -202,7 +205,7 @@ class BackgroundSessionTitleCoordinator:
             self._run_task_summary(
                 request=BackgroundTitleRequest(
                     session_id=session_id,
-                    prompt=prompt,
+                    prompt=prompt[:_TASK_SUMMARY_PROMPT_MAX_CHARS],
                     agent_id=agent_id,
                     harness_override=harness_override,
                     model_override=model_override,
@@ -319,6 +322,18 @@ class BackgroundSessionTitleCoordinator:
         """Generate a task summary for a child session and write it to task_summary."""
         started = time.perf_counter()
         try:
+            conversation = await asyncio.to_thread(
+                self._conversation_store.get_conversation,
+                request.session_id,
+            )
+            if conversation is None or conversation.task_summary is not None:
+                return
+            seed_prompt = await asyncio.to_thread(
+                _first_persisted_seed_task_summary_prompt,
+                self._conversation_store,
+                request.session_id,
+            )
+            request = replace(request, prompt=seed_prompt or request.prompt)
             async with self._generation_slots:
                 generated = await asyncio.wait_for(
                     self._generator(request),
@@ -458,15 +473,78 @@ def schedule_background_child_task_summary(
     )
 
 
-def background_title_prompt(event: SessionEventInput) -> str:
-    if event.type == "slash_command":
-        name = event.data.get("name")
-        arguments = event.data.get("arguments", "")
-        if not isinstance(name, str) or not name.strip() or not isinstance(arguments, str):
-            return ""
-        return f"/{name.strip()} {arguments}".strip()
+def schedule_background_child_task_summary_for_event(
+    *,
+    coordinator: BackgroundSessionTitleCoordinator | None,
+    conversation: Conversation,
+    event: SessionEventInput,
+) -> bool:
+    """Schedule the first task-derived display summary for a child session."""
+    if (
+        coordinator is None
+        or conversation.parent_conversation_id is None
+        or conversation.task_summary is not None
+    ):
+        return False
+    if event.type == "message" and (
+        event.data.get("role") != "user" or event.data.get("is_meta") is True
+    ):
+        return False
+    if event.type == "slash_command" and event.data.get("kind", "skill") != "skill":
+        return False
+    if event.type not in {"message", "slash_command"}:
+        return False
+    prompt = background_title_prompt(event)
+    if not prompt:
+        return False
+    schedule_background_child_task_summary(
+        coordinator=coordinator,
+        session_id=conversation.id,
+        prompt=prompt,
+        agent_id=conversation.agent_id,
+        sub_agent_name=conversation.sub_agent_name,
+    )
+    return True
 
-    content = event.data.get("content")
+
+def _first_persisted_seed_task_summary_prompt(
+    conversation_store: ConversationStore,
+    session_id: str,
+) -> str:
+    """Return the earliest runnerless create-time prompt eligible for a task summary."""
+    after: str | None = None
+    while True:
+        page = conversation_store.list_items(
+            session_id,
+            limit=100,
+            after=after,
+            order="asc",
+        )
+        for item in page.data:
+            prompt = _persisted_seed_task_summary_prompt(item)
+            if prompt:
+                return prompt
+        if not page.has_more or page.last_id is None:
+            return ""
+        after = page.last_id
+
+
+def _persisted_seed_task_summary_prompt(item: ConversationItem) -> str:
+    if item.response_id != "seed":
+        return ""
+    if item.type == "slash_command":
+        if not isinstance(item.data, SlashCommandData) or item.data.kind != "skill":
+            return ""
+        arguments = item.data.arguments.strip()
+        return f"/{item.data.name} {arguments}".strip()[:_TASK_SUMMARY_PROMPT_MAX_CHARS]
+    if item.type != "message" or not isinstance(item.data, MessageData):
+        return ""
+    if item.data.role != "user" or item.data.is_meta:
+        return ""
+    return _input_text_prompt(item.data.content)
+
+
+def _input_text_prompt(content: object) -> str:
     if not isinstance(content, list):
         return ""
     parts: list[str] = []
@@ -475,4 +553,15 @@ def background_title_prompt(event: SessionEventInput) -> str:
             text = block.get("text", "")
             if isinstance(text, str):
                 parts.append(text)
-    return " ".join(parts)[:4000]
+    return " ".join(parts)[:_TASK_SUMMARY_PROMPT_MAX_CHARS]
+
+
+def background_title_prompt(event: SessionEventInput) -> str:
+    if event.type == "slash_command":
+        name = event.data.get("name")
+        arguments = event.data.get("arguments", "")
+        if not isinstance(name, str) or not name.strip() or not isinstance(arguments, str):
+            return ""
+        return f"/{name.strip()} {arguments}".strip()
+
+    return _input_text_prompt(event.data.get("content"))

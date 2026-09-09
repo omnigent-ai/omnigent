@@ -128,6 +128,22 @@ def test_rename_conversation_if_title_matches_is_atomic(
     assert conversation_store.get_conversation(conv.id).title == "Debug request timeout"  # type: ignore[union-attr]
 
 
+def test_set_task_summary_is_first_write_wins(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conversation = conversation_store.create_conversation(title="researcher:researcher-1")
+
+    first = conversation_store.set_task_summary(conversation.id, "Investigate auth timeout")
+    stale = conversation_store.set_task_summary(conversation.id, "Overwrite from follow-up")
+
+    assert first is not None
+    assert first.task_summary == "Investigate auth timeout"
+    assert stale is None
+    reloaded = conversation_store.get_conversation(conversation.id)
+    assert reloaded is not None
+    assert reloaded.task_summary == "Investigate auth timeout"
+
+
 def test_get_conversations_bulk(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

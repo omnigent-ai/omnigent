@@ -119,6 +119,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     background_session_titles_enabled,
     prepare_background_session_title,
+    schedule_background_child_task_summary_for_event,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
@@ -5879,7 +5880,11 @@ async def _dispatch_session_event_to_runner_impl(
                 runner_router,
                 created_by=created_by,
             )
-            return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+            return _SessionEventDispatchResult(
+                item_id=item_id,
+                pending_id=None,
+                accepted=False,
+            )
         if ensure_outcome.policy_notice is not None:
             # Terminal is up but policy enforcement is off (fail-open). Post
             # a durable, non-fatal banner; the user message still forwards.
@@ -6077,7 +6082,11 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(
+            item_id=None,
+            pending_id=pending_id,
+            accepted=True,
+        )
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -6091,7 +6100,11 @@ async def _dispatch_session_event_to_runner_impl(
         created_by=created_by,
         host_store=host_store,
     )
-    return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+    return _SessionEventDispatchResult(
+        item_id=item_id,
+        pending_id=None,
+        accepted=True,
+    )
 
 
 # Transient runner-tunnel drops (Apps ingress recycles, sleep-wake
@@ -9024,6 +9037,7 @@ async def _create_session_from_existing_agent(
             )
             # Dispatch (not a plain forward) so native-terminal sessions take the
             # single-writer bypass — otherwise the forwarder's echo duplicates the kickoff.
+            task_summary_scheduled = False
             for item in body.initial_items:
                 pending_background_title = prepare_background_session_title(
                     coordinator=background_title_coordinator,
@@ -9031,7 +9045,7 @@ async def _create_session_from_existing_agent(
                     event=item,
                     enabled=background_session_titles_enabled(request.headers),
                 )
-                await _dispatch_session_event_to_runner(
+                dispatch = await _dispatch_session_event_to_runner(
                     conv.id,
                     conv,
                     item,
@@ -9045,7 +9059,13 @@ async def _create_session_from_existing_agent(
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
                 )
-                if pending_background_title is not None:
+                if dispatch.accepted and not task_summary_scheduled:
+                    task_summary_scheduled = schedule_background_child_task_summary_for_event(
+                        coordinator=background_title_coordinator,
+                        conversation=conv,
+                        event=item,
+                    )
+                if dispatch.accepted and pending_background_title is not None:
                     pending_background_title.schedule(expected_seed_title=conv.title)
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was

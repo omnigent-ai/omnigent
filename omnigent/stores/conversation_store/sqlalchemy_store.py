@@ -3098,7 +3098,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         return self.get_conversation(conversation_id)
 
     def set_task_summary(self, conversation_id: str, task_summary: str) -> Conversation | None:
-        """Set a human-readable task summary on a sub-agent conversation."""
+        """Set the first human-readable task summary on a sub-agent conversation."""
         with self._session("set_task_summary") as session:
             result = cast(
                 _RowCountResult,
@@ -3107,6 +3107,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationMetadata.workspace_id == current_workspace_id(),
                         SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.task_summary.is_(None),
                     )
                     .values(task_summary=task_summary)
                 ),
