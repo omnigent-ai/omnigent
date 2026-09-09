@@ -4469,6 +4469,8 @@ export function NewChatLandingScreen() {
       // move). A label-only folder (no first-class row yet) keeps the legacy
       // label + post-create move, which creates the project row on demand.
       const createProjectId = selectedProject !== "" ? configProjectId : null;
+      const localProject =
+        selectedProject !== "" ? { id: createProjectId, name: selectedProject } : undefined;
       // Server-side default-fill: a slot still holding its untouched project-
       // config seed (per the source refs) is OMITTED so the server fills it
       // from the config. Any user interaction — even re-picking the exact
@@ -4549,7 +4551,7 @@ export function NewChatLandingScreen() {
         // Normal path: bind to an existing registered agent.
         const provisional = newTempConversation();
         try {
-          localConv = beginLocalConversation(initialPrompt, files, provisional);
+          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject);
           if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
         } catch {
           /* non-fatal: the response still opens the server session */
@@ -4806,6 +4808,7 @@ export function NewChatLandingScreen() {
           skill,
           navigate,
           () => window.location.pathname.endsWith(tempRouteSuffix),
+          localProject,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
       } else {
