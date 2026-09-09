@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -102,6 +103,17 @@ class _BlockingSigner(_Signer):
         self.starting.set()
         await asyncio.sleep(3600)
         raise AssertionError("unreachable")
+
+
+class _BlockingCloseSigner(_Signer):
+    def __init__(self, order: list[str]) -> None:
+        super().__init__(order)
+        self.closing = asyncio.Event()
+
+    async def close(self) -> None:
+        self.order.append("signer-close")
+        self.closing.set()
+        await asyncio.sleep(3600)
 
 
 def _session(tmp_path: Path, signer: _Signer) -> _CodexAppServerSession:
@@ -453,7 +465,7 @@ async def test_signer_exit_escalates_to_kill_for_term_ignoring_worker(
     await session.close()
 
 
-async def test_runner_close_invalidates_signer_before_terminating_worker(
+async def test_runner_close_terminates_worker_without_waiting_for_signer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -482,7 +494,113 @@ async def test_runner_close_invalidates_signer_before_terminating_worker(
 
     await session.close()
 
-    assert order[-2:] == ["signer-close", "worker-terminate"]
+    assert order[-2:] == ["worker-terminate", "signer-close"]
+
+
+async def test_cancelled_close_contains_worker_and_retains_incomplete_signer_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _BlockingCloseSigner([])
+    process = _Process()
+    terminate = Mock(side_effect=lambda proc: setattr(proc, "returncode", 0))
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
+    monkeypatch.setattr("omnigent.inner.codex_executor._SIGNER_CLOSE_TIMEOUT_SECONDS", 0.01)
+    session = _session(tmp_path, signer)
+    session._request = AsyncMock(return_value={"result": {}})
+    await session.start()
+
+    close_task = asyncio.create_task(session.close())
+    await signer.closing.wait()
+    close_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    terminate.assert_called_once_with(process)
+    assert not session.cleaned
+    assert session._proc is None
+    assert session._signer is signer
+
+
+async def test_cancelled_start_reclaims_worker_prepared_in_background_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _Signer([])
+    worker = Mock(launch_path="/private/sandbox-launcher", sandboxed=True)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _prepare(**kwargs: object) -> Mock:
+        del kwargs
+        started.set()
+        assert release.wait(timeout=5)
+        return worker
+
+    spawn = AsyncMock()
+    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", _prepare)
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    session = _session(tmp_path, signer)
+
+    start_task = asyncio.create_task(session.start())
+    assert await asyncio.to_thread(started.wait, 5)
+    start_task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    worker.close.assert_called_once_with()
+    spawn.assert_not_awaited()
+    assert session.cleaned
+
+
+async def test_concurrent_close_during_spawn_reaps_returned_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _Signer([])
+    worker = Mock(launch_path="/private/sandbox-launcher", sandboxed=True)
+    process = _Process()
+    spawning = asyncio.Event()
+    release = asyncio.Event()
+    terminate = Mock(side_effect=lambda proc: setattr(proc, "returncode", 0))
+
+    async def _spawn(*args: object, **kwargs: object) -> _Process:
+        del args, kwargs
+        spawning.set()
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        Mock(return_value=worker),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _spawn)
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
+    session = _session(tmp_path, signer)
+
+    start_task = asyncio.create_task(session.start())
+    await spawning.wait()
+    close_task = asyncio.create_task(session.close())
+    release.set()
+    with pytest.raises(RuntimeError, match="closed during worker spawn"):
+        await start_task
+    await close_task
+
+    terminate.assert_called_once_with(process)
+    assert session._proc is None
+    assert session.cleaned
 
 
 async def test_cancelled_start_closes_partially_started_signer(tmp_path: Path) -> None:

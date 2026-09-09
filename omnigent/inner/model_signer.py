@@ -15,7 +15,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from . import _proc
-from ._subprocess_lifecycle import close_subprocess_transport
+from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
@@ -223,41 +223,53 @@ class SubprocessModelSigner:
         proc = self._proc
         if proc is None:
             return
-        if proc.returncode is None:
-            if proc.stdin is not None:
+        try:
+            if proc.returncode is None and proc.stdin is not None:
                 try:
                     proc.stdin.write(b"shutdown\n")
-                    await proc.stdin.drain()
-                except (BrokenPipeError, ConnectionError):
+                    await asyncio.wait_for(proc.stdin.drain(), timeout=1)
+                except (asyncio.TimeoutError, BrokenPipeError, ConnectionError):
                     pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=_SHUTDOWN_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                _proc.terminate_tree(proc)
+            if proc.returncode is None:
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=2)
+                    await asyncio.wait_for(proc.wait(), timeout=_SHUTDOWN_TIMEOUT_SECONDS)
                 except asyncio.TimeoutError:
+                    await terminate_subprocess(
+                        proc,
+                        terminate_timeout=2,
+                        kill_timeout=1,
+                        label="model signer",
+                    )
+                else:
                     _proc.kill_tree(proc)
-                    await proc.wait()
-        else:
-            # The signer leader may have exited while a helper inherited its
-            # process group. A completed Process handle is not proof that the
-            # group is empty.
-            _proc.kill_tree(proc)
-        close_subprocess_transport(proc)
-        self._readiness = None
+            else:
+                await terminate_subprocess(
+                    proc,
+                    terminate_timeout=0,
+                    kill_timeout=1,
+                    label="model signer",
+                )
+        finally:
+            if proc.returncode is None:
+                _proc.kill_tree(proc)
+            close_subprocess_transport(proc)
+            self._readiness = None
 
     async def _abort(self) -> None:
         proc = self._proc
         if proc is None:
             return
-        _proc.terminate_tree(proc)
         try:
-            await asyncio.wait_for(proc.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            _proc.kill_tree(proc)
-            await proc.wait()
-        close_subprocess_transport(proc)
+            await terminate_subprocess(
+                proc,
+                terminate_timeout=2,
+                kill_timeout=1,
+                label="model signer startup",
+            )
+        finally:
+            if proc.returncode is None:
+                _proc.kill_tree(proc)
+            close_subprocess_transport(proc)
 
 
 def _parse_readiness(line: bytes, config: SignerLaunchConfig) -> SignerReadiness:

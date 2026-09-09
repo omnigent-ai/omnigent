@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import subprocess
+import time
 import weakref
 from contextlib import suppress
 from typing import Protocol, TypedDict
@@ -84,6 +85,11 @@ _getpgid_fn = getattr(os, "getpgid", None)
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 _CREATE_NEW_PROCESS_GROUP = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
 _owned_process_groups: weakref.WeakKeyDictionary[object, int] = weakref.WeakKeyDictionary()
+_owned_process_identities: weakref.WeakKeyDictionary[object, dict[int, float]] = (
+    weakref.WeakKeyDictionary()
+)
+_CENSUS_MAX_ITERATIONS = 3
+_CENSUS_MAX_SECONDS = 0.05
 
 
 class SpawnKwargs(TypedDict, total=False):
@@ -140,6 +146,23 @@ def remember_process_group(process: _ProcessLike) -> None:
             _owned_process_groups[process] = pgid
     except (ProcessLookupError, PermissionError, OSError, TypeError):
         return
+    identities = _snapshot_identities(pid)
+    if identities:
+        with suppress(TypeError):
+            _owned_process_identities[process] = identities
+
+
+def refresh_process_tree(process: _ProcessLike | None) -> None:
+    """Add currently observable descendants without adopting a reused root PID."""
+    if process is None or process.pid is None or process.returncode is not None:
+        return
+    pid = process.pid
+    remembered = _remember_identities(process, {})
+    current = _snapshot_identities(pid)
+    expected_root = remembered.get(pid)
+    if expected_root is not None and current.get(pid) != expected_root:
+        return
+    _remember_identities(process, current)
 
 
 def _owned_process_group(process: _ProcessLike, *, remove: bool = False) -> int | None:
@@ -199,6 +222,102 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def _snapshot_identities(pid: int) -> dict[int, float]:
+    """Snapshot a process tree using PID plus creation time identity."""
+    identities: dict[int, float] = {}
+    for proc in _walk_descendants(pid):
+        if proc.pid <= 1 or proc.pid == os.getpid():
+            continue
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            identities[proc.pid] = proc.create_time()
+    return identities
+
+
+def _remember_identities(
+    process: _ProcessLike,
+    identities: dict[int, float],
+    *,
+    remove: bool = False,
+) -> dict[int, float]:
+    try:
+        if remove:
+            remembered = _owned_process_identities.pop(process, {})
+            remembered.update(identities)
+        else:
+            remembered = _owned_process_identities.get(process, {})
+            remembered.update(identities)
+            _owned_process_identities[process] = remembered
+        return dict(remembered)
+    except TypeError:
+        return dict(identities)
+
+
+def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
+    """Signal only PIDs whose current creation time matches the snapshot."""
+    for pid, create_time in identities.items():
+        if pid <= 1 or pid == os.getpid():
+            continue
+        try:
+            proc = psutil.Process(pid)
+            if proc.create_time() != create_time:
+                continue
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
+def _identity_in_group(identities: dict[int, float], pgid: int) -> bool:
+    """Whether the group still contains at least one identity we observed."""
+    if _getpgid_fn is None:
+        return False
+    for pid, create_time in identities.items():
+        try:
+            proc = psutil.Process(pid)
+            if proc.create_time() == create_time and _getpgid_fn(pid) == pgid:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return False
+
+
+def _signal_tree_census(
+    process: _ProcessLike,
+    pid: int,
+    *,
+    force: bool,
+    remove: bool,
+    snapshot_root: bool,
+) -> dict[int, float]:
+    """Signal a bounded union of remembered and currently observable descendants."""
+    remembered = _remember_identities(process, {}, remove=False)
+    current = _snapshot_identities(pid) if snapshot_root else {}
+    expected_root = remembered.get(pid)
+    if expected_root is not None and current.get(pid) != expected_root:
+        # The direct child was already reaped and its PID was reused. Never
+        # adopt the replacement process or its descendants into this tree.
+        current = {}
+        snapshot_root = False
+    identities = _remember_identities(process, current, remove=remove)
+    deadline = time.monotonic() + _CENSUS_MAX_SECONDS
+    for _ in range(_CENSUS_MAX_ITERATIONS):
+        current = _snapshot_identities(pid) if snapshot_root else {}
+        if expected_root is not None and current.get(pid) != expected_root:
+            current = {}
+            snapshot_root = False
+        before = len(identities)
+        identities.update(current)
+        _signal_identities(identities, force=force)
+        if len(identities) == before or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    if not remove:
+        _remember_identities(process, identities)
+    return identities
+
+
 def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     """
     Gracefully stop ``process`` and all of its descendants.
@@ -223,16 +342,23 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     owned_pgid = _owned_process_group(process)
     if process.returncode is not None and owned_pgid is None:
         return
-    if _killpg(pid, signal.SIGTERM, owned_pgid=owned_pgid):
-        if grace:
-            _wait_gone(pid, grace)
-        return
-
-    procs = _walk_descendants(pid)
-    for proc in procs:
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            proc.terminate()
-    if not procs:
+    leader_live = process.returncode is None
+    observed = _remember_identities(process, {})
+    current = _snapshot_identities(pid) if leader_live else {}
+    if observed.get(pid) is not None and current.get(pid) != observed[pid]:
+        current = {}
+        leader_live = False
+    observed = _remember_identities(process, current)
+    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    identities = _signal_tree_census(
+        process,
+        pid,
+        force=False,
+        remove=False,
+        snapshot_root=leader_live,
+    )
+    group_signaled = group_is_owned and _killpg(pid, signal.SIGTERM, owned_pgid=owned_pgid)
+    if not group_signaled and not identities:
         with suppress(Exception):
             process.terminate()
     if grace:
@@ -258,14 +384,23 @@ def kill_tree(process: _ProcessLike | None) -> None:
     owned_pgid = _owned_process_group(process, remove=True)
     if process.returncode is not None and owned_pgid is None:
         return
-    if _killpg(pid, _SIGKILL, owned_pgid=owned_pgid):
-        return
-
-    procs = _walk_descendants(pid)
-    for proc in procs:
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            proc.kill()
-    if not procs:
+    leader_live = process.returncode is None
+    observed = _remember_identities(process, {})
+    current = _snapshot_identities(pid) if leader_live else {}
+    if observed.get(pid) is not None and current.get(pid) != observed[pid]:
+        current = {}
+        leader_live = False
+    observed = _remember_identities(process, current)
+    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    identities = _signal_tree_census(
+        process,
+        pid,
+        force=True,
+        remove=True,
+        snapshot_root=leader_live,
+    )
+    group_signaled = group_is_owned and _killpg(pid, _SIGKILL, owned_pgid=owned_pgid)
+    if not group_signaled and not identities:
         with suppress(Exception):
             process.kill()
 
