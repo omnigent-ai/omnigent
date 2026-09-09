@@ -102,6 +102,13 @@ describe("sandboxOptionLabel", () => {
   it("humanizes underscores in unknown provider ids", () => {
     expect(sandboxOptionLabel("foo_bar")).toBe("Foo Bar Sandbox");
   });
+
+  it.each([
+    ["_foo", "Foo Sandbox"],
+    ["foo__bar", "Foo Bar Sandbox"],
+  ])("avoids stray spaces when humanizing %s", (provider, expected) => {
+    expect(sandboxOptionLabel(provider)).toBe(expected);
+  });
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
