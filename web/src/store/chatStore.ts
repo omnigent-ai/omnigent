@@ -1400,6 +1400,7 @@ const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 // instantly.
 const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
+export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
 // A reverse proxy serves 404 for the stream route for the ~10-60s a backend
 // container takes to restart (upgrade, config change, re-seed bounce), so a
 // 404 mid-restart must not be treated as permanent. Bound the retries instead
@@ -3992,6 +3993,62 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
 }
 
 /**
+ * Reconcile the visible conversation's lifecycle from its persisted snapshot.
+ *
+ * A stream can keep receiving heartbeats while missing a real lifecycle event.
+ * The byte-stall guard cannot detect that semantic gap, so periodically re-read
+ * durable status while the stream remains open. If a live event changes the
+ * entry during the fetch, discard the older snapshot.
+ */
+async function reconcileActiveSessionStatus(
+  id: string,
+  controller: AbortController,
+  set: Setter,
+  get: Getter,
+): Promise<void> {
+  if (
+    queryClient === null ||
+    controller.signal.aborted ||
+    conversationRegistry.getActive()?.id !== id ||
+    get().abortController !== controller
+  ) {
+    return;
+  }
+  const stateBeforeFetch = get();
+  let session: Session;
+  try {
+    session = await queryClient.fetchQuery({
+      queryKey: ["session", id],
+      queryFn: () => getSessionSlim(id),
+      staleTime: 0,
+      retry: false,
+    });
+  } catch {
+    return;
+  }
+  const current = get();
+  if (
+    controller.signal.aborted ||
+    isConversationDisposed(id) ||
+    conversationRegistry.getActive()?.id !== id ||
+    get().abortController !== controller ||
+    current.sessionStatus !== stateBeforeFetch.sessionStatus ||
+    current.status !== stateBeforeFetch.status ||
+    current.activeResponse !== stateBeforeFetch.activeResponse ||
+    current.backgroundTaskCount !== stateBeforeFetch.backgroundTaskCount ||
+    current.backgroundTasks !== stateBeforeFetch.backgroundTasks ||
+    current.mcpStartup !== stateBeforeFetch.mcpStartup ||
+    current.contextWindow !== stateBeforeFetch.contextWindow ||
+    current.tokensUsed !== stateBeforeFetch.tokensUsed ||
+    current.sessionCostUsd !== stateBeforeFetch.sessionCostUsd ||
+    current.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
+  ) {
+    return;
+  }
+  set((s) => reconnectStatusPatch(session, s));
+}
+
+/**
  * Reconcile rendered ApprovalCards against a reconnect snapshot's
  * pending-elicitation list.
  *
@@ -4466,6 +4523,17 @@ export async function startStreamPump(
   get: Getter,
 ): Promise<void> {
   let failedOpens = 0;
+  let statusReconcileInFlight = false;
+  const statusReconcileTimer =
+    typeof window === "undefined"
+      ? null
+      : window.setInterval(() => {
+          if (statusReconcileInFlight) return;
+          statusReconcileInFlight = true;
+          void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
+            statusReconcileInFlight = false;
+          });
+        }, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
   // Consecutive 404s only — reset on any non-404 outcome (success or a
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
@@ -4634,6 +4702,7 @@ export async function startStreamPump(
       }
     }
   } finally {
+    if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
     if (get().abortController === controller) {
       set({ abortController: null });
     }
