@@ -88,7 +88,7 @@ class NativeHarnessProvider:
     ``NativeCodingAgent`` is pure identity data; behavior lives here as a
     sibling row keyed by the same ``key``. Every value is a dotted import path
     (``module:attr`` or ``module.attr``) resolved lazily at dispatch time via
-    :mod:`omnigent.native_dispatch`, so building the registry never imports the
+    :mod:`omnigent.native.native_dispatch`, so building the registry never imports the
     runner / CLI / native-harness stack. Optional hooks are ``None`` when the
     behavior is not yet a module-level function the resolver can reach (e.g.
     interrupt/stop handlers that are still runner closures, or the inline
@@ -258,21 +258,26 @@ _BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "an
 def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     """Build a built-in provider row from the ``omnigent.<key>_native`` module.
 
-    The built-in native harnesses follow a uniform module layout: each exports
+    The built-in native harnesses follow a uniform package layout under
+    ``omnigent.harnesses.<key>_native``: the ``.main`` module exports
     ``run_<key>_native`` (CLI + resume launch) and ``_materialize_<key>_agent_spec``
-    (agent seeding), exposes a ``_launch_<key>`` terminal adapter in
-    ``omnigent.runner.native``, and exposes ``build_<key>_native_spawn_env`` in
-    ``omnigent.<key>_native_bridge``. The remaining hooks (interrupt, stop,
-    bridge-dir) are still runner-local closures / inline dispatch, so they stay
-    ``None`` until those hubs migrate onto the seam.
+    (agent seeding), a ``_launch_<key>`` terminal adapter lives in
+    ``omnigent.runner.native``, and ``build_<key>_native_spawn_env`` lives in the
+    ``.bridge`` submodule. The remaining hooks (interrupt, stop, bridge-dir) are
+    still runner-local closures / inline dispatch, so they stay ``None`` until
+    those hubs migrate onto the seam.
     """
-    module = f"omnigent.{key}_native"
+    pkg = f"omnigent.harnesses.{key}_native"
+    module = f"{pkg}.main"
     return NativeHarnessProvider(
         key=key,
         run_native=f"{module}:run_{key}_native",
         auto_create_terminal=f"omnigent.runner.native:_launch_{key}",
-        spawn_env_builder=f"{module}_bridge:build_{key}_native_spawn_env",
-        bridge_id_label_key=(f"{module}.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None),
+        spawn_env_builder=f"{pkg}.bridge:build_{key}_native_spawn_env",
+        # Session label key — a stable wire identifier, not a module path.
+        bridge_id_label_key=(
+            f"omnigent.{key}_native.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None
+        ),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
     )
 

@@ -14,10 +14,10 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -574,7 +574,7 @@ def register_hooks_routes(
         ``data`` for content-rewriting policies.
 
         Used by Claude Code's ``PreToolUse`` and ``PostToolUse``
-        command hooks (via ``omnigent.claude_native_hook``) to
+        command hooks (via ``omnigent.harnesses.claude_native.hook``) to
         evaluate admin policies on native tool calls. Also usable
         by any client that speaks the proto-compatible JSON schema.
 
@@ -953,6 +953,19 @@ def register_hooks_routes(
         add_audit_attrs(policy_verdict=resp_body["result"], policy_phase=phase.value)
         if result.reason:
             add_audit_attrs(policy_reason=result.reason)
+        # Emit a structured log for non-ALLOW verdicts so operators can diagnose
+        # policy evaluation failures without needing audit-log access.
+        if result.action in (PolicyAction.DENY, PolicyAction.ASK):
+            _logger.info(
+                "policy_eval_verdict: session=%s phase=%s action=%s policy=%s reason=%r tool=%s",
+                session_id,
+                phase.value,
+                result.action.value,
+                result.deciding_policy,
+                result.reason,
+                (data.get("name") if isinstance(data, dict) else None),
+                extra={"session_id": session_id},
+            )
         _policy_tool = data.get("name") if isinstance(data, dict) else None
         if _policy_tool:
             add_audit_attrs(policy_tool=_policy_tool)
@@ -1204,7 +1217,7 @@ def register_hooks_routes(
 
         Receives a tool-approval prompt detected on the ``cursor-agent`` TUI
         pane by the runner-side mirror
-        (:mod:`omnigent.cursor_native_permissions`), publishes the standard
+        (:mod:`omnigent.harnesses.cursor_native.permissions`), publishes the standard
         ``response.elicitation_request`` event for the web UI, then parks for
         the session ``approval`` verdict — the same registry / publish /
         cleanup path as the Codex- and Claude-native hooks, so pending badges

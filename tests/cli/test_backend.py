@@ -329,6 +329,7 @@ def test_ensure_host_daemon_reuses_same_target(
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
     (tmp_path / "host.pid").write_text("4242\nlocal\n")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
 
     _ensure_host_daemon(None)
@@ -349,6 +350,7 @@ def test_ensure_host_daemon_keeps_other_target_daemons(
     captured: dict[str, object] = {}
     killed: list[int] = []
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append(pid))
 
@@ -376,6 +378,7 @@ def test_ensure_host_daemon_local_daemon_serves_requested_url_is_noop(
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
     (tmp_path / "host.pid").write_text("4242\nlocal\n")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123")
 
@@ -406,6 +409,7 @@ def test_ensure_host_daemon_reuses_healthy_background_daemon(
         config_sig=sig,
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Old enough to be eligible for the tunnel-health check, and online.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
@@ -444,6 +448,7 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_new")
     torn_down: list[str] = []
@@ -455,6 +460,47 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
 
     assert len(torn_down) == 1 and "identity" in torn_down[0]
     assert "args" in captured
+
+
+@pytest.mark.parametrize(
+    "configured_host_id",
+    [
+        "host_329c39d03aad39ccf2f8597d596676bd",
+        "329c39d0-3aad-39cc-f2f8-597d596676bd",
+    ],
+)
+def test_ensure_host_daemon_reuses_equivalent_host_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured_host_id: str,
+) -> None:
+    """Legacy and dashed forms do not replace a daemon using the bare UUID."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    target = "https://server.example.com"
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        host_id="329c39d03aad39ccf2f8597d596676bd",
+        config_sig=cli.server_config_signature(),
+    )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_load_existing_host_id", lambda: configured_host_id)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    _ensure_host_daemon(target)
+
+    assert "args" not in captured
+    assert torn_down == []
 
 
 def test_ensure_host_daemon_respawns_on_config_drift(
@@ -480,6 +526,7 @@ def test_ensure_host_daemon_respawns_on_config_drift(
         config_sig="stale-signature-0000",
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     torn_down: list[str] = []
     monkeypatch.setattr(
@@ -514,6 +561,7 @@ def test_ensure_host_daemon_heals_offline_tunnel(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Old enough to be past the min-age grace; tunnel does not recover.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
@@ -551,6 +599,7 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Younger than _DAEMON_REUSE_MIN_AGE_S → skip the tunnel-health teardown.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_002.0)
@@ -579,6 +628,7 @@ def test_concurrent_ensure_host_daemon_elects_one_daemon(
     monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
     live_pids: set[int] = set()
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid in live_pids)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
 
     both_spawned = threading.Barrier(2)
     spawn_count = 0
@@ -931,6 +981,7 @@ def test_foreground_connect_refuses_duplicate_live_daemon(
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid == 4242)
     _write_daemon_registry_record(
         tmp_path,
@@ -1130,6 +1181,34 @@ def test_host_reset_id_declined_prompt_leaves_id_untouched(
     assert cfg["host"]["host_id"] == "a" * 32
 
 
+def test_host_reset_id_refuses_when_env_override_pins_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With OMNIGENT_HOST_ID set, reset-id refuses instead of a silent no-op.
+
+    An env override makes the host read its identity from the environment,
+    ignoring config.yaml — so writing a fresh id to the file would be
+    ignored by the next `omnigent host`. The command must fail loud (naming
+    the env vars to unset) rather than print a reset that has no effect.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "b" * 32)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-host")
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code != 0
+    assert "OMNIGENT_HOST_ID" in result.output
+    # The persisted id is untouched — no misleading "reset" happened.
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32
+
+
 def test_foreground_connect_local_prompts_after_keyboard_interrupt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1257,6 +1336,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
 ) -> None:
     """``host status --json`` includes daemon, host, runner, and sessions."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     _write_daemon_registry_record(
         tmp_path,
@@ -1320,6 +1400,7 @@ def test_host_status_reports_unreachable_daemon_without_traceback(
 ) -> None:
     """``host status`` renders per-daemon connection failures."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     _write_daemon_registry_record(
         tmp_path,
@@ -1525,6 +1606,10 @@ def test_host_stop_stops_sessions_before_daemon(
         path = str(kwargs["path"])
         events.append((method, path))
         if method == "GET" and path == "/v1/sessions":
+            assert kwargs["params"] == {
+                "limit": 1000,
+                "include_archived": "true",
+            }
             return cli._HostHttpResult(
                 status_code=200,
                 body={
@@ -1534,7 +1619,19 @@ def test_host_stop_stops_sessions_before_daemon(
                             "host_id": "host_abc",
                             "status": "running",
                             "runner_id": "runner_abc",
-                        }
+                        },
+                        {
+                            "id": "conv_idle",
+                            "host_id": "host_abc",
+                            "status": "idle",
+                            "runner_id": "runner_idle",
+                        },
+                        {
+                            "id": "conv_failed",
+                            "host_id": "host_abc",
+                            "status": "failed",
+                            "runner_id": "runner_failed",
+                        },
                     ]
                 },
             )
@@ -1567,7 +1664,112 @@ def test_host_stop_stops_sessions_before_daemon(
         ("POST", "/v1/sessions/conv_owned/events"),
         ("TERM", "https://server.example.com"),
     ]
+    assert "Stopping 1 active session(s)..." in result.output
+    assert "Stopped session conv_owned (1/1)." in result.output
     assert "sessions_stopped=1" in result.output
+
+
+def test_host_stop_bounds_parallel_session_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Graceful shutdown overlaps session stops without unbounded fan-out."""
+    sessions = [{"id": f"conv_{index}", "status": "running"} for index in range(12)]
+
+    def _fake_sessions(
+        record: cli._HostDaemonRecord, *, connected_only: bool = False
+    ) -> cli._DaemonSessionsResult:
+        del record
+        assert connected_only is False
+        return cli._DaemonSessionsResult(
+            base_url="https://server.example.com",
+            sessions=sessions,
+            error=None,
+        )
+
+    monkeypatch.setattr(cli, "_sessions_for_daemon", _fake_sessions)
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    workers_started = threading.Event()
+    release_workers = threading.Event()
+
+    def _fake_stop(*, base_url: str, session_id: str) -> None:
+        nonlocal active, peak
+        assert base_url == "https://server.example.com"
+        assert session_id.startswith("conv_")
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == cli._HOST_SESSION_STOP_MAX_WORKERS:
+                workers_started.set()
+        assert release_workers.wait(timeout=2)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(cli, "_stop_session_on_server", _fake_stop)
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+    )
+    outcome: list[int] = []
+    worker = threading.Thread(target=lambda: outcome.append(cli._stop_daemon_sessions(record)))
+    worker.start()
+    assert workers_started.wait(timeout=2)
+    release_workers.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert outcome == [12]
+    assert peak == cli._HOST_SESSION_STOP_MAX_WORKERS
+
+
+def test_host_stop_failure_leaves_daemon_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed graceful session stop prevents daemon termination."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_sessions_for_daemon",
+        lambda record, *, connected_only=False: cli._DaemonSessionsResult(
+            base_url="https://server.example.com",
+            sessions=[
+                {"id": "conv_ok", "status": "waiting"},
+                {"id": "conv_failed", "status": "running"},
+            ],
+            error=None,
+        ),
+    )
+
+    def _fake_stop(*, base_url: str, session_id: str) -> None:
+        del base_url
+        if session_id == "conv_failed":
+            raise click.ClickException("runner unavailable")
+
+    monkeypatch.setattr(cli, "_stop_session_on_server", _fake_stop)
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated after a failed session stop"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code != 0
+    assert "Failed session conv_failed" in result.output
+    assert "Failed to stop 1 of 2 active session(s); daemon left running" in result.output
 
 
 def test_host_stop_daemon_only_skips_session_stop(
@@ -1645,10 +1847,10 @@ def test_host_stop_session_list_timeout_points_at_force(
     assert "--daemon-only" in result.output
 
 
-def test_host_stop_force_terminates_after_session_list_timeout(
+def test_host_stop_force_skips_session_stop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``--force`` stops the daemon when the session pre-check times out."""
+    """``--force`` terminates immediately without making session API calls."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     _write_daemon_registry_record(
         tmp_path,
@@ -1660,10 +1862,7 @@ def test_host_stop_force_terminates_after_session_list_timeout(
     monkeypatch.setattr(
         cli,
         "_host_http_json",
-        lambda **kwargs: cli._HostHttpResult(
-            status_code=0,
-            body="ReadTimeout: The read operation timed out",
-        ),
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
     )
     terminated: list[str] = []
     monkeypatch.setattr(
@@ -1954,7 +2153,7 @@ def test_claude_command_routes_server_through_ensure_backend(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native",
+        "omnigent.harnesses.claude_native.main.run_claude_native",
         _fake_run_claude_native_capture(captured),
     )
 

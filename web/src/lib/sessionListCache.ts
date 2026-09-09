@@ -312,6 +312,33 @@ export function mergeItemsIntoPages(
   return { data: { ...data, pages }, found, needsRefetch };
 }
 
+// ── Recently-created keep-alive ───────────────────────────────────────
+//
+// The push stream inserts a just-created session into the sidebar instantly
+// (SessionUpdatesProvider → insertNewRowsIntoPages), but the create path also
+// fires a `["conversations"]` refetch, and on the search-indexed deployment
+// that fetch lags the write — so it comes back WITHOUT the new session and
+// replaces the cache, dropping the row until the index catches up (it flashes
+// in, then out). We keep the row in the first-page fetch until the index
+// reflects it — the additive mirror of the delete tombstone. Lives in this
+// leaf module so both `useConversations` (the reader) and the chat store (the
+// optimistic-create writer) can reach it without an import cycle.
+export const recentlyCreatedSessions = new Map<string, Conversation>();
+
+/** Grace window for the server's async create reindex. */
+const CREATED_KEEPALIVE_MS = 60_000;
+
+/** Keep a just-created session in the first-page list fetch until it's indexed. */
+export function markRecentlyCreated(conv: Conversation): void {
+  recentlyCreatedSessions.set(conv.id, conv);
+  setTimeout(() => recentlyCreatedSessions.delete(conv.id), CREATED_KEEPALIVE_MS);
+}
+
+/** Clear the keep-alive map — exported for test cleanup (mirrors `unmarkSessionsDeleting`). */
+export function clearRecentlyCreated(): void {
+  recentlyCreatedSessions.clear();
+}
+
 /**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced

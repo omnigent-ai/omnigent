@@ -298,7 +298,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("workspace" in body).toBe(false);
   });
 
-  it("keeps a non-project visit's body unchanged: no project_id, all fields explicit", async () => {
+  it("keeps a non-project visit explicit and adds only the create token label", async () => {
     searchParams = new URLSearchParams("");
     localStorage.setItem("omnigent:last-agent-id", "ag_hello");
     renderLanding();
@@ -307,12 +307,13 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     );
 
     const body = await submitAndReadBody();
-    // Byte-identical to the pre-project_id shape: exactly the explicit
-    // fields, nothing new riding along.
-    expect(Object.keys(body).sort()).toEqual(["agent_id", "host_id", "workspace"]);
+    expect(Object.keys(body).sort()).toEqual(["agent_id", "host_id", "labels", "workspace"]);
     expect(body.agent_id).toBe("ag_hello");
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
+    expect(body.labels).toEqual({
+      "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+    });
   });
 
   it("skips the post-create move when project_id was sent (atomic server-side filing)", async () => {

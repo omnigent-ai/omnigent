@@ -24,9 +24,10 @@ from urllib.error import URLError
 
 import pytest
 
-from omnigent import claude_native_bridge, native_cost_popup
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
+    _LOGIN_GUIDANCE,
     _build_tools,
     _claude_prompt_rendered,
     _escape_unsupported_slash_command,
@@ -39,6 +40,7 @@ from omnigent.claude_native_bridge import (
     ensure_claude_workspace_trusted,
     inject_interrupt,
     inject_user_message,
+    is_auth_slash_command,
     kill_session,
     post_tools_changed,
     prepare_bridge_dir,
@@ -63,7 +65,8 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
 )
-from omnigent.reasoning_effort import CLAUDE_EFFORTS
+from omnigent.native import native_cost_popup
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 
 @pytest.fixture(autouse=True)
@@ -75,8 +78,8 @@ def _trust_tmp_bridge_parent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
 
 
 def _composer_pane(draft: str = "") -> str:
@@ -111,7 +114,7 @@ def subprocess_bridge_root() -> Iterator[Path]:
 
     :yields: Temporary directory path under the production trusted
         Claude bridge root, so a child
-        ``python -m omnigent.claude_native_bridge`` accepts bridge
+        ``python -m omnigent.harnesses.claude_native.bridge`` accepts bridge
         writes without inheriting pytest monkeypatches.
     """
     production_root = (
@@ -254,8 +257,8 @@ def test_prepare_bridge_dir_preserves_token_and_updates_runtime(
     old token.
     """
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     first = prepare_bridge_dir(
         "conv_abc",
@@ -290,8 +293,8 @@ def test_prepare_bridge_dir_preserves_permission_hook_config(
     web UI (a regression we guard against).
     """
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     # ``augment_claude_args`` is the production path that writes
@@ -330,8 +333,10 @@ def test_prepare_bridge_dir_restricts_filesystem_permissions(
     """
     import stat
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
 
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     bridge_json = bridge_dir / "bridge.json"
@@ -370,8 +375,8 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     symlink = tmp_path / "claude-native"
     symlink.symlink_to(attacker_dir, target_is_directory=True)
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", symlink)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", symlink)
 
     with pytest.raises(RuntimeError, match="symlink"):
         prepare_bridge_dir("conv_abc", workspace=tmp_path)
@@ -552,12 +557,14 @@ def test_trusted_parent_accepts_qwen_native_bridge_dir(
     root`` and the relay never starts (observed in a live runner log). This
     pins the qwen-native branch so the regression can't return.
     """
-    from omnigent import qwen_native_bridge
+    from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 
     # Distinct claude root so the qwen target can't match the claude branch
     # first (the autouse fixture points the claude root at ``tmp_path``).
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     # qwen root mirrors production shape: <uid-scoped temp>/qwen-native.
     qwen_root = tmp_path / "omnigent-test" / "qwen-native"
     monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
@@ -583,12 +590,14 @@ def test_trusted_parent_accepts_kiro_native_bridge_dir(
     and the relay (and serve-mcp's own ``server.json`` write) never start. This
     pins the kiro-native branch.
     """
-    from omnigent import kiro_native_bridge
+    from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 
     # Distinct claude root so the kiro target can't match the claude branch
     # first (the autouse fixture points the claude root at ``tmp_path``).
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     # kiro root mirrors production shape: <uid-scoped temp>/kiro-native.
     kiro_root = tmp_path / "omnigent-test" / "kiro-native"
     monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", kiro_root)
@@ -605,12 +614,14 @@ def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A path under no known root is refused, and the error names the qwen root."""
-    from omnigent import qwen_native_bridge
+    from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 
     # Distinct claude root so ``outside`` below isn't swept under it (the autouse
     # fixture points the claude root at ``tmp_path``).
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     qwen_root = tmp_path / "omnigent-test" / "qwen-native"
     monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
 
@@ -811,7 +822,7 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
                         "message": {
                             "role": "assistant",
                             "content": [
-                                {"type": "thinking", "thinking": "redacted"},
+                                {"type": "thinking", "thinking": "check the todo file first"},
                                 {
                                     "type": "tool_use",
                                     "id": "toolu_read_1",
@@ -876,6 +887,7 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
     assert cursor == 6, "cursor should include metadata records even when they emit no items"
     assert [item.item_type for item in items] == [
         "message",
+        "reasoning",
         "function_call",
         "function_call_output",
         "message",
@@ -884,19 +896,115 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
         "role": "user",
         "content": [{"type": "input_text", "text": "please inspect TODO.md"}],
     }
-    tool_call = items[1]
+    reasoning = items[1]
+    assert reasoning.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "check the todo file first"}],
+    }
+    tool_call = items[2]
     assert tool_call.data["name"] == "Read"
     assert json.loads(tool_call.data["arguments"]) == {"file_path": "TODO.md"}
     assert tool_call.data["call_id"] == "toolu_read_1"
-    assert items[2].response_id == tool_call.response_id
-    assert items[2].data == {"call_id": "toolu_read_1", "output": "TODO contents"}
+    assert reasoning.response_id == tool_call.response_id
     assert items[3].response_id == tool_call.response_id
-    assert items[3].data == {
+    assert items[3].data == {"call_id": "toolu_read_1", "output": "TODO contents"}
+    assert items[4].response_id == tool_call.response_id
+    assert items[4].data == {
         "role": "assistant",
         "agent": "claude-native-ui",
         "content": [{"type": "output_text", "text": "Done."}],
     }
     assert current_response_id == tool_call.response_id
+
+
+def test_read_transcript_items_since_mirrors_thinking_as_reasoning(tmp_path: Path) -> None:
+    """
+    A ``thinking`` block becomes a ``reasoning`` item in the mirrored turn.
+
+    Claude Code renders the thought in the TUI and persists it to the
+    transcript, so the chat mirror must surface the same reasoning
+    context: a ``reasoning`` item sharing the turn's response id,
+    ordered before the answer text it precedes.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "the user wants the token verbatim",
+                            "signature": "sig",
+                        },
+                        {"type": "text", "text": "TOKEN"},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["reasoning", "message"]
+    reasoning, answer = items
+    assert reasoning.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "the user wants the token verbatim"}],
+    }
+    assert reasoning.source_id.endswith(":0:reasoning"), (
+        "reasoning items need a stable per-block source id so forwarder retries dedup"
+    )
+    assert reasoning.response_id == answer.response_id
+    assert current_response_id == answer.response_id
+
+
+def test_read_transcript_items_since_skips_unreadable_thinking(tmp_path: Path) -> None:
+    """
+    Thinking with no readable text mirrors nothing.
+
+    A whitespace-only ``thinking`` block and a ``redacted_thinking``
+    block (encrypted payload, no text anywhere — the TUI shows nothing
+    either) must not produce a dead, empty reasoning section in chat.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "   "},
+                        {"type": "redacted_thinking", "data": "opaque-bytes"},
+                        {"type": "text", "text": "Done."},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
 
 
 def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
@@ -1126,6 +1234,15 @@ def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: 
     assert noop.data["kind"] == "command"
     assert noop.data["output"] == stdout.strip()
 
+    byte_result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+    record_items = [item for record in byte_result.record_items for item in record.items]
+    assert record_items == byte_result.items
+
 
 def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:
     """
@@ -1191,6 +1308,182 @@ def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str)
     assert "Context limit reached" in text
     assert "/compact" in text
     assert "/clear" in text
+
+
+def _assistant_transcript_text(
+    tmp_path: Path,
+    raw_text: str,
+    *,
+    is_api_error: bool = False,
+) -> str:
+    """
+    Return the display text the bridge produces for one assistant record.
+
+    :param tmp_path: Directory to hold the throwaway transcript.
+    :param raw_text: Assistant message content written to the JSONL.
+    :param is_api_error: Write Claude Code's ``isApiErrorMessage`` flag
+        beside ``message``, marking the record as CLI-authored.
+    :returns: Text of the single parsed conversation item.
+    """
+    record: dict[str, Any] = {
+        "type": "assistant",
+        "uuid": "auth-1",
+        "message": {"role": "assistant", "content": raw_text},
+    }
+    if is_api_error:
+        record["isApiErrorMessage"] = True
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(record) + "\n",
+        encoding="utf-8",
+    )
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+    assert len(items) == 1
+    return str(items[0].data["content"][0]["text"])
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Prose ABOUT the command — including a turn explaining this very
+        # rewrite — must survive untouched.
+        "You can run /login to sign in again.",
+        "The CLI says: Please run /login\nBut the web chat cannot send it.",
+        "Please run /clear",
+        # Byte-identical to the CLI's error, but UNFLAGGED. Without the
+        # flag there is nothing to tell it apart from a model quoting
+        # the line, and replacing a real turn would delete an answer the
+        # user asked for — so it is forwarded as-is.
+        "Login expired · Please run /login",
+    ],
+)
+def test_read_transcript_leaves_unflagged_login_text_untouched(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    Only a CLI-flagged record gets the guidance, never an unflagged one.
+
+    Appending remedy text to a real model answer that merely mentions
+    ``/login`` would misdirect the user. ``isApiErrorMessage`` is the
+    only evidence that the text is not model output; without it,
+    nothing is touched.
+    """
+    assert _assistant_transcript_text(tmp_path, raw_text) == raw_text
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Verbatim constants from the claude binary (2.1.212). The last
+        # two do NOT end in "Please run /login", so the unflagged
+        # single-line anchor alone would miss them.
+        "Login expired · Please run /login",
+        "OAuth token revoked · Please run /login",
+        "Your organization has disabled API key authentication · Run /login "
+        "to sign in with your claude.ai account",
+    ],
+)
+def test_read_transcript_rewrites_flagged_api_error_anywhere(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    A CLI-flagged record gets guidance appended wherever its ``/login`` sits.
+
+    ``isApiErrorMessage`` is Claude Code's own marker for a record it
+    synthesized instead of receiving from the model — an expired login
+    never reaches the API, so there is no model turn behind the text.
+    That makes a wider match safe, which is what catches the auth
+    strings whose instruction sits mid-sentence. The CLI's own text is
+    kept: variants whose remedy goes beyond re-auth must not lose it.
+    """
+    expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
+
+
+def test_read_transcript_flag_inside_message_also_counts(tmp_path: Path) -> None:
+    """
+    The flag is honoured inside ``message`` as well as beside it.
+
+    Claude Code writes it as a sibling of ``message`` but reads it back
+    from both places, so accept either rather than betting on one.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "auth-2",
+                "message": {
+                    "role": "assistant",
+                    "content": "Credit balance too low · Run /login to switch accounts",
+                    "isApiErrorMessage": True,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+
+    rendered = items[0].data["content"][0]["text"]
+    assert "omni setup" in rendered
+    # The CLI's own diagnosis (a billing problem, not an expired login)
+    # must survive: the guidance is appended, never a replacement.
+    assert rendered.startswith("Credit balance too low · Run /login to switch accounts")
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Not about auth at all.
+        "API Error: 500 Internal Server Error",
+        # Auth errors that name /logout ALONE (verbatim from the binary).
+        # Their remedy is unsetting an env var, which `omni setup` does
+        # not do — appending its guidance there would only add noise.
+        "ANTHROPIC_API_KEY is set · unset it or /logout to clear the saved key",
+        "Unset the ANTHROPIC_API_KEY environment variable, or claude /logout then say continue",
+        "This background session shares credentials with other sessions; /logout here has "
+        "no effect. Run /logout from your main terminal to sign out.",
+    ],
+)
+def test_read_transcript_flagged_record_without_login_is_untouched(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    Flagging alone rewrites nothing — the text must name ``/login``.
+
+    Two families must survive verbatim: API errors unrelated to auth
+    (rate limits, overload, 5xx), and the auth errors that point at
+    ``/logout`` alone. The latter describe an env var or a sibling
+    session overriding the credential, and the instruction they carry —
+    unset ``ANTHROPIC_API_KEY`` — is one ``omni setup`` cannot perform,
+    so replacing the message would strand the user. A message naming
+    both (``...then /logout and /login.``) still matches on ``/login``.
+    """
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == raw_text
+
+
+def test_read_transcript_rewrites_logout_and_login_together(tmp_path: Path) -> None:
+    """
+    A message naming BOTH commands is still a ``/login`` dead end.
+
+    The CLI's "...then /logout and /login." shape ends in a re-auth
+    instruction, so it takes the guidance via its ``/login`` — but its
+    env-var prerequisite (unset or re-mint ``CLAUDE_CODE_OAUTH_TOKEN``,
+    which ``omni setup`` cannot do) must stay on screen, so the CLI
+    text is kept and the guidance appended below it.
+    """
+    raw_text = (
+        "If CLAUDE_CODE_OAUTH_TOKEN is set, unset it or re-mint it for this "
+        "account, then /logout and /login."
+    )
+
+    expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
 
 
 def test_read_transcript_items_from_offset_skips_existing_prefix(
@@ -2770,7 +3063,10 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     # pass the development-channels flag.
     assert "--dangerously-load-development-channels" not in args
     settings = _load_invocation_settings(args)
-    assert "omnigent.claude_native_hook" in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert (
+        "omnigent.harnesses.claude_native.hook"
+        in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    )
     # ``PreCompact`` must be wired so the forwarder can surface
     # ``response.compaction.in_progress`` while Claude compacts in the
     # terminal. Missing it = no "Compacting…" spinner for claude-native.
@@ -2778,7 +3074,8 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
         f"PreCompact hook must be registered; got hooks {sorted(settings['hooks'])!r}."
     )
     assert (
-        "omnigent.claude_native_hook" in settings["hooks"]["PreCompact"][0]["hooks"][0]["command"]
+        "omnigent.harnesses.claude_native.hook"
+        in settings["hooks"]["PreCompact"][0]["hooks"][0]["command"]
     )
     # No built-in tools are disabled anymore: ``AskUserQuestion``
     # routes through its dedicated PreToolUse hook (answers injected
@@ -3118,7 +3415,7 @@ def test_augment_claude_args_registers_permission_command_hook(
     # terminal prompt is still open. A failure here (missing key or a
     # short value) means that premature auto-resolve has regressed.
     assert hook["timeout"] == 86400
-    assert "omnigent.claude_native_hook permission-request" in hook["command"]
+    assert "omnigent.harnesses.claude_native.hook permission-request" in hook["command"]
     assert "--bridge-dir" in hook["command"]
     assert "Bearer xyz" not in hook["command"]
     permission_config = json.loads((tmp_path / "permission_hook.json").read_text(encoding="utf-8"))
@@ -3225,16 +3522,18 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
     org policy, breaking the native wrapper.
     """
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
         Path(tempfile.gettempdir()),
     )
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", subprocess_bridge_root
+    )
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
-            "omnigent.claude_native_bridge",
+            "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
             "--bridge-dir",
             str(bridge_dir),
@@ -3344,7 +3643,7 @@ def test_inject_user_message_pastes_content_then_submits(
     regresses to send-keys argv delivery, drops the trailing Enter, or
     stops clearing the stale buffer.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3464,6 +3763,29 @@ def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
     assert _escape_unsupported_slash_command(content) == expected
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("/login", True),
+        ("  /login", True),
+        ("/logout", True),
+        ("/login --claudeai", True),
+        ("plain text", False),
+        ("/clear", False),
+        ("/loginsomething", False),
+        ("please run /login", False),
+    ],
+)
+def test_is_auth_slash_command(content: str, expected: bool) -> None:
+    """
+    Only a leading ``/login`` / ``/logout`` is an auth command.
+
+    A bare mention mid-sentence is ordinary prose and must still reach
+    Claude Code — the caller short-circuits the whole turn on a True.
+    """
+    assert is_auth_slash_command(content) is expected
+
+
 def test_inject_user_message_escapes_unsupported_slash_command_payload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3508,6 +3830,237 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
 
     inject_user_message(bridge_dir, content="/clear")
     assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
+
+
+def _rejection_pane(name: str, draft: str = "") -> str:
+    """
+    Render a pane where Claude Code has rejected an unknown command.
+
+    Mirrors the real TUI output: the rejection prints as its own
+    bullet-led transcript line above the (now empty) composer.
+
+    :param name: The rejected command name without the slash.
+    :param draft: Text sitting in the composer; empty means idle.
+    :returns: The pane text.
+    """
+    return f"""\
+● Unknown command: /{name}
+──────────────────────────────
+❯ {draft}
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
+def _run_unknown_command_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    content: str,
+    reject_name: str | None,
+) -> list[bytes]:
+    """
+    Drive ``inject_user_message`` against a fake TUI, optionally rejecting.
+
+    The fake pane accepts the paste into the composer; on Enter it either
+    starts a turn silently (``reject_name=None`` — a recognized skill) or
+    prints the "Unknown command" rejection line the way Claude Code does
+    for a name it cannot resolve.
+
+    :param tmp_path: Test temp dir for the bridge directory.
+    :param monkeypatch: Pytest monkeypatch for subprocess + timeouts.
+    :param content: User text to inject.
+    :param reject_name: Command name the fake TUI rejects, or ``None``.
+    :returns: The byte payloads delivered via ``load-buffer``, in order.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # Keep the rejection watch fast: it polls the pane, which the fake
+    # answers instantly, so a short timeout keeps the no-rejection case
+    # from sleeping out the full production window.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._UNKNOWN_COMMAND_WATCH_TIMEOUT_S", 0.5
+    )
+
+    loaded_payloads: list[bytes] = []
+    tui: dict[str, Any] = {"pane": _composer_pane(), "submits": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record buffer payloads and simulate accept/reject on submit.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            tui["submits"] += 1
+            if reject_name is not None and tui["submits"] == 1:
+                tui["pane"] = _rejection_pane(reject_name)
+            else:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content=content)
+    return loaded_payloads
+
+
+def test_unknown_command_rejection_redelivers_escaped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message rejected as "Unknown command" is re-delivered escaped.
+
+    Claude Code drops a message whose leading ``/name`` it does not
+    recognize without ever calling the model — the message would be
+    silently swallowed. The bridge must watch for the rejection and paste
+    the message again with the zero-width escape so it reaches the model
+    as plain user text.
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="/not-a-real-skill hello world",
+        reject_name="not-a-real-skill",
+    )
+    assert len(payloads) == 2, (
+        f"Expected the rejected message to be pasted twice (raw, then escaped); "
+        f"got {len(payloads)} paste(s)."
+    )
+    assert payloads[0].startswith(b"/not-a-real-skill")
+    assert payloads[1].startswith("\ufeff/not-a-real-skill hello world".encode("utf-8"))
+
+
+def test_unknown_name_accepted_as_skill_is_not_redelivered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unknown-to-the-bridge name Claude Code accepts runs exactly once.
+
+    A real skill invocation prints no rejection, so the watch must lapse
+    without a second paste — re-delivering would run the skill twice.
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="/my-real-skill do the thing",
+        reject_name=None,
+    )
+    assert len(payloads) == 1, (
+        f"Expected a single paste for an accepted skill; got {len(payloads)}."
+    )
+    assert payloads[0].startswith(b"/my-real-skill")
+
+
+def test_plain_text_skips_the_rejection_watch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message with no leading slash command never watches for a rejection.
+
+    The watch costs up to the full timeout when no rejection prints, so
+    ordinary messages must skip it entirely (no second paste either).
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="just a normal message",
+        reject_name=None,
+    )
+    assert len(payloads) == 1
+
+
+def test_stale_rejection_in_scrollback_does_not_trigger_redelivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A rejection of the same name already in scrollback is not "fresh".
+
+    The watch counts rejection lines against a pre-submit baseline; a
+    stale line from an earlier message keeps the count flat, so an
+    accepted skill re-sent after an earlier typo must not be re-delivered
+    escaped (which would duplicate the message).
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._UNKNOWN_COMMAND_WATCH_TIMEOUT_S", 0.5
+    )
+    stale = "● Unknown command: /my-skill\n"
+
+    loaded_payloads: list[bytes] = []
+    tui = {"pane": stale + _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Serve a pane whose scrollback already carries the rejection.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = stale + _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            # Accepted this time: the stale rejection stays, no new one.
+            tui["pane"] = stale + _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="/my-skill retry after typo fix")
+    assert len(loaded_payloads) == 1, (
+        f"A stale rejection must not trigger escaped re-delivery; "
+        f"got {len(loaded_payloads)} paste(s)."
+    )
+
+
+def test_rejection_line_matching_ignores_message_echo() -> None:
+    """
+    The rejection matcher counts rejections, not echoed composer text.
+
+    A user message *containing* the words "Unknown command: /x" renders
+    on a composer row (behind the prompt glyph) and must not count. The
+    TUI also reflows the rejection at the pane width — "Unknown command:"
+    and the name can land on separate lines — so a wrapped rejection must
+    still count.
+    """
+    counter = claude_native_bridge._count_unknown_command_rejections
+    needle = "Unknown command: /x"
+    assert counter("● Unknown command: /x\n❯ \n", needle) == 1
+    # Echoed in the composer draft — not a rejection line.
+    assert counter("❯ say Unknown command: /x\n", needle) == 0
+    assert counter("● Unknown command: /x\n● Unknown command: /x\n", needle) == 2
+    # Narrow pane: the TUI wraps the name onto its own line.
+    wrapped = "● Unknown command:\n  /x\n❯ \n"
+    assert counter(wrapped, needle) == 1
+    long_needle = "Unknown command: /definitely-not-a-real-command"
+    long_wrapped = "● Unknown command:\n  /definitely-not-a-real-command\n❯ \n"
+    assert counter(long_wrapped, long_needle) == 1
 
 
 def test_inject_user_message_raises_when_tmux_target_never_published(
@@ -3584,7 +4137,7 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     no send-keys is issued until ``capture-pane`` shows the prompt
     glyph, and that injection proceeds once it does.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3663,7 +4216,7 @@ def test_inject_user_message_raises_when_prompt_never_renders(
     the web UI stuck on "Working…". The RuntimeError surfaces as an
     ExecutorError instead. No keystrokes must be sent on this path.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3705,7 +4258,7 @@ def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
     appears only in an early line, with later non-empty lines lacking
     it, so the gate must NOT treat the pane as ready.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3761,12 +4314,14 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     fire-and-forget Enter would send exactly one and return "success"
     with the message undelivered.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     # Shrink the polling cadence so the retry happens in milliseconds —
     # the production defaults (1s retry spacing) would make this test slow.
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3825,11 +4380,13 @@ def test_inject_user_message_raises_when_draft_never_submits(
     the message still sitting unsent in Claude's input box. The
     RuntimeError surfaces as an ExecutorError instead.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -4665,16 +5222,18 @@ async def test_channel_server_relays_active_omnigent_tools(
     call the Omnigent tools made available to the server-side agent.
     """
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
         Path(tempfile.gettempdir()),
     )
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", subprocess_bridge_root
+    )
     bridge_dir = prepare_bridge_dir("conv_tools", workspace=tmp_path)
     proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
-            "omnigent.claude_native_bridge",
+            "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
             "--bridge-dir",
             str(bridge_dir),
@@ -4875,10 +5434,12 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     ``_serve_mcp`` and the ``tools/list`` read below times out.
     """
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
         Path(tempfile.gettempdir()),
     )
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", subprocess_bridge_root
+    )
     bridge_dir = prepare_bridge_dir("conv_crash", workspace=tmp_path)
 
     # A relay server that returns HTTP 200 with invalid UTF-8 bytes. This
@@ -4940,7 +5501,7 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
         [
             sys.executable,
             "-m",
-            "omnigent.claude_native_bridge",
+            "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
             "--bridge-dir",
             str(bridge_dir),
@@ -5249,10 +5810,10 @@ async def test_start_tool_relay_accepts_pi_native_bridge_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Relay startup accepts Pi-native's persistent bridge root."""
-    from omnigent import pi_native_bridge
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
     pi_root = tmp_path / ".omnigent" / "pi-native"
-    monkeypatch.setattr("omnigent.pi_native_bridge._BRIDGE_ROOT", pi_root)
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", pi_root)
     bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_pi")
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
 
@@ -5303,10 +5864,10 @@ async def test_start_tool_relay_accepts_codex_native_bridge_root(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    from omnigent import codex_native_bridge
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 
     codex_root = tmp_path / ".omnigent" / "codex-native"
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", codex_root)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", codex_root)
     bridge_dir = codex_native_bridge.prepare_bridge_dir("conv_codex")
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
 
@@ -5365,10 +5926,12 @@ async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    from omnigent import antigravity_native_bridge
+    from omnigent.harnesses.antigravity_native import bridge as antigravity_native_bridge
 
     antigravity_root = tmp_path / ".omnigent" / "antigravity-native"
-    monkeypatch.setattr("omnigent.antigravity_native_bridge._BRIDGE_ROOT", antigravity_root)
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT", antigravity_root
+    )
     bridge_dir = antigravity_native_bridge.prepare_bridge_dir("conv_agy")
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
 
@@ -5428,10 +5991,10 @@ async def test_start_tool_relay_accepts_opencode_native_bridge_root(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    from omnigent import opencode_native_bridge
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
 
     opencode_root = tmp_path / ".omnigent" / "opencode-native"
-    monkeypatch.setattr("omnigent.opencode_native_bridge._BRIDGE_ROOT", opencode_root)
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge._BRIDGE_ROOT", opencode_root)
     bridge_dir = opencode_native_bridge.prepare_bridge_dir("conv_oc")
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
 
@@ -5483,9 +6046,11 @@ async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
     # gettempdir(), not a literal /tmp: the fixture root lives under the
     # platform temp dir (/var/folders/… on macOS), which /tmp never contains.
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._TRUSTED_PARENT", Path(tempfile.gettempdir())
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", Path(tempfile.gettempdir())
     )
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", subprocess_bridge_root
+    )
     bridge_dir = prepare_bridge_dir("conv_shared_bridge", workspace=tmp_path)
     relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
 
@@ -6091,7 +6656,7 @@ def test_prepare_bridge_dir_stores_launch_model(
 ) -> None:
     """``launch_model`` is persisted in bridge.json when provided."""
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
@@ -6108,7 +6673,7 @@ def test_prepare_bridge_dir_omits_launch_model_when_none(
 ) -> None:
     """``launch_model`` key is absent from bridge.json when not provided."""
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
@@ -6124,7 +6689,7 @@ def test_read_launch_model_returns_stored_value(
 ) -> None:
     """``read_launch_model`` round-trips the value stored by ``prepare_bridge_dir``."""
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
@@ -6140,7 +6705,7 @@ def test_read_launch_model_returns_none_when_absent(
 ) -> None:
     """``read_launch_model`` returns ``None`` when no launch model was stored."""
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
@@ -6161,10 +6726,10 @@ def test_model_env_round_trips_the_launch_vocabulary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The runner reads the alias pinning from here, not from its own env."""
-    from omnigent.claude_native_bridge import read_model_env
+    from omnigent.harnesses.claude_native.bridge import read_model_env
 
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
@@ -6193,14 +6758,14 @@ def test_record_model_vocabulary_backfills_a_runner_prepared_bridge(
     so the pins and launch model land via a second write — and must read
     back exactly as the CLI path's prepare-time record does.
     """
-    from omnigent.claude_native_bridge import (
+    from omnigent.harnesses.claude_native.bridge import (
         read_launch_model,
         read_model_env,
         record_model_vocabulary,
     )
 
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     assert read_model_env(bridge_dir) == {}
@@ -6229,10 +6794,10 @@ def test_model_env_is_empty_without_a_ucode_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.claude_native_bridge import read_model_env
+    from omnigent.harnesses.claude_native.bridge import read_model_env
 
     root = tmp_path / "root"
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     assert read_model_env(bridge_dir) == {}
@@ -6676,7 +7241,7 @@ def test_display_cost_approval_popup_builds_detached_tmux_command(
     cost-popup module with all resolve inputs.
 
     Proves the modal targets the right tmux socket + pane + attached
-    client (``-c``), launches :mod:`omnigent.native_cost_popup`, and
+    client (``-c``), launches :mod:`omnigent.native.native_cost_popup`, and
     forwards the session/elicitation/message plus THIS bridge's
     ``permission_hook.json`` (where the popup reads the Omnigent url/token). A
     failure means native approval would render at the wrong pane/client,
@@ -6724,7 +7289,7 @@ def test_display_cost_approval_popup_builds_detached_tmux_command(
     assert args[args.index("-t") + 1] == "claude:0.0"
     # Inner command runs the popup module with every resolve input.
     inner = shlex.split(args[-1])
-    assert "omnigent.native_cost_popup" in inner
+    assert "omnigent.native.native_cost_popup" in inner
     assert "conv_abc123" in inner  # --session-id value
     assert "elicit_deadbeef" in inner  # --elicitation-id value
     assert "Cost $0.12 crossed the $0.10 checkpoint. Continue?" in inner  # --message
@@ -7394,7 +7959,7 @@ def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatc
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TERMINAL_FAILURE_TAIL_CHARS", 50)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TERMINAL_FAILURE_TAIL_CHARS", 50)
     pane = "\n".join(f"line {i}" for i in range(100))
     tail = claude_native_bridge._format_terminal_failure_tail(pane)
     body = tail.split("\n", 1)[1]
@@ -7424,7 +7989,7 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
         "  at parse (unknown)\n"
     )
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: crash_pane,
     )
     with pytest.raises(RuntimeError) as excinfo:
@@ -7455,7 +8020,7 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     :returns: None.
     """
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._capture_pane",
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: "",
     )
     with pytest.raises(RuntimeError) as excinfo:
@@ -7502,7 +8067,7 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
         # rewritten gate must never fetch, since it does not re-capture.
         return observed if calls["n"] == 1 else late_ready
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._capture_pane", fake_capture)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", fake_capture)
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
@@ -8494,8 +9059,10 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     (its own documented dismissal), restoring the empty input box, then
     deliver the message normally.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -8677,10 +9244,12 @@ def test_inject_user_message_retries_a_swallowed_occupied_input_escape(
     Retries fire only while the surface is verifiably on screen, so none
     can reach the restored composer (where Escape interrupts a turn).
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge._OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S", 0.0
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S", 0.0
     )
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -8886,11 +9455,11 @@ def test_statusline_shell_command_captures_and_chains(
     forwarder-side sync, and the chained command must receive the exact
     stdin Claude sent.
     """
-    from omnigent.claude_native_status import CONTEXT_RAW_FILE, sync_raw_status_context
+    from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE, sync_raw_status_context
 
     chain_out = tmp_path / "chain_out.json"
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.read_user_status_line_command",
+        "omnigent.harnesses.claude_native.bridge.read_user_status_line_command",
         lambda: f"cat > {chain_out}",
     )
     args = augment_claude_args((), bridge_dir=tmp_path)
@@ -8958,9 +9527,9 @@ class _ScriptedPolicyClient:
 
 def _hook_relay(tmp_path, monkeypatch, client):
     """Boot a relay wired with *client* for the hook-evaluate tests."""
-    from omnigent import pi_native_bridge
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
-    monkeypatch.setattr("omnigent.pi_native_bridge._BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
     bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_hook_eval")
 
     async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
@@ -9050,7 +9619,7 @@ async def test_hook_evaluate_endpoint_returns_deny_hook_output(
 async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upstream failure denies PreToolUse and stays open for PostToolUse."""
+    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -9061,7 +9630,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             _PRE_TOOL_USE_PAYLOAD,
         )
         output = json.loads(body)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
 
         post_body = await asyncio.to_thread(
             _relay_request_raw,
@@ -9097,7 +9666,7 @@ async def test_curl_evaluate_policy_command_round_trips(
         assert "curl" in command and "evaluate-policy" in command
         # The Python hook must appear only as the relay-less fallback,
         # after the curl fast path.
-        assert command.index("curl") < command.index("claude_native_hook")
+        assert command.index("curl") < command.index("claude_native.hook")
 
         # Off-loop: the relay proxies through this test's event loop, so a
         # blocking subprocess.run here would deadlock the curl round trip.
@@ -9136,7 +9705,7 @@ async def test_curl_evaluate_policy_command_round_trips(
     )
     assert result.returncode == 0, result.stderr
     output = json.loads(result.stdout)
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
 
 
@@ -9149,10 +9718,12 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
 ) -> None:
     """prepare_bridge_dir records the creating pid so the periodic sweep can
     prune the dir only when its owner is provably dead."""
-    from omnigent.claude_native_bridge import prepare_bridge_dir
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
 
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
 
     bridge_dir = prepare_bridge_dir("conv_owner", workspace=tmp_path)
 
@@ -9164,11 +9735,11 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
-    from omnigent.claude_native_bridge import prune_orphaned_bridge_dirs
+    from omnigent.harnesses.claude_native.bridge import prune_orphaned_bridge_dirs
 
     root = tmp_path / "claude-native"
     root.mkdir(parents=True)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
 
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()

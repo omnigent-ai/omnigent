@@ -30,6 +30,7 @@ import {
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
+import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
   useHostModelOptions,
   fetchHosts,
@@ -186,8 +187,29 @@ const CLAUDE_MODEL_OPTIONS_RESULT = {
 };
 const CODEX_MODEL_OPTIONS_RESULT = {
   data: [
-    { id: "databricks-gpt-5-5", displayName: "GPT-5.5", isDefault: true },
-    { id: "databricks-gpt-5-6", displayName: "GPT-5.6" },
+    {
+      id: "databricks-gpt-5-5",
+      displayName: "GPT-5.5",
+      isDefault: true,
+      // Codex's catalog advertises a per-model effort ladder; the config
+      // modal's Effort row is built from exactly this metadata.
+      supportedReasoningEfforts: [
+        { reasoningEffort: "low" },
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+      ],
+    },
+    {
+      id: "databricks-gpt-5-6",
+      displayName: "GPT-5.6",
+      // A deliberately different ladder so tests can observe the row follow
+      // the drafted model (xhigh only here; low only on 5.5).
+      supportedReasoningEfforts: [
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "xhigh" },
+      ],
+    },
   ],
   isLoading: false,
   isError: false,
@@ -1784,6 +1806,83 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("Read only")).toBeTruthy();
   });
 
+  it("offers the Codex effort ladder in the gear modal and sends the pick as reasoning_effort", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentConfig("a2");
+    // With no model pinned, the row lists the catalog default's (GPT-5.5)
+    // ladder — raw Codex ids, never another model's rungs.
+    openSelect("new-chat-landing-config-effort");
+    expect(screen.getByRole("option", { name: "low" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "medium" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "xhigh" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "high" }));
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
+    saveConfig();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    // The pick rides the create exactly like Claude's landing row — the field
+    // the codex-native launch path reads at terminal launch.
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("drops a drafted Codex effort the newly-picked model doesn't offer", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentConfig("a2");
+    // Pin GPT-5.6: the Effort row follows the DRAFTED model, so its ladder
+    // swaps in (xhigh appears, low disappears).
+    pickSelectOption("new-chat-landing-config-model", "GPT-5.6");
+    openSelect("new-chat-landing-config-effort");
+    expect(screen.queryByRole("option", { name: "low" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "xhigh" }));
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("xhigh");
+    // Back to Default (GPT-5.5), whose ladder has no xhigh: the stale rung
+    // resets so Save can't commit a level the model rejects.
+    openSelect("new-chat-landing-config-model");
+    fireEvent.click(screen.getByRole("option", { name: "Default (GPT-5.5)" }));
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("Default");
+    saveConfig();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("remembers the Codex effort per harness without leaking it onto Claude", () => {
+    renderLanding();
+    openAgentConfig("a2");
+    pickSelectOption("new-chat-landing-config-effort", "high");
+    saveConfig();
+
+    // Claude's row reopens on its own remembered effort (nothing stored →
+    // Default) — the Codex pick must not ride the shared state across.
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("Default");
+    saveConfig();
+
+    // Codex reopens on the remembered pick, still valid for its ladder.
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
+  });
+
   it("sends the selected Codex launch model without changing Claude's remembered model", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
@@ -2538,20 +2637,15 @@ describe("NewChatLandingScreen", () => {
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
     expect(
-      sandboxOption.compareDocumentPosition(hostItem!) & Node.DOCUMENT_POSITION_FOLLOWING,
+      sandboxOption.compareDocumentPosition(hostItem) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     // Picking the host restores the workspace flow (file-browser chip,
     // worktree chip) — the sandbox default doesn't wedge the normal path.
-    fireEvent.click(hostItem!);
+    fireEvent.click(hostItem);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
@@ -2687,6 +2781,18 @@ describe("NewChatLandingScreen", () => {
     await screen.findByTestId("new-chat-landing-input");
     expect(screen.getByText("What should we build?")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
+  });
+
+  it("sends the background-title opt-out header on direct session creation", async () => {
+    localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
+    renderLanding();
+    await screen.findByTestId("new-chat-landing-input");
+
+    await submitAndReadBody("explain the nature of time");
+
+    const createCall = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const init = createCall[1] as RequestInit;
+    expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 
   it("files a pre-selected project, and invalidates project sessions", async () => {
@@ -3812,15 +3918,9 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
-    fireEvent.click(hostItem!);
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
     );
     // With no custom agents yet, the create item is a top-level row (no
     // "Custom agents" submenu to hide it behind) and opens the dialog.
@@ -3839,14 +3939,9 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    fireEvent.click(hostItem!);
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
@@ -4842,7 +4937,9 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     // The placeholder the server rebinds off.
     expect(body.agent_id).toBe("a1");
     // Nothing that describes the placeholder's own CLI may ride along.
-    expect(body.labels).toBeUndefined();
+    expect(body.labels).toEqual({
+      "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+    });
     expect(body.terminal_launch_args).toBeUndefined();
     expect(body.model_override).toBeUndefined();
     expect(body.reasoning_effort).toBeUndefined();
@@ -5364,7 +5461,9 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       // A pinned model would silently disable routing for the whole session.
       expect(body.model_override).toBeUndefined();
       expect(body.reasoning_effort).toBeUndefined();
-      expect(body.labels).toBeUndefined();
+      expect(body.labels).toEqual({
+        "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      });
       expect(body.terminal_launch_args).toBeUndefined();
       // A bundle agent arms at create and routes on the first message event —
       // its harness isn't decided yet, so there is nothing to route here.

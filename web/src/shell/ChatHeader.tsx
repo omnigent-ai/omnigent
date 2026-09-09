@@ -3,6 +3,7 @@ import {
   EllipsisVerticalIcon,
   FileIcon,
   GitCompareIcon,
+  GitForkIcon,
   InfoIcon,
   ListIcon,
   PanelLeftIcon,
@@ -12,6 +13,7 @@ import {
   TerminalIcon,
   UserPlusIcon,
 } from "lucide-react";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -36,7 +38,7 @@ import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_PILL, MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -85,6 +87,10 @@ interface MobileSessionMenuProps {
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
+  /** True while the mobile GitHub drawer is open. */
+  githubPanelOpen: boolean;
+  /** Open the mobile GitHub drawer. */
+  onOpenGithub: () => void;
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -145,12 +151,16 @@ interface ChatHeaderProps {
   wrapperLabel: string | null;
   /** Whether the Share button/menu entry should render. */
   canShare: boolean;
+  /** Whether the active session can be forked. */
+  canFork: boolean;
   /** Whether the rendered Share controls should be disabled. */
   shareDisabled?: boolean;
   /** User-facing reason for the disabled Share controls. */
   shareDisabledReason?: string;
   /** Open the share dialog. */
   onShare: () => void;
+  /** Open the fork dialog for the active session. */
+  onFork: () => void;
   /** Whether the agent has tools/policies worth surfacing. */
   hasAgentInfo: boolean;
   /** Open the mobile agent-info dialog. */
@@ -210,9 +220,11 @@ export function ChatHeader({
   boundAgent,
   wrapperLabel,
   canShare,
+  canFork,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
+  onFork,
   hasAgentInfo,
   onAgentInfo,
   hasHeaderMenu,
@@ -230,12 +242,20 @@ export function ChatHeader({
   const { trackClick } = useOmnigentAnalytics();
   const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const peekRequest = useRef(0);
+  // Once the dwell fires the peek, the card fades in click-through, so the
+  // pointer keeps resting on the toggle — long enough to trip the hover
+  // tooltip's own (longer) delay. The peek is the intended hover reveal, so
+  // suppress the tooltip when the peek fires. Pointer-armed only: keyboard
+  // focus never arms a peek, so the focus tooltip still works.
+  const suppressTooltip = useRef(false);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
   const cancelPeek = useCallback(() => {
     peekRequest.current += 1;
     if (peekTimer.current) {
       clearTimeout(peekTimer.current);
       peekTimer.current = null;
     }
+    suppressTooltip.current = false;
   }, []);
   const onPeekSidebar = useCallback(() => {
     if (isMobile) return;
@@ -244,6 +264,8 @@ export function ChatHeader({
     peekTimer.current = setTimeout(() => {
       peekTimer.current = null;
       if (peekRequest.current !== request) return;
+      suppressTooltip.current = true;
+      setTooltipOpen(false);
       onOpenSidebar(true);
     }, 400);
   }, [isMobile, onOpenSidebar, cancelPeek]);
@@ -262,6 +284,7 @@ export function ChatHeader({
     !mobileMenu.filesPanelOpen &&
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
+    !mobileMenu.githubPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
       <>
         {showFilesPanel && (
@@ -285,6 +308,15 @@ export function ChatHeader({
                 {mobileMenu.changedCount}
               </span>
             )}
+          </DropdownMenuItem>
+        )}
+        {showFilesPanel && (
+          <DropdownMenuItem
+            onSelect={mobileMenu.onOpenGithub}
+            className="gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <GithubMono size={16} className="shrink-0" />
+            GitHub
           </DropdownMenuItem>
         )}
         {/* Agents — always present (the panel lists at least
@@ -350,9 +382,11 @@ export function ChatHeader({
       conversation={actionConversation}
       currentProject={projectName}
       canShare={canShare}
+      canFork={canFork}
       shareDisabled={shareDisabled}
       shareDisabledReason={shareDisabledReason}
       onShare={onShare}
+      onFork={onFork}
       hasAgentInfo={isMobile && hasAgentInfo}
       onAgentInfo={onAgentInfo}
       workspaceItems={isMobile ? workspaceItems : null}
@@ -412,7 +446,13 @@ export function ChatHeader({
         )}
       >
         {!sidebarOpen && (
-          <Tooltip>
+          <Tooltip
+            open={tooltipOpen}
+            onOpenChange={(next) => {
+              if (next && suppressTooltip.current) return;
+              setTooltipOpen(next);
+            }}
+          >
             <TooltipTrigger asChild>
               <Button
                 type="button"
@@ -484,20 +524,40 @@ export function ChatHeader({
             nothing when the user is alone. */}
         {conversationId && <PresenceAvatars />}
         {/* Desktop (md+) action buttons. On mobile these collapse into
-            the three-dot "Session actions" menu below, which renders
-            the same set off the same gating booleans. Clone has no
-            header presence at all — it's reached via the per-message
-            "Fork from here" action on assistant bubbles (ChatPage). */}
+            the three-dot "Session actions" menu below. Fork is also
+            available from the session menus and assistant messages. */}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
         {conversationId && <ViewModeToggle />}
-        {/* Fallback mobile kebab for sessions with no owner-managed menu:
-            the action buttons above (Share · Agent info) plus the same
-            workspace-rail entries, so a phone still needs only one trigger. */}
-        {(hasHeaderMenu || workspaceItems) && (!actionConversation || !isMobile) && (
+        {!actionConversation && canFork && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Conversation actions"
+                data-testid="desktop-fork-actions-menu"
+                className="hidden border-none text-muted-foreground hover:text-foreground md:inline-flex"
+              >
+                <EllipsisVerticalIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-44">
+              <DropdownMenuItem onSelect={onFork}>
+                <GitForkIcon className="size-3.5" />
+                Fork
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {/* Fallback mobile kebab for sessions with no owner-managed menu.
+            It carries Fork, Share, Agent info, and the workspace-rail entries
+            so a phone still needs only one trigger. */}
+        {(hasHeaderMenu || workspaceItems || canFork) && (!actionConversation || !isMobile) && (
           // Non-modal on mobile: modal mode's body-wide pointer-events:none
           // makes the menu the sole touch target, so touch-target adjustment
           // snaps outside taps onto it and the menu can't be dismissed (see
@@ -516,6 +576,12 @@ export function ChatHeader({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className={cn("min-w-44", MOBILE_GLASS_SURFACE)}>
+              {canFork && (
+                <DropdownMenuItem onSelect={onFork} data-testid="fallback-fork-conversation">
+                  <GitForkIcon className="size-4" />
+                  Fork
+                </DropdownMenuItem>
+              )}
               {canShare && (
                 <DropdownMenuItem
                   onSelect={

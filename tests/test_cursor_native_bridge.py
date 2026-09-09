@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`omnigent.cursor_native_bridge` composer handling.
+"""Unit tests for :mod:`omnigent.harnesses.cursor_native.bridge` composer handling.
 
 Focused on the leftover-draft clear (:func:`_clear_composer`) and its use by
 :func:`inject_user_message`. cursor-agent restores the interrupted prompt into
@@ -15,8 +15,8 @@ from pathlib import Path
 import click
 import pytest
 
-from omnigent import cursor_native_bridge
-from omnigent.cursor_native_bridge import write_tmux_target
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.cursor_native.bridge import write_tmux_target
 
 _SOCK = "/tmp/example/cursor.sock"
 _TARGET = "cursor:0.0"
@@ -336,7 +336,7 @@ class TestHooksConfig:
         # The recorder is invoked isolated (-I) on the usage module, with the
         # absolute bridge dir baked in so it writes where the forwarder reads.
         assert "-I" in command
-        assert "omnigent.cursor_native_usage" in command
+        assert "omnigent.harnesses.cursor_native.usage" in command
         assert "record-usage" in command
         assert "/tmp/bridge" in command
         assert command.startswith("/usr/bin/python3")

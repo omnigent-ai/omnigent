@@ -3,6 +3,7 @@ import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as GoalApiModule from "@/lib/goalApi";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
@@ -55,7 +56,12 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     copilot: "Copilot",
   }),
 }));
+vi.mock("@/lib/goalApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof GoalApiModule>()),
+  getGoal: vi.fn(),
+}));
 import type { ElicitationBlock } from "@/lib/blocks";
+import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage";
 import type { Session } from "@/lib/types";
@@ -344,6 +350,42 @@ describe("Composer Codex goal control", () => {
     fireEvent.click(screen.getByTestId("goal-start"));
 
     expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation and pass tests");
+  });
+});
+
+describe("Composer native goal state", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("loads the goal when a detached runner reconnects", async () => {
+    const mockGetGoal = vi.mocked(getGoal);
+    mockGetGoal.mockResolvedValueOnce({
+      goal: {
+        objective: "Finish the implementation",
+        status: "active",
+        tokenBudget: null,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: null,
+        updatedAt: null,
+      },
+    });
+    useChatStore.setState({ conversationId: "conv_goal" });
+
+    const { rerender } = renderWithTooltips(
+      <Composer {...composerProps({ showGoalControl: true, runnerOnline: false })} />,
+    );
+    expect(mockGetGoal).not.toHaveBeenCalled();
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ showGoalControl: true, runnerOnline: true })} />
+      </TooltipProvider>,
+    );
+
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_goal"));
   });
 });
 
@@ -748,6 +790,41 @@ describe("Composer slash-command submit routing", () => {
     expect(gearTooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
       gearTooltip.textContent?.indexOf("Effort:") ?? -1,
     );
+  });
+
+  it("keeps the label's truncation chain intact when the source tooltip wraps it", () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    // jsdom does no layout, so pin the CSS contract instead: the tooltip
+    // wrapper must be a shrinkable flex container (flex + min-w-0 + shrink),
+    // or the label's `truncate` never engages and a long model id runs under
+    // the Stop button on phone-width viewports.
+    const wrapper = screen.getByTestId("composer-model-source");
+    for (const cls of ["flex", "min-w-0", "shrink"]) {
+      expect(wrapper.classList.contains(cls), `wrapper is missing "${cls}"`).toBe(true);
+    }
+    const label = screen.getByTestId("composer-model-effort-label");
+    for (const cls of ["truncate", "min-w-0", "shrink"]) {
+      expect(label.classList.contains(cls), `label is missing "${cls}"`).toBe(true);
+    }
   });
 
   it("labels subscription provenance instead of showing an unexplained CLI name", async () => {
@@ -1265,6 +1342,75 @@ describe("Composer model/effort label", () => {
     // The real effort still renders — only the leaked model was suppressed.
     expect(label()).toHaveTextContent("High");
   });
+
+  it("opens the config modal when the label half of the pill is clicked", async () => {
+    // The pill-wide hover highlight advertises one clickable control, so the
+    // label half must perform the same action as the gear beside it.
+    useChatStore.setState({ llmModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+
+    fireEvent.click(label());
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+  });
+
+  it("keeps the label click inert when the session is read-only", () => {
+    // Mirrors the gear's soft-disable: a read-only viewer gets no config modal
+    // from either pill half, and aria-disabled drops the pill's hover
+    // highlight so no dead affordance is advertised.
+    useChatStore.setState({ llmModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+          readOnlyReason: "Mirrored transcript",
+        })}
+      />,
+    );
+
+    expect(label()).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(label());
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("stays a non-interactive read-out when no gear renders beside it", () => {
+    // SDK/bundle identity fallback with no config surface: there's no modal
+    // to open, no button in the pill, and thus no hover highlight to honor.
+    useChatStore.setState({
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      sessionHarness: "pi",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "polly" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+
+    expect(screen.queryByTestId("composer-config-gear")).toBeNull();
+    expect(label().tagName).toBe("SPAN");
+  });
 });
 
 describe("Composer effort slash-command visibility", () => {
@@ -1383,6 +1529,15 @@ describe("Composer Codex Plan-mode control", () => {
     const button = screen.getByTestId("codex-plan-mode-toggle");
     expect(button).toHaveAttribute("aria-pressed", "true");
     expect(button).toHaveAccessibleName("Exit Plan mode");
+  });
+
+  it("collapses the visible Plan label in a narrow composer", () => {
+    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+
+    expect(screen.getByTestId("composer-action-row")).toHaveClass("@container/composer-actions");
+    const button = screen.getByRole("button", { name: "Enter Plan mode" });
+    expect(button).toHaveClass("w-9", "@lg/composer-actions:w-auto");
+    expect(within(button).getByText("Plan")).toHaveClass("hidden", "@lg/composer-actions:inline");
   });
 
   it("hides the control when the session is not Codex-native", () => {

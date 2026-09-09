@@ -1,4 +1,9 @@
 name: UI Preview
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('Delete UI preview PR {0}', inputs.pr_number)
+      || github.event.pull_request.title
+      || github.event.head_commit.message }}
 
 # Per-PR live preview of the Omnigent web UI, deployed to Databricks Apps.
 # The preview is ephemeral (SQLite + local artifacts) and ships no LLM/runner --
@@ -31,6 +36,24 @@ name: UI Preview
 # configured for guard #2 to take effect. See .github/ui-preview/README.md.
 
 on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR whose preview should be deleted'
+        required: true
+        type: string
+      expected_id:
+        description: 'App ID observed by the cleanup reconciler'
+        required: true
+        type: string
+      expected_create_time:
+        description: 'App creation timestamp observed by the cleanup reconciler'
+        required: true
+        type: string
+      expected_update_time:
+        description: 'App update timestamp observed by the cleanup reconciler'
+        required: true
+        type: string
   push:
     branches:
       - main
@@ -47,7 +70,11 @@ on:
       - closed
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || 'main' }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch'
+        && format('cleanup-{0}', inputs.pr_number)
+        || github.event.pull_request.number
+        || 'main' }}
   cancel-in-progress: true
 
 defaults:
@@ -413,8 +440,11 @@ jobs:
     # and workspace files forever. Run on every close; the delete step is a cheap
     # no-op (one existence check) for PRs that never had a preview.
     if: >-
-      github.event_name != 'push'
-      && github.event.action == 'closed'
+      github.event_name == 'workflow_dispatch'
+      || (
+        github.event_name != 'push'
+        && github.event.action == 'closed'
+      )
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -431,23 +461,78 @@ jobs:
           DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
           DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
           DATABRICKS_AUTH_TYPE: oauth-m2m
-          APP_NAME: omnigent-ui-preview-pr-${{ github.event.pull_request.number }}
+          DISPATCHED: ${{ github.event_name == 'workflow_dispatch' }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
+          EXPECTED_ID: ${{ inputs.expected_id }}
+          EXPECTED_CREATE_TIME: ${{ inputs.expected_create_time }}
+          EXPECTED_UPDATE_TIME: ${{ inputs.expected_update_time }}
+          REPO: ${{ github.repository }}
         run: |
-          if databricks apps get "$APP_NAME" > /dev/null 2>&1; then
-            SOURCE_PATH=$(databricks apps get "$APP_NAME" -o json \
-              | jq -r '.default_source_code_path // empty')
-            databricks apps delete "$APP_NAME" --auto-approve
-            if [ -n "$SOURCE_PATH" ]; then
-              WS_PATH="${SOURCE_PATH#/Workspace}"
-              databricks workspace delete "$WS_PATH" --recursive 2>/dev/null || true
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid PR number'; exit 1; }
+          APP_NAME="omnigent-ui-preview-pr-$PR_NUMBER"
+          INVENTORY="$RUNNER_TEMP/ui-preview-apps.json"
+          APP_JSON="$RUNNER_TEMP/ui-preview-app.json"
+
+          databricks apps list -o json > "$INVENTORY"
+          if ! jq -e --arg name "$APP_NAME" '.[] | select(.name == $name)' \
+              "$INVENTORY" > "$APP_JSON"; then
+            echo "App is already absent: $APP_NAME"
+            exit 0
+          fi
+
+          databricks apps get "$APP_NAME" -o json > "$APP_JSON"
+          if [[ "$DISPATCHED" == true ]]; then
+            EXPECTED_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+            jq -e \
+              --arg name "$APP_NAME" \
+              --arg id "$EXPECTED_ID" \
+              --arg create_time "$EXPECTED_CREATE_TIME" \
+              --arg update_time "$EXPECTED_UPDATE_TIME" \
+              --arg description "$EXPECTED_URL" \
+              '
+                .name == $name
+                and .id == $id
+                and .create_time == $create_time
+                and .update_time == $update_time
+                and .description == $description
+                and (.creator | type == "string" and length > 0)
+                and .default_source_code_path == ("/Workspace/Users/" + .creator + "/apps/" + $name)
+                and ((.resources // []) | length == 0)
+                and (.compute_status.state | IN("ACTIVE", "STOPPED", "ERROR"))
+                and (.pending_deployment == null)
+                and (.pending_update == null)
+              ' "$APP_JSON" > /dev/null || {
+                echo 'App changed after cleanup review; refusing deletion'
+                exit 1
+              }
+          fi
+
+          SOURCE_PATH=$(jq -r '.default_source_code_path // empty' "$APP_JSON")
+          databricks apps delete "$APP_NAME" --auto-approve
+          for _ in $(seq 1 20); do
+            databricks apps list -o json > "$INVENTORY"
+            if ! jq -e --arg name "$APP_NAME" '.[] | select(.name == $name)' \
+                "$INVENTORY" > /dev/null; then
+              break
             fi
+            sleep 3
+          done
+          if jq -e --arg name "$APP_NAME" '.[] | select(.name == $name)' \
+              "$INVENTORY" > /dev/null; then
+            echo "App still exists after deletion: $APP_NAME"
+            exit 1
+          fi
+          if [[ "$DISPATCHED" != true && -n "$SOURCE_PATH" ]]; then
+            WS_PATH="${SOURCE_PATH#/Workspace}"
+            databricks workspace delete "$WS_PATH" --recursive 2>/dev/null || true
           fi
 
       - name: Update PR comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
         run: |
           BODY="${COMMENT_MARKER}
 

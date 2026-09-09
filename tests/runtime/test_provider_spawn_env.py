@@ -76,7 +76,7 @@ def _clear_ambient_keys(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda provider_name, family, *, context: _CATALOG_DEFAULTS[(provider_name, family)],
     )
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=_CATALOG_DEFAULTS[(provider_name, family)]
         ),

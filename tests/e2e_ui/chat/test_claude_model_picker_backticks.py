@@ -14,7 +14,7 @@ the Model picker → every row must read as a plain model name and both
 1M-context rows must read the same way.
 
 The catalog is produced by the REAL probe pipeline
-(``omnigent.claude_native.claude_model_catalog``) against a stub ``claude``
+(``omnigent.harnesses.claude_native.main.claude_model_catalog``) against a stub ``claude``
 CLI whose stream-json output is byte-identical to what a real Claude Code
 2.1.250 ``claude -p "/model"`` run printed when captured live — so the test
 is deterministic regardless of which CLI version this machine has installed,
@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from omnigent.claude_native import claude_model_catalog
+from omnigent.harnesses.claude_native.main import claude_model_catalog
 from tests.e2e_ui.conftest import fetch_with_retry
 
 # What each picker row must read as once the harness's markdown-code label

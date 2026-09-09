@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-import omnigent.antigravity_native_launch as _mod
-from omnigent.antigravity_native_launch import (
+import omnigent.harnesses.antigravity_native.launch as _mod
+from omnigent.harnesses.antigravity_native.launch import (
     NativeAntigravityLaunch,
     agy_binary_path,
     build_agy_launch,
@@ -80,7 +80,7 @@ class TestResolveNativeAntigravityLaunch:
     ) -> None:
         """Return subscription mode when Gemini credential is detected."""
         monkeypatch.setattr(
-            "omnigent.antigravity_native_launch.gemini_auth_has_credential",
+            "omnigent.harnesses.antigravity_native.launch.gemini_auth_has_credential",
             lambda: True,
         )
         result = resolve_native_antigravity_launch()
@@ -92,7 +92,7 @@ class TestResolveNativeAntigravityLaunch:
     ) -> None:
         """Return subscription mode even when no Gemini credential is found."""
         monkeypatch.setattr(
-            "omnigent.antigravity_native_launch.gemini_auth_has_credential",
+            "omnigent.harnesses.antigravity_native.launch.gemini_auth_has_credential",
             lambda: False,
         )
         result = resolve_native_antigravity_launch()
@@ -102,7 +102,7 @@ class TestResolveNativeAntigravityLaunch:
     def test_passes_model_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Model kwarg is forwarded to NativeAntigravityLaunch."""
         monkeypatch.setattr(
-            "omnigent.antigravity_native_launch.gemini_auth_has_credential",
+            "omnigent.harnesses.antigravity_native.launch.gemini_auth_has_credential",
             lambda: True,
         )
         result = resolve_native_antigravity_launch(model="gemini-2.5-pro")
@@ -111,7 +111,7 @@ class TestResolveNativeAntigravityLaunch:
     def test_model_none_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Model defaults to None when not provided."""
         monkeypatch.setattr(
-            "omnigent.antigravity_native_launch.gemini_auth_has_credential",
+            "omnigent.harnesses.antigravity_native.launch.gemini_auth_has_credential",
             lambda: True,
         )
         result = resolve_native_antigravity_launch()
@@ -122,12 +122,14 @@ class TestResolveNativeAntigravityLaunch:
     ) -> None:
         """A warning naming both token paths is logged when no agy credential is found."""
         monkeypatch.setattr(
-            "omnigent.antigravity_native_launch.gemini_auth_has_credential",
+            "omnigent.harnesses.antigravity_native.launch.gemini_auth_has_credential",
             lambda: False,
         )
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="omnigent.antigravity_native_launch"):
+        with caplog.at_level(
+            logging.WARNING, logger="omnigent.harnesses.antigravity_native.launch"
+        ):
             resolve_native_antigravity_launch()
         records = [r.message for r in caplog.records]
         assert any("agy credential" in m for m in records)

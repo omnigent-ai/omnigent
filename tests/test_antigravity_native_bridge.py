@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import omnigent.antigravity_native_bridge as _mod
-from omnigent.antigravity_native_bridge import (
+import omnigent.harnesses.antigravity_native.bridge as _mod
+from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     AntigravityNativeBridgeState,
@@ -436,7 +436,7 @@ def test_update_conversation_id_returns_false_and_warns_when_no_state(
     logs a WARNING naming the dropped id so the cold-start caller can report that
     the reader will stay bound to the ``agy_conv_*`` placeholder.
     """
-    with caplog.at_level(logging.WARNING, logger="omnigent.antigravity_native_bridge"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.antigravity_native.bridge"):
         result = update_conversation_id(bridge_dir, "agy_conv_new")  # empty bridge dir
     assert result is False
     assert read_bridge_state(bridge_dir) is None
@@ -1432,7 +1432,7 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert server["args"] == [
         "-I",
         "-m",
-        "omnigent.claude_native_bridge",
+        "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",
         "--bridge-dir",
         str(tmp_path),

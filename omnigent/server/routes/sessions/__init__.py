@@ -50,10 +50,6 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from omnigent.codex_native_elicitation import codex_elicitation_id
-from omnigent.cost_plan import (
-    reserved_cost_control_keys,
-)
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import (
     Agent,
@@ -70,17 +66,13 @@ from omnigent.entities.conversation import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
-from omnigent.model_override import validate_model_override
-from omnigent.native_coding_agents import (
+from omnigent.models.model_override import validate_model_override
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
-)
-from omnigent.reasoning_effort import (
-    EFFORT_CLEAR_VALUES,
-    EFFORT_VALUES,
-    validate_effort,
 )
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -168,6 +160,14 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.util.cost_plan import (
+    reserved_cost_control_keys,
+)
+from omnigent.util.reasoning_effort import (
+    EFFORT_CLEAR_VALUES,
+    EFFORT_VALUES,
+    validate_effort,
+)
 
 # Shared constants, state, and small dataclasses live in the _sessions.common
 # leaf module; import them here so this module and its re-exporters see the same
@@ -622,6 +622,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _forward_native_terminal_message as _forward_native_terminal_message,
     _get_session_snapshot as _get_session_snapshot,
     _handle_mcp_tools_call as _handle_mcp_tools_call,
+    _harness_elicitation_request_fingerprint as _harness_elicitation_request_fingerprint,
     _heal_subagent_runner_binding_via_parent as _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session as _is_native_terminal_session,
     _kick_managed_relaunch as _kick_managed_relaunch,
@@ -638,7 +639,6 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_native_cumulative_usage as _persist_native_cumulative_usage,
     _persist_native_terminal_failure as _persist_native_terminal_failure,
     _persist_session_event as _persist_session_event,
-    _persist_skipped_kiro_pending_input as _persist_skipped_kiro_pending_input,
     _publish_and_wait_for_harness_elicitation as _publish_and_wait_for_harness_elicitation,
     _publish_subtree_cost_to_ancestors as _publish_subtree_cost_to_ancestors,
     _recover_subagent_status_forward_via_parent as _recover_subagent_status_forward_via_parent,
@@ -713,10 +713,6 @@ from omnigent.server.schemas import (
     SkillSummary,
     UpdateSessionRequest,
 )
-from omnigent.session_lifecycle import (
-    is_session_closed,
-    labels_with_closed_status,
-)
 from omnigent.spec.types import (
     FunctionPolicySpec,
     Phase,
@@ -738,6 +734,10 @@ from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedE
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+from omnigent.util.session_lifecycle import (
+    is_session_closed,
+    labels_with_closed_status,
+)
 
 if TYPE_CHECKING:
     __all__ = [
