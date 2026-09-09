@@ -3695,7 +3695,10 @@ function ComposerImpl({
             {commandError}
           </div>
         )}
-        <div className="flex items-center justify-between gap-2 px-2 pb-2">
+        <div
+          className="@container/composer-actions flex items-center justify-between gap-2 px-2 pb-2"
+          data-testid="composer-action-row"
+        >
           {/* Attach + mic — left side of the action row */}
           <div className="flex shrink-0 items-center gap-0.5">
             <Button
@@ -3748,7 +3751,7 @@ function ComposerImpl({
                     size="sm"
                     variant={codexPlanMode ? "secondary" : "ghost"}
                     className={cn(
-                      "h-9 w-9 gap-0 px-0 text-sm md:h-8 md:w-auto md:gap-1.5 md:px-2",
+                      "h-9 w-9 gap-0 px-0 text-sm md:h-8 @lg/composer-actions:w-auto @lg/composer-actions:gap-1.5 @lg/composer-actions:px-2",
                       codexPlanMode && "border border-ring/30 text-foreground",
                     )}
                     disabled={isReadOnly || planModeBusy}
@@ -3764,7 +3767,7 @@ function ComposerImpl({
                     ) : (
                       <FileTextIcon className="size-3.5" />
                     )}
-                    <span className="hidden md:inline">Plan</span>
+                    <span className="hidden @lg/composer-actions:inline">Plan</span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>

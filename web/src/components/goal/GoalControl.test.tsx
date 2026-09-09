@@ -72,12 +72,12 @@ describe("GoalControl", () => {
     expect(screen.getByTestId("goal-toggle")).toBeDisabled();
   });
 
-  it("collapses the visible Goal label below the mobile breakpoint", () => {
+  it("collapses the visible Goal label in a narrow composer", () => {
     renderControl();
 
     const button = screen.getByRole("button", { name: "View goal" });
-    expect(button).toHaveClass("w-9", "md:w-auto");
-    expect(screen.getByText("Goal")).toHaveClass("hidden", "md:inline");
+    expect(button).toHaveClass("w-9", "@lg/composer-actions:w-auto");
+    expect(screen.getByText("Goal")).toHaveClass("hidden", "@lg/composer-actions:inline");
   });
 
   it("starts a command-backed goal", () => {

@@ -310,11 +310,11 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         reset_mock_llm(mock_llm_server_url)
 
 
-def test_composer_compacts_plan_and_goal_labels_on_phone_width(
+def test_composer_compacts_plan_and_goal_labels_when_action_row_is_narrow(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Phone widths preserve model space without dropping the config gear.
+    """Narrow composer rows preserve model space without dropping the gear.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
@@ -340,12 +340,16 @@ def test_composer_compacts_plan_and_goal_labels_on_phone_width(
         expect(plan_text).to_be_hidden()
         expect(goal_text).to_be_hidden()
 
-        page.set_viewport_size({"width": 700, "height": _IPHONE_VIEWPORT["height"]})
+        page.set_viewport_size({"width": 1200, "height": _IPHONE_VIEWPORT["height"]})
+        action_row = page.get_by_test_id("composer-action-row")
+        action_row.evaluate(
+            "element => { element.style.width = '31rem'; element.style.alignSelf = 'center'; }"
+        )
         expect(plan_text).to_be_hidden()
         expect(goal_text).to_be_hidden()
         expect(gear).to_be_visible()
 
-        page.set_viewport_size({"width": 800, "height": _IPHONE_VIEWPORT["height"]})
+        action_row.evaluate("element => { element.style.width = '34rem'; }")
         expect(plan_text).to_be_visible()
         expect(goal_text).to_be_visible()
         expect(gear).to_be_visible()
