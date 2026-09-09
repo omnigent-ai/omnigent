@@ -67,6 +67,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
+import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { randomUUID } from "@/lib/randomUUID";
@@ -4559,7 +4560,10 @@ export function NewChatLandingScreen() {
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...backgroundSessionTitlesRequestHeaders(),
+          },
           body: JSON.stringify({
             // Config-seeded agent on a `project_id` create: omitted so the
             // server default-fills it from the project config.

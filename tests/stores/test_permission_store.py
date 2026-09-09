@@ -59,27 +59,6 @@ def _create_conversation(db_uri: str) -> str:
     return conv.id
 
 
-# ── user settings ────────────────────────────────────────────────────────────
-
-
-def test_background_session_titles_default_on_when_unset(store: SqlAlchemyPermissionStore) -> None:
-    _ensure_user(store, "alice@test.com")
-
-    assert store.get_background_session_titles_enabled("alice@test.com") is True
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_background_session_titles_setting_round_trips(
-    store: SqlAlchemyPermissionStore,
-    enabled: bool,
-) -> None:
-    _ensure_user(store, "alice@test.com")
-
-    store.set_background_session_titles_enabled("alice@test.com", enabled)
-
-    assert store.get_background_session_titles_enabled("alice@test.com") is enabled
-
-
 # ── grant ────────────────────────────────────────────────────────────────────
 
 

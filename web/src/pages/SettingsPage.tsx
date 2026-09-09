@@ -226,7 +226,10 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
-import { getUserSettings, updateUserSettings } from "@/lib/userSettingsApi";
+import {
+  readBackgroundSessionTitlesEnabled,
+  writeBackgroundSessionTitlesEnabled,
+} from "@/lib/backgroundSessionTitlesPreferences";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -1275,35 +1278,14 @@ function ComposerSendShortcutControl() {
 }
 
 function BackgroundSessionTitlesControl() {
-  const [enabled, setEnabled] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
   const labelId = useId();
   const descriptionId = useId();
 
-  useEffect(() => {
-    let cancelled = false;
-    void getUserSettings()
-      .then((settings) => {
-        if (!cancelled) setEnabled(settings.backgroundSessionTitlesEnabled);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeBackgroundSessionTitlesEnabled(next);
   }, []);
-
-  const toggle = useCallback(
-    (next: boolean) => {
-      const previous = enabled;
-      setEnabled(next);
-      setSaving(true);
-      void updateUserSettings({ backgroundSessionTitlesEnabled: next })
-        .then((settings) => setEnabled(settings.backgroundSessionTitlesEnabled))
-        .catch(() => setEnabled(previous))
-        .finally(() => setSaving(false));
-    },
-    [enabled],
-  );
 
   return (
     <div className="flex items-start justify-between gap-6">
@@ -1320,7 +1302,6 @@ function BackgroundSessionTitlesControl() {
         aria-labelledby={labelId}
         aria-describedby={descriptionId}
         checked={enabled}
-        disabled={saving}
         onCheckedChange={toggle}
         data-testid="background-session-titles-toggle"
         className="mt-0.5 shrink-0"

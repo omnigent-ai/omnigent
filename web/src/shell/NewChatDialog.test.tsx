@@ -30,6 +30,7 @@ import {
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
+import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
   useHostModelOptions,
   fetchHosts,
@@ -2780,6 +2781,18 @@ describe("NewChatLandingScreen", () => {
     await screen.findByTestId("new-chat-landing-input");
     expect(screen.getByText("What should we build?")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
+  });
+
+  it("sends the background-title opt-out header on direct session creation", async () => {
+    localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
+    renderLanding();
+    await screen.findByTestId("new-chat-landing-input");
+
+    await submitAndReadBody("explain the nature of time");
+
+    const createCall = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const init = createCall[1] as RequestInit;
+    expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 
   it("files a pre-selected project, and invalidates project sessions", async () => {

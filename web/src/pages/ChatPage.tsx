@@ -3695,7 +3695,10 @@ function ComposerImpl({
             {commandError}
           </div>
         )}
-        <div className="flex items-center justify-between gap-2 px-2 pb-2">
+        <div
+          className="@container/composer-actions flex items-center justify-between gap-2 px-2 pb-2"
+          data-testid="composer-action-row"
+        >
           {/* Attach + mic — left side of the action row */}
           <div className="flex shrink-0 items-center gap-0.5">
             <Button
@@ -3748,7 +3751,7 @@ function ComposerImpl({
                     size="sm"
                     variant={codexPlanMode ? "secondary" : "ghost"}
                     className={cn(
-                      "h-9 gap-1.5 px-2 text-sm md:h-8",
+                      "h-9 w-9 gap-0 px-0 text-sm md:h-8 @lg/composer-actions:w-auto @lg/composer-actions:gap-1.5 @lg/composer-actions:px-2",
                       codexPlanMode && "border border-ring/30 text-foreground",
                     )}
                     disabled={isReadOnly || planModeBusy}
@@ -3764,7 +3767,7 @@ function ComposerImpl({
                     ) : (
                       <FileTextIcon className="size-3.5" />
                     )}
-                    <span>Plan</span>
+                    <span className="hidden @lg/composer-actions:inline">Plan</span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>
@@ -5139,7 +5142,10 @@ function ComposerModelSource({
           <span
             tabIndex={0}
             data-testid="composer-model-source"
-            className="min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+            // `flex` keeps the min-width chain flowing through this wrapper:
+            // as a plain span the label inside loses its flex-imposed width
+            // and its `truncate` never engages, running under the Stop button.
+            className="flex min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
           >
             {children}
           </span>

@@ -371,6 +371,24 @@ def test_restore_returns_a_drained_entry_to_the_front() -> None:
     assert redrained is not None and redrained.pending_id == first
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("matched", [False, True])
+def test_title_preference_survives_drain_and_restore(enabled: bool, matched: bool) -> None:
+    content = [{"type": "input_text", "text": "investigate timeout"}]
+    pending_inputs.record("conv_title", content, background_titles_enabled=enabled)
+    drained = (
+        pending_inputs.resolve_matching_text("conv_title", "investigate timeout").matched
+        if matched
+        else pending_inputs.resolve_oldest("conv_title")
+    )
+    assert drained is not None
+    assert drained.background_titles_enabled is enabled
+    pending_inputs.restore("conv_title", drained)
+    restored = pending_inputs.resolve_oldest("conv_title")
+    assert restored is not None
+    assert restored.background_titles_enabled is enabled
+
+
 def test_has_pending_tracks_parked_messages() -> None:
     assert pending_inputs.has_pending("conv_hp") is False
     pending_id = pending_inputs.record("conv_hp", [_text_block("hello")])

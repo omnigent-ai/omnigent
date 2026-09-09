@@ -4,13 +4,14 @@
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import { sessionBelongsToProject } from "@/shell/sidebarNav";
 
+/** Cards snap to this lattice; layout cells are whole steps so every card lines up. */
+export const GRID_STEP = 32;
 export const CARD_WIDTH = 280;
 export const CARD_HEIGHT = 132;
-export const CARD_GAP = 32;
 /** Sessions outside any project (or whose project is gone) live on this canvas. */
 export const MAIN_CANVAS_ID = "main";
-const CELL_WIDTH = CARD_WIDTH + CARD_GAP;
-const CELL_HEIGHT = CARD_HEIGHT + CARD_GAP;
+const CELL_WIDTH = GRID_STEP * 10;
+const CELL_HEIGHT = GRID_STEP * 5;
 
 export interface CanvasPosition {
   x: number;
@@ -109,10 +110,9 @@ export function mergeCanvasPositions(
   return positions;
 }
 
-export function prunePositions(
-  positions: CanvasPositions,
-  sessionIds: Iterable<string>,
-): CanvasPositions {
-  const live = new Set(sessionIds);
-  return Object.fromEntries(Object.entries(positions).filter(([id]) => live.has(id)));
+/** True when both hold the same cards at the same spots. */
+export function samePositions(left: CanvasPositions, right: CanvasPositions): boolean {
+  const ids = Object.keys(left);
+  if (ids.length !== Object.keys(right).length) return false;
+  return ids.every((id) => right[id]?.x === left[id].x && right[id]?.y === left[id].y);
 }
