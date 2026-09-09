@@ -717,6 +717,75 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert entry["refresh_token"] == "refresh-1"
 
 
+def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> None:
+    """A loopback server without /oauth/token is expected and must stay quiet.
+
+    A local/header-mode dev server has no refresh route, so a near-expiry
+    token would 404 on every reconnect. That case logs at debug (no warning,
+    no misleading "run omnigent login" advice) so it doesn't spam the host
+    daemon's reconnect loop.
+    """
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(404, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    with caplog.at_level(logging.DEBUG, logger="omnigent.cli_auth"):
+        assert refresh_stored_token("http://localhost:6767") is None
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    assert any(
+        r.levelno == logging.DEBUG and "no /oauth/token" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_refresh_404_on_remote_warns_without_relogin_advice(
+    token_dir, monkeypatch, caplog
+) -> None:
+    """A remote 404 is still surfaced, but not blamed on credentials.
+
+    A missing /oauth/token route on a real server (wrong URL, or a build
+    without session refresh) is not fixed by re-login, so the warning must
+    not tell the user to run `omnigent login`.
+    """
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    url = "https://omni.example.com"
+    store_token(
+        url,
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(u, *, data=None, timeout=None):
+        return httpx.Response(404, request=httpx.Request("POST", u))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert refresh_stored_token(url) is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("404" in m for m in warnings)
+    assert not any("omnigent login" in m for m in warnings)
+
+
 def test_refresh_stored_token_skips_when_already_fresh(token_dir, monkeypatch) -> None:
     """A concurrent refresher already renewed → return the valid token
     without a network call (the lock-then-recheck path)."""

@@ -444,6 +444,28 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     except httpx.HTTPError as exc:
         _logger.warning("Token refresh against %s failed: %s", normalized, exc)
         return None
+    if resp.status_code == 404:
+        # No ``/oauth/token`` route: a local/header-mode dev server or an
+        # older build that never issues refreshable sessions. Re-login
+        # cannot add the route, so the "run `omnigent login`" advice below
+        # is misleading. On a loopback target this is the expected case and
+        # would otherwise spam a warning on every near-expiry reconnect, so
+        # keep it at debug; a remote 404 (wrong URL / too-old server) still
+        # warrants a visible, non-credential-blaming note.
+        from omnigent_client._http import is_loopback_url
+
+        if is_loopback_url(normalized):
+            _logger.debug(
+                "Token refresh against %s skipped: server has no /oauth/token endpoint.",
+                normalized,
+            )
+        else:
+            _logger.warning(
+                "Token refresh against %s returned HTTP 404 — the server does not "
+                "expose /oauth/token (wrong URL or a build without session refresh).",
+                normalized,
+            )
+        return None
     if resp.status_code != 200:
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
