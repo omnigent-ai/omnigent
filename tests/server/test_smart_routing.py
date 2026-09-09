@@ -172,7 +172,7 @@ def test_model_lists_cover_current_claude_generations() -> None:
     """A stale list turns a live model into an unservable arm (sonnet-5 → haiku)."""
     models = infer_models("claude-sdk")
     assert models is not None
-    assert "databricks-claude-sonnet-5" in models
+    assert "system.ai.claude-sonnet-5" in models
 
 
 def test_substitute_model_applies_the_pick_when_the_catalog_serves_it() -> None:
@@ -736,7 +736,7 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
             runner_client=mock_client,
         )
     # Still routes — fell back to the static infer_models table.
-    assert model == "databricks-claude-haiku-4-5"
+    assert model == "system.ai.claude-haiku-4-5"
 
 
 # ── ExternalRoutingClient ─────────────────────────────────────────────
@@ -2397,9 +2397,9 @@ def test_infer_models_takes_the_current_generation_arms_from_the_settings() -> N
         models = infer_models("codex")
     assert models is not None
     assert models[-1] == "databricks-acme-1"
-    assert "databricks-glm-5-2" not in models
+    assert "system.ai.glm-5-2" not in models
     # The curated cost/capability spread is not a deployment knob.
-    assert models[0] == "databricks-gpt-5-4-nano"
+    assert models[0] == "system.ai.gpt-5-4-nano"
 
 
 def test_task_v1_claude_arms_follows_a_configured_menu() -> None:
@@ -2934,10 +2934,9 @@ async def test_route_session_harness_keeps_the_rationale_off_info(
 # ── Router source selection ─────────────────────────────────────────────────
 #
 # Gateway backing selects WHICH router answers, not whether Smart Routing is
-# offered. Off the gateway the external client's ``databricks-*`` picks are
-# unreachable from the pane, so the built-in judge answers instead — and the
-# static ``infer_models`` table, which is nothing but ``databricks-*`` ids, must
-# not be offered as candidates at all.
+# offered. Off the gateway the external client's UC model picks are unreachable
+# from the pane, so the built-in judge answers instead — and the static
+# ``infer_models`` table must not be offered as candidates at all.
 
 
 def _both_backends(external: FakeRoutingClient, local: FakeRoutingClient) -> RoutingBackends:

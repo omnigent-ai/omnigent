@@ -233,8 +233,7 @@ def _uc_service(name: str, api_types: list[str]) -> dict:
     return {"name": f"model-services/{name}", "supported_api_types": api_types}
 
 
-# Realistic serving-endpoints page (non-pi harnesses use /api/2.0/serving-endpoints
-# which returns databricks-* ids, not system.ai.* ids).
+# Realistic legacy serving-endpoints page used when UC discovery fails.
 _SERVING_ENDPOINTS_PAGE = {
     "endpoints": [
         {
@@ -449,10 +448,14 @@ def test_resolve_provider_legacy_profile(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert provider.profile == "legacy-prof"
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["databricks-claude-opus-4-8", "system.ai.claude-opus-4-8"],
+)
 def test_resolve_provider_databricks_model_prefix_uses_env_profile(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str
 ) -> None:
-    """A ``databricks-*`` spec model routes via the runner-env profile.
+    """A Databricks spec model routes via the runner-env profile.
 
     Mirrors the spawn builders' model-prefix heuristic plus the native
     launch paths' ``DATABRICKS_CONFIG_PROFILE`` fallback.
@@ -468,7 +471,7 @@ def test_resolve_provider_databricks_model_prefix_uses_env_profile(
         executor=ExecutorSpec(
             type="omnigent",
             config={"harness": "pi"},
-            model="databricks-claude-opus-4-8",
+            model=model,
         ),
     )
     provider = resolve_model_provider(spec, "pi")
@@ -650,7 +653,7 @@ def _databricks_transport(
     }
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve serving-endpoints (non-pi) or UC model-services (pi)."""
+        """Serve the UC model-services listing and its legacy fallback."""
         requests_seen.append(request)
         if request.url.path == "/api/2.0/serving-endpoints":
             return httpx.Response(200, json=_SERVING_ENDPOINTS_PAGE)
@@ -697,7 +700,7 @@ def test_databricks_listing_filters_to_llm_wire_surfaces(
     # The profile's minted token authenticated the listing call.
     assert requests_seen[0].headers["authorization"] == "Bearer dapi-test"
     by_id = {m.id: m for m in listing.models}
-    # Pi uses UC model-services API → system.ai.* ids; embeddings endpoint excluded.
+    # Databricks workers use UC model-services ids; embeddings are excluded.
     assert set(by_id) == {
         "system.ai.claude-sonnet-4-6",
         "system.ai.gpt-5-4",
@@ -760,23 +763,31 @@ def test_databricks_listing_skips_explicitly_non_ready_endpoints(
 @pytest.mark.parametrize(
     ("harness", "expected_ids"),
     [
-        pytest.param("claude-native", {"databricks-claude-sonnet-4-6"}, id="claude-family-only"),
-        pytest.param("codex-native", {"databricks-gpt-5-4"}, id="openai-family-only"),
+        pytest.param("claude-native", {"system.ai.claude-sonnet-4-6"}, id="claude-family-only"),
+        pytest.param(
+            "codex-native",
+            {"system.ai.gpt-5-4", "system.ai.gpt-responses-only"},
+            id="openai-family-only",
+        ),
         # The executor-type spelling spec_harness() yields when a spec
         # declares no config harness must filter like its canonical
         # sibling — an unrecognized spelling silently disables the
         # filter and lists wrong-family models.
         pytest.param(
-            "claude_sdk", {"databricks-claude-sonnet-4-6"}, id="claude-sdk-executor-type"
+            "claude_sdk", {"system.ai.claude-sonnet-4-6"}, id="claude-sdk-executor-type"
         ),
-        pytest.param("claude-sdk", {"databricks-claude-sonnet-4-6"}, id="claude-sdk-spelling"),
-        pytest.param("codex", {"databricks-gpt-5-4"}, id="codex-spelling"),
+        pytest.param("claude-sdk", {"system.ai.claude-sonnet-4-6"}, id="claude-sdk-spelling"),
+        pytest.param(
+            "codex",
+            {"system.ai.gpt-5-4", "system.ai.gpt-responses-only"},
+            id="codex-spelling",
+        ),
         # openai-agents / openai-agents-sdk / agents_sdk outcomes are
         # deliberately NOT pinned here: a later change relaxes that harness to
         # multi-model (any validated id), flipping the expected set.
         pytest.param(
             "pi",
-            # Pi uses UC model-services API → system.ai.* ids (embeddings excluded).
+            # Pi keeps every chat-capable UC model service.
             {
                 "system.ai.claude-sonnet-4-6",
                 "system.ai.gpt-5-4",
@@ -861,25 +872,20 @@ def test_codex_worker_listing_keeps_glm_and_kimi_endpoints(
     _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
     _stub_workspace_creds(monkeypatch)
     page = {
-        "endpoints": [
-            {
-                "name": name,
-                "creator": "system",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            }
+        "model_services": [
+            _uc_service(name, ["openai/v1/responses"])
             for name in (
-                "databricks-gpt-5-5",
-                "databricks-glm-5-2",
-                "databricks-kimi-k2-6",
-                "databricks-claude-sonnet-4-6",
-                "databricks-meta-llama-3-3-70b-instruct",
+                "system.ai.gpt-5-5",
+                "system.ai.glm-5-2",
+                "system.ai.kimi-k2-6",
+                "system.ai.claude-sonnet-4-6",
+                "system.ai.meta-llama-3-3-70b-instruct",
             )
         ]
     }
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve the serving-endpoints page for the codex worker."""
+        """Serve the Unity Catalog model-services page for the codex worker."""
         return httpx.Response(200, json=page)
 
     listing = list_models_for_worker(
@@ -887,9 +893,9 @@ def test_codex_worker_listing_keeps_glm_and_kimi_endpoints(
     )
 
     assert {m.id for m in listing.models} == {
-        "databricks-gpt-5-5",
-        "databricks-glm-5-2",
-        "databricks-kimi-k2-6",
+        "system.ai.gpt-5-5",
+        "system.ai.glm-5-2",
+        "system.ai.kimi-k2-6",
     }
 
 
@@ -1275,11 +1281,18 @@ def test_listing_failure_reported_and_not_cached(
     def _flaky_handler(request: httpx.Request) -> httpx.Response:
         """Fail the first listing call, succeed afterwards."""
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 2:
             return httpx.Response(503, json={"error": "temporarily unavailable"})
-        return httpx.Response(200, json=_SERVING_ENDPOINTS_PAGE)
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    _uc_service("system.ai.gpt-5-4", ["openai/v1/responses"])
+                ]
+            },
+        )
 
-    # Use codex-native (serving-endpoints path) to test generic failure/retry logic.
+    # Use codex-native to test generic UC-listing failure/retry behavior.
     transport = httpx.MockTransport(_flaky_handler)
     failed = list_models_for_worker(
         _worker_spec("codex-native"), "codex-native", transport=transport
@@ -1294,7 +1307,7 @@ def test_listing_failure_reported_and_not_cached(
     )
     # Recovery proves the failure was NOT cached for the TTL window.
     assert recovered.source == "gateway"
-    # codex-native filters to openai-family only → 1 model from _SERVING_ENDPOINTS_PAGE
+    # codex-native filters to the one OpenAI-family UC model.
     assert len(recovered.models) == 1
 
 
