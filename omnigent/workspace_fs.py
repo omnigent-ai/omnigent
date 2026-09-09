@@ -418,10 +418,10 @@ class WorkspaceReader:
         scan(str(self._root), True)
         while deferred and not stop:
             scan(deferred.pop(0), False)
-        # Deferred subtrees left unwalked because the budget ran out mean the
-        # scan was not exhaustive, so "no more matches" would be a lie.
-        if deferred and not stop:
-            truncated = True
+        # When the walk stops early it is always because scan() tripped the
+        # budget (which sets truncated) or the result limit (signaled by
+        # has_more); the loop exits only once deferred is drained or stop is
+        # set, so no extra truncation flag is needed here.
 
         results.sort(key=lambda entry: cast(str, entry["path"]))
         return {
