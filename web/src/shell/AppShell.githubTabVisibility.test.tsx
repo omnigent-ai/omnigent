@@ -14,7 +14,6 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useConversations: vi.fn(),
@@ -184,5 +183,4 @@ describe("GitHub rail tab visibility", () => {
 
     expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
   });
-
 });
