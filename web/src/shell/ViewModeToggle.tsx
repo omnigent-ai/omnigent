@@ -38,8 +38,10 @@ export function ViewModeToggle() {
       // 32px tall, matching the header's other controls. On mobile the
       // segments grow to the 44px tap-target floor and the padding drops so
       // the track matches the pill's other 44px controls instead of
-      // stretching it.
-      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5 max-md:p-0"
+      // stretching it — and the flush track must be a capsule like those
+      // segments and the glass pill, or its grey paints squared corners
+      // between two round shapes.
+      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5 max-md:rounded-full max-md:p-0"
     >
       <ViewModeSegment
         label="Chat view"
