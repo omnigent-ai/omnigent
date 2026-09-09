@@ -54,6 +54,8 @@ const mobileMenu = {
   onOpenChanges: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
+  githubPanelOpen: false,
+  onOpenGithub: () => {},
   onOpenMainExecutionLog: () => {},
 };
 

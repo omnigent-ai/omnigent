@@ -51,6 +51,4 @@ def test_github_tab_shows_empty_state_for_non_git_workspace(
 
     # Clicking it must render the empty state, not crash or show a blank panel.
     github_tab.click()
-    expect(rail.get_by_text(re.compile(r"Not a git repository"))).to_be_visible(
-        timeout=30_000
-    )
+    expect(rail.get_by_text(re.compile(r"Not a git repository"))).to_be_visible(timeout=30_000)
