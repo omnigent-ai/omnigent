@@ -481,9 +481,10 @@ class _PiNativeLaunchConfig:
 
     A generic session-snapshot reader shared by the pi-native and
     cursor-native launch paths (workspace + terminal_launch_args +
-    model_override). Each path consumes the subset it needs: pi-native
-    uses ``model_override`` as ``--model`` (overrides the spec's pinned
-    model); cursor-native does the same.
+    model_override). Each path consumes the subset it needs: managed
+    pi-native providers use ``model_override`` as ``--model`` while Pi's
+    own-login path replays it through the extension after startup; cursor-native
+    passes it as ``--model``.
 
     :param workspace: Workspace cwd for the native TUI.
     :param server_url: Omnigent server URL for the extension/forwarder.
@@ -500,8 +501,9 @@ class _PiNativeLaunchConfig:
         the cursor-native launch to replay prior turns as a text preamble on
         the first message.
     :param model_override: Persisted per-session ``/model`` override, e.g.
-        ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
-        cursor-native launch (``--model``), ignored by pi-native.
+        ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by
+        managed pi-native launches as ``--model`` and replayed through the
+        extension for Pi's own-login path; cursor-native also uses ``--model``.
     :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
         Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
         Pi's model default in place.
@@ -2193,6 +2195,7 @@ async def _auto_create_pi_terminal(
     # falls back to its own login). Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
     credential_warning: str | None = None
+    startup_model_replay_model: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.harnesses.pi_native.credentials import (
             pi_native_provider_launch,
@@ -2221,6 +2224,12 @@ async def _auto_create_pi_terminal(
                 or provider.credential_warning
                 or launch.effort_warning
             )
+        elif launch_config.model_override:
+            # Pi's own-login provider cannot be represented by Omnigent's
+            # managed ``--provider/--model`` launch path. Replay the persisted
+            # web selection through the resident extension after startup so a
+            # fresh process does not silently fall back to Pi's global default.
+            startup_model_replay_model = launch_config.model_override
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -2246,6 +2255,30 @@ async def _auto_create_pi_terminal(
             tmux_start_on_attach=False,
         ),
     )
+    if startup_model_replay_model is not None:
+        from omnigent.harnesses.pi_native.bridge import (
+            enqueue_model_change,
+            wait_for_model_change_ack,
+        )
+
+        # The launch API has returned, so Pi has been spawned. Queue the
+        # persisted UI selection now; the extension will acknowledge only
+        # after its session_start handler has installed the inbox poller and
+        # Pi's setModel call has completed.
+        startup_model_replay_id = await asyncio.to_thread(
+            enqueue_model_change,
+            bridge_dir,
+            startup_model_replay_model,
+            wait_for_ack=True,
+        )
+        applied = await wait_for_model_change_ack(bridge_dir, startup_model_replay_id)
+        if not applied:
+            _logger.warning(
+                "Pi-native startup model replay was not acknowledged for session %s (model=%s)",
+                session_id,
+                startup_model_replay_model,
+                extra={"session_id": session_id},
+            )
     publish_event(
         session_id,
         {
