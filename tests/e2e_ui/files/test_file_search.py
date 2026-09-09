@@ -141,20 +141,32 @@ def test_search_matches_and_reveals_a_directory(
     rail = page.get_by_role("complementary", name="Workspace")
     search = rail.get_by_role("searchbox", name="Search all files")
     expect(search).to_be_visible(timeout=30_000)
+    # Match rows by exact accessible name — a slash inside a Playwright
+    # name-regex is invalid, and the trailing-slash folder label collides with
+    # the file path otherwise. The folder row's name is the path + "/"; the
+    # flat file result's name is the full file path.
+    folder_row = rail.get_by_role("button", name=f"{_DIR_NAME}/", exact=True)
+    # Match the file result by its slash-free basename: _row builds a name-regex
+    # and a slash inside a Playwright regex is invalid, but the substring match
+    # still resolves the full-path button ("widgets/gadget.py").
+    file_result = _row(rail, "gadget.py")
     # The seeded folder must be listed before searching so the panel has
     # settled out of its mount-time re-render (see _search_for).
-    expect(_row(rail, f"{_DIR_NAME}/")).to_be_visible(timeout=30_000)
+    expect(folder_row).to_be_visible(timeout=30_000)
 
-    # The query matches the directory by name; it appears as a folder row whose
-    # label carries the full path with a trailing slash.
+    # The query matches both the directory (folder row) and the file under it.
     _search_for(search, _DIR_NAME)
-    dir_result = rail.get_by_role("button", name=re.compile(rf"{re.escape(_DIR_NAME)}/"))
-    expect(dir_result.first).to_be_visible(timeout=15_000)
+    # Wait until search-RESULTS mode is actually active before clicking: the
+    # flat file result only exists in search mode (in the tree it's hidden
+    # inside the collapsed folder), and while it's showing the tree is
+    # unmounted, so the only "widgets/" button left is the search folder row.
+    # Without this gate the ~300ms debounce lets the click land on the tree's
+    # folder toggle instead, which expands in place rather than revealing.
+    expect(file_result).to_be_visible(timeout=15_000)
 
     # Clicking the folder result reveals it in the tree: search clears and the
     # folder is shown as an (expandable) tree row, not opened as a file.
-    dir_result.first.click()
+    folder_row.click()
     expect(search).to_have_value("")
-    # Back in tree mode the folder row is present and its file becomes reachable
-    # once expanded — assert the folder itself is shown as a tree node.
-    expect(_row(rail, f"{_DIR_NAME}/")).to_be_visible(timeout=15_000)
+    # Back in tree mode the folder row is still present as a tree node.
+    expect(folder_row).to_be_visible(timeout=15_000)
