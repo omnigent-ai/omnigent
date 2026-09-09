@@ -477,8 +477,8 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-_BROKERED_CODEX_MIN_VERSION = Version("0.140.0a19")
-_BROKERED_CODEX_MAX_VERSION = Version("0.140.0a20")
+_BROKERED_CODEX_MIN_VERSION = Version("0.146.0")
+_BROKERED_CODEX_MAX_VERSION = Version("0.146.1")
 
 
 async def _require_brokered_codex_version(codex_path: str) -> None:
@@ -496,8 +496,8 @@ async def _require_brokered_codex_version(codex_path: str) -> None:
         shown = raw or "unparseable"
         raise RuntimeError(
             "unsupported Codex wire version "
-            f"{shown}; brokered authentication requires >= 0.140.0-alpha.19 "
-            "and < 0.140.0-alpha.20"
+            f"{shown}; brokered authentication requires >= 0.146.0 "
+            "and < 0.146.1"
         )
 
 

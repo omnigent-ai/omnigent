@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.codex_executor import CodexExecutor
+from omnigent.inner.codex_executor import CodexExecutor, _require_brokered_codex_version
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import TextChunk, TurnComplete
 from omnigent.inner.model_egress import FrozenModelRoute
@@ -24,6 +24,10 @@ _MARKER = "BROKERED_E2E_OK upstream_saw_signer_only_fake_bearer=true"
 async def test_real_codex_seatbelt_signer_turn_and_cleanup(
     tmp_path: Path,
 ) -> None:
+    try:
+        await _require_brokered_codex_version(str(_CODEX))
+    except RuntimeError as exc:
+        pytest.skip(f"requires brokered Codex version pin: {exc}")
     config = SignerLaunchConfig(
         binding_id="test-fake-provider-v1",
         endpoint="https://model.test/v1",
@@ -114,7 +118,7 @@ async def test_linux_bwrap_real_signer_relay_with_deterministic_worker(tmp_path:
         """#!/usr/bin/python3
 import json, os, sys, urllib.request
 if "--version" in sys.argv:
-    print("codex-cli 0.140.0-alpha.19")
+    print("codex-cli 0.146.0")
     raise SystemExit(0)
 for line in sys.stdin:
     request = json.loads(line)
