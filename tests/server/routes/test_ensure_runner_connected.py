@@ -15,6 +15,8 @@ from typing import Any
 import pytest
 
 from omnigent.entities.conversation import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE
 from omnigent.server.routes._sessions import orchestration
 
 
@@ -171,6 +173,119 @@ async def test_workspace_refusal_records_canonical_owner_scoped_error(
         "error": "workspace path does not exist: /trusted/workspace",
         "owner": "alice@example.com",
     }
+
+
+@pytest.mark.parametrize(
+    "host_error_code",
+    [_WORKSPACE_MISSING_ERROR_CODE, None],
+    ids=["coded", "older-host"],
+)
+@pytest.mark.asyncio
+async def test_raised_workspace_refusal_rebuilds_message(
+    monkeypatch: pytest.MonkeyPatch,
+    host_error_code: str | None,
+) -> None:
+    """The raising path sanitizes too, not just the recording path.
+
+    ``raise_host_refusal=True`` is how ``/retry`` recovery surfaces a refusal.
+    It must rebuild the message from the authorized workspace like the
+    relaunch and direct-launch paths do, or a hostile host's log tail is
+    reflected straight back through the API.
+    """
+    monkeypatch.setattr(orchestration, "_get_runner_client", _async_return(None))
+    monkeypatch.setattr(
+        orchestration,
+        "_maybe_wake_stale_resumable_managed_sandbox",
+        _async_return(False),
+    )
+    canonical = "workspace path does not exist: /trusted/workspace"
+    # An older host omits error_code and sends only the categorical reason.
+    host_error = (
+        "runner log tail: SECRET_TOKEN\nforged workspace failure"
+        if host_error_code is not None
+        else canonical
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_launch_runner_on_host",
+        _async_return(
+            SimpleNamespace(
+                runner_id="runner_new",
+                error_code=host_error_code,
+                error=host_error,
+            )
+        ),
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("a refused launch must not wait for a runner")
+
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", _boom)
+
+    conv = _conv(host_id="host_1", workspace="/trusted/workspace")
+    app_state = SimpleNamespace(
+        host_registry=SimpleNamespace(get=lambda _hid: SimpleNamespace(owner="alice@example.com")),
+        runner_exit_reports=None,
+        tunnel_registry=None,
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        await orchestration.ensure_runner_connected(
+            session_id="conv_1",
+            conv=conv,
+            app_state=app_state,
+            conversation_store=_Store(conv),
+            runner_router=None,
+            raise_host_refusal=True,
+        )
+
+    assert excinfo.value.code == ErrorCode.WORKSPACE_MISSING
+    assert excinfo.value.message == canonical
+    assert "SECRET_TOKEN" not in excinfo.value.message
+
+
+@pytest.mark.asyncio
+async def test_raised_harness_refusal_keeps_host_setup_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Harness refusals still carry the host's setup hint, by design."""
+    monkeypatch.setattr(orchestration, "_get_runner_client", _async_return(None))
+    monkeypatch.setattr(
+        orchestration,
+        "_maybe_wake_stale_resumable_managed_sandbox",
+        _async_return(False),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_launch_runner_on_host",
+        _async_return(
+            SimpleNamespace(
+                runner_id="runner_new",
+                error_code=orchestration._HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                error="harness 'claude' is not configured on host 'box'",
+            )
+        ),
+    )
+
+    conv = _conv(host_id="host_1", workspace="/w")
+    app_state = SimpleNamespace(
+        host_registry=SimpleNamespace(get=lambda _hid: SimpleNamespace(owner="alice@example.com")),
+        runner_exit_reports=None,
+        tunnel_registry=None,
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        await orchestration.ensure_runner_connected(
+            session_id="conv_1",
+            conv=conv,
+            app_state=app_state,
+            conversation_store=_Store(conv),
+            runner_router=None,
+            raise_host_refusal=True,
+        )
+
+    assert excinfo.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert excinfo.value.message == "harness 'claude' is not configured on host 'box'"
 
 
 @pytest.mark.asyncio

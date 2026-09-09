@@ -26,10 +26,13 @@ from omnigent.entities.conversation import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
-    HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.host.frames import (
-    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
+    classify_launch_refusal as _classify_launch_refusal,
+)
+from omnigent.host.frames import (
+    workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
@@ -1728,23 +1731,16 @@ def register_events_routes(
                         _host_reg,
                         _host_conn,
                     )
-                    host_error_code: str | None = None
-                    host_error: str | None = None
-                    if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
-                        host_error_code = _HARNESS_NOT_CONFIGURED_ERROR_CODE
-                        host_error = launch_attempt.error
-                    else:
-                        workspace_error = f"workspace path does not exist: {conv.workspace}"
-                        if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE or (
-                            # Rolling upgrade: older hosts send this exact
-                            # categorical reason without an error_code.
-                            launch_attempt.error_code is None
-                            and launch_attempt.error == workspace_error
-                        ):
-                            host_error_code = _WORKSPACE_MISSING_ERROR_CODE
-                            # Rebuild from the authorized session row instead
-                            # of reflecting arbitrary host-provided text.
-                            host_error = workspace_error
+                    host_error_code = _classify_launch_refusal(
+                        launch_attempt.error_code,
+                        launch_attempt.error,
+                        conv.workspace,
+                    )
+                    host_error: str | None = launch_attempt.error
+                    if host_error_code == _WORKSPACE_MISSING_ERROR_CODE:
+                        # Rebuild from the authorized session row instead
+                        # of reflecting arbitrary host-provided text.
+                        host_error = _workspace_missing_message(conv.workspace)
                     if host_error_code is not None:
                         # No runner can connect after either safe categorical
                         # refusal. Consume the message and record the actionable

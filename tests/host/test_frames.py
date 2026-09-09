@@ -47,8 +47,10 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    classify_launch_refusal,
     decode_host_frame,
     encode_host_frame,
+    workspace_missing_message,
 )
 
 
@@ -1667,3 +1669,32 @@ def test_fs_result_null_payload_round_trip() -> None:
     assert isinstance(decoded, HostFsResultFrame)
     assert decoded.payload is None
     assert decoded.error_status == 500
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error", "expected"),
+    [
+        (HARNESS_NOT_CONFIGURED_ERROR_CODE, "any text", HARNESS_NOT_CONFIGURED_ERROR_CODE),
+        (WORKSPACE_MISSING_ERROR_CODE, "any text", WORKSPACE_MISSING_ERROR_CODE),
+        # Rolling upgrade: an older host sends the reason with no code.
+        (None, "workspace path does not exist: /w", WORKSPACE_MISSING_ERROR_CODE),
+        # Uncategorized failures stay generic, however they are worded.
+        (None, "workspace path does not exist: /elsewhere", None),
+        (None, "runner exited with code 1", None),
+        (None, None, None),
+        ("some_future_code", "any text", None),
+    ],
+)
+def test_classify_launch_refusal(
+    error_code: str | None, error: str | None, expected: str | None
+) -> None:
+    """Only the two categorical refusals classify; everything else is generic."""
+    assert classify_launch_refusal(error_code, error, "/w") == expected
+
+
+def test_workspace_missing_message_is_the_host_spelling() -> None:
+    """Producer and consumer share one spelling so the compat match holds."""
+    assert workspace_missing_message("/w") == "workspace path does not exist: /w"
+    assert classify_launch_refusal(None, workspace_missing_message("/w"), "/w") == (
+        WORKSPACE_MISSING_ERROR_CODE
+    )

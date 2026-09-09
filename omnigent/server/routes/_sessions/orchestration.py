@@ -57,6 +57,12 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    classify_launch_refusal as _classify_launch_refusal,
+)
+from omnigent.host.frames import (
+    workspace_missing_message as _workspace_missing_message,
+)
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.model_metadata import concrete_reported_model
 from omnigent.native_coding_agents import (
@@ -3433,37 +3439,42 @@ async def ensure_runner_connected(
             # Record the refusal message in runner_exit_reports so the
             # runner_failed_to_start error surfaces the actionable cause
             # rather than the generic "may have failed to start" fallback.
-            _fatal_refusal = launch_attempt.error_code in (
-                _HARNESS_NOT_CONFIGURED_ERROR_CODE,
-                _WORKSPACE_MISSING_ERROR_CODE,
+            _refusal_code = _classify_launch_refusal(
+                launch_attempt.error_code,
+                launch_attempt.error,
+                conv.workspace,
             )
-            if _fatal_refusal and raise_host_refusal:
-                error_code = (
-                    ErrorCode.HARNESS_NOT_CONFIGURED
-                    if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
-                    else ErrorCode.WORKSPACE_MISSING
-                )
+            if _refusal_code == _WORKSPACE_MISSING_ERROR_CODE:
+                # Rebuild from the authorized session row: the host's own
+                # text is untrusted and may carry log tails or secrets.
+                # Harness refusals keep the host's text by design: it is a
+                # deterministic setup hint, not runner output.
+                _refusal_message = _workspace_missing_message(conv.workspace)
+            else:
+                _refusal_message = launch_attempt.error or ""
+            if _refusal_code is not None and raise_host_refusal:
                 raise OmnigentError(
-                    launch_attempt.error
+                    _refusal_message
                     or (
                         "The session harness is not configured on this host."
-                        if error_code == ErrorCode.HARNESS_NOT_CONFIGURED
+                        if _refusal_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
                         else "The session workspace no longer exists on the host."
                     ),
-                    code=error_code,
+                    code=(
+                        ErrorCode.HARNESS_NOT_CONFIGURED
+                        if _refusal_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
+                        else ErrorCode.WORKSPACE_MISSING
+                    ),
                 )
-            if _fatal_refusal and launch_attempt.error is not None:
+            if _refusal_code is not None and _refusal_message:
                 _rer = getattr(app_state, "runner_exit_reports", None)
                 if _rer is not None:
-                    report_error = launch_attempt.error
-                    if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE:
-                        report_error = f"workspace path does not exist: {conv.workspace}"
                     _rer.record(
                         launch_attempt.runner_id,
-                        report_error,
+                        _refusal_message,
                         owner=host_conn.owner,
                     )
-            if not _fatal_refusal:
+            if _refusal_code is None:
                 relaunched_runner_id = launch_attempt.runner_id
         elif await _maybe_relaunch_managed_sandbox(
             session_id=session_id,
@@ -4200,7 +4211,11 @@ async def _persist_host_launch_failure_turn(
     :param conv: Conversation row for the session.
     :param body: Original user message event.
     :param conversation_store: Store used for the durable append.
-    :param host_error: The host's human-readable refusal.
+    :param host_error: The refusal text to surface. Workspace refusals must
+        pass the server-rebuilt message (see
+        :func:`~omnigent.host.frames.workspace_missing_message`); harness
+        refusals pass the host's own text, which is a deterministic setup
+        hint rather than runner output.
     :param runner_router: Router used to resolve a sub-agent's runner for
         the parent-wake forward, or ``None`` in in-process / test setups.
     :param created_by: Authenticated posting actor, e.g.

@@ -83,6 +83,7 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
+    workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
     WorktreeError,
@@ -1715,7 +1716,7 @@ class HostProcess:
         if not workspace.is_dir():
             return self._launch_failed(
                 frame,
-                f"workspace path does not exist: {workspace}",
+                workspace_missing_message(workspace),
                 error_code=WORKSPACE_MISSING_ERROR_CODE,
             )
 

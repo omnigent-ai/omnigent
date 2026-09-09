@@ -38,8 +38,10 @@ from omnigent.host.frames import (
     HostLaunchRunnerFrame,
     HostListDirFrame,
     HostStoreSecretFrame,
+    classify_launch_refusal,
     encode_host_frame,
     optional_str_bool_map,
+    workspace_missing_message,
 )
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
@@ -977,7 +979,12 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
-            if result.get("error_code") == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            refusal_code = classify_launch_refusal(
+                result.get("error_code"),
+                result.get("error"),
+                workspace,
+            )
+            if refusal_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action
                 # (`omnigent setup` on the host machine). Surface the
@@ -986,16 +993,11 @@ def create_hosts_router(
                     f"host failed to launch runner: {result.get('error')}",
                     code=ErrorCode.HARNESS_NOT_CONFIGURED,
                 )
-            workspace_error = f"workspace path does not exist: {workspace}"
-            if result.get("error_code") == WORKSPACE_MISSING_ERROR_CODE or (
-                # Rolling upgrade: an older host sends this exact
-                # categorical reason without an error_code.
-                result.get("error_code") is None and result.get("error") == workspace_error
-            ):
+            if refusal_code == WORKSPACE_MISSING_ERROR_CODE:
                 # Rebuild the message from the authorized, canonical
                 # workspace rather than reflecting arbitrary host output.
                 raise OmnigentError(
-                    f"host failed to launch runner: {workspace_error}",
+                    f"host failed to launch runner: {workspace_missing_message(workspace)}",
                     code=ErrorCode.WORKSPACE_MISSING,
                 )
             raise HTTPException(
