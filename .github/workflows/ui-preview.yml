@@ -54,6 +54,10 @@ on:
         description: 'App update timestamp observed by the cleanup reconciler'
         required: true
         type: string
+      expected_creator:
+        description: 'App creator observed by the cleanup reconciler'
+        required: true
+        type: string
   push:
     branches:
       - main
@@ -456,6 +460,7 @@ jobs:
           databricks --version
 
       - name: Delete app
+        id: delete
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
@@ -466,18 +471,29 @@ jobs:
           EXPECTED_ID: ${{ inputs.expected_id }}
           EXPECTED_CREATE_TIME: ${{ inputs.expected_create_time }}
           EXPECTED_UPDATE_TIME: ${{ inputs.expected_update_time }}
+          EXPECTED_CREATOR: ${{ inputs.expected_creator }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid PR number'; exit 1; }
-          APP_NAME="omnigent-ui-preview-pr-$PR_NUMBER"
+          RESULT="$RUNNER_TEMP/ui-preview-cleanup-result.json"
           INVENTORY="$RUNNER_TEMP/ui-preview-apps.json"
           APP_JSON="$RUNNER_TEMP/ui-preview-app.json"
+          record_result() {
+            jq -n --arg action "$1" --arg reason "$2" \
+              '{action: $action, reason: $reason}' > "$RESULT"
+            echo "action=$1" >> "$GITHUB_OUTPUT"
+          }
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            record_result error 'invalid PR number'
+            exit 1
+          fi
+          APP_NAME="omnigent-ui-preview-pr-$PR_NUMBER"
 
           databricks apps list -o json > "$INVENTORY"
           if ! jq -e --arg name "$APP_NAME" '.[] | select(.name == $name)' \
               "$INVENTORY" > "$APP_JSON"; then
             echo "App is already absent: $APP_NAME"
+            record_result absent 'app was already absent'
             exit 0
           fi
 
@@ -489,6 +505,7 @@ jobs:
               --arg id "$EXPECTED_ID" \
               --arg create_time "$EXPECTED_CREATE_TIME" \
               --arg update_time "$EXPECTED_UPDATE_TIME" \
+              --arg creator "$EXPECTED_CREATOR" \
               --arg description "$EXPECTED_URL" \
               '
                 .name == $name
@@ -496,7 +513,7 @@ jobs:
                 and .create_time == $create_time
                 and .update_time == $update_time
                 and .description == $description
-                and (.creator | type == "string" and length > 0)
+                and .creator == $creator
                 and .default_source_code_path == ("/Workspace/Users/" + .creator + "/apps/" + $name)
                 and ((.resources // []) | length == 0)
                 and (.compute_status.state | IN("ACTIVE", "STOPPED", "ERROR"))
@@ -504,8 +521,14 @@ jobs:
                 and (.pending_update == null)
               ' "$APP_JSON" > /dev/null || {
                 echo 'App changed after cleanup review; refusing deletion'
+                record_result error 'app changed after cleanup review'
                 exit 1
               }
+            if [[ "$EXPECTED_CREATOR" != "$DATABRICKS_CLIENT_ID" ]]; then
+              echo 'App belongs to another deployment principal; retaining it'
+              record_result retain 'app belongs to another deployment principal'
+              exit 0
+            fi
           fi
 
           SOURCE_PATH=$(jq -r '.default_source_code_path // empty' "$APP_JSON")
@@ -521,14 +544,26 @@ jobs:
           if jq -e --arg name "$APP_NAME" '.[] | select(.name == $name)' \
               "$INVENTORY" > /dev/null; then
             echo "App still exists after deletion: $APP_NAME"
+            record_result error 'app still exists after deletion'
             exit 1
           fi
           if [[ "$DISPATCHED" != true && -n "$SOURCE_PATH" ]]; then
             WS_PATH="${SOURCE_PATH#/Workspace}"
             databricks workspace delete "$WS_PATH" --recursive 2>/dev/null || true
           fi
+          record_result deleted 'app deleted and absence verified'
+
+      - name: Upload cleanup result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ui-preview-cleanup-result
+          path: ${{ runner.temp }}/ui-preview-cleanup-result.json
+          retention-days: 1
+          if-no-files-found: warn
 
       - name: Update PR comment
+        if: steps.delete.outputs.action == 'deleted' || steps.delete.outputs.action == 'absent'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
