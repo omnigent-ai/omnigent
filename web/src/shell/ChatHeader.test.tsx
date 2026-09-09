@@ -794,6 +794,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Add to project",
       "Files",
       "Changes",
+      "GitHub",
       "Agents1",
       "Archive",
       "Delete",
