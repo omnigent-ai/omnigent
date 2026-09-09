@@ -201,6 +201,21 @@ describe("GithubPanel", () => {
     expect(screen.queryByText(/pending/)).toBeNull();
   });
 
+  it.each([
+    ["OPEN", "Open", "text-green-700"],
+    ["CLOSED", "Closed", "text-red-700"],
+    ["MERGED", "Merged", "text-brand-accent"],
+  ])("shows a %s status pill beside the PR title", (stateName, label, tone) => {
+    state.info!.data!.pr!.state = stateName;
+    renderPanel();
+
+    const pill = screen.getByLabelText(`Pull request status: ${label}`);
+    expect(pill).toHaveTextContent(label);
+    expect(pill).toHaveClass(tone, "h-5", "rounded-full", "border", "text-xs");
+    expect(pill.parentElement).toHaveClass("flex-nowrap");
+    expect(screen.getByRole("link", { name: /chore: dummy PR/ })).not.toHaveClass("flex-1");
+  });
+
   it("lands on the Summary tab, showing the PR description and comments", async () => {
     state.info!.data!.pr!.body = "## Overview\nThis PR does the thing.";
     state.info!.data!.pr!.comments = [
