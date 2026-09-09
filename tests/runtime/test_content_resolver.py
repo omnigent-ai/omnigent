@@ -1159,6 +1159,40 @@ def test_extracts_text_from_csv_attachment() -> None:
     assert "4111 1111 1111 1111" in out[0]["text"]
 
 
+def test_workspace_attachment_is_announced_to_policy_without_text() -> None:
+    """
+    A workspace-delivered file is listed for policy, with no text.
+
+    Its bytes are not scannable, but the file does land on the agent's
+    filesystem, so a policy needs to see that it was attached and be able to
+    refuse it by name. Omitting it entirely would make the request look like
+    it carried no attachment at all.
+    """
+    fs, arts = _stores_with("file_zip", "bundle.zip", "application/zip", b"PK\x03\x04data")
+    content = [
+        {"type": "input_text", "text": "unpack this"},
+        {"type": "input_file", "file_id": "file_zip"},
+    ]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert len(out) == 1
+    assert out[0]["filename"] == "bundle.zip"
+    assert out[0]["delivery"] == "workspace"
+    assert out[0]["text"] == ""
+
+
+def test_inlined_attachment_is_marked_as_inline_delivery() -> None:
+    """Inline entries say so, so a policy can tell the two apart."""
+    fs, arts = _stores_with("file_csv", "data.csv", "text/csv", b"a,b\n1,2\n")
+    content = [{"type": "input_file", "file_id": "file_csv"}]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert len(out) == 1
+    assert out[0]["delivery"] == "inline"
+
+
 def test_skips_binary_attachments() -> None:
     """Non-text attachments (image/PDF) are not decoded."""
     fs, arts = _stores_with("file_png", "photo.png", "image/png", PNG_BYTES)
