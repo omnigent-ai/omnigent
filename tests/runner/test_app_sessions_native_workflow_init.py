@@ -2043,8 +2043,8 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
         name="codex-bundle-agent",
         skills_filter=["codex_e2e_xyz_greet_a3f9c2"],
         executor=ExecutorSpec(
-            config={"harness": "codex", "profile": "test-profile"},
-            model="databricks-gpt-5-4-mini",
+            config={"harness": "codex"},
+            model="gpt-5.4-mini",
         ),
     )
     harness_client = _ScriptedHarnessClient([])

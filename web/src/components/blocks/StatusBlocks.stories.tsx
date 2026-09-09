@@ -80,9 +80,7 @@ export const ProviderAuthRequired: Story = {
     />
   ),
   play: async ({ canvasElement }) => {
-    await userEvent.click(
-      within(canvasElement).getByRole("button", { name: "Sign in to continue" }),
-    );
+    await userEvent.click(within(canvasElement).getByTestId("error-pill"));
   },
 };
 
