@@ -105,6 +105,7 @@ import {
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
 import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { takePendingShareText } from "@/lib/shareIntake";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -2047,6 +2048,17 @@ function AccountSection() {
   }, []);
 
   const onSignOut = useCallback(async () => {
+    // Sign-out is the one supported identity transition (this app has no
+    // in-session account switcher): whoever authenticates next in this same
+    // browser tab must not inherit a still-durable share meant for the
+    // outgoing user. The hard navigations below reset the in-memory chat
+    // store, but NOT sessionStorage — its OS-share slot (see
+    // lib/shareIntake.ts) would otherwise survive a sign-out and silently
+    // hand the previous user's shared text to whoever logs in next on this
+    // device. An in-progress, not-yet-authenticated share's OWN
+    // hard-navigation (identity.ts's redirectToLogin) intentionally does NOT
+    // go through this function, so that durability is untouched here.
+    takePendingShareText();
     if (accountsEnabled) {
       // Accounts: clear the cookie via the JSON logout endpoint, then land on
       // the SPA login form.

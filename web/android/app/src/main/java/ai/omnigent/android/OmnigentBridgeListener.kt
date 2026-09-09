@@ -23,6 +23,7 @@ import org.json.JSONObject
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    private val onSharedFilesAcknowledged: () -> Unit,
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -93,6 +94,10 @@ class OmnigentBridgeListener(
                     mimeType = json.optString("mimeType").ifEmpty { "application/octet-stream" },
                     suggestedName = json.optString("name"),
                 )
+            }
+
+            "sharedFilesReceived" -> {
+                onSharedFilesAcknowledged()
             }
         }
     }

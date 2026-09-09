@@ -6,6 +6,7 @@
 
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as ChatStoreModule from "@/store/chatStore";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -23,7 +24,10 @@ vi.mock("@/lib/routing", () => ({
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));
 
-vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
+vi.mock("@/store/chatStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof ChatStoreModule>()),
+  setPendingInitialPrompt: vi.fn(),
+}));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),

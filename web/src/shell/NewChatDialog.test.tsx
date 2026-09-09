@@ -55,7 +55,7 @@ import {
   onHostStatusChanged,
 } from "@/lib/nativeBridge";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
-import { setPendingInitialPrompt } from "@/store/chatStore";
+import { setPendingInitialPrompt, useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Only authenticatedFetch is stubbed (the create POST under test);
@@ -3264,6 +3264,124 @@ describe("NewChatLandingScreen attachments", () => {
     });
 
     expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
+});
+
+// This screen -- not ChatPage.tsx's in-session Composer -- is the actual
+// "new chat" composer in this product (see NewChatDialog.tsx's comment by
+// the drain effects): a share's intended recipient (conversationId === null)
+// lands HERE. Mirrors ChatPage.shareIntake.test.tsx / .shareFileIntake.test.tsx.
+describe("NewChatLandingScreen OS-share intake", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    useChatStore.setState({ pendingComposerText: null, pendingComposerFiles: null });
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    useChatStore.setState({ pendingComposerText: null, pendingComposerFiles: null });
+  });
+
+  function queueShareText(text: string): void {
+    act(() => {
+      useChatStore.getState().setPendingComposerText(text);
+    });
+  }
+
+  function queueSharedFiles(files: File[]): void {
+    act(() => {
+      useChatStore.getState().setPendingComposerFiles(files);
+    });
+  }
+
+  it("inserts shared text into an empty draft", () => {
+    renderLanding();
+
+    queueShareText("hello from share");
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("hello from share");
+    expect(useChatStore.getState().pendingComposerText).toBeNull();
+  });
+
+  it("does not create a session just from a queued share (no autosend)", () => {
+    renderLanding();
+
+    queueShareText("hello from share");
+
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("offers a recoverable banner instead of silently discarding when the draft is non-empty", () => {
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "already typing something" },
+    });
+
+    queueShareText("hello from share");
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("already typing something");
+    expect(screen.getByText(/hello from share/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Insert" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+  });
+
+  it("banner Insert appends the shared text to the existing draft", () => {
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "already typing something" },
+    });
+    queueShareText("hello from share");
+
+    fireEvent.click(screen.getByRole("button", { name: "Insert" }));
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "already typing something\nhello from share",
+    );
+    expect(screen.queryByRole("button", { name: "Insert" })).not.toBeInTheDocument();
+  });
+
+  it("banner Dismiss is an explicit discard, leaving the draft alone", () => {
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "already typing something" },
+    });
+    queueShareText("hello from share");
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("already typing something");
+    expect(screen.queryByText(/hello from share/)).not.toBeInTheDocument();
+  });
+
+  it("attaches a shared file through the existing validated upload flow", () => {
+    renderLanding();
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+
+    queueSharedFiles([file]);
+
+    expect(screen.getByText("shot.png")).toBeInTheDocument();
+    expect(useChatStore.getState().pendingComposerFiles).toBeNull();
+  });
+
+  it("rejects an unsupported shared file the same way a manual attach would", () => {
+    renderLanding();
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+
+    queueSharedFiles([bad]);
+
+    expect(screen.queryByText("clip.mp4")).not.toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeInTheDocument();
+  });
+
+  it("a shared attachment can be removed like any other (cancellation)", () => {
+    renderLanding();
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    queueSharedFiles([file]);
+    expect(screen.getByText("shot.png")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove shot.png" }));
+
+    expect(screen.queryByText("shot.png")).not.toBeInTheDocument();
   });
 });
 

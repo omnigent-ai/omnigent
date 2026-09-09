@@ -4,27 +4,38 @@
 // SharedFileReceiver).
 //
 // This intentionally does NOT mirror shareIntake.ts's sessionStorage-durable
-// capture step: that exists because a URL fragment is cheap to persist and
-// the unauthenticated-share hard-navigation through /login would otherwise
-// wipe it. A shared file's payload is base64 binary (up to several MB per
-// file) — not something to round-trip through sessionStorage. Instead this
-// relies on two mechanisms already proven in this codebase for the surviving
-// concern that actually applies here (an Android app cold start, not an
-// in-app auth redirect): the native shell defers emission until its page has
-// loaded (MainActivity.flushPendingSharedFiles), and the bridge itself queues
-// delivery until the first subscriber (mirrors the notification-tap
-// cold-start replay). The unauthenticated-share-hard-navigation race that
-// affects text is a known, explicitly out-of-scope gap for files in this
-// pass — see the follow-up note in the PR description.
+// capture step: a URL fragment is cheap to persist, but a shared file's
+// payload is base64 binary (up to several MB per file) — not something to
+// round-trip through sessionStorage. Instead, surviving the unauthenticated
+// -share hard-navigation through /login (the same concern text solves with
+// sessionStorage) is handled by an explicit ACK protocol: the native shell
+// holds the payload and retries delivery on every page load
+// (MainActivity.flushPendingSharedFiles) until this module explicitly
+// acknowledges receipt (acknowledgeNativeSharedFiles, below) — bounded by a
+// native-side retry cap so a shell talking to an old web build (no
+// shareFileIntake.ts, never acks) doesn't retry forever. A page the native
+// side emitted into but that then hard-navigated away (e.g. mid-login)
+// never ran this module's callback, so it never acked, so the NEXT
+// pinned-origin page load gets a retry instead of the share being silently
+// dropped. The bridge additionally queues delivery until the first
+// subscriber exists (mirrors the notification-tap cold-start replay), for
+// the narrower React-not-mounted-yet race on an ordinary (already
+// authenticated) cold start.
 //
 // A share landing while a conversation is already open is held in memory
 // (not discarded) until conversationId next becomes null — a share's
 // intended recipient is always the new-chat composer, the same convention
-// `shareIntake.ts` uses for text.
+// `shareIntake.ts` uses for text. It is still ACKED immediately either way:
+// the ack means "the web layer has taken ownership of this payload", not
+// "it has been inserted into a visible composer".
 
 import { useEffect, useRef } from "react";
 import { useChatStore } from "@/store/chatStore";
-import { onNativeSharedFiles, type NativeSharedFile } from "@/lib/nativeBridge";
+import {
+  acknowledgeNativeSharedFiles,
+  onNativeSharedFiles,
+  type NativeSharedFile,
+} from "@/lib/nativeBridge";
 
 /** Decode one base64 payload into a real `File`; null on malformed input. */
 function decodeSharedFile(file: NativeSharedFile): File | null {
@@ -58,6 +69,11 @@ export function useSharedFileIntake(): void {
 
   useEffect(() => {
     return onNativeSharedFiles((incoming) => {
+      // Acknowledge unconditionally, even if nothing below decodes
+      // successfully: the native side's job (deliver this exact payload) is
+      // done either way, and retrying a payload that will decode the same
+      // way every time serves no purpose.
+      acknowledgeNativeSharedFiles();
       const decoded = incoming.map(decodeSharedFile).filter((f): f is File => f !== null);
       if (decoded.length === 0) return;
       if (useChatStore.getState().conversationId === null) {

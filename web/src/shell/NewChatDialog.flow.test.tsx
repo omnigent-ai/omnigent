@@ -1,6 +1,7 @@
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
+import type * as ChatStoreModule from "@/store/chatStore";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -49,7 +50,8 @@ vi.mock("@/lib/routing", () => ({
 
 // The screen hands the first message to ChatPage through the chatStore
 // (keyed by conversation id), not router state — assert on that call.
-vi.mock("@/store/chatStore", () => ({
+vi.mock("@/store/chatStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof ChatStoreModule>()),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
 }));
 

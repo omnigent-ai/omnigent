@@ -11,6 +11,7 @@ import type { NativeSharedFile } from "@/lib/nativeBridge";
 
 type SharedFilesCallback = (files: NativeSharedFile[]) => void;
 const subscribers: SharedFilesCallback[] = [];
+const acknowledgeNativeSharedFiles = vi.fn();
 
 vi.mock("@/lib/nativeBridge", () => ({
   onNativeSharedFiles: vi.fn((callback: SharedFilesCallback) => {
@@ -20,6 +21,7 @@ vi.mock("@/lib/nativeBridge", () => ({
       if (i >= 0) subscribers.splice(i, 1);
     };
   }),
+  acknowledgeNativeSharedFiles: (...args: unknown[]) => acknowledgeNativeSharedFiles(...args),
 }));
 
 const { useSharedFileIntake } = await import("./shareFileIntake");
@@ -36,6 +38,7 @@ function b64(text: string): string {
 
 function reset(): void {
   subscribers.length = 0;
+  acknowledgeNativeSharedFiles.mockClear();
   useChatStore.setState({ conversationId: null, pendingComposerFiles: null });
 }
 
@@ -104,6 +107,31 @@ describe("useSharedFileIntake", () => {
     const files = useChatStore.getState().pendingComposerFiles;
     expect(files).toHaveLength(1);
     expect(files?.[0].name).toBe("note.txt");
+  });
+
+  it("acknowledges receipt so the native side stops retrying delivery", () => {
+    // The native side holds an unacknowledged file payload and retries it on
+    // every page load (see MainActivity.flushPendingSharedFiles) precisely
+    // because there's no sessionStorage-durable copy the way text has --
+    // this ack is what tells it the web layer took ownership.
+    useChatStore.setState({ conversationId: null });
+    renderHook(() => useSharedFileIntake());
+
+    emit([{ name: "note.txt", mimeType: "text/plain", base64: b64("hello") }]);
+
+    expect(acknowledgeNativeSharedFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it("acknowledges even when every file in the delivery fails to decode", () => {
+    // Retrying an unparseable payload would never succeed differently --
+    // ack it so native stops resending the same doomed bytes.
+    useChatStore.setState({ conversationId: null });
+    renderHook(() => useSharedFileIntake());
+
+    emit([{ name: "bad.txt", mimeType: "text/plain", base64: "not valid base64!!" }]);
+
+    expect(acknowledgeNativeSharedFiles).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState().pendingComposerFiles).toBeNull();
   });
 
   it("unsubscribes on unmount", () => {

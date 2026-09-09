@@ -13,9 +13,13 @@ package ai.omnigent.android
  * frames on the pinned origin. `notify()` resolves `true` optimistically (as on
  * iOS) since the post is fire-and-forget. native -> web is driven by
  * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here
- * — including `__omnigentNativeEmitSharedFiles`, fed by an OS Share
+ * — including `__omnigentNativeEmitSharedFiles` and
+ * `__omnigentNativeEmitSharedText`, both fed by an OS Share
  * (ACTION_SEND/ACTION_SEND_MULTIPLE) via [SharedFileReceiver] and
- * `MainActivity.handleShareIntent`.
+ * `MainActivity.handleShareIntent`. The files side of that handoff is
+ * acknowledged back (`acknowledgeSharedFiles`, web -> native) once the web
+ * layer has taken ownership of a delivery — see `MainActivity`'s
+ * `onSharedFilesAcknowledged` / `pendingSharedFilesRetries`.
  */
 object NativeBridgeScript {
     val source: String =
@@ -224,6 +228,20 @@ object NativeBridgeScript {
             },
           });
 
+          // Same cold-start race and same queue-until-first-subscriber
+          // treatment as shared files above, for a text-only OS share
+          // (ACTION_SEND EXTRA_TEXT, no attached file).
+          const sharedTextCallbacks = new Set();
+          let pendingSharedText = null;
+          Object.defineProperty(window, "__omnigentNativeEmitSharedText", {
+            configurable: false, enumerable: false, writable: false,
+            value(text) {
+              if (typeof text !== "string" || text === "") return;
+              if (sharedTextCallbacks.size === 0) { pendingSharedText = text; return; }
+              for (const cb of sharedTextCallbacks) { try { cb(text); } catch (_) {} }
+            },
+          });
+
           window.omnigentNative = Object.freeze({
             kind: "android",
             setColorScheme(scheme) {
@@ -282,6 +300,19 @@ object NativeBridgeScript {
                 try { callback(f); } catch (_) {}
               }
               return () => sharedFilesCallbacks.delete(callback);
+            },
+            acknowledgeSharedFiles() {
+              post({ method: "sharedFilesReceived" });
+            },
+            onSharedText(callback) {
+              if (typeof callback !== "function") return () => {};
+              sharedTextCallbacks.add(callback);
+              if (pendingSharedText) {
+                const t = pendingSharedText;
+                pendingSharedText = null;
+                try { callback(t); } catch (_) {}
+              }
+              return () => sharedTextCallbacks.delete(callback);
             },
           });
         })();

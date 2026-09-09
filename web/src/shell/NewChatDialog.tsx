@@ -104,7 +104,8 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
-import { setPendingInitialPrompt } from "@/store/chatStore";
+import { setPendingInitialPrompt, useChatStore } from "@/store/chatStore";
+import { takePendingShareText } from "@/lib/shareIntake";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
@@ -2189,6 +2190,65 @@ export function NewChatLandingScreen() {
     setFiles((prev) => prev.filter((_, i) => i !== index));
     setAttachmentError(null);
   };
+
+  // OS-share hand-off into the first message (see lib/shareIntake.ts /
+  // lib/shareFileIntake.ts). This screen -- not ChatPage.tsx's in-session
+  // Composer -- is the actual "new chat" composer in this product: the
+  // Composer only ever renders for an EXISTING conversationId (ChatPage.tsx
+  // shows THIS screen instead whenever there isn't one, since sessions here
+  // are CLI-launched, not created by posting a first message from the web
+  // UI). A share's "intended recipient" is conversationId === null, i.e.
+  // exactly this screen -- wiring only the Composer left every share
+  // silently stranded in the store until switchTo's reset (on the next real
+  // conversation) wiped it, unseen.
+  const pendingComposerText = useChatStore((s) => s.pendingComposerText);
+  const [shareBannerText, setShareBannerText] = useState<string | null>(null);
+  const pendingComposerFiles = useChatStore((s) => s.pendingComposerFiles);
+  // Read inside the effect below without making its dependency array fire
+  // on every keystroke / viewport change -- it should only run when a new
+  // share actually arrives.
+  const messageRef = useRef(message);
+  messageRef.current = message;
+  const isMobileViewportRef = useRef(isMobileViewport);
+  isMobileViewportRef.current = isMobileViewport;
+
+  useEffect(() => {
+    if (pendingComposerText === null) return;
+    if (messageRef.current.trim() === "") {
+      setMessage(pendingComposerText);
+      if (!isMobileViewportRef.current) textareaRef.current?.focus();
+      takePendingShareText();
+    } else {
+      // Recoverable offer instead of silently discarding either the share
+      // or the draft -- same convention as ChatPage.tsx's Composer.
+      setShareBannerText(pendingComposerText);
+    }
+    useChatStore.getState().clearPendingComposerText();
+  }, [pendingComposerText]);
+
+  const acceptShareBanner = useCallback(() => {
+    if (shareBannerText === null) return;
+    setMessage((prev) => (prev.trim() === "" ? shareBannerText : `${prev}\n${shareBannerText}`));
+    if (!isMobileViewportRef.current) textareaRef.current?.focus();
+    takePendingShareText();
+    setShareBannerText(null);
+  }, [shareBannerText]);
+
+  const dismissShareBanner = useCallback(() => {
+    takePendingShareText();
+    setShareBannerText(null);
+  }, []);
+
+  useEffect(() => {
+    if (pendingComposerFiles === null) return;
+    // Drains through the SAME validated upload flow as a manual attach or
+    // drag-drop above: rejected files surface the same attachmentError
+    // banner, accepted ones just append -- no autosend, no new UI beyond
+    // the recoverable text banner above, cancellation is the existing
+    // remove-attachment button.
+    addFiles(pendingComposerFiles);
+    useChatStore.getState().clearPendingComposerFiles();
+  }, [pendingComposerFiles]);
 
   // Drag-and-drop onto the composer — same behavior as the in-session
   // composer (drop files anywhere on the box; an inset ring + overlay
@@ -4818,6 +4878,33 @@ export function NewChatLandingScreen() {
                 data-testid="new-chat-landing-attachment-error"
               >
                 {attachmentError}
+              </div>
+            )}
+            {/* Recoverable OS-share offer: shown instead of silently discarding
+                shared text when it arrived while this draft already held
+                something. Insert appends to the existing draft; Dismiss is an
+                explicit discard, not a silent one. */}
+            {shareBannerText !== null && (
+              <div className="flex items-center justify-between gap-2 px-4 pb-2 text-sm">
+                <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                  Shared text available: &ldquo;{shareBannerText}&rdquo;
+                </span>
+                <span className="flex shrink-0 gap-3">
+                  <button
+                    type="button"
+                    onClick={acceptShareBanner}
+                    className="font-medium text-primary hover:underline"
+                  >
+                    Insert
+                  </button>
+                  <button
+                    type="button"
+                    onClick={dismissShareBanner}
+                    className="text-muted-foreground hover:underline"
+                  >
+                    Dismiss
+                  </button>
+                </span>
               </div>
             )}
             {/* No own bg — the pill paints the surface. An explicit bg-card

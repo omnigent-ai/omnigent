@@ -1,7 +1,8 @@
-// Unit tests for the OS-share intake pipeline:
+// Unit tests for the OS-share TEXT intake pipeline:
 //   captureIncomingShareFragment (module-load-time, sessionStorage-backed)
+//   receiveNativeSharedText (native ACTION_SEND EXTRA_TEXT, live bridge)
 //   peekPendingShareText / takePendingShareText (durable read/consume)
-//   useShareIntake (conversation-gated queue into the composer)
+//   useShareIntake (conversation-gated queue into the composer, both origins)
 //
 // The split exists because an unauthenticated share hard-navigates through
 // /login and back (see main.tsx's call-ordering comment), which wipes every
@@ -9,14 +10,29 @@
 // so the capture step is tested independently of any React lifecycle.
 
 import { renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
-import {
+
+type SharedTextCallback = (text: string) => void;
+const textSubscribers: SharedTextCallback[] = [];
+
+vi.mock("@/lib/nativeBridge", () => ({
+  onNativeSharedText: vi.fn((callback: SharedTextCallback) => {
+    textSubscribers.push(callback);
+    return () => {
+      const i = textSubscribers.indexOf(callback);
+      if (i >= 0) textSubscribers.splice(i, 1);
+    };
+  }),
+}));
+
+const {
   captureIncomingShareFragment,
   peekPendingShareText,
   takePendingShareText,
+  receiveNativeSharedText,
   useShareIntake,
-} from "./shareIntake";
+} = await import("./shareIntake");
 
 const STORAGE_KEY = "omnigent:pendingShareText";
 
@@ -27,6 +43,7 @@ function setHash(hash: string): void {
 function reset(): void {
   setHash("");
   window.sessionStorage.removeItem(STORAGE_KEY);
+  textSubscribers.length = 0;
   useChatStore.setState({ conversationId: null, pendingComposerText: null });
 }
 
@@ -77,6 +94,18 @@ describe("captureIncomingShareFragment", () => {
     expect(() => captureIncomingShareFragment()).not.toThrow();
     expect(window.sessionStorage.getItem(STORAGE_KEY)).toBe("cold start");
   });
+
+  it("appends to an unconsumed durable share rather than overwriting it", () => {
+    // Real path: a native EXTRA_TEXT share lands and is never consumed (the
+    // composer's banner is still awaiting a decision), then a SECOND share
+    // arrives via the fragment route before the first is acted on.
+    window.sessionStorage.setItem(STORAGE_KEY, "first share");
+    setHash("#shared-text=second%20share");
+
+    captureIncomingShareFragment();
+
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).toBe("first share\nsecond share");
+  });
 });
 
 describe("peekPendingShareText / takePendingShareText", () => {
@@ -101,6 +130,62 @@ describe("peekPendingShareText / takePendingShareText", () => {
   it("take on an already-empty key is a harmless no-op", () => {
     expect(() => takePendingShareText()).not.toThrow();
     expect(peekPendingShareText()).toBeNull();
+  });
+});
+
+describe("receiveNativeSharedText", () => {
+  beforeEach(reset);
+  afterEach(reset);
+
+  it("persists durably AND applies immediately when the new-chat composer is current", () => {
+    useChatStore.setState({ conversationId: null });
+
+    receiveNativeSharedText("hello from native share");
+
+    expect(peekPendingShareText()).toBe("hello from native share");
+    expect(useChatStore.getState().pendingComposerText).toBe("hello from native share");
+  });
+
+  it("persists durably but does NOT apply into an already-open conversation", () => {
+    useChatStore.setState({ conversationId: "conv_existing" });
+
+    receiveNativeSharedText("hello from native share");
+
+    expect(peekPendingShareText()).toBe("hello from native share");
+    expect(useChatStore.getState().pendingComposerText).toBeNull();
+  });
+
+  it("merges with an unconsumed durable share rather than overwriting it", () => {
+    // Two native shares in a row before the first was ever drained (e.g.
+    // both arrived while conversationId was already non-null and held).
+    useChatStore.setState({ conversationId: "conv_existing" });
+    receiveNativeSharedText("first");
+    receiveNativeSharedText("second");
+
+    expect(peekPendingShareText()).toBe("first\nsecond");
+  });
+
+  it("re-applies the full merged text, not just the latest increment, once landing on a new chat", () => {
+    useChatStore.setState({ conversationId: "conv_existing" });
+    receiveNativeSharedText("first");
+    receiveNativeSharedText("second");
+
+    useChatStore.setState({ conversationId: null });
+    receiveNativeSharedText("third");
+
+    // pendingComposerText must reflect ALL three, not just "third" -- a
+    // consumer draining pendingComposerText alone (not re-peeking storage)
+    // would otherwise silently drop "first" and "second".
+    expect(useChatStore.getState().pendingComposerText).toBe("first\nsecond\nthird");
+  });
+
+  it("ignores an empty string", () => {
+    useChatStore.setState({ conversationId: null });
+
+    receiveNativeSharedText("");
+
+    expect(peekPendingShareText()).toBeNull();
+    expect(useChatStore.getState().pendingComposerText).toBeNull();
   });
 });
 
@@ -166,5 +251,18 @@ describe("useShareIntake", () => {
 
     // conversationId didn't change, so the effect's dependency didn't fire.
     expect(useChatStore.getState().pendingComposerText).toBeNull();
+  });
+
+  it("subscribes to native shared-text delivery exactly once for its lifetime", () => {
+    useChatStore.setState({ conversationId: null });
+    const { unmount } = renderHook(() => useShareIntake());
+
+    expect(textSubscribers).toHaveLength(1);
+
+    textSubscribers[0]("hello from a live native share");
+    expect(useChatStore.getState().pendingComposerText).toBe("hello from a live native share");
+
+    unmount();
+    expect(textSubscribers).toHaveLength(0);
   });
 });
