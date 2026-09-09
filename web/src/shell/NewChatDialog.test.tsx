@@ -3551,6 +3551,12 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const ta = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
     fireEvent.change(ta, { target: { value: "draft text" } });
+    // A non-empty selection strictly inside the draft: a collapsed
+    // end-of-string caret can't distinguish "no text to insert" from a
+    // missing empty-text guard, since inserting "" at a collapsed caret is a
+    // no-op either way. A real selection makes the two paths diverge — the
+    // guard leaves it alone, but an unguarded insert would delete it.
+    ta.setSelectionRange(3, 7);
 
     const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
     firePaste(ta, pasteClipboardData({ file }));
