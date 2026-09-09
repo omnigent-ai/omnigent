@@ -302,6 +302,36 @@ def test_server_stop_stops_server_and_local_daemon(monkeypatch: pytest.MonkeyPat
     stop_server.assert_called_once_with()  # and the server stopped
 
 
+def test_server_stop_disarms_local_service_before_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local service manager is stopped before its daemon is signalled."""
+    local_record = _record()
+    events: list[str] = []
+    monkeypatch.setattr("omnigent.cli._user_service_owns_target", lambda server: True)
+    monkeypatch.setattr(
+        "omnigent.cli._stop_enabled_host_service",
+        lambda server: events.append("service") or True,
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._find_daemon_record",
+        lambda target: local_record if target == "local" else None,
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: events.append("daemon"),
+    )
+    monkeypatch.setattr("omnigent.cli.local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr("omnigent.cli.stop_local_omnigent_server", Mock())
+    monkeypatch.setattr("omnigent.cli.stop_untracked_local_server", lambda: None)
+
+    result = CliRunner().invoke(cli, ["server", "stop"])
+
+    assert result.exit_code == 0, result.output
+    assert events == ["service", "daemon"]
+    assert "service remains installed" in result.output
+
+
 def test_server_stop_no_server_running(monkeypatch: pytest.MonkeyPatch) -> None:
     """``server stop`` reports nothing running when no background server exists."""
     monkeypatch.setattr("omnigent.cli.local_server_url_if_healthy", lambda: None)
@@ -342,6 +372,42 @@ def test_stop_terminates_all_daemons_and_server(monkeypatch: pytest.MonkeyPatch)
     assert terminated == records  # both daemons terminated
     stop_server.assert_called_once_with()
     assert "Stopped 2 daemon(s) and the background server." in result.output
+
+
+def test_stop_handles_running_service_without_daemon_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The global off switch reaches a service during its record startup window."""
+    from omnigent.host.service import HostServiceStatus
+
+    monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
+    monkeypatch.setattr(
+        "omnigent.host.service.user_host_service_status",
+        lambda: HostServiceStatus(
+            supported=True,
+            kind="systemd_user",
+            path=tmp_path / "omnigent-host.service",
+            label="omnigent-host.service",
+            installed=True,
+            configured_target="https://server.example.com",
+            manager_state="running",
+            enabled=True,
+        ),
+    )
+    stopped: list[str | None] = []
+    monkeypatch.setattr(
+        "omnigent.cli._stop_enabled_host_service",
+        lambda server: stopped.append(server) or True,
+    )
+    monkeypatch.setattr("omnigent.cli.local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr("omnigent.cli.stop_local_omnigent_server", Mock())
+    monkeypatch.setattr("omnigent.cli.stop_untracked_local_server", lambda: None)
+
+    result = CliRunner().invoke(cli, ["stop"])
+
+    assert result.exit_code == 0, result.output
+    assert stopped == ["https://server.example.com"]
+    assert "autostart remains enabled" in result.output
 
 
 def test_stop_nothing_running(monkeypatch: pytest.MonkeyPatch) -> None:

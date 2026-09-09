@@ -160,6 +160,107 @@ def test_service_status_reports_unsupported_platform(monkeypatch: pytest.MonkeyP
     assert "macOS and Linux" in (status.manager_error or "")
 
 
+def test_start_systemd_service_preserves_definition_and_autostart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    path = tmp_path / ".config/systemd/user/omnigent-host.service"
+    path.parent.mkdir(parents=True)
+    path.write_text("definition")
+    statuses = iter(
+        [
+            service.HostServiceStatus(
+                supported=True,
+                kind="systemd_user",
+                path=path,
+                label=path.name,
+                installed=True,
+                configured_target="local",
+                manager_state="stopped",
+                enabled=True,
+            ),
+            service.HostServiceStatus(
+                supported=True,
+                kind="systemd_user",
+                path=path,
+                label=path.name,
+                installed=True,
+                configured_target="local",
+                manager_state="running",
+                manager_pid=4242,
+                enabled=True,
+            ),
+        ]
+    )
+    monkeypatch.setattr(service, "user_host_service_status", lambda: next(statuses))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(service, "_run_checked", lambda args: calls.append(list(args)))
+
+    status = service.start_user_host_service(None)
+
+    assert status.manager_state == "running"
+    assert path.exists()
+    assert calls == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "start", "omnigent-host.service"],
+    ]
+
+
+def test_stop_launchd_service_preserves_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(service.os, "getuid", lambda: 503)
+    path = tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
+    path.parent.mkdir(parents=True)
+    path.write_text("definition")
+    statuses = iter(
+        [
+            service.HostServiceStatus(
+                supported=True,
+                kind="launchd",
+                path=path,
+                label="ai.omnigent.host",
+                installed=True,
+                configured_target="https://example.com",
+                manager_state="running",
+                manager_pid=4242,
+                enabled=True,
+            ),
+            service.HostServiceStatus(
+                supported=True,
+                kind="launchd",
+                path=path,
+                label="ai.omnigent.host",
+                installed=True,
+                configured_target="https://example.com",
+                manager_state="stopped",
+                enabled=True,
+            ),
+        ]
+    )
+    monkeypatch.setattr(service, "user_host_service_status", lambda: next(statuses))
+    calls: list[list[str]] = []
+
+    def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 1 if args[1] == "print" else 0, "", "")
+
+    monkeypatch.setattr(service, "_run_best_effort", _run)
+
+    status = service.stop_user_host_service("https://example.com")
+
+    assert status.manager_state == "stopped"
+    assert path.exists()
+    assert calls == [
+        ["launchctl", "bootout", "gui/503/ai.omnigent.host"],
+        ["launchctl", "print", "gui/503/ai.omnigent.host"],
+    ]
+
+
 def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
