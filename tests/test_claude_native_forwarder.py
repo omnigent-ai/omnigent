@@ -28,6 +28,8 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
+    TranscriptReadResult,
+    TranscriptRecordItems,
     prepare_bridge_dir,
     read_active_session_id,
     record_hook_event,
@@ -5836,6 +5838,161 @@ def test_subagent_batches_obey_count_and_exact_byte_limits() -> None:
     assert "content truncated by omnigent" in truncated_output
     for batch in [*tiny_batches, *large_batches, *oversized]:
         assert len(forwarder._encoded_subagent_batch(batch)) <= 1024 * 1024
+
+
+def test_subagent_batch_partitioning_encodes_items_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Byte accounting never re-encodes the growing batch prefix."""
+
+    entries = [
+        forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"linear-{index}",
+                item_type="message",
+                data={"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                response_id="resp_linear",
+            )
+        )
+        for index in range(20)
+    ]
+    encoded_item_count = 0
+    original_encode = forwarder._encoded_subagent_batch
+
+    def record_encode(items: list[forwarder._PendingSubagentItem]) -> bytes:
+        nonlocal encoded_item_count
+        encoded_item_count += len(items)
+        return original_encode(items)
+
+    monkeypatch.setattr(forwarder, "_encoded_subagent_batch", record_encode)
+
+    batches = forwarder._partition_subagent_batches(entries)
+
+    assert batches == [entries]
+    assert encoded_item_count == 2 * len(entries)
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_partitioning_runs_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Child-history JSON sizing does not block the live forwarding loop."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-worker.jsonl").write_text("", encoding="utf-8")
+    entry = forwarder.SubagentEntry(
+        subagent_id="worker",
+        child_conversation_id="conv_child_worker",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"worker": entry}),
+    )
+    event_loop_thread = threading.current_thread()
+    partition_threads: list[threading.Thread] = []
+    original_partition = forwarder._partition_subagent_batches
+
+    def record_partition(
+        items: list[forwarder._PendingSubagentItem],
+    ) -> list[list[forwarder._PendingSubagentItem]]:
+        partition_threads.append(threading.current_thread())
+        return original_partition(items)
+
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(forwarder, "_partition_subagent_batches", record_partition)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_request),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    assert partition_threads
+    assert all(thread is not event_loop_thread for thread in partition_threads)
+
+
+@pytest.mark.asyncio
+async def test_untruncatable_subagent_item_is_dead_lettered_and_checkpointed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One impossible item cannot livelock every later child-history poll."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-oversized.jsonl").write_text("{}\n", encoding="utf-8")
+    item = ClaudeTranscriptItem(
+        source_id="oversized-untruncatable",
+        item_type="message",
+        data={"x" * forwarder.MAX_SESSION_EVENT_BATCH_BYTES: 1},
+        response_id="resp_oversized",
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=3,
+        current_response_id=None,
+        items=[item],
+        record_items=(TranscriptRecordItems(next_byte_offset=3, items=(item,)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="oversized",
+        child_conversation_id="conv_child_oversized",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"oversized": entry}),
+    )
+
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_request),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    updated = checkpoint.state.subagents["oversized"]
+    assert updated.byte_offset == 3
+    assert updated.seen_source_ids == (item.source_id,)
+    dead_letter = json.loads(
+        (bridge_dir / "dead_letter.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert dead_letter["payload"]["source_id"] == item.source_id
+    assert "no truncatable text" in dead_letter["reason"]
+    assert dead_letter["http_status"] == 413
 
 
 @pytest.mark.asyncio
