@@ -762,7 +762,7 @@ export function sandboxOptionLabel(provider: string | null): string {
   if (!provider) return "New Sandbox";
   const name =
     SANDBOX_PROVIDER_NAMES[provider] ??
-    provider.replace(/(^|_)+(.)/g, (_, __, c, i) => `${i ? " " : ""}${c.toUpperCase()}`);
+    provider.replace(/(?:^|_)+([^_]|$)/g, (_, c, i) => `${i && c ? " " : ""}${c.toUpperCase()}`);
   return `${name} Sandbox`;
 }
 
