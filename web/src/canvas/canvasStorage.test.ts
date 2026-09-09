@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  activeCanvasStorageKey,
   canvasLayoutStorageKey,
   EMPTY_CANVAS_LAYOUT,
   LAYOUT_VERSION,
   MAX_SAVED_POSITIONS,
+  readActiveCanvas,
   readCanvasLayout,
-  withoutPositions,
   withPosition,
+  writeActiveCanvas,
   writeCanvasLayout,
 } from "./canvasStorage";
 
@@ -76,14 +78,15 @@ describe("canvas layout storage", () => {
     expect(layout.positions.a).toEqual({ x: 2, y: 3 });
   });
 
-  it("forgets only the given cards' spots", () => {
-    const placed = withPosition(
-      withPosition(EMPTY_CANVAS_LAYOUT, "onMain", { x: 1, y: 1 }),
-      "onProject",
-      { x: 2, y: 2 },
+  it("remembers the selected canvas per server and viewer", () => {
+    expect(activeCanvasStorageKey("user_1")).toBe(
+      `omnigent:canvas-active:${window.location.origin}:user_1`,
     );
-    expect(withoutPositions(placed, ["onMain"])).toEqual({
-      positions: { onProject: { x: 2, y: 2 } },
-    });
+    expect(readActiveCanvas("user_1")).toBeNull();
+    writeActiveCanvas("proj_a", "user_1");
+    expect(readActiveCanvas("user_1")).toBe("proj_a");
+    expect(readActiveCanvas("user_2")).toBeNull();
+    writeActiveCanvas("", "user_1");
+    expect(readActiveCanvas("user_1")).toBeNull();
   });
 });

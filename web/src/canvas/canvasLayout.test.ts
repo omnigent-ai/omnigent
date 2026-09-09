@@ -2,15 +2,16 @@ import { describe, expect, it } from "vitest";
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import {
-  CARD_GAP,
   CARD_HEIGHT,
   CARD_WIDTH,
+  GRID_STEP,
   MAIN_CANVAS_ID,
   canvasIdFor,
+  gridPosition,
   mergeCanvasPositions,
   mergeSessionPositions,
   projectCanvasId,
-  prunePositions,
+  samePositions,
   sessionsOnCanvas,
 } from "./canvasLayout";
 
@@ -40,11 +41,9 @@ describe("mergeSessionPositions", () => {
 
     expect(second).toEqual(first);
     expect(first.new).toEqual({ x: 0, y: 0 });
-    expect(first.middle).toEqual({ x: CARD_WIDTH + CARD_GAP, y: 0 });
+    expect(first.middle).toEqual({ x: GRID_STEP * 10, y: 0 });
     const unique = new Set(
-      Object.values(first).map(
-        ({ x, y }) => `${x / (CARD_WIDTH + CARD_GAP)}:${y / (CARD_HEIGHT + CARD_GAP)}`,
-      ),
+      Object.values(first).map(({ x, y }) => `${x / GRID_STEP}:${y / GRID_STEP}`),
     );
     expect(unique.size).toBe(3);
   });
@@ -61,11 +60,33 @@ describe("mergeSessionPositions", () => {
   });
 });
 
-describe("prunePositions", () => {
-  it("keeps only IDs from a complete live session set", () => {
-    expect(prunePositions({ one: { x: 1, y: 2 }, two: { x: 3, y: 4 } }, ["two"])).toEqual({
+describe("grid lattice", () => {
+  it("lays cards out in whole snap steps so dragged cards line up with the grid", () => {
+    const firstRow = gridPosition(0, 2);
+    const secondColumn = gridPosition(1, 2);
+    const secondRow = gridPosition(2, 2);
+    expect(secondColumn.x - firstRow.x).toBeGreaterThan(CARD_WIDTH);
+    expect(secondRow.y - firstRow.y).toBeGreaterThan(CARD_HEIGHT);
+    expect(secondColumn.x % GRID_STEP).toBe(0);
+    expect(secondRow.y % GRID_STEP).toBe(0);
+  });
+
+  it("drops saved spots of sessions that are gone", () => {
+    const merged = mergeSessionPositions([session("two", 1)], {
+      one: { x: 1, y: 2 },
       two: { x: 3, y: 4 },
     });
+    expect(merged).toEqual({ two: { x: 3, y: 4 } });
+  });
+});
+
+describe("samePositions", () => {
+  it("compares card sets and coordinates", () => {
+    const left = { a: { x: 1, y: 2 }, b: { x: 3, y: 4 } };
+    expect(samePositions(left, { b: { x: 3, y: 4 }, a: { x: 1, y: 2 } })).toBe(true);
+    expect(samePositions(left, { a: { x: 1, y: 2 } })).toBe(false);
+    expect(samePositions(left, { a: { x: 1, y: 2 }, b: { x: 3, y: 5 } })).toBe(false);
+    expect(samePositions(left, { a: { x: 1, y: 2 }, c: { x: 3, y: 4 } })).toBe(false);
   });
 });
 
