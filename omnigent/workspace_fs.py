@@ -36,6 +36,7 @@ import base64
 import mimetypes
 import os
 import re
+from collections import deque
 from pathlib import Path
 from typing import TypeAlias, cast
 
@@ -326,10 +327,11 @@ class WorkspaceReader:
         exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
 
         results: list[_WorkspacePayload] = []
-        # State the two-pass walk mutates via closures. A dict holds `scanned`
-        # so the nested helpers can rebind it without a `nonlocal` per call.
-        deferred: list[str] = []
-        counters = {"scanned": 0}
+        # State the two-pass walk mutates via closures (rebound through the
+        # `nonlocal` in scan()). deferred is a FIFO of noise-dir roots to drain
+        # in pass 2.
+        deferred: deque[str] = deque()
+        scanned = 0
         truncated = False
         stop = False
 
@@ -369,7 +371,7 @@ class WorkspaceReader:
             # A query matching little or nothing never fills the result cap, so
             # the walk needs its own bound. Counted per entry: a per-directory
             # check lets one huge directory overshoot before `truncated` trips.
-            nonlocal truncated, stop
+            nonlocal scanned, truncated, stop
             for dirpath, dirnames, filenames in os.walk(root):
                 kept = []
                 for d in sorted(dirnames):
@@ -390,8 +392,11 @@ class WorkspaceReader:
                     kept.append(d)
                 dirnames[:] = [d for d in kept if not (defer and d in _DEFAULT_DEPRIORITIZED_DIRS)]
                 for dname in kept:
-                    counters["scanned"] += 1
-                    if counters["scanned"] >= _SEARCH_SCAN_BUDGET:
+                    # Count then check `> budget`, not `>= budget`: a tree of
+                    # exactly `budget` entries is fully enumerable and must not
+                    # report truncated.
+                    scanned += 1
+                    if scanned > _SEARCH_SCAN_BUDGET:
                         truncated = True
                         stop = True
                         return
@@ -400,8 +405,8 @@ class WorkspaceReader:
                         stop = True
                         return
                 for fname in sorted(filenames):
-                    counters["scanned"] += 1
-                    if counters["scanned"] >= _SEARCH_SCAN_BUDGET:
+                    scanned += 1
+                    if scanned > _SEARCH_SCAN_BUDGET:
                         truncated = True
                         stop = True
                         return
@@ -417,7 +422,7 @@ class WorkspaceReader:
         # deferred roots only if budget remains. Mirrors the runner's walk.
         scan(str(self._root), True)
         while deferred and not stop:
-            scan(deferred.pop(0), False)
+            scan(deferred.popleft(), False)
         # When the walk stops early it is always because scan() tripped the
         # budget (which sets truncated) or the result limit (signaled by
         # has_more); the loop exits only once deferred is drained or stop is

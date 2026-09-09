@@ -682,6 +682,7 @@ class CallerProcessFilesystem:
         _header = "\n".join(
             [
                 "import os, json, re",
+                "from collections import deque",
                 f"q = {_json.dumps(q)}",
                 f"limit = {limit}",
                 f"start = {_json.dumps(start)}",
@@ -700,7 +701,7 @@ class CallerProcessFilesystem:
         # if budget remains. A query's own tree is scanned first, whole.
         _body = r"""
 results = []
-deferred = []
+deferred = deque()
 scanned = 0
 truncated = False
 stop = False
@@ -767,8 +768,10 @@ def scan(root, defer):
             kept.append(d)
         dirnames[:] = [d for d in kept if not (defer and d in depri)]
         for dname in kept:
+            # Count then check `> budget`, not `>= budget`: a tree of exactly
+            # `budget` entries is fully enumerable and must not report truncated.
             scanned += 1
-            if scanned >= budget:
+            if scanned > budget:
                 truncated = True
                 stop = True
                 return
@@ -778,7 +781,7 @@ def scan(root, defer):
                 return
         for fname in sorted(filenames):
             scanned += 1
-            if scanned >= budget:
+            if scanned > budget:
                 truncated = True
                 stop = True
                 return
@@ -790,7 +793,7 @@ def scan(root, defer):
 
 scan(start, True)
 while deferred and not stop:
-    scan(deferred.pop(0), False)
+    scan(deferred.popleft(), False)
 # When the walk stops early it is always because scan() tripped the budget
 # (which sets truncated) or the result limit (signaled by has_more upstream);
 # the loop exits only once deferred is drained or stop is set, so no extra

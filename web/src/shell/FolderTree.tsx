@@ -512,6 +512,13 @@ export function FolderTree({
   // list collapses back to the tree. Cleared once the flash fades.
   const [revealedPath, setRevealedPath] = useState<string | null>(null);
   const revealFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The path still awaiting its one scroll+flash. The scroll effect re-runs as
+  // each lazy level lands, but must act exactly once per reveal — otherwise a
+  // later level re-fires scrollToIndex and restarts the 800ms timer, so the
+  // flash lingers through a multi-level load. Cleared when the row is handled.
+  const pendingRevealRef = useRef<string | null>(null);
+  // Clear any in-flight flash timer on unmount only (not per flatRows change).
+  useEffect(() => () => clearTimeout(revealFlashTimer.current ?? undefined), []);
 
   // Reveal a directory the user picked from search results: expand it and every
   // ancestor (so the row is visible once the flat tree returns), then leave
@@ -529,6 +536,7 @@ export function FolderTree({
         if (cacheKey) expandedPathsCache.set(cacheKey, next);
         return next;
       });
+      pendingRevealRef.current = path;
       setRevealedPath(path);
       onExitSearch?.();
     },
@@ -588,20 +596,21 @@ export function FolderTree({
 
   // Once a revealed directory's row exists in the flat tree (its ancestors'
   // lazy listings have landed), smooth-scroll it into view and start the
-  // highlight flash. Runs when `flatRows` changes, so it fires on the render
-  // after each expansion level resolves — no-op until the target row appears.
+  // highlight flash — exactly once. Re-runs as `flatRows` changes so it can
+  // catch the row when a later lazy level resolves, but `pendingRevealRef`
+  // gates it to a single scroll + timer per reveal (a later level must not
+  // re-fire the scroll or restart the 800ms flash).
   useEffect(() => {
-    if (!revealedPath) return;
-    const index = flatRows.findIndex((r) => r.kind === "node" && r.key === revealedPath);
+    const pending = pendingRevealRef.current;
+    if (!pending) return;
+    const index = flatRows.findIndex((r) => r.kind === "node" && r.key === pending);
     if (index === -1) return; // row not materialized yet; a later level is loading
+    pendingRevealRef.current = null; // handled — don't scroll/flash again
     rowVirtualizer.scrollToIndex(index, { align: "center", behavior: "smooth" });
     // Clear once the shared flash animation (800ms) has played out.
-    if (revealFlashTimer.current) clearTimeout(revealFlashTimer.current);
+    clearTimeout(revealFlashTimer.current ?? undefined);
     revealFlashTimer.current = setTimeout(() => setRevealedPath(null), 800);
-    return () => {
-      if (revealFlashTimer.current) clearTimeout(revealFlashTimer.current);
-    };
-  }, [revealedPath, flatRows, rowVirtualizer]);
+  }, [flatRows, rowVirtualizer]);
 
   // When a search query is active, render a flat filtered list instead of the tree.
   if (searchQuery.trim().length > 0) {

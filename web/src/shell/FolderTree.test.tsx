@@ -393,6 +393,56 @@ describe("FolderTree directory search results", () => {
     // itself stays collapsed, like clicking a folder in the tree.
     expect(subRow).toHaveAttribute("aria-expanded", "false");
   });
+
+  it("flashes a deep revealed folder once its ancestors' lazy levels resolve", async () => {
+    // Reveal a deep target (a/b/target) whose ancestors' listings arrive in
+    // separate lazy steps, so `flatRows` changes several times before the row
+    // materializes. The scroll/flash effect re-runs on each change but is gated
+    // (pendingRevealRef) to act once the row first appears — the highlight
+    // lands on exactly the target and no other row.
+    Object.defineProperty(Element.prototype, "scrollTo", {
+      value: vi.fn(),
+      configurable: true,
+      writable: true,
+    });
+    lazyChildren.set("a", [dir("a/b")]);
+    lazyChildren.set("a/b", [dir("a/b/target")]);
+
+    function Harness() {
+      const [query, setQuery] = useState("target");
+      return (
+        <FolderTree
+          files={[dir("a")]}
+          isLoading={false}
+          isError={false}
+          error={null}
+          onFileSelect={vi.fn()}
+          conversationId="conv_reveal_deep"
+          showHidden={false}
+          changedFiles={undefined}
+          sort="alpha"
+          searchQuery={query}
+          searchResults={[dir("a/b/target")]}
+          onExitSearch={() => setQuery("")}
+        />
+      );
+    }
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /a\/b\/target\// }));
+
+    // Wait for the deep row to materialize after both lazy levels resolve.
+    const targetRow = await screen.findByRole("button", { name: "target/" });
+    expect(targetRow.closest("div.group")).toHaveClass("animate-user-msg-flash");
+    // Exactly one row flashes — the reveal doesn't smear the highlight across
+    // ancestors as their levels land.
+    expect(container.querySelectorAll(".animate-user-msg-flash")).toHaveLength(1);
+  });
 });
 
 describe("FolderTree nested lazy loading", () => {

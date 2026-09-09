@@ -1813,6 +1813,40 @@ async def test_search_scan_budget_bounds_a_no_match_walk(
 
 
 @pytest.mark.asyncio
+async def test_search_tree_of_exactly_budget_size_is_not_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tree with exactly `budget` entries is fully enumerable, not truncated.
+
+    The walk counts an entry then checks `> budget` (not `>= budget`), so a
+    tree whose entry count equals the budget is walked to completion and must
+    report ``truncated=False``. One more entry would flip it to True.
+    """
+    # 3 files + their parent dir = 4 walked entries. Budget 4 exactly covers it.
+    d = tmp_path / "d"
+    d.mkdir()
+    for i in range(3):
+        (d / f"f{i}.txt").write_text("x")
+
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 4)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    _entries, truncated = await fs.search_files("zznomatchzz")
+
+    assert truncated is False, (
+        "a tree of exactly budget size is fully enumerable and must not be flagged truncated"
+    )
+
+
+@pytest.mark.asyncio
 async def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
