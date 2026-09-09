@@ -453,6 +453,12 @@ def test_interjected_answer_starts_worked_fold_expanded(
     _seed_user_message(
         base_url,
         session_id,
+        text="[Request interrupted by user]",
+        response_id=response_id,
+    )
+    _seed_user_message(
+        base_url,
+        session_id,
         text="Does this conflict with the other change?",
         response_id=response_id,
     )

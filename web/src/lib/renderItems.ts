@@ -1379,9 +1379,10 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
  *
  * Native harnesses persist a steered message with the active response id. A
  * normal next-turn message has a new response id, so comparing it with the
- * immediately preceding rendered block distinguishes the two without inspecting
- * message wording. Empty ids are provisional live-stream values, not durable turn
- * identity, and are deliberately ignored.
+ * preceding assistant work distinguishes the two without inspecting message
+ * wording. Runtime system messages may record an interruption in between and are
+ * skipped; lifecycle markers remain hard boundaries. Empty ids are provisional
+ * live-stream values, not durable turn identity, and are deliberately ignored.
  */
 function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | null {
   const user = blocks[index];
@@ -1392,15 +1393,15 @@ function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | n
   ) {
     return null;
   }
-  const previous = blocks[index - 1];
-  if (
-    previous === undefined ||
-    !isAssistantSideBlock(previous) ||
-    previous.ctx.responseId !== user.ctx.responseId
-  ) {
-    return null;
+  for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
+    const previous = blocks[previousIndex]!;
+    if (isNonRenderingBlock(previous)) return null;
+    if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
+    return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
+      ? user.ctx.responseId
+      : null;
   }
-  return user.ctx.responseId;
+  return null;
 }
 
 /** Return true when persisted text marks the assistant turn interrupted. */

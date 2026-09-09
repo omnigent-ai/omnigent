@@ -251,6 +251,9 @@ describe("buildBubbles — bubble grouping", () => {
       content: [{ type: "input_text", text: "[System: timer timer_1 fired]" }],
     };
     expect(lastAssistant([before, system, answer("resp_reused")]).defaultExpanded).toBeUndefined();
+    expect(lastAssistant([before, system, human, answer("resp_reused")]).defaultExpanded).toBe(
+      true,
+    );
 
     const restarted: AnyBlock = {
       type: "response_start",
