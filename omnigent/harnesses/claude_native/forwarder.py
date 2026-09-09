@@ -3794,7 +3794,8 @@ async def _cancel_subagent_forward_task(
     try:
         await task
     except asyncio.CancelledError:
-        pass
+        # Cancellation is expected after task.cancel().
+        return
     except Exception:
         _logger.exception("Claude child-history worker failed during cleanup")
 
