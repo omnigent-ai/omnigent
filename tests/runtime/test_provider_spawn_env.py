@@ -60,16 +60,28 @@ _CATALOG_DEFAULTS = {
 @pytest.fixture(autouse=True)
 def _clear_ambient_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Clear ambient vendor keys so they cannot leak into the spawn env.
+    Clear ambient vendor keys and gateway routing so they cannot leak into
+    the spawn env.
 
     The coding-agent process may have ``ANTHROPIC_API_KEY`` /
-    ``OPENAI_API_KEY`` / ``DATABRICKS_TOKEN`` set; clearing them keeps the
-    tests deterministic (the provider path resolves keys from the config
-    file, not the ambient environment).
+    ``OPENAI_API_KEY`` / ``DATABRICKS_TOKEN`` set; a gateway-driven shell also
+    exports ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_MODEL`` /
+    ``ANTHROPIC_CUSTOM_HEADERS``. Detection folds those routing vars into the
+    detected anthropic entry, which would redirect the "routes to
+    api.anthropic.com" assertions at the developer's own gateway (issue #4279).
+    Clearing them keeps the tests deterministic (the provider path resolves
+    from the config file, not the ambient environment).
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DATABRICKS_TOKEN"):
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "DATABRICKS_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(
         "omnigent.runtime.workflow._resolve_catalog_default_model",
