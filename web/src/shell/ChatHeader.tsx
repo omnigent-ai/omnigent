@@ -13,6 +13,7 @@ import {
   TerminalIcon,
   UserPlusIcon,
 } from "lucide-react";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -86,6 +87,10 @@ interface MobileSessionMenuProps {
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
+  /** True while the mobile GitHub drawer is open. */
+  githubPanelOpen: boolean;
+  /** Open the mobile GitHub drawer. */
+  onOpenGithub: () => void;
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -279,6 +284,7 @@ export function ChatHeader({
     !mobileMenu.filesPanelOpen &&
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
+    !mobileMenu.githubPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
       <>
         {showFilesPanel && (
@@ -302,6 +308,15 @@ export function ChatHeader({
                 {mobileMenu.changedCount}
               </span>
             )}
+          </DropdownMenuItem>
+        )}
+        {showFilesPanel && (
+          <DropdownMenuItem
+            onSelect={mobileMenu.onOpenGithub}
+            className="gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <GithubMono size={16} className="shrink-0" />
+            GitHub
           </DropdownMenuItem>
         )}
         {/* Agents — always present (the panel lists at least

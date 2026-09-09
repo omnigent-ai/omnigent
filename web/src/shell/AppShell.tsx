@@ -95,6 +95,7 @@ import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
+import { GithubPanel } from "./GithubPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -380,6 +381,7 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
+  const [githubPanelOpen, setGithubPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
@@ -1622,6 +1624,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setExecutionLogsKey(key);
   }
 
@@ -1634,6 +1637,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setFilesDrawerFlatView(flatView);
     setFilesPanelOpen(true);
   }
@@ -1649,6 +1653,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -1663,7 +1668,22 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setShellsPanelOpen(true);
+  }
+
+  // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
+  // (matches the desktop rail's GitHub tab; the panel handles all states —
+  // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
+  function openGithubPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(true);
   }
 
   function openMainExecutionLog() {
@@ -2019,6 +2039,7 @@ export function AppShell() {
                       filesPanelOpen,
                       subagentsPanelOpen,
                       shellsPanelOpen,
+                      githubPanelOpen,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2035,6 +2056,7 @@ export function AppShell() {
                       onOpenChanges: openChangesPanel,
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
+                      onOpenGithub: openGithubPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -2179,6 +2201,16 @@ export function AppShell() {
                     // the "+ New shell" create row.
                     showNewShell
                   />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && showFilesPanel && (
+                <MobilePanelDrawer
+                  open={githubPanelOpen}
+                  title="GitHub"
+                  onClose={() => setGithubPanelOpen(false)}
+                  testId="github-panel-drawer"
+                >
+                  <GithubPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
