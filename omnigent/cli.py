@@ -9203,16 +9203,21 @@ def _local_server_confirmed_dead() -> bool:
 
     A failed ``/health`` probe alone must not count: a live-but-slow server
     misses the 2s probe too, and ``local_server_url_if_healthy`` collapses
-    both cases to ``None``. Only a missing/malformed pidfile or a recorded
-    PID that no longer runs proves the server is gone rather than slow.
+    both cases to ``None``. Only a missing pidfile or a recorded PID that
+    no longer runs proves the server is gone rather than slow.
 
     :returns: ``True`` when no recorded local server process is alive.
     """
-    from omnigent.host.local_server import _read_local_server_pid_file
+    from omnigent.host.local_server import _LOCAL_SERVER_PID_PATH, _read_local_server_pid_file
 
+    if not _LOCAL_SERVER_PID_PATH.exists():
+        # No pidfile means no recorded server that could still be alive.
+        return True
     existing = _read_local_server_pid_file()
     if existing is None:
-        return True
+        # The pidfile exists but is unreadable/corrupt: the server's state
+        # is unknown, not provably dead — keep the loud ``--force`` path.
+        return False
     pid, _port = existing
     return not _pid_alive(pid)
 

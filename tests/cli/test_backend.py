@@ -2031,15 +2031,21 @@ def test_host_stop_slow_local_server_with_live_pid_keeps_force_guidance(
 
 
 def test_local_server_confirmed_dead_requires_dead_pid(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Only a missing pidfile or a dead recorded PID counts as confirmed dead."""
-    import omnigent.host.local_server as local_server
+    pid_path = tmp_path / "local_server.pid"
+    monkeypatch.setattr("omnigent.host.local_server._LOCAL_SERVER_PID_PATH", pid_path)
 
-    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: None)
+    # Missing pidfile: no recorded server that could still be alive.
     assert cli._local_server_confirmed_dead() is True
 
-    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
+    # Corrupt pidfile: the server's state is unknown, not provably dead.
+    pid_path.write_text("not-a-pid\n")
+    assert cli._local_server_confirmed_dead() is False
+
+    # Valid pidfile: liveness of the recorded PID decides.
+    pid_path.write_text("4242\n6767\n")
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     assert cli._local_server_confirmed_dead() is False
 
