@@ -1606,6 +1606,10 @@ def test_host_stop_stops_sessions_before_daemon(
         path = str(kwargs["path"])
         events.append((method, path))
         if method == "GET" and path == "/v1/sessions":
+            assert kwargs["params"] == {
+                "limit": 1000,
+                "include_archived": "true",
+            }
             return cli._HostHttpResult(
                 status_code=200,
                 body={
@@ -1615,7 +1619,19 @@ def test_host_stop_stops_sessions_before_daemon(
                             "host_id": "host_abc",
                             "status": "running",
                             "runner_id": "runner_abc",
-                        }
+                        },
+                        {
+                            "id": "conv_idle",
+                            "host_id": "host_abc",
+                            "status": "idle",
+                            "runner_id": "runner_idle",
+                        },
+                        {
+                            "id": "conv_failed",
+                            "host_id": "host_abc",
+                            "status": "failed",
+                            "runner_id": "runner_failed",
+                        },
                     ]
                 },
             )
@@ -1648,7 +1664,112 @@ def test_host_stop_stops_sessions_before_daemon(
         ("POST", "/v1/sessions/conv_owned/events"),
         ("TERM", "https://server.example.com"),
     ]
+    assert "Stopping 1 active session(s)..." in result.output
+    assert "Stopped session conv_owned (1/1)." in result.output
     assert "sessions_stopped=1" in result.output
+
+
+def test_host_stop_bounds_parallel_session_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Graceful shutdown overlaps session stops without unbounded fan-out."""
+    sessions = [{"id": f"conv_{index}", "status": "running"} for index in range(12)]
+
+    def _fake_sessions(
+        record: cli._HostDaemonRecord, *, connected_only: bool = False
+    ) -> cli._DaemonSessionsResult:
+        del record
+        assert connected_only is False
+        return cli._DaemonSessionsResult(
+            base_url="https://server.example.com",
+            sessions=sessions,
+            error=None,
+        )
+
+    monkeypatch.setattr(cli, "_sessions_for_daemon", _fake_sessions)
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    workers_started = threading.Event()
+    release_workers = threading.Event()
+
+    def _fake_stop(*, base_url: str, session_id: str) -> None:
+        nonlocal active, peak
+        assert base_url == "https://server.example.com"
+        assert session_id.startswith("conv_")
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == cli._HOST_SESSION_STOP_MAX_WORKERS:
+                workers_started.set()
+        assert release_workers.wait(timeout=2)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(cli, "_stop_session_on_server", _fake_stop)
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+    )
+    outcome: list[int] = []
+    worker = threading.Thread(target=lambda: outcome.append(cli._stop_daemon_sessions(record)))
+    worker.start()
+    assert workers_started.wait(timeout=2)
+    release_workers.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert outcome == [12]
+    assert peak == cli._HOST_SESSION_STOP_MAX_WORKERS
+
+
+def test_host_stop_failure_leaves_daemon_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed graceful session stop prevents daemon termination."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_sessions_for_daemon",
+        lambda record, *, connected_only=False: cli._DaemonSessionsResult(
+            base_url="https://server.example.com",
+            sessions=[
+                {"id": "conv_ok", "status": "waiting"},
+                {"id": "conv_failed", "status": "running"},
+            ],
+            error=None,
+        ),
+    )
+
+    def _fake_stop(*, base_url: str, session_id: str) -> None:
+        del base_url
+        if session_id == "conv_failed":
+            raise click.ClickException("runner unavailable")
+
+    monkeypatch.setattr(cli, "_stop_session_on_server", _fake_stop)
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated after a failed session stop"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code != 0
+    assert "Failed session conv_failed" in result.output
+    assert "Failed to stop 1 of 2 active session(s); daemon left running" in result.output
 
 
 def test_host_stop_daemon_only_skips_session_stop(

@@ -653,6 +653,8 @@ _INTERNAL_BETA_BUNDLED_AGENTS: tuple[str, ...] = (
     "knowledge_work_agent.yaml",
 )
 _HOST_DAEMON_STOP_GRACE_S = 5.0
+_HOST_SESSION_STOP_MAX_WORKERS = 8
+_HOST_SESSION_ACTIVE_STATUSES = frozenset({"running", "waiting"})
 # How often ``omni upgrade`` re-polls the local server for in-flight
 # (connected) sessions while draining before it stops the server.
 _UPGRADE_DRAIN_POLL_S = 2.0
@@ -9910,48 +9912,63 @@ def _stop_session_on_server(
 
 def _stop_daemon_sessions(
     record: _HostDaemonRecord,
-    *,
-    force: bool,
 ) -> int:
     """
-    Stop sessions owned by a daemon before terminating it.
+    Stop active sessions owned by a daemon before terminating it.
 
     :param record: Daemon record whose host-bound sessions should stop.
-    :param force: Continue stopping remaining sessions after failures.
     :returns: Number of sessions successfully stopped.
-    :raises click.ClickException: If session listing or stop fails and
-        ``force`` is ``False``.
+    :raises click.ClickException: If session listing or any stop fails.
     """
     result = _sessions_for_daemon(record)
     if result.error is not None:
-        if force:
-            click.echo(
-                f"{_host_display_url(record.target)}: skipping session stop: {result.error}",
-                err=True,
-            )
-            return 0
         raise click.ClickException(
             f"{_host_display_url(record.target)}: {result.error} — retry with --force to stop the "
             f"daemon anyway, or --daemon-only to skip the session stop entirely."
         )
     if result.base_url is None:
         return 0
+    session_ids = [
+        session_id
+        for session in result.sessions
+        if isinstance((session_id := session.get("id")), str)
+        and session_id
+        and session.get("status") in _HOST_SESSION_ACTIVE_STATUSES
+    ]
+    if not session_ids:
+        return 0
+
+    total = len(session_ids)
+    click.echo(f"Stopping {total} active session(s)...")
+    failures: list[str] = []
     stopped = 0
-    for session in result.sessions:
-        session_id = session.get("id")
-        if not isinstance(session_id, str) or not session_id:
-            continue
-        try:
-            _stop_session_on_server(
+    max_workers = min(total, _HOST_SESSION_STOP_MAX_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _stop_session_on_server,
                 base_url=result.base_url,
                 session_id=session_id,
-            )
-        except click.ClickException as exc:
-            if not force:
-                raise
-            click.echo(str(exc), err=True)
-            continue
-        stopped += 1
+            ): session_id
+            for session_id in session_ids
+        }
+        for completed, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            session_id = futures[future]
+            try:
+                future.result()
+            except click.ClickException as exc:
+                failures.append(str(exc))
+                click.echo(f"Failed session {session_id} ({completed}/{total}): {exc}", err=True)
+            else:
+                stopped += 1
+                click.echo(f"Stopped session {session_id} ({completed}/{total}).")
+
+    if failures:
+        summary = f"Failed to stop {len(failures)} of {total} active session(s)"
+        raise click.ClickException(
+            f"{summary}; daemon left running. "
+            "Retry, or use --force to stop the daemon immediately."
+        )
     return stopped
 
 
@@ -10083,7 +10100,7 @@ def host_stop(
     for record in records:
         stopped = 0
         if not daemon_only and not force:
-            stopped = _stop_daemon_sessions(record, force=force)
+            stopped = _stop_daemon_sessions(record)
         _terminate_daemon(record, force=force)
         click.echo(
             f"Stopped {_host_display_url(record.target)} daemon "
