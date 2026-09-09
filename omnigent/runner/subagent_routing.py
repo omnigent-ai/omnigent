@@ -562,8 +562,8 @@ def candidate_models(
         catalog has no row for.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
         may fill a harness the catalog has no row for. Off the AI Gateway it may
-        not: every id in that table is a ``databricks-*`` endpoint the spawn
-        could not reach, so the catalog is the only provider-accurate source.
+        not: every id in that table is a Unity Catalog endpoint the spawn could
+        not reach, so the catalog is the only provider-accurate source.
     :returns: Harness → model ids, cheapest first, empty entries dropped.
     """
     from omnigent.server.smart_routing import (
@@ -698,7 +698,7 @@ async def resolve_subagent_route(
         external router out of play and the built-in judge answers instead.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
         may supply candidates. Callers pass ``gateway_backed``: off the gateway
-        its ``databricks-*`` ids are unreachable from the spawn.
+        its Unity Catalog ids are unreachable from the spawn.
     :param persist: Coroutine that records the decision in the
         transcript. ``None`` skips persistence (unit tests, dry runs).
     :returns: The verdict the hook script enforces.
@@ -852,11 +852,25 @@ def _decision_from_result(
 ) -> SubagentRouteDecision:
     model = result.model
     rationale = getattr(result, "rationale", "") or ""
+    # The external router still returns the legacy ``databricks-*`` spelling,
+    # while Unity Catalog candidates use ``system.ai.*``. Resolve a same-arm
+    # pick onto the exact offered id before enforcing the offer boundary.
+    from omnigent.server.smart_routing import _bare_id
+
+    offered_model = next(
+        (
+            candidate
+            for models in candidates.values()
+            for candidate in models
+            if _bare_id(candidate) == _bare_id(model)
+        ),
+        None,
+    )
+    if offered_model is not None:
+        model = offered_model
     # Only report a raw pick that actually differs from the resolved model, so
     # the raw_model field means "the router asked for something else". A
     # prefix-only spelling difference is the same arm, not a substitution.
-    from omnigent.server.smart_routing import _bare_id
-
     raw = _opt_str(getattr(result, "raw_model", None))
     raw_model = raw if raw and _bare_id(raw) != _bare_id(model) else None
     offered = {m for models in candidates.values() for m in models}
@@ -881,7 +895,7 @@ def _decision_from_result(
     note = _ask_note(req, model)
 
     if target == req.harness:
-        if req.parent_model is not None and model == req.parent_model:
+        if req.parent_model is not None and _bare_id(model) == _bare_id(req.parent_model):
             return SubagentRouteDecision(
                 action="allow",
                 rationale=(rationale or "Router kept the parent model") + note,

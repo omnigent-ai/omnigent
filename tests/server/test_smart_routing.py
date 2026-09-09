@@ -711,7 +711,7 @@ async def test_route_turn_offers_and_applies_a_glm_pick_on_codex() -> None:
             ]
         }
     ]
-    assert model == "databricks-glm-5-2"
+    assert model == "system.ai.glm-5-2"
 
 
 @pytest.mark.asyncio
@@ -2727,7 +2727,7 @@ async def test_route_turn_substitutes_a_model_the_harness_gateway_bars() -> None
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
         model, verdict = await route_turn("pi", "quick lookup")
     # haiku 400s on pi's completions path; the claude fallback (sonnet-5) does not.
-    assert model == "databricks-claude-sonnet-5"
+    assert model == "system.ai.claude-sonnet-5"
     assert verdict is not None and verdict["raw_model"] == "claude-haiku-4-5"
 
 
@@ -2911,7 +2911,7 @@ async def test_route_turn_keeps_the_rationale_off_info(
         patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)),
     ):
         model, _verdict = await route_turn("codex", "hello")
-    assert model == "databricks-gpt-5-4"
+    assert model == "system.ai.gpt-5-4"
     assert "secret prompt paraphrase" not in caplog.text
 
 
@@ -3034,9 +3034,9 @@ async def test_route_turn_picks_the_router_gateway_backing_allows(
     assert verdict is not None
     assert verdict["router_source"] == expected_source
     if gateway_backed:
-        assert (model, local.offered) == ("databricks-gpt-5-4", [])
+        assert (model, local.offered) == ("system.ai.gpt-5-4", [])
     else:
-        assert (model, external.offered) == ("databricks-gpt-5-5", [])
+        assert (model, external.offered) == ("system.ai.gpt-5-5", [])
 
 
 @pytest.mark.asyncio

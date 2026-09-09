@@ -4226,17 +4226,15 @@ async def _dispatch_model_send(
         pytest.param(
             "claude-native",
             "claude-sonnet-4-6",
-            "databricks-claude-sonnet-4-6",
+            "system.ai.claude-sonnet-4-6",
             id="canonical-claude-localized",
         ),
-        pytest.param(
-            "codex-native", "gpt-5-4", "databricks-gpt-5-4", id="canonical-gpt-localized"
-        ),
+        pytest.param("codex-native", "gpt-5-4", "system.ai.gpt-5-4", id="canonical-gpt-localized"),
         pytest.param(
             "claude-native",
             "databricks-claude-sonnet-4-6",
-            "databricks-claude-sonnet-4-6",
-            id="already-local-unchanged",
+            "system.ai.claude-sonnet-4-6",
+            id="legacy-local-canonicalized",
         ),
         pytest.param(
             "claude-native",
@@ -4258,9 +4256,9 @@ async def test_sys_session_send_localizes_canonical_model_for_gateway_child(
 
     With a Databricks default provider, a bare canonical vendor id
     (``claude-sonnet-4-6``) would die at the gateway ("model not
-    found"); the gate must persist the ``databricks-``-prefixed
-    spelling as ``model_override`` — and ONLY for mechanical ids:
-    already-local and vendor-prefixed shapes pass through verbatim.
+    found"); the gate must persist the Unity Catalog ``system.ai.`` spelling
+    as ``model_override`` — and ONLY for mechanical ids: legacy-local ids
+    canonicalize and vendor-prefixed shapes pass through.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir for the isolated provider config.
