@@ -425,6 +425,48 @@ class TestHooksConfig:
             "omnigent.harnesses.cursor_native.usage" in command for command in stop_commands
         )
 
+    def test_write_hooks_config_tolerates_invalid_utf8_file(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        # Invalid UTF-8 must not crash the launch: reading it raises
+        # UnicodeDecodeError (a ValueError, not a JSONDecodeError), which the
+        # shared tolerant loader must swallow.
+        (cursor_dir / "hooks.json").write_bytes(b'\xff\xfe{"hooks": {}}')
+
+        path = cursor_native_bridge.write_hooks_config(workspace, tmp_path / "bridge")
+
+        payload = json.loads(path.read_text())
+        assert payload["version"] == 1
+        stop_commands = [entry["command"] for entry in payload["hooks"]["stop"]]
+        assert any(
+            "omnigent.harnesses.cursor_native.usage" in command for command in stop_commands
+        )
+
+    def test_write_mcp_config_tolerates_invalid_utf8_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        # Stub the bridge-token write and Cursor CLI plumbing: this test only
+        # exercises the mcp.json read-merge-write path.
+        monkeypatch.setattr(cursor_native_bridge, "write_mcp_bridge_config", lambda _: None)
+        monkeypatch.setattr(cursor_native_bridge, "enable_mcp_for_workspace", lambda _: None)
+        monkeypatch.setattr(cursor_native_bridge, "allow_mcp_tools_in_cli_config", lambda: None)
+        workspace = tmp_path / "ws"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        # The sibling mcp.json writer shares the decode policy: invalid UTF-8
+        # must not crash the launch either.
+        (cursor_dir / "mcp.json").write_bytes(b'\xff\xfe{"mcpServers": {}}')
+
+        path = cursor_native_bridge.write_mcp_config(workspace, tmp_path / "bridge")
+
+        payload = json.loads(path.read_text())
+        assert "omnigent" in payload["mcpServers"]
+
 
 class TestMcpBridgeConfigSecureDir:
     """``bridge.json`` holds a relay bearer token, so its tree must be owner-only."""

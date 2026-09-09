@@ -342,13 +342,9 @@ def write_mcp_config(
     cursor_dir.mkdir(parents=True, exist_ok=True)
     path = cursor_dir / _MCP_CONFIG_FILE
 
-    loaded: object = None
-    if path.exists():
-        with contextlib.suppress(json.JSONDecodeError, OSError):
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-
     # A hand-edited mcp.json can hold any JSON shape; discard non-dicts so a
     # malformed file can't crash the session launch.
+    loaded = _load_json_config(path)
     existing: _JsonObject = loaded if isinstance(loaded, dict) else {}
     servers = existing.get("mcpServers")
     if not isinstance(servers, dict):
@@ -399,6 +395,21 @@ def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None
     return {"version": 1, "hooks": {"stop": [{"command": command}]}}
 
 
+def _load_json_config(path: Path) -> object:
+    """Best-effort load of an existing workspace JSON config.
+
+    Shared decode policy for the ``.cursor`` config writers: a missing,
+    unreadable, non-UTF-8, or non-JSON file yields ``None`` — a malformed
+    file must never crash the session launch. ``ValueError`` covers both
+    ``json.JSONDecodeError`` and ``UnicodeDecodeError``.
+    """
+    if not path.exists():
+        return None
+    with contextlib.suppress(ValueError, OSError):
+        return json.loads(path.read_text(encoding="utf-8"))
+    return None
+
+
 def _is_omnigent_usage_hook(entry: object) -> bool:
     """Whether a hooks.json entry is Omnigent's own usage-recorder hook.
 
@@ -427,13 +438,9 @@ def write_hooks_config(
     cursor_dir.mkdir(parents=True, exist_ok=True)
     path = cursor_dir / _HOOKS_CONFIG_FILE
 
-    loaded: object = None
-    if path.exists():
-        with contextlib.suppress(json.JSONDecodeError, OSError):
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-
     # A hand-edited hooks.json can hold any JSON shape; discard non-dicts so a
     # malformed file can't crash the session launch.
+    loaded = _load_json_config(path)
     existing: _JsonObject = loaded if isinstance(loaded, dict) else {}
     hooks = existing.get("hooks")
     if not isinstance(hooks, dict):
