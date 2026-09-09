@@ -150,6 +150,82 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
   );
 }
 
+describe("Composer Escape interrupt", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: "conv_escape", blocks: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+  });
+
+  it.each(["idle", "streaming"] as const)(
+    "interrupts a working session with local status %s without losing the draft",
+    (status) => {
+      const props = composerProps({ status, isWorking: true });
+      render(<Composer {...props} />);
+
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+      expect(props.onStop).toHaveBeenCalledTimes(1);
+
+      fireEvent.change(textarea(), { target: { value: "unfinished follow-up" } });
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+      expect(props.onStop).toHaveBeenCalledTimes(2);
+      expect(textarea()).toHaveValue("unfinished follow-up");
+      expect(props.onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["idle", "streaming"] as const)(
+    "does not interrupt an inactive session with local status %s",
+    (status) => {
+      const props = composerProps({ status });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "unfinished message" } });
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+      expect(props.onStop).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("unfinished message");
+    },
+  );
+
+  it.each([{ permissionLevel: 1 }, { readOnlyReason: "Session is read-only" }])(
+    "does not interrupt a read-only session: %j",
+    (overrides) => {
+      const props = composerProps({ status: "streaming", isWorking: true, ...overrides });
+      render(<Composer {...props} />);
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeDisabled();
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+      expect(props.onStop).not.toHaveBeenCalled();
+    },
+  );
+
+  it("dismisses slash suggestions before interrupting", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(activeRow()).not.toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(activeRow()).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves Escape to active IME composition", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.compositionStart(textarea());
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+    fireEvent.compositionEnd(textarea());
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("Composer session drafts", () => {
   beforeEach(() => {
     clearSessionDrafts();
