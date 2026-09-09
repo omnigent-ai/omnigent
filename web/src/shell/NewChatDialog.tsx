@@ -104,7 +104,7 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
-import { setPendingInitialPrompt, useChatStore } from "@/store/chatStore";
+import { composerAttachmentKey, setPendingInitialPrompt, useChatStore } from "@/store/chatStore";
 import { takePendingShareText } from "@/lib/shareIntake";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
@@ -232,6 +232,7 @@ import {
   buildMentionPreamble,
   detectMentionAt,
   mentionItemPath,
+  type MentionItem,
   type MentionState,
   parseMentionToken,
   rankMentionEntries,
@@ -3795,6 +3796,7 @@ export function NewChatLandingScreen() {
   const {
     mentionIndex,
     mentionedItems,
+    setMentionedItems,
     attachMention,
     openMentionDir,
     removeMentionedItem,
@@ -3808,6 +3810,38 @@ export function NewChatLandingScreen() {
     setText: setMessage,
     textareaRef,
   });
+
+  // Drain externally-queued attachments (file viewer "Attach to agent" button)
+  // into the local mention chips -- the same pendingComposerAttachments queue
+  // ChatPage.tsx's in-session Composer drains, wired here too since THIS
+  // screen, not that Composer, is what actually renders for conversationId
+  // === null (see the OS-share drain effects above for why). Without this,
+  // an attachment queued while looking at the landing screen sat inert in
+  // the store until switchTo's reset silently wiped it. Mirrors ChatPage.tsx's
+  // identical effect exactly (dedup, focus, cleanup-on-unmount).
+  const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
+  useEffect(() => {
+    if (pendingComposerAttachments.length === 0) return;
+    setMentionedItems((prev) => {
+      const seen = new Set(prev.map(composerAttachmentKey));
+      const fresh: MentionItem[] = [];
+      for (const a of pendingComposerAttachments) {
+        const k = composerAttachmentKey(a);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        fresh.push(a);
+      }
+      return fresh.length > 0 ? [...prev, ...fresh] : prev;
+    });
+    useChatStore.getState().clearPendingComposerAttachments();
+    if (!isMobileViewportRef.current) textareaRef.current?.focus();
+    // Defense-in-depth against a cross-session leak, matching ChatPage.tsx:
+    // if this screen unmounts (route change) while an entry is still
+    // queued, clear it so the next-mounted composer doesn't drain a stale
+    // chip. switchTo also resets the queue; this closes non-switch unmounts.
+    return () => useChatStore.getState().clearPendingComposerAttachments();
+    // setMentionedItems is a stable useState setter (from useMentionBrowser).
+  }, [pendingComposerAttachments, setMentionedItems]);
 
   const canSubmit =
     message.trim().length > 0 &&

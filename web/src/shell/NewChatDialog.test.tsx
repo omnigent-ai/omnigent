@@ -3385,6 +3385,73 @@ describe("NewChatLandingScreen OS-share intake", () => {
   });
 });
 
+// pendingComposerAttachments (the file viewer's "Attach to agent" button) has
+// the exact same landing-screen drain gap the OS-share queues above had:
+// ChatPage.tsx's in-session Composer drains it, but that Composer never
+// renders for conversationId === null -- this screen does. Mirrors the
+// existing ChatPage.tsx behavior (dedup, focus, cleanup-on-unmount).
+describe("NewChatLandingScreen externally-queued attachments", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    useChatStore.setState({ pendingComposerAttachments: [] });
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    useChatStore.setState({ pendingComposerAttachments: [] });
+  });
+
+  function queueAttachment(path: string, isDir = false): void {
+    act(() => {
+      useChatStore.getState().addComposerAttachment({ path, isDir });
+    });
+  }
+
+  it("drains a queued attachment into a mention chip", () => {
+    renderLanding();
+
+    queueAttachment("src/foo.ts");
+
+    expect(screen.getByText("@src/foo.ts")).toBeInTheDocument();
+    expect(useChatStore.getState().pendingComposerAttachments).toEqual([]);
+  });
+
+  it("does not duplicate a chip already tagged", () => {
+    renderLanding();
+    queueAttachment("src/foo.ts");
+
+    queueAttachment("src/foo.ts");
+
+    expect(screen.getAllByText("@src/foo.ts")).toHaveLength(1);
+  });
+
+  it("appends to, rather than replaces, existing mention chips", () => {
+    renderLanding();
+    queueAttachment("src/foo.ts");
+
+    queueAttachment("src/bar.ts");
+
+    expect(screen.getByText("@src/foo.ts")).toBeInTheDocument();
+    expect(screen.getByText("@src/bar.ts")).toBeInTheDocument();
+  });
+
+  it("clears the queue on unmount so a stale chip can't leak into the next mount", () => {
+    const { unmount } = renderLanding();
+    queueAttachment("src/foo.ts");
+    // Drained already, but simulate an entry still queued at unmount time
+    // (e.g. queued and unmounted in the same tick) via a direct store set.
+    act(() => {
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/late.ts", isDir: false }],
+      });
+    });
+
+    unmount();
+
+    expect(useChatStore.getState().pendingComposerAttachments).toEqual([]);
+  });
+});
+
 // The "@"-file-mention browser on the launcher mirrors the in-session
 // composer, but its file source is the *host filesystem* (no session/runner
 // exists yet) and its paths are converted from the host's absolute form to
