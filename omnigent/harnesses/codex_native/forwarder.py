@@ -2646,7 +2646,10 @@ async def _handle_event(
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
             await _ensure_user_message_posted(client, route_session_id, params, forwarder_state)
-        elif isinstance(item, dict) and item.get("type") == "commandExecution":
+        elif isinstance(item, dict) and item.get("type") in {
+            "commandExecution",
+            "mcpToolCall",
+        }:
             call_id = await _post_tool_call_item(client, route_session_id, params, item)
             if call_id is not None:
                 forwarder_state.note_tool_call_posted(call_id)
@@ -5870,6 +5873,81 @@ def _web_search_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | N
     )
 
 
+def _mcp_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
+    """Build a tool call from a Codex ``mcpToolCall`` item.
+
+    :param call_id: Codex item id, e.g. ``"exec-abc"``.
+    :param item: Codex ``mcpToolCall`` item, e.g. one naming a server,
+        tool, arguments, and MCP result content.
+    :returns: Normalized tool call, or ``None`` when required fields are
+        missing.
+    """
+    server = item.get("server")
+    tool = item.get("tool")
+    arguments = item.get("arguments")
+    if not isinstance(server, str) or not server:
+        _logger.warning("Codex mcpToolCall missing server: call_id=%s", call_id)
+        return None
+    if not isinstance(tool, str) or not tool:
+        _logger.warning("Codex mcpToolCall missing tool: call_id=%s server=%s", call_id, server)
+        return None
+    if not isinstance(arguments, dict):
+        _logger.warning(
+            "Codex mcpToolCall missing object arguments: call_id=%s server=%s tool=%s",
+            call_id,
+            server,
+            tool,
+        )
+        return None
+    return _CodexToolCall(
+        call_id=call_id,
+        name=f"{server}.{tool}",
+        arguments=arguments,
+        output=_mcp_tool_output_text(item),
+    )
+
+
+def _mcp_tool_output_text(item: _JsonObject) -> str:
+    """Extract display-safe text from a completed Codex MCP call."""
+    error = item.get("error")
+    if isinstance(error, str):
+        return error
+    if error is not None:
+        try:
+            return json.dumps(error, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(error)
+
+    result = item.get("result")
+    if not isinstance(result, dict):
+        status = item.get("status")
+        return f"status: {status}" if status not in {None, "completed"} else ""
+
+    content = result.get("content")
+    rendered: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if block.get("type") == "text" and isinstance(text, str):
+                rendered.append(text)
+                continue
+            block_type = block.get("type")
+            if isinstance(block_type, str) and block_type:
+                rendered.append(f"[{block_type} content]")
+    if rendered:
+        return "\n".join(rendered)
+
+    structured = result.get("structuredContent")
+    if structured is not None:
+        try:
+            return json.dumps(structured, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(structured)
+    return ""
+
+
 def _image_view_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
     """
     Build a tool call from a Codex ``imageView`` item.
@@ -5935,14 +6013,12 @@ def _image_generation_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCa
     )
 
 
-# Codex built-in tool item types this forwarder mirrors into Omnigent history.
-# ``mcpToolCall`` is intentionally absent: its event shape has not been
-# verified, so it is logged-but-skipped rather than mirrored with guessed
-# fields. Add it here once its real shape is captured.
+# Codex tool item types this forwarder mirrors into Omnigent history.
 _TOOL_ITEM_BUILDERS: dict[str, _ToolItemBuilder] = {
     "commandExecution": _command_execution_tool_call,
     "fileChange": _file_change_tool_call,
     "webSearch": _web_search_tool_call,
+    "mcpToolCall": _mcp_tool_call,
     "imageView": _image_view_tool_call,
     "imageGeneration": _image_generation_tool_call,
 }

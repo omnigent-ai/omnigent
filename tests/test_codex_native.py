@@ -6470,6 +6470,156 @@ def test_forwarder_posts_codex_web_search_tool_call() -> None:
     assert posted[1]["data"]["item_data"]["output"] == "python latest stable version"
 
 
+def test_forwarder_posts_codex_mcp_tool_call() -> None:
+    """A completed Codex ``mcpToolCall`` becomes a visible tool card."""
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "mcpToolCall",
+                "id": "exec-123",
+                "server": "databricks-v2",
+                "tool": "execute_parameterized_sql",
+                "status": "completed",
+                "arguments": {
+                    "warehouse_id": "warehouse-123",
+                    "statement": "SELECT 1",
+                },
+                "result": {
+                    "content": [{"type": "text", "text": "Results:\n1"}],
+                    "structuredContent": None,
+                    "_meta": None,
+                },
+                "error": None,
+                "durationMs": 42,
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "codex-native-ui",
+                    "name": "databricks-v2.execute_parameterized_sql",
+                    "arguments": '{"warehouse_id": "warehouse-123", "statement": "SELECT 1"}',
+                    "call_id": "exec-123",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {"call_id": "exec-123", "output": "Results:\n1"},
+                "response_id": "codex_turn_123",
+            },
+        },
+    ]
+
+
+def test_forwarder_posts_codex_mcp_call_at_start_then_result(tmp_path: Path) -> None:
+    """A running MCP call appears before its completed result arrives."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+    started_item = {
+        "type": "mcpToolCall",
+        "id": "exec-live",
+        "server": "databricks-v2",
+        "tool": "execute_parameterized_sql",
+        "status": "inProgress",
+        "arguments": {"statement": "SELECT sleep(10)"},
+        "result": None,
+        "error": None,
+    }
+
+    async def run() -> None:
+        """Replay MCP start and completion notifications."""
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            for event in (
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": started_item,
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": {
+                            **started_item,
+                            "status": "completed",
+                            "result": {"content": [{"type": "text", "text": "Results:\n10"}]},
+                        },
+                    },
+                },
+            ):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=state,
+                )
+
+    asyncio.run(run())
+
+    assert [payload["data"]["item_type"] for payload in posted] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert posted[0]["data"]["item_data"]["call_id"] == "exec-live"
+    assert posted[1]["data"]["item_data"] == {
+        "call_id": "exec-live",
+        "output": "Results:\n10",
+    }
+
+
+def test_forwarder_surfaces_codex_mcp_error() -> None:
+    """A failed Codex MCP call preserves its structured error."""
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "mcpToolCall",
+                "id": "exec-failed",
+                "server": "databricks-v2",
+                "tool": "execute_parameterized_sql",
+                "status": "failed",
+                "arguments": {"statement": "SELECT bad_column"},
+                "result": None,
+                "error": {"message": "column not found"},
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted[1]["data"]["item_data"]["output"] == '{"message": "column not found"}'
+
+
 def test_forwarder_drops_codex_tool_item_missing_required_field(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
