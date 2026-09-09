@@ -254,7 +254,7 @@ function PullRequestStatus({ state }: { state: string }) {
       : normalized === "MERGED"
         ? {
             label: "Merged",
-            className: "border-brand-accent/25 bg-brand-accent/10 text-brand-accent",
+            className: "border-purple-500/25 bg-purple-500/10 text-purple-700 dark:text-purple-400",
           }
         : normalized === "CLOSED"
           ? {

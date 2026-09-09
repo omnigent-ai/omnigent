@@ -204,7 +204,7 @@ describe("GithubPanel", () => {
   it.each([
     ["OPEN", "Open", "text-green-700"],
     ["CLOSED", "Closed", "text-red-700"],
-    ["MERGED", "Merged", "text-brand-accent"],
+    ["MERGED", "Merged", "text-purple-700"],
   ])("shows a %s status pill beside the PR title", (stateName, label, tone) => {
     state.info!.data!.pr!.state = stateName;
     renderPanel();
