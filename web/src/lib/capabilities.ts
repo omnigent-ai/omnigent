@@ -652,6 +652,7 @@ export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
  * provider still reads sensibly without a frontend change.
  */
 const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
+  agent_sandbox: "Agent",
   modal: "Modal",
   lakebox: "Databricks",
   daytona: "Daytona",
@@ -669,7 +670,8 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
 export function sandboxOptionLabel(provider: string | null): string {
   if (!provider) return "New Sandbox";
   const name =
-    SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
+    SANDBOX_PROVIDER_NAMES[provider] ??
+    provider.replaceAll("_", " ").replace(/\b./g, (char) => char.toUpperCase());
   return `${name} Sandbox`;
 }
 

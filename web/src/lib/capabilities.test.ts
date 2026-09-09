@@ -94,6 +94,16 @@ describe("sandboxProviderOptions", () => {
   });
 });
 
+describe("sandboxOptionLabel", () => {
+  it("uses the friendly agent-sandbox provider name", () => {
+    expect(sandboxOptionLabel("agent_sandbox")).toBe("Agent Sandbox");
+  });
+
+  it("humanizes underscores in unknown provider ids", () => {
+    expect(sandboxOptionLabel("foo_bar")).toBe("Foo Bar Sandbox");
+  });
+});
+
 describe("resolveServerInfo sandbox_providers", () => {
   it.each([null, [], "invalid", { arclet: null }, { arclet: [] }, { arclet: "invalid" }])(
     "ignores malformed provider capabilities (%j)",
