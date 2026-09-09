@@ -9,12 +9,10 @@
 //   the "Working…" indicator.
 
 import {
-  AlertCircleIcon,
   BrainCircuitIcon,
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
-  InfoIcon,
   Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
@@ -158,7 +156,6 @@ export function ErrorBanner({
 }: ErrorBannerProps) {
   const notice = level === "info";
   const tone = notice ? "var(--muted-foreground)" : "var(--destructive)";
-  const StatusIcon = notice ? InfoIcon : AlertCircleIcon;
   const headline =
     title || FAILURE_CODE_DESCRIPTIONS[code] || (notice ? "Notice" : "Something went wrong");
   const parsed = useMemo(() => parseErrorMessage(message), [message]);
