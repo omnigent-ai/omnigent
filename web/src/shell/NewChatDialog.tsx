@@ -3776,14 +3776,28 @@ export function NewChatLandingScreen() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeWorktree?.path]);
+  // True when the settled worktrees probe says the picked directory is not
+  // a git repository: a repo always lists at least its main work tree, and
+  // a non-git path resolves to []. Unknown states (probe disabled, still
+  // loading, or an anti-flicker placeholder from a previous path) count as
+  // a repo so the worktree chip doesn't flash out on every directory hop.
+  const workspaceKnownNonGit =
+    worktreesEnabled &&
+    !hostWorktreesArePlaceholder &&
+    hostWorktrees !== undefined &&
+    hostWorktrees.length === 0;
   // True when the session should start directly in the existing worktree:
   // the workspace is a worktree and the branch field still holds its
   // prefilled branch (the user hasn't edited it to request a new worktree).
   const startInExistingWorktree =
     activeWorktree !== null && prefilledBranch !== "" && branchName.trim() === prefilledBranch;
-  // A new, isolated worktree is created only when a branch is named and the
-  // workspace isn't already sitting on that existing worktree.
-  const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  // A new, isolated worktree is created only when a branch is named, the
+  // workspace isn't already sitting on that existing worktree, and the
+  // directory has a repo to branch — a stale branch name typed before
+  // browsing into a non-git directory must not send git options the host
+  // can only fail on ("worktree creation failed: not a git repository").
+  const shouldCreateWorktree =
+    branchName.trim() !== "" && !startInExistingWorktree && !workspaceKnownNonGit;
   // Auto-fill the base branch when a new-worktree branch is named, but only
   // until the user touches the base field — then their choice (including a
   // cleared field) stands. Clearing the branch name (so the base field goes
@@ -5781,8 +5795,9 @@ export function NewChatLandingScreen() {
               )}
 
               {/* Git worktree chip — hidden for sandbox sessions (worktree
-                creation requires a caller-supplied host_id). */}
-              {!sandboxSelected && (
+                creation requires a caller-supplied host_id) and for a picked
+                directory that is not a git repository (no repo to branch). */}
+              {!sandboxSelected && !workspaceKnownNonGit && (
                 <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                   <PopoverTrigger asChild>
                     <button

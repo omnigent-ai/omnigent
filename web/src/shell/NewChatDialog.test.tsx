@@ -2430,6 +2430,86 @@ describe("NewChatLandingScreen", () => {
     expect(body.git?.existing_worktree).toBeUndefined();
   });
 
+  it("hides the worktree chip when the picked directory is not a git repository", async () => {
+    // The settled probe resolved to []: the hook maps the endpoint's 400
+    // ("not a git repository") to an empty list, and a real repo always
+    // lists at least its main work tree — so [] means "no repo to branch".
+    useHostWorktreesMock.mockReturnValue({
+      data: [],
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    // No repo to branch — the chip must not offer a doomed worktree create.
+    expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+  });
+
+  it("keeps the worktree chip while the worktrees probe is unsettled", async () => {
+    // An empty list that is still the anti-flicker placeholder from a
+    // previous path is not a verdict on THIS directory — the chip stays so
+    // it doesn't flash out on every directory hop.
+    useHostWorktreesMock.mockReturnValue({
+      data: [],
+      isPlaceholderData: true,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeInTheDocument();
+  });
+
+  it("drops git options when the picked directory settles as non-git after a branch was named", async () => {
+    // A branch typed while the probe was still unsettled must not ride into
+    // the create once the directory settles as non-git — the host's git call
+    // could only fail with "worktree creation failed: not a git repository".
+    let settled = false;
+    useHostWorktreesMock.mockImplementation(
+      () =>
+        ({
+          data: [],
+          isPlaceholderData: !settled,
+        }) as unknown as ReturnType<typeof useHostWorktrees>,
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    // Unsettled probe: the chip is still offered; the user names a branch.
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/x" },
+    });
+
+    // The probe settles: no repo here. The next render hides the chip.
+    settled = true;
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start without a worktree" },
+    });
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull());
+
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      workspace?: string;
+      git?: { branch_name: string };
+    };
+    // The stale branch name sends no git block; the workspace still binds.
+    expect(body.git).toBeUndefined();
+    expect(body.workspace).toBe("/Users/corey/repo");
+  });
+
   it("filters the worktree dropdown as you type in the branch combobox", async () => {
     useHostWorktreesMock.mockReturnValue({
       data: [
