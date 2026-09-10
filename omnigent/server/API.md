@@ -860,6 +860,20 @@ Content-Type: application/json
   }
 }
 
+The encoded request-body limit is 10 MiB. The request may also be a top-level
+JSON array of 1-100 events:
+
+[
+  {"type": "external_conversation_item", "data": {"source_id": "record-1", ...}},
+  {"type": "external_conversation_item", "data": {"source_id": "record-2", ...}}
+]
+
+Batch entries are processed in order and each entry uses the same
+`SessionEventInput` contract described below. A batch response is a JSON array
+of acknowledgements in the corresponding order. Batch processing is not
+atomic: if a later event fails, earlier events may already have completed.
+Retrying source-keyed `external_conversation_item` events is idempotent.
+
 Request body matches `SessionEventInput`:
 
   type (string, required)
@@ -984,6 +998,7 @@ Request body matches `SessionEventInput`:
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
+[{"queued": false, "item_id": "item_..."}, ...] # top-level event array
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
 404 Not Found — no session with that id

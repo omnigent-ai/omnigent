@@ -159,4 +159,12 @@ describe("ViewModeToggle", () => {
     }
     expect(screen.getByTestId("view-mode-toggle")).toHaveClass("max-md:p-0");
   });
+
+  it("rounds the track into a capsule on mobile", () => {
+    // With max-md:p-0 the grey track sits flush to the fully-round 44px
+    // segments inside the round glass pill; keeping the 8px desktop radius
+    // there paints a squared grey box sandwiched between two capsules.
+    renderToggle(makeCtx());
+    expect(screen.getByTestId("view-mode-toggle")).toHaveClass("max-md:rounded-full");
+  });
 });

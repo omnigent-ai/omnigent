@@ -9,8 +9,9 @@ import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,8 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
+    TranscriptReadResult,
+    TranscriptRecordItems,
     prepare_bridge_dir,
     read_active_session_id,
     record_hook_event,
@@ -264,6 +267,100 @@ async def _wait_for_json_state(
                 return payload
         await asyncio.sleep(0.01)
     raise AssertionError(f"{path} did not reach expected state; last={last_payload!r}")
+
+
+def test_observer_hook_stderr_is_logged_incrementally(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hook process errors reach the session-scoped runner log exactly once."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    stderr_path = bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE
+    stderr_path.write_text("ModuleNotFoundError: No module named 'omnigent'\n", encoding="utf-8")
+    caplog.set_level(logging.ERROR, logger=forwarder.__name__)
+
+    offset = forwarder._log_new_observer_hook_stderr(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        byte_offset=0,
+    )
+    assert offset == stderr_path.stat().st_size
+    assert "No module named 'omnigent'" in caplog.text
+    assert caplog.records[-1].session_id == "conv_abc"
+
+    with stderr_path.open("a", encoding="utf-8") as handle:
+        handle.write("PermissionError: bridge directory is not writable\n")
+    offset = forwarder._log_new_observer_hook_stderr(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        byte_offset=offset,
+    )
+    assert offset == stderr_path.stat().st_size
+    assert caplog.text.count("No module named 'omnigent'") == 1
+    assert caplog.text.count("bridge directory is not writable") == 1
+
+    record_count = len(caplog.records)
+    assert (
+        forwarder._log_new_observer_hook_stderr(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            byte_offset=offset,
+        )
+        == offset
+    )
+    assert len(caplog.records) == record_count
+
+
+def test_missing_transcript_logs_actionable_snapshot_once(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A silent observer failure becomes a bounded, session-scoped error."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=100.0)
+    warning_at = diagnostics.started_at + forwarder._TRANSCRIPT_DISCOVERY_WARNING_S
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+
+    forwarder._observe_transcript_discovery(
+        bridge_dir=bridge_dir,
+        session_id="conv_abc",
+        transcript_path=None,
+        diagnostics=diagnostics,
+        now=warning_at - 0.1,
+    )
+    assert "has not started" not in caplog.text
+
+    for now in (warning_at, warning_at + 30.0):
+        forwarder._observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            transcript_path=None,
+            diagnostics=diagnostics,
+            now=now,
+        )
+
+    failures = [record for record in caplog.records if "has not started" in record.getMessage()]
+    assert len(failures) == 1
+    assert failures[0].session_id == "conv_abc"
+    assert "last_hook=UserPromptSubmit" in failures[0].getMessage()
+    assert "observer_stderr_bytes=missing" in failures[0].getMessage()
+    assert "hook_settings=present" in failures[0].getMessage()
+
+    transcript_path = tmp_path / "claude-session.jsonl"
+    for now in (warning_at + 31.0, warning_at + 32.0):
+        forwarder._observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id="conv_abc",
+            transcript_path=transcript_path,
+            diagnostics=diagnostics,
+            now=now,
+        )
+    discoveries = [record for record in caplog.records if "path discovered" in record.getMessage()]
+    assert len(discoveries) == 1
 
 
 @pytest.mark.asyncio
@@ -4975,7 +5072,7 @@ async def test_forwarder_posts_raw_todos_on_todo_write(tmp_path: Path) -> None:
 
 
 def _start_recording_server_with_responses(
-    response_for: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    response_for: Callable[[object], object] | None = None,
 ) -> tuple[_RecordingHTTPServer, threading.Thread, str]:
     """
     Start a local HTTP server that records POST bodies AND returns
@@ -4988,7 +5085,7 @@ def _start_recording_server_with_responses(
     that the forwarder reads back.
 
     :param response_for: Callback that takes the decoded request
-        body and returns the JSON dict to send back. ``None`` (the
+        body and returns the JSON value to send back. ``None`` (the
         default) responds with ``{}`` like the standard recorder.
     :returns: ``(server, thread, base_url)``.
     """
@@ -5605,7 +5702,7 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
 ) -> None:
     """
     After registering a sub-agent, the forwarder tails its
-    ``.jsonl`` and POSTs ``external_conversation_item`` events to
+    ``.jsonl`` and POSTs an array of ``external_conversation_item`` events to
     the Omnigent child session id (not the parent's).
     """
     bridge_dir = tmp_path / "bridge"
@@ -5650,13 +5747,17 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         },
     )
 
-    def response_for(body: dict[str, Any]) -> dict[str, Any]:
+    def response_for(body: object) -> object:
         """Mint a known child id for the start event.
 
         :param body: Decoded request body.
         :returns: Response payload.
         """
-        if body.get("type") == "external_subagent_start":
+        if isinstance(body, list):
+            return [
+                {"queued": False, "item_id": f"item-{index}"} for index, _event in enumerate(body)
+            ]
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return {"queued": False, "child_session_id": "conv_child_beta"}
         return {}
 
@@ -5673,22 +5774,17 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         )
     )
     try:
-        # We need: the start event + at least one item event addressed
-        # to the child. Drain up to N requests and collect every
-        # request bound for the child's ``/events`` path.
+        # We need the start event plus one event array addressed to the child.
         child_path = "/v1/sessions/conv_child_beta/events"
-        child_requests: list[dict[str, Any]] = []
+        batch: list[dict[str, Any]] | None = None
         for _ in range(40):
             req = await _get_recorded_request(server)
-            if req["path"] == child_path:
-                child_requests.append(req)
-                if len(child_requests) >= 2:
-                    break
-        assert len(child_requests) >= 2, (
-            f"only saw {len(child_requests)} requests to {child_path}: {child_requests!r}"
-        )
-        item_types = [r["body"]["type"] for r in child_requests]
-        assert "external_conversation_item" in item_types
+            if req["path"] == child_path and isinstance(req["body"], list):
+                batch = req["body"]
+                break
+        assert batch is not None
+        assert len(batch) == 2
+        assert all(event["type"] == "external_conversation_item" for event in batch)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -5697,19 +5793,15 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         server.server_close()
 
 
-async def test_subagent_watcher_retry_skips_previously_posted_items(
+async def test_subagent_watcher_retries_failed_batch_from_checkpoint(
     tmp_path: Path,
 ) -> None:
     """
-    Retrying a failed child item does not re-post earlier child items.
+    A rejected child batch leaves its byte cursor behind and retries in order.
 
-    The sub-agent watcher intentionally leaves ``byte_offset`` behind
-    when a later item fails, so the next poll re-reads the same JSONL
-    window. This test pins the durable ``seen_source_ids`` guard: item
-    A succeeds, item B fails once, and the retry must post only B.
-    Without that guard Omnigent live subscribers can see item A synced back
-    twice; the server no longer receives a ``source_id`` key that can
-    dedupe the post on AP's side.
+    The server deduplicates source ids, so an ambiguous response can safely
+    retry the entire batch even if some entries were already applied. The local
+    cursor advances only after the acknowledgement arrives.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -5748,27 +5840,30 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
         }
     )
     posted_items: list[str] = []
-    attempts_by_item: dict[str, int] = {}
+    batch_attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
-        Fail the assistant item once and accept everything else.
+        Fail the first batch and acknowledge its retry.
 
         :param request: Request issued by the forwarder.
         :returns: Canned Omnigent response.
         """
+        nonlocal batch_attempts
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") != "external_conversation_item":
+        if not isinstance(body, list):
             return httpx.Response(202, json={})
-        item_data = body["data"]["item_data"]
-        role = item_data["role"]
-        text = item_data["content"][0]["text"]
-        item_key = f"{role}:{text}"
-        posted_items.append(item_key)
-        attempts_by_item[item_key] = attempts_by_item.get(item_key, 0) + 1
-        if item_key == "assistant:done" and attempts_by_item[item_key] == 1:
+        batch_attempts += 1
+        for event in body:
+            row = event["data"]
+            item_data = row["item_data"]
+            posted_items.append(f"{item_data['role']}:{item_data['content'][0]['text']}")
+        if batch_attempts == 1:
             return httpx.Response(503, json={"error": "try again"})
-        return httpx.Response(202, json={})
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
 
     item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
     async with httpx.AsyncClient(
@@ -5798,13 +5893,1088 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
         )
 
-    assert posted_items == ["user:go", "assistant:done", "assistant:done"]
+    assert posted_items == ["user:go", "assistant:done", "user:go", "assistant:done"]
     child_state = second.subagents["retry1"]
     assert child_state.byte_offset == subagent_jsonl.stat().st_size
     assert set(child_state.seen_source_ids) == {
         "sa-user-retry:0:message",
         "sa-assistant-retry:0:message",
     }
+
+
+def test_subagent_batches_obey_count_and_exact_byte_limits() -> None:
+    """Batching counts the complete UTF-8 JSON body and truncates one huge item."""
+    assert forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES == 5 * 1024 * 1024
+
+    def pending(index: int, text: str) -> forwarder._PendingSubagentItem:
+        return forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"source-{index}",
+                item_type="function_call_output",
+                data={"call_id": f"toolu_{index}", "output": text},
+                response_id="resp_batch",
+            ),
+            checkpoint_after=index + 1,
+        )
+
+    tiny_batches = forwarder._partition_subagent_batches(
+        [pending(index, "ok") for index in range(205)]
+    )
+    assert [len(batch) for batch in tiny_batches] == [100, 100, 5]
+
+    large_batches = forwarder._partition_subagent_batches(
+        [pending(1000, "€" * 1_000_000), pending(1001, "€" * 1_000_000)]
+    )
+    assert [len(batch) for batch in large_batches] == [1, 1]
+
+    oversized = forwarder._partition_subagent_batches([pending(2000, "€" * 2_000_000)])
+    assert len(oversized) == 1
+    truncated_output = oversized[0][0].item.data["output"]
+    assert isinstance(truncated_output, str)
+    assert "content truncated by omnigent" in truncated_output
+    for batch in [*tiny_batches, *large_batches, *oversized]:
+        assert (
+            len(forwarder._encoded_subagent_batch(batch))
+            <= forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES
+        )
+
+
+def test_oversized_subagent_item_does_not_truncate_identifiers() -> None:
+    """Batch fitting never rewrites schema-significant identifier fields."""
+    name = "n" * forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES
+    entry = forwarder._PendingSubagentItem(
+        item=ClaudeTranscriptItem(
+            source_id="oversized-name",
+            item_type="function_call",
+            data={"agent": "claude", "name": name, "arguments": "{}", "call_id": "call-1"},
+            response_id="resp-name",
+        )
+    )
+
+    fitted = forwarder._fit_subagent_item(entry)
+
+    assert fitted.drop_reason is not None
+    assert fitted.item.data["name"] == name
+
+
+@pytest.mark.parametrize(
+    ("field_name", "kind"),
+    [("input", "input"), ("stdout", "output"), ("stderr", "output")],
+)
+def test_oversized_subagent_terminal_text_is_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    kind: str,
+) -> None:
+    """Large terminal commands and output are shrunk instead of dropped."""
+    monkeypatch.setattr(forwarder, "MAX_SUBAGENT_EVENT_BATCH_BYTES", 1024)
+    entry = forwarder._PendingSubagentItem(
+        item=ClaudeTranscriptItem(
+            source_id=f"oversized-terminal-{field_name}",
+            item_type="terminal_command",
+            data={"kind": kind, field_name: "x" * 2048},
+            response_id="resp-terminal",
+        )
+    )
+
+    fitted = forwarder._fit_subagent_item(entry)
+
+    assert fitted.drop_reason is None
+    assert fitted.item.data["kind"] == kind
+    terminal_text = fitted.item.data[field_name]
+    assert isinstance(terminal_text, str)
+    assert "content truncated by omnigent" in terminal_text
+    assert len(forwarder._encoded_subagent_batch([fitted])) <= 1024
+
+
+def test_subagent_batch_partitioning_encodes_items_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Byte accounting never re-encodes the growing batch prefix."""
+
+    entries = [
+        forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"linear-{index}",
+                item_type="message",
+                data={"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                response_id="resp_linear",
+            )
+        )
+        for index in range(20)
+    ]
+    encoded_item_count = 0
+    original_encode = forwarder._encoded_subagent_batch
+
+    def record_encode(items: list[forwarder._PendingSubagentItem]) -> bytes:
+        nonlocal encoded_item_count
+        encoded_item_count += len(items)
+        return original_encode(items)
+
+    monkeypatch.setattr(forwarder, "_encoded_subagent_batch", record_encode)
+
+    batches = forwarder._partition_subagent_batches(entries)
+
+    assert batches == [entries]
+    assert encoded_item_count == 2 * len(entries)
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_partitioning_runs_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Child-history JSON sizing does not block the live forwarding loop."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-worker.jsonl").write_text("", encoding="utf-8")
+    entry = forwarder.SubagentEntry(
+        subagent_id="worker",
+        child_conversation_id="conv_child_worker",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"worker": entry}),
+    )
+    event_loop_thread = threading.current_thread()
+    partition_threads: list[threading.Thread] = []
+    original_partition = forwarder._partition_subagent_batches
+
+    def record_partition(
+        items: list[forwarder._PendingSubagentItem],
+    ) -> list[list[forwarder._PendingSubagentItem]]:
+        partition_threads.append(threading.current_thread())
+        return original_partition(items)
+
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(forwarder, "_partition_subagent_batches", record_partition)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_request),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    assert partition_threads
+    assert all(thread is not event_loop_thread for thread in partition_threads)
+
+
+@pytest.mark.asyncio
+async def test_untruncatable_subagent_item_is_dead_lettered_and_checkpointed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One impossible item cannot livelock every later child-history poll."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-oversized.jsonl").write_text("{}\n", encoding="utf-8")
+    item = ClaudeTranscriptItem(
+        source_id="oversized-untruncatable",
+        item_type="message",
+        data={"x" * forwarder.MAX_SUBAGENT_EVENT_BATCH_BYTES: 1},
+        response_id="resp_oversized",
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=3,
+        current_response_id=None,
+        items=[item],
+        record_items=(TranscriptRecordItems(next_byte_offset=3, items=(item,)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="oversized",
+        child_conversation_id="conv_child_oversized",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"oversized": entry}),
+    )
+
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_request),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    updated = checkpoint.state.subagents["oversized"]
+    assert updated.byte_offset == 3
+    assert updated.seen_source_ids == (item.source_id,)
+    dead_letter = json.loads(
+        (bridge_dir / "dead_letter.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert dead_letter["payload"]["source_id"] == item.source_id
+    assert "no truncatable text" in dead_letter["reason"]
+    assert dead_letter["http_status"] == 413
+
+
+@pytest.mark.asyncio
+async def test_subagent_batches_fall_back_once_for_older_server(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server that rejects event arrays receives individual events thereafter."""
+
+    def pending(index: int) -> forwarder._PendingSubagentItem:
+        return forwarder._PendingSubagentItem(
+            item=ClaudeTranscriptItem(
+                source_id=f"fallback-{index}",
+                item_type="message",
+                data={
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": str(index)}],
+                },
+                response_id="resp_fallback",
+            )
+        )
+
+    bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        bodies.append(body)
+        if isinstance(body, list):
+            return httpx.Response(
+                422,
+                json={
+                    "detail": [
+                        {
+                            "type": "model_attributes_type",
+                            "loc": ["body"],
+                            "msg": "Input should be a valid dictionary",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(202, json={"queued": False, "item_id": "item_fallback"})
+
+    capability = forwarder._SessionEventBatchCapability()
+    caplog.set_level(logging.INFO)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_child_one",
+            items=[pending(1), pending(2)],
+            batch_capability=capability,
+        )
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_child_two",
+            items=[pending(3), pending(4)],
+            batch_capability=capability,
+        )
+
+    assert capability.supported is False
+    assert len([body for body in bodies if isinstance(body, list)]) == 1
+    individual_source_ids = {
+        body["data"]["source_id"] for body in bodies if isinstance(body, dict)
+    }
+    assert individual_source_ids == {"fallback-1", "fallback-2", "fallback-3", "fallback-4"}
+    assert "does not accept session event arrays" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_failure_resumes_at_first_unsent_record(tmp_path: Path) -> None:
+    """A failed second batch keeps the durable cursor after record 100."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    records = [
+        {
+            "isSidechain": True,
+            "type": "assistant",
+            "uuid": f"sa-{index}",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": f"item {index}"}],
+            },
+        }
+        for index in range(150)
+    ]
+    subagent_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="checkpoint",
+        agent_type="Explore",
+        description="large history",
+        tool_use_id="toolu_checkpoint",
+        transcript_records=records,
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "checkpoint": forwarder.SubagentEntry(
+                subagent_id="checkpoint",
+                child_conversation_id="conv_child_checkpoint",
+            )
+        }
+    )
+    attempts: list[list[str]] = []
+    failed_second_batch = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal failed_second_batch
+        body = json.loads(request.content.decode("utf-8"))
+        if not isinstance(body, list):
+            return httpx.Response(202, json={})
+        source_ids = [event["data"]["source_id"] for event in body]
+        attempts.append(source_ids)
+        if source_ids[0].startswith("sa-100:") and not failed_second_batch:
+            failed_second_batch = True
+            return httpx.Response(503, json={"error": "retry"})
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        with subagent_jsonl.open("rb") as handle:
+            expected_offset = sum(len(handle.readline()) for _ in range(100))
+        assert first.subagents["checkpoint"].byte_offset == expected_offset
+        persisted = forwarder._read_subagent_forward_state(bridge_dir)
+        assert persisted.subagents["checkpoint"].byte_offset == expected_offset
+
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert second.subagents["checkpoint"].byte_offset == subagent_jsonl.stat().st_size
+    attempted_ids = [source_id for batch in attempts for source_id in batch]
+    assert all(attempted_ids.count(f"sa-{index}:0:message") == 1 for index in range(100))
+    assert all(attempted_ids.count(f"sa-{index}:0:message") == 2 for index in range(100, 150))
+
+
+@pytest.mark.asyncio
+async def test_permanent_batch_failure_redrives_items_individually(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poison event cannot discard valid siblings from a failed batch."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-redrive.jsonl").write_text("{}\n", encoding="utf-8")
+    items = tuple(
+        ClaudeTranscriptItem(
+            source_id=source_id,
+            item_type="message",
+            data={"role": "assistant", "content": [{"type": "text", "text": source_id}]},
+            response_id="resp_redrive",
+        )
+        for source_id in ("before-poison", "poison", "after-poison")
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=3,
+        byte_offset=30,
+        current_response_id=None,
+        items=list(items),
+        record_items=tuple(
+            TranscriptRecordItems(next_byte_offset=(index + 1) * 10, items=(item,))
+            for index, item in enumerate(items)
+        ),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="redrive",
+        child_conversation_id="conv_child_redrive",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"redrive": entry}),
+    )
+    request_bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        request_bodies.append(body)
+        if isinstance(body, list):
+            return httpx.Response(400, json={"error": "poison in batch"})
+        if body["type"] == "external_conversation_item":
+            if body["data"]["source_id"] == "poison":
+                return httpx.Response(400, json={"error": "poison"})
+            return httpx.Response(202, json={"queued": False, "item_id": "item-ok"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0,
+                max_permanent_attempts=1,
+            ),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    individual_source_ids = [
+        body["data"]["source_id"]
+        for body in request_bodies
+        if isinstance(body, dict) and body.get("type") == "external_conversation_item"
+    ]
+    assert individual_source_ids == ["before-poison", "poison", "after-poison"]
+    updated = checkpoint.state.subagents["redrive"]
+    assert updated.byte_offset == 30
+    assert updated.seen_source_ids == tuple(item.source_id for item in items)
+    dead_letters = [
+        json.loads(line)
+        for line in (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert [record["payload"]["source_id"] for record in dead_letters] == ["poison"]
+
+
+@pytest.mark.asyncio
+async def test_individual_redrive_honors_not_confirmed_retry_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fallback item is retried before a not-confirmed 503 is dead-lettered."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-retry.jsonl").write_text("{}\n", encoding="utf-8")
+    item = ClaudeTranscriptItem(
+        source_id="retry-not-confirmed",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        response_id="resp-retry",
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=10,
+        current_response_id=None,
+        items=[item],
+        record_items=(TranscriptRecordItems(next_byte_offset=10, items=(item,)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="retry",
+        child_conversation_id="conv_child_retry",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"retry": entry}),
+    )
+    batch_attempts = 0
+    individual_attempts = 0
+    forward_successes = 0
+
+    def note_forward_success() -> None:
+        nonlocal forward_successes
+        forward_successes += 1
+
+    monkeypatch.setattr(forwarder, "_note_forward_success", note_forward_success)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal batch_attempts, individual_attempts
+        body = json.loads(request.content.decode("utf-8"))
+        if isinstance(body, list):
+            batch_attempts += 1
+        else:
+            individual_attempts += 1
+        return httpx.Response(
+            503,
+            json={"error": "subagent_delivery_not_confirmed"},
+        )
+
+    retry_tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_permanent_attempts=1,
+        max_not_confirmed_attempts=2,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(3):
+            await forwarder._forward_one_subagent(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                subagents_dir=subagents_dir,
+                entry=checkpoint.state.subagents["retry"],
+                agent_name="claude-native-ui",
+                checkpoint=checkpoint,
+                item_retry_tracker=retry_tracker,
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                batch_capability=forwarder._SessionEventBatchCapability(),
+            )
+
+    assert batch_attempts == 2
+    assert individual_attempts == 2
+    assert forward_successes == 0
+    assert checkpoint.state.subagents["retry"].byte_offset == 10
+    dead_letters = [
+        json.loads(line)
+        for line in (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert [record["payload"]["source_id"] for record in dead_letters] == [item.source_id]
+    assert dead_letters[0]["reason"] == "delivery not confirmed after retries"
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_backoff_survives_new_tail_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Appending later items cannot reset backoff for the failing head item."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-backoff.jsonl").write_text("{}\n", encoding="utf-8")
+
+    def transcript_item(source_id: str) -> ClaudeTranscriptItem:
+        return ClaudeTranscriptItem(
+            source_id=source_id,
+            item_type="message",
+            data={"role": "assistant", "content": [{"type": "text", "text": source_id}]},
+            response_id="resp-backoff",
+        )
+
+    first = transcript_item("first")
+    second = transcript_item("second")
+    current_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=10,
+        current_response_id=None,
+        items=[first],
+        record_items=(TranscriptRecordItems(next_byte_offset=10, items=(first,)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: current_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="backoff",
+        child_conversation_id="conv_child_backoff",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"backoff": entry}),
+    )
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(502, text="unavailable")
+
+    retry_tracker = forwarder._PostRetryTracker(base_delay_s=60.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=retry_tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+        current_result = TranscriptReadResult(
+            line_cursor=2,
+            byte_offset=20,
+            current_response_id=None,
+            items=[first, second],
+            record_items=(
+                TranscriptRecordItems(next_byte_offset=10, items=(first,)),
+                TranscriptRecordItems(next_byte_offset=20, items=(second,)),
+            ),
+        )
+        await forwarder._forward_one_subagent(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            subagents_dir=subagents_dir,
+            entry=entry,
+            agent_name="claude-native-ui",
+            checkpoint=checkpoint,
+            item_retry_tracker=retry_tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            batch_capability=forwarder._SessionEventBatchCapability(),
+        )
+
+    assert requests == 1
+
+
+@pytest.mark.asyncio
+async def test_subagent_cleanup_swallows_finished_worker_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rotation cleanup cannot re-raise an already-finished worker error."""
+
+    async def fail() -> forwarder.SubagentForwardState:
+        raise RuntimeError("worker failed")
+
+    task = asyncio.create_task(fail())
+    await asyncio.sleep(0)
+
+    await forwarder._cancel_subagent_forward_task(task)
+
+    assert "worker failed during cleanup" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Path) -> None:
+    """Independent child conversations are concurrent while each stays ordered."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    entries: dict[str, forwarder.SubagentEntry] = {}
+    for index in range(16):
+        subagent_id = f"parallel-{index}"
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id=subagent_id,
+            agent_type="Explore",
+            description="parallel backlog",
+            tool_use_id=f"toolu_parallel_{index}",
+            transcript_records=[
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": f"parallel-message-{index}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": str(index)}],
+                    },
+                }
+            ],
+        )
+        entries[subagent_id] = forwarder.SubagentEntry(
+            subagent_id=subagent_id,
+            child_conversation_id=f"conv_child_{index}",
+        )
+
+    active = 0
+    maximum_active = 0
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        body = json.loads(request.content.decode("utf-8"))
+        if not isinstance(body, list):
+            return httpx.Response(202, json={})
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active == 8:
+            release.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await asyncio.wait_for(
+            forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=forwarder.SubagentForwardState(subagents=entries),
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            ),
+            timeout=3.0,
+        )
+    assert maximum_active == 8
+
+
+@pytest.mark.asyncio
+async def test_concurrent_subagent_502s_recover_without_phantom_completion(
+    tmp_path: Path,
+) -> None:
+    """A failed fan-out retries every child before any child can finish idle."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    old_activity = time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60
+    entries: dict[str, forwarder.SubagentEntry] = {}
+    for index in range(5):
+        subagent_id = f"recover-{index}"
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id=subagent_id,
+            agent_type="Explore",
+            description="concurrent retry",
+            tool_use_id=f"toolu_recover_{index}",
+            transcript_records=[
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": f"recover-message-{index}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": str(index)}],
+                    },
+                }
+            ],
+        )
+        entries[subagent_id] = forwarder.SubagentEntry(
+            subagent_id=subagent_id,
+            child_conversation_id=f"conv_recover_{index}",
+            last_activity_ts=old_activity,
+            last_status="running",
+        )
+
+    attempts: dict[str, int] = {}
+    statuses: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        child_id = request.url.path.split("/")[-2]
+        if isinstance(body, list):
+            attempts[child_id] = attempts.get(child_id, 0) + 1
+            if attempts[child_id] == 1:
+                return httpx.Response(502, text="bad gateway")
+            return httpx.Response(202, json=[{"item_id": f"item-{child_id}"}])
+        if body.get("type") == "external_session_status":
+            statuses.append((child_id, body["data"]["status"]))
+        return httpx.Response(202, json={})
+
+    tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=3,
+    )
+    state = forwarder.SubagentForwardState(subagents=entries)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        assert statuses == []
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        quiet_entries = {
+            subagent_id: replace(entry, last_activity_ts=old_activity)
+            for subagent_id, entry in state.subagents.items()
+        }
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents=quiet_entries),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert set(attempts.values()) == {2}
+    assert sorted(status for _, status in statuses) == ["idle"] * 5
+    assert all(entry.delivery_error is None for entry in state.subagents.values())
+
+
+@pytest.mark.asyncio
+async def test_persistent_subagent_502_ends_as_explicit_failure(tmp_path: Path) -> None:
+    """A child that exhausts 502 retries fails with recoverable dead letters."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagent_id = "persistent-502"
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id=subagent_id,
+        agent_type="Explore",
+        description="persistent outage",
+        tool_use_id="toolu_persistent_502",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "persistent-message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "lost output"}],
+                },
+            }
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            subagent_id: forwarder.SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id="conv_persistent_502",
+            )
+        }
+    )
+    statuses: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if isinstance(body, list):
+            return httpx.Response(502, text="bad gateway")
+        if body.get("type") == "external_session_status":
+            statuses.append(body["data"])
+        return httpx.Response(202, json={})
+
+    tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=2,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(2):
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=tracker,
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            )
+        failed_entry = replace(
+            state.subagents[subagent_id],
+            last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60,
+        )
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={subagent_id: failed_entry}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert statuses == [{"status": "failed", "output": forwarder._SUBAGENT_DROPPED_ITEM_REASON}]
+    assert state.subagents[subagent_id].delivery_error == forwarder._SUBAGENT_DROPPED_ITEM_REASON
+    persisted = forwarder._read_subagent_forward_state(bridge_dir)
+    assert (
+        persisted.subagents[subagent_id].delivery_error == forwarder._SUBAGENT_DROPPED_ITEM_REASON
+    )
+    dead_letters = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    assert len(dead_letters) == 1
+    assert json.loads(dead_letters[0])["http_status"] == 502
+
+
+@pytest.mark.asyncio
+async def test_parent_output_forwards_while_child_history_is_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck child request cannot prevent the next live parent poll."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="blocked-child",
+        agent_type="Explore",
+        description="blocked history",
+        tool_use_id="toolu_blocked_child",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "blocked-child-item",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "old output"}],
+                },
+            }
+        ],
+    )
+    forwarder._write_subagent_forward_state(
+        bridge_dir,
+        forwarder.SubagentForwardState(
+            subagents={
+                "blocked-child": forwarder.SubagentEntry(
+                    subagent_id="blocked-child",
+                    child_conversation_id="conv_blocked_child",
+                )
+            }
+        ),
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    child_request_started = asyncio.Event()
+    release_child = asyncio.Event()
+    parent_item_forwarded = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if isinstance(body, list):
+            child_request_started.set()
+            await release_child.wait()
+            return httpx.Response(
+                202,
+                json=[
+                    {"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)
+                ],
+            )
+        if (
+            request.url.path == "/v1/sessions/conv_parent/events"
+            and isinstance(body, dict)
+            and body.get("type") == "external_conversation_item"
+        ):
+            parent_item_forwarded.set()
+        return httpx.Response(202, json={})
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(child_request_started.wait(), timeout=2.0)
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "fresh-parent-item",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "fresh output"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        await asyncio.wait_for(parent_item_forwarded.wait(), timeout=1.0)
+    finally:
+        release_child.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 async def test_subagent_watcher_skips_subagents_already_in_state(
@@ -8448,9 +9618,9 @@ async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
         :returns: Canned Omnigent response.
         """
         body = json.loads(request.content.decode("utf-8"))
-        if body.get("type") == "external_subagent_start":
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
             return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
-        if body.get("type") == "external_conversation_item":
+        if isinstance(body, list) or body.get("type") == "external_conversation_item":
             return httpx.Response(400, json={"error": "nope"})
         return httpx.Response(202, json={})
 
@@ -9068,6 +10238,22 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forward_progress_timeout_resets_after_each_response() -> None:
+    """A healthy long drain is not cancelled while responses keep arriving."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.06)
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        async with forwarder._forward_progress_timeout(client, 0.1):
+            for _ in range(3):
+                await client.post("/events", json={})
+
+
+@pytest.mark.asyncio
 async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9121,7 +10307,7 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-    stall_warnings = [r for r in caplog.records if "iteration exceeded" in r.getMessage()]
+    stall_warnings = [r for r in caplog.records if "made no live progress" in r.getMessage()]
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None

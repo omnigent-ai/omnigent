@@ -16,6 +16,7 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
+import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -396,6 +397,10 @@ export class ApiError extends Error {
  * instead, so that shape is read too — otherwise those failures reach the
  * user as a bare status line ("415 ", with statusText empty over HTTP/2)
  * rather than the reason the server actually gave.
+ *
+ * Databricks-backed stores propagate rejections as a top-level
+ * `{"error_code": "…", "message": "…"}` envelope (e.g. a title the
+ * workspace storage refuses), so that shape is read as well.
  */
 export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`.trim();
@@ -404,12 +409,16 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
     const body = (await res.json()) as {
       error?: { code?: string; message?: string };
       detail?: unknown;
+      message?: unknown;
+      error_code?: unknown;
     };
     // FastAPI's validation errors put a list in `detail`; only a plain
     // string is a message meant for the user.
     if (body.error?.message) message = body.error.message;
     else if (typeof body.detail === "string" && body.detail) message = body.detail;
+    else if (typeof body.message === "string" && body.message) message = body.message;
     if (body.error?.code) code = body.error.code;
+    else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
@@ -491,7 +500,11 @@ export async function createSession(
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -685,7 +698,10 @@ export async function createBundledSession(
   form.append("bundle", bundle);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: form,
   });
   if (!res.ok) {
@@ -1063,6 +1079,8 @@ export interface GetSessionSlimOptions {
    * refresh pierces stale server-side capability caches.
    */
   refreshState?: boolean;
+  /** Cancel this request when the owning operation ends or times out. */
+  signal?: AbortSignal;
 }
 
 export async function getSessionSlim(
@@ -1076,6 +1094,7 @@ export async function getSessionSlim(
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
+    { signal: options.signal },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
@@ -1169,7 +1188,10 @@ export async function postEvent(
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(event),
   });
   // Throw a typed ApiError (not the bare status line) so callers can branch

@@ -32,6 +32,8 @@ const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
 const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
+let searchParams = new URLSearchParams();
+let projects: { id: string | null; name: string }[] = [];
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 // Prompt history is scoped per conversation; the landing composer writes under
@@ -47,9 +49,7 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigateMock,
-  // The landing screen reads `?project=` to pre-fill the project chip; this
-  // flow suite never sets one, so an empty params object is enough.
-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+  useSearchParams: () => [searchParams, vi.fn()],
 }));
 
 // The screen hands the first message to ChatPage through the chatStore
@@ -119,12 +119,10 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
 }));
-// The composer's project chip lists projects via useProjects; stub it to an
-// empty list so it doesn't fire its own authenticatedFetch (which would land
-// at mock.calls[0] and skew these create-POST call assertions).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
-  useProjects: () => ({ data: [] }),
+  useProjects: () => ({ data: projects }),
+  useProjectConfig: () => ({ data: null, isLoading: false }),
   // Same reason as useProjects above: the landing reads useConversations for
   // hasNoSessions, so stub it to avoid an authenticatedFetch skewing calls[0].
   useConversations: () => ({ data: undefined }),
@@ -310,6 +308,8 @@ beforeEach(() => {
   resetLandingDraft();
   clearOptimisticTitles();
   localStorage.clear();
+  searchParams = new URLSearchParams();
+  projects = [];
   vi.mocked(useHostModelOptions).mockReturnValue({
     data: [
       { id: "opus", displayName: "Opus" },
@@ -331,6 +331,49 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it("keeps project placement on the provisional and rekeyed conversation", async () => {
+    searchParams = new URLSearchParams("project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_1",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    const project = { id: "proj_alpha", name: "Alpha" };
+    await waitFor(() =>
+      expect(beginLocalConversationMock).toHaveBeenCalledWith(
+        "inspect the repo",
+        [],
+        expect.any(Object),
+        project,
+      ),
+    );
+    await waitFor(() =>
+      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
+        "temp:1234567890abcdef1234567890abcdef",
+        "conv_new",
+        "ag_hello",
+        "inspect the repo",
+        [],
+        "pend_1",
+        null,
+        navigateMock,
+        expect.any(Function),
+        project,
+      ),
+    );
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -429,6 +472,7 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
+        undefined,
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -474,6 +518,7 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
+        undefined,
       ),
     );
   });
@@ -593,6 +638,7 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
+        undefined,
       ),
     );
 

@@ -316,6 +316,89 @@ def test_databricks_request_headers_org_only(token_dir) -> None:
     assert databricks_request_headers("https://single.databricks.com/api/2.0/omnigent") == {}
 
 
+def test_databricks_request_headers_explicit_org_wins(token_dir) -> None:
+    """The current URL selector overrides a stale stored workspace selector."""
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+
+    server = "https://acme.databricks.com/api/2.0/omnigent"
+    store_databricks_auth(
+        server_url=server,
+        workspace_host="https://acme.databricks.com",
+        org_id="111",
+    )
+
+    assert databricks_request_headers(server, org_id="222")["X-Databricks-Org-Id"] == "222"
+
+
+def test_store_databricks_org_id_preserves_session_token(token_dir) -> None:
+    """Remembering URL routing must not replace an existing login session."""
+    from omnigent.cli_auth import (
+        load_databricks_org_id,
+        load_token,
+        store_databricks_org_id,
+        store_token,
+    )
+
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_token(server, "session-token", "user@example.com", time.time() + 3600)
+
+    store_databricks_org_id(server, "123")
+
+    assert load_token(server) == "session-token"
+    assert load_databricks_org_id(server) == "123"
+
+
+def test_store_token_preserves_databricks_org_id(token_dir) -> None:
+    """Refreshing a login session must retain remembered routing."""
+    from omnigent.cli_auth import (
+        load_databricks_org_id,
+        store_databricks_org_id,
+        store_token,
+    )
+
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_databricks_org_id(server, "123")
+
+    store_token(server, "session-token", "user@example.com", time.time() + 3600)
+
+    assert load_databricks_org_id(server) == "123"
+
+
+def test_store_databricks_org_id_preserves_databricks_pointer(token_dir) -> None:
+    """Remembering routing must retain the workspace used to mint credentials."""
+    from omnigent.cli_auth import (
+        load_databricks_org_id,
+        load_databricks_workspace_host,
+        store_databricks_auth,
+        store_databricks_org_id,
+    )
+
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    workspace = "https://workspace.example.com"
+    store_databricks_auth(server, workspace, org_id="111")
+
+    store_databricks_org_id(server, "222")
+
+    assert load_databricks_workspace_host(server) == workspace
+    assert load_databricks_org_id(server) == "222"
+
+
+def test_store_databricks_pointer_preserves_org_id_when_unspecified(token_dir) -> None:
+    """Updating a credential pointer must retain remembered routing."""
+    from omnigent.cli_auth import (
+        load_databricks_org_id,
+        store_databricks_auth,
+        store_databricks_org_id,
+    )
+
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_databricks_org_id(server, "123")
+
+    store_databricks_auth(server, "https://workspace.example.com")
+
+    assert load_databricks_org_id(server) == "123"
+
+
 def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
     """The paired minter always emits the bearer and the ?o= header together.
 

@@ -533,6 +533,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_harness_override_executor_type as _validated_harness_override_executor_type,
     _wait_for_managed_runner_tunnel as _wait_for_managed_runner_tunnel,
     announce_hosts_changed as announce_hosts_changed,
+    announce_projects_changed as announce_projects_changed,
     cancel_managed_launch_tasks as cancel_managed_launch_tasks,
     prefetch_session_routing_catalogs as prefetch_session_routing_catalogs,
 )
@@ -622,6 +623,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _forward_native_terminal_message as _forward_native_terminal_message,
     _get_session_snapshot as _get_session_snapshot,
     _handle_mcp_tools_call as _handle_mcp_tools_call,
+    _harness_elicitation_request_fingerprint as _harness_elicitation_request_fingerprint,
     _heal_subagent_runner_binding_via_parent as _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session as _is_native_terminal_session,
     _kick_managed_relaunch as _kick_managed_relaunch,

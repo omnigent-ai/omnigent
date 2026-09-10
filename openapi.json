@@ -2637,6 +2637,17 @@
             "title": "Force",
             "type": "boolean"
           },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
           "items": {
             "items": {
               "$ref": "#/components/schemas/ImportItemInput"

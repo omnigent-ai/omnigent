@@ -94,6 +94,10 @@ class ImportSessionRequest(BaseModel):
     title: str | None = Field(default=None, max_length=512)
     force: bool = False
     project_id: str | None = None
+    # The importing CLI's own host, so the session binds back to the machine
+    # the transcript came from and resumes there. Bound only alongside a
+    # workspace (the workspace-required-for-host check constraint).
+    host_id: str | None = None
     items: list[ImportItemInput] = Field(min_length=1, max_length=_MAX_IMPORT_ITEMS)
 
     @field_validator("external_session_id")
@@ -420,8 +424,7 @@ def create_imports_router(
         user_id = require_user(request, auth_provider)
         items = [item.to_item() for item in body.items]
         existing = await asyncio.to_thread(
-            conversation_store.find_imported_conversation,
-            body.source,
+            conversation_store.find_conversation_by_external_session_id,
             body.external_session_id,
         )
         if existing is not None:
@@ -433,8 +436,10 @@ def create_imports_router(
                 conversation_store,
             )
             if not body.force:
+                # Matches a prior import or a native run of the same session
+                # (both record the external id), so "exists", not "imported".
                 raise OmnigentError(
-                    f"This {body.source} session has already been imported as {existing.id}",
+                    f"This {body.source} session already exists as {existing.id}",
                     code=ErrorCode.CONFLICT,
                 )
 
@@ -449,6 +454,7 @@ def create_imports_router(
             user_id=user_id,
             native_title=body.title,
             project_id=body.project_id,
+            host_id=body.host_id,
         )
 
         response.status_code = 201
@@ -539,8 +545,7 @@ def create_imports_router(
             # concrete harness — narrow off the request's ImportSource | "all".
             source = cast(ImportSource, source)
             existing = await asyncio.to_thread(
-                conversation_store.find_imported_conversation,
-                source,
+                conversation_store.find_conversation_by_external_session_id,
                 external_session_id,
             )
             if existing is not None:

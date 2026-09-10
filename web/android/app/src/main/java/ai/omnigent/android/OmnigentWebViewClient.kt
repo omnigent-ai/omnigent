@@ -34,6 +34,7 @@ class OmnigentWebViewClient(
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
     private val onRendererGone: (view: WebView, didCrash: Boolean) -> Unit,
+    private val onNavigationStarted: () -> Unit = {},
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -70,6 +71,8 @@ class OmnigentWebViewClient(
             onLoginRequired()
             return
         }
+
+        if (isHttpScheme(scheme)) onNavigationStarted()
 
         // Workspace roots are caught here too, not only in
         // shouldOverrideUrlLoading: that callback is skipped for loads the shell

@@ -1,7 +1,7 @@
 """CLI-side auth storage for ``omnigent login``.
 
 Persists per-server auth state in ``~/.omnigent/auth_tokens.json``
-keyed by server URL. Two record shapes live side by side:
+keyed by server URL. Three record shapes live side by side:
 
 - **Session JWTs** from the browser-based OIDC / accounts login flow
   (``{"token": ..., "user_id": ..., "expires_at": ...}``).
@@ -12,6 +12,9 @@ keyed by server URL. Two record shapes live side by side:
   just names the workspace whose host-keyed Databricks CLI OAuth cache
   (``databricks auth login --host <ws>``) mints fresh bearers on
   demand.
+- **Workspace routing selectors** (``{"org_id": ...}``) remembered while
+  normalizing a managed URL. They may stand alone or augment either credential
+  record so subprocesses route to the same workspace.
 
 See ``designs/OIDC_AUTH.md`` §CLI Login Flow.
 """
@@ -181,6 +184,9 @@ def store_token(
     }
     if refresh_token is not None:
         entry["refresh_token"] = refresh_token
+    existing_org_id = load_databricks_org_id(server_url)
+    if existing_org_id is not None:
+        entry["org_id"] = existing_org_id
     _store_entry(server_url, entry)
 
 
@@ -217,7 +223,28 @@ def store_databricks_auth(
         entry["user_id"] = user_id
     if org_id:
         entry["org_id"] = org_id
+    else:
+        existing_org_id = load_databricks_org_id(server_url)
+        if existing_org_id is not None:
+            entry["org_id"] = existing_org_id
     _store_entry(server_url, entry)
+
+
+def store_databricks_org_id(server_url: str, org_id: str) -> None:
+    """Persist a workspace selector without replacing existing credentials.
+
+    URL normalization calls this when a managed server URL carries ``?o=``.
+    Keeping the selector beside the server's existing auth record lets later
+    CLI helpers and child processes rebuild routing headers after the query has
+    been removed from the HTTP base URL.
+
+    :param server_url: Canonical server API base.
+    :param org_id: Workspace selector parsed from the user-supplied URL.
+    """
+    existing = _load_entry(server_url) or {}
+    if existing.get("org_id") == org_id:
+        return
+    _store_entry(server_url, {**existing, "org_id": org_id})
 
 
 def _load_entry(server_url: str) -> dict[str, str | float] | None:
@@ -524,16 +551,15 @@ def load_databricks_workspace_host(server_url: str) -> str | None:
 
 
 def load_databricks_org_id(server_url: str) -> str | None:
-    """Load the workspace org id from a Databricks pointer record.
+    """Load the workspace org id from a stored server record.
 
     :param server_url: The server URL, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
     :returns: The org id, e.g. ``"2850744067564480"``, or ``None``
-        when the stored record (if any) is not a Databricks pointer
-        record or carries no org id.
+        when the stored record carries no org id.
     """
     entry = _load_entry(server_url)
-    if entry is None or entry.get("auth_type") != "databricks":
+    if entry is None:
         return None
     org_id = entry.get("org_id")
     return org_id if isinstance(org_id, str) and org_id else None
@@ -587,6 +613,7 @@ def databricks_request_headers(
     *,
     bearer_token: str | None = None,
     host_id: str | None = None,
+    org_id: str | None = None,
 ) -> dict[str, str]:
     """Build the headers for a request to a Databricks-fronted server.
 
@@ -619,6 +646,9 @@ def databricks_request_headers(
         sharding layer that reads it. ``None`` defaults to the runner's own
         host_id inside a runner process (via ``OMNIGENT_RUNNER_SLICE_KEY``) and
         otherwise leaves routing to the default.
+    :param org_id: An explicit workspace selector captured from the current
+        server URL. When omitted, the selector from the stored login record is
+        used. An explicit value wins over stored state.
     :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
         ``X-Databricks-Omnigent-Slice-Key``, and/or the configured extra headers
         as available, possibly empty.
@@ -626,7 +656,7 @@ def databricks_request_headers(
     headers: dict[str, str] = {}
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
-    org_id = load_databricks_org_id(server_url)
+    org_id = org_id or load_databricks_org_id(server_url)
     if org_id:
         headers[DATABRICKS_ORG_ID_HEADER] = org_id
     # Resolve the slice-key host_id when the caller names none, so every
