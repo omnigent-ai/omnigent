@@ -602,9 +602,16 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.os_env import create_os_environment
 
+    # A long-lived runner can outlive the directory it was started in, making
+    # Path.cwd() raise. This environment exists purely for schema extraction,
+    # so any directory that exists serves equally well.
+    try:
+        _schema_cwd = str(Path.cwd())
+    except OSError:
+        _schema_cwd = tempfile.gettempdir()
     _os_spec = OSEnvSpec(
         type="caller_process",
-        cwd=str(Path.cwd()),
+        cwd=_schema_cwd,
         sandbox=OSEnvSandboxSpec(type="none"),
         fork=False,
     )

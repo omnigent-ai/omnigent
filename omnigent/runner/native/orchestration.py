@@ -724,6 +724,34 @@ def _required_runner_env(name: str) -> str:
     return value
 
 
+def _native_launch_workspace() -> str:
+    """
+    Resolve the workspace a native terminal launches in.
+
+    ``OMNIGENT_RUNNER_WORKSPACE`` is the runner's own launch directory and
+    wins whenever it is set; the process cwd only stands in for runners
+    started without it. Read lazily on purpose: a long-lived runner can
+    outlive the directory it was started in (the user deletes that
+    worktree), and reading the cwd eagerly failed terminal creation even
+    when the environment already named a perfectly good workspace.
+
+    :returns: Workspace path for the terminal cwd.
+    :raises RuntimeError: If the environment names no workspace and the
+        process cwd is unreadable.
+    """
+    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
+    if workspace:
+        return workspace
+    try:
+        return str(Path.cwd())
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot resolve a workspace for this session: the runner's working "
+            "directory no longer exists and OMNIGENT_RUNNER_WORKSPACE is unset. "
+            "Restart the host from a directory that exists."
+        ) from exc
+
+
 def _codex_session_workspace(session_workspace: str | None) -> Path:
     """
     Resolve the cwd for a runner-owned Codex terminal.
@@ -6640,7 +6668,7 @@ async def _auto_create_claude_terminal(
     workspace = (
         session_init.snapshot.workspace
         if session_init is not None and session_init.snapshot.workspace
-        else os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+        else _native_launch_workspace()
     )
     started_at = time.monotonic()
     _logger.info(
@@ -7509,7 +7537,7 @@ async def _auto_create_repl_terminal(
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     started_at = time.monotonic()
-    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    workspace = _native_launch_workspace()
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``) is honoured;
     # without sandbox= here and parent_os_env below, launch_terminal falls back to

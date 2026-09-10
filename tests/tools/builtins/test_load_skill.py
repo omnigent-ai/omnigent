@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -310,3 +312,31 @@ def test_load_skill_tool_accepts_namespaced_alias(tmp_path: Path, tool_ctx: Tool
     tool = LoadSkillTool([skill])
     result = tool.invoke(json.dumps({"name": "myplugin:brand-review"}), tool_ctx)
     assert result == "Review the brand."
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="a removed cwd makes os.getcwd() raise on Linux; other platforms may serve stale paths",
+)
+def test_deleted_cwd_degrades_to_bundled_skills(
+    tmp_path: Path, skill_no_resources: SkillSpec, tool_ctx: ToolContext
+) -> None:
+    """
+    A long-lived runner can outlive its working directory. With no
+    ``agent_root``, host-scope discovery falls back to the process cwd; when
+    that directory has been deleted, construction must degrade to the bundled
+    skills instead of raising into whatever is building the tool list.
+    """
+    doomed = tmp_path / "doomed"
+    doomed.mkdir()
+    original_cwd = os.getcwd()
+    os.chdir(doomed)
+    try:
+        doomed.rmdir()
+        tool = LoadSkillTool([skill_no_resources])
+    finally:
+        os.chdir(original_cwd)
+
+    assert [s.name for s in tool.skills] == [skill_no_resources.name]
+    result = tool.invoke(json.dumps({"name": skill_no_resources.name}), tool_ctx)
+    assert result == skill_no_resources.content

@@ -4334,3 +4334,55 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()
+
+
+def _unreadable_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``Path.cwd()`` behave as it does when the cwd was deleted."""
+
+    def _boom() -> Path:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(Path, "cwd", staticmethod(_boom))
+
+
+def test_native_launch_workspace_prefers_env_over_a_deleted_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner can outlive the directory it was started in. The environment
+    already names the workspace in that case, so resolution must not touch
+    the cwd at all — reading it eagerly aborted terminal creation with a
+    bare ``FileNotFoundError``.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/srv/launch-dir")
+    _unreadable_cwd(monkeypatch)
+
+    from omnigent.runner.native.orchestration import _native_launch_workspace
+
+    assert _native_launch_workspace() == "/srv/launch-dir"
+
+
+def test_native_launch_workspace_falls_back_to_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runners started without the env var still get the process cwd."""
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+    monkeypatch.setattr(Path, "cwd", staticmethod(lambda: Path("/srv/inherited")))
+
+    from omnigent.runner.native.orchestration import _native_launch_workspace
+
+    assert _native_launch_workspace() == "/srv/inherited"
+
+
+def test_native_launch_workspace_reports_when_nothing_is_resolvable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    No env var and no readable cwd is a genuinely broken environment, so it
+    must surface as an actionable message rather than a bare errno.
+    """
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+    _unreadable_cwd(monkeypatch)
+
+    from omnigent.runner.native.orchestration import _native_launch_workspace
+
+    with pytest.raises(RuntimeError, match="OMNIGENT_RUNNER_WORKSPACE is unset"):
+        _native_launch_workspace()

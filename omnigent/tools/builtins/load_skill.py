@@ -48,13 +48,24 @@ class LoadSkillTool(Tool):
         # but fall back to cwd — in production the server process
         # runs from the user's project, so cwd finds .claude/skills/
         # even when agent_root is a cache dir.
-        discovery_root = agent_root or Path.cwd()
+        discovery_root = agent_root
+        if discovery_root is None:
+            try:
+                discovery_root = Path.cwd()
+            except OSError:
+                # A long-lived runner can outlive its own working directory —
+                # deleting the worktree it was started in makes os.getcwd()
+                # raise. Host-scope discovery is an enrichment, so degrade to
+                # bundled skills instead of failing the caller, which would
+                # take down whatever is building the tool list.
+                discovery_root = None
         from omnigent.spec.parser import discover_host_skills
 
         bundled_names = {s.name for s in skills}
-        for hs in discover_host_skills(discovery_root, skills_filter):
-            if hs.name not in bundled_names:
-                all_skills.append(hs)
+        if discovery_root is not None:
+            for hs in discover_host_skills(discovery_root, skills_filter):
+                if hs.name not in bundled_names:
+                    all_skills.append(hs)
         self._skills = all_skills
         self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in all_skills}
 
