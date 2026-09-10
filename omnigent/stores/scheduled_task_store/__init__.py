@@ -133,6 +133,7 @@ class ScheduledTaskStore(ABC):
         name: str | None = None,
         prompt: str | None = None,
         rrule: str | None = None,
+        agent_id: str | None = None,
         timezone: str | None = None,
         model_override: str | None = _UNSET,
         reasoning_effort: str | None = _UNSET,
@@ -158,6 +159,11 @@ class ScheduledTaskStore(ABC):
 
         Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged.
+
+        Passing ``agent_id`` rebinds the task to a different agent, which
+        switches the harness its future firings run. The fire path reads
+        ``agent_id`` fresh on every firing and each firing owns its own
+        conversation, so past runs keep the agent they actually ran.
 
         Returns ``None`` if the task does not exist.
 

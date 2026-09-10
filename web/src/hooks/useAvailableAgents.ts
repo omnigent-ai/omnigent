@@ -173,14 +173,17 @@ interface ScannedSessionAgent {
  * Scan the caller's sessions — sub-agent children included — for unique
  * bound agents. `kind=any` requires server support; an older server
  * ignores the unknown param and returns only top-level sessions, which
- * degrades discovery scope rather than failing.
+ * degrades discovery scope rather than failing. Archived sessions are
+ * included: archiving a session must not make its (possibly still
+ * deployed) agent undiscoverable — e.g. a project-pinned agent whose
+ * anchor session was archived.
  */
 async function scanSessionAgents(): Promise<ScannedSessionAgent[]> {
   // limit=100 bounds the scan to the most recent sessions: an agent whose
   // only session is older than the newest 100 won't be discovered. A
   // deliberate recency cut — the picker is for agents the user is
   // actively working with.
-  const res = await authenticatedFetch("/v1/sessions?limit=100&kind=any");
+  const res = await authenticatedFetch("/v1/sessions?limit=100&kind=any&include_archived=true");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { data: SessionListItemWire[] };
   const seen = new Map<string, ScannedSessionAgent>();
@@ -197,6 +200,33 @@ async function scanSessionAgents(): Promise<ScannedSessionAgent[]> {
     });
   }
   return Array.from(seen.values());
+}
+
+/**
+ * Direct lookup for a pinned agent the bounded scan missed (its only
+ * sessions are archived or paginated out of the newest 100): any one
+ * session bound to it names it and anchors the on-hover detail fetch.
+ * null when no such session is visible to the caller — the agent is
+ * genuinely unresolvable and the consumer surfaces that explicitly.
+ */
+async function lookupPinnedAgent(agentId: string): Promise<AvailableAgent | null> {
+  try {
+    const res = await authenticatedFetch(
+      `/v1/sessions?limit=1&kind=any&include_archived=true&agent_id=${encodeURIComponent(agentId)}`,
+    );
+    if (!res.ok) return null;
+    const body = (await res.json()) as { data: SessionListItemWire[] };
+    const row = body.data[0];
+    if (!row?.agent_id || !row.agent_name) return null;
+    return sessionAgentFromScan({
+      agentId: row.agent_id,
+      agentName: row.agent_name,
+      sessionId: row.id,
+      createdAt: row.created_at ?? null,
+    });
+  } catch {
+    return null;
+  }
 }
 
 /** Wire shape of `GET /v1/sessions/{id}/agent` (AgentObject). */
@@ -244,7 +274,8 @@ export async function prefetchAvailableAgentDetails(
     );
     if (!res.ok) return;
     const json = (await res.json()) as AgentObjectWire;
-    queryClient.setQueryData<AvailableAgent[]>(["available-agents"], (prev) => {
+    // Prefix match: patches the bare list and every pinned variant alike.
+    queryClient.setQueriesData<AvailableAgent[]>({ queryKey: ["available-agents"] }, (prev) => {
       if (!prev) return prev;
       const enriched = prev.map((a) =>
         a.id !== agent.id
@@ -310,8 +341,17 @@ export async function prefetchAvailableAgentDetails(
  * A failing sessions scan (e.g. transient 5xx) degrades to the catalog list
  * rather than blanking the picker — catalog availability must not be hostage
  * to the discovery extension.
+ *
+ * `pinnedAgentIds` (e.g. a project's configured default agent) are guaranteed
+ * to survive: any pinned id the merged list lacks — dropped by the
+ * newest-wins name collapse (an id swap would silently rebind the project),
+ * or missed by the recency-bounded scan — is restored from the scan, from
+ * the catalog (a session-less user template can lose its bucket to a newer
+ * same-named upload), or resolved via a direct per-agent session lookup.
+ * A pinned id in neither source stays absent (the consumer surfaces that
+ * state).
  */
-async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
+async function fetchAvailableAgents(pinnedAgentIds: string[] = []): Promise<AvailableAgent[]> {
   const [catalog, scanned] = await Promise.all([
     fetchBuiltinAgents(),
     scanSessionAgents().catch(() => [] as ScannedSessionAgent[]),
@@ -381,11 +421,34 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   // first. NewChatDialog's display-order sort is stable, so unranked names
   // keep this relative order.
   resolved.sort((a, b) => recencyOf(b) - recencyOf(a));
-  return [...seeded, ...resolved];
+  const merged = [...seeded, ...resolved];
+
+  // Pinned-survival pass: restore every pinned id the merge lost (from the
+  // scan when it saw the agent but a same-named newer row won its bucket),
+  // from the catalog when the pin is a user-registered template with no
+  // sessions of its own, or via a direct lookup when neither source saw it.
+  const missingPinned = pinnedAgentIds.filter((id) => !merged.some((a) => a.id === id));
+  const restored = await Promise.all(
+    missingPinned.map((id) => {
+      const seen = scanned.find((s) => s.agentId === id);
+      if (seen) return Promise.resolve(sessionAgentFromScan(seen));
+      const template = catalog.find((a) => a.id === id);
+      return template ? Promise.resolve(template) : lookupPinnedAgent(id);
+    }),
+  );
+  merged.push(...restored.filter((a): a is AvailableAgent => a !== null));
+  return merged;
 }
 
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
+  /**
+   * Agent ids that must survive discovery — e.g. the current project's
+   * configured default agent, which the recency-bounded scan can miss and
+   * the same-name collapse could otherwise drop or id-swap. Resolved via a
+   * direct lookup when needed; ids with no visible session stay absent.
+   */
+  pinnedAgentIds?: string[];
 }
 
 /**
@@ -420,6 +483,17 @@ function applyAcpHarnessCatalog(
 
 export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   const enabled = options.enabled ?? true;
+  // Normalized, order-stable pin key so equivalent pin sets share one cache
+  // entry and a caller's fresh array literal doesn't churn the query. Agent
+  // ids never contain "," so the join is unambiguous.
+  const pinnedIds = options.pinnedAgentIds;
+  const pinnedKey = useMemo(
+    () =>
+      Array.from(new Set(pinnedIds ?? []))
+        .sort()
+        .join(","),
+    [pinnedIds],
+  );
   // Read the catalog under the same gate: a disabled picker must not provoke a
   // request. Both values are cached references, so the memoized select keeps a
   // stable identity and TanStack doesn't hand consumers a fresh array per render.
@@ -431,8 +505,10 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
     [acpHarnessIds, harnessLabels],
   );
   return useQuery({
-    queryKey: ["available-agents"],
-    queryFn: fetchAvailableAgents,
+    // Unpinned consumers keep the historical bare key; pinned variants get
+    // their own entry (prefetch patches both via a prefix match).
+    queryKey: pinnedKey === "" ? ["available-agents"] : ["available-agents", pinnedKey],
+    queryFn: () => fetchAvailableAgents(pinnedKey === "" ? [] : pinnedKey.split(",")),
     enabled,
     staleTime: 30_000,
     select,

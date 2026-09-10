@@ -307,9 +307,39 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     expect((screen.getByTestId("task-prompt-input") as HTMLTextAreaElement).value).toBe(
       "Summarize overnight activity",
     );
-    expect(screen.getByTestId("task-agent-readonly")).toHaveTextContent("Polly");
-    expect(screen.queryByTestId("agent-picker-stub")).not.toBeInTheDocument();
+    // Edit mode offers the same picker create does, seeded with the task's own
+    // agent — the harness of an existing automation is changeable.
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-effective", "ag_1");
+    expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
     expect(screen.getByTestId("schedule-time")).toHaveValue("08:30 AM");
+  });
+
+  it("keeps a task bound to an agent the picker hides instead of retargeting it", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "ag_gone" })}
+      />,
+    );
+    // Without the edit-mode fallback this would silently resolve to the first
+    // listed agent and switch the harness on the next save.
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-effective", "ag_gone");
+  });
+
+  it("sends agentId when the harness is switched, clearing the old agent's settings", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+    fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.agentId).toBe("ag_claude_native");
+    // The target harness carries model/effort/permission controls, so the PATCH
+    // states them explicitly — at Default, i.e. cleared.
+    expect(input.modelOverride).toBeNull();
+    expect(input.reasoningEffort).toBeNull();
+    expect(input.permissionMode).toBeNull();
   });
 
   it("round-trips non-quarter-hour edit times through the update payload", async () => {
@@ -351,6 +381,53 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         timezone: "America/Los_Angeles",
       },
     });
+  });
+
+  it("keeps the task's settings when the pick lands back on its own agent", async () => {
+    // Switching away and back is not a rebind, so the stored model/effort/
+    // permission must survive it — the clear is only justified by a real switch.
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          modelOverride: "opus",
+          reasoningEffort: "high",
+          permissionMode: "acceptEdits",
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("pick-agent-polly"));
+    fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).not.toHaveProperty("agentId");
+    expect(input.modelOverride).toBe("opus");
+    expect(input.reasoningEffort).toBe("high");
+    expect(input.permissionMode).toBe("acceptEdits");
+  });
+
+  it("keeps the task's settings when the current agent is re-picked", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          permissionMode: "bypassPermissions",
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).not.toHaveProperty("agentId");
+    expect(input.permissionMode).toBe("bypassPermissions");
   });
 
   it("blocks update when the existing RRULE cannot be represented by the form", () => {

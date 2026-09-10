@@ -36,6 +36,17 @@ export const NativeEditPermission: Story = {
   },
 };
 
+export const AutoModePermission: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    allowAutoMode: true,
+    rememberScope: { tool: "Bash" },
+  },
+};
+
 export const RememberWebDomain: Story = {
   args: {
     message: "Claude wants to fetch the Storybook documentation.",

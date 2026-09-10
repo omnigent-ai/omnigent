@@ -17,6 +17,7 @@ from omnigent.harness_capabilities import (
     Elicitation,
     ForkHistory,
     HarnessCapabilities,
+    InstructionDelivery,
     IntegrationMode,
     ModelFamily,
     Resume,
@@ -30,7 +31,7 @@ from omnigent.harness_plugins import (
     valid_harnesses,
 )
 from omnigent.inner.devin import DEVIN_ACP_EXTENSION
-from omnigent.model_override import (
+from omnigent.models.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
 )
@@ -114,7 +115,7 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
 
 def test_pi_harnesses_declare_the_pi_effort_family() -> None:
     """Both pi harnesses advertise pi's 7-level ladder, not "no effort knob"."""
-    from omnigent.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
+    from omnigent.util.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
 
     caps = harness_capabilities()
     for harness in ("pi", "pi-native"):
@@ -144,6 +145,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.fork_history is ForkHistory.NONE
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
+    assert capability.instruction_delivery is InstructionDelivery.UNKNOWN
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -161,6 +163,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "fork_history": "none",
         "shell_tool_name": None,
         "shell_tool_prompt": None,
+        "instruction_delivery": "unknown",
     }
 
 
@@ -222,7 +225,7 @@ def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
     (via ``_SDK_MODEL_OVERRIDE_HARNESSES``) makes the server accept the override
     instead of rejecting it up front."""
     from omnigent.harness_plugins import model_env_keys
-    from omnigent.model_override import harness_supports_model_override
+    from omnigent.models.model_override import harness_supports_model_override
 
     assert model_env_keys()["hermes"] == "HARNESS_HERMES_MODEL"
     assert harness_supports_model_override("hermes")
@@ -354,3 +357,20 @@ def test_native_tui_harnesses_declare_shell_tool_provocation() -> None:
         assert capability.shell_tool_name, harness
         assert capability.shell_tool_prompt, harness
         assert "omnigent-bench-ok" in capability.shell_tool_prompt, harness
+
+
+def test_every_canonical_harness_declares_instruction_delivery() -> None:
+    caps = harness_capabilities()
+    for harness in valid_harnesses():
+        assert caps[harness].instruction_delivery is not InstructionDelivery.UNKNOWN, harness
+
+
+def test_hermes_and_hermes_native_deliver_differently() -> None:
+    caps = harness_capabilities()
+    assert caps["hermes"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
+    assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_kiro_native_is_not_delivered() -> None:
+    caps = harness_capabilities()
+    assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED

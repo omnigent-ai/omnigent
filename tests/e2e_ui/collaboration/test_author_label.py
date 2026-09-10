@@ -40,7 +40,7 @@ Selectors:
   - user bubbles: ``data-testid="message-bubble"`` + ``data-role="user"``
   - author badge: ``data-testid="message-author"`` (avatar beside the
     bubble; ``aria-label`` carries the author email)
-  - composer:     placeholder ``"Ask the agent anything…"``
+  - composer:     placeholder ``"Send a message…"``
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ _BOB = f"bob-{_RUN_TAG}@example.com"
 # Mirrors auth.py — the level granting edit access.
 _LEVEL_EDIT = 2
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER = "Send a message…"
 
 
 def _grant_edit(base_url: str, session_id: str, grantee_email: str) -> None:

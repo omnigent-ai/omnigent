@@ -7,12 +7,44 @@ from typing import cast
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData
+from omnigent.runner.app import _format_subagent_wake_notice
 from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+    SUBAGENT_WAKE_NOTICE_SHAPE,
     append_framework_instructions,
     build_instructions,
+    build_instructions_nullable,
     history_to_input_items,
+    raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
+
+_SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
+
+
+def _spec(
+    instructions: str | None,
+    *,
+    agents: tuple[str, ...] = (),
+    spawn: bool = False,
+    builtins: tuple[str, ...] = (),
+) -> AgentSpec:
+    """
+    Stub only the AgentSpec fields the instruction builders read.
+    """
+    return cast(
+        AgentSpec,
+        SimpleNamespace(
+            instructions=instructions,
+            skills=[],
+            tools=SimpleNamespace(
+                agents=list(agents),
+                builtins=[SimpleNamespace(name=name) for name in builtins],
+            ),
+            spawn=spawn,
+        ),
+    )
 
 
 def _output_item(output: str) -> ConversationItem:
@@ -96,7 +128,7 @@ def test_history_replay_leaves_non_image_json_output_unchanged() -> None:
 
 
 def test_framework_instructions_append_after_custom_prompts() -> None:
-    spec = cast(AgentSpec, SimpleNamespace(instructions="Agent prompt", skills=[]))
+    spec = _spec("Agent prompt")
 
     result = build_instructions(
         spec,
@@ -105,16 +137,181 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
         framework_instructions=("  Framework prompt  ",),
     )
 
-    assert result == "Agent prompt\n\nRequest prompt\n\nFramework prompt"
+    assert result == (
+        "Agent prompt\n\nRequest prompt\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+    )
 
 
 def test_empty_framework_instructions_do_not_change_default() -> None:
-    spec = cast(AgentSpec, SimpleNamespace(instructions=None, skills=[]))
+    spec = _spec(None)
 
     assert build_instructions(spec, None, [], framework_instructions=("", "   ")) == (
-        "You are a helpful assistant."
+        f"You are a helpful assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
     )
 
 
 def test_framework_only_instructions_use_shared_composer() -> None:
     assert append_framework_instructions(None, ("Rename session",)) == "Rename session"
+
+
+def test_build_instructions_nullable_unauthored_never_fabricates_fallback() -> None:
+    """No author text → the always-on framework guidance alone, never the
+    fabricated fallback (and never ``None``, since the embedded-browser
+    guidance applies to every agent)."""
+    spec = _spec(None)
+    result = build_instructions_nullable(spec, None, [])
+    assert result == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert "You are a helpful assistant." not in result
+
+
+def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None:
+    """Whitespace-only spec.instructions is not real content — matches
+    raw_author_instructions' non-empty/non-whitespace gate, so authored_present
+    and composed agree on what counts as "authored"."""
+    spec = _spec("   \n  ")
+    assert build_instructions_nullable(spec, None, []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    result = build_instructions_nullable(
+        spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+    )
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
+
+
+def test_build_instructions_nullable_whitespace_only_per_request_treated_as_absent() -> None:
+    """Whitespace-only per_request_instructions is not real content either —
+    the same non-empty/non-whitespace gate applies to both instruction
+    sources, not just spec.instructions."""
+    spec = _spec(None)
+    assert (
+        build_instructions_nullable(spec, "   \n  ", []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    )
+    result = build_instructions_nullable(
+        spec, "   \n  ", [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+    )
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
+
+
+def test_build_instructions_nullable_authored_present() -> None:
+    """Author text present → fully composed authored + framework string."""
+    spec = _spec("Agent prompt")
+    result = build_instructions_nullable(
+        spec, "Request prompt", [], framework_instructions=("Framework prompt",)
+    )
+    assert result == (
+        "Agent prompt\n\nRequest prompt\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+    )
+
+
+def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
+    """Framework-only text must never carry the fabricated fallback fused onto it.
+
+    Regression: naively comparing ``build_instructions()``'s output against
+    the fallback literal misses this exact case, because
+    ``build_instructions`` seeds the fallback as ``base_instructions`` and
+    then appends framework text on top of it regardless of whether ``parts``
+    was empty — producing a mixed string that is neither the bare literal
+    nor framework-text-alone.
+    """
+    spec = _spec(None)
+    result = build_instructions_nullable(
+        spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+    )
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
+    assert "You are a helpful assistant." not in (result or "")
+
+    # The comparison this helper replaces would have misclassified the
+    # framework-only case: build_instructions()'s actual output IS fused
+    # with the fallback literal, confirming the unsafe-comparison rationale.
+    fused = build_instructions(
+        spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+    )
+    assert fused.startswith("You are a helpful assistant.")
+    assert _SAMPLE_FRAMEWORK_INSTRUCTION in fused
+
+
+@pytest.mark.parametrize(
+    ("agents", "spawn", "builtins"),
+    [(("researcher",), False, ()), ((), True, ()), ((), False, ("web_fetch",))],
+)
+def test_subagent_wake_instruction_added_for_dispatching_agents(
+    agents: tuple[str, ...], spawn: bool, builtins: tuple[str, ...]
+) -> None:
+    """
+    An agent that can dispatch sub-agents is told what a wake notice is.
+
+    The gate mirrors ``sys_session_send`` registration (declared sub-agents or
+    ``spawn: true``) plus the ``web_fetch`` builtin, whose researcher dispatch
+    wakes the parent the same way. The announcement lands after the authored
+    text and before per-turn framework instructions, and on its own it never
+    drags in the fabricated fallback.
+    """
+    dispatching = _spec("Agent prompt", agents=agents, spawn=spawn, builtins=builtins)
+    result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
+    assert result == (
+        f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nTurn note"
+    )
+
+    unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
+    assert build_instructions_nullable(unauthored, None, []) == (
+        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+    )
+
+
+def test_embedded_browser_guidance_included_for_every_agent() -> None:
+    """
+    Every agent's composed prompt steers the model to the embedded browser.
+
+    The ``browser_*`` tools are auto-registered for every agent without a
+    spec gate (``ToolManager._register_browser_tools``); a tool description
+    alone loses to a model's native web tooling, so the system prompt must
+    carry the preference for any spec — authored or not.
+    """
+    authored = _spec("Agent prompt")
+    assert build_instructions(authored, None, []) == (
+        f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+    )
+
+
+def test_embedded_browser_guidance_names_registered_tools() -> None:
+    """
+    The guidance must track the canonical registered browser tool names, so
+    a tool rename cannot silently orphan the prompt text.
+    """
+    from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
+
+    for name in sorted(BROWSER_TOOL_NAMES):
+        assert name in EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+
+
+def test_subagent_wake_notice_shape_matches_runner_notice() -> None:
+    """
+    The announced shape must track the notice the runner actually posts.
+    """
+    expected = (
+        SUBAGENT_WAKE_NOTICE_SHAPE.replace("<agent>/<title>", "researcher/auth")
+        .replace("<status>", "completed")
+        .replace("<N>", "2")
+    )
+    notice = _format_subagent_wake_notice(
+        agent="researcher", title="auth", status="completed", pending=2
+    )
+    assert notice == expected
+
+
+def test_raw_author_instructions_verbatim_and_none() -> None:
+    present = cast(AgentSpec, SimpleNamespace(instructions="  Keep this exact.  "))
+    assert raw_author_instructions(present) == "  Keep this exact.  "
+
+    absent = cast(AgentSpec, SimpleNamespace(instructions=None))
+    assert raw_author_instructions(absent) is None
+
+    whitespace_only = cast(AgentSpec, SimpleNamespace(instructions="   \n  "))
+    assert raw_author_instructions(whitespace_only) is None

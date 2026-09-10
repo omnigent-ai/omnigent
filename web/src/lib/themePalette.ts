@@ -18,6 +18,12 @@
 // plus a single `apply*` function that owns the DOM side-effect, called at boot
 // (main.tsx) before first paint and on every change (Appearance settings).
 
+// `.ts` extension (not extensionless like the app's other imports): this module
+// is also loaded directly by the `generate-theme-palettes.mjs` node script,
+// whose ESM resolver can't do extensionless resolution. tsconfig has
+// `allowImportingTsExtensions`, and Vite resolves it the same either way.
+import { getThemeRoots } from "./host.ts";
+
 const STORAGE_KEY = "omnigent:ui-theme-palette";
 
 /** Selectable color palettes. The first entry is the default (brand) look. */
@@ -27,6 +33,7 @@ export const themePalettes = [
   "github",
   "catppuccin",
   "gruvbox",
+  "solarized",
   "nord",
 ] as const;
 
@@ -494,6 +501,69 @@ export const PALETTES: readonly PaletteMeta[] = [
     },
   },
   {
+    id: "solarized",
+    label: "Solarized",
+    blurb: "Precision colors in Solarized Light & Dark.",
+    light: {
+      bg: "#fdf6e3",
+      card: "#eee8d5",
+      accent: "#268bd2",
+      border: "#93a1a1",
+      text: "#657b83",
+    },
+    dark: {
+      bg: "#002b36",
+      card: "#073642",
+      accent: "#268bd2",
+      border: "#586e75",
+      text: "#839496",
+    },
+    tokens: {
+      light: paletteTokens({
+        background: "#fdf6e3",
+        foreground: "#657b83",
+        card: "#eee8d5",
+        cardSolid: "#eee8d5",
+        primary: "#268bd2",
+        primaryForeground: "#fdf6e3",
+        secondary: "#eee8d5",
+        muted: "#eee8d5",
+        mutedForeground: "#586e75",
+        codeBackground: "#eee8d5",
+        accent: "#eee8d5",
+        accentForeground: "#268bd2",
+        border: "#93a1a1",
+        borderStrong: "#839496",
+        ring: "#268bd2",
+        brandAccent: "#6c71c4",
+        sidebar: "#eee8d5",
+        shellBackground: "#fdf6e3",
+      }),
+      dark: paletteTokens({
+        background: "#002b36",
+        foreground: "#839496",
+        card: "#073642",
+        cardSolid: "#073642",
+        popover: "#073642",
+        primary: "#268bd2",
+        primaryForeground: "#fdf6e3",
+        secondary: "#073642",
+        muted: "#073642",
+        mutedForeground: "#93a1a1",
+        codeBackground: "#073642",
+        accent: "#073642",
+        accentForeground: "#2aa198",
+        border: "#586e75",
+        borderStrong: "#657b83",
+        ring: "#268bd2",
+        brandAccent: "#6c71c4",
+        sidebar: "#073642",
+        sidebarPrimaryForeground: "#fdf6e3",
+        shellBackground: "#002b36",
+      }),
+    },
+  },
+  {
     id: "nord",
     label: "Nord",
     blurb: "Arctic frost blues over polar-night neutrals.",
@@ -606,17 +676,25 @@ export function writeThemePalette(palette: ThemeSelection): void {
 }
 
 /**
- * Apply the palette to the DOM by setting `data-theme` on the document root.
+ * Apply the palette to the DOM by setting `data-theme` on the theme roots.
  * The generated `[data-theme]` blocks re-point the color tokens; the default
- * "omni" palette removes the attribute. This composes with next-themes' `.dark`
+ * "omni" palette removes the attribute. This composes with the `.dark` mode
  * class untouched.
+ *
+ * Embedded, `getThemeRoots()` returns both the scope root (matched by the light
+ * `:root[data-theme]` selectors) and the inner `.dark` root (matched by the
+ * dark `.dark[data-theme]` selectors); standalone it's just the document root,
+ * so behavior is unchanged.
  */
 export function applyThemePalette(palette: ThemeSelection): void {
-  if (typeof document === "undefined") return;
+  const roots = getThemeRoots();
+  if (roots.length === 0) return;
   const next = isThemeSelection(palette) ? palette : DEFAULT_PALETTE;
-  if (next === DEFAULT_PALETTE) {
-    document.documentElement.removeAttribute("data-theme");
-    return;
+  for (const root of roots) {
+    if (next === DEFAULT_PALETTE) {
+      root.removeAttribute("data-theme");
+    } else {
+      root.setAttribute("data-theme", next);
+    }
   }
-  document.documentElement.setAttribute("data-theme", next);
 }

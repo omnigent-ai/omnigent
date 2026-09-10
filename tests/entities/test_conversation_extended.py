@@ -34,6 +34,20 @@ from omnigent.entities.conversation import (
 # ── ErrorData ─────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("level", "expected"), [(None, None), ("info", "info"), ("error", "error")]
+)
+def test_error_data_level(level: str | None, expected: str | None) -> None:
+    kwargs = {} if level is None else {"level": level}
+    err = ErrorData(source="harness", code="codex_thread_reset", message="fresh thread", **kwargs)
+    assert err.level == expected
+
+
+def test_error_data_rejects_unknown_level() -> None:
+    with pytest.raises(ValidationError):
+        ErrorData(source="harness", code="x", message="y", level="warning")  # type: ignore[arg-type]
+
+
 def test_error_data_valid() -> None:
     err = ErrorData(
         source="execution",
@@ -90,6 +104,19 @@ def test_compaction_data_valid() -> None:
     assert cd.last_item_id == "msg_abc123"
     assert cd.model == "openai/gpt-4o"
     assert cd.token_count == 342
+
+
+@pytest.mark.parametrize("window_id", [2, "01a070e2-2665-7d62-9b74-973decf239b7"])
+def test_compaction_data_accepts_vendor_window_id(window_id: int | str) -> None:
+    cd = CompactionData(
+        summary="Compacted",
+        last_item_id="msg_abc123",
+        model="system.ai.gpt-5-6-sol",
+        token_count=0,
+        window_id=window_id,
+    )
+
+    assert cd.window_id == window_id
 
 
 def test_compaction_data_missing_field() -> None:

@@ -1,16 +1,10 @@
 """Build-output guard: the embed island ships no service worker.
 
-Companion to ``conftest._assert_service_worker_tombstone`` (which guards the
-*standalone* SPA build in the ``built_spa`` fixture): this asserts the **embed
-island** ships no service worker or web manifest. The island is mounted inside a
-host application (e.g. Databricks), so it must never register a worker or
-precache anything — that is why ``vite.embed.config.ts`` omits the
-``emitServiceWorkerTombstone`` plugin. A regression that added one would hijack
-the host page's origin with our service worker.
-
-This outlives the retired PWA: the standalone build's ``sw.js`` is now only a
-tombstone that unregisters itself, but the embed island must ship neither that
-nor any future worker.
+The **embed island** must ship no service worker or web manifest: it is mounted
+inside a host application (e.g. Databricks), so it must never register a worker
+or precache anything — a regression that added one would hijack the host page's
+origin with our service worker. This invariant outlived the retired PWA and its
+tombstone ``sw.js`` (removed in 0.11.0): the embed island must ship neither.
 
 Note: icons under ``public/`` *are* copied into the embed output (Vite copies
 ``publicDir`` for every build) — but they are inert images. Only a service worker

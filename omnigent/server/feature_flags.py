@@ -22,6 +22,7 @@ class Feature(StrEnum):
 
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    CANVAS = "canvas"
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Install and configure missing harnesses from the web UI",
         owner="onboarding",
         review_by_release="0.11.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CANVAS,
+        description="Web Canvas page: sessions as draggable cards grouped by project",
+        owner="web",
+        review_by_release="0.15.0",
     ),
 )
 

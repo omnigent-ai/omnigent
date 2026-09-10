@@ -42,6 +42,12 @@ HOST_ACTION = "host_select"
 WORKSPACE_BLOCK = "workspace_block"
 WORKSPACE_ACTION = "workspace_input"
 
+# ``value`` of the host menu's managed-sandbox entry. Not a host id: the server
+# provisions the host when the session is created, so this marks "let the server
+# choose one" rather than naming a machine. Prefixed and underscored so it can
+# never collide with a real host id.
+MANAGED_HOST_VALUE = "__omnigent_managed__"
+
 # Slack caps a static_select at 100 options; both agents and hosts are far
 # below that in practice, but truncate defensively so a huge server never
 # produces an invalid view payload.
@@ -370,16 +376,23 @@ class SetupFlow:
             # routing through the login-framed errors branch.
             await ack(response_action="update", view=no_agents_modal(server_url))
             return
-        if not validated.online_hosts:
-            # A session needs a host to run on, so setup can't finish without
-            # one. Swap the modal for the same guidance a turn shows when no
-            # host is reachable, telling the user how to bring one online.
+        if not validated.online_hosts and not validated.managed_hosts:
+            # Nothing can run a session: the user has no host of their own online
+            # and the server provisions none. Swap the modal for the same
+            # guidance a turn shows when no host is reachable, telling the user
+            # how to bring one online. A server WITH managed sandboxes never
+            # reaches here — the picker offers one instead of dead-ending.
             await ack(response_action="update", view=no_host_modal(server_url))
             return
         # Default the workspace to the host's home directory (where runners
         # actually run), not the bot process's cwd. Fall back to the bot's cwd
-        # only if the host can't be probed.
-        workspace_default = await self._resolve_default_workspace(omnigent, validated.online_hosts)
+        # only if the host can't be probed. With no host to probe, leave it
+        # blank — the bot's cwd names nothing a managed sandbox can use.
+        workspace_default = (
+            await self._resolve_default_workspace(omnigent, validated.online_hosts)
+            if validated.online_hosts
+            else None
+        )
         await ack(
             response_action="update",
             view=select_modal(server_url, validated, workspace_default=workspace_default),
@@ -661,14 +674,9 @@ class SetupFlow:
             )
             return
 
-        workspace = _input_value(view, WORKSPACE_BLOCK, WORKSPACE_ACTION).strip()
-        if not workspace.startswith("/"):
-            await ack(
-                response_action="errors",
-                errors={WORKSPACE_BLOCK: "Enter an absolute workspace path (starting with /)."},
-            )
-            return
-
+        # The host choice is read BEFORE the workspace, because it decides what a
+        # valid workspace is: a managed sandbox is created by the server with its
+        # own working directory, so there is no path for the user to supply.
         host_option = _selected_option(view, HOST_BLOCK, HOST_ACTION)
         if host_option is None:
             await ack(
@@ -676,8 +684,25 @@ class SetupFlow:
                 errors={HOST_BLOCK: "Select a host to run your sessions on."},
             )
             return
-        host_id = str(host_option.get("value"))
+        host_value = str(host_option.get("value"))
+        managed = host_value == MANAGED_HOST_VALUE
+        host_id = None if managed else host_value
         host_name = _option_text(host_option)
+
+        # A managed sandbox's working directory is created by the server inside
+        # it, so the path field does not apply and is not stored. An external
+        # host still needs an absolute path to start its runner in.
+        workspace = ""
+        if not managed:
+            workspace = _input_value(view, WORKSPACE_BLOCK, WORKSPACE_ACTION).strip()
+            if not workspace.startswith("/"):
+                await ack(
+                    response_action="errors",
+                    errors={
+                        WORKSPACE_BLOCK: "Enter an absolute workspace path (starting with /)."
+                    },
+                )
+                return
 
         config = UserConfig(
             agent_id=str(agent_option.get("value")),
@@ -685,6 +710,7 @@ class SetupFlow:
             workspace=workspace,
             host_id=host_id,
             host_name=host_name,
+            host_type="managed" if managed else "external",
         )
 
         team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
@@ -700,15 +726,19 @@ class SetupFlow:
         await self._store.upsert_user_config(team_id, user_id, config)
         await ack()
         self._logger.info(
-            "Saved Omnigent setup team=%s user=%s server=%s agent=%s host=%s",
+            "Saved Omnigent setup team=%s user=%s server=%s agent=%s host_type=%s host=%s",
             team_id,
             user_id,
             server_url,
             config.agent_id,
+            config.host_type,
             host_id,
         )
 
-        host_line = f" on host *{host_name}*" if host_name else ""
+        if managed:
+            host_line = " in a sandbox this server runs for you"
+        else:
+            host_line = f" on host *{host_name}*" if host_name else ""
         await self._dm_user(
             client,
             user_id,
@@ -966,7 +996,7 @@ def select_modal(
             },
         },
     ]
-    host_options = _host_options(validated.online_hosts)
+    host_options = _host_options(validated)
     blocks.append(
         {
             "type": "input",
@@ -980,20 +1010,35 @@ def select_modal(
             },
         }
     )
+    workspace_element: dict[str, Any] = {
+        "type": "plain_text_input",
+        "action_id": WORKSPACE_ACTION,
+        "placeholder": {"type": "plain_text", "text": "/absolute/path/on/the/host"},
+    }
+    # A path only means something on a host the user runs. Seed it from that host
+    # when there is one; with only a managed sandbox on offer, start blank rather
+    # than suggest a directory that exists nowhere the session can reach.
+    workspace_initial = workspace_default or (
+        default_workspace() if validated.online_hosts else ""
+    )
+    if workspace_initial:
+        workspace_element["initial_value"] = workspace_initial
     blocks.append(
         {
             "type": "input",
             "block_id": WORKSPACE_BLOCK,
+            # Optional in Slack's own required-field check, because a managed
+            # sandbox brings its own workspace. The submit handler still demands
+            # an absolute path whenever a real host is chosen.
+            "optional": True,
             "label": {"type": "plain_text", "text": "Workspace path"},
-            "element": {
-                "type": "plain_text_input",
-                "action_id": WORKSPACE_ACTION,
-                "initial_value": workspace_default or default_workspace(),
-                "placeholder": {"type": "plain_text", "text": "/absolute/path/on/the/host"},
-            },
+            "element": workspace_element,
             "hint": {
                 "type": "plain_text",
-                "text": "Absolute directory on the host where each session's runner starts.",
+                "text": (
+                    "Absolute directory on the host where each session's runner "
+                    "starts. Ignored for a managed sandbox."
+                ),
             },
         }
     )
@@ -1018,15 +1063,35 @@ def _agent_options(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return options
 
 
-def _host_options(hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _host_options(validated: ValidatedServer) -> list[dict[str, Any]]:
+    """Host menu entries: the managed sandbox first, then the user's own hosts.
+
+    The managed entry is listed first so a user with nothing online still sees a
+    usable choice at the top of the menu, and is omitted entirely when the server
+    can't provision one — an option that would only 422 is worse than no option.
+    """
     options: list[dict[str, Any]] = []
-    for host in hosts[:_MAX_SELECT_OPTIONS]:
+    if validated.managed_hosts:
+        options.append(
+            _option(
+                truncate_option(managed_host_label(validated.managed_host_provider)),
+                MANAGED_HOST_VALUE,
+            )
+        )
+    # The managed entry counts against Slack's option cap, so the host slice
+    # shrinks by what is already in the menu.
+    for host in validated.online_hosts[: _MAX_SELECT_OPTIONS - len(options)]:
         host_id = host_id_of(host)
         if host_id is None:
             continue
         name = host.get("name") or host_id
         options.append(_option(truncate_option(str(name)), host_id))
     return options
+
+
+def managed_host_label(provider: str | None) -> str:
+    """Menu label for the server-provisioned sandbox, named by its provider."""
+    return f"Managed sandbox ({provider})" if provider else "Managed sandbox"
 
 
 def _option(text: str, value: str) -> dict[str, Any]:

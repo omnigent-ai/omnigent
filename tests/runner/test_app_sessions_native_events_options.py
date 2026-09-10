@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
@@ -9,16 +10,14 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-    cursor_native_bridge,
-    kiro_native_bridge,
-    qwen_native_bridge,
-)
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
 )
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
@@ -29,6 +28,22 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.fixture(autouse=True)
+def _isolate_anthropic_default_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient ``ANTHROPIC_DEFAULT_*_MODEL`` gateway pins (#4279).
+
+    claude-native model resolution reads these from ``os.environ``; a developer
+    whose shell pins them (anyone driving Claude through a gateway) otherwise
+    gets a different model-change verdict and these tests fail spuriously.
+    """
+    for var in (
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.mark.asyncio
@@ -470,10 +485,9 @@ async def test_events_compact_on_native_session_types_slash_command(
     types the slash command into the pane.
 
     The 200 (not 204) is load-bearing: the Omnigent server reads it to know
-    the control was handled in the terminal and skips its own
-    in-process compaction. A regression returning 204 here would make
-    the Omnigent server fall through to ``_run_compact_locked``, which 400s
-    on the LLM-less claude-native pseudo-agent — the original bug.
+    the control was handled in the terminal. A regression returning 204 here
+    would make the server return a 400 "not available for this session type"
+    error instead of the native compact succeeding.
     """
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
@@ -542,11 +556,9 @@ async def test_events_compact_on_native_session_types_slash_command(
                 if isinstance(item, dict):
                     queued_events.append(item)
 
-    # 200 = native dispatch routed to the compact handler and it
-    # injected successfully. 204 would mean the handler returned the
-    # in-process no-op (wrong harness branch) → Omnigent falls through to
-    # _run_compact_locked and 400s. 404 = the dispatch fell through to
-    # the generic harness-forward.
+    # 200 = native dispatch routed to the compact handler and injected
+    # successfully. 204 would mean the wrong harness branch fired (→ server
+    # returns 400). 404 = dispatch fell through to the generic forward.
     assert resp.status_code == 200, (
         f"Native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
     )
@@ -746,13 +758,12 @@ async def test_events_compact_on_codex_native_injects_slash_command(
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> None:
+async def test_events_compact_on_codex_native_returns_503_when_no_terminal() -> None:
     """
-    Codex-native compact returns 204 when no live terminal is registered.
+    Codex-native compact returns 503 when no live terminal is registered.
 
-    Without a running codex terminal the ``/compact`` slash command
-    has nowhere to go.  204 tells the Omnigent server to fall back to
-    its own AP-side compaction (or skip it).
+    Without a running codex terminal the ``/compact`` slash command has
+    nowhere to go. 503 tells the caller to reconnect first.
     """
     codex_native_spec = AgentSpec(
         spec_version=1,
@@ -789,8 +800,8 @@ async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> 
             json={"type": "compact"},
         )
 
-    assert resp.status_code == 204, (
-        f"Codex-native compact with no terminal must return 204; "
+    assert resp.status_code == 503, (
+        f"Codex-native compact with no terminal must return 503; "
         f"got {resp.status_code}: {resp.text}"
     )
 
@@ -875,9 +886,8 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
     cursor-agent manages its own context window in the TUI, so explicit
     compaction must run there (its built-in ``/summarize`` command) rather
     than as AP-side compaction — the same rationale as the claude-native
-    path.  The 200 (not 204) is load-bearing: the Omnigent server reads it to
-    skip its own ``_run_compact_locked`` (which 400s on the LLM-less native
-    pseudo-agent).
+    path. The 200 (not 204) is load-bearing: the Omnigent server reads it to
+    know the control was handled in the terminal.
 
     Two properties are pinned here:
 
@@ -1110,7 +1120,7 @@ async def test_events_compact_on_pi_native_enqueues_compact_payload(
     2. A ``compact_*`` payload is written to the session's bridge inbox.
     3. /compact is a control signal and publishes no ``session.status`` events.
     """
-    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
@@ -1197,7 +1207,7 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
     ``pi_native_compact_failed`` code rather than silently swallowing the
     request; the Omnigent server then treats it as not-handled.
     """
-    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "9c52b3dbe1d543718c1678a256017326"
@@ -1262,7 +1272,7 @@ async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner
     Unlike cursor, injection is file-based: a ``submit`` line routes through
     qwen's ``RemoteInputWatcher`` then ``submitQuery``, which processes the slash
     command (no autocomplete-dropdown trap). The 200 is load-bearing (server
-    skips its own ``_run_compact_locked``). The handler publishes only
+    reads it to know the control was handled). The handler publishes only
     ``in_progress``; the ``completed`` edge is the compaction mirror's job once
     the ``chat_compression`` record lands (covered in test_qwen_native_forwarder).
     """
@@ -1397,7 +1407,7 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
 class _FakeOpenCodeCompactClient:
     """OpenCode client stub recording ``summarize`` calls for compact tests.
 
-    Stands in for :class:`omnigent.opencode_native_client.OpenCodeClient` so
+    Stands in for :class:`omnigent.harnesses.opencode_native.client.OpenCodeClient` so
     the opencode-native compact handler's model-resolution + ``/summarize``
     call is observable without a live ``opencode serve``.
     """
@@ -1487,9 +1497,9 @@ async def _drive_opencode_native_compact(
     :param summarize_error: When set, ``summarize`` raises it (503 path).
     :returns: ``(response, fake_client)`` for the compact POST.
     """
-    from omnigent import opencode_native_bridge
-    from omnigent.opencode_native_bridge import OpenCodeNativeBridgeState
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+    from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _AUTO_OPENCODE_SERVERS, _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
     from tests.runner.helpers import make_test_terminal_instance
@@ -1563,7 +1573,7 @@ def test_resolve_opencode_compact_model_prefers_latest_assistant_message() -> No
     must iterate in reverse and ignore user-role messages, picking the live
     model even when a session ``model`` and a ``model_override`` also resolve.
     """
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _resolve_opencode_compact_model
 
     session = OpenCodeSession.from_payload(
@@ -1598,7 +1608,7 @@ def test_resolve_opencode_compact_model_falls_back_to_session_model() -> None:
     ``modelID``). An assistant message missing ``modelID`` must be skipped so
     the session field is used.
     """
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _resolve_opencode_compact_model
 
     session = OpenCodeSession.from_payload(
@@ -1619,7 +1629,7 @@ def test_resolve_opencode_compact_model_falls_back_to_model_override() -> None:
     A model id may itself contain ``/`` (e.g. an OpenRouter slug), so only the
     FIRST separator delimits provider from model.
     """
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _resolve_opencode_compact_model
 
     session = OpenCodeSession.from_payload({"id": "ses_x"})
@@ -1638,7 +1648,7 @@ def test_resolve_opencode_compact_model_returns_none_when_unresolvable() -> None
     Covers the live Omnigent flow: the session is created without a model and
     has no assistant turn yet, and no override is set.
     """
-    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _resolve_opencode_compact_model
 
     session = OpenCodeSession.from_payload({"id": "ses_x"})
@@ -1746,14 +1756,15 @@ async def test_events_compact_on_opencode_native_summarizes_from_model_override(
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
+async def test_events_compact_on_opencode_native_503_when_model_unresolvable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    No resolvable model → 204 and ``/summarize`` is never called.
+    No resolvable model → 503 and ``/summarize`` is never called.
 
-    The 204 tells the Omnigent server to run its own AP-side compaction.
+    Without a model the compaction has nowhere to go; 503 tells the caller
+    to switch the model first.
     """
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
@@ -1764,8 +1775,8 @@ async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
         model_override=None,
     )
 
-    assert resp.status_code == 204, (
-        f"opencode-native compact must 204 when no model resolves; "
+    assert resp.status_code == 503, (
+        f"opencode-native compact must 503 when no model resolves; "
         f"got {resp.status_code}: {resp.text}"
     )
     assert client.summarize_calls == [], (
@@ -1784,7 +1795,7 @@ async def test_events_compact_on_opencode_native_503_when_summarize_raises(
     The Omnigent server must see the failure (rather than a silent fallback)
     so it does not run a duplicate compaction.
     """
-    from omnigent.opencode_native_client import OpenCodeClientError
+    from omnigent.harnesses.opencode_native.client import OpenCodeClientError
 
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
@@ -1820,12 +1831,10 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     """
     Non-native sessions accept compact and 204 without side effects.
 
-    For in-process harnesses, explicit compaction is an AP-side
-    operation (``_run_compact_locked`` → ``compact_conversation_now``).
-    The Omnigent server forwards ``compact`` to ``/events`` for every harness
-    (it stays harness-agnostic), so the runner must accept the event
-    and 204 — never reach the slash-command injector. The 204 tells the
-    Omnigent server to run its own compaction.
+    The Omnigent server forwards ``compact`` to ``/events`` for every harness,
+    so the runner must accept the event and 204 — never reach the
+    slash-command injector. The server then returns a 400 to the client
+    (SDK harnesses control their own context; AP-side compaction is not available).
     """
     from omnigent.spec.types import ExecutorSpec
 
@@ -1893,7 +1902,7 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     "event_payload,inject_attr",
     # ``/fork`` creates a new conversation that reuses the
     # same Claude process (same bridge_dir), so the new session has
-    # bridge_id != conv_id, stored on the ``omnigent.claude_native
+    # bridge_id != conv_id, stored on the ``omnigent.harnesses.claude_native.main
     # .bridge_id`` label. The runner-side native dispatch MUST
     # resolve bridge_id via ``_claude_native_bridge_id_for_session``
     # so the slash command lands in the right pane. Using
@@ -2214,6 +2223,29 @@ async def test_events_model_change_confirms_against_the_status_file(
 
 
 @pytest.mark.asyncio
+async def test_events_model_change_without_status_omits_bridge_path_from_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unverifiable model switch logs session context without the bridge path."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        resp = await _post_model_change_with_status_sequence(monkeypatch, [None])
+
+    assert resp.status_code == 204, resp.text
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "model change" in record.getMessage() and "could not be verified" in record.getMessage()
+    ]
+    assert messages == [
+        "claude-native model change for session=68c7c1acc5eeec3978c5e62043da51a5 "
+        "could not be verified: no statusLine snapshot"
+    ]
+    bridge_dir = bridge_dir_for_bridge_id("68c7c1acc5eeec3978c5e62043da51a5")
+    assert str(bridge_dir) not in messages[0]
+
+
+@pytest.mark.asyncio
 async def test_events_model_change_unconfirmed_switch_answers_503(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2309,7 +2341,7 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
     leave resolution to Claude — anything else switches the pane to a
     model the user did not choose.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     captured: list[str] = []
 
@@ -2327,14 +2359,17 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
     monkeypatch.setattr(claude_native_bridge, "read_model_env", lambda _bridge_dir: dict(pins))
-    monkeypatch.setattr("omnigent.claude_native._CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ()
+    )
     config = (
         ClaudeNativeUcodeConfig(env=dict(pins), model=pins.get("ANTHROPIC_DEFAULT_OPUS_MODEL"))
         if pins
         else None
     )
     monkeypatch.setattr(
-        "omnigent.claude_native.resolve_native_claude_config", lambda *, spec: config
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: config,
     )
 
     native_spec = AgentSpec(

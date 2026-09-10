@@ -4,14 +4,16 @@ import type { DailyCost } from "@/lib/usageApi";
 
 interface Props {
   dailyCosts: DailyCost[];
+  now?: Date;
+  animate?: boolean;
 }
 
-function fillGaps(costs: DailyCost[]): { label: string; cost: number }[] {
+function fillGaps(costs: DailyCost[], now: Date): { label: string; cost: number }[] {
   if (costs.length === 0) return [];
   const map = new Map(costs.map((d) => [d.day, d.costUsd]));
   const start = new Date(costs[0].day + "T00:00:00Z");
   const end = new Date(costs[costs.length - 1].day + "T00:00:00Z");
-  const today = new Date();
+  const today = new Date(now);
   today.setUTCHours(0, 0, 0, 0);
   const last = end > today ? end : today;
   const result: { label: string; cost: number }[] = [];
@@ -46,8 +48,8 @@ function CustomTooltip({
   );
 }
 
-export function CostTimelineChart({ dailyCosts }: Props) {
-  const data = fillGaps(dailyCosts);
+export function CostTimelineChart({ dailyCosts, now, animate = true }: Props) {
+  const data = fillGaps(dailyCosts, now ?? new Date());
   if (data.length === 0) {
     return (
       <div className="flex h-48 items-center justify-center text-sm text-muted-foreground">
@@ -76,7 +78,12 @@ export function CostTimelineChart({ dailyCosts }: Props) {
             className="fill-muted-foreground"
           />
           <Tooltip content={<CustomTooltip />} cursor={{ fill: "var(--accent)", opacity: 0.3 }} />
-          <Bar dataKey="cost" fill="var(--primary)" radius={[3, 3, 0, 0]} />
+          <Bar
+            dataKey="cost"
+            fill="var(--primary)"
+            radius={[3, 3, 0, 0]}
+            isAnimationActive={animate}
+          />
         </BarChart>
       </ResponsiveContainer>
     </div>

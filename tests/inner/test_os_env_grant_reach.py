@@ -208,6 +208,33 @@ def test_write_grant_permits_write_edit_and_read(tmp_path: Path) -> None:
     assert target.read_text() == "bye"
 
 
+def test_active_policy_reads_workspace_and_write_grants(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    workspace_file = workspace / "workspace.txt"
+    workspace_file.write_text("workspace")
+    read_grant = tmp_path / "ro"
+    read_grant.mkdir()
+    write_grant = tmp_path / "rw"
+    write_grant.mkdir()
+    write_file = tmp_path / "single.txt"
+    write_file.write_text("single")
+    write_target = write_grant / "target.txt"
+    write_target.write_text("target")
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[read_grant.resolve()],
+        write_roots=[workspace.resolve(), write_grant.resolve()],
+        write_files=[write_file.resolve()],
+        allow_network=False,
+    )
+
+    assert _req("read", workspace_file, workspace, policy).get("content") == "workspace"
+    assert _req("read", write_target, workspace, policy).get("content") == "target"
+    assert _req("read", write_file, workspace, policy).get("content") == "single"
+
+
 def test_write_files_grant_is_file_scoped(tmp_path: Path) -> None:
     """A single-file write grant covers exactly that file, not its siblings."""
     workspace = tmp_path / "ws"

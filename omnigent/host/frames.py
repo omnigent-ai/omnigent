@@ -22,9 +22,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
+from os import PathLike
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -37,6 +38,50 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # does not exist on the host (e.g. the worktree was deleted). Shared by the
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+
+
+def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
+    """Build the canonical text of a workspace-missing launch refusal.
+
+    Single source for both the host that emits the refusal and the server
+    that rebuilds the client-facing message from its own authorized
+    workspace, so the two spellings cannot drift apart.
+
+    :param workspace: Session workspace path, e.g. ``"/home/me/proj"``.
+    :returns: The refusal reason, e.g.
+        ``"workspace path does not exist: /home/me/proj"``.
+    """
+    return f"workspace path does not exist: {workspace}"
+
+
+def classify_launch_refusal(
+    error_code: str | None,
+    error: str | None,
+    workspace: str | PathLike[str] | None,
+) -> str | None:
+    """Categorize a launch failure as one of the safe refusal codes.
+
+    A refusal is safe to surface when no runner can ever connect and the
+    server can describe the cause from its own state. Callers must treat
+    every other failure as generic and must not echo the host's text.
+
+    :param error_code: ``HostLaunchRunnerResultFrame.error_code``; ``None``
+        for uncategorized failures and from hosts too old to send it.
+    :param error: The host's human-readable failure text.
+    :param workspace: The server's authorized workspace for the session.
+    :returns: :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE`,
+        :data:`WORKSPACE_MISSING_ERROR_CODE`, or ``None`` when the failure
+        is not a safe categorical refusal.
+    """
+    if error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+        return HARNESS_NOT_CONFIGURED_ERROR_CODE
+    if error_code == WORKSPACE_MISSING_ERROR_CODE:
+        return WORKSPACE_MISSING_ERROR_CODE
+    # Rolling upgrade: an older host sends this exact categorical reason
+    # with no error_code.
+    if error_code is None and error == workspace_missing_message(workspace):
+        return WORKSPACE_MISSING_ERROR_CODE
+    return None
 
 
 class HostFrameKind(str, Enum):
@@ -72,8 +117,13 @@ class HostFrameKind(str, Enum):
     DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
+    FS_WRITE_REQUEST = "host.fs_write_request"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
+    IMPORT_LOCAL = "host.import_local"
+    IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
+    IMPORT_LOCAL_SESSION = "host.import_local_session"
+    IMPORT_LOCAL_DONE = "host.import_local_done"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -194,9 +244,10 @@ class HostLaunchRunnerResultFrame:
         success.
     :param error_code: Machine-readable failure category when
         ``status`` is ``"failed"``, e.g.
-        :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE`. ``None`` for
-        uncategorized failures and on success (and always from
-        older hosts that don't send it).
+        :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` or
+        :data:`WORKSPACE_MISSING_ERROR_CODE`. ``None`` for uncategorized
+        failures and on success (and always from older hosts that don't
+        send it).
     """
 
     request_id: str
@@ -467,12 +518,16 @@ class HostCreateWorktreeFrame:
     :param branch_name: New branch to create, e.g. ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from ``HEAD``.
+    :param existing_branch: When ``True``, check out the pre-existing
+        ``branch_name`` into a fresh worktree (the deleted-worktree
+        recreate path) instead of creating a new branch.
     """
 
     request_id: str
     repo_path: str
     branch_name: str
     base_branch: str | None = None
+    existing_branch: bool = False
 
 
 @dataclass
@@ -814,10 +869,37 @@ class HostFsRequestFrame:
 
 
 @dataclass
-class HostFsResultFrame:
-    """Host → server: outcome of a workspace filesystem request.
+class HostFsWriteFrame:
+    """Server → host: a workspace-mutating operation, served host-side.
 
-    :param request_id: Correlates to the :class:`HostFsRequestFrame`.
+    The read counterpart (:class:`HostFsRequestFrame`) is read-only by design;
+    this carries the small set of writes the host can serve when the session's
+    runner is offline — currently the GitHub account/base preference
+    (``op="github_set_preference"``). The host runs the mutation against
+    ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
+    would, so the result transport and correlation are shared.
+
+    :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
+    :param op: Write op name — currently ``"github_set_preference"``.
+    :param workspace: Absolute path to the session's workspace on the host.
+    :param session_id: Session id, for parity with the read frame.
+    :param params: Operation-specific arguments, e.g.
+        ``{"account": "octocat", "remote": "origin"}``.
+    """
+
+    request_id: str
+    op: str
+    workspace: str
+    session_id: str
+    params: _JsonObject = field(default_factory=dict)
+
+
+@dataclass
+class HostFsResultFrame:
+    """Host → server: outcome of a workspace filesystem request (read or write).
+
+    :param request_id: Correlates to the :class:`HostFsRequestFrame` or
+        :class:`HostFsWriteFrame`.
     :param status: ``"ok"`` when ``payload`` carries the runner-shaped
         result, or ``"error"`` when the read failed.
     :param payload: The runner-shaped JSON result on success, ``None`` on
@@ -864,6 +946,95 @@ class HostModelOptionsResultFrame:
     routable_models: list[str] = field(default_factory=list)
 
 
+@dataclass
+class HostImportedLocalSession:
+    """One local transcript the host read, normalized for import.
+
+    :param external_session_id: Harness-native session id on the host.
+    :param workspace: The session's recorded working directory, or ``None``.
+    :param items: Items in ``/v1/imports`` wire shape —
+        ``{"type", "response_id", "data"}`` — ready to persist server-side.
+    :param title: The harness's own session title, or ``None`` to let the
+        server synthesize one from the first user message.
+    :param source: Harness this session came from, e.g. ``"claude"``. Carried
+        per session so an "all harnesses" request can mix sources in one batch.
+    """
+
+    external_session_id: str
+    workspace: str | None
+    items: list[_JsonObject]
+    title: str | None = None
+    source: str = ""
+
+
+@dataclass
+class HostImportLocalFrame:
+    """Server → host: read the host's recent local transcripts for a harness.
+
+    The host owns the transcripts (``~/.claude`` etc.); the server can't see
+    them, so it asks the host to enumerate + normalize the most recent ones.
+
+    :param request_id: Unique id for correlating the result.
+    :param source: Harness whose local sessions to read, e.g. ``"claude"``, or
+        ``"all"`` to read every supported harness on the host in one batch.
+    :param limit: Maximum number of most-recent sessions to return per harness.
+    """
+
+    request_id: str
+    source: str
+    limit: int = 10
+
+
+@dataclass
+class HostImportLocalByIdFrame:
+    """Server → host: read one known local transcript without listing.
+
+    :param request_id: Unique id for correlating the result.
+    :param source: Harness namespace containing the session.
+    :param session_id: Exact harness-native session id to load.
+    """
+
+    request_id: str
+    source: str
+    session_id: str
+
+
+@dataclass
+class HostImportLocalSessionFrame:
+    """Host → server: one normalized local session, streamed as it's read.
+
+    Sent once per session so a large batch never rides in a single frame (the
+    server persists each on arrival). ``total`` is the number of sessions the
+    host expects to stream for this request, so the server can report progress.
+
+    :param request_id: Correlates to the :class:`HostImportLocalFrame`.
+    :param total: Total sessions the host will stream for this request.
+    :param session: The normalized session to persist.
+    """
+
+    request_id: str
+    total: int
+    session: HostImportedLocalSession
+
+
+@dataclass
+class HostImportLocalDoneFrame:
+    """Host → server: the import stream for a request has ended.
+
+    :param request_id: Correlates to the :class:`HostImportLocalFrame`.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param error: Failure detail when ``status`` is ``"failed"``.
+    :param failed: Count of enumerated sessions the host could not read/parse
+        (skipped, no session frame sent). The server folds these into its own
+        failed tally so the reported counts account for every target.
+    """
+
+    request_id: str
+    status: str
+    error: str | None = None
+    failed: int = 0
+
+
 HostFrame = (
     HostHelloFrame
     | HostConnectionErrorFrame
@@ -895,8 +1066,13 @@ HostFrame = (
     | HostDetectCredentialsResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
+    | HostFsWriteFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
+    | HostImportLocalFrame
+    | HostImportLocalByIdFrame
+    | HostImportLocalSessionFrame
+    | HostImportLocalDoneFrame
 )
 
 
@@ -1089,6 +1265,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "repo_path": frame.repo_path,
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
+                "existing_branch": frame.existing_branch,
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -1227,6 +1404,17 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "params": frame.params,
             }
         )
+    if isinstance(frame, HostFsWriteFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.FS_WRITE_REQUEST.value,
+                "request_id": frame.request_id,
+                "op": frame.op,
+                "workspace": frame.workspace,
+                "session_id": frame.session_id,
+                "params": frame.params,
+            }
+        )
     if isinstance(frame, HostFsResultFrame):
         return _encode_payload(
             {
@@ -1256,6 +1444,50 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "models": frame.models,
                 "error": frame.error,
                 "routable_models": frame.routable_models,
+            }
+        )
+    if isinstance(frame, HostImportLocalFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "limit": frame.limit,
+            }
+        )
+    if isinstance(frame, HostImportLocalByIdFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_BY_ID.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "session_id": frame.session_id,
+            }
+        )
+    if isinstance(frame, HostImportLocalSessionFrame):
+        s = frame.session
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_SESSION.value,
+                "request_id": frame.request_id,
+                "total": frame.total,
+                "session": {
+                    "external_session_id": s.external_session_id,
+                    "workspace": s.workspace,
+                    "items": s.items,
+                    "title": s.title,
+                    "source": s.source,
+                },
+            }
+        )
+    if isinstance(frame, HostImportLocalDoneFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_DONE.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "error": frame.error,
+                "failed": frame.failed,
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
@@ -1382,10 +1614,20 @@ def _decode_known_host_frame(
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
             return _decode_fs_result(msg)
+        case HostFrameKind.FS_WRITE_REQUEST:
+            return _decode_fs_write_request(msg)
         case HostFrameKind.MODEL_OPTIONS:
             return _decode_model_options(msg)
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
+        case HostFrameKind.IMPORT_LOCAL:
+            return _decode_import_local(msg)
+        case HostFrameKind.IMPORT_LOCAL_BY_ID:
+            return _decode_import_local_by_id(msg)
+        case HostFrameKind.IMPORT_LOCAL_SESSION:
+            return _decode_import_local_session(msg)
+        case HostFrameKind.IMPORT_LOCAL_DONE:
+            return _decode_import_local_done(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -1623,11 +1865,15 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
     :param msg: Decoded frame object.
     :returns: Typed host.create_worktree frame.
     """
+    # ``existing_branch`` is absent on frames from older servers — treat
+    # missing (or non-bool) as False so old-server/new-host stays compatible.
+    existing_branch = msg.get("existing_branch")
     return HostCreateWorktreeFrame(
         request_id=_required_str(msg, "request_id"),
         repo_path=_required_str(msg, "repo_path"),
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
+        existing_branch=existing_branch is True,
     )
 
 
@@ -1853,6 +2099,24 @@ def _decode_fs_request(msg: _JsonObject) -> HostFsRequestFrame:
     )
 
 
+def _decode_fs_write_request(msg: _JsonObject) -> HostFsWriteFrame:
+    """Decode a host.fs_write_request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.fs_write_request frame.
+    """
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        raise ValueError("frame field must be a JSON object: 'params'")
+    return HostFsWriteFrame(
+        request_id=_required_str(msg, "request_id"),
+        op=_required_str(msg, "op"),
+        workspace=_required_str(msg, "workspace"),
+        session_id=_required_str(msg, "session_id"),
+        params=params,
+    )
+
+
 def _decode_fs_result(msg: _JsonObject) -> HostFsResultFrame:
     """Decode a host.fs_result frame.
 
@@ -1901,6 +2165,69 @@ def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFram
         models=models,
         error=_optional_nullable_str(msg, "error"),
         routable_models=routable,
+    )
+
+
+def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
+    """Decode a host.import_local frame."""
+    return HostImportLocalFrame(
+        request_id=_required_str(msg, "request_id"),
+        source=_required_str(msg, "source"),
+        limit=_required_int(msg, "limit"),
+    )
+
+
+def _decode_import_local_by_id(msg: _JsonObject) -> HostImportLocalByIdFrame:
+    """Decode a host.import_local_by_id frame."""
+    return HostImportLocalByIdFrame(
+        request_id=_required_str(msg, "request_id"),
+        source=_required_str(msg, "source"),
+        session_id=_required_str(msg, "session_id"),
+    )
+
+
+def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
+    """Decode one normalized session object into a HostImportedLocalSession."""
+    if not isinstance(raw, dict):
+        raise ValueError("'session' must be a JSON object")
+    items = raw.get("items", [])
+    if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+        raise ValueError("session 'items' must be a list of JSON objects")
+    workspace = raw.get("workspace")
+    if workspace is not None and not isinstance(workspace, str):
+        raise ValueError("session 'workspace' must be a string or null")
+    title = raw.get("title")
+    if title is not None and not isinstance(title, str):
+        raise ValueError("session 'title' must be a string or null")
+    source = raw.get("source", "")
+    if not isinstance(source, str):
+        raise ValueError("session 'source' must be a string")
+    return HostImportedLocalSession(
+        external_session_id=_required_str(raw, "external_session_id"),
+        workspace=workspace,
+        items=items,
+        title=title,
+        source=source,
+    )
+
+
+def _decode_import_local_session(msg: _JsonObject) -> HostImportLocalSessionFrame:
+    """Decode a host.import_local_session frame (one streamed session)."""
+    return HostImportLocalSessionFrame(
+        request_id=_required_str(msg, "request_id"),
+        total=_required_int(msg, "total"),
+        session=_decode_imported_local_session(msg.get("session")),
+    )
+
+
+def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
+    """Decode a host.import_local_done frame."""
+    return HostImportLocalDoneFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        error=_optional_nullable_str(msg, "error"),
+        # Absent on older hosts; default to 0 so decode stays backward-compatible.
+        failed=raw_failed if isinstance(raw_failed := msg.get("failed"), int) else 0,
     )
 
 

@@ -6,14 +6,16 @@ child ``sessionId``, but no shipping agent emits that yet, so an agent that
 spawns sub-agents reports them in its own dialect.
 
 This module owns only the **generic** half: a small normalized lifecycle
-(:class:`SubAgentStart` / :class:`SubAgentEnd`) and the
-:class:`AcpSubAgentSource` protocol that maps one dialect onto it. It reads no
-vendor field and names no vendor;
+(:class:`SubAgentStart` / :class:`SubAgentEnd`, plus :class:`SubAgentActivity`
+for a tool call the sub-agent ran) and the :class:`AcpSubAgentSource` protocol
+that maps one dialect onto it. It reads no vendor field and names no vendor;
 :class:`~omnigent.inner.acp_executor.AcpExecutor` runs whatever sources its
-:class:`~omnigent.inner.acp_extension.AcpExtension` supplies and emits
-:class:`~omnigent.inner.executor.SubAgentStarted` /
-:class:`~omnigent.inner.executor.SubAgentCompleted`, which the runner turns into
-Omnigent child sessions so the web "Subagents" panel lists one row per child.
+:class:`~omnigent.inner.acp_extension.AcpExtension` supplies and emits the
+matching :class:`~omnigent.inner.executor.SubAgentStarted` /
+:class:`~omnigent.inner.executor.SubAgentCompleted` /
+:class:`~omnigent.inner.executor.SubAgentToolCall`, which the runner turns into
+an Omnigent child session and its transcript so the web "Subagents" panel lists
+one row per child with the work it did.
 
 A vendor's dialect lives with that vendor — see
 :class:`omnigent.inner.devin.subagents.DevinSubAgentSource` for the worked
@@ -26,7 +28,7 @@ compliant agent at once, and can ship here rather than per-vendor.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -60,7 +62,29 @@ class SubAgentEnd:
     summary: str = ""
 
 
-SubAgentEvent = SubAgentStart | SubAgentEnd
+@dataclass(frozen=True)
+class SubAgentActivity:
+    """A tool call a sub-agent ran, to route into its child transcript.
+
+    Distinct from the parent's own tool calls: this is a call the sub-agent made
+    *inside* its delegated work, which belongs in the child session's chat rather
+    than the parent stream. A source emits one only for frames it can attribute to
+    a specific sub-agent (Devin tags them with the owning ``parentAgentId``).
+
+    :param child_key: The owning sub-agent — matches the originating
+        :attr:`SubAgentStart.child_key`, so the runner can address the child.
+    :param call_id: The tool call's id, used as the child item's ``call_id``.
+    :param name: Human tool label for the card, e.g. ``"Wrote mathutils.py"``.
+    :param args: The tool's raw input, rendered as the call's arguments.
+    """
+
+    child_key: str
+    call_id: str
+    name: str
+    args: Mapping[str, Any] = field(default_factory=dict)
+
+
+SubAgentEvent = SubAgentStart | SubAgentEnd | SubAgentActivity
 
 
 @runtime_checkable

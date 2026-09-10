@@ -51,6 +51,59 @@ final class ServerURLTests: XCTestCase {
   }
 }
 
+final class InWebViewAuthTests: XCTestCase {
+  func testDatabricksHostsUseInWebViewAuth() {
+    for origin in [
+      "https://databricks.com",
+      "https://dbc-123.cloud.databricks.com",
+      "https://azuredatabricks.net",
+      "https://adb-123.azuredatabricks.net",
+      "https://databricksapps.com",
+      "https://my-app.aws.databricksapps.com",
+      "https://DBC-123.CLOUD.DATABRICKS.COM",
+    ] {
+      XCTAssertTrue(usesInWebViewAuth(origin), origin)
+    }
+  }
+
+  func testOtherHostsUseSystemBrowserAuth() {
+    for origin in [
+      "https://example.com",
+      "https://notdatabricks.com",
+      "https://databricks.com.example.org",
+      "https://databricksapps.com.example.org",
+      "not a URL",
+    ] {
+      XCTAssertFalse(usesInWebViewAuth(origin), origin)
+    }
+    XCTAssertFalse(usesInWebViewAuth(nil))
+  }
+}
+
+final class AppDeviceSupportTests: XCTestCase {
+  func testAppSupportsIPhoneAndIPad() throws {
+    let deviceFamilies = try XCTUnwrap(
+      Bundle.main.object(forInfoDictionaryKey: "UIDeviceFamily") as? [Int])
+
+    XCTAssertEqual(deviceFamilies, [1, 2])
+  }
+
+  func testIPadSupportsAllOrientations() throws {
+    let orientations = try XCTUnwrap(
+      Bundle.main.object(forInfoDictionaryKey: "UISupportedInterfaceOrientations~ipad")
+        as? [String])
+
+    XCTAssertEqual(
+      Set(orientations),
+      Set([
+        "UIInterfaceOrientationPortrait",
+        "UIInterfaceOrientationPortraitUpsideDown",
+        "UIInterfaceOrientationLandscapeLeft",
+        "UIInterfaceOrientationLandscapeRight",
+      ]))
+  }
+}
+
 final class AppPrivacyInfoTests: XCTestCase {
   func testPrivacyUsageDescriptionsArePresent() throws {
     for key in [

@@ -47,6 +47,15 @@ const getRecognitionCtor = (): SpeechRecognitionCtor | null => {
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 };
 
+const getDefaultDictationLang = (): string => {
+  if (typeof navigator === "undefined") return "en-US";
+  try {
+    return navigator.language || "en-US";
+  } catch {
+    return "en-US";
+  }
+};
+
 // FFT bin ranges per bar, weighted toward voice frequencies (~100Hz–3kHz).
 const BAR_BINS: readonly (readonly [number, number])[] = [
   [1, 3],
@@ -90,7 +99,7 @@ export const ComposerMicButton = ({
   onTranscript,
   onInterim,
   disabled,
-  lang = "en-US",
+  lang = getDefaultDictationLang(),
   enableHotkey = false,
   onVoiceStart,
   onVoiceDiscard,

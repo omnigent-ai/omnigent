@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import NoSuchModuleError
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -236,6 +238,18 @@ def _create_engine(db_uri: str) -> Engine:
         engine = create_engine(
             db_uri,
             connect_args={"check_same_thread": False, "timeout": 20.0},
+            # Give SQLite a modest pool above SQLAlchemy's default
+            # QueuePool(5, 10) = 15, which the /health sidebar poll exhausts
+            # under load (surfacing as "QueuePool ... timeout" 500s).
+            # Deliberately NOT sized to the 200-token AnyIO thread limiter
+            # like the Postgres branch below: SQLite serializes at the file
+            # level, so handing out ~200 connections just lets that many
+            # worker threads thrash SQLite's page-cache mutex and burn CPU
+            # instead of queuing cheaply on the pool. ~40 total clears the
+            # exhaustion without inviting lock contention.
+            pool_size=15,
+            max_overflow=25,
+            pool_timeout=10,
         )
 
         # Apply WAL + busy_timeout on every fresh DBAPI connection
@@ -266,32 +280,117 @@ def _create_engine(db_uri: str) -> Engine:
     pool_recycle = (
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
-    engine = create_engine(
-        db_uri,
-        # Verify connections are alive before checking them out
-        # from the pool. Prevents "server has gone away" errors
-        # after idle periods.
-        pool_pre_ping=True,
-        # Recycle connections older than this window. Prevents stale
-        # connections when the database server restarts or closes idle
-        # connections; in Lakebase token mode the shorter window also keeps
-        # each connection's OAuth token refreshed ahead of its ~1h expiry.
-        pool_recycle=pool_recycle,
-        # Aligned with the AnyIO thread limiter in
-        # ``server/app.py:_lifespan``. Every DB call runs via
-        # ``asyncio.to_thread``, so connections beyond the thread
-        # token count just sit idle. Overflow covers boot-time
-        # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
-        pool_size=200,
-        max_overflow=20,
-        # Bound the wait when the pool is exhausted instead of
-        # blocking indefinitely; surfaces real saturation as an
-        # error rather than a hang.
-        pool_timeout=10,
-    )
+    try:
+        engine = create_engine(
+            db_uri,
+            # Verify connections are alive before checking them out
+            # from the pool. Prevents "server has gone away" errors
+            # after idle periods.
+            pool_pre_ping=True,
+            # Recycle connections older than this window. Prevents stale
+            # connections when the database server restarts or closes idle
+            # connections; in Lakebase token mode the shorter window also keeps
+            # each connection's OAuth token refreshed ahead of its ~1h expiry.
+            pool_recycle=pool_recycle,
+            # Aligned with the AnyIO thread limiter in
+            # ``server/app.py:_lifespan``. Every DB call runs via
+            # ``asyncio.to_thread``, so connections beyond the thread
+            # token count just sit idle. Overflow covers boot-time
+            # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
+            pool_size=200,
+            max_overflow=20,
+            # Bound the wait when the pool is exhausted instead of
+            # blocking indefinitely; surfaces real saturation as an
+            # error rather than a hang.
+            pool_timeout=10,
+        )
+    except ModuleNotFoundError as exc:
+        # SQLAlchemy imports the DBAPI lazily in create_engine; a missing
+        # Postgres driver surfaces as an opaque "No module named 'psycopg'".
+        # Bare re-raise on pass-through keeps the original truly untouched.
+        translated = _translate_missing_driver_error(db_uri, exc)
+        if translated is exc:
+            raise
+        raise translated from exc
+    except NoSuchModuleError as exc:
+        # PaaS-style postgres:// is not a SQLAlchemy dialect at all; append
+        # conversion guidance for direct --database-uri callers (the spawn
+        # path normalizes it away). Non-Postgres dialect errors re-raise bare.
+        scheme = db_uri.split("://", 1)[0].lower()
+        if not scheme.startswith("postgres"):
+            raise
+        raise NoSuchModuleError(
+            f"{exc}. The scheme '{scheme}://' is not a valid SQLAlchemy "
+            f"dialect — use 'postgresql+psycopg://<rest of your URI>' "
+            f"(and install the driver via the 'omnigent[postgres]' extra "
+            f"if needed)."
+        ) from exc
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
     return engine
+
+
+def _translate_missing_driver_error(db_uri: str, exc: ModuleNotFoundError) -> ModuleNotFoundError:
+    """
+    Rewrite a missing-DBAPI-driver import error into an actionable one.
+
+    When :func:`_create_engine` builds a Postgres engine but the ``psycopg``
+    driver is not installed, SQLAlchemy raises a bare
+    ``ModuleNotFoundError: No module named 'psycopg'`` from inside
+    ``create_engine``. That is technically correct but gives the operator no
+    hint that the driver ships in an optional extra. This returns a
+    replacement error whose message names the exact install commands.
+
+    Only the dialect part of *db_uri* is echoed (never the credentials), so
+    the message is safe to log.
+
+    :param db_uri: The connection string being opened, e.g.
+        ``"postgresql+psycopg://user:pass@host/db"``.
+    :param exc: The original ``ModuleNotFoundError`` from ``create_engine``.
+    :returns: A new ``ModuleNotFoundError`` with an actionable message when the
+        backend is Postgres and the driver is the missing module; otherwise the
+        original *exc* unchanged.
+    """
+    # Echo only the dialect — never the credentials. Prefer SQLAlchemy's own
+    # URL parser over string surgery; fall back to a plain scheme split for
+    # strings make_url rejects (the message must never crash error handling).
+    try:
+        backend = make_url(db_uri).drivername
+    except Exception:  # noqa: BLE001 — any parse failure falls back
+        backend = db_uri.split("://", 1)[0]
+    if "postgres" not in backend.lower() or exc.name not in {"psycopg", "psycopg2"}:
+        return exc
+    install_commands = (
+        "    uv tool install omnigent --with 'psycopg[binary]'   "
+        "# uv tool (e.g. `omni`/`omnigent` CLI)\n"
+        "    pip install 'omnigent[postgres]'                    "
+        "# the extra that bundles the driver\n"
+        "    pip install 'psycopg[binary]'                       "
+        "# plain virtualenv\n"
+    )
+    if exc.name == "psycopg2":
+        # Installing psycopg 3 would NOT fix the psycopg2 dialects — the
+        # guidance must lead with switching the URI scheme.
+        message = (
+            f"Database backend '{backend}' selects the legacy PostgreSQL "
+            f"driver 'psycopg2', which is not installed. Preferred fix: "
+            f"change the URI scheme to 'postgresql+psycopg://' (the modern "
+            f"psycopg 3 dialect) and install the driver with one of:\n"
+            f"{install_commands}"
+            f"Alternatively, keep the psycopg2 dialect by installing it "
+            f"explicitly: pip install psycopg2-binary\n"
+            f"The Postgres backend is selected via OMNIGENT_DATABASE_URI / "
+            f"--database-uri."
+        )
+    else:
+        message = (
+            f"Database backend '{backend}' needs the PostgreSQL driver "
+            f"'{exc.name}', which is not installed. Install it with one of:\n"
+            f"{install_commands}"
+            f"The Postgres backend is selected via OMNIGENT_DATABASE_URI / "
+            f"--database-uri."
+        )
+    return ModuleNotFoundError(message, name=exc.name)
 
 
 def get_or_create_engine(db_uri: str) -> Engine:
@@ -354,6 +453,11 @@ def _ensure_conversation_tables(engine: Engine) -> None:
         ensure_fts_table(engine)
 
 
+def _set_alembic_database_url(config: Config, db_uri: str) -> None:
+    """Store a database URL safely in Alembic's ConfigParser-backed config."""
+    config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))
+
+
 def _build_alembic_config(db_uri: str) -> Config:
     """
     Build an Alembic ``Config`` pointed at our migrations directory.
@@ -373,7 +477,7 @@ def _build_alembic_config(db_uri: str) -> Config:
 
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
-    config.set_main_option("sqlalchemy.url", db_uri)
+    _set_alembic_database_url(config, db_uri)
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     return config
 
@@ -430,6 +534,80 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
         # in single-DB mode this engine hosts the AP tables too.
         for base in (OmnigentBase, ConversationBase):
             base.metadata.create_all(bind=engine, checkfirst=True)
+
+
+def run_migrations_with_retry(
+    db_uri: str,
+    *,
+    max_attempts: int = 8,
+    backoff_seconds: float = 3.0,
+    engine_factory: Callable[[str], Engine] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Connect and run migrations, retrying a cold database with backoff.
+
+    Managed Postgres endpoints (e.g. Databricks Lakebase) suspend after
+    an idle window and take several seconds to resume. A process that
+    boots and migrates once at startup can hit that resume window and
+    fail with a transient :class:`~sqlalchemy.exc.OperationalError`
+    ("the database system is starting up" / connection refused). Callers
+    that treat a startup exception as fatal then crash-loop until the DB
+    happens to be warm. Retrying the connect+migrate with linear backoff
+    lets a cold start self-heal.
+
+    A fresh engine is created per attempt and disposed afterward so a
+    poisoned connection pool from a failed attempt is never reused. Only
+    :class:`~sqlalchemy.exc.OperationalError` is retried; every other
+    exception (including a real migration/schema error) propagates
+    immediately. The final attempt's error is re-raised so a genuinely
+    unreachable database still fails loudly.
+
+    :param db_uri: SQLAlchemy database URL to connect and migrate.
+    :param max_attempts: Total connect+migrate attempts before giving
+        up. Must be >= 1.
+    :param backoff_seconds: Base linear backoff; attempt *n* sleeps
+        ``backoff_seconds * n`` before attempt *n+1*.
+    :param engine_factory: Callable returning an :class:`Engine` for the
+        URI. Defaults to :func:`sqlalchemy.create_engine`. Injectable
+        for tests.
+    :param sleep: Sleep function, injectable for tests. Defaults to
+        :func:`time.sleep`.
+    :raises sqlalchemy.exc.OperationalError: If every attempt fails to
+        connect.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if engine_factory is None:
+        import sqlalchemy
+
+        engine_factory = sqlalchemy.create_engine
+
+    from sqlalchemy.exc import OperationalError
+
+    for attempt in range(1, max_attempts + 1):
+        engine = engine_factory(db_uri)
+        try:
+            _run_migrations(engine, db_uri)
+            return
+        except OperationalError as exc:
+            if attempt == max_attempts:
+                _logger.error(
+                    "Database not reachable after %d attempt(s); giving up",
+                    max_attempts,
+                )
+                raise
+            delay = backoff_seconds * attempt
+            _logger.warning(
+                "DB connect/migrate attempt %d/%d failed (%s); retrying in %.0fs "
+                "(a managed endpoint may be resuming from suspend)",
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                delay,
+            )
+            sleep(delay)
+        finally:
+            engine.dispose()
 
 
 def _get_current_db_revision(engine: Engine) -> str | None:

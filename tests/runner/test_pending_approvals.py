@@ -67,7 +67,7 @@ async def test_resolve_sets_result_and_returns_true() -> None:
     # between register and resolve.
     assert delivered is True
     assert fut.done()
-    assert fut.result() is True
+    assert fut.result() == pending_approvals.Verdict(approved=True, content=None)
 
 
 @pytest.mark.asyncio
@@ -94,7 +94,7 @@ async def test_resolve_already_done_returns_false() -> None:
     stays idempotent.
     """
     fut = pending_approvals.register("elicit_dup")
-    fut.set_result(True)
+    fut.set_result(pending_approvals.Verdict(approved=True))
     second = pending_approvals.resolve("elicit_dup", False)
     assert second is False
 
@@ -116,6 +116,24 @@ async def test_cleanup_unknown_id_is_noop() -> None:
     # the wait_for_user_approval helper's finally block would
     # fail to clean up on the already-resolved path.
     pending_approvals.cleanup("elicit_never_seen")
+
+
+@pytest.mark.asyncio
+async def test_server_reconnect_notifies_only_replayable_approvals() -> None:
+    """Reconnect wakes server-issued gates without replaying external MCP work."""
+    replayable = pending_approvals.register(
+        "elicit_server_policy",
+        retry_on_server_reconnect=True,
+    )
+    external = pending_approvals.register("elicit_external_mcp")
+
+    assert pending_approvals.notify_server_reconnect() == 1
+    with pytest.raises(pending_approvals.ServerReconnected):
+        await replayable
+    assert not external.done()
+
+    pending_approvals.cleanup("elicit_server_policy")
+    pending_approvals.cleanup("elicit_external_mcp")
 
 
 @pytest.mark.asyncio
