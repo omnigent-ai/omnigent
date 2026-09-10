@@ -448,6 +448,11 @@ def register_docloop_forwarding(
     router.include_router(notebook_gateway_router(authorize, transport, prefix=""))
     if jupyter_transport is not None:
         from omnigent.jupyter_gateway import jupyter_gateway_router
+        from omnigent.notebook_history_gateway import notebook_history_router
+
+        router.include_router(
+            notebook_history_router(authorize, jupyter_transport.jupyter_client, prefix="")
+        )
 
         router.include_router(
             jupyter_gateway_router(

@@ -1,4 +1,6 @@
 /** Imperative pane behind a thin native React wrapper; no replacement chat UI. */
+import { prettyJSON } from "./display-json.mjs";
+
 const draftsBySession = new Map();
 const LIMIT = 256 * 1024;
 // Retained drafts must still warn when the pane is closed or another session is open.
@@ -233,7 +235,11 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
     card.meta.textContent = `${node.kind} · ${node.id}${node.role ? ` · ${node.role}` : ""}`;
     card.area.readOnly = !node.editable || saving || Boolean(draft?.pending);
     card.area.setAttribute("aria-label", `Source ${node.id}`);
-    if (!draft && card.area.value !== node.source) card.area.value = node.source;
+    const shown =
+      !node.editable && ["json", "mcp", "team"].includes(node.language)
+        ? prettyJSON(node.source)
+        : node.source;
+    if (!draft && card.area.value !== shown) card.area.value = shown;
     if (draft && card.area.value !== draft.source) card.area.value = draft.source;
     const changed =
       draft && (node.source !== draft.original || snapshot.revision !== draft.revision);
@@ -252,7 +258,7 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
     card.save.disabled = !draft || saving || reading || !node.editable;
     card.discard.disabled = !draft || saving;
     card.compare.hidden = !changed;
-    card.output.textContent = node.output_text || "";
+    card.output.textContent = prettyJSON(node.output_text || "");
     if (node.output_truncated) card.output.textContent += "\n[Output truncated]";
     card.output.hidden = !node.output_text && !node.output_truncated;
   }

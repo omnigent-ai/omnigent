@@ -90,10 +90,115 @@
 }
 .docloop-notebook-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   padding: 4px 8px;
   border-bottom: 1px solid var(--border);
+}
+.docloop-history {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  gap: 12px;
+}
+.docloop-history header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.docloop-history header div {
+  flex: 1;
+}
+.docloop-history h2,
+.docloop-history h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+}
+.docloop-history p {
+  font-size: 13px;
+  color: var(--muted-foreground);
+  margin: 6px 0;
+}
+.docloop-history button {
+  min-height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.docloop-history button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.docloop-history button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.docloop-history button[aria-pressed="true"] {
+  background: var(--accent);
+}
+.docloop-history-body {
+  display: grid;
+  grid-template-columns: minmax(130px, 1fr) minmax(0, 2fr);
+  gap: 12px;
+}
+.docloop-history nav {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.docloop-history nav button strong,
+.docloop-history nav button span {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.docloop-history nav button span {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  margin-top: 4px;
+}
+.docloop-history-pages {
+  display: flex;
+  gap: 6px;
+}
+.docloop-history-copy {
+  min-width: 0;
+}
+.docloop-history article {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  margin-top: 10px;
+}
+.docloop-history h4 {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin: 0 0 6px;
+}
+.docloop-history pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font:
+    13px/1.5 ui-monospace,
+    monospace;
+}
+@container docloop (max-width:500px) {
+  .docloop-history-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .docloop-history nav {
+    max-height: 220px;
+    overflow: auto;
+  }
 }
 .docloop-notebook-toolbar button,
 .docloop-notebook-toolbar a {

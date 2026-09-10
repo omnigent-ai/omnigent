@@ -136,6 +136,7 @@ def runner_notebook_router(
         pass
 
     from omnigent.jupyter_gateway import jupyter_gateway_router
+    from omnigent.notebook_history_gateway import notebook_history_router
 
     async def authorize_jupyter(connection: HTTPConnection, _session_id: str) -> None:
         if connection.client and connection.client.host == "tunnel":
@@ -146,6 +147,9 @@ def runner_notebook_router(
 
     transport = LiveHarnessNotebookTransport(manager)
     router = notebook_gateway_router(authorize, transport)
+    router.include_router(
+        notebook_history_router(authorize_jupyter, transport.jupyter_client, prefix="")
+    )
     router.include_router(
         jupyter_gateway_router(
             authorize_jupyter,

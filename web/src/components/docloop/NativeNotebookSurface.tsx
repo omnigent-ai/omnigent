@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { authenticatedFetch, fetchWithBrowserSession } from "@/lib/identity";
 import { mountNotebookPane } from "./notebook-pane.mjs";
+import { NotebookHistory } from "./NotebookHistory";
 
 /** Keep Lab mounted while switching to Chat so its kernel connection survives. */
 export function NativeNotebookSurface({
@@ -14,6 +15,7 @@ export function NativeNotebookSurface({
   const [url, setUrl] = useState<string | null>(null);
   const [message, setMessage] = useState("Opening notebook…");
   const [source, setSource] = useState(false);
+  const [history, setHistory] = useState(false);
   const [org, setOrg] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [kernelStatus, setKernelStatus] = useState("Loading JupyterLab…");
@@ -124,22 +126,39 @@ export function NativeNotebookSurface({
   if (!started) return null;
   return (
     <div className="docloop-notebook-surface">
-      {!org && (
-        <div className="docloop-notebook-toolbar" aria-label="Notebook editor">
-          <button type="button" aria-pressed={!source} onClick={() => setSource(false)}>
+      <div className="docloop-notebook-toolbar" aria-label="Notebook editor">
+        {!org && (
+          <button
+            type="button"
+            aria-pressed={!source && !history}
+            onClick={() => {
+              setSource(false);
+              setHistory(false);
+            }}
+          >
             JupyterLab
           </button>
-          <button type="button" aria-pressed={source} onClick={() => setSource(true)}>
-            Source
-          </button>
-          {url && (
-            <a href={url} target="_blank" rel="noreferrer">
-              Open full page ↗
-            </a>
-          )}
-        </div>
-      )}
-      {!source && message && (
+        )}
+        <button
+          type="button"
+          aria-pressed={source && !history}
+          onClick={() => {
+            setSource(true);
+            setHistory(false);
+          }}
+        >
+          {org ? "Document" : "Source"}
+        </button>
+        <button type="button" aria-pressed={history} onClick={() => setHistory(true)}>
+          History
+        </button>
+        {url && (
+          <a href={url} target="_blank" rel="noreferrer">
+            Open full page ↗
+          </a>
+        )}
+      </div>
+      {!source && !history && message && (
         <div className="docloop-notebook-message">
           <p role="status">{message}</p>
           <button type="button" onClick={() => setAttempt((value) => value + 1)}>
@@ -147,7 +166,7 @@ export function NativeNotebookSurface({
           </button>
         </div>
       )}
-      {url && !source && (
+      {url && !source && !history && (
         <p className="docloop-kernel-status" role="status">
           {kernelStatus}
         </p>
@@ -158,11 +177,12 @@ export function NativeNotebookSurface({
           ref={frame}
           src={url}
           title="JupyterLab notebook"
-          hidden={source}
+          hidden={source || history}
           className="docloop-jupyter-frame"
         />
       )}
-      <div ref={editor} hidden={!source} className="docloop-source-editor" />
+      <div ref={editor} hidden={!source || history} className="docloop-source-editor" />
+      {history && <NotebookHistory key={sessionId} sessionId={sessionId} />}
     </div>
   );
 }
