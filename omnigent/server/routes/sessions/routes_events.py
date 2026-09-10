@@ -257,6 +257,22 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
 )
 
 
+# Stand-in detail for a native ``failed`` status edge that carries no output.
+# The harness genuinely reported nothing, but a failure the user cannot read is
+# worse than a vague one, so point them at the log that does have the reason.
+_NATIVE_FAILURE_WITHOUT_DETAIL = (
+    "The turn failed but the agent reported no detail. See the runner log for details."
+)
+
+# Label for a failure detail backfilled from the session's persisted
+# transcript rather than reported by the forwarder. The trailing text can be
+# the harness's in-band error report -- or the turn's own successful reply --
+# so name the situation instead of presenting that prose as the error itself.
+_NATIVE_FAILURE_ENRICHED_DETAIL_PREFIX = (
+    "The turn failed without a reported reason; the last assistant message was: "
+)
+
+
 def _event_body_too_large() -> HTTPException:
     """Build the shared error for an oversized session-event request."""
     return HTTPException(
@@ -1398,18 +1414,38 @@ def register_events_routes(
             # last_task_error, not only the sub-agent parent-inbox path.
             output = data.get("output")
             status_error: ErrorDetail | None = None
-            if status == "failed" and isinstance(output, str) and output.strip():
+            if status == "failed":
+                # A detail-less failed edge still has to carry a message: the
+                # web only renders an error block when the status edge has one,
+                # so dropping it flips the session to "failed" with nothing in
+                # the transcript to explain why.
+                detail = output.strip() if isinstance(output, str) and output.strip() else ""
+                wire_output = body.data.get("output")
+                wire_detail = wire_output.strip() if isinstance(wire_output, str) else ""
+                if not detail:
+                    message = _NATIVE_FAILURE_WITHOUT_DETAIL
+                elif wire_detail:
+                    # The forwarder reported this reason itself: verbatim.
+                    message = detail
+                else:
+                    # Store-enriched: the transcript's latest assistant text,
+                    # not a reported reason -- label it so a successful
+                    # reply is never published as the error verbatim.
+                    message = f"{_NATIVE_FAILURE_ENRICHED_DETAIL_PREFIX}{detail}"
                 status_error = ErrorDetail(
                     code=(
+                        # Forwarders attach a non-empty output alongside
+                        # reauth today; the fallback message covers a latent
+                        # detail-less reauth.
                         "codex_reauth_required"
                         if data.get("reauth_required") is True
                         # The store-enriched detail keeps a harness-neutral
-                        # code; a forwarder-sent detail keeps codex's.
-                        else (
-                            "codex_turn_error" if body.data.get("output") else "native_turn_error"
-                        )
+                        # code; a forwarder-sent detail keeps codex's. Both
+                        # normalize whitespace, so a blank wire output
+                        # classifies as detail-less rather than codex-sent.
+                        else ("codex_turn_error" if wire_detail else "native_turn_error")
                     ),
-                    message=output.strip(),
+                    message=message,
                 )
             if status_error is not None:
                 await _persist_session_status_error_labels(

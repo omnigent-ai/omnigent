@@ -1325,3 +1325,84 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("relayed_message", "expected_message"),
+    [
+        # Blank message: substituted wholesale with the stand-in.
+        (
+            "   ",
+            "The turn failed but the runner reported no detail. See the runner log for details.",
+        ),
+        # Reason dropped after the colon (str(exc) was empty runner-side):
+        # completed with a stand-in, keeping the recognizable prefix.
+        (
+            "turn setup failed: ",
+            "turn setup failed: no reason reported (see the runner log for details)",
+        ),
+    ],
+)
+async def test_relay_repairs_failed_error_without_reason(
+    relayed_message: str,
+    expected_message: str,
+) -> None:
+    """
+    A relayed ``failed`` error with no usable reason is repaired.
+
+    Old runners can relay ``{"code": "runner_error", "message": "turn setup
+    failed: "}`` (an exception whose ``str()`` was empty) or a blank message.
+    Republished verbatim, that detail reaches the broken-turn ERROR log and
+    ``last_task_error`` with nothing triageable in it -- the relay must
+    substitute or complete it with a stand-in pointing at the runner log.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    release = asyncio.Event()
+    events: list[dict[str, Any]] = [
+        {
+            "type": "session.status",
+            "status": "failed",
+            "error": {"code": "runner_error", "message": relayed_message},
+        },
+    ]
+    fake_runner = _ScriptedRunnerClient(release, events)
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "7c2f1a9e5d3b4c8fa1e6d0b2c4a8e7f3"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_relay_reasonless_failure",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        # Subscribe BEFORE releasing the script so the published
+        # session.status event fans out to the collector.
+        collector = await start_session_stream_collector(session_id)
+        release.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "failed"
+        assert event["error"]["code"] == "runner_error"
+        assert event["error"]["message"] == expected_message
+    finally:
+        release.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

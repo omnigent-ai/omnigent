@@ -2447,6 +2447,24 @@ def _session_status_to_task_status(status: object) -> str | None:
     return None
 
 
+def _exception_detail(exc: BaseException) -> str:
+    """
+    Return exception text for a failure message, never empty.
+
+    Some exceptions stringify to ``""`` (e.g. a bare ``CancelledError``
+    or ``RuntimeError()``), which turns a message like
+    ``f"turn setup failed: {exc}"`` into a prefix with the cause
+    dropped. Fall back to the class name so the published detail always
+    carries something diagnosable.
+
+    :param exc: The caught exception.
+    :returns: ``str(exc)``, or the exception class name when that is
+        blank, e.g. ``"CancelledError"``.
+    """
+    text = str(exc).strip()
+    return text or type(exc).__name__
+
+
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     """
     Coerce a turn-failure ``error`` dict into a ``{code, message}`` shape.
@@ -7267,7 +7285,9 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv},
             )
-            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            _on_proxy_stream_end(
+                conv, error={"message": f"turn setup failed: {_exception_detail(exc)}"}
+            )
             raise
         except Exception as exc:
             _logger.error(
@@ -7277,7 +7297,9 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv},
             )
-            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            _on_proxy_stream_end(
+                conv, error={"message": f"turn setup failed: {_exception_detail(exc)}"}
+            )
         finally:
             # Permanent-wedge floor: guarantee _active_turns is never left stale,
             # however the body exits — including a BaseException that escapes
@@ -7754,7 +7776,7 @@ def create_runner_app(
             _on_proxy_stream_end(
                 session_id,
                 error={
-                    "message": f"background turn drain failed: {exc}",
+                    "message": f"background turn drain failed: {_exception_detail(exc)}",
                 },
             )
 

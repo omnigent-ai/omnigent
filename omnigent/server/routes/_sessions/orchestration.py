@@ -2482,6 +2482,43 @@ def _build_skipped_kiro_items(
     return items
 
 
+# Stand-ins for a relayed ``failed`` status whose error message carries no
+# usable reason. The runner logs the original exception with a traceback, so
+# point the reader there rather than publishing an empty detail.
+_RELAYED_FAILURE_WITHOUT_MESSAGE = (
+    "The turn failed but the runner reported no detail. See the runner log for details."
+)
+_RELAYED_FAILURE_REASON_STAND_IN = "no reason reported (see the runner log for details)"
+
+
+def _ensure_relayed_failure_reason(error: ErrorDetail) -> ErrorDetail:
+    """
+    Give a relayed failed-turn error a non-empty, diagnosable reason.
+
+    A runner can relay a failure whose message is blank, or one built as
+    ``f"turn setup failed: {exc}"`` from an exception whose ``str()`` was
+    empty -- leaving nothing after the colon. Published verbatim, that
+    detail is untriageable (the broken-turn ERROR log and
+    ``last_task_error`` both carry it), so substitute or complete it with
+    a stand-in that points at the runner log. Runner messages are
+    machine-built sentences, so a trailing colon is reliably the
+    dropped-reason shape, not prose.
+
+    :param error: The relayed error detail, e.g.
+        ``ErrorDetail(code="runner_error", message="turn setup failed: ")``.
+    :returns: The same detail, with ``message`` repaired when it carried
+        no reason; unchanged otherwise.
+    """
+    message = error.message.strip()
+    if not message:
+        return error.model_copy(update={"message": _RELAYED_FAILURE_WITHOUT_MESSAGE})
+    if message.endswith(":"):
+        return error.model_copy(
+            update={"message": f"{message} {_RELAYED_FAILURE_REASON_STAND_IN}"}
+        )
+    return error
+
+
 async def _enrich_terminal_status_with_subagent_output(
     data: dict[str, Any],
     status: str,
@@ -6445,6 +6482,11 @@ async def _relay_runner_stream_once(
                                 else None
                             )
                             if status == "failed" and status_error is not None:
+                                # An old runner can relay a detail whose
+                                # reason was dropped (blank, or a bare
+                                # "turn setup failed:") -- repair it before
+                                # it reaches the log and last_task_error.
+                                status_error = _ensure_relayed_failure_reason(status_error)
                                 await _persist_session_status_error_labels(
                                     session_id,
                                     status_error,
