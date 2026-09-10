@@ -9312,7 +9312,7 @@
     },
     "/v1/hosts/{host_id}/filesystem": {
       "get": {
-        "description": "List the contents of the host daemon's home directory.\n\nEmpty trailing path \u2192 forward `~` to the host (the host\nexpands against its own process owner). Used by the\nWeb UI's directory picker to show the \"root\" view.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...], \"has_more\": bool}` mirroring the existing session-scoped filesystem endpoint shape.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline, 504 on host timeout, 502 on host I/O failure.",
+        "description": "List the host daemon's home directory or platform roots.\n\nBy default, forwards `~` so the Host expands its process owner's\nhome. `roots=true` asks a capable Host to enumerate Windows drives\nor the POSIX `/` root.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...], \"has_more\": bool}` mirroring the existing session-scoped filesystem endpoint shape.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline or `roots=true` is not supported by its current connection, 504 on host timeout, 502 on host I/O failure.",
         "operationId": "list_host_filesystem_root_v1_hosts__host_id__filesystem_get",
         "parameters": [
           {
@@ -9323,6 +9323,17 @@
             "schema": {
               "title": "Host Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Whether to enumerate platform filesystem roots.",
+            "in": "query",
+            "name": "roots",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Roots",
+              "type": "boolean"
             }
           },
           {
@@ -9385,6 +9396,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "409": {
+            "description": "Host is offline or does not advertise filesystem-root enumeration"
           },
           "422": {
             "content": {
