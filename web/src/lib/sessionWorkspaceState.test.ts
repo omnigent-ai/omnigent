@@ -17,7 +17,7 @@ describe("sessionWorkspaceState", () => {
   });
 
   it("merges partial patches into one session rather than replacing", () => {
-    writeSessionWorkspaceState("conv_a", { open: true, widthPx: 480 });
+    writeSessionWorkspaceState("conv_a", { open: true, widthPx: 480, paneSizePct: 38 });
     writeSessionWorkspaceState("conv_a", { rightRailTab: "subagents" });
 
     // The second write patches only rightRailTab; open/widthPx from the first
@@ -26,6 +26,7 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_a")).toEqual({
       open: true,
       widthPx: 480,
+      paneSizePct: 38,
       rightRailTab: "subagents",
     });
   });
@@ -121,7 +122,12 @@ describe("sessionWorkspaceState", () => {
     // proving one bad field can't poison the whole entry.
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
+      JSON.stringify([
+        {
+          id: "conv_b",
+          state: { open: true, widthPx: -5, paneSizePct: 120, rightRailTab: "bogus" },
+        },
+      ]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
   });

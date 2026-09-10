@@ -41,6 +41,8 @@ import { FolderTree } from "./FolderTree";
 import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
+  /** Session whose workspace this panel browses; defaults to the active route. */
+  conversationId?: string;
   onFileSelect: (path: string) => void;
   /**
    * Which scope this panel renders: false = full folder tree, true =
@@ -227,6 +229,7 @@ const browseLocationCache = new Map<string, string>();
  * intentionally not listed here.
  */
 export function FilesPanel({
+  conversationId: conversationIdProp,
   onFileSelect,
   flatView,
   showHidden,
@@ -236,7 +239,8 @@ export function FilesPanel({
   onClose,
   frameless,
 }: FilesPanelProps) {
-  const { conversationId } = useParams<{ conversationId: string }>();
+  const { conversationId: routeConversationId } = useParams<{ conversationId: string }>();
+  const conversationId = conversationIdProp ?? routeConversationId;
   // The runner went offline (e.g. its host restarted): `sessionStatus`
   // is "failed", set by `_on_runner_disconnect` server-side when the
   // runner's tunnel drops (and also client-side in chatStore when the

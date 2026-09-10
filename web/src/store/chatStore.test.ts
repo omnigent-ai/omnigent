@@ -616,6 +616,59 @@ describe("test harness teardown", () => {
   });
 });
 
+describe("chatStore — loadInBackground", () => {
+  it("hydrates a non-active conversation without switching the active session", async () => {
+    // Restored split layouts render panes for conversations the route never
+    // activated; the pane needs the transcript without a root switch.
+    seedSession("conv_a", [userMessage("resp_a", "in a")]);
+    seedSession("conv_b", [userMessage("resp_b", "in b")]);
+
+    await useChatStore.getState().switchTo("conv_a");
+    await useChatStore.getState().loadInBackground("conv_b");
+
+    expect(useChatStore.getState().conversationId).toBe("conv_a");
+    const entry = conversationRegistry.peek("conv_b");
+    expect(entry).toBeDefined();
+    expect(entry!.getState().blocks).toHaveLength(1);
+    expect(entry!.getState().loadingConversation).toBe(false);
+    expect(entry!.getState().conversationLoadError).toBeNull();
+  });
+
+  it("is a no-op for the active conversation and for live entries", async () => {
+    seedSession("conv_a", [userMessage("resp_a", "in a")]);
+    seedSession("conv_b", [userMessage("resp_b", "in b")]);
+
+    await useChatStore.getState().switchTo("conv_a");
+    const afterSwitch = fetchMock.mock.calls.length;
+    await useChatStore.getState().loadInBackground("conv_a");
+    expect(fetchMock.mock.calls.length).toBe(afterSwitch);
+
+    await useChatStore.getState().loadInBackground("conv_b");
+    const afterBackgroundBind = fetchMock.mock.calls.length;
+    await useChatStore.getState().loadInBackground("conv_b");
+    expect(fetchMock.mock.calls.length).toBe(afterBackgroundBind);
+  });
+
+  it("dedupes concurrent binds for the same conversation", async () => {
+    // StrictMode double-fires the pane mount effect; a second bind while the
+    // first is still opening would release the first entry and double the
+    // stream slots, evicting other panes under the dev-slot budget.
+    seedSession("conv_a", [userMessage("resp_a", "in a")]);
+    seedSession("conv_b", [userMessage("resp_b", "in b")]);
+
+    await useChatStore.getState().switchTo("conv_a");
+    await Promise.all([
+      useChatStore.getState().loadInBackground("conv_b"),
+      useChatStore.getState().loadInBackground("conv_b"),
+    ]);
+    const streamOpens = fetchMock.mock.calls.filter(
+      ([url]) => String(url).split("?")[0] === "/v1/sessions/conv_b/stream",
+    );
+    expect(streamOpens).toHaveLength(1);
+    expect(conversationRegistry.ids().filter((id) => id === "conv_b")).toHaveLength(1);
+  });
+});
+
 describe("chatStore — switchTo", () => {
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
     const items: ConversationItem[] = [

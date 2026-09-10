@@ -143,6 +143,20 @@ describe("ConversationRegistry", () => {
     expect(registry.evictLruEvictable()).toBeNull();
   });
 
+  it("never evicts a pinned entry, even when it is the least-recently-viewed", () => {
+    // Split panes pin their conversations: a visible pane must not lose its
+    // stream (and its transcript) just because another pane bound later.
+    const a = registry.acquire("conv_a");
+    registry.acquire("conv_b");
+    registry.pin("conv_a");
+    expect(registry.evictLruEvictable()).toBe("conv_b");
+    expect(a.disposed).toBe(false);
+    expect(registry.ids()).toEqual(["conv_a"]);
+    expect(registry.evictLruEvictable()).toBeNull();
+    registry.unpin("conv_a");
+    expect(registry.evictLruEvictable()).toBe("conv_a");
+  });
+
   it("treats acquire as a recency touch, so a revisited entry is not the victim", () => {
     registry.acquire("conv_a");
     registry.acquire("conv_b");

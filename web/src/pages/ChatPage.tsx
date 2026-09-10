@@ -363,8 +363,14 @@ function truncateTitle(raw: string, max = 60): string {
  * and triggers `switchTo` when the URL changes. The store owns the
  * items fetch (no useConversationItems here).
  */
-export function ChatPage() {
-  const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+export interface ChatPageProps {
+  conversationId?: string;
+  active?: boolean;
+}
+
+export function ChatPage({ conversationId, active = true }: ChatPageProps = {}) {
+  const { conversationId: routeConversationId } = useParams<{ conversationId: string }>();
+  const urlConvId = conversationId ?? routeConversationId;
   // The id for every server-scoped fetch/hook — `undefined` while the URL holds
   // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
   // the session exists. `switchTo` still gets the raw `urlConvId`.
@@ -435,6 +441,7 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    if (!active) return;
     // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
     // conversation is gone) has no forward path: landing is URL-keyed, so the
     // page would sit on a permanently read-only phantom chat. Redirect to
@@ -444,7 +451,7 @@ export function ChatPage() {
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate]);
+  }, [active, urlConvId, navigate]);
 
   // Server-driven redirect: when the active conversation is superseded
   // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
@@ -455,12 +462,12 @@ export function ChatPage() {
   // when we're already on the target URL.
   const redirectToConversationId = useChatStore((s) => s.redirectToConversationId);
   useEffect(() => {
-    if (!redirectToConversationId) return;
+    if (!active || !redirectToConversationId) return;
     if (redirectToConversationId !== urlConvId) {
       navigate(`/c/${redirectToConversationId}`, { replace: true });
     }
     useChatStore.setState({ redirectToConversationId: null });
-  }, [redirectToConversationId, urlConvId, navigate]);
+  }, [active, redirectToConversationId, urlConvId, navigate]);
 
   // Pull the first message the landing composer stashed for this conversation,
   // if any. Read-once (consume deletes), so a refresh/back can't replay
@@ -473,6 +480,7 @@ export function ChatPage() {
   // null when no prompt is pending clears a prior conversation's value
   // when ChatPage stays mounted across `/c/:a` → `/c/:b`.
   useEffect(() => {
+    if (!active) return;
     if (!urlConvId) {
       setInitialPrompt(null);
       return;
@@ -482,7 +490,7 @@ export function ChatPage() {
       cached?.conversationId === urlConvId ? cached.prompt : consumePendingInitialPrompt(urlConvId);
     consumedInitialPromptRef.current = { conversationId: urlConvId, prompt };
     setInitialPrompt(prompt === null ? null : { conversationId: urlConvId, prompt });
-  }, [urlConvId]);
+  }, [active, urlConvId]);
 
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
@@ -568,6 +576,7 @@ export function ChatPage() {
   // sends once — while still resetting for the next conversation, since
   // ChatPage stays mounted across `/c/:a` → `/c/:b`.
   useEffect(() => {
+    if (!active) return;
     if (
       !shouldSendInitialPrompt({
         initialPrompt: initialPrompt?.prompt.text ?? null,
@@ -587,7 +596,7 @@ export function ChatPage() {
     initialPromptSentForConvRef.current = urlConvId;
     const { send, sendSlashCommand } = useChatStore.getState();
     dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
-  }, [initialPrompt, urlConvId, loadingConversation, agentId]);
+  }, [active, initialPrompt, urlConvId, loadingConversation, agentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
   // survives a re-mount of the chat surface. Declared BEFORE the
@@ -616,13 +625,13 @@ export function ChatPage() {
   // effect uses. If the user switched away before the clone started, the
   // prompt stays pinned and waits; it never floats into another session.
   useEffect(() => {
-    if (pendingResumePrompt === null || !agentId || !urlConvId) return;
+    if (!active || pendingResumePrompt === null || !agentId || !urlConvId) return;
     if (pendingResumePrompt.sessionId !== urlConvId) return;
     if (runnerOnline !== true) return;
     const { text, files } = pendingResumePrompt;
     setPendingResumePrompt(null);
     void useChatStore.getState().send(text, agentId, files);
-  }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
+  }, [active, pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
   // Opened when the user tries to interact with an unreachable session
   // (host offline, or not host-bound with the runner down).
@@ -810,10 +819,11 @@ export function ChatPage() {
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
       : null;
   useEffect(() => {
+    if (!active) return;
     const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
     const base = truncateTitle(activeConv?.title ?? subAgentTabTitle ?? fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
+  }, [active, activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);

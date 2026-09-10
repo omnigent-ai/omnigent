@@ -15,7 +15,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
@@ -58,23 +57,15 @@ import {
   WalletIcon,
   XIcon,
 } from "lucide-react";
-import {
-  DndContext,
-  DragOverlay,
-  type DragEndEvent,
-  type DragStartEvent,
-  MeasuringStrategy,
-  MouseSensor,
-  pointerWithin,
-  TouchSensor,
-  useDraggable,
-  useDroppable,
-  useSensor,
-  useSensors,
-} from "@dnd-kit/core";
+import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
+import {
+  SessionDragDropBoundary,
+  useSessionDragDrop,
+  type SessionDragState,
+} from "./SessionDragDropProvider";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
@@ -203,7 +194,6 @@ import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
-import { getEmbedRoot } from "../lib/host";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
@@ -1880,39 +1870,9 @@ function ConversationList({
   // pin button remain the keyboard-accessible paths; DnD is a pointer
   // enhancement on top of them, so the sensors are pointer-only.
   const moveToProject = useMoveToProject();
-  // The session currently being dragged (id + source project + pinned state), or
-  // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
-  // preview and which drop zones light up (ungroup only for a filed session, pin
-  // only for an unpinned one).
-  const [activeDrag, setActiveDrag] = useState<{
-    id: string;
-    label: string;
-    project: string | null;
-    isPinned: boolean;
-  } | null>(null);
-  // Mouse: a small drag threshold so a plain click still navigates / opens the
-  // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
-  // into a drag. Keyboard users use the kebab menu instead (no KeyboardSensor).
-  const sensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
-  );
-  const handleDragStart = useCallback((event: DragStartEvent) => {
-    const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
-    setActiveDrag({
-      id: String(event.active.id),
-      label: data?.label ?? String(event.active.id),
-      project: data?.project ?? null,
-      isPinned: data?.isPinned ?? false,
-    });
-  }, []);
-  const handleDragEnd = useCallback(
-    (event: DragEndEvent) => {
-      const dragged = activeDrag;
-      setActiveDrag(null);
-      if (!dragged) return;
-      const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
+  const { activeDrag, registerSidebarDropHandler } = useSessionDragDrop();
+  const handleSidebarDrop = useCallback(
+    (dragged: SessionDragState, target: SidebarDropTarget) => {
       const action = resolveSidebarDrop(
         { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
         target,
@@ -1940,7 +1900,11 @@ function ConversationList({
         if (action.unpin) onTogglePinned(dragged.id);
       }
     },
-    [activeDrag, moveToProject, expandProject, onTogglePinned],
+    [moveToProject, expandProject, onTogglePinned],
+  );
+  useEffect(
+    () => registerSidebarDropHandler(handleSidebarDrop),
+    [handleSidebarDrop, registerSidebarDropHandler],
   );
 
   const expandAllProjects = useCallback((allNames: string[]) => {
@@ -2137,16 +2101,7 @@ function ConversationList({
       serverInfo={serverInfo}
       onActivate={activateRow}
     >
-      <DndContext
-        sensors={sensors}
-        collisionDetection={pointerWithin}
-        // Always-measure so the transient "remove from project" zone (mounted at
-        // drag start) is registered as a drop target without a stale layout cache.
-        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
-        onDragCancel={() => setActiveDrag(null)}
-      >
+      <SessionDragDropBoundary>
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
             className="flex flex-col gap-4"
@@ -2370,23 +2325,7 @@ function ConversationList({
             )}
           </div>
         </RowEditHoldContext.Provider>
-        {/* The dragged row's preview follows the pointer: a compact card showing
-          the session's title. Portaled to <body>: the aside always carries a CSS
-          translate (the mobile slide-in), which makes it the containing block for
-          fixed descendants, so an inline overlay would resolve its viewport
-          coordinates against the aside's box and drift off the cursor whenever
-          the aside sits away from (0,0) — e.g. the floating peek card. */}
-        {createPortal(
-          <DragOverlay dropAnimation={null}>
-            {activeDrag ? (
-              <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
-                {activeDrag.label}
-              </div>
-            ) : null}
-          </DragOverlay>,
-          getEmbedRoot() ?? document.body,
-        )}
-      </DndContext>
+      </SessionDragDropBoundary>
     </SidebarRowDataProvider>
   );
 }

@@ -428,7 +428,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 .dark
   :is(.bg-card, [class*="md:bg-card"]):not(
     :is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])
-  ):not([data-collapsed]):not([aria-label="Workspace"]):not([aria-label="Conversations"]) {
+  ):not([data-collapsed]):not([data-workspace-panel]):not([aria-label="Conversations"]) {
   /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
    * build) collapses the pair and keeps only the last declaration. */
   -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
@@ -461,16 +461,16 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
  * (FilesPanel/TerminalsPanel/SubagentsPanel + the graph surface).
  * Skip when maximized — the panel covers the full content area and needs an
  * opaque background so the chat beneath doesn't bleed through. */
-.dark aside[aria-label="Workspace"]:not([data-maximized]),
+.dark aside[data-workspace-panel]:not([data-maximized]),
 .dark
-  aside[aria-label="Workspace"]:not([data-maximized])
+  aside[data-workspace-panel]:not([data-maximized])
   :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
   background: transparent !important;
 }
 
 /* When maximized the workspace panel covers the full content area; use an
  * opaque background so the chat underneath doesn't bleed through. */
-aside[aria-label="Workspace"][data-maximized] {
+aside[data-workspace-panel][data-maximized] {
   background: var(--card-solid) !important;
 }
 
@@ -632,7 +632,7 @@ aside[aria-label="Workspace"][data-maximized] {
  * cluster sit over IT, not the strip — the strip starts right of the sidebar
  * with nothing to clear, and the padding would shove the tabs into the middle. */
 [data-electron-mac]:not([data-sidebar-open])
-  aside[aria-label="Workspace"][data-maximized]
+  aside[data-workspace-panel][data-maximized]
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
@@ -791,14 +791,14 @@ aside[aria-label="Workspace"][data-maximized] {
  * panels inside the padded Workspace rail must not receive the inset twice. */
 :is([data-ios-native], [data-android-native])
   :is(
-    aside[aria-label="Workspace"],
+    aside[data-workspace-panel],
     .conversations-sidebar,
     [data-testid="execution-logs-panel"],
     [data-testid="file-viewer"],
     [data-testid="files-panel-drawer"],
     [data-testid="terminals-panel"],
     .mobile-panel-drawer
-  ):not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(.is-peek) {
+  ):not(aside[data-workspace-panel] *):not([data-collapsed]):not(.is-peek) {
   /* Border-box floors the box at the padding sum, so each lateral inset is
    * capped at half the surface's published reservation (the rail's inline
    * --omnigent-reserved-width) — without the var the full inset holds. */
@@ -1796,17 +1796,17 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 @media (min-width: 48rem) {
   :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
-    :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
+    :is(.conversations-sidebar, aside[data-workspace-panel]:not([data-maximized])) {
     background: var(--custom-light-sidebar);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   .dark[data-theme="custom"][data-custom-translucent-sidebar]
-    :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
+    :is(.conversations-sidebar, aside[data-workspace-panel]:not([data-maximized])) {
     background: var(--custom-dark-sidebar);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   :root[data-theme="custom"][data-custom-translucent-sidebar]
-    aside[aria-label="Workspace"]:not([data-maximized])
+    aside[data-workspace-panel]:not([data-maximized])
     :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
     background-color: transparent;
   }

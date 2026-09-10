@@ -1,12 +1,13 @@
 import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
-import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
+import { WorkspacePage as WorkspacePageImpl } from "@/pages/WorkspacePage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
 import { Spinner } from "@/components/ui/spinner";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { SessionDragDropProvider } from "@/shell/SessionDragDropProvider";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -28,7 +29,7 @@ function withPageView<P extends object>(id: string, Component: ComponentType<P>)
 // so a non-accounts (header / OIDC) deploy doesn't ship them in the main chunk —
 // their routes aren't registered there, so the chunk never downloads. (Members /
 // Policies are lazy inside SettingsPage now that they're settings sub-categories.)
-const ChatPage = withPageView("chat", ChatPageImpl);
+const WorkspacePage = withPageView("chat", WorkspacePageImpl);
 const NotFoundPage = withPageView("not_found", NotFoundPageImpl);
 const LoginPage = withPageView(
   "login",
@@ -165,9 +166,15 @@ function App({ basename }: AppProps = {}) {
           </>
         )}
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
-        <Route element={<AppShell />}>
-          <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+        <Route
+          element={
+            <SessionDragDropProvider>
+              <AppShell />
+            </SessionDragDropProvider>
+          }
+        >
+          <Route path={prefix || "/"} element={<WorkspacePage />} />
+          <Route path={`${prefix}/c/:conversationId`} element={<WorkspacePage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route
             path={`${prefix}/canvas`}

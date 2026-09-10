@@ -22,8 +22,12 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView }: { flatView: boolean }) => (
-    <div data-testid="files-panel-stub" data-flat-view={String(flatView)} />
+  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId?: string }) => (
+    <div
+      data-testid="files-panel-stub"
+      data-flat-view={String(flatView)}
+      data-conversation-id={conversationId}
+    />
   ),
 }));
 vi.mock("./SubagentsPanel", () => ({
@@ -90,6 +94,7 @@ function renderWorkspace(
     selectedTerminalKey?: string | null;
     maximized?: boolean;
     liveness?: SessionLiveness;
+    variant?: "global" | "session-column";
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -98,11 +103,13 @@ function renderWorkspace(
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
+  const onCollapse = vi.fn();
   render(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
         conversationId="conv_ws"
         width={360}
+        variant={overrides.variant}
         handleProps={{ tabIndex: 0 }}
         rightRailTab={overrides.rightRailTab ?? "files"}
         onRightRailTabChange={onRightRailTabChange}
@@ -125,6 +132,7 @@ function renderWorkspace(
         onCloseTerminal={onCloseTerminal}
         maximized={overrides.maximized ?? false}
         onToggleMaximized={onToggleMaximized}
+        onCollapse={overrides.variant === "session-column" ? onCollapse : undefined}
         permissionLevel={null}
         filesPanelSort={"recent" as ChangedSort}
         onSortChange={vi.fn()}
@@ -141,6 +149,7 @@ function renderWorkspace(
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
+    onCollapse,
   };
 }
 
@@ -149,8 +158,31 @@ describe("WorkspacePanel surface presentation", () => {
     renderWorkspace();
 
     const panel = screen.getByRole("complementary", { name: "Workspace" });
+    expect(panel).toHaveAttribute("data-workspace-panel", "");
     expect(panel).toHaveClass("md:border-l", "md:border-border");
     expect(panel).not.toHaveClass("md:m-2", "md:rounded-lg", "md:shadow-lg");
+  });
+
+  it("uses SP2K percentage geometry inside a session column", () => {
+    renderWorkspace({ variant: "session-column" });
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    expect(panel.className).toContain("md:basis-[var(--session-workspace-basis,45%)]");
+    expect(panel.className).toContain("md:w-full");
+    expect(panel.className).toContain("@min-[720px]/session-column:md:w-auto");
+    expect(panel).not.toHaveClass("md:border-t");
+    expect(panel.className).not.toContain("@min-[720px]/session-column:md:border-l");
+  });
+
+  it("lets a session workspace collapse itself without adding the control to the global rail", () => {
+    const { onCollapse } = renderWorkspace({ variant: "session-column" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse workspace" }));
+    expect(onCollapse).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    renderWorkspace();
+    expect(screen.queryByRole("button", { name: "Collapse workspace" })).toBeNull();
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {
@@ -281,6 +313,15 @@ describe("WorkspacePanel content area", () => {
     // must not also mount. The stub echoes the path it received.
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+  });
+
+  it("binds the files scope to the workspace panel session", () => {
+    renderWorkspace();
+
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute(
+      "data-conversation-id",
+      "conv_ws",
+    );
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {

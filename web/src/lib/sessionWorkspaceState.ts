@@ -15,6 +15,8 @@ export interface SessionWorkspaceState {
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
+  /** Workspace pane size along its active dock axis, as a percentage. */
+  paneSizePct?: number;
   /** The selected rail tab (Files / Changes / Agents). */
   rightRailTab?: RightRailTab;
   /** Ordered list of open file tabs. */
@@ -43,6 +45,10 @@ function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
+function isValidPaneSize(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 15 && value <= 85;
+}
+
 function isRailTab(value: unknown): value is RightRailTab {
   return typeof value === "string" && (RAIL_TABS as readonly string[]).includes(value);
 }
@@ -67,6 +73,7 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   const state: SessionWorkspaceState = {};
   if (typeof record.open === "boolean") state.open = record.open;
   if (isValidWidth(record.widthPx)) state.widthPx = record.widthPx;
+  if (isValidPaneSize(record.paneSizePct)) state.paneSizePct = record.paneSizePct;
   if (isRailTab(record.rightRailTab)) state.rightRailTab = record.rightRailTab;
   if (Array.isArray(record.openFiles) && record.openFiles.every((p) => typeof p === "string")) {
     state.openFiles = record.openFiles as string[];

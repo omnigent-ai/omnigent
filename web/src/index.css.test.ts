@@ -362,12 +362,13 @@ describe("index.css native safe-area layout", () => {
     assertNativePanelPadding,
   );
 
-  it("keeps the Workspace aria-label on the rail component", () => {
+  it("keeps Workspace as the default rail aria-label", () => {
     // The stub <aside> in assertNativePanelPadding stands in for
-    // WorkspacePanel; this pins the real component to the label the CSS
-    // selector keys on.
+    // WorkspacePanel; pin both the default and its use on the real surface so
+    // per-session rails may provide a more specific accessible label.
     const source = readFileSync("src/shell/WorkspacePanel.tsx", "utf8");
-    expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label="Workspace"/);
+    expect(source).toMatch(/ariaLabel = "Workspace"/);
+    expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label=\{ariaLabel\}/);
   });
 
   it("leaves a collapsed rail unpadded, so its starved width stays zero", () => {
