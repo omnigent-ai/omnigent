@@ -26,10 +26,9 @@ _HTTP_TIMEOUT_S = 10.0
 
 
 #: Catalog spellings the same endpoint can be served under. Ordered by
-#: preference: a workspace exposing both keeps the ``databricks-`` id, so every
-#: consumer (routing candidates, the model picker, the launch alias pins) names
-#: a model the same way no matter which listing answered.
-_CATALOG_SPELLINGS: tuple[str, ...] = ("databricks-", _SYSTEM_MODEL_PREFIX)
+#: Unity Catalog model-service ids are the routable v3 spelling. The legacy
+#: ``databricks-`` form remains accepted for comparisons and compatibility.
+_CATALOG_SPELLINGS: tuple[str, ...] = (_SYSTEM_MODEL_PREFIX, "databricks-")
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
 #: ``gpt-5-6-sol`` → ``("gpt", "5", "6", "sol")``. Mirrors
@@ -58,16 +57,18 @@ def _natural_model_key(model_id: str) -> tuple[tuple[int, str | int], ...]:
     )
 
 
-def _prefer_databricks_spelling(model_ids: Iterable[str]) -> list[str]:
-    """Collapse duplicate spellings of one model onto the preferred one.
+def _prefer_system_model_spelling(model_ids: Iterable[str]) -> list[str]:
+    """Canonicalize model ids onto the Unity Catalog spelling.
 
     :param model_ids: Catalog ids from one or more listings, possibly naming
         the same endpoint under two spellings.
-    :returns: One id per model, sorted, with ``databricks-`` winning ties.
+    :returns: One id per model, sorted, with ``system.ai.`` winning ties.
     """
     best: dict[str, str] = {}
     for model_id in model_ids:
         bare = _bare_model_id(model_id)
+        if model_id.lower().startswith("databricks-"):
+            model_id = f"{_SYSTEM_MODEL_PREFIX}{bare}"
         current = best.get(bare)
         if current is None or _spelling_rank(model_id) < _spelling_rank(current):
             best[bare] = model_id
@@ -133,7 +134,7 @@ def preferred_served_claude_model(
     preferred_family = _claude_family_of(preferred_model_id, marker="claude-")
     if preferred_family is None:
         return None
-    claude_ids = _prefer_databricks_spelling(
+    claude_ids = _prefer_system_model_spelling(
         model_id
         for model_id in served_ids
         if _claude_family_of(model_id, marker="claude-") is not None
@@ -261,8 +262,8 @@ def discover_databricks_claude_catalog(
     endpoint under both spellings (``system.ai.claude-opus-5`` from Unity
     Catalog model services, ``databricks-claude-opus-5`` from the Anthropic AI
     Gateway) and answering with whichever listing happened to succeed makes the
-    catalog nondeterministic. Duplicates collapse onto the ``databricks-``
-    spelling so every consumer names a model the same way.
+    catalog nondeterministic. Duplicates collapse onto the ``system.ai.``
+    spelling used by Unity Catalog model services v3.
 
     The gateway listing is therefore issued even when Unity Catalog already
     named Claude models — short-circuiting on the UC hit would cost one HTTP
@@ -298,7 +299,7 @@ def discover_databricks_claude_catalog(
     if primary_error is not None and gateway_error is not None:
         raise gateway_error from primary_error
 
-    merged = _prefer_databricks_spelling([*model_service_ids, *gateway_ids])
+    merged = _prefer_system_model_spelling([*model_service_ids, *gateway_ids])
     models = _models_by_claude_family(merged, marker="claude-")
     if models:
         return DatabricksClaudeCatalog(
