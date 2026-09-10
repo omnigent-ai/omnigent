@@ -567,12 +567,37 @@ def _worker_db_uri() -> Generator[str, None, None]:
     root_engine2.dispose()
 
 
+@pytest.fixture(scope="session")
+def _sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Build one migrated SQLite template per pytest worker process.
+
+    The function-scoped ``db_uri`` fixture previously replayed the full Alembic
+    chain for every SQLite test. Copying this template preserves a private file
+    per test at the same Alembic head revision as a fresh migration. Because
+    the copied file carries its ``alembic_version`` stamp, its first
+    ``get_or_create_engine`` call takes the already-at-head verification path.
+    """
+    template = tmp_path_factory.mktemp("schema-template") / "template.db"
+    uri = f"sqlite:///{template}"
+    engine = get_or_create_engine(uri)
+    with _engine_lock:
+        _engine_cache.pop(uri, None)
+    engine.dispose()
+    return str(template)
+
+
 @pytest.fixture()
-def db_uri(tmp_path: Path, _worker_db_uri: str) -> Generator[str, None, None]:
+def db_uri(
+    tmp_path: Path,
+    _worker_db_uri: str,
+    request: pytest.FixtureRequest,
+) -> Generator[str, None, None]:
     """
     Per-test database URI.
 
-    * **SQLite** (default): fresh file per test, fully isolated.
+    * **SQLite** (default): fresh file per test, copied from the session
+      schema template so the Alembic chain runs once per worker rather than
+      once per test. Still fully isolated.
     * **Postgres / MySQL** (``OMNIGENT_TEST_DB_URI`` set): reuses the
       session-scoped worker database and truncates all non-alembic tables
       between tests so each test starts clean without re-migrating.
@@ -580,8 +605,10 @@ def db_uri(tmp_path: Path, _worker_db_uri: str) -> Generator[str, None, None]:
     import sqlalchemy as _sa
 
     if not _worker_db_uri:
-        # SQLite: per-test file.
+        # SQLite: per-test file, seeded from the migrated template.
+        template = request.getfixturevalue("_sqlite_schema_template")
         db_path = tmp_path / "test.db"
+        shutil.copyfile(template, db_path)
         uri = f"sqlite:///{db_path}"
         engine = get_or_create_engine(uri)
         yield uri
