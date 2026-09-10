@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,7 +15,7 @@ from omnigent_slack.approvals import (
 )
 from omnigent_slack.auth_manager import pack_user_key
 from omnigent_slack.elicitation import ElicitationController, ElicitationTurnState
-from omnigent_slack.models import SlackTurn, ThreadKey, event_is_dm
+from omnigent_slack.models import SessionRecord, SlackTurn, ThreadKey, event_is_dm
 from omnigent_slack.notifications import (
     SlackNotifier,
     format_output_file,
@@ -44,6 +46,14 @@ from omnigent_slack.streaming import (
     _AnswerReply,
 )
 from omnigent_slack.text import GENERIC_FAILURE_TEXT, strip_bot_mention
+from omnigent_slack.thread_context import (
+    ThreadContextLimits,
+    is_after,
+    is_ts,
+    newest_ts,
+    quotable_lines,
+    render_thread_context_prompt,
+)
 
 # Immediate acknowledgement shown while the session spins up and while the agent
 # works before the first streamed tokens arrive. Deleted only once real content
@@ -84,6 +94,145 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
+# Pages of NEW ground one read may render. ``conversations.replies`` serves a
+# thread oldest-first, so reaching the mention means paging forward — but only
+# this far, so a session start can't become a crawl.
+_REPLIES_PAGE_LIMIT = 200
+_REPLIES_MAX_PAGES = 5
+
+# Pages a catch-up may walk THROUGH — not render — when Slack ignores ``oldest``
+# and re-serves ground the last read covered. Without it the render budget goes
+# on that prefix and the catch-up never reaches the new messages at all.
+_REPLIES_MAX_SKIP_PAGES = 20
+
+# Ceiling on the in-thread disclosure post. It goes up after the reply, so a slow
+# ``chat_postMessage`` would otherwise hold a finished turn open for a courtesy.
+_DISCLOSURE_TIMEOUT_SECONDS = 3.0
+
+# Slack error codes are snake_case identifiers. Anything else is not a code and
+# is dropped rather than logged.
+_SLACK_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+class _MalformedRepliesPage(Exception):
+    """A ``conversations.replies`` page the bot can't trust.
+
+    ``reason`` is one of this module's own fixed labels, so it is safe to log.
+    Raised rather than worked around: a broken pagination contract means the
+    messages in hand are not known to be the thread's tail.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(slots=True)
+class _ThreadRead:
+    """What a paged ``conversations.replies`` crawl has actually fetched so far.
+
+    Mutated page by page, and owned by the CALLER rather than the crawl, so a
+    deadline that cuts the crawl short still leaves behind everything that
+    landed: the read degrades to partial instead of to nothing.
+    """
+
+    lines: deque[str]
+    # Qualifying lines seen across all pages, so the caller can tell that the
+    # sliding window dropped older ones.
+    qualifying: int = 0
+    # Pages that fully landed. Zero means nothing was fetched and no mark may move.
+    pages: int = 0
+    # Newest ts any landed page carried — the candidate floor for the next read
+    # when the crawl stopped short of the mention. A candidate only: whether it
+    # may be committed is ``_delivered_read_ts``'s call, not the crawl's.
+    reached_ts: str | None = None
+    # Whether the crawl read all the way to the mention.
+    complete: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ThreadContext:
+    """The outcome of one thread-context read, ready to hand to a turn.
+
+    ``read_ts`` / ``delivered_ts`` are marks to commit ONLY once the prompt is
+    accepted; ``None`` means "leave the stored mark alone", which is what every
+    failure path returns.
+    """
+
+    prompt: str
+    quoted: int = 0
+    read_ts: str | None = None
+    delivered_ts: str | None = None
+    catch_up: bool = False
+
+
+def _delivered_read_ts(read: _ThreadRead, *, mention_ts: str, quoted: int) -> str | None:
+    """How far this read may certify the thread as read, or ``None`` for "not at all".
+
+    A mark may only ever certify messages that actually reached the model, or
+    that the prompt explicitly marked as trimmed. FETCHED is not DELIVERED: a
+    page can land and still produce no quote at all — a character budget too
+    small to hold even one message renders the request unchanged, with nothing
+    quoted and no omission marker. Certifying those as read is a silent,
+    permanent gap, so this returns ``None`` and the next mention reads them
+    again.
+
+    A trim that keeps SOME of what it read is different: once anything survives,
+    every WHOLE message the caps dropped is announced by
+    ``[earlier messages omitted]``. (A retained message whose tail was clipped
+    is a different loss, carrying ``…[truncated]`` on its own line — visible
+    too, but not via the omission marker.) So an operator-configured cap stays a
+    bounded loss the prompt discloses, which is the only kind allowed to bury a
+    message.
+    """
+    if not read.pages:
+        # Nothing was fetched — a deadline that expired before the first page.
+        return None
+    if read.lines and not quoted:
+        # Fetched, delivered nothing, told the reader nothing.
+        return None
+    return mention_ts if read.complete else read.reached_ts
+
+
+def _allowlisted_code(value: Any) -> str | None:
+    """``value`` if it looks like a Slack error code, else ``None``."""
+    return value if isinstance(value, str) and _SLACK_ERROR_CODE_RE.fullmatch(value) else None
+
+
+def _slack_payload(response: Any) -> dict[str, Any] | None:
+    """A Slack response's body as a plain dict, or ``None`` if unreadable.
+
+    The async SDK returns ``AsyncSlackResponse``, which supports dict-style
+    access but is NOT a dict — its parsed body is ``.data``. Plain dicts pass
+    through so tests can hand one back. A bytes/list/absent body reads as
+    unreadable rather than raising on later access.
+    """
+    if isinstance(response, dict):
+        return response
+    try:
+        data = getattr(response, "data", None)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _slack_error_code(exc: BaseException) -> str:
+    """An allowlisted, payload-free label for a fail-open diagnostic.
+
+    Never the exception's own message: ``SlackApiError`` stringifies its entire
+    response, which carries the thread's message text. Exception-safe by
+    design — this runs inside a fail-open handler, so a second exception here
+    would abort the very session startup that handler exists to protect.
+    """
+    if isinstance(exc, _MalformedRepliesPage):
+        return exc.reason
+    try:
+        payload = _slack_payload(getattr(exc, "response", None))
+        code = _allowlisted_code(payload.get("error")) if payload is not None else None
+    except Exception:
+        return "none"
+    return code or "none"
+
 
 class _TurnAborted(Exception):
     """A turn can't proceed; ``text`` is the public user-facing reason to deliver."""
@@ -114,6 +263,9 @@ class _StreamState:
     errored: bool = False
     # Set when a known error was delivered mid-stream and the turn should stop.
     aborted: bool = False
+    # Set once the server has answered on the stream, which it can only do after
+    # it accepted the prompt — so this is the turn's proof the text was forwarded.
+    forwarded: bool = False
     # In-flight elicitation cards this turn (owned by the ElicitationController).
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
@@ -152,6 +304,7 @@ class SlackOmnigentService:
         server_url: str,
         bot_user_id: str | None = None,
         elicitations: ElicitationCoordinator | None = None,
+        thread_context: ThreadContextLimits | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
@@ -161,6 +314,8 @@ class SlackOmnigentService:
         # ignored, so a config change points every thread at the new server.
         self._server_url = server_url
         self._bot_user_id = bot_user_id
+        # Bounds on the thread history quoted into a new session's first prompt.
+        self._thread_context = thread_context or ThreadContextLimits()
         self._logger = logging.getLogger(__name__)
         # All outbound Slack messages (acks, replies, ephemerals, todo plan,
         # deflection notices) — keeps message formatting out of this class.
@@ -252,6 +407,8 @@ class SlackOmnigentService:
                 text=text,
                 client=client,
                 in_channel=not event_is_dm(event),
+                bot_user_id=bot_user_id,
+                is_mention=True,
             )
         except Exception:
             await self._unclaim_event(body, event)
@@ -319,6 +476,8 @@ class SlackOmnigentService:
                 text=text,
                 client=client,
                 in_channel=False,
+                bot_user_id=bot_user_id,
+                is_mention=False,
             )
         except Exception:
             await self._unclaim_event(body, event)
@@ -332,6 +491,8 @@ class SlackOmnigentService:
         text: str,
         client: SlackClientProtocol,
         in_channel: bool,
+        bot_user_id: str | None,
+        is_mention: bool,
     ) -> None:
         requester = str(event.get("user") or "")
         if not requester:
@@ -447,10 +608,23 @@ class SlackOmnigentService:
                         session_id=record.session_id,
                     )
                     return
+                # A re-mention on a running session. Everything posted since the
+                # last read is invisible to the agent — it only ever saw its own
+                # turns — so catch it up before this turn's request.
+                context = _ThreadContext(prompt=text, catch_up=True)
+                if is_mention:
+                    context = await self._prompt_with_thread_context(
+                        text,
+                        key=key,
+                        event=event,
+                        client=client,
+                        bot_user_id=bot_user_id,
+                        record=record,
+                    )
                 self._spawn_turn(
                     SlackTurn(
                         key=key,
-                        text=text,
+                        text=context.prompt,
                         user_id=requester,
                         create_if_missing=False,
                         # Title is only used when creating a session; an existing
@@ -465,6 +639,10 @@ class SlackOmnigentService:
                         # thread keeps running where it was created even if the
                         # user re-runs setup and switches host type.
                         host_type=record.host_type,
+                        context_messages=context.quoted,
+                        context_catch_up=context.catch_up,
+                        context_read_ts=context.read_ts,
+                        context_delivered_ts=context.delivered_ts,
                     )
                 )
                 spawned = True
@@ -486,10 +664,24 @@ class SlackOmnigentService:
                 )
                 return
 
+            # Every gate has passed and a NEW session is about to be created. A
+            # mention dropped into an existing discussion would otherwise reach
+            # the agent as that one line, so quote what was said above it.
+            context = _ThreadContext(prompt=text)
+            if is_mention:
+                context = await self._prompt_with_thread_context(
+                    text,
+                    key=key,
+                    event=event,
+                    client=client,
+                    bot_user_id=bot_user_id,
+                    record=None,
+                )
+
             self._spawn_turn(
                 SlackTurn(
                     key=key,
-                    text=text,
+                    text=context.prompt,
                     user_id=requester,
                     create_if_missing=True,
                     title=await _session_title(client, key, event),
@@ -499,6 +691,10 @@ class SlackOmnigentService:
                     workspace=config.workspace,
                     host_id=config.host_id,
                     host_type=config.host_type,
+                    context_messages=context.quoted,
+                    context_catch_up=context.catch_up,
+                    context_read_ts=context.read_ts,
+                    context_delivered_ts=context.delivered_ts,
                 )
             )
             spawned = True
@@ -507,6 +703,265 @@ class SlackOmnigentService:
             # turn's ``_run_turn_tracked`` finally owns the release from here on.
             if not spawned:
                 self._active_threads.discard(key)
+
+    async def _prompt_with_thread_context(
+        self,
+        text: str,
+        *,
+        key: ThreadKey,
+        event: dict[str, Any],
+        client: SlackClientProtocol,
+        bot_user_id: str | None,
+        record: SessionRecord | None,
+    ) -> _ThreadContext:
+        """Quote the thread messages this session hasn't seen ahead of ``text``.
+
+        Runs on EVERY mention in a channel thread, not just the first: with no
+        ``record`` this is the session's opening read, and with one it is a
+        catch-up over what was posted while the bot was quiet. A DM has no
+        surrounding discussion, and a mention that STARTS a thread has nothing
+        above it — both skip the read, the latter still marking the thread read
+        to its own ts, which is true.
+
+        Fails open, always: a missing ``channels:history`` / ``groups:history``
+        scope, a rate limit, or a malformed payload is logged and the prompt
+        returned unchanged with NO mark advanced — a mark moved over messages
+        that were never read would skip them permanently. A deadline is no longer
+        a failure: whatever pages landed are quoted and marked as partial, and
+        the mark stops at what was actually delivered, so the unread tail stays
+        above it for the next catch-up to recover.
+        """
+        limits = self._thread_context
+        thread_ts = str(event.get("thread_ts") or "")
+        mention_ts = str(event.get("ts") or "")
+        catch_up = record is not None
+        unchanged = _ThreadContext(prompt=text, catch_up=catch_up)
+        if not limits.enabled or event_is_dm(event) or key.is_dm:
+            return unchanged
+        if not is_ts(mention_ts):
+            return unchanged
+        if not thread_ts or thread_ts == mention_ts:
+            # A thread root: nothing precedes it, so the thread IS read to here.
+            return _ThreadContext(
+                prompt=text, read_ts=mention_ts, delivered_ts=mention_ts, catch_up=catch_up
+            )
+        if limits.max_messages <= 0 or limits.max_chars <= 0:
+            # Caps leave nothing quotable — don't read a thread we can't use.
+            return unchanged
+
+        since_ts = record.context_read_ts if record is not None else None
+        read = _ThreadRead(lines=deque(maxlen=limits.max_messages))
+        try:
+            finished = await self._within(
+                self._crawl_thread(
+                    read,
+                    key=key,
+                    thread_ts=thread_ts,
+                    mention_ts=mention_ts,
+                    since_ts=since_ts,
+                    exclude_ts=record.context_delivered_ts if record is not None else None,
+                    client=client,
+                    bot_user_id=bot_user_id,
+                ),
+                limits.timeout_seconds,
+                label="thread-context read",
+            )
+        except Exception as exc:
+            # Class and Slack error code only — an exception's message can carry
+            # the thread's own text, which never belongs in a log.
+            self._logger.info(
+                "Slack thread context unavailable thread=%s error=%s code=%s",
+                key.display(),
+                type(exc).__name__,
+                _slack_error_code(exc),
+            )
+            return unchanged
+
+        # Snapshot before anything can await again: an abandoned crawl that
+        # swallowed its cancellation may still be mutating ``read``.
+        snapshot = _ThreadRead(
+            lines=deque(read.lines),
+            qualifying=read.qualifying,
+            pages=read.pages,
+            reached_ts=read.reached_ts,
+            complete=read.complete,
+        )
+        lines = list(snapshot.lines)
+        prompt, quoted = render_thread_context_prompt(
+            text,
+            lines,
+            limits=limits,
+            omitted_earlier=snapshot.qualifying > len(lines),
+            partial_thread=not snapshot.complete,
+        )
+        read_ts = _delivered_read_ts(snapshot, mention_ts=mention_ts, quoted=quoted)
+        self._logger.info(
+            "Read Slack thread context thread=%s catch_up=%s quoted=%s pages=%s "
+            "finished=%s complete=%s certified=%s chars=%s",
+            key.display(),
+            catch_up,
+            quoted,
+            snapshot.pages,
+            finished,
+            snapshot.complete,
+            read_ts is not None,
+            len(prompt) - len(text),
+        )
+        return _ThreadContext(
+            prompt=prompt,
+            quoted=quoted,
+            read_ts=read_ts,
+            # The mention itself reaches the agent whether or not its context
+            # read got anywhere, so a later catch-up must not quote this request
+            # back as if it were someone else's background chatter.
+            delivered_ts=mention_ts,
+            catch_up=catch_up,
+        )
+
+    async def _crawl_thread(
+        self,
+        read: _ThreadRead,
+        *,
+        key: ThreadKey,
+        thread_ts: str,
+        mention_ts: str,
+        since_ts: str | None,
+        exclude_ts: str | None,
+        client: SlackClientProtocol,
+        bot_user_id: str | None,
+    ) -> None:
+        """Page ``conversations.replies`` toward the mention, filling ``read``.
+
+        ``conversations.replies`` serves a thread OLDEST-first, so the messages
+        just before the mention are on its LAST page — reached by following
+        ``next_cursor``. Two separate budgets bound the walk: ``_REPLIES_MAX_PAGES``
+        pages of new ground and ``_REPLIES_MAX_SKIP_PAGES`` already-read ones, so
+        one mention issues up to 25 requests, not the five the render budget alone
+        suggests. A sliding window keeps just the newest qualifying messages, and
+        anything dropped (by that window, either budget, or the caller's deadline)
+        is marked in the rendered block.
+
+        ``read`` is updated only once a whole page has landed, so a caller that
+        abandons this mid-page still renders a consistent prefix of the crawl.
+
+        Raises :class:`_MalformedRepliesPage` for an unreadable page or a broken
+        cursor chain, so the caller falls back to the mention alone rather than
+        quoting a window it can't place in the thread.
+        """
+        cursor: str | None = None
+        used_cursors: set[str] = set()
+        # Pages counted separately: those that carried new ground, and those
+        # that landed entirely at or below the floor. Only the first kind spends
+        # the render budget — see the skip accounting below.
+        read_pages = 0
+        skipped_pages = 0
+        while read_pages < _REPLIES_MAX_PAGES and skipped_pages < _REPLIES_MAX_SKIP_PAGES:
+            params: dict[str, Any] = {
+                "channel": key.channel_id,
+                "ts": thread_ts,
+                # Bound the range at the mention and, on a catch-up, at the read
+                # mark. The renderer re-applies both: Slack serves the thread's
+                # parent message whatever ``oldest`` says.
+                "latest": mention_ts,
+                "inclusive": False,
+                "limit": _REPLIES_PAGE_LIMIT,
+            }
+            if since_ts:
+                params["oldest"] = since_ts
+            if cursor:
+                params["cursor"] = cursor
+            payload = _slack_payload(await client.conversations_replies(**params))
+            if payload is None:
+                raise _MalformedRepliesPage("unreadable_page")
+            if payload.get("ok") is False:
+                raise _MalformedRepliesPage(_allowlisted_code(payload.get("error")) or "not_ok")
+            messages = payload.get("messages")
+            if not isinstance(messages, list):
+                # An ``ok`` page always carries a list. Reading it as "no more
+                # messages" would keep earlier pages and present them as the
+                # whole read.
+                raise _MalformedRepliesPage("unreadable_page")
+            read.pages += 1
+            page_newest = newest_ts(messages, None, before_ts=mention_ts)
+            read.reached_ts = newest_ts(messages, read.reached_ts, before_ts=mention_ts)
+            # A page entirely at or below the floor is ground a previous read
+            # covered. Spending the render budget on it would leave every future
+            # mention re-reading the same prefix, so it goes on the skip budget.
+            if since_ts is not None and not is_after(page_newest, since_ts):
+                skipped_pages += 1
+            else:
+                read_pages += 1
+                lines = quotable_lines(
+                    messages,
+                    mention_ts=mention_ts,
+                    bot_user_id=bot_user_id,
+                    since_ts=since_ts,
+                    exclude_ts=exclude_ts,
+                )
+                read.qualifying += len(lines)
+                read.lines.extend(lines)
+            if not payload.get("has_more"):
+                # Read through to the mention: everything below it is covered.
+                read.complete = True
+                return
+            # More to read, so the cursor must be usable and new. Neither holding
+            # an incomplete window nor re-reading a page is acceptable: both
+            # misrepresent which messages precede the mention.
+            cursor = _next_cursor(payload)
+            if cursor is None:
+                raise _MalformedRepliesPage("missing_cursor")
+            if cursor in used_cursors:
+                raise _MalformedRepliesPage("repeated_cursor")
+            used_cursors.add(cursor)
+
+    async def _within(self, coro: Any, seconds: float, *, label: str) -> bool:
+        """Run ``coro`` under a hard ceiling; return whether it finished in time.
+
+        Not ``asyncio.wait_for``: that AWAITS the child's cancellation, so a
+        client that swallows ``CancelledError`` defeats the ceiling entirely and
+        the caller hangs for exactly as long as it was trying not to. Here the
+        child is cancelled and ABANDONED, so the ceiling holds whatever the child
+        does about it.
+
+        The abandon path also runs when this wrapper is itself cancelled —
+        otherwise the child outlives the turn that started it, untracked. It is
+        deliberately not registered in ``_turn_tasks``: shutdown gathers those,
+        which would reintroduce the unbounded wait this exists to prevent. The
+        cost is a "Task was destroyed but it is pending" warning if a
+        cancellation-suppressing child is still running when the loop closes.
+
+        An exception from a child that DID finish is re-raised to the caller.
+        """
+        task = asyncio.ensure_future(coro)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=seconds)
+        except BaseException:
+            self._abandon(task, label)
+            raise
+        if not done:
+            self._logger.info("Slack %s exceeded its %ss deadline; abandoning", label, seconds)
+            self._abandon(task, label)
+            return False
+        task.result()
+        return True
+
+    def _abandon(self, task: asyncio.Task[Any], label: str) -> None:
+        """Cancel a task we will never await, retrieving whatever it ends with.
+
+        Without the callback, a child that fails after being abandoned surfaces
+        on the event loop as "Task exception was never retrieved".
+        """
+        task.cancel()
+        task.add_done_callback(lambda finished: self._log_abandoned(label, finished))
+
+    def _log_abandoned(self, label: str, task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._logger.info(
+                "Abandoned Slack %s failed after its deadline error=%s", label, type(exc).__name__
+            )
 
     def _spawn_turn(self, turn: SlackTurn) -> None:
         """Run a reserved turn as a background task, tracked for shutdown.
@@ -566,12 +1021,20 @@ class SlackOmnigentService:
         # no-delta fallback below can tell this turn's answer from a prior one.
         baseline = await omnigent.latest_assistant_message(session_id)
 
+        # Owned here, not by _stream_turn, so ``forwarded`` survives the abort path.
+        state = _StreamState()
         try:
-            errored = await self._stream_turn(turn, omnigent, session_id, reply)
+            errored = await self._stream_turn(turn, omnigent, session_id, reply, state)
         except _TurnAborted:
-            # A known mid-stream error already delivered its message and stopped
-            # the reply; nothing left to finalize.
+            # The mid-stream error already delivered its message and stopped the
+            # reply, but the prompt went out, so the thread is still owed its notice.
+            await self._disclose_thread_context(turn, state)
             return
+
+        if not errored:
+            # A clean stream is what licenses the marks to move; short of that the
+            # next mention reads those messages again.
+            await self._commit_thread_marks(turn)
 
         if reply.needs_fallback_text():
             # Last-resort safety net: the turn delivered no answer text on the
@@ -599,6 +1062,10 @@ class SlackOmnigentService:
             # already logged in _stream_turn; never echo it to the channel.
             await self._notifier.post_failure_reply(turn.slack_client, turn.key)
 
+        # After the answer: the notice is a courtesy and must never sit in front
+        # of the reply the user is waiting for.
+        await self._disclose_thread_context(turn, state)
+
         self._logger.info(
             "Completed Slack turn thread=%s session=%s streamed_chars=%s segments=%s errored=%s",
             turn.key.display(),
@@ -607,6 +1074,54 @@ class SlackOmnigentService:
             reply.segments,
             errored,
         )
+
+    async def _commit_thread_marks(self, turn: SlackTurn) -> None:
+        """Move this turn's thread-read marks forward, for a turn that ran clean.
+
+        Only a clean stream may advance them. A mark moved over messages a turn
+        never delivered skips them permanently; leaving it costs a re-quote the
+        next mention makes visible. A failed commit is dropped for the same
+        reason — the worst it can cost is that re-quote.
+        """
+        if turn.context_read_ts is None and turn.context_delivered_ts is None:
+            return
+        try:
+            await self._store.advance_thread_marks(
+                turn.key,
+                read_ts=turn.context_read_ts,
+                delivered_ts=turn.context_delivered_ts,
+            )
+        except Exception:
+            self._logger.warning(
+                "Thread-context marks not committed thread=%s; the next mention re-quotes",
+                turn.key.display(),
+            )
+
+    async def _disclose_thread_context(self, turn: SlackTurn, state: _StreamState) -> None:
+        """Tell the thread, publicly, that its messages went into this turn.
+
+        Gated on the prompt having been FORWARDED, not on the turn having gone
+        well: a stream that errors or aborts mid-answer has already sent the
+        quoted messages, and the people quoted are owed the notice just the same.
+        A turn that never reached the server says nothing, so the count can still
+        not overstate what was sent.
+
+        Best-effort and bounded, and posted after the reply, so a slow
+        ``chat_postMessage`` costs the notice rather than the turn.
+        """
+        if not turn.context_messages or not state.forwarded:
+            return
+        with contextlib.suppress(Exception):
+            await self._within(
+                self._notifier.post_context_disclosure(
+                    turn.slack_client,
+                    turn.key,
+                    turn.context_messages,
+                    catch_up=turn.context_catch_up,
+                ),
+                _DISCLOSURE_TIMEOUT_SECONDS,
+                label="context disclosure",
+            )
 
     async def _notify_auth_expired(self, turn: SlackTurn, reply: _AnswerReply) -> None:
         """Deliver the expired-login re-login prompt as a DM with a setup button.
@@ -770,6 +1285,7 @@ class SlackOmnigentService:
         omnigent: OmnigentClient,
         session_id: str,
         reply: _AnswerReply,
+        state: _StreamState,
     ) -> bool:
         """Stream the turn's events into ``reply``. Returns whether it errored.
 
@@ -782,8 +1298,6 @@ class SlackOmnigentService:
         message (delivered here); any other exception, or an in-band
         ``response.error`` event, becomes error text used at finalization.
         """
-        # Timestamp of the live plan/todo message, edited in place across updates.
-        state = _StreamState()
         try:
             # Explicit iteration (not ``async for``) so a gap between events can
             # be detected: when the stream goes quiet for ``_IDLE_FLUSH_SECONDS``
@@ -814,6 +1328,7 @@ class SlackOmnigentService:
                     except StopAsyncIteration:
                         break
                     pending = None
+                    state.forwarded = True
                     await self._dispatch_stream_event(
                         event, turn, omnigent, session_id, reply, state
                     )
@@ -1028,6 +1543,13 @@ def _team_id(body: dict[str, Any], event: dict[str, Any]) -> str:
     if not team_id:
         raise ValueError("Slack event is missing team_id")
     return str(team_id)
+
+
+def _next_cursor(payload: dict[str, Any]) -> str | None:
+    """The ``response_metadata.next_cursor`` of a Slack page, if it carries one."""
+    metadata = payload.get("response_metadata")
+    cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
+    return cursor if isinstance(cursor, str) and cursor else None
 
 
 def _event_id(body: dict[str, Any], event: dict[str, Any]) -> str | None:

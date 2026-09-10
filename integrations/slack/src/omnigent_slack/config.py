@@ -7,6 +7,13 @@ from typing import Literal
 from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from omnigent_slack.thread_context import (
+    DEFAULT_ENABLED,
+    DEFAULT_MAX_CHARS,
+    DEFAULT_MAX_MESSAGES,
+    DEFAULT_TIMEOUT_SECONDS,
+)
+
 
 class ConfigError(Exception):
     """A configuration problem stated in operator-friendly terms.
@@ -146,6 +153,37 @@ class Settings(BaseSettings):
     token_encryption_key: str | None = Field(
         default=None,
         validation_alias="OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY",
+    )
+
+    # ── Thread context ────────────────────────────────────────────────────
+    # An @-mention in an existing thread quotes the messages above it into the
+    # prompt. OFF by default — it forwards OTHER people's messages. See README.
+    thread_context_enabled: bool = Field(
+        default=DEFAULT_ENABLED,
+        validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT",
+    )
+
+    # Caps on the quoted block. Both trim from the OLDEST end — the messages
+    # nearest the mention are the ones the request is about — and mark the trim.
+    thread_context_max_messages: int = Field(
+        default=DEFAULT_MAX_MESSAGES,
+        ge=0,
+        validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES",
+    )
+    thread_context_max_chars: int = Field(
+        default=DEFAULT_MAX_CHARS,
+        ge=0,
+        validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS",
+    )
+
+    # Hard deadline on the whole read. ``allow_inf_nan`` is off because ``inf``
+    # satisfies ``gt=0`` and would mean no deadline at all, holding the thread's
+    # turn reservation open indefinitely.
+    thread_context_timeout_seconds: float = Field(
+        default=DEFAULT_TIMEOUT_SECONDS,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT",
     )
 
     # ── Databricks Apps web-auth (header/proxy-mode servers) ──────────────

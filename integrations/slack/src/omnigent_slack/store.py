@@ -8,6 +8,7 @@ import aiosqlite
 
 from omnigent_slack.events import HostType
 from omnigent_slack.models import SessionRecord, ThreadKey, UserConfig
+from omnigent_slack.thread_context import newer_ts
 
 # Columns added to a table after it was first created, as
 # ``(table, column, definition)``. ``CREATE TABLE IF NOT EXISTS`` leaves an
@@ -15,9 +16,19 @@ from omnigent_slack.models import SessionRecord, ThreadKey, UserConfig
 # shape and every query naming a newer column fails. ``initialize`` adds each
 # missing one in place. A definition must carry a default, since SQLite requires
 # one to add a NOT NULL column to a populated table.
+# How long a writer waits for another writer's lock before giving up. Stated
+# rather than inherited from the driver, so the wait a turn can spend here is a
+# decision this module owns.
+_BUSY_TIMEOUT_MS = 5000
+
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("thread_sessions", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
     ("user_configs", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
+    # Thread-read marks. NULLABLE on purpose: a session created before they
+    # existed reads NULL and falls back to the normal bounded window, never to
+    # an unbounded backfill of everything since the thread began.
+    ("thread_sessions", "context_read_ts", "TEXT"),
+    ("thread_sessions", "context_delivered_ts", "TEXT"),
 )
 
 
@@ -51,6 +62,8 @@ class SQLiteStore:
                     host_id TEXT,
                     workspace TEXT,
                     host_type TEXT NOT NULL DEFAULT 'external',
+                    context_read_ts TEXT,
+                    context_delivered_ts TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (team_id, channel_id, thread_ts)
@@ -106,7 +119,8 @@ class SQLiteStore:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
                 """
-                SELECT omnigent_session_id, owner_user_id, host_id, workspace, host_type
+                SELECT omnigent_session_id, owner_user_id, host_id, workspace, host_type,
+                       context_read_ts, context_delivered_ts
                 FROM thread_sessions
                 WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
                 """,
@@ -122,6 +136,8 @@ class SQLiteStore:
             host_id=str(row[2]) if row[2] is not None else None,
             workspace=str(row[3]) if row[3] is not None else None,
             host_type=_host_type(row[4]),
+            context_read_ts=str(row[5]) if row[5] is not None else None,
+            context_delivered_ts=str(row[6]) if row[6] is not None else None,
         )
 
     async def upsert_session(
@@ -166,6 +182,68 @@ class SQLiteStore:
                     host_type,
                     now,
                     now,
+                ),
+            )
+            await db.commit()
+
+    async def advance_thread_marks(
+        self,
+        key: ThreadKey,
+        *,
+        read_ts: str | None = None,
+        delivered_ts: str | None = None,
+    ) -> None:
+        """Move this thread's read/delivered marks FORWARD, never backwards.
+
+        ``read_ts`` is how far a read actually delivered or marked — the floor
+        the next catch-up starts from. ``delivered_ts`` is the newest mention whose prompt
+        was accepted. ``None`` leaves that mark alone; both are compared with
+        Slack-timestamp ordering rather than string ordering, so a
+        ``"1000000000.x"`` mark is not treated as older than ``"999999999.x"``.
+
+        Read-compare-write under ``BEGIN IMMEDIATE`` so two turns finishing at
+        once can't interleave: an unconditional write lets a delayed mention
+        rewind the mark past ground a newer one already covered, which re-quotes
+        everything in between. A thread with no session row (a logout mid-turn)
+        is a no-op.
+        """
+        if read_ts is None and delivered_ts is None:
+            return
+        now = int(time.time())
+        async with aiosqlite.connect(self._path) as db:
+            # Take the write lock before reading, so the compare below is made
+            # against a value no concurrent writer can change under us, and wait
+            # a stated interval for it rather than failing the moment it is held.
+            await db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT context_read_ts, context_delivered_ts
+                FROM thread_sessions
+                WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
+                """,
+                (key.team_id, key.channel_id, key.thread_ts),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.rollback()
+                return
+            stored_read = str(row[0]) if row[0] is not None else None
+            stored_delivered = str(row[1]) if row[1] is not None else None
+            await db.execute(
+                """
+                UPDATE thread_sessions
+                SET context_read_ts = ?, context_delivered_ts = ?, updated_at = ?
+                WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
+                """,
+                (
+                    newer_ts(stored_read, read_ts),
+                    newer_ts(stored_delivered, delivered_ts),
+                    now,
+                    key.team_id,
+                    key.channel_id,
+                    key.thread_ts,
                 ),
             )
             await db.commit()

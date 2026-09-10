@@ -35,6 +35,32 @@ except Exception:  # pragma: no cover
     _ACK_TEXT = "Working on it…"
 
 
+def replies_page(thread: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+    """The body Slack returns for one ``conversations.replies`` page.
+
+    Reproduces the semantics the bot depends on: a thread is served
+    OLDEST-first within the range bounded by ``oldest`` and ``latest``, one
+    ``limit``-sized page at a time, with ``has_more`` +
+    ``response_metadata.next_cursor`` to walk forward. The cursor is an opaque
+    offset here.
+    """
+    latest = str(kwargs.get("latest") or "")
+    oldest = str(kwargs.get("oldest") or "")
+    visible = [
+        message
+        for message in thread
+        if (not latest or float(str(message.get("ts") or 0)) < float(latest))
+        and (not oldest or float(str(message.get("ts") or 0)) > float(oldest))
+    ]
+    start = int(str(kwargs.get("cursor") or "0"))
+    page = visible[start : start + int(kwargs.get("limit") or 200)]
+    end = start + len(page)
+    body: dict[str, Any] = {"ok": True, "messages": page, "has_more": end < len(visible)}
+    if body["has_more"]:
+        body["response_metadata"] = {"next_cursor": str(end)}
+    return body
+
+
 class FakeStream:
     """Records a ``chat_stream`` lifecycle: appended deltas and the stop tail.
 
@@ -95,6 +121,9 @@ class RecordingSlackClient:
         self.opened_views: list[dict[str, Any]] = []
         self.updated_views: list[dict[str, Any]] = []
         self.streams: list[FakeStream] = []
+        # Thread history conversations_replies serves, and the calls it received.
+        self.thread_replies: list[dict[str, Any]] = []
+        self.replies_calls: list[dict[str, Any]] = []
         self._next_ts = 0
 
     # ── turn path ────────────────────────────────────────────────────────
@@ -137,6 +166,12 @@ class RecordingSlackClient:
         stream = FakeStream(self, kwargs)
         self.streams.append(stream)
         return stream
+
+    async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+        # One page of the thread, with Slack's real ordering and cursor
+        # semantics (see :func:`replies_page`).
+        self.replies_calls.append({**kwargs})
+        return replies_page(self.thread_replies, **kwargs)
 
     # ── setup path ───────────────────────────────────────────────────────
     async def views_open(self, **kwargs: Any) -> dict[str, Any]:

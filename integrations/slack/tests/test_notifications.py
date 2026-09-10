@@ -70,3 +70,69 @@ def test_session_web_link_maps_workspace_api_mount_to_ui() -> None:
         notifier._session_web_link("conv_abc")
         == "https://ws.databricks.com/omnigent/c/conv_abc?o=123"
     )
+
+
+async def test_context_disclosure_names_the_read_it_came_from() -> None:
+    """The two reads say different true things, and neither claims the other.
+
+    A first read forwards what was said before the bot arrived; a catch-up
+    forwards what was said while it was quiet. Both are public in-thread, so the
+    people whose words were forwarded see it rather than only the mentioner.
+    """
+    import logging
+
+    from omnigent_slack.models import ThreadKey
+    from omnigent_slack.notifications import SlackNotifier
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.posts: list[dict[str, object]] = []
+
+        async def chat_postMessage(self, **kwargs: object) -> dict[str, object]:
+            self.posts.append(kwargs)
+            return {"ok": True, "ts": "1"}
+
+    notifier = SlackNotifier(server_url="http://s", logger=logging.getLogger("test"))
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    client = Recorder()
+
+    await notifier.post_context_disclosure(client, key, 3, catch_up=False)  # type: ignore[arg-type]
+    await notifier.post_context_disclosure(client, key, 2, catch_up=True)  # type: ignore[arg-type]
+    # Nothing was forwarded, so nothing is claimed.
+    await notifier.post_context_disclosure(client, key, 0, catch_up=True)  # type: ignore[arg-type]
+
+    assert [post["text"] for post in client.posts] == [
+        ":speech_balloon: 3 earlier message(s) from this thread were included as "
+        "context for this session.",
+        ":speech_balloon: 2 additional message(s) from this thread were included as "
+        "context for this session.",
+    ]
+    assert all(post["thread_ts"] == "100.1" for post in client.posts)
+
+
+async def test_a_failed_context_disclosure_never_raises() -> None:
+    """Best-effort: the forwarding already happened, and the turn must not die
+    over a notice about it."""
+    import logging
+
+    from omnigent_slack.models import ThreadKey
+    from omnigent_slack.notifications import SlackNotifier
+
+    class Broken:
+        def __init__(self) -> None:
+            self.attempts: list[dict[str, object]] = []
+
+        async def chat_postMessage(self, **kwargs: object) -> dict[str, object]:
+            self.attempts.append(kwargs)
+            raise RuntimeError("slack is down")
+
+    notifier = SlackNotifier(server_url="http://s", logger=logging.getLogger("test"))
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    client = Broken()
+
+    await notifier.post_context_disclosure(client, key, 3, catch_up=True)  # type: ignore[arg-type]
+
+    # Not-raising is only half of it: a no-op would satisfy that too. The post
+    # must actually have been attempted, with the disclosure on it.
+    assert len(client.attempts) == 1
+    assert "3 additional message(s)" in str(client.attempts[0]["text"])

@@ -82,6 +82,18 @@ class SessionRecord:
     ``host_type`` is recorded per session, not just per user: it decides whether
     a later turn on this thread may launch a runner, and it must survive both a
     bot restart and the user changing their setup mid-thread.
+
+    The two marks are how the thread catches up across mentions. ``context_read_ts``
+    is how far a read actually DELIVERED (or explicitly marked as trimmed) — the
+    floor the next read starts from, so a tail one read abandoned stays above it
+    and the next read recovers it. Fetching alone never advances it.
+    ``context_delivered_ts`` is the newest mention whose prompt was accepted, so
+    that request isn't re-quoted back as background. They coincide until a
+    deadline or the page budget cuts a crawl short — or until a crawl completes
+    but renders nothing at all (a character budget too small to quote one
+    message), which certifies no read while still recording the mention as
+    delivered. ``None`` on both (a session predating them) falls back to the
+    normal bounded window.
     """
 
     session_id: str
@@ -89,6 +101,8 @@ class SessionRecord:
     host_id: str | None
     workspace: str | None
     host_type: HostType = "external"
+    context_read_ts: str | None = None
+    context_delivered_ts: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,3 +118,13 @@ class SlackTurn:
     workspace: str | None = None
     host_id: str | None = None
     host_type: HostType = "external"
+    # How many thread messages ``text`` quotes, and whether they came from a
+    # catch-up rather than the thread's first read. Disclosed in-thread once the
+    # prompt has been forwarded, so the people quoted can see it happened.
+    context_messages: int = 0
+    context_catch_up: bool = False
+    # Thread-read marks to commit once the prompt is accepted — never before.
+    # Advancing them on a turn that never reached a model would skip those
+    # messages permanently; leaving them costs a re-quote at worst.
+    context_read_ts: str | None = None
+    context_delivered_ts: str | None = None

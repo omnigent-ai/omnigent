@@ -22,6 +22,7 @@ from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
 from omnigent_slack.setup import SetupFlow
 from omnigent_slack.store import SQLiteStore
+from omnigent_slack.thread_context import ThreadContextLimits
 from omnigent_slack.tokens import EncryptedTokenStore, InMemoryTokenStore, TokenStore
 from omnigent_slack.webauth import WebAuthServer
 
@@ -137,6 +138,12 @@ async def run() -> None:
         pool=pool,
         setup=setup,
         server_url=settings.server_url,
+        thread_context=ThreadContextLimits(
+            enabled=settings.thread_context_enabled,
+            max_messages=settings.thread_context_max_messages,
+            max_chars=settings.thread_context_max_chars,
+            timeout_seconds=settings.thread_context_timeout_seconds,
+        ),
     )
 
     app = AsyncApp(token=settings.slack_bot_token)

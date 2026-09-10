@@ -14,6 +14,7 @@ import logging
 from typing import Any, Protocol
 
 from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from omnigent_slack.models import ThreadKey
 from omnigent_slack.text import GENERIC_FAILURE_TEXT, truncate_for_slack
@@ -23,6 +24,12 @@ class SlackStreamProtocol(Protocol):
     async def append(self, *, markdown_text: str | None = ..., chunks: Any = ...) -> Any: ...
 
     async def stop(self, *, markdown_text: str | None = ...) -> Any: ...
+
+
+# A Slack Web-API response as the bot may receive it. ``AsyncSlackResponse``
+# is not a ``dict``, so anything reading a body structurally must normalize
+# first (see ``service._slack_payload``).
+SlackResponse = dict[str, Any] | AsyncSlackResponse
 
 
 class SlackClientProtocol(Protocol):
@@ -35,6 +42,11 @@ class SlackClientProtocol(Protocol):
     async def chat_update(self, **kwargs: Any) -> dict[str, Any]: ...
 
     async def chat_getPermalink(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    # Typed as the union the callers actually handle: the real client returns
+    # ``AsyncSlackResponse`` (dict-style access, but NOT a dict — its body is
+    # ``.data``), while test fakes hand back a plain dict.
+    async def conversations_replies(self, **kwargs: Any) -> SlackResponse: ...
 
     async def chat_stream(self, **kwargs: Any) -> SlackStreamProtocol: ...
 
