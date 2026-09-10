@@ -1007,11 +1007,14 @@ aside[aria-label="Workspace"][data-maximized] {
  *
  * The bg override pulls inline-code chips off the page-default `bg-muted`
  * (which is only ~4% darker than the background) onto the dedicated
- * --code-bg token (~7% light / ~12% dark step from page). Reference:
+ * --code-bg token (~7% light / ~12% dark step from page). A small tracking
+ * step keeps punctuation runs distinct at the fractional rendered size.
+ * Reference:
  * Claude Code's inline chips — stronger contrast does the differentiation
  * work without needing a foreground tint or extra border. */
 [data-streamdown="inline-code"] {
   font-size: 0.875em;
+  letter-spacing: 0.025em;
   background-color: var(--code-bg);
 }
 [data-streamdown="code-block-body"] {

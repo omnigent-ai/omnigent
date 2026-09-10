@@ -174,6 +174,17 @@ describe("index.css app-shell viewport lock", () => {
   });
 });
 
+describe("index.css inline code rule", () => {
+  const rule = cssBlocks
+    .map(([block]) => block)
+    .find((block) => selectorOf(block) === '[data-streamdown="inline-code"]');
+
+  it("keeps punctuation runs visually separated", () => {
+    expect(rule, "the inline-code rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/letter-spacing\s*:\s*0\.025em/);
+  });
+});
+
 const allWidthNativeLayoutRules = [
   ["iOS keyboard viewport", "[data-ios-native].app-shell", "--omnigent-viewport-height"],
   ["native chat header", ".chat-header", "--omnigent-safe-top"],
