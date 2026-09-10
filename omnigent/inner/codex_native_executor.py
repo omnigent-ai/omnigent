@@ -8,7 +8,9 @@ import binascii
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -56,6 +58,8 @@ _logger = logging.getLogger(__name__)
 
 _NO_ACTIVE_TURN_ERROR_CODE = -32600
 _NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
+_COMPACTION_WAIT_TIMEOUT_S = 60.0
+_COMPACTION_POLL_INTERVAL_S = 0.1
 
 
 def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
@@ -65,6 +69,61 @@ def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
         and error.message is not None
         and error.message.strip().casefold() == _NO_ACTIVE_TURN_ERROR_MESSAGE
     )
+
+
+def _replacement_turn_id(error: CodexAppServerResponseError, expected_turn_id: str) -> str | None:
+    """Read a replacement only from an explicit rejection of our expected turn."""
+    if error.code != _NO_ACTIVE_TURN_ERROR_CODE or error.message is None:
+        return None
+    match = re.fullmatch(
+        r"expected active turn id `([^`\s]+)` but found `([^`\s]+)`", error.message
+    )
+    if match is None or match[1] != expected_turn_id or match[2] == expected_turn_id:
+        return None
+    return match[2]
+
+
+def _is_compacting_turn(error: CodexAppServerResponseError) -> bool:
+    """Recognize Codex's structured rejection of steering during compaction."""
+    if error.code != _NO_ACTIVE_TURN_ERROR_CODE:
+        return False
+    payload = _json_object(error.error)
+    data = _json_object(payload.get("data")) if payload is not None else None
+    info = _json_object(data.get("codexErrorInfo")) if data is not None else None
+    not_steerable = _json_object(info.get("activeTurnNotSteerable")) if info is not None else None
+    return not_steerable is not None and not_steerable.get("turnKind") == "compact"
+
+
+def _read_recovery_state(
+    bridge_dir: Path, expected: CodexNativeBridgeState
+) -> CodexNativeBridgeState:
+    """Reject recovery after the session, thread, or app-server has changed."""
+    current = read_bridge_state(bridge_dir)
+    if current is None or (
+        current.session_id,
+        current.thread_id,
+        current.socket_path,
+    ) != (expected.session_id, expected.thread_id, expected.socket_path):
+        raise RuntimeError("Codex native bridge changed while recovering a rejected steer")
+    return current
+
+
+async def _wait_for_compaction(
+    bridge_dir: Path, expected: CodexNativeBridgeState
+) -> CodexNativeBridgeState:
+    """Hold rejected input until the forwarder observes compaction finishing."""
+    try:
+        async with asyncio.timeout(_COMPACTION_WAIT_TIMEOUT_S):
+            while True:
+                current = _read_recovery_state(bridge_dir, expected)
+                if current.active_turn_id != expected.active_turn_id:
+                    return current
+                await asyncio.sleep(_COMPACTION_POLL_INTERVAL_S)
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "Codex is still compacting; this message was not delivered. "
+            "Wait for compaction to finish before retrying."
+        ) from exc
 
 
 async def _start_codex_turn(
@@ -144,7 +203,7 @@ async def _inject_codex_turn(
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
 ) -> None:
-    """Steer an active turn or start one, recovering one proven stale steer."""
+    """Steer or start a turn, retrying once only after a proven rejection."""
     if state.active_turn_id is None:
         await _start_codex_turn(
             client,
@@ -165,18 +224,22 @@ async def _inject_codex_turn(
         )
         return
     except CodexAppServerResponseError as error:
-        if not _is_no_active_turn_to_steer(error):
+        recovered_state = _read_recovery_state(bridge_dir, state)
+        replacement_turn_id = _replacement_turn_id(error, expected_turn_id)
+        if _is_no_active_turn_to_steer(error):
+            clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
+            recovered_state = _read_recovery_state(bridge_dir, state)
+        elif replacement_turn_id is not None:
+            if recovered_state.active_turn_id in (None, expected_turn_id):
+                recovered_state = replace(recovered_state, active_turn_id=replacement_turn_id)
+        elif _is_compacting_turn(error):
+            recovered_state = await _wait_for_compaction(bridge_dir, state)
+        else:
             raise
 
-    # Codex authoritatively says A ended. Clear A only if it is still the
-    # bridge's value; a concurrent turn/started(B) must survive this recovery.
-    clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
-    recovered_state = read_bridge_state(bridge_dir)
-    if recovered_state is None or recovered_state.session_id != state.session_id:
-        raise RuntimeError("Codex native bridge changed while recovering a stale turn")
     if recovered_state.active_turn_id is not None:
         _logger.info(
-            "Codex native stale steer raced with a newer turn; steering turn_id=%s",
+            "Codex native reconciled rejected steer; steering turn_id=%s",
             recovered_state.active_turn_id,
         )
         await _steer_codex_turn(
