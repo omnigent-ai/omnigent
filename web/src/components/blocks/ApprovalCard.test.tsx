@@ -1454,3 +1454,47 @@ describe("ApprovalCard — cancel verdict", () => {
     expect(screen.queryByText(/Rejected/)).toBeNull();
   });
 });
+
+describe("ApprovalCard — prompt expired", () => {
+  it("says the prompt expired and how to resume instead of 'Resolved elsewhere'", () => {
+    // The server's deferred clear fires when the hook stopped waiting and
+    // nobody answered. "Resolved elsewhere" implied someone had, which
+    // left the session looking ambiguously stuck.
+    render(
+      <ApprovalCard
+        elicitationId="elic_expired"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "auto_resolved", reason: "unanswered" }}
+      />,
+    );
+
+    expect(screen.getByText(/Prompt expired/)).toBeDefined();
+    expect(screen.getByTestId("prompt-expired-hint").textContent).toContain(
+      "Send a message to continue",
+    );
+    expect(screen.queryByText(/Resolved elsewhere/)).toBeNull();
+  });
+
+  it("keeps the neutral pill for an auto-resolve with no reason", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_neutral"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "auto_resolved" }}
+      />,
+    );
+
+    expect(screen.getByText(/Resolved elsewhere/)).toBeDefined();
+    expect(screen.queryByTestId("prompt-expired-hint")).toBeNull();
+  });
+});

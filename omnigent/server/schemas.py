@@ -4064,11 +4064,18 @@ class ElicitationResolvedEvent(_SSEEventBase):
         without a verdict — timeout, severed wait, or a runner
         that predates verdict carriage — so consumers can say "no
         verdict was recorded" rather than guessing one.
+    :param reason: Why a verdict-less resolution happened, when
+        known. ``"unanswered"``: the hook stopped waiting (a severed
+        poll never re-parked, the ask timed out) before anyone
+        answered, so the prompt is gone rather than decided and the
+        UI can say so instead of implying it was resolved elsewhere.
+        ``None`` when a verdict is present or the reason is unknown.
     """
 
     type: Literal["response.elicitation_resolved"]
     elicitation_id: str
     action: Literal["accept", "decline", "cancel"] | None = None
+    reason: Literal["unanswered"] | None = None
 
 
 class PolicyDeniedEvent(_SSEEventBase):

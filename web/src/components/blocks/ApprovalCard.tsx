@@ -35,6 +35,7 @@
 import {
   CheckIcon,
   ClipboardListIcon,
+  ClockIcon,
   ExternalLinkIcon,
   InfoIcon,
   MessageCircleQuestionMark,
@@ -113,6 +114,8 @@ interface ApprovalCardProps {
   status: "pending" | "responded";
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
+    /** Why an `auto_resolved` card has no verdict; see `ElicitationBlock`. */
+    reason?: "unanswered";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   } | null;
@@ -447,6 +450,7 @@ export function ApprovalCard({
 
   if (status === "responded" && response) {
     const autoResolved = response.action === "auto_resolved";
+    const promptExpired = autoResolved && response.reason === "unanswered";
     const accepted = response.action === "accept";
 
     // Distinguish three responded sub-states:
@@ -478,7 +482,14 @@ export function ApprovalCard({
 
     let icon = <XIcon className="size-4 text-destructive" />;
     let label = isExitPlanMode ? "Plan rejected" : "Rejected";
-    if (autoResolved) {
+    if (promptExpired) {
+      // The server cleared the prompt because the hook stopped waiting
+      // before anyone answered (a severed poll never re-parked, the ask
+      // timed out). Nothing was decided, so say so and tell the user how
+      // to get the agent moving again instead of implying an answer.
+      icon = <ClockIcon className="size-4 text-muted-foreground" />;
+      label = "Prompt expired";
+    } else if (autoResolved) {
       // Card was cleared by the chat store when the gated tool's
       // function_call_output arrived without a UI verdict —
       // typically because the user approved (or denied) via Claude
@@ -533,7 +544,8 @@ export function ApprovalCard({
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
-      planRejectionFeedback !== null;
+      planRejectionFeedback !== null ||
+      promptExpired;
 
     return (
       <Alert
@@ -581,6 +593,11 @@ export function ApprovalCard({
             {planRejectionFeedback !== null && (
               <span className="italic" data-testid="plan-rejection-feedback">
                 “{planRejectionFeedback}”
+              </span>
+            )}
+            {promptExpired && (
+              <span className="text-muted-foreground" data-testid="prompt-expired-hint">
+                Nobody answered before the agent stopped waiting. Send a message to continue.
               </span>
             )}
           </AlertDescription>

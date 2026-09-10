@@ -579,6 +579,12 @@ export interface ElicitationBlock {
    */
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
+    /**
+     * Refines `auto_resolved`: `"unanswered"` means the server cleared
+     * the prompt because the hook stopped waiting before anyone
+     * answered, so the card says the prompt expired and how to resume.
+     */
+    reason?: "unanswered";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   } | null;

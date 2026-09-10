@@ -425,4 +425,27 @@ describe("parseEvent — response.elicitation_resolved", () => {
       elicitationId: "elic_3",
     } satisfies ElicitationResolved);
   });
+
+  it("keeps the unanswered reason on a verdict-less clear", () => {
+    // The server's deferred clear (hook stopped waiting, nobody answered)
+    // says why there is no verdict; dropping it rendered the same
+    // "Resolved elsewhere" pill as an answer given on another surface.
+    const ev = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_4",
+      reason: "unanswered",
+    });
+    expect(ev).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_4",
+      reason: "unanswered",
+    } satisfies ElicitationResolved);
+    const junkReason = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_5",
+      reason: "because",
+    });
+    expect(junkReason).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_5",
+    } satisfies ElicitationResolved);
+  });
 });

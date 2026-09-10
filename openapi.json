@@ -1690,6 +1690,20 @@
             "title": "Elicitation Id",
             "type": "string"
           },
+          "reason": {
+            "anyOf": [
+              {
+                "const": "unanswered",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Why a verdict-less resolution happened, when known. `\"unanswered\"`: the hook stopped waiting (a severed poll never re-parked, the ask timed out) before anyone answered, so the prompt is gone rather than decided and the UI can say so instead of implying it was resolved elsewhere. `None` when a verdict is present or the reason is unknown.",
+            "title": "Reason"
+          },
           "sequence_number": {
             "anyOf": [
               {

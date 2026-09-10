@@ -1515,6 +1515,7 @@ def _publish_elicitation_resolved_to_ancestors(
     session_id: str,
     elicitation_id: str,
     action: str | None = None,
+    reason: str | None = None,
 ) -> None:
     """
     Mirror an elicitation-resolved event into each ancestor stream.
@@ -1526,9 +1527,11 @@ def _publish_elicitation_resolved_to_ancestors(
         ``"elicit_abc123"``.
     :param action: Optional MCP verdict carried through to the
         mirrors; see :func:`_publish_elicitation_resolved`.
+    :param reason: Optional no-verdict reason carried through to the
+        mirrors; see :func:`_publish_elicitation_resolved`.
     """
     for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action)
+        _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action, reason=reason)
 
 
 def _descendant_sessions(
@@ -2980,12 +2983,17 @@ def _publish_external_output_reasoning_delta(session_id: str, body: SessionEvent
 
 
 _VALID_ELICITATION_ACTIONS: tuple[str, ...] = ("accept", "decline", "cancel")
+# Why a resolved event carries no verdict. ``"unanswered"``: the hook stopped
+# waiting (a severed poll never re-parked, or the ask timed out) before anyone
+# answered, so the prompt is gone rather than decided.
+_VALID_ELICITATION_RESOLVED_REASONS: tuple[str, ...] = ("unanswered",)
 
 
 def _publish_elicitation_resolved(
     session_id: str,
     elicitation_id: str,
     action: str | None = None,
+    reason: str | None = None,
 ) -> None:
     """
     Universal "approval done" signal — single publish drives both
@@ -3001,6 +3009,10 @@ def _publish_elicitation_resolved(
         state how the gate was answered instead of leaving agents to
         guess. Omitted from the payload when unknown or not one of
         the three MCP actions.
+    :param reason: Why there is no verdict, e.g. ``"unanswered"`` when
+        the hook stopped waiting before anyone answered, so the card
+        can say the prompt expired instead of implying someone resolved
+        it. Omitted when unknown or not a recognised reason.
     """
     payload: dict[str, Any] = {
         "type": "response.elicitation_resolved",
@@ -3008,6 +3020,8 @@ def _publish_elicitation_resolved(
     }
     if action in _VALID_ELICITATION_ACTIONS:
         payload["action"] = action
+    if reason in _VALID_ELICITATION_RESOLVED_REASONS:
+        payload["reason"] = reason
     session_stream.publish(session_id, payload)
 
 

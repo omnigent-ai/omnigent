@@ -1229,12 +1229,18 @@ multiplexes them; the per-response stream emits them directly.
 | `response.client_task.cancel` | `ClientTaskCancelEvent` |
 | `response.heartbeat` | `HeartbeatEvent` |
 | `response.elicitation_request` | `ElicitationRequestEvent` |
+| `response.elicitation_resolved` | `ElicitationResolvedEvent` |
 
 See the per-class docstring in `omnigent/server/schemas.py` for
 the canonical wire shape and field types of each `response.*` event.
 When a child/sub-agent elicitation is mirrored into an ancestor stream,
 `response.elicitation_request.params.target_session_id` is the child
 session whose resolve endpoint must receive the verdict.
+`response.elicitation_resolved` carries `action` when a human verdict
+settled the prompt (answered in another tab, the inbox, or the approve
+page) and `reason: "unanswered"` when the hook stopped waiting before
+anyone answered; a clear with neither means the prompt was answered
+in the native terminal, where the verdict is not observable.
 
 ### Reconnect Contract
 

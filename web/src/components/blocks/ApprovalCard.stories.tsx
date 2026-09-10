@@ -109,3 +109,47 @@ export const SubmittedAnswers: Story = {
     },
   },
 };
+
+export const Approved: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    status: "responded",
+    response: { action: "accept" },
+  },
+};
+
+export const ResolvedElsewhere: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    status: "responded",
+    response: { action: "auto_resolved" },
+  },
+};
+
+export const PromptExpired: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    status: "responded",
+    response: { action: "auto_resolved", reason: "unanswered" },
+  },
+};
+
+export const Cancelled: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    status: "responded",
+    response: { action: "cancel" },
+  },
+};
