@@ -2596,6 +2596,43 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostModelOptionsResponse": {
+        "description": "Pre-launch model choices resolved by a host harness.\n\n`error` carries the host's reason for an empty catalog \u2014 a probe that\nfailed on the host is not a transport failure, so the request still\nsucceeds and the picker can say WHY it is empty instead of a generic\n\"Models unavailable\".",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "models": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "routable_models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Routable Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models",
+          "routable_models"
+        ],
+        "title": "HostModelOptionsResponse",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -9620,9 +9657,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HostModelOptionsResponse"
                 }
               }
             },

@@ -287,6 +287,8 @@ async def test_host_model_options_returns_prelaunch_catalog(
         # The frame's routable set reaches the web client instead of being
         # dropped at the route boundary.
         "routable_models": ["system.ai.claude-sonnet-4-6[1m]"],
+        # A healthy catalog has no reason to report.
+        "error": None,
     }
 
 
@@ -328,9 +330,9 @@ async def test_host_model_options_reports_probe_error_without_500(
 
     The host answers ``status="ok"`` with no models and an ``error`` string
     explaining why (a failed probe is not a transport failure, so it is not a
-    502). The reason has to survive response serialization: annotating the
-    return as ``dict[str, list[Any]]`` made the string-valued ``error`` key
-    fail response validation, turning the explanation into an opaque 500.
+    502). The reason has to survive response serialization — a response model
+    that does not declare ``error`` drops the explanation, and a route
+    annotated ``dict[str, list[Any]]`` rejected the string outright as a 500.
     """
     app, _reg, _comm, replies, _drain = fs_setup
     replies["model:codex-native"] = {
