@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
-import { isSystemUserContent, parseSystemMessage } from "./systemMessage";
+import {
+  claudeTaskNotificationMarker,
+  isSystemUserContent,
+  parseSystemMessage,
+  taskNotificationMarkerContent,
+} from "./systemMessage";
 
 describe("parseSystemMessage", () => {
   it("returns null for plain user text", () => {
@@ -155,5 +160,63 @@ describe("isSystemUserContent", () => {
       { type: "input_image", file_id: "f1" },
     ];
     expect(isSystemUserContent(withImage)).toBe(false);
+  });
+});
+
+describe("Claude background-task notifications", () => {
+  const notification = [
+    "<task-notification>",
+    "<task-id>b3f9a2c1d</task-id>",
+    "<tool-use-id>toolu_bdrk_01Xy7Q2PfLm8RkVn3Ws4Tz9A</tool-use-id>",
+    "<output-file>/tmp/claude/tasks/b3f9a2c1d.output</output-file>",
+    "<status>completed</status>",
+    '<summary>Background command "air run" completed (exit code 0)</summary>',
+    "</task-notification>",
+  ].join("\n");
+
+  it("re-labels a notification as a marker whose header parses as a completed task", () => {
+    const marker = claudeTaskNotificationMarker(notification);
+    expect(marker).toBe(
+      "[System: background task b3f9a2c1d completed]\n" +
+        'Background command "air run" completed (exit code 0)',
+    );
+    expect(parseSystemMessage(marker!)).toEqual({
+      kind: "task_completed",
+      label: "Background task completed",
+      body: 'Background command "air run" completed (exit code 0)',
+    });
+    // Marker content is a system row, not a human turn.
+    expect(isSystemUserContent([{ type: "input_text", text: marker! }])).toBe(true);
+  });
+
+  it("maps failed and unknown statuses to the matching marker kinds", () => {
+    expect(
+      parseSystemMessage(
+        claudeTaskNotificationMarker(
+          "<task-notification>\n<task-id>t1</task-id>\n<status>failed</status>\n</task-notification>",
+        )!,
+      ),
+    ).toEqual({ kind: "task_failed", label: "Background task failed", body: "" });
+    expect(
+      parseSystemMessage(
+        claudeTaskNotificationMarker(
+          "<task-notification>\n<task-id>t2</task-id>\n<summary>Monitor event</summary>\n</task-notification>",
+        )!,
+      ),
+    ).toEqual({ kind: "generic", label: "Background task finished", body: "Monitor event" });
+  });
+
+  it("leaves ordinary user text and partial markup alone", () => {
+    expect(claudeTaskNotificationMarker("please run the tests")).toBeNull();
+    expect(claudeTaskNotificationMarker("<task-notification> unterminated")).toBeNull();
+    expect(taskNotificationMarkerContent([{ type: "input_text", text: "hi" }])).toBeNull();
+    expect(taskNotificationMarkerContent([{ type: "input_text", text: notification }])).toEqual([
+      {
+        type: "input_text",
+        text:
+          "[System: background task b3f9a2c1d completed]\n" +
+          'Background command "air run" completed (exit code 0)',
+      },
+    ]);
   });
 });

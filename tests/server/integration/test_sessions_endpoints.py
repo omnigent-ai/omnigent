@@ -2085,18 +2085,19 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
     assert "malformed skill resolution" in resp.json()["error"]["message"]
 
 
-async def test_external_meta_user_message_persists_without_live_input_event(
+async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    External bridge meta messages are durable but hidden from live UI.
+    External bridge meta messages are durable and reach live subscribers flagged.
 
     Codex-native mirrors ``<skill>`` wrappers via
     ``external_conversation_item``. The server must store those
-    messages so resume has the context, while suppressing
-    ``session.input.consumed`` so subscribers do not render raw skill
-    text.
+    messages so resume has the context, and publish
+    ``session.input.consumed`` with ``is_meta`` set so subscribers can
+    hide raw skill text yet still see a Claude background-task wake as a
+    turn boundary; it must not seed a title from the hidden text.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -2131,7 +2132,13 @@ async def test_external_meta_user_message_persists_without_live_input_event(
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.status_code == 200
     assert snap.json()["title"] is None
-    assert published == []
+    assert [(sid, ev["type"]) for sid, ev in published] == [
+        (session["id"], "session.input.consumed")
+    ]
+    consumed = published[0][1]["data"]
+    assert consumed["item_id"] == meta["id"]
+    assert consumed["data"]["is_meta"] is True
+    assert consumed["cleared_pending_id"] is None
 
 
 async def test_external_user_message_folds_pending_image_into_durable_item(
