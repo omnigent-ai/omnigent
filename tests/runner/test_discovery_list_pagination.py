@@ -413,7 +413,12 @@ async def test_sys_session_list_preserves_small_default_then_pages() -> None:
             conversation_id="conv_caller",
         )
 
-    child = {"agent": "researcher", "title": "catalog", "conversation_id": "conv_child"}
+    child = {
+        "agent": "researcher",
+        "title": "catalog",
+        "conversation_id": "conv_child",
+        "status": None,
+    }
     assert len(complete["sessions"]) == _ROW_COUNT
     assert complete["sub_agents"] == [child]
     assert "page" not in complete

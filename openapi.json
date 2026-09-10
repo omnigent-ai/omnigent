@@ -700,6 +700,18 @@
             "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. `None` if `title` is `None` or missing a colon.",
             "title": "Session Name"
           },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The child's live session status \u2014 `\"idle\"`, `\"running\"`, `\"waiting\"`, or `\"failed\"` \u2014 from the relay-fed status cache, falling back to the durable `omnigent_conversation_metadata.live_status` row so a replica that does not hold the runner tunnel (or a restarted server) still reports the child's real state. Forced to `\"failed\"` when the child carries a durable `last_task_error`. `None` when no live state is known anywhere (e.g. a child that has not run a turn). This is what lets a supervisor agent reconcile a sub-agent whose turn died with an interrupted runner instead of assuming it is still working.",
+            "title": "Status"
+          },
           "task_summary": {
             "anyOf": [
               {
