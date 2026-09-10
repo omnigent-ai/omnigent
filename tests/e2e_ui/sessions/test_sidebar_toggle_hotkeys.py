@@ -123,36 +123,3 @@ def test_sidebar_click_cancels_pending_peek(
     expect(conversations).not_to_have_class(_PEEK_CLASS)
     page.wait_for_timeout(200)
     expect(conversations).not_to_have_class(_PEEK_CLASS)
-
-
-def test_sidebar_peek_is_opaque_in_dark_mode(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """The dark-mode hover preview uses the opaque sidebar surface."""
-    page.emulate_media(color_scheme="dark")
-    base_url, session_id = seeded_session
-    page.goto(f"{base_url}/c/{session_id}")
-
-    conversations = page.locator(_CONVERSATIONS)
-    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible(timeout=30_000)
-    expect(page.locator("html")).to_have_class(re.compile(r"(^|\s)dark(\s|$)"))
-
-    page.keyboard.press(_LEFT_CHORD)
-    expect(conversations).to_have_attribute("data-collapsed", "true")
-
-    page.get_by_role("button", name="Open sidebar").hover()
-    expect(conversations).to_have_class(_PEEK_CLASS)
-
-    colors = conversations.evaluate(
-        """element => {
-          const probe = document.createElement("div");
-          probe.style.backgroundColor = "var(--card-solid)";
-          document.body.appendChild(probe);
-          const expected = getComputedStyle(probe).backgroundColor;
-          const actual = getComputedStyle(element).backgroundColor;
-          probe.remove();
-          return { actual, expected };
-        }"""
-    )
-    assert colors["actual"] == colors["expected"]

@@ -163,8 +163,7 @@ def _run_client_tool_turn(
                     # and then again as ``action_required`` once it parks
                     # waiting for the client result. The action_required
                     # emission is the load-bearing signal — match it
-                    # exactly (mirrors test_client_tool_round_trip) and
-                    # post the output only then.
+                    # exactly and post the output only then.
                     if (
                         item.get("type") == "function_call"
                         and item.get("name") == "lookup_secret_token"

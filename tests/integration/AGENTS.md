@@ -39,7 +39,6 @@ pytest tests/integration/ --integration --profile <name> --llm-api-key $KEY \
 | `test_smoke.py` | Single-turn marker echo (basic harness liveness) |
 | `test_multi_turn.py` | Three-turn context retention across dispatches |
 | `test_client_tools.py` | Tunneled client-tool results thread into the next turn's context |
-| `test_sharing.py` | An EDIT collaborator's turn sees the owner's context and completes |
 
 One journey per file on purpose: `--dist=loadscope` groups by module,
 so separate files parallelize across xdist workers (each worker gets

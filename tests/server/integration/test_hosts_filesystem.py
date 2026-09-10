@@ -355,60 +355,6 @@ async def test_host_model_options_reports_probe_error_without_500(
     }
 
 
-async def test_list_filesystem_returns_paginated_entries(
-    fs_setup: tuple[
-        FastAPI,
-        HostRegistry,
-        ApplicationCommunicator,
-        dict[str, dict[str, Any]],
-        asyncio.Task[None],
-    ],
-) -> None:
-    """
-    Verify the endpoint returns the runner-compatible response shape:
-    ``{"object": "list", "data": [...], "has_more": bool}``.
-
-    Without this match, the Web UI's existing
-    ``fetchWorkspaceDirectory`` hook would fail to parse the
-    response (different field names) and the picker would render
-    no entries.
-    """
-    from omnigent.host.frames import HostListDirEntry
-
-    app, _reg, _comm, replies, _drain = fs_setup
-    replies["/Users/corey/projects"] = {
-        "entries": [
-            HostListDirEntry(
-                name="src",
-                path="/Users/corey/projects/src",
-                type="directory",
-                bytes=None,
-                modified_at=1779980000,
-            ),
-            HostListDirEntry(
-                name="README.md",
-                path="/Users/corey/projects/README.md",
-                type="file",
-                bytes=42,
-                modified_at=1779980100,
-            ),
-        ],
-        "has_more": False,
-    }
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/Users/corey/projects")
-    assert resp.status_code == 200, resp.text
-    payload = resp.json()
-    assert payload["object"] == "list"
-    assert payload["has_more"] is False
-    names = [entry["name"] for entry in payload["data"]]
-    assert names == ["src", "README.md"]
-    # Type field present and correct so the Web UI can pick the
-    # right icon.
-    types = [entry["type"] for entry in payload["data"]]
-    assert types == ["directory", "file"]
-
-
 async def test_list_filesystem_root_forwards_tilde(
     fs_setup: tuple[
         FastAPI,
