@@ -2499,3 +2499,66 @@ async def test_open_http_transport_uses_streamable_for_non_sse_url() -> None:
         await conn._open_http_transport(stack)
 
     assert calls == ["streamable"], "plain URL must try Streamable HTTP first"
+
+
+def test_is_connection_error_mcp_session_terminated_code() -> None:
+    """
+    The streamable-HTTP transport's Session terminated (positive 32600,
+    raised when the server restarted and lost the session id) must be
+    classified as a connection error so the reconnect path runs.
+    """
+    exc = McpError(
+        ErrorData(
+            code=32600,
+            message="Session terminated",
+        )
+    )
+    assert _is_connection_error(exc) is True
+
+
+def test_is_connection_error_mcp_session_terminated_message_only() -> None:
+    """
+    The message match keeps classification correct if the SDK fixes the
+    sign of the code (32600 is a typo of JSON-RPC's -32600).
+    """
+    exc = McpError(
+        ErrorData(
+            code=-32600,
+            message="Session terminated",
+        )
+    )
+    assert _is_connection_error(exc) is True
+
+
+def test_is_connection_error_mcp_real_invalid_request_not_connection() -> None:
+    """
+    A genuine -32600 invalid-request error with different message text is
+    NOT a connection error.
+    """
+    exc = McpError(
+        ErrorData(
+            code=-32600,
+            message="Invalid Request",
+        )
+    )
+    assert _is_connection_error(exc) is False
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_managed_mcp_records_pr_before_result_formatting(
+    tmp_path, monkeypatch, failed
+) -> None:
+    from omnigent.runner.session_prs import SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    url = "https://github.com/example/managed/pull/42"
+    response = CallToolResult.model_validate(
+        {"content": [{"type": "text", "text": json.dumps({"html_url": url})}], "isError": failed}
+    )
+    with _mock_mcp_transport() as session:
+        session.call_tool.return_value = response
+        connection = McpServerConnection(config=_make_http_config(name="custom-github"))
+        await connection.connect()
+        result = await connection._invoke_tool("create_pull_request", {}, session_id="conv_mcp")
+        assert url in result
+    assert [pr.url for pr in SessionPrRegistry("conv_mcp").list()] == ([] if failed else [url])

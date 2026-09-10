@@ -1,7 +1,10 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BlockStream } from "@/lib/blockStream";
+import { buildBubbles } from "@/lib/renderItems";
+import { parseEventLines } from "@/lib/sse";
 import { useChatStore } from "@/store/chatStore";
-import { ApprovalCard } from "./ApprovalCard";
+import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
 afterEach(() => {
   cleanup();
@@ -194,6 +197,112 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(submitSpy).toHaveBeenCalledWith("elic_cmd_policy", "accept", {
       execpolicy_amendment: [".venv/bin/python", "-m", "pytest"],
     });
+  });
+});
+
+describe("ApprovalCard — approve & switch to auto mode", () => {
+  const props = {
+    elicitationId: "elic_auto",
+    message: "Claude wants to call **Bash**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"git status"})',
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it.each([undefined, false])("does not offer auto mode when the hint is %s", (allowAutoMode) => {
+    render(<ApprovalCard {...props} allowAutoMode={allowAutoMode} />);
+    expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
+  });
+
+  it("preserves the server capability through parsing, reduction, and rendering", () => {
+    const events = [
+      ...parseEventLines([
+        JSON.stringify({
+          event: "response.elicitation_request",
+          data: {
+            type: "response.elicitation_request",
+            elicitation_id: props.elicitationId,
+            params: {
+              mode: "form",
+              message: props.message,
+              phase: props.phase,
+              policy_name: props.policyName,
+              requestedSchema: {},
+              allow_auto_mode: true,
+            },
+          },
+        }),
+      ]),
+    ];
+    const blocks = new BlockStream().reduceSync(events);
+    const bubbles = buildBubbles(blocks, null);
+    const bubble = bubbles[0];
+    expect(bubble.kind).toBe("assistant");
+    if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
+    const item = bubble.items[0];
+    expect(item.kind).toBe("elicitation");
+    if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy });
+
+    render(<ElicitationCard item={item} />);
+    fireEvent.click(screen.getByRole("button", { name: /approve & switch to auto mode/i }));
+
+    expect(submitSpy).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", {
+      allow_auto_mode: true,
+    });
+  });
+
+  it("keeps ordinary approval and rejection separate from the mode switch", () => {
+    const onSubmit = vi.fn();
+    render(<ApprovalCard {...props} allowAutoMode onSubmit={onSubmit} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "accept");
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "decline");
+    fireEvent.click(screen.getByRole("button", { name: /switch to auto mode/i }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "accept", {
+      allow_auto_mode: true,
+    });
+  });
+
+  it.each([
+    {
+      allowAllEdits: true,
+      button: /accept & allow all edits/i,
+      content: { allow_all_edits: true },
+    },
+    {
+      rememberScope: { tool: "Bash" },
+      button: /don't ask again for Bash/i,
+      content: { remember: true },
+    },
+  ])("retains the narrower $button action alongside auto mode", (scope) => {
+    const onSubmit = vi.fn();
+    render(<ApprovalCard {...props} {...scope} allowAutoMode onSubmit={onSubmit} />);
+    expect(screen.getByRole("button", { name: /switch to auto mode/i })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: scope.button }));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", scope.content);
+  });
+
+  it.each([
+    ["accept", "Approved · auto mode"],
+    ["decline", "Rejected"],
+  ] as const)("shows the correct outcome for %s", (action, label) => {
+    render(
+      <ApprovalCard
+        {...props}
+        allowAutoMode
+        status="responded"
+        response={{ action, content: { allow_auto_mode: true } }}
+      />,
+    );
+    expect(screen.getByText(label)).toBeDefined();
+    expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
   });
 });
 
@@ -416,6 +525,41 @@ describe("ApprovalCard — approve & don't ask again (persistent allow rule)", (
     );
 
     expect(screen.getByText(/won't ask again for github\.com/i)).toBeDefined();
+  });
+});
+
+describe("ApprovalCard — Codex MCP persistence choices", () => {
+  it("renders advertised persistence modes and returns the selected mode in _meta", () => {
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        elicitationId="elic_codex_mcp"
+        message={'Allow the omnigent MCP server to run tool "sys_read_inbox"?'}
+        phase="codex_mcp_elicitation"
+        policyName="codex_native_mcp_elicitation"
+        contentPreview="{}"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        codexPersistModes={["session", "always"]}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    const sessionButton = screen.getByRole("button", { name: /approve for this session/i });
+    const alwaysButton = screen.getByRole("button", { name: /always allow/i });
+    expect(sessionButton).toBeDefined();
+    expect(alwaysButton).toBeDefined();
+
+    fireEvent.click(sessionButton);
+    expect(submitSpy).toHaveBeenCalledWith("elic_codex_mcp", "accept", undefined, {
+      persist: "session",
+    });
+
+    fireEvent.click(alwaysButton);
+    expect(submitSpy).toHaveBeenLastCalledWith("elic_codex_mcp", "accept", undefined, {
+      persist: "always",
+    });
   });
 });
 

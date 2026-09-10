@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -31,6 +32,27 @@ from omnigent.terminals.control_bridge import (
 )
 
 _HAS_TMUX = shutil.which("tmux") is not None
+
+
+def _tmux_supports_bracket_paste_flag() -> bool:
+    """tmux exposes ``#{bracket_paste_flag}`` only since 3.7."""
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return False
+    try:
+        out = subprocess.run(
+            [tmux, "-V"], capture_output=True, text=True, check=True, timeout=5
+        ).stdout.strip()
+        # "tmux 3.7b" / "tmux next-3.7" — take the trailing version token and
+        # strip any suffix letters.
+        version = out.split()[-1].removeprefix("next-")
+        major, minor = version.rstrip("abcdefghijklmnopqrstuvwxyz").split(".")[:2]
+        return (int(major), int(minor)) >= (3, 7)
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return False
+
+
+_HAS_TMUX_BRACKET_PASTE_FLAG = _tmux_supports_bracket_paste_flag()
 
 
 def test_unescape_control_output_round_trips_control_bytes() -> None:
@@ -608,6 +630,59 @@ async def test_seed_replays_alt_screen_and_mouse_modes() -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
+async def test_seed_rejoins_soft_wrapped_lines() -> None:
+    """A pane line wrapped across rows seeds as one logical line.
+
+    ``capture-pane`` without ``-J`` emits one entry per screen row, so a long
+    line would seed into xterm as hard lines and copying it back out would
+    insert a newline at each wrap point (xterm only rejoins rows it flagged
+    as wrapped itself).
+    """
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    # 150 chars in an 80-col pane wraps across two rows.
+    sock, target = await _new_private_tmux(
+        'python3 -c \'import sys,time; sys.stdout.write("x" * 150); '
+        "sys.stdout.flush(); time.sleep(30)'"
+    )
+    await asyncio.sleep(0.5)
+    try:
+        seed = await _run_tmux_capture(str(sock), target)
+        assert seed is not None
+        assert b"x" * 150 in seed, "soft-wrapped line was not rejoined in the seed"
+    finally:
+        await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(
+    not _HAS_TMUX_BRACKET_PASTE_FLAG,
+    reason="tmux #{bracket_paste_flag} requires tmux >= 3.7",
+)
+@pytest.mark.asyncio
+async def test_seed_replays_bracketed_paste_mode() -> None:
+    """The seed replays bracketed paste when the pane program enabled it.
+
+    A shell/TUI that enabled bracketed paste (``?2004h``) BEFORE this client
+    attached would otherwise leave the browser xterm unaware, so a multi-line
+    paste arrives as raw newlines and readline executes each line on arrival.
+    """
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    sock, target = await _new_private_tmux(
+        "python3 -c 'import sys,time; "
+        'sys.stdout.write("\\x1b[?2004h"); sys.stdout.flush(); time.sleep(30)\''
+    )
+    await asyncio.sleep(0.5)
+    try:
+        seed = await _run_tmux_capture(str(sock), target)
+        assert seed is not None
+        assert b"\x1b[?2004h" in seed, "bracketed paste mode not replayed in seed"
+    finally:
+        await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
 async def test_seed_plain_shell_replays_no_modes() -> None:
     """A primary-screen pane with no mouse tracking gets no mode escapes.
 
@@ -771,3 +846,53 @@ async def test_control_bridge_read_only_drops_input() -> None:
     assert ws.sent_text == []
 
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_attach_pins_client_term_over_inherited_dumb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control client reports a real TERM even when the runner env is ``dumb``.
+
+    A pane TUI (e.g. Codex) reads the attached client's ``#{client_termname}``
+    over its own $TERM and refuses to start when it sees ``dumb``. A runner
+    launched non-interactively can inherit ``TERM=dumb``, so the bridge must pin
+    a real terminal type on the attach regardless of the inherited value.
+    """
+    tmux = shutil.which("tmux")
+    assert tmux
+    # Simulate a runner whose environment carries a non-interactive ``dumb``.
+    monkeypatch.setenv("TERM", "dumb")
+
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        termname = ""
+        for _ in range(50):
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                str(sock),
+                "list-clients",
+                "-F",
+                "#{client_termname}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            termname = out.decode().strip()
+            if termname:
+                break
+            await asyncio.sleep(0.1)
+        assert termname == "xterm-256color", (
+            f"attached control client reported TERM {termname!r}; a leaked "
+            "'dumb' makes a pane TUI (Codex) refuse to start"
+        )
+    finally:
+        await _kill_and_join(sock, task)

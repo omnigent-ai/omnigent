@@ -15,9 +15,8 @@ function avatarStyle(name: string): { backgroundColor: string; color: string } {
   return { backgroundColor: `hsl(${hash % 360} 60% 50%)`, color: "white" };
 }
 
-function formatCommentTime(createdAt: number): string {
+function formatCommentTime(createdAt: number, now: Date): string {
   const date = new Date(createdAt * 1000);
-  const now = new Date();
   const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
   if (date.toDateString() === now.toDateString()) return `${time} Today`;
   const yesterday = new Date(now);
@@ -65,6 +64,8 @@ export interface CommentsPanelProps {
    * a draft before deciding to clear the pending mark on click-away.
    */
   pendingBodyRef?: RefObject<string>;
+  /** Fixed wall clock for deterministic embeds and tests. Defaults to now. */
+  now?: Date;
 }
 
 type Tab = "open" | "addressed";
@@ -84,7 +85,9 @@ export function CommentsPanel({
   canEdit = true,
   pendingBodyRef,
   onCopyCommentLink,
+  now,
 }: CommentsPanelProps) {
+  const currentTime = now ?? new Date();
   const [body, setBody] = useState("");
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -296,6 +299,7 @@ export function CommentsPanel({
                     onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
                     onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
                     onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
+                    now={currentTime}
                   />
                 );
               })}
@@ -318,6 +322,7 @@ export function CommentsPanel({
                   onClick={() => onClickComment(c)}
                   onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
                   onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
+                  now={currentTime}
                 />
               );
             })}
@@ -341,6 +346,7 @@ interface CommentCardProps {
   onEdit?: (body: string) => void;
   onDelete?: () => void;
   onCopyLink?: () => void;
+  now: Date;
 }
 
 function CommentCard({
@@ -351,6 +357,7 @@ function CommentCard({
   onEdit,
   onDelete,
   onCopyLink,
+  now,
 }: CommentCardProps) {
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState(c.body);
@@ -498,7 +505,7 @@ function CommentCard({
               </TooltipProvider>
             </div>
             <span className="text-[10px] text-muted-foreground/70">
-              {formatCommentTime(c.created_at)}
+              {formatCommentTime(c.created_at, now)}
             </span>
             {statusLabel && (
               <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] w-fit">

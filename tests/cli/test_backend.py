@@ -13,8 +13,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import re
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -88,6 +90,30 @@ def _patch_daemon_spawn(
         return proc
 
     monkeypatch.setattr(cli.subprocess, "Popen", _popen)
+
+    def _claim(
+        target: str,
+        spawned: cli._SpawnedDaemonProcess,
+        **_kwargs: object,
+    ) -> cli._HostDaemonRecord | None:
+        env = captured["env"]
+        assert isinstance(env, dict)
+        mode = "local" if target == "local" else "server"
+        cli._write_daemon_record(
+            cli._HostDaemonRecord(
+                pid=spawned.pid,
+                target=target,
+                mode=mode,
+                server_url=None if mode == "local" else target,
+                log_path=spawned.log_path,
+                started_at=int(cli.time.time()),
+                config_sig=str(env[cli.DAEMON_CONFIG_SIG_ENV_VAR]),
+            )
+        )
+        cli._HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+        return cli._find_daemon_record(target)
+
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", _claim)
 
 
 def _write_daemon_registry_record(
@@ -303,6 +329,7 @@ def test_ensure_host_daemon_reuses_same_target(
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
     (tmp_path / "host.pid").write_text("4242\nlocal\n")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
 
     _ensure_host_daemon(None)
@@ -323,6 +350,7 @@ def test_ensure_host_daemon_keeps_other_target_daemons(
     captured: dict[str, object] = {}
     killed: list[int] = []
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append(pid))
 
@@ -350,6 +378,7 @@ def test_ensure_host_daemon_local_daemon_serves_requested_url_is_noop(
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
     (tmp_path / "host.pid").write_text("4242\nlocal\n")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123")
 
@@ -380,6 +409,7 @@ def test_ensure_host_daemon_reuses_healthy_background_daemon(
         config_sig=sig,
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Old enough to be eligible for the tunnel-health check, and online.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
@@ -418,6 +448,7 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_new")
     torn_down: list[str] = []
@@ -429,6 +460,47 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
 
     assert len(torn_down) == 1 and "identity" in torn_down[0]
     assert "args" in captured
+
+
+@pytest.mark.parametrize(
+    "configured_host_id",
+    [
+        "host_329c39d03aad39ccf2f8597d596676bd",
+        "329c39d0-3aad-39cc-f2f8-597d596676bd",
+    ],
+)
+def test_ensure_host_daemon_reuses_equivalent_host_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured_host_id: str,
+) -> None:
+    """Legacy and dashed forms do not replace a daemon using the bare UUID."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    target = "https://server.example.com"
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        host_id="329c39d03aad39ccf2f8597d596676bd",
+        config_sig=cli.server_config_signature(),
+    )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_load_existing_host_id", lambda: configured_host_id)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    _ensure_host_daemon(target)
+
+    assert "args" not in captured
+    assert torn_down == []
 
 
 def test_ensure_host_daemon_respawns_on_config_drift(
@@ -454,6 +526,7 @@ def test_ensure_host_daemon_respawns_on_config_drift(
         config_sig="stale-signature-0000",
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     torn_down: list[str] = []
     monkeypatch.setattr(
@@ -488,6 +561,7 @@ def test_ensure_host_daemon_heals_offline_tunnel(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Old enough to be past the min-age grace; tunnel does not recover.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
@@ -525,6 +599,7 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Younger than _DAEMON_REUSE_MIN_AGE_S → skip the tunnel-health teardown.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_002.0)
@@ -542,6 +617,96 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
 
     assert torn_down == []
     assert "args" not in captured  # reused despite being offline (still connecting)
+
+
+def test_concurrent_ensure_host_daemon_elects_one_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Concurrent launchers may spawn, but only one daemon claims the target."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    live_pids: set[int] = set()
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid in live_pids)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+
+    both_spawned = threading.Barrier(2)
+    spawn_count = 0
+    count_lock = threading.Lock()
+
+    def _spawn(**_kw: object) -> cli._SpawnedDaemonProcess:
+        nonlocal spawn_count
+        with count_lock:
+            spawn_count += 1
+            count = spawn_count
+        pid = 4241 + count
+        both_spawned.wait(timeout=5)
+        if count == 1:
+            live_pids.add(pid)
+            target = "https://server.example.com"
+            cli._write_daemon_record(
+                cli._HostDaemonRecord(
+                    pid=pid,
+                    target=target,
+                    mode="server",
+                    server_url=target,
+                    log_path=str(tmp_path / "host.log"),
+                    started_at=int(cli.time.time()),
+                    config_sig="sig",
+                )
+            )
+        return cli._SpawnedDaemonProcess(pid=pid, log_path=str(tmp_path / "host.log"))
+
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", _spawn)
+    errors: list[Exception] = []
+
+    def _ensure() -> None:
+        try:
+            _ensure_host_daemon("https://server.example.com")
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=_ensure)
+    second = threading.Thread(target=_ensure)
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert spawn_count == 2
+    record = cli._find_daemon_record("https://server.example.com")
+    assert record is not None
+    assert record.pid == 4242
+
+
+def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawned daemon that never writes its record is surfaced, not silent."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(
+        cli,
+        "_spawn_host_daemon_process",
+        lambda **_kw: cli._SpawnedDaemonProcess(pid=4242, log_path=str(log_path)),
+    )
+    # The daemon crashes before claiming: no record ever appears.
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli"):
+        _ensure_host_daemon("https://server.example.com")
+
+    assert any(
+        "did not claim its registry record" in message and str(log_path) in message
+        for message in caplog.messages
+    )
 
 
 def _online_record() -> cli._HostDaemonRecord:
@@ -816,6 +981,7 @@ def test_foreground_connect_refuses_duplicate_live_daemon(
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid == 4242)
     _write_daemon_registry_record(
         tmp_path,
@@ -947,6 +1113,102 @@ def test_foreground_connect_local_prompt_aborted_leaves_server(
     assert "Left the local server running at http://127.0.0.1:8000." in result.output
 
 
+def test_host_reset_id_mints_fresh_id_when_no_daemon_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`host reset-id --yes` replaces the persisted host id.
+
+    The recovery path for the 409 "already registered to a different
+    account" refusal: the machine must be able to mint a fresh id and
+    re-register under the signed-in identity without an administrator.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Host id reset:" in result.output
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] != "a" * 32
+    assert cfg["host"]["name"] == "my-laptop"
+
+
+def test_host_reset_id_refuses_while_a_daemon_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live daemon still holds the old id — the reset must ask for a stop first.
+
+    Resetting under a running daemon would desync the persisted identity
+    from the registered tunnel; failing loud with the stop command is the
+    actionable path.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [_online_record()])
+    monkeypatch.setattr(cli, "_pid_alive", lambda _pid: True)
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code != 0
+    assert "host stop" in result.output
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32, "a refused reset must not touch the id"
+
+
+def test_host_reset_id_declined_prompt_leaves_id_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Answering no at the confirmation keeps the persisted id."""
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id"], input="n\n")
+
+    assert result.exit_code != 0  # click.Abort
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32
+
+
+def test_host_reset_id_refuses_when_env_override_pins_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With OMNIGENT_HOST_ID set, reset-id refuses instead of a silent no-op.
+
+    An env override makes the host read its identity from the environment,
+    ignoring config.yaml — so writing a fresh id to the file would be
+    ignored by the next `omnigent host`. The command must fail loud (naming
+    the env vars to unset) rather than print a reset that has no effect.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "b" * 32)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-host")
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code != 0
+    assert "OMNIGENT_HOST_ID" in result.output
+    # The persisted id is untouched — no misleading "reset" happened.
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32
+
+
 def test_foreground_connect_local_prompts_after_keyboard_interrupt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1074,6 +1336,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
 ) -> None:
     """``host status --json`` includes daemon, host, runner, and sessions."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     _write_daemon_registry_record(
         tmp_path,
@@ -1137,6 +1400,7 @@ def test_host_status_reports_unreachable_daemon_without_traceback(
 ) -> None:
     """``host status`` renders per-daemon connection failures."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     _write_daemon_registry_record(
         tmp_path,
@@ -1342,6 +1606,10 @@ def test_host_stop_stops_sessions_before_daemon(
         path = str(kwargs["path"])
         events.append((method, path))
         if method == "GET" and path == "/v1/sessions":
+            assert kwargs["params"] == {
+                "limit": 1000,
+                "include_archived": "true",
+            }
             return cli._HostHttpResult(
                 status_code=200,
                 body={
@@ -1351,7 +1619,19 @@ def test_host_stop_stops_sessions_before_daemon(
                             "host_id": "host_abc",
                             "status": "running",
                             "runner_id": "runner_abc",
-                        }
+                        },
+                        {
+                            "id": "conv_idle",
+                            "host_id": "host_abc",
+                            "status": "idle",
+                            "runner_id": "runner_idle",
+                        },
+                        {
+                            "id": "conv_failed",
+                            "host_id": "host_abc",
+                            "status": "failed",
+                            "runner_id": "runner_failed",
+                        },
                     ]
                 },
             )
@@ -1384,7 +1664,112 @@ def test_host_stop_stops_sessions_before_daemon(
         ("POST", "/v1/sessions/conv_owned/events"),
         ("TERM", "https://server.example.com"),
     ]
+    assert "Stopping 1 active session(s)..." in result.output
+    assert "Stopped session conv_owned (1/1)." in result.output
     assert "sessions_stopped=1" in result.output
+
+
+def test_host_stop_bounds_parallel_session_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Graceful shutdown overlaps session stops without unbounded fan-out."""
+    sessions = [{"id": f"conv_{index}", "status": "running"} for index in range(12)]
+
+    def _fake_sessions(
+        record: cli._HostDaemonRecord, *, connected_only: bool = False
+    ) -> cli._DaemonSessionsResult:
+        del record
+        assert connected_only is False
+        return cli._DaemonSessionsResult(
+            base_url="https://server.example.com",
+            sessions=sessions,
+            error=None,
+        )
+
+    monkeypatch.setattr(cli, "_sessions_for_daemon", _fake_sessions)
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    workers_started = threading.Event()
+    release_workers = threading.Event()
+
+    def _fake_stop(*, base_url: str, session_id: str) -> None:
+        nonlocal active, peak
+        assert base_url == "https://server.example.com"
+        assert session_id.startswith("conv_")
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == cli._HOST_SESSION_STOP_MAX_WORKERS:
+                workers_started.set()
+        assert release_workers.wait(timeout=2)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(cli, "_stop_session_on_server", _fake_stop)
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+    )
+    outcome: list[int] = []
+    worker = threading.Thread(target=lambda: outcome.append(cli._stop_daemon_sessions(record)))
+    worker.start()
+    assert workers_started.wait(timeout=2)
+    release_workers.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert outcome == [12]
+    assert peak == cli._HOST_SESSION_STOP_MAX_WORKERS
+
+
+def test_host_stop_failure_leaves_daemon_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed graceful session stop prevents daemon termination."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_sessions_for_daemon",
+        lambda record, *, connected_only=False: cli._DaemonSessionsResult(
+            base_url="https://server.example.com",
+            sessions=[
+                {"id": "conv_ok", "status": "waiting"},
+                {"id": "conv_failed", "status": "running"},
+            ],
+            error=None,
+        ),
+    )
+
+    def _fake_stop(*, base_url: str, session_id: str) -> None:
+        del base_url
+        if session_id == "conv_failed":
+            raise click.ClickException("runner unavailable")
+
+    monkeypatch.setattr(cli, "_stop_session_on_server", _fake_stop)
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated after a failed session stop"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code != 0
+    assert "Failed session conv_failed" in result.output
+    assert "Failed to stop 1 of 2 active session(s); daemon left running" in result.output
 
 
 def test_host_stop_daemon_only_skips_session_stop(
@@ -1462,10 +1847,10 @@ def test_host_stop_session_list_timeout_points_at_force(
     assert "--daemon-only" in result.output
 
 
-def test_host_stop_force_terminates_after_session_list_timeout(
+def test_host_stop_force_skips_session_stop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``--force`` stops the daemon when the session pre-check times out."""
+    """``--force`` terminates immediately without making session API calls."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     _write_daemon_registry_record(
         tmp_path,
@@ -1477,10 +1862,7 @@ def test_host_stop_force_terminates_after_session_list_timeout(
     monkeypatch.setattr(
         cli,
         "_host_http_json",
-        lambda **kwargs: cli._HostHttpResult(
-            status_code=0,
-            body="ReadTimeout: The read operation timed out",
-        ),
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
     )
     terminated: list[str] = []
     monkeypatch.setattr(
@@ -1497,6 +1879,339 @@ def test_host_stop_force_terminates_after_session_list_timeout(
     assert result.exit_code == 0, result.output
     assert terminated == ["https://server.example.com"]
     assert "sessions_stopped=0" in result.output
+
+
+def test_host_stop_unreachable_server_degrades_to_daemon_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dead server must not block a plain ``host stop``.
+
+    When the session-list preflight hits connection refused, the server is
+    gone and holds no sessions to stop; the stop should degrade to
+    terminating the daemon instead of failing and stranding it until the
+    user discovers ``--force``.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    # Identity normalization: the workspace-URL expansion probes the
+    # network and has dedicated tests.
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        ),
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == ["https://server.example.com"]
+    assert "sessions_stopped=0" in result.output
+    assert "skipping session stop" in result.output
+
+
+def test_host_stop_undiscoverable_local_server_degrades_to_daemon_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A local daemon whose server vanished still stops without ``--force``.
+
+    A local-mode record with no healthy server to discover and a
+    confirmed-dead server process means the detached server is gone; a
+    plain ``host stop`` should still terminate the daemon rather than
+    error out.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_local_server_confirmed_dead", lambda: True)
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target),
+    )
+
+    result = CliRunner().invoke(cli_group, ["host", "stop", "--server", ""])
+
+    assert result.exit_code == 0, result.output
+    assert terminated == ["local"]
+    assert "sessions_stopped=0" in result.output
+
+
+def test_host_http_json_marks_connection_refused_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback connect failure is classified unreachable.
+
+    Binds and releases a loopback port so nothing is listening, then
+    requests it: the ``ConnectError`` must surface as ``status_code=0``
+    with ``unreachable=True`` (a timeout or HTTP error must not).
+    """
+    import socket
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    result = cli._host_http_json(
+        base_url=f"http://127.0.0.1:{port}",
+        method="GET",
+        path="/v1/sessions",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert result.unreachable is True
+    assert "ConnectError" in str(result.body)
+
+
+def test_host_stop_slow_local_server_with_live_pid_keeps_force_guidance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live-but-slow local server must not trigger the daemon-only degrade.
+
+    ``local_server_url_if_healthy`` returns ``None`` on any ``/health``
+    timeout or non-200 even while the server process is alive; that is a
+    slow server, not a gone one, so the stop must fail loudly with the
+    ``--force`` guidance instead of silently reaping the daemon and its
+    record.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_local_server_confirmed_dead", lambda: False)
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated despite a live server process"),
+    )
+
+    result = CliRunner().invoke(cli_group, ["host", "stop", "--server", ""])
+
+    assert result.exit_code != 0
+    assert "--force" in result.output
+
+
+def test_local_server_confirmed_dead_requires_dead_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a missing pidfile or a dead recorded PID counts as confirmed dead."""
+    pid_path = tmp_path / "local_server.pid"
+    monkeypatch.setattr("omnigent.host.local_server._LOCAL_SERVER_PID_PATH", pid_path)
+
+    # Missing pidfile: no recorded server that could still be alive.
+    assert cli._local_server_confirmed_dead() is True
+
+    # Corrupt pidfile: the server's state is unknown, not provably dead.
+    pid_path.write_text("not-a-pid\n")
+    assert cli._local_server_confirmed_dead() is False
+
+    # Valid pidfile: liveness of the recorded PID decides.
+    pid_path.write_text("4242\n6767\n")
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    assert cli._local_server_confirmed_dead() is False
+
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: False)
+    assert cli._local_server_confirmed_dead() is True
+
+
+def test_host_http_json_loopback_timeout_is_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback timeout stays ``unreachable=False`` — slow is not gone."""
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+
+    class _TimingOutClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def __enter__(self) -> _TimingOutClient:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def request(self, *args: Any, **kwargs: Any) -> None:
+            raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(httpx, "Client", _TimingOutClient)
+
+    result = cli._host_http_json(
+        base_url="http://127.0.0.1:6767",
+        method="GET",
+        path="/v1/sessions",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert result.unreachable is False
+    assert "ReadTimeout" in str(result.body)
+
+
+def test_host_http_json_loopback_http_error_is_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback HTTP 500 stays ``unreachable=False`` — erroring is not gone."""
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+
+    class _Response:
+        status_code = 500
+
+        @staticmethod
+        def json() -> dict[str, str]:
+            return {"detail": "internal error"}
+
+    class _ErroringClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def __enter__(self) -> _ErroringClient:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def request(self, *args: Any, **kwargs: Any) -> _Response:
+            return _Response()
+
+    monkeypatch.setattr(httpx, "Client", _ErroringClient)
+
+    result = cli._host_http_json(
+        base_url="http://127.0.0.1:6767",
+        method="GET",
+        path="/v1/sessions",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 500
+    assert result.unreachable is False
+
+
+def test_host_http_json_remote_connect_failure_is_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect failure against a remote host keeps ``unreachable=False``.
+
+    DNS hiccups, network blips, or TLS faults can be transient against a
+    live remote server, so the auto-degrade must stay restricted to
+    loopback targets; remote failures keep the loud ``--force`` guidance.
+    """
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+
+    class _RefusingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def __enter__(self) -> _RefusingClient:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def request(self, *args: Any, **kwargs: Any) -> None:
+            raise httpx.ConnectError("[Errno -2] Name or service not known")
+
+    monkeypatch.setattr(httpx, "Client", _RefusingClient)
+
+    result = cli._host_http_json(
+        base_url="https://server.example.com",
+        method="GET",
+        path="/v1/sessions",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert result.unreachable is False
+    assert "ConnectError" in str(result.body)
+
+
+def test_fetch_session_pages_mid_pagination_failure_is_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-pagination connect failure is never classified unreachable.
+
+    A server that already served page one is provably alive, so a failure
+    on a later page must surface as a plain error (keeping the ``--force``
+    guidance) rather than triggering the daemon-only degrade and silently
+    skipping the already-listed live sessions.
+    """
+    calls: list[str | None] = []
+
+    def _fake_host_http_json(**kwargs: Any) -> cli._HostHttpResult:
+        after = kwargs["params"].get("after")
+        calls.append(after)
+        if after is None:
+            return cli._HostHttpResult(
+                status_code=200,
+                body={
+                    "data": [{"id": "conv_abc123", "status": "running"}],
+                    "last_id": "conv_abc123",
+                    "has_more": True,
+                },
+            )
+        return cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        )
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake_host_http_json)
+
+    result = cli._fetch_session_pages(
+        base_url="http://127.0.0.1:6767",
+        connected_only=False,
+    )
+
+    assert calls == [None, "conv_abc123"]
+    assert result.error is not None
+    assert result.unreachable is False
 
 
 def test_host_stop_session_stops_only_named_sessions(
@@ -1657,7 +2372,7 @@ def test_claude_command_routes_server_through_ensure_backend(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native",
+        "omnigent.harnesses.claude_native.main.run_claude_native",
         _fake_run_claude_native_capture(captured),
     )
 
@@ -1853,7 +2568,11 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
         return next(responses)
 
     monkeypatch.setattr(httpx, "get", _get)
-    monkeypatch.setattr(cli, "_databricks_workspace_token", lambda workspace: "fresh-token")
+    monkeypatch.setattr(
+        cli,
+        "_databricks_workspace_auth_info",
+        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh-token", profile_name=None),
+    )
     monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: "123")
 
@@ -1872,6 +2591,191 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
     assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
     assert requests[1]["params"] == {"o": "123"}
     assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com", "123")]
+
+
+def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omni host`` routes workspace-hosted auth with the CLI profile workspace id."""
+    import httpx
+
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    requests: list[dict[str, object]] = []
+    stored: list[tuple[str, str, str | None]] = []
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[expired]\n"
+        "host = https://example.databricks.com\n"
+        "workspace_id = 111\n"
+        "auth_type = databricks-cli\n"
+        "[fresh]\n"
+        "host = https://example.databricks.com\n"
+        "workspace_id = 1965859176160743\n"
+        "auth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {},
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr(
+        cli,
+        "_databricks_workspace_auth_info",
+        lambda workspace: cli._DatabricksWorkspaceAuthInfo(
+            token="fresh-token", profile_name="fresh"
+        ),
+    )
+    monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return httpx.Response(
+                401,
+                headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'},
+                request=httpx.Request("GET", url),
+            )
+        return httpx.Response(
+            200,
+            content=json.dumps({"user_id": "alice@example.com"}).encode(),
+            request=httpx.Request("GET", url),
+        )
+
+    def _store(
+        server: str,
+        workspace: str,
+        user_id: str | None = None,
+        org_id: str | None = None,
+    ) -> None:
+        stored.append((server, workspace, org_id))
+
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+
+    cli._ensure_databricks_server_auth(server, non_interactive=True)
+
+    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["params"] == {"o": "1965859176160743"}
+    assert stored == [(server, "https://example.databricks.com", "1965859176160743")]
+
+
+def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``omnigent host`` preflight avoids ambiguous host-keyed token lookup.
+
+    When two ``~/.databrickscfg`` profiles point at the same workspace, the
+    Databricks SDK's ``Config(profile=...)`` path can still shell out to
+    ``databricks auth token --host ...``. The preflight refresh must recover by
+    pinning the CLI token call to ``--profile``.
+    """
+    import httpx
+
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[expired]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = databricks-cli\n"
+        "[fresh]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer expired-token"},
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+
+    attempts: list[tuple[str, object]] = []
+
+    def _ambiguous_sdk_config(**kwargs: str) -> object:
+        attempts.append(("sdk", kwargs))
+        raise ValueError(
+            "databricks-cli: expired and fresh match "
+            "https://example.databricks.com. Use --profile to specify which profile to use"
+        )
+
+    def _run_databricks(args: list[str], **kwargs: object) -> object:
+        attempts.append(("cli", args))
+        assert "--host" not in args
+        profile = args[args.index("--profile") + 1]
+        if profile == "expired":
+            return type("_Result", (), {"returncode": 1, "stdout": "", "stderr": "expired"})()
+        if profile == "fresh":
+            return type(
+                "_Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": json.dumps({"access_token": "fresh-token"}),
+                    "stderr": "",
+                },
+            )()
+        raise AssertionError(f"unexpected Databricks profile lookup: {args!r}")
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        headers = kwargs.get("headers")
+        auth_header = headers.get("Authorization") if isinstance(headers, dict) else None
+        if auth_header == "Bearer fresh-token":
+            return _databricks_probe_response(200)
+        return _databricks_probe_response(302)
+
+    stored: list[tuple[str, str, str | None]] = []
+
+    def _store(
+        server: str,
+        workspace: str,
+        user_id: str | None = None,
+        org_id: str | None = None,
+    ) -> None:
+        stored.append((server, workspace, org_id))
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _ambiguous_sdk_config)
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(databricks_executor.subprocess, "run", _run_databricks)
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
+    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert attempts == [
+        ("sdk", {"profile": "expired"}),
+        (
+            "cli",
+            [
+                "/usr/bin/databricks",
+                "auth",
+                "token",
+                "--profile",
+                "expired",
+                "--output",
+                "json",
+            ],
+        ),
+        ("sdk", {"profile": "fresh"}),
+        (
+            "cli",
+            [
+                "/usr/bin/databricks",
+                "auth",
+                "token",
+                "--profile",
+                "fresh",
+                "--output",
+                "json",
+            ],
+        ),
+    ]
+    assert stored == [
+        (_HOST_DATABRICKS_SERVER, "https://example.databricks.com", None),
+    ]
 
 
 # ── Foreground ``host`` auth pre-flight ─────────────────────────────
@@ -1904,6 +2808,185 @@ def test_databricks_preflight_non_interactive_overrides_tty(
     assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
     # The browser login never ran despite the TTY.
     assert login_calls == []
+
+
+def _patch_rejected_credential_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pointer_workspace: str | None,
+    unauthed_status: int,
+    unauthed_realm: bool,
+) -> list[str]:
+    """Wire the pre-flight for a stale-bearer run the edge rejects with 403.
+
+    The credential chain mints a (stale) bearer, the authed ``/v1/me``
+    probe answers a bare 403 (no edge signature — the shape an expired
+    Databricks OAuth token gets), and the SDK can mint no fresh token.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param pointer_workspace: Workspace host the stored ``omnigent login``
+        pointer record names, or ``None`` when no record exists.
+    :param unauthed_status: Status the credential-less re-probe answers.
+    :param unauthed_realm: Whether that re-probe carries the
+        DatabricksRealm challenge.
+    :returns: Capture list of the URLs each probe was sent to with
+        ``"authed"``/``"unauthed"`` markers.
+    """
+    import httpx
+
+    probes: list[str] = []
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        headers = kwargs.get("headers")
+        authed = isinstance(headers, dict) and "Authorization" in headers
+        probes.append("authed" if authed else "unauthed")
+        if authed:
+            return httpx.Response(
+                403,
+                json={"error_code": 403, "message": "Invalid access token. [ReqId: x]"},
+                request=httpx.Request("GET", url),
+            )
+        realm_headers = (
+            {"www-authenticate": 'Bearer realm="DatabricksRealm"'} if unauthed_realm else {}
+        )
+        return httpx.Response(
+            unauthed_status, headers=realm_headers, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer stale"},
+    )
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host", lambda server: pointer_workspace
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace: None)
+    monkeypatch.setattr(
+        cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
+    )
+    return probes
+
+
+def test_databricks_preflight_expired_credential_routes_to_reauth_via_pointer_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403-rejected stale bearer surfaces the re-login hint, not the raw 403.
+
+    The edge rejects an expired bearer with a bare 403 (no OAuth redirect,
+    no DatabricksRealm challenge), so the shape classifier alone can't see
+    Databricks — the stored ``omnigent login`` pointer record names the
+    fronting workspace and must route the run to reauth instead of letting
+    it die at session-create with the raw ``Invalid access token`` error.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace="https://example.databricks.com",
+        unauthed_status=403,
+        unauthed_realm=False,
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert "expired or was revoked" in str(exc.value)
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
+    # The pointer record answered; no credential-less re-probe was needed.
+    assert probes == ["authed"]
+
+
+def test_databricks_preflight_expired_credential_routes_to_reauth_via_reprobe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a pointer record, a credential-less re-probe classifies the edge.
+
+    Ambient workspace-CLI profile credentials (no ``omnigent login`` record)
+    can also go stale; the bare re-probe surfaces the DatabricksRealm
+    challenge the stale bearer masked, so the run still routes to reauth.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace=None,
+        unauthed_status=401,
+        unauthed_realm=True,
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert "expired or was revoked" in str(exc.value)
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
+    assert probes == ["authed", "unauthed"]
+
+
+def test_databricks_preflight_leaves_non_databricks_403_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 from a non-Databricks server is not misread as an expired login.
+
+    No pointer record and no edge signature on the credential-less
+    re-probe means the rejection is the server's own (e.g. a permission
+    refusal) — suggesting a re-login could not help, so the pre-flight
+    steps aside and lets the connect path report the real error.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace=None,
+        unauthed_status=403,
+        unauthed_realm=False,
+    )
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert probes == ["authed", "unauthed"]
+
+
+def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected stale bearer still recovers silently when the SDK can refresh."""
+    import httpx
+
+    stored: list[tuple[str, str]] = []
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        headers = kwargs.get("headers")
+        auth = headers.get("Authorization") if isinstance(headers, dict) else None
+        if auth == "Bearer fresh-token":
+            return httpx.Response(200, request=httpx.Request("GET", url))
+        return httpx.Response(
+            403,
+            json={"error_code": 403, "message": "Invalid access token. [ReqId: x]"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer stale"},
+    )
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda server: "https://example.databricks.com",
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr(
+        cli,
+        "_databricks_workspace_auth_info",
+        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh-token", profile_name=None),
+    )
+    monkeypatch.setattr(
+        cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
+    )
+    monkeypatch.setattr(
+        "omnigent.cli_auth.store_databricks_auth",
+        lambda server, workspace, user_id=None, org_id=None: stored.append((server, workspace)),
+    )
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com")]
 
 
 def _patch_foreground_host(

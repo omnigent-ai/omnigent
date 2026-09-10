@@ -291,6 +291,79 @@ async def test_create_session_rejects_invalid_reasoning_effort(
     )
 
 
+async def test_create_session_inherits_spec_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """A client-less create inherits ``executor.reasoning_effort`` from the spec.
+
+    The spec-level default must reach the session (and thus the runner /
+    native ``--effort``) with no per-request effort, mirroring how the model
+    default comes from the spec rather than the create body.
+    """
+    agent = await create_test_agent(
+        client,
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk"},
+            "model": "databricks-claude-sonnet-4-6",
+            "reasoning_effort": "high",
+        },
+        include_llm=False,
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["reasoning_effort"] == "high"
+    get = await client.get(f"/v1/sessions/{session['id']}")
+    assert get.status_code == 200
+    assert get.json()["reasoning_effort"] == "high"
+
+
+async def test_create_session_explicit_reasoning_effort_overrides_spec(
+    client: httpx.AsyncClient,
+) -> None:
+    """A client-supplied ``reasoning_effort`` wins over the spec default."""
+    agent = await create_test_agent(
+        client,
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk"},
+            "model": "databricks-claude-sonnet-4-6",
+            "reasoning_effort": "high",
+        },
+        include_llm=False,
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "initial_items": [], "reasoning_effort": "low"},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["reasoning_effort"] == "low"
+
+
+async def test_bundle_create_inherits_spec_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """A bundle upload (the ``omnigent run <dir>`` path) inherits spec effort.
+
+    ``create_test_agent`` creates its owning session via the multipart bundle
+    path, which must seed ``executor.reasoning_effort`` from the spec just like
+    the agent-id path — otherwise ``omnigent run`` with a spec-level default
+    would silently start at the harness default.
+    """
+    agent = await create_test_agent(
+        client,
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk"},
+            "model": "databricks-claude-sonnet-4-6",
+            "reasoning_effort": "high",
+        },
+        include_llm=False,
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["reasoning_effort"] == "high"
+
+
 class _CaptureClient:
     """Stub runner client that records the POSTed body for inspection."""
 

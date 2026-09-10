@@ -44,7 +44,9 @@ def _publish_native_status(
     response.raise_for_status()
 
 
-def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
+def _seed_error_item(
+    session_id: str, *, code: str, message: str, level: str | None = None
+) -> None:
     """Append a committed ``error`` transcript item to the session's store.
 
     Mirrors ``seed_committed_turn`` but writes an error banner item, so the
@@ -54,6 +56,7 @@ def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
     :param session_id: Session to append to, e.g. ``"conv_abc123"``.
     :param code: Error classifier, e.g. ``"required_terminal_exited"``.
     :param message: Raw error message stored alongside the code.
+    :param level: ``"info"`` seeds a neutral notice instead of a failure.
     :raises RuntimeError: If the server under test isn't one we spawned.
     """
     from omnigent.entities import ErrorData, NewConversationItem
@@ -73,7 +76,7 @@ def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
             NewConversationItem(
                 type="error",
                 response_id="resp_seeded_error",
-                data=ErrorData(source="execution", code=code, message=message),
+                data=ErrorData(source="execution", code=code, message=message, level=level),  # type: ignore[arg-type]
             ),
         ],
     )
@@ -403,3 +406,32 @@ def test_error_row_divider_aligns_with_message_edges(
         f"dashed rule ends at {edges['dividerRight']:.0f}px but its row ends at "
         f"{edges['rowRight']:.0f}px"
     )
+
+
+def test_info_level_error_item_renders_as_notice_pill(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A persisted ``error`` item with ``level: "info"`` renders as a neutral notice.
+
+    This is the codex fresh-thread fallback's notice: same pill, no failure tone,
+    headline derived from the code, and it survives reload because it is an item.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="codex_thread_reset",
+        message="Codex could not load this session's saved transcript.",
+        level="info",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    pill = page.locator('[data-testid="error-pill"][data-level="info"]')
+    expect(pill).to_be_visible(timeout=15_000)
+    expect(pill).to_contain_text("Codex hit an error reloading", timeout=15_000)
+    expect(page.locator('[data-testid="error-pill"][data-level="error"]')).to_have_count(0)

@@ -1322,3 +1322,52 @@ async def test_subtree_busy_counts_awaiting_input_as_busy() -> None:
         assert await ns.subtree_busy("root") is True
     finally:
         await client.aclose()
+
+
+# ── list() ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_preserves_host_id_on_rows() -> None:
+    """``list()`` rows keep the server's ``host_id`` (and default to None).
+
+    ``GET /v1/sessions`` reports which host each session's runner was
+    launched on. The native resume picker filters on it — native
+    transcript/workspace state is host-local — so a decoder that drops
+    the field silently re-opens the cross-host picker bug.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "conv_host_bound",
+                        "agent_id": "ag_abc",
+                        "status": "idle",
+                        "created_at": 1700000000,
+                        "updated_at": 1700000042,
+                        "host_id": "a1b2c3d4e5f67890abcdef1234567890",
+                    },
+                    {
+                        "id": "conv_unbound",
+                        "agent_id": "ag_abc",
+                        "status": "idle",
+                        "created_at": 1700000001,
+                        "updated_at": 1700000043,
+                    },
+                ]
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        rows = await ns.list(limit=50)
+    finally:
+        await client.aclose()
+
+    by_id = {row.id: row for row in rows}
+    assert by_id["conv_host_bound"].host_id == "a1b2c3d4e5f67890abcdef1234567890"
+    assert by_id["conv_unbound"].host_id is None

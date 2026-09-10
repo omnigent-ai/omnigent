@@ -3,12 +3,13 @@
 Shared reference for **repro-agent** and **resolve-agent**. Both film the same
 kinds of journeys on the same surfaces; only *which* clip they produce differs:
 
-- **repro-agent** films the reproduction — a `reproduced` facet yields a
-  **`before`** clip (the test FAILS, showing the live bug); an `already_fixed`
-  facet yields a **`fixed`** clip (the test PASSES on the running build).
-- **resolve-agent** films the resolution — after the fix, the recovered test now
-  PASSES, and that passing run is the **`after`** clip (the human-visible half of
-  the fail→pass proof). On the review path it films the reviewed PR head.
+- **repro-agent** films the product journey — a `reproduced` facet yields a
+  **`before`** clip showing the live bug; an `already_fixed` facet yields a
+  **`fixed`** clip showing the correct user-visible outcome.
+- **resolve-agent** films the product journey after the fix as the **`after`**
+  clip (the human-visible half of the fail→pass proof). The recovered test
+  verifies the result separately. On the review path it films the reviewed PR
+  head.
 
 Everything else below — which surface to drive, how to stand the recorder up, and
 the per-surface mechanics — is identical for both. Each agent's own AGENTS.md says
@@ -17,10 +18,29 @@ which clip `kind` it produces and where it goes; this file is the how.
 ## What is expected to yield a recording
 
 A `web` / `mobile` / `terminal` / `cli` / `desktop` facet is expected to yield a recording:
-drive it on that surface and film it. Only an `api` facet — a failure no user
-observes on any surface (a wrong value in a response, an internal state a pytest
-asserts) — legitimately has no recording; `recordings: []` is correct there and is
-not a gap.
+drive it on that surface and film it. A facet legitimately has no recording when
+its outcome is not something a user *watches* — an `api` failure no user observes
+on any surface (a wrong value in a response, an internal state a pytest asserts),
+or a facet whose whole user-visible outcome is a static piece of text (an error
+string, a value, a log line) with nothing that moves on screen. For those,
+`recordings: []` is correct and not a gap: state the observed text and how you
+confirmed it in your prose/evidence instead. Tests may drive and verify the
+journey, but the clip itself must show the product surface and user-visible
+outcome, never the test process, pytest output, assertions, logs, or a synthetic
+evidence-summary slide.
+
+**A valid clip shows a live action producing the outcome — not static text
+asserting it.** A recording earns its place only when there is something to
+*watch*: a user action drives the surface and the product visibly responds — a
+terminal command executing and printing its result, a screen changing, a value
+updating, an error appearing in response to input. That is why filming a
+`terminal`/`cli` command is legitimate: the pane is live, the command runs, the
+output is the product's own behavior. What is **never** a recording is a clip
+whose content is just text sitting on screen — a summary slide, a narrated page,
+the reproduction test's own console output, or a hand-typed sentence "claiming"
+the bug reproduces. Those film your *assertion*, not the product, and a viewer
+learns nothing a written line wouldn't tell them better; describe the outcome in
+prose instead of manufacturing a video of it.
 
 **One verdict-appropriate clip per facet — nothing else.** Every recording must
 correspond to a facet, and its `kind` must match that facet's verdict. Do **not**
@@ -30,11 +50,20 @@ confuses the reader.
 
 Recording is **best-effort**: if the tooling below is missing, or a user-facing
 facet's state is genuinely unreachable in this harness, keep `recordings: []` for
-that facet and **name the specific blocker** in your evidence/handoff — an empty
-recordings list on a `web`/`mobile`/`terminal`/`cli`/`desktop` facet must always come with
-a concrete reason, never a silent skip. Never let recording block or distort the
-work itself, and never fabricate a hollow journey that doesn't reach the failure
-just to produce a video.
+that facet and **name the specific blocker** in `recording_unavailable_reason` —
+an empty recordings list on a `web`/`mobile`/`terminal`/`cli`/`desktop` facet must
+always come with a concrete reason, never a silent skip. Never let recording block
+or distort the work itself, and never fabricate a hollow journey that doesn't
+reach the failure just to produce a video. Missing or rejected footage never
+blocks the verdict, fix, or PR.
+
+Every declared recording includes `capture_mode`, which records how the product
+surface was filmed. Use `playwright_ui` for browser-page capture, `electron` for
+the desktop harness, `vhs_user_command` for a VHS tape that types the real user
+command, and `screen` for a direct device/screen capture. Do not declare a raw
+recorder output: copy the selected clip to a stable `<kind>-<facet>.<ext>` path
+first, then declare only that path. Undeclared media remains available in the CI
+artifact for debugging but is not attached to Linear or a PR.
 
 ## The recorder needs its own local server
 
@@ -57,13 +86,18 @@ like an environment failure but is really the build starving the boot. So
 **always build the SPA first as its own step**, then run the recorder.
 
 When you are yourself running inside a server-spawned runner (the `--server`
-path), also **strip the ambient runner/host env vars** so the fixture's own runner
-starts clean. Those vars (`OMNIGENT_RUNNER_ZYGOTE*` FDs, `OMNIGENT_RUNNER_ID`,
-tunnel/host tokens) leak into the spawned child, make it take the zygote-fork path
-and block on control FDs it doesn't have, so it hangs with an empty `runner.log`
-and stays `online: false`. Strip them with `env -u`:
+path — check with `echo "$OMNIGENT_RUNNER_ID"`, which is set there), you **must
+strip the ambient runner/host env vars** so the fixture's own runner starts clean.
+This is not optional: those vars (`OMNIGENT_RUNNER_ZYGOTE*` FDs,
+`OMNIGENT_RUNNER_ID`, tunnel/host tokens) leak into the spawned child, make it take
+the zygote-fork path and block on control FDs it doesn't have, so it hangs with an
+empty `runner.log` and stays `online: false`. A bare `pytest`/`uv run pytest` with
+`OMNIGENT_RUNNER_ID` still set is the single most common way the after-clip
+silently fails to record. Strip them with `env -u`:
 
 ```bash
+# Point npm/pnpm at the Databricks registry proxy first (see
+# dev/agent-environment.md) or this install fails with an auth error.
 pnpm --filter web install && pnpm --filter web run build   # once, up front
 env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
     -u OMNIGENT_RUNNER_TUNNEL_TOKEN -u OMNIGENT_RUNNER_PARENT_PID \
@@ -75,13 +109,18 @@ env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
     pytest <test_path> --screenshot on --output recordings/<slug>
 ```
 
-If the spawned runner still doesn't reach `online: true` within the fixture's
-timeout *after* the SPA is built and the env is stripped, capture the tail of the
-fixture's `runner.log`, treat that lane as genuinely unreachable here, keep
-`recordings: []` for it, and say plainly **"recorder's test server did not come
-online in time"** with the `runner.log` tail — noting whether the log was empty
-(the leaked-env/zygote hang) or showed a later failure, so the cause is named from
-what you observed rather than guessed.
+Only *after* the SPA is built and the env is stripped is an `online: false` a
+real environment limit. If you see `online: false` and you have **not** stripped
+the leaked vars (`OMNIGENT_RUNNER_ID` was set in your shell), that failure is your
+own un-stripped env, not the harness — re-run with the `env -u` prefix before
+concluding anything; do **not** file it as an environmental blocker or a "runner
+not coming online" env problem. Once the SPA is built, the env is stripped, and the
+spawned runner still doesn't reach `online: true` within the fixture's timeout,
+capture the tail of the fixture's `runner.log`, treat that lane as genuinely
+unreachable here, keep `recordings: []` for it, and say plainly **"recorder's test
+server did not come online in time"** with the `runner.log` tail — noting whether
+the log was empty (the leaked-env/zygote hang) or showed a later failure, so the
+cause is named from what you observed rather than guessed.
 
 ## `web` facets
 

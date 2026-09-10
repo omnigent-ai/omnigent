@@ -454,6 +454,94 @@
   background: var(--sidebar);
 }
 
+:root:not(.dark)[data-theme="solarized"] {
+  --background: #fdf6e3;
+  --foreground: #657b83;
+  --card: #eee8d5;
+  --card-solid: #eee8d5;
+  --card-foreground: #657b83;
+  --tray: #eee8d5;
+  --popover: #eee8d5;
+  --popover-foreground: #657b83;
+  --primary: #268bd2;
+  --primary-foreground: #fdf6e3;
+  --secondary: #eee8d5;
+  --secondary-foreground: #657b83;
+  --muted: #eee8d5;
+  --muted-foreground: #586e75;
+  --code-bg: #eee8d5;
+  --accent: #eee8d5;
+  --accent-foreground: #268bd2;
+  --border: #93a1a1;
+  --border-strong: #839496;
+  --button-border: #93a1a1;
+  --input: #93a1a1;
+  --ring: #268bd2;
+  --brand-accent: #6c71c4;
+  --sidebar: #eee8d5;
+  --sidebar-foreground: #657b83;
+  --sidebar-primary: #268bd2;
+  --sidebar-primary-foreground: #fdf6e3;
+  --sidebar-accent: #eee8d5;
+  --sidebar-accent-foreground: #268bd2;
+  --sidebar-border: #93a1a1;
+  --sidebar-ring: #268bd2;
+  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
+  --sidebar-active-foreground: var(--sidebar-foreground);
+}
+
+:root:not(.dark)[data-theme="solarized"] .app-shell {
+  background: #fdf6e3;
+}
+
+:root:not(.dark)[data-theme="solarized"] .conversations-sidebar {
+  background: var(--sidebar);
+}
+
+.dark[data-theme="solarized"] {
+  --background: #002b36;
+  --foreground: #839496;
+  --card: #073642;
+  --card-solid: #073642;
+  --card-foreground: #839496;
+  --tray: #073642;
+  --popover: #073642;
+  --popover-foreground: #839496;
+  --primary: #268bd2;
+  --primary-foreground: #fdf6e3;
+  --secondary: #073642;
+  --secondary-foreground: #839496;
+  --muted: #073642;
+  --muted-foreground: #93a1a1;
+  --code-bg: #073642;
+  --accent: #073642;
+  --accent-foreground: #2aa198;
+  --border: #586e75;
+  --border-strong: #657b83;
+  --button-border: #586e75;
+  --input: #586e75;
+  --ring: #268bd2;
+  --brand-accent: #6c71c4;
+  --sidebar: #073642;
+  --sidebar-foreground: #839496;
+  --sidebar-primary: #268bd2;
+  --sidebar-primary-foreground: #fdf6e3;
+  --sidebar-accent: #073642;
+  --sidebar-accent-foreground: #2aa198;
+  --sidebar-border: #586e75;
+  --sidebar-ring: #268bd2;
+  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
+  --sidebar-active-foreground: var(--sidebar-foreground);
+}
+
+.dark[data-theme="solarized"] .app-shell {
+  background: #002b36;
+}
+
+.dark[data-theme="solarized"] .conversations-sidebar {
+  background: var(--sidebar);
+}
+
 :root:not(.dark)[data-theme="nord"] {
   --background: #eceff4;
   --foreground: #2e3440;

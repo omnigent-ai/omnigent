@@ -87,7 +87,9 @@ the review gate after the fact.
 ## What it does
 
 1. Recovers the repro handoff (verdict, facets, journey, `bug_url`) and the e2e
-   test's content from the `session` or `ci_link`.
+   test's content from the `session` or `ci_link`. CI recovery reads the compact
+   artifact checkpoint and preserved test files first, using multi-megabyte job
+   logs only as a compatibility fallback for older bundles.
 2. **Looks for an open PR already fixing the bug.** This decides the path:
    - **Existing fix PR** → checks it out, runs the repro test against it (pass =
      it fixes the bug; fail = it doesn't — the key review finding), reviews the
@@ -112,20 +114,19 @@ the review gate after the fact.
    it performs, and carries the before clips' captions through — so the captioned
    before/after pair lands in the PR's Demo section and, for Linear bugs with a
    key available, on the ticket.
-6. *(author path)* **Gets an independent cross-vendor review before opening the
-   PR** — spawns a different-model reviewer child (a `codex-native` bundle) on its
-   own diff, the same review polly runs after the fact but here *before* publish,
-   and feeds it a growing **recurring-pitfalls checklist**
-   (`review-checklist.md`) so known repo mistakes are caught by name. Acts on any
-   blocking finding, then commits, pushes, and opens a **ready-for-review PR** (so
-   the repo's automated review runs too). Reuses the same server + runner; if no
-   second vendor is configured it skips and says so.
+6. *(author path)* Commits the focused, locally validated fix and opens a
+   **ready-for-review PR**. Full repository validation and independent review are
+   intentionally delegated to GitHub CI and Polly after publication.
 7. *(author path)* **Drives the open PR to a landable state** — a bounded loop:
    - Labels **every** PR **`ui-preview`** (not just frontend fixes) to request a
-     live app deploy, waits for the preview URL, and posts a comment with how to
-     connect a runner to it (`omnigent run --server <url>`) to validate the fix
-     directly. (The workflow only deploys for `OWNER`/`MEMBER`/`COLLABORATOR`
-     authors; the agent degrades gracefully when no preview appears.)
+     live app deploy — but only **after** CI is green and the Polly review is
+     clean for the current commit, never up front, since the label triggers a
+     `pull_request_target` deploy of the PR's code. Then waits for the
+     preview URL and posts a comment with how to connect a runner to it
+     (`omnigent run --server <url>`) to validate the fix directly. (The workflow
+     deploys for any labelled non-draft PR, forks included — the label is the
+     trust boundary, and only a maintainer-privileged identity can apply it; the
+     agent degrades gracefully when no preview appears.)
    - Watches CI (`gh pr checks --watch`); when a check fails it reads the log,
      fixes its own regressions, and pushes — while leaving pre-existing/flaky/infra
      failures alone (and saying so).
@@ -138,8 +139,8 @@ the review gate after the fact.
 8. Emits a single fenced ```json handoff block: `mode`
    (`reviewed_existing_pr` / `authored_fix`), `outcome` (`fixed` /
    `partially_fixed` / `not_fixed` / `nothing_to_fix` / `needs_more_info`), the
-   per-facet fail→pass proof, the `cross_review` result, the PR URL (opened or
-   reviewed), and the Step 4 landing state (`ci_status`, `polly_review`,
+   per-facet fail→pass proof, the PR URL (opened or reviewed), and the Step 4
+   landing state (`ci_status`, `polly_review`,
    `ui_preview`, `validation_prompt`, `maintainer_review`).
 
 It does **not** merge. See `AGENTS.md` for the full operating procedure.

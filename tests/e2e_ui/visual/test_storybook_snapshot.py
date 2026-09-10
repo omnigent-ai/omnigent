@@ -168,6 +168,14 @@ def test_story_matches_baseline(
             timeout=30_000,
         )
 
+    images = page.locator("img[src]")
+    if images.count() > 0:
+        page.wait_for_function(
+            """() => Array.from(document.querySelectorAll('img[src]'))
+                .every((image) => image.complete && image.naturalWidth > 0)""",
+            timeout=30_000,
+        )
+
     settle_for_snapshot(page)
     page.evaluate(
         "() => new Promise((resolve) => "
@@ -175,4 +183,29 @@ def test_story_matches_baseline(
     )
 
     assert not unexpected_requests, f"Story made external requests: {unexpected_requests}"
-    assert_snapshot(surface)
+
+    portals = page.locator(
+        '[data-radix-popper-content-wrapper]:visible, [role="dialog"][data-state="open"]:visible'
+    )
+    if portals.count() == 0:
+        assert_snapshot(surface)
+        return
+
+    boxes = [surface.bounding_box()]
+    boxes.extend(portals.nth(index).bounding_box() for index in range(portals.count()))
+    visible_boxes = [box for box in boxes if box is not None]
+    assert visible_boxes, "Story snapshot has no visible surface"
+    viewport = page.viewport_size
+    assert viewport is not None
+    padding = 8
+    left = max(0, min(box["x"] for box in visible_boxes) - padding)
+    top = max(0, min(box["y"] for box in visible_boxes) - padding)
+    right = min(viewport["width"], max(box["x"] + box["width"] for box in visible_boxes) + padding)
+    bottom = min(
+        viewport["height"], max(box["y"] + box["height"] for box in visible_boxes) + padding
+    )
+    screenshot = page.screenshot(
+        animations="disabled",
+        clip={"x": left, "y": top, "width": right - left, "height": bottom - top},
+    )
+    assert_snapshot(screenshot)

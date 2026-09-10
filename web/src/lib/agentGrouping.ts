@@ -93,6 +93,24 @@ export function sortAgentsForDisplay<T extends AvailableAgent>(agents: readonly 
   );
 }
 
+// Hidden from session-creation pickers. `nessie` is superseded by polly.
+// `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent /
+// `run --harness kimi` use) — pickers offer only the native TUI
+// (`kimi-native-ui`).
+export const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
+
+/**
+ * The pickable agent set for session-creation surfaces. The new-session
+ * composer AND project settings must resolve the SAME set through this
+ * helper — if they diverged, a project could pin a default agent the
+ * composer refuses to show (and then silently substitutes another for).
+ *
+ * @param agents - Raw catalog + discovery output (e.g. useAvailableAgents).
+ */
+export function selectableSessionAgents<T extends AvailableAgent>(agents: readonly T[]): T[] {
+  return sortAgentsForDisplay(agents.filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name)));
+}
+
 /**
  * Sort then split agents into the built-in group and the custom group,
  * for rendering with a divider between. Built-ins are the

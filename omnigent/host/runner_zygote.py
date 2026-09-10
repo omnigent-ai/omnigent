@@ -236,6 +236,8 @@ class ZygoteManager:
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
+                # Avoid pinning the daemon's potentially transient cwd.
+                cwd="/",
             )
 
     def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> ZygoteRunnerProc:

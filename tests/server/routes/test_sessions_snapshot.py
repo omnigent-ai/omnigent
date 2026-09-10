@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -349,6 +350,105 @@ async def test_session_snapshot_uses_child_spec_metadata(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A child session whose ``sub_agent_name`` no longer resolves in the
+    parent bundle publishes the PARENT's identity, model and context window,
+    and warns.
+
+    Reporting the parent is long-standing: this path already retained the
+    parent spec and published its name, model and context window on a miss.
+    What the snapshot did not do was say so. The warning is the new part, and
+    it is what makes this the same answer the runner-side consumers of
+    ``_find_spec_by_name`` give across a separate process boundary.
+
+    Both halves are asserted: the warning must be emitted AND the parent's
+    values must be published — a silent fallback satisfies neither.
+
+    :param monkeypatch: Pytest monkeypatch, used to stub runner lookups.
+    :param caplog: Pytest log capture, used to confirm the unresolved
+        sub-agent is reported rather than passed over in silence.
+    """
+    parent_spec = AgentSpec(
+        spec_version=1,
+        name="advisor",
+        executor=ExecutorSpec(
+            config={"harness": "codex"},
+            model="openai-codex/gpt-5.6-sol:high",
+            context_window=200_000,
+        ),
+        # No sub_agents: "executor" (recorded on the child conversation row)
+        # cannot resolve — simulates a spec edit removing the sub-agent
+        # after the child session was created.
+    )
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+        ),
+        "conv_child": Conversation(
+            id="conv_child",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            parent_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+            kind="sub_agent",
+            sub_agent_name="executor",
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            assert agent_id == "ag_advisor"
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "advisor-row",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
+            assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            return type("LoadedAgent", (), {"spec": parent_spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes._sessions.orchestration"):
+        child = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            "conv_child",
+            agent_store=_AgentStore(),  # type: ignore[arg-type]
+            agent_cache=_AgentCache(),  # type: ignore[arg-type]
+        )
+
+    assert "'executor'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The unresolved sub-agent must be warned about; got {caplog.text!r}."
+    )
+    # The PARENT spec is what the session actually runs on, so it is what the
+    # snapshot reports: the spec's own name ("advisor"), not the agent ROW's
+    # name ("advisor-row") and not the recorded child name ("executor").
+    assert child.agent_name == "advisor"
+    assert child.llm_model == "openai-codex/gpt-5.6-sol:high"
+    assert child.context_window == 200_000
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_populates_runner_online_from_session_lookup() -> None:
     """GET /sessions/{id} carries session-scoped runner + host liveness."""
     conv_store = _ConversationStore([_message_item("item_1", "hi")])
@@ -554,6 +654,67 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
         f"got {len(status_calls)}. If 2, the cache "
         f"wasn't populated after the first query."
     )
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_uses_persisted_status_after_server_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recycled server keeps a native turn running from its durable status.
+
+    Native harness injection returns before the external turn completes, so the
+    runner's generic session endpoint can report ``idle`` while Codex is still
+    working. After a server restart clears the in-memory status cache, the
+    conversation row is the surviving relay truth and must win over that probe.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "bef42153ba7a4f2cb35350dc23b27c93"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_skills_cache.pop(session_id, None)
+
+    class _SkillsResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, list[Any]]:
+            return {"skills": []}
+
+    class _IdleRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _SkillsResponse()
+            raise AssertionError("persisted running status must avoid the idle runner probe")
+
+    runner_client = _IdleRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        live_status="running",
+    )
+
+    try:
+        snapshot = await _get_session_snapshot(
+            _ConversationStore([], conversations={session_id: conv}),  # type: ignore[arg-type]
+            session_id,
+        )
+        await _drain_runner_skills(session_id)
+    finally:
+        _mod._session_status_cache.pop(session_id, None)
+        _mod._runner_skills_cache.pop(session_id, None)
+
+    assert snapshot.status == "running"
+    status_calls = [url for url in runner_client.get_calls if not url.endswith("/skills")]
+    assert status_calls == []
 
 
 @pytest.mark.asyncio

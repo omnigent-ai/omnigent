@@ -52,6 +52,7 @@ import os
 
 from fastapi import FastAPI
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -135,7 +136,7 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
     if not command:
         raise RuntimeError(
             f"{_ENV_COMMAND} is not set — no ACP agent command configured. "
-            "Add one via `omnigent setup` → configure harnesses → Custom ACP agent."
+            f"Add one via `{cli_invocation()} setup` → configure harnesses → Custom ACP agent."
         )
     name = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
     model = os.environ.get(_ENV_MODEL, "").strip() or None

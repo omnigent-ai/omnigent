@@ -18,11 +18,13 @@ import asyncio
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
@@ -32,6 +34,7 @@ from omnigent.inner.executor import (
     ReasoningChunk,
     SubAgentCompleted,
     SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -249,7 +252,8 @@ def test_tool_call_and_update_emit_cards() -> None:
     assert len(started) == 1
     req = started[0]
     assert isinstance(req, ToolCallRequest)
-    assert req.name == "shell" and req.metadata == {"call_id": "c1"}
+    assert req.name == "shell"
+    assert req.metadata == {"call_id": "c1", "internally_executed": True}
     assert ex._tool_names["c1"] == "shell"
 
     done = ex._handle_session_update(
@@ -344,6 +348,71 @@ def test_usage_omits_absent_and_non_integer_fields() -> None:
     assert AcpExecutor._usage_from_result({}) is None
 
 
+def test_usage_maps_cached_writes_to_the_canonical_key() -> None:
+    """``cachedWriteTokens`` surfaces as ``cache_creation_input_tokens``.
+
+    Agents that report cache-creation tokens (e.g. jcode against a Databricks
+    gateway) had them silently dropped before, understating cost — cache writes
+    bill at ~1.25x the input rate.
+    """
+    usage = AcpExecutor._usage_from_result(
+        {
+            "usage": {
+                "inputTokens": 6216,
+                "outputTokens": 5,
+                "totalTokens": 6221,
+                "cachedReadTokens": 0,
+                "cachedWriteTokens": 128,
+            }
+        }
+    )
+    assert usage == {
+        "input_tokens": 6216,
+        "output_tokens": 5,
+        "total_tokens": 6221,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 128,
+    }
+
+
+def test_usage_with_active_model_tags_the_model() -> None:
+    """A turn's usage is stamped with the agent's active model.
+
+    ACP ``result.usage`` carries token counts but no model id, so the server
+    cannot attribute the tokens to a model — leaving its per-model usage view
+    (``usage_by_model``) empty and the UI showing no token counts for the ACP
+    (jcode / Devin / Grok) session. The active model comes from the agent's
+    ``model`` config option, captured at ``session/new``.
+
+    **What breaks if this fails**: token counts never render for any ACP harness.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._active_model = "system.ai.claude-haiku-4-5"
+    usage = ex._usage_with_active_model(
+        {"usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}}
+    )
+    assert usage == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "model": "system.ai.claude-haiku-4-5",
+    }
+
+
+def test_usage_with_active_model_skips_stamp_when_model_unknown() -> None:
+    """No active model → no ``model`` key (attribution simply stays absent)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._active_model is None
+    assert ex._usage_with_active_model({"usage": {"totalTokens": 15}}) == {"total_tokens": 15}
+
+
+def test_usage_with_active_model_is_none_when_no_usage_reported() -> None:
+    """No usage on the result → ``None`` (never a model-only dict)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._active_model = "system.ai.claude-haiku-4-5"
+    assert ex._usage_with_active_model({}) is None
+
+
 def test_in_progress_tool_update_emits_nothing() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     ex._handle_session_update({"sessionUpdate": "tool_call", "toolCallId": "c3", "title": "t"})
@@ -364,11 +433,17 @@ class _FakeSubAgentDialect:
     """An invented dialect, so this generic suite names no vendor."""
 
     def read(self, update: dict[str, object]) -> tuple[object, ...]:
-        """Return a start/end for ``acme.dev/spawn`` / ``acme.dev/done``."""
-        from omnigent.inner.acp_subagents import SubAgentEnd, SubAgentStart
+        """Return start / activity / end for ``acme.dev/{spawn,work,done}``."""
+        from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentEnd, SubAgentStart
 
         if isinstance(update.get("acme.dev/spawn"), dict):
             return (SubAgentStart(child_key="w1", title="worker", task="do a thing"),)
+        if isinstance(update.get("acme.dev/work"), dict):
+            return (
+                SubAgentActivity(
+                    child_key="w1", call_id="c9", name="Wrote out.txt", args={"path": "out.txt"}
+                ),
+            )
         if isinstance(update.get("acme.dev/done"), dict):
             return (SubAgentEnd(child_key="w1", ok=True, summary="done"),)
         return ()
@@ -427,11 +502,199 @@ def test_generic_executor_does_no_subagent_scanning() -> None:
 
 
 def test_tool_cards_still_render_alongside_the_scan() -> None:
-    """The scan is additive — an ordinary tool_call still produces its card."""
+    """An ordinary (unclaimed) tool_call still produces a parent card."""
     events = _extended_executor()._handle_session_update(
         {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Ran ls", "kind": "execute"}
     )
     assert [type(e) for e in events] == [ToolCallRequest]
+
+
+def test_handle_session_update_routes_activity_to_the_child() -> None:
+    """A claimed tool call becomes a ``SubAgentToolCall``, not a parent card.
+
+    **What breaks if this fails**: the sub-agent's own work renders in the parent
+    stream (or nowhere) instead of the child transcript — the exact gap this
+    change closes.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c9", "acme.dev/work": {"any": 1}}
+    )
+    assert events == [
+        SubAgentToolCall(
+            child_key="w1", call_id="c9", name="Wrote out.txt", args={"path": "out.txt"}
+        )
+    ]
+    # The frame is claimed, so it does NOT also emit a parent tool card.
+    assert not any(isinstance(e, ToolCallRequest) for e in events)
+
+
+def test_claimed_completion_frame_emits_no_spurious_parent_card() -> None:
+    """A claimed ``tool_call_update`` doesn't also close a parent tool card.
+
+    The sub-agent's completion rides a ``tool_call_update`` whose id was never an
+    originating ``tool_call``; without the short-circuit the terminal-status
+    branch would emit a stray ``ToolCallComplete(name="tool")`` in the parent.
+    """
+    events = _extended_executor()._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "status": "completed", "acme.dev/done": {"id": "w1"}}
+    )
+    assert [type(e) for e in events] == [SubAgentCompleted]
+    assert not any(isinstance(e, ToolCallComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Agent-native vs MCP-bridge classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("update", "is_bridge"),
+    [
+        ({"title": "sys_session_get_info", "rawInput": {}}, True),
+        (
+            {"title": "Session info", "rawInput": {"tool": "mcp_omnigent_sys_session_get_info"}},
+            True,
+        ),
+        (
+            {"title": "Session info", "rawInput": {"tool": "mcp__omnigent__sys_session_get_info"}},
+            True,
+        ),
+        (
+            {
+                "title": "omnigent: sys session get info",
+                "rawInput": {"session_id": ""},
+                "_meta": {"goose": {"toolCall": {"toolName": "omnigent__sys_session_get_info"}}},
+            },
+            True,
+        ),
+        ({"title": "GitHub comments", "rawInput": {"tool": "github__list_comments"}}, False),
+        ({"title": "shell: git status", "rawInput": {"command": "git status"}}, False),
+    ],
+)
+def test_only_advertised_bridge_aliases_enter_dispatch_correlation(
+    update: dict[str, object], is_bridge: bool
+) -> None:
+    """A call the bridge never advertised must not claim a dispatch slot."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._bridge_tool_aliases = frozenset(
+        {
+            "sys_session_get_info",
+            "mcp_omnigent_sys_session_get_info",
+            "mcp__omnigent__sys_session_get_info",
+            "omnigent__sys_session_get_info",
+        }
+    )
+
+    event = ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", **update}
+    )[0]
+
+    assert isinstance(event, ToolCallRequest)
+    assert ("internally_executed" not in event.metadata) is is_bridge
+
+
+def test_no_advertised_bridge_classifies_every_call_as_native() -> None:
+    """Tools alone are not enough: without a served relay there is no bridge."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._omnigent_tools = [{"name": "sys_session_get_info"}]
+
+    event = ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "sys_session_get_info"}
+    )[0]
+
+    assert isinstance(event, ToolCallRequest)
+    assert event.metadata == {"call_id": "c1", "internally_executed": True}
+
+
+@pytest.mark.asyncio
+async def test_bridge_aliases_hold_until_the_session_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent keeps the tools sent at session/new, so classify against those."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._rpc = AsyncMock(return_value={"result": {"sessionId": "s1"}})  # type: ignore[method-assign]
+    monkeypatch.setattr(ex._mcp, "session_new_servers", lambda **_: [{"name": "omnigent"}])
+
+    ex._omnigent_tools = [{"name": "sys_session_get_info"}]
+    await ex._ensure_session()
+    ex._omnigent_tools = [{"name": "web_search"}]
+
+    assert "sys_session_get_info" in ex._bridge_tool_aliases
+    assert "web_search" not in ex._bridge_tool_aliases
+
+    ex._reset_session_state()
+    ex._rpc = AsyncMock(return_value={"result": {"sessionId": "s2"}})  # type: ignore[method-assign]
+    await ex._ensure_session()
+
+    assert "web_search" in ex._bridge_tool_aliases
+    assert "sys_session_get_info" not in ex._bridge_tool_aliases
+
+
+def test_session_reset_drops_in_flight_tool_state() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "pending",
+            "title": "shell",
+            "rawInput": {"command": "sleep 10"},
+        }
+    )
+
+    ex._reset_session_state()
+
+    assert ex._tool_names == {}
+    assert ex._tool_inputs == {}
+    assert ex._bridge_tool_aliases == frozenset()
+
+
+class _RecordingCtx:
+    """Minimal ``TurnContext`` stand-in: the surface the adapter touches.
+
+    A typed stub rather than MagicMock, so a call to a method that does not
+    exist fails loud instead of silently returning another mock.
+    """
+
+    def __init__(self, response_id: str = "resp_acp") -> None:
+        self.response_id = response_id
+        self.emitted: list[object] = []
+
+    def emit(self, event: object) -> None:
+        self.emitted.append(event)
+
+
+@pytest.mark.asyncio
+async def test_native_call_before_a_bridge_call_keeps_each_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported defect: a native call ahead of a bridge call stole its id."""
+    import omnigent.runtime.harnesses._executor_adapter as adapter_module
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._bridge_tool_aliases = frozenset({"sys_session_get_info"})
+    adapter = ExecutorAdapter(executor_factory=lambda: ex)
+    ctx = _RecordingCtx()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    adapter._current_agent = "test-model"
+
+    for call_id, title in (("native-1", "terminal: date"), ("bridge-1", "sys_session_get_info")):
+        for event in ex._handle_session_update(
+            {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": title, "rawInput": {}}
+        ):
+            adapter._translate_event(event, ctx)  # type: ignore[arg-type]
+
+    dispatched: dict[str, str] = {}
+
+    async def fake_bridge(*_args: object, call_id: str, **_kw: object) -> dict[str, object]:
+        dispatched["call_id"] = call_id
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter_module, "_bridge_one_dispatch", fake_bridge)
+    await adapter._stable_tool_executor("sys_session_get_info", {})
+
+    assert dispatched["call_id"] == "bridge-1"
+    assert list(adapter._pending_mcp_call_ids) == []
 
 
 # ---------------------------------------------------------------------------
@@ -892,6 +1155,38 @@ def test_config_option_update_records_options_and_active_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_new_captures_advertised_model() -> None:
+    """A model advertised in ``session/new``'s config options sets ``_active_model``.
+
+    jcode (and others) report their model in the ``session/new`` result rather than
+    a later ``config_option_update``; capturing it at session creation is what lets
+    a turn's usage name the model, so the server can attribute per-model tokens.
+
+    **What breaks if this fails**: an ACP agent that only advertises its model in
+    ``session/new`` records no model → token counts don't render for the session.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+
+    async def fake_rpc(method: str, params: dict, timeout: float | None = None) -> dict:
+        return {
+            "result": {
+                "sessionId": "s1",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "system.ai.claude-haiku-4-5",
+                        "options": [{"value": "system.ai.claude-haiku-4-5"}],
+                    }
+                ],
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    assert await ex._ensure_session() == "s1"
+    assert ex._active_model == "system.ai.claude-haiku-4-5"
+
+
+@pytest.mark.asyncio
 async def test_model_override_switches_warm_via_set_config_option() -> None:
     """
     A new model is applied with ``session/set_config_option`` using ``configId``.
@@ -1293,7 +1588,7 @@ async def test_mcp_relay_starts_and_builds_serve_mcp_entry() -> None:
         entry = servers[0]
         assert entry["name"] == "omnigent"
         assert "serve-mcp" in entry["args"]
-        assert "omnigent.claude_native_bridge" in entry["args"]
+        assert "omnigent.harnesses.claude_native.bridge" in entry["args"]
         assert all("name" in e and "value" in e for e in entry["env"])
         # Idempotent: a second call returns the cached relay, not a new one.
         assert m.session_new_servers(tools=[], tool_executor=fake_exec, loop=loop) is servers
@@ -1667,3 +1962,69 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     """No stderr and an empty ``str(exc)`` still yields something actionable."""
     ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
+
+
+# ---------------------------------------------------------------------------
+# Process lifecycle: a torn-down executor must not strand the agent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_spawned_agent_leads_its_own_process_group(tmp_path: Path) -> None:
+    """The spawned agent is a session/group leader, not in the harness's group.
+
+    Without the boundary ``_proc._killpg`` resolves the target group to the one
+    we share with the harness and daemon, refuses to signal it, and tree-aware
+    teardown silently degrades to a per-descendant walk.
+    """
+    agent_path = tmp_path / "sleepy_agent.py"
+    agent_path.write_text("import time\ntime.sleep(300)\n")
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Sleepy")
+    )
+
+    await ex._start_process()
+    try:
+        pid = ex._proc.pid  # type: ignore[union-attr]
+        assert os.getpgid(pid) == pid, "agent must lead its own process group"
+        assert os.getpgid(pid) != os.getpgid(0), "agent must not share our group"
+    finally:
+        await ex.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
+    """``close()`` stops the agent's descendants, not just the handle it holds.
+
+    Under a sandbox the handle is the seatbelt ``run_launcher`` wrapper, which
+    forks the real agent; a single-pid ``terminate()`` reached the wrapper and
+    left the agent running for the daemon's whole lifetime.
+    """
+    pid_file = tmp_path / "grandchild.pid"
+    agent_path = tmp_path / "forking_agent.py"
+    agent_path.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(kid.pid))\n"
+        "time.sleep(300)\n"
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Forking")
+    )
+
+    await ex._start_process()
+    deadline = time.monotonic() + 10.0
+    while not pid_file.exists():
+        assert time.monotonic() < deadline, "the fake agent never forked its child"
+        await asyncio.sleep(0.05)
+    grandchild = int(pid_file.read_text())
+    assert _proc.process_alive(grandchild)
+
+    await ex.close()
+
+    deadline = time.monotonic() + 10.0
+    while _proc.process_alive(grandchild):
+        assert time.monotonic() < deadline, f"agent child {grandchild} survived close()"
+        await asyncio.sleep(0.05)

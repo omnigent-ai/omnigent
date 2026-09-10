@@ -59,9 +59,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
-from omnigent.inner.acp_subagents import SubAgentStart, read_subagent_events
+from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -73,6 +74,7 @@ from omnigent.inner.executor import (
     ReasoningChunk,
     SubAgentCompleted,
     SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -391,6 +393,9 @@ class AcpExecutor(Executor):
         # :meth:`close`). ``_omnigent_tools`` is captured each turn for the relay.
         self._mcp = OmnigentAcpMcp(label=config.name)
         self._omnigent_tools: list[ToolSpec] = []
+        # Tool names the agent can use to reach the Omnigent MCP bridge, snapshotted
+        # from what session/new advertised. Empty means nothing is a bridge call.
+        self._bridge_tool_aliases: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------------
     # Low-level ACP transport
@@ -418,6 +423,9 @@ class AcpExecutor(Executor):
             env=env,
             cwd=self._cwd,
             limit=_STREAM_LIMIT,
+            # Own session/group: the sandbox launcher forks the real agent,
+            # and without a group boundary teardown reaches only the wrapper.
+            **_proc.spawn_kwargs(),
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -692,17 +700,10 @@ class AcpExecutor(Executor):
 
         params: _AcpJsonObject = {
             "cwd": self._cwd,
-            # ACP requires this field even when no per-session MCP servers are
-            # configured. Keep it empty when Omnigent MCP is disabled.
-            "mcpServers": [],
+            # ACP requires this field even with no per-session MCP servers; the
+            # helper returns [] when Omnigent MCP is disabled.
+            "mcpServers": self._session_mcp_servers(),
         }
-        if self._config.omnigent_mcp:
-            params["mcpServers"] = self._mcp.session_new_servers(
-                tools=self._omnigent_tools,
-                tool_executor=getattr(self, "_tool_executor", None),
-                loop=asyncio.get_event_loop(),
-                enabled=True,
-            )
         client_id: str | None = None
         if self._config.session_id_mode == "client":
             client_id = secrets.token_urlsafe(16)
@@ -723,7 +724,46 @@ class AcpExecutor(Executor):
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = session_id
+        # Capture the agent's advertised model from session/new's config options, so a
+        # turn's usage can name it. Agents that report the model here (e.g. jcode) would
+        # otherwise leave it unknown until a later config_option_update, leaving the
+        # server unable to attribute per-model token usage for the turn.
+        if isinstance(result, dict):
+            self._note_config_options(result.get("configOptions"))
         return self._session_id
+
+    def _session_mcp_servers(self) -> list[_AcpJsonObject]:
+        """Build ``session/new.mcpServers`` and snapshot the bridge aliases.
+
+        Relay creation and tool-call classification happen here together so they
+        cannot drift apart. No entries means no aliases, so with Omnigent MCP
+        disabled every call classifies as agent-native.
+        """
+        mcp_servers: list[_AcpJsonObject] = []
+        if self._config.omnigent_mcp:
+            mcp_servers = self._mcp.session_new_servers(
+                tools=self._omnigent_tools,
+                tool_executor=getattr(self, "_tool_executor", None),
+                loop=asyncio.get_event_loop(),
+                enabled=True,
+            )
+        servers = {str(s.get("name", "")) for s in mcp_servers if isinstance(s, dict)}
+        servers.discard("")
+        tools = {
+            name
+            for name in (spec.get("name") for spec in (self._omnigent_tools or []))
+            if isinstance(name, str) and name
+        }
+        # Agents name a bridged tool one of several ways; accept every shape we have
+        # seen, plus the bare name for agents that report it unprefixed.
+        aliases = set(tools) if servers else set()
+        for server in servers:
+            for tool in tools:
+                aliases.update(
+                    (f"mcp_{server}_{tool}", f"mcp__{server}__{tool}", f"{server}__{tool}")
+                )
+        self._bridge_tool_aliases = frozenset(aliases)
+        return mcp_servers
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
@@ -1146,14 +1186,15 @@ class AcpExecutor(Executor):
         return self._context_window
 
     @staticmethod
-    def _usage_from_result(result: _AcpJsonObject) -> dict[str, int] | None:
+    def _usage_from_result(result: _AcpJsonObject) -> dict[str, Any] | None:
         """Map an agent's final ``result.usage`` to Omnigent's usage keys.
 
-        ACP does not standardize usage, but agents that report it (Goose, Devin)
-        use ``{totalTokens, inputTokens, outputTokens}`` plus an optional
-        ``cachedReadTokens``; Omnigent's ``TurnComplete.usage`` uses
-        ``{input_tokens, output_tokens, total_tokens, cache_read_input_tokens}``.
-        Absent → ``None`` (usage simply isn't shown for agents that don't report).
+        ACP does not standardize usage, but agents that report it (Goose, Devin,
+        jcode) use ``{totalTokens, inputTokens, outputTokens}`` plus optional
+        ``cachedReadTokens`` / ``cachedWriteTokens``; Omnigent's ``TurnComplete.usage``
+        uses ``{input_tokens, output_tokens, total_tokens, cache_read_input_tokens,
+        cache_creation_input_tokens}``. Absent → ``None`` (usage simply isn't shown for
+        agents that don't report).
 
         ``cachedReadTokens`` is kept as its own key rather than folded into
         ``input_tokens``: cache reads are real consumption but billed at a
@@ -1165,17 +1206,70 @@ class AcpExecutor(Executor):
         usage = result.get("usage")
         if not isinstance(usage, dict):
             return None
-        out: dict[str, int] = {}
+        out: dict[str, Any] = {}
         for acp_key, omni_key in (
             ("inputTokens", "input_tokens"),
             ("outputTokens", "output_tokens"),
             ("totalTokens", "total_tokens"),
             ("cachedReadTokens", "cache_read_input_tokens"),
+            ("cachedWriteTokens", "cache_creation_input_tokens"),
         ):
             value = usage.get(acp_key)
             if isinstance(value, int) and not isinstance(value, bool):
                 out[omni_key] = value
         return out or None
+
+    def _usage_with_active_model(self, result: _AcpJsonObject) -> dict[str, Any] | None:
+        """Usage from the result, tagged with the active model for cost attribution.
+
+        ACP ``result.usage`` carries token counts but no model id, so the server
+        cannot attribute a turn's tokens to a model — leaving its per-model usage
+        view (``usage_by_model``) empty and the counts unrendered in the UI. Stamp
+        the agent's active model (its ``model`` config option, captured at
+        ``session/new``) so the tokens are attributed, mirroring how codex stamps
+        ``usage["model"]``. The stamp is skipped when the model is unknown or the
+        agent already reported one on the result.
+
+        :param result: The ACP ``session/prompt`` result object.
+        :returns: The usage dict (with ``model`` when known), or ``None``.
+        """
+        usage = self._usage_from_result(result)
+        if usage is not None and self._active_model and "model" not in usage:
+            usage["model"] = self._active_model
+        return usage
+
+    def _is_bridge_tool_call(self, name: str, update: _AcpJsonObject) -> bool:
+        """True when this tool call reaches Omnigent through the MCP bridge.
+
+        Candidates are the reported name plus the machine names some agents carry
+        beside a humanized title. An unrecognized shape reads as agent-native,
+        which may duplicate a card but cannot corrupt dispatch correlation.
+        """
+        if not self._bridge_tool_aliases:
+            return False
+        raw = update.get("rawInput")
+        raw_tool = str(raw.get("tool", "")) if isinstance(raw, dict) else ""
+        # Goose reports the machine name under ``_meta.goose.toolCall.toolName``;
+        # older builds used the flatter ``_meta.goose.toolName``. Read both.
+        meta = update.get("_meta")
+        goose = meta.get("goose") if isinstance(meta, dict) else None
+        meta_tool = ""
+        if isinstance(goose, dict):
+            inner = goose.get("toolCall")
+            meta_tool = str(
+                (inner.get("toolName", "") if isinstance(inner, dict) else "")
+                or goose.get("toolName", "")
+            )
+        candidates = {c for c in (name, raw_tool, meta_tool) if c}
+        return not self._bridge_tool_aliases.isdisjoint(candidates)
+
+    def _reset_session_state(self) -> None:
+        """Forget state that is only valid for the current ACP session."""
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._tool_names.clear()
+        self._tool_inputs.clear()
+        self._bridge_tool_aliases = frozenset()
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
         """Translate one ``session/update`` payload into ExecutorEvents.
@@ -1186,6 +1280,36 @@ class AcpExecutor(Executor):
         """
         update_type = update.get("sessionUpdate", "")
         events: list[ExecutorEvent] = []
+
+        # Sub-agent frames ride a per-agent dialect (Devin: cognition.ai/* on the
+        # ``_meta``); a source claims them. When one does, the frame belongs to a
+        # *child* session, not the parent stream — so emit the child-directed
+        # events and stop. The tool-card branches below would otherwise render the
+        # sub-agent's own work in the parent, and a lifecycle ``tool_call_update``
+        # (whose id was never an originating ``tool_call``) would close a spurious
+        # "tool" card there. Empty for a generic ACP agent (no sources), so this
+        # is a no-op for every non-Devin harness.
+        sub_events = read_subagent_events(update, self._extension.subagent_sources)
+        if sub_events:
+            for sub in sub_events:
+                if isinstance(sub, SubAgentStart):
+                    events.append(
+                        SubAgentStarted(child_key=sub.child_key, title=sub.title, task=sub.task)
+                    )
+                elif isinstance(sub, SubAgentActivity):
+                    events.append(
+                        SubAgentToolCall(
+                            child_key=sub.child_key,
+                            call_id=sub.call_id,
+                            name=sub.name,
+                            args=dict(sub.args),
+                        )
+                    )
+                else:  # SubAgentEnd
+                    events.append(
+                        SubAgentCompleted(child_key=sub.child_key, ok=sub.ok, summary=sub.summary)
+                    )
+            return events
 
         if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
             content = update.get("content", {})
@@ -1205,9 +1329,13 @@ class AcpExecutor(Executor):
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
                 self._tool_inputs[call_id] = args
-                events.append(
-                    ToolCallRequest(name=str(name), args=args, metadata={"call_id": call_id})
-                )
+                metadata: _AcpJsonObject = {"call_id": call_id}
+                # An agent-native tool ran inside the agent's own loop and never
+                # round-trips Omnigent dispatch. Leaving its id in the correlation
+                # queue would mis-pair the next bridge completion.
+                if not self._is_bridge_tool_call(str(name), update):
+                    metadata["internally_executed"] = True
+                events.append(ToolCallRequest(name=str(name), args=args, metadata=metadata))
         elif update_type == _UPDATE_TOOL_CALL_UPDATE:
             call_id = update.get("toolCallId")
             status = update.get("status")
@@ -1236,20 +1364,6 @@ class AcpExecutor(Executor):
 
         elif update_type == _UPDATE_CONFIG_OPTION:
             self._note_config_options(update.get("configOptions"))
-
-        # Sub-agent lifecycle rides on these updates in a per-agent dialect, so
-        # only the sources this agent's extension supplies can recognize it —
-        # none for a generic ACP agent. The runner mints a child session per
-        # start so the "Subagents" panel lists it.
-        for sub in read_subagent_events(update, self._extension.subagent_sources):
-            if isinstance(sub, SubAgentStart):
-                events.append(
-                    SubAgentStarted(child_key=sub.child_key, title=sub.title, task=sub.task)
-                )
-            else:
-                events.append(
-                    SubAgentCompleted(child_key=sub.child_key, ok=sub.ok, summary=sub.summary)
-                )
 
         return events
 
@@ -1473,19 +1587,17 @@ class AcpExecutor(Executor):
                     response = fut.result()
                 except Exception as exc:
                     logger.exception("ACP process response retrieval failed")
-                    self._session_id = None
-                    self._system_prompt_sent = False
+                    self._reset_session_state()
                     yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
                     return
                 if "error" in response:
                     error_msg = response["error"].get("message", "Unknown ACP error")
                     if "Session not found" in error_msg:
-                        self._session_id = None
-                        self._system_prompt_sent = False
+                        self._reset_session_state()
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
-                usage = self._usage_from_result(result) if isinstance(result, dict) else None
+                usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 
@@ -1540,6 +1652,7 @@ class AcpExecutor(Executor):
 
     async def close(self) -> None:
         """Terminate the agent subprocess and clean up."""
+        self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
             self._mcp.close()
@@ -1561,10 +1674,12 @@ class AcpExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._proc.stdin.close()  # type: ignore[union-attr]
             try:
-                self._proc.terminate()
+                # Tree-aware: the handle is the sandbox launcher, not the
+                # agent it forked. A bare terminate() orphans the agent.
+                _proc.terminate_tree(self._proc)
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except Exception:  # noqa: BLE001
                 with contextlib.suppress(Exception):
-                    self._proc.kill()
+                    _proc.kill_tree(self._proc)
             finally:
                 self._proc = None
