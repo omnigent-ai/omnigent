@@ -350,6 +350,44 @@ export function parseTerminalClipboardMessage(message: string): string | null {
   return decodeTerminalClipboardBase64((value as { data: string }).data);
 }
 
+/**
+ * Selection names an OSC 52 write may target, per ``xterm``'s ``Ps = 5 2``.
+ *
+ * ``c``/``p``/``s`` are the clipboard, primary and select selections — the
+ * only ones with a browser equivalent. Cut buffers (``0``-``7``) and the
+ * secondary selection (``q``) have none, so a write naming them is not a
+ * request this terminal can honor. An empty list means the default.
+ */
+const OSC52_WRITE_TARGETS_RE = /^[cps]*$/;
+
+/**
+ * Parse an OSC 52 payload (``<targets>;<base64>``) into clipboard text.
+ *
+ * Returns ``null`` for anything that must not reach the clipboard, leaving
+ * the caller nothing to forward:
+ *
+ * - ``?`` as the data, which asks the terminal to *report* the clipboard
+ *   back into the pane. Serving it would hand a pane program read access to
+ *   whatever the user last copied, so it is refused outright — this terminal
+ *   only ever writes.
+ * - a target this app has no equivalent for (cut buffers, secondary).
+ * - a payload failing the same bounded, canonical base64 check applied to
+ *   ``clipboard-write`` frames, so a pane cannot spend memory here that it
+ *   could not spend through tmux.
+ *
+ * :param payload: OSC 52 body, i.e. the bytes after ``ESC ] 52 ;``.
+ * :returns: The decoded text, or ``null`` when it must not be forwarded.
+ */
+export function parseTerminalOsc52(payload: string): string | null {
+  const separator = payload.indexOf(";");
+  if (separator === -1) return null;
+  const targets = payload.slice(0, separator);
+  const data = payload.slice(separator + 1);
+  if (data === "?") return null;
+  if (!OSC52_WRITE_TARGETS_RE.test(targets)) return null;
+  return decodeTerminalClipboardBase64(data);
+}
+
 /** Whether a clipboard event is attributable to recent input on this attach. */
 export function hadRecentTerminalInput(lastInputAt: number, now: number): boolean {
   return (
@@ -572,9 +610,20 @@ export class TerminalSession {
       // Opt into xterm's proposed APIs, matching openui's terminal setup.
       allowProposedApi: true,
     });
-    // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
-    // writes can only arrive through validated tmux `clipboard-write` frames.
-    this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
+    // Control mode forwards raw pane output, so a pane program's OSC 52 lands
+    // here verbatim: tmux `set-clipboard external` keeps it out of a tmux
+    // buffer, but not off this socket. TUIs copy this way and have no other
+    // route to the clipboard (pi's copy action, vim's "+ register), so the
+    // sequence is honored — through the same consent gate as a validated
+    // `clipboard-write` frame, never straight to the clipboard. A pane runs
+    // agent-controlled output; an unprompted write would let injected content
+    // silently replace what the user copies. Always returns true so a payload
+    // we refuse is consumed here rather than handled anywhere else.
+    this.osc52Dispose = this.term.parser.registerOscHandler(52, (payload) => {
+      const text = parseTerminalOsc52(payload);
+      if (text !== null) this.requestClipboardWrite(text);
+      return true;
+    });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links. Without

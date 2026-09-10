@@ -1,9 +1,15 @@
-"""E2E: terminal clipboard frames require consent before writing locally.
+"""E2E: terminal clipboard writes require consent, whatever their source.
+
+Two sources reach the same gate:
+
+- a validated tmux ``clipboard-write`` control frame (a copy-mode selection),
+- raw pane OSC 52, which control mode forwards verbatim -- how a TUI running
+  in the pane (pi's copy action, vim's ``"+`` register) asks to copy.
 
 The terminal resource and attach WebSocket are browser-route mocks. This keeps
-this test tmux-free while exercising the built SPA's real TerminalView,
-TerminalSession, xterm input bookkeeping, WebSocket parsing, Sonner consent UI,
-and browser Clipboard API.
+these tests tmux-free while exercising the built SPA's real TerminalView,
+TerminalSession, xterm OSC parsing and input bookkeeping, WebSocket parsing,
+Sonner consent UI, and browser Clipboard API.
 """
 
 from __future__ import annotations
@@ -17,7 +23,7 @@ from collections.abc import Iterator
 
 import httpx
 import pytest
-from playwright.sync_api import Page, Route, WebSocketRoute, expect
+from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
 
 from tests.e2e_ui.conftest import _build_hello_world_bundle, open_right_rail
 
@@ -52,6 +58,7 @@ def clipboard_ui_session(live_server: str) -> Iterator[tuple[str, str]]:
 
 
 def _clipboard_frame(text: str) -> str:
+    """Build the validated server->browser ``clipboard-write`` text frame."""
     encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
     return json.dumps(
         {
@@ -61,6 +68,12 @@ def _clipboard_frame(text: str) -> str:
         },
         separators=(",", ":"),
     )
+
+
+def _osc52_write(text: str) -> bytes:
+    """Build the raw pane bytes a TUI emits to copy: ``ESC ] 52 ; c ; <b64> BEL``."""
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return f"\x1b]52;c;{encoded}\x07".encode("ascii")
 
 
 def _expect_clipboard(page: Page, expected: str) -> None:
@@ -75,12 +88,14 @@ def _expect_clipboard(page: Page, expected: str) -> None:
     raise AssertionError(f"clipboard was {actual!r}, expected {expected!r}")
 
 
-def test_terminal_clipboard_prompt_and_session_grant(
-    page: Page,
-    clipboard_ui_session: tuple[str, str],
-) -> None:
-    """The first copy asks; a session grant makes the next copy automatic."""
-    base_url, session_id = clipboard_ui_session
+def _mount_mock_terminal(
+    page: Page, base_url: str, session_id: str
+) -> tuple[Locator, list[WebSocketRoute]]:
+    """Mock the terminal resource and attach socket, then open the shell tab.
+
+    :returns: The connected ``terminal-view`` locator and the captured attach
+        sockets, whose last entry is the live one to inject server frames on.
+    """
     sockets: list[WebSocketRoute] = []
 
     terminal_list = re.compile(
@@ -118,7 +133,7 @@ def test_terminal_clipboard_prompt_and_session_grant(
 
     def _attach(ws: WebSocketRoute) -> None:
         sockets.append(ws)
-        # Swallow resize/input frames; the test injects server frames below.
+        # Swallow resize/input frames; the tests inject server frames below.
         ws.on_message(lambda _message: None)
 
     page.route(terminal_list, _serve_terminal)
@@ -142,6 +157,16 @@ def test_terminal_clipboard_prompt_and_session_grant(
     terminal = rail.get_by_test_id("terminal-view")
     expect(terminal).to_have_attribute("data-state", "connected", timeout=20_000)
     assert sockets, "mock terminal attach WebSocket did not connect"
+    return terminal, sockets
+
+
+def test_terminal_clipboard_prompt_and_session_grant(
+    page: Page,
+    clipboard_ui_session: tuple[str, str],
+) -> None:
+    """The first copy asks; a session grant makes the next copy automatic."""
+    base_url, session_id = clipboard_ui_session
+    terminal, sockets = _mount_mock_terminal(page, base_url, session_id)
 
     textarea = terminal.locator("textarea.xterm-helper-textarea")
     consent = page.get_by_test_id("terminal-clipboard-consent")
@@ -169,3 +194,75 @@ def test_terminal_clipboard_prompt_and_session_grant(
 
     _expect_clipboard(page, second)
     expect(consent).to_have_count(0)
+
+
+def test_pane_osc52_copy_prompts_then_reaches_clipboard(
+    page: Page,
+    clipboard_ui_session: tuple[str, str],
+) -> None:
+    """A TUI's in-pane copy reaches the clipboard, behind the same prompt.
+
+    Control mode forwards raw pane output, so a TUI's copy arrives as an OSC 52
+    sequence with no tmux buffer behind it -- the shape ``set-clipboard
+    external`` keeps out of tmux, but not off this socket. It must land on the
+    clipboard the way a tmux selection does, through the consent prompt, and
+    never by writing straight to it: pane output is agent-controlled, so an
+    unprompted write would let injected content replace what the user copies.
+    """
+    base_url, session_id = clipboard_ui_session
+    terminal, sockets = _mount_mock_terminal(page, base_url, session_id)
+
+    textarea = terminal.locator("textarea.xterm-helper-textarea")
+    consent = page.get_by_test_id("terminal-clipboard-consent")
+
+    copied = f"osc52-copy-{uuid.uuid4().hex}"
+    textarea.focus()
+    page.keyboard.type("a")  # Satisfy TerminalSession's recent-input gate.
+    sockets[-1].send(_osc52_write(copied))
+
+    expect(consent).to_be_visible()
+    expect(consent).to_contain_text("Allow this terminal to copy to your clipboard?")
+
+    consent.get_by_role("button", name="Copy once").click()
+    _expect_clipboard(page, copied)
+    expect(consent).to_have_count(0)
+
+
+def test_pane_osc52_read_request_is_never_answered(
+    page: Page,
+    clipboard_ui_session: tuple[str, str],
+) -> None:
+    """``OSC 52 ; c ; ?`` asks to read the clipboard; it must produce nothing.
+
+    Answering would hand agent-controlled pane output whatever the user last
+    copied. The sequence is consumed with no prompt and no reply.
+    """
+    base_url, session_id = clipboard_ui_session
+    terminal, sockets = _mount_mock_terminal(page, base_url, session_id)
+
+    sent: list[str | bytes] = []
+
+    def _record(message: str | bytes) -> None:
+        # A plain function, not ``sent.append``: Playwright tags handlers with
+        # an attribute, which a builtin method rejects.
+        sent.append(message)
+
+    sockets[-1].on_message(_record)
+
+    textarea = terminal.locator("textarea.xterm-helper-textarea")
+    consent = page.get_by_test_id("terminal-clipboard-consent")
+
+    secret = f"never-disclosed-{uuid.uuid4().hex}"
+    page.evaluate("(text) => navigator.clipboard.writeText(text)", secret)
+
+    textarea.focus()
+    page.keyboard.type("a")  # Satisfy the recent-input gate; still no answer.
+    sent.clear()
+    sockets[-1].send(b"\x1b]52;c;?\x07")
+
+    # No prompt, and nothing containing the clipboard goes back to the pane.
+    expect(consent).to_have_count(0)
+    page.wait_for_timeout(500)
+    for message in sent:
+        payload = message if isinstance(message, str) else message.decode("utf-8", "replace")
+        assert secret not in payload, f"clipboard leaked to the pane: {payload!r}"
