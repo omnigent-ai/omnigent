@@ -8,6 +8,7 @@ import os
 import queue
 import select
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,10 +28,12 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
+    _LOGIN_GUIDANCE,
     _build_tools,
     _claude_prompt_rendered,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
+    _is_box_rule,
     _JsonlRecord,
     _occupying_surface,
     augment_claude_args,
@@ -39,6 +42,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ensure_claude_workspace_trusted,
     inject_interrupt,
     inject_user_message,
+    is_auth_slash_command,
     kill_session,
     post_tools_changed,
     prepare_bridge_dir,
@@ -820,7 +824,7 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
                         "message": {
                             "role": "assistant",
                             "content": [
-                                {"type": "thinking", "thinking": "redacted"},
+                                {"type": "thinking", "thinking": "check the todo file first"},
                                 {
                                     "type": "tool_use",
                                     "id": "toolu_read_1",
@@ -885,6 +889,7 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
     assert cursor == 6, "cursor should include metadata records even when they emit no items"
     assert [item.item_type for item in items] == [
         "message",
+        "reasoning",
         "function_call",
         "function_call_output",
         "message",
@@ -893,19 +898,115 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
         "role": "user",
         "content": [{"type": "input_text", "text": "please inspect TODO.md"}],
     }
-    tool_call = items[1]
+    reasoning = items[1]
+    assert reasoning.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "check the todo file first"}],
+    }
+    tool_call = items[2]
     assert tool_call.data["name"] == "Read"
     assert json.loads(tool_call.data["arguments"]) == {"file_path": "TODO.md"}
     assert tool_call.data["call_id"] == "toolu_read_1"
-    assert items[2].response_id == tool_call.response_id
-    assert items[2].data == {"call_id": "toolu_read_1", "output": "TODO contents"}
+    assert reasoning.response_id == tool_call.response_id
     assert items[3].response_id == tool_call.response_id
-    assert items[3].data == {
+    assert items[3].data == {"call_id": "toolu_read_1", "output": "TODO contents"}
+    assert items[4].response_id == tool_call.response_id
+    assert items[4].data == {
         "role": "assistant",
         "agent": "claude-native-ui",
         "content": [{"type": "output_text", "text": "Done."}],
     }
     assert current_response_id == tool_call.response_id
+
+
+def test_read_transcript_items_since_mirrors_thinking_as_reasoning(tmp_path: Path) -> None:
+    """
+    A ``thinking`` block becomes a ``reasoning`` item in the mirrored turn.
+
+    Claude Code renders the thought in the TUI and persists it to the
+    transcript, so the chat mirror must surface the same reasoning
+    context: a ``reasoning`` item sharing the turn's response id,
+    ordered before the answer text it precedes.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "the user wants the token verbatim",
+                            "signature": "sig",
+                        },
+                        {"type": "text", "text": "TOKEN"},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["reasoning", "message"]
+    reasoning, answer = items
+    assert reasoning.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "the user wants the token verbatim"}],
+    }
+    assert reasoning.source_id.endswith(":0:reasoning"), (
+        "reasoning items need a stable per-block source id so forwarder retries dedup"
+    )
+    assert reasoning.response_id == answer.response_id
+    assert current_response_id == answer.response_id
+
+
+def test_read_transcript_items_since_skips_unreadable_thinking(tmp_path: Path) -> None:
+    """
+    Thinking with no readable text mirrors nothing.
+
+    A whitespace-only ``thinking`` block and a ``redacted_thinking``
+    block (encrypted payload, no text anywhere — the TUI shows nothing
+    either) must not produce a dead, empty reasoning section in chat.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "   "},
+                        {"type": "redacted_thinking", "data": "opaque-bytes"},
+                        {"type": "text", "text": "Done."},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
 
 
 def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
@@ -1135,6 +1236,15 @@ def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: 
     assert noop.data["kind"] == "command"
     assert noop.data["output"] == stdout.strip()
 
+    byte_result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+    record_items = [item for record in byte_result.record_items for item in record.items]
+    assert record_items == byte_result.items
+
 
 def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:
     """
@@ -1200,6 +1310,182 @@ def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str)
     assert "Context limit reached" in text
     assert "/compact" in text
     assert "/clear" in text
+
+
+def _assistant_transcript_text(
+    tmp_path: Path,
+    raw_text: str,
+    *,
+    is_api_error: bool = False,
+) -> str:
+    """
+    Return the display text the bridge produces for one assistant record.
+
+    :param tmp_path: Directory to hold the throwaway transcript.
+    :param raw_text: Assistant message content written to the JSONL.
+    :param is_api_error: Write Claude Code's ``isApiErrorMessage`` flag
+        beside ``message``, marking the record as CLI-authored.
+    :returns: Text of the single parsed conversation item.
+    """
+    record: dict[str, Any] = {
+        "type": "assistant",
+        "uuid": "auth-1",
+        "message": {"role": "assistant", "content": raw_text},
+    }
+    if is_api_error:
+        record["isApiErrorMessage"] = True
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(record) + "\n",
+        encoding="utf-8",
+    )
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+    assert len(items) == 1
+    return str(items[0].data["content"][0]["text"])
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Prose ABOUT the command — including a turn explaining this very
+        # rewrite — must survive untouched.
+        "You can run /login to sign in again.",
+        "The CLI says: Please run /login\nBut the web chat cannot send it.",
+        "Please run /clear",
+        # Byte-identical to the CLI's error, but UNFLAGGED. Without the
+        # flag there is nothing to tell it apart from a model quoting
+        # the line, and replacing a real turn would delete an answer the
+        # user asked for — so it is forwarded as-is.
+        "Login expired · Please run /login",
+    ],
+)
+def test_read_transcript_leaves_unflagged_login_text_untouched(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    Only a CLI-flagged record gets the guidance, never an unflagged one.
+
+    Appending remedy text to a real model answer that merely mentions
+    ``/login`` would misdirect the user. ``isApiErrorMessage`` is the
+    only evidence that the text is not model output; without it,
+    nothing is touched.
+    """
+    assert _assistant_transcript_text(tmp_path, raw_text) == raw_text
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Verbatim constants from the claude binary (2.1.212). The last
+        # two do NOT end in "Please run /login", so the unflagged
+        # single-line anchor alone would miss them.
+        "Login expired · Please run /login",
+        "OAuth token revoked · Please run /login",
+        "Your organization has disabled API key authentication · Run /login "
+        "to sign in with your claude.ai account",
+    ],
+)
+def test_read_transcript_rewrites_flagged_api_error_anywhere(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    A CLI-flagged record gets guidance appended wherever its ``/login`` sits.
+
+    ``isApiErrorMessage`` is Claude Code's own marker for a record it
+    synthesized instead of receiving from the model — an expired login
+    never reaches the API, so there is no model turn behind the text.
+    That makes a wider match safe, which is what catches the auth
+    strings whose instruction sits mid-sentence. The CLI's own text is
+    kept: variants whose remedy goes beyond re-auth must not lose it.
+    """
+    expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
+
+
+def test_read_transcript_flag_inside_message_also_counts(tmp_path: Path) -> None:
+    """
+    The flag is honoured inside ``message`` as well as beside it.
+
+    Claude Code writes it as a sibling of ``message`` but reads it back
+    from both places, so accept either rather than betting on one.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "auth-2",
+                "message": {
+                    "role": "assistant",
+                    "content": "Credit balance too low · Run /login to switch accounts",
+                    "isApiErrorMessage": True,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+
+    rendered = items[0].data["content"][0]["text"]
+    assert "omni setup" in rendered
+    # The CLI's own diagnosis (a billing problem, not an expired login)
+    # must survive: the guidance is appended, never a replacement.
+    assert rendered.startswith("Credit balance too low · Run /login to switch accounts")
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Not about auth at all.
+        "API Error: 500 Internal Server Error",
+        # Auth errors that name /logout ALONE (verbatim from the binary).
+        # Their remedy is unsetting an env var, which `omni setup` does
+        # not do — appending its guidance there would only add noise.
+        "ANTHROPIC_API_KEY is set · unset it or /logout to clear the saved key",
+        "Unset the ANTHROPIC_API_KEY environment variable, or claude /logout then say continue",
+        "This background session shares credentials with other sessions; /logout here has "
+        "no effect. Run /logout from your main terminal to sign out.",
+    ],
+)
+def test_read_transcript_flagged_record_without_login_is_untouched(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    Flagging alone rewrites nothing — the text must name ``/login``.
+
+    Two families must survive verbatim: API errors unrelated to auth
+    (rate limits, overload, 5xx), and the auth errors that point at
+    ``/logout`` alone. The latter describe an env var or a sibling
+    session overriding the credential, and the instruction they carry —
+    unset ``ANTHROPIC_API_KEY`` — is one ``omni setup`` cannot perform,
+    so replacing the message would strand the user. A message naming
+    both (``...then /logout and /login.``) still matches on ``/login``.
+    """
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == raw_text
+
+
+def test_read_transcript_rewrites_logout_and_login_together(tmp_path: Path) -> None:
+    """
+    A message naming BOTH commands is still a ``/login`` dead end.
+
+    The CLI's "...then /logout and /login." shape ends in a re-auth
+    instruction, so it takes the guidance via its ``/login`` — but its
+    env-var prerequisite (unset or re-mint ``CLAUDE_CODE_OAUTH_TOKEN``,
+    which ``omni setup`` cannot do) must stay on screen, so the CLI
+    text is kept and the guidance appended below it.
+    """
+    raw_text = (
+        "If CLAUDE_CODE_OAUTH_TOKEN is set, unset it or re-mint it for this "
+        "account, then /logout and /login."
+    )
+
+    expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
 
 
 def test_read_transcript_items_from_offset_skips_existing_prefix(
@@ -2829,6 +3115,31 @@ def test_augment_claude_args_materializes_api_key_helper(
     assert settings_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_augment_claude_args_threads_model_overrides_into_settings(tmp_path: Path) -> None:
+    """``model_overrides`` is written into the invocation-local sidecar."""
+    overrides = {
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-opus-5": "databricks-claude-opus-5",
+    }
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        api_key_helper="printf tok",
+        model_overrides=overrides,
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings["apiKeyHelper"] == "printf tok"
+    assert settings["modelOverrides"] == overrides
+
+
+def test_augment_claude_args_omits_model_overrides_when_unsupplied(tmp_path: Path) -> None:
+    """Existing call sites that omit ``model_overrides`` write no such key."""
+    settings = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    assert "modelOverrides" not in settings
+
+
 def test_augment_claude_args_mirrors_launch_overrides_into_settings(
     tmp_path: Path,
 ) -> None:
@@ -3477,6 +3788,29 @@ def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
     supported commands and skills are left untouched.
     """
     assert _escape_unsupported_slash_command(content) == expected
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("/login", True),
+        ("  /login", True),
+        ("/logout", True),
+        ("/login --claudeai", True),
+        ("plain text", False),
+        ("/clear", False),
+        ("/loginsomething", False),
+        ("please run /login", False),
+    ],
+)
+def test_is_auth_slash_command(content: str, expected: bool) -> None:
+    """
+    Only a leading ``/login`` / ``/logout`` is an auth command.
+
+    A bare mention mid-sentence is ordinary prose and must still reach
+    Claude Code — the caller short-circuits the whole turn on a True.
+    """
+    assert is_auth_slash_command(content) is expected
 
 
 def test_inject_user_message_escapes_unsupported_slash_command_payload(
@@ -4884,6 +5218,26 @@ def test_post_tools_changed_normalizes_transport_errors(
         post_tools_changed(tmp_path)
 
     assert caught.value.__cause__ is transport_error
+
+
+def test_post_tools_changed_normalizes_server_info_read_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Reading the bridge advertisement can fail for reasons other than the file
+    being absent — a runner that has exhausted its file descriptors raises
+    ``OSError`` (EMFILE) on the read. That must arrive as the documented
+    ``RuntimeError`` so the fire-and-forget caller can swallow it instead of
+    leaving an unretrieved task exception behind.
+    """
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(side_effect=OSError(24, "Too many open files")),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to read the Claude native bridge server info"):
+        post_tools_changed(tmp_path)
 
 
 def test_post_tools_changed_preserves_programming_errors(
@@ -7263,6 +7617,134 @@ def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_under_labelled_rule() -> None:
+    """
+    A label on the box's opening rule does not hide the input box.
+
+    Claude Code breaks the opening rule with the session's title
+    (``"──── 01007290 ─"``). Requiring every glyph on the rule to be a
+    rule glyph made ``_composer_row`` anchor on the *closing* rule
+    instead, pick the footer row below it, and report "no input box" with
+    ``❯`` plainly on screen. The turn then waited out
+    ``_CLAUDE_PROMPT_TIMEOUT_S`` and the person's message was never
+    delivered. Pane shape is taken from a session that hit this.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            "● 2 background agents launched (↓ to manage)",
+            "  ⎿  Interrupted · What should Claude do instead?",
+            f"{rule} 01007290 ─",  # opening rule, labelled with the session title
+            "❯ ",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "  ◯ support-agent:enrichment-ru…  Connecting     40s · ↓ 66.3k tokens",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
+    """
+    A label that fills the rule still does not hide the input box.
+
+    Claude Code right-aligns the title, so the run of glyphs left of it
+    shrinks as the title grows and is a single glyph once the title nears
+    the pane width. The pane is only as wide as the person's browser
+    terminal (``window-size latest`` plus the web client's own
+    ``refresh-client -C``), so an ordinary title on a narrow terminal
+    reaches that shape — and requiring a longer leading run left the
+    labelled-rule turn timing out there exactly as it did before. Pane
+    shape is taken from a 50-column session.
+    """
+    rule = "─" * 50
+    pane = "\n".join(
+        [
+            "  ⎿  Session renamed to:",
+            "     fix-the-billing-webhook-retry-backoff-path-now",
+            "─ fix-the-billing-webhook-retry-backoff-path-now ─",  # 1-glyph lead
+            "❯ ",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ high │ 0/1M $0.00",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "─" * 40,  # plain rule
+        "───",  # shortest plain rule
+        "╭" + "─" * 10 + "╮",  # cornered rule
+        "─" * 40 + " 01007290 ─",  # labelled with a session title
+        "─" * 40 + " design doc work ─",  # label carrying spaces
+        # Claude Code right-aligns the label, so the leading run shrinks to a
+        # single glyph once the title nears the pane width. Both of these come
+        # off a real pane: a 75-char title at 80 columns, and an ordinary
+        # 46-char title on a browser terminal only 50 columns wide.
+        "── " + "t" * 75 + " ─",
+        "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+    ],
+)
+def test_is_box_rule_accepts_rules(line: str) -> None:
+    """Plain, cornered and labelled rules all frame the input box."""
+    assert _is_box_rule(line) is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "❯ 2. No (recommended)",  # a menu row, not a rule
+        "│ cell │",  # vertical glyphs bound a table cell, not a rule
+        "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",  # footer row
+        "output line 1",
+        "─ x ─",  # narrower than _MIN_TITLED_RULE_WIDTH
+        # Wide enough to clear the width floor, so only the vertical frame
+        # glyphs keep these off the rule list.
+        "│ a longer table cell │",
+        "│ a very wide pasted table cell indeed │",
+        "──",  # shorter than the minimum rule
+        "│   │",  # nested pipes + spaces: pasted table indentation, not a rule
+        "│   │   │",  # deeper nesting, same shape
+        "│   ├── src",  # a ``tree`` row
+        "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+    ],
+)
+def test_is_box_rule_rejects_non_rules(line: str) -> None:
+    """Ordinary rows must not pass as a rule now that labels are allowed."""
+    assert _is_box_rule(line) is False
+
+
+def test_claude_prompt_rendered_sees_prompt_over_pasted_tree_output() -> None:
+    """
+    Box glyphs inside a multi-line draft do not hide the input box.
+
+    Admitting any run of rule glyphs and spaces as a rule would make a
+    pasted ``tree``/table line (``"│   │"``) an *interior* rule.
+    ``_composer_row`` takes the row under the last two rules, so that
+    false rule and the closing rule would be the pair it checks — skipping
+    the real opening rule where ``❯`` lives and reporting "no input box"
+    for the very reason this labelled-rule fix exists.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            f"{rule} 01007290 ─",  # opening rule, labelled
+            "❯ here is the layout I meant:",
+            "  src",
+            "  │   ├── app.py",
+            "  │   │",  # pasted tree indentation — content, not a rule
+            "  │   └── util.py",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
     """
     Append raw JSONL lines to the bridge deltas file.
@@ -9453,3 +9935,285 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Bridge HTTP server bind/advertise behavior.
+#
+# The servers default to loopback (127.0.0.1). Sandbox backends with SSRF
+# hardening (e.g. OpenShell) deny loopback destinations unconditionally, so a
+# loopback-advertised relay is unreachable from hook subprocesses inside such
+# a sandbox; that integrator opts into an all-interfaces bind via
+# OMNIGENT_BRIDGE_BIND_HOST="0.0.0.0", which advertises the host's routable
+# address. Ports come from a stable, allowlistable pool.
+# ---------------------------------------------------------------------------
+
+
+async def _noop_relay_executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+    """Accept any relayed tool call; these tests only exercise binding."""
+    del name, arguments
+    return {}
+
+
+def _relay_tools() -> list[dict[str, Any]]:
+    """Minimal tool list for a relay advertisement."""
+    return [{"name": "sys_noop", "description": "", "parameters": {"type": "object"}}]
+
+
+@pytest.fixture
+def _no_ambient_bridge_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate bind/advertise decisions from ambient host environment."""
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, raising=False)
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, raising=False)
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_tool_relay_defaults_to_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no override the relay stays loopback-only, even given a routable IP.
+
+    Loopback is the default posture so an ordinary host keeps the relay off
+    every other interface. A routable address is present here (mocked) to
+    prove detection alone never widens the bind without the opt-in.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    bridge_dir = prepare_bridge_dir("conv_default_loopback", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert info["url"].startswith("http://127.0.0.1:"), (
+            "detecting a routable address must not widen the default bind"
+        )
+        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+            encoding="utf-8"
+        )
+        assert "OMNIGENT_RELAY_URL='http://127.0.0.1:" in env_text
+    finally:
+        relay.close()
+    assert not (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).exists(), (
+        "close() must recognise its own advertisement and unlink it"
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_all_interfaces_opt_in_advertises_routable_host_reachable_locally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OMNIGENT_BRIDGE_BIND_HOST=0.0.0.0 advertises the routable host.
+
+    This is the sandbox integrator's opt-in: a loopback advertisement is
+    unreachable from an SSRF-hardened sandbox, so the relay must advertise a
+    routable host while still binding all interfaces. TEST-NET-3 stands in for
+    the detected routable address; it is deliberately not locally bindable,
+    proving the server listens on all interfaces rather than on the advertised
+    address itself, so loopback consumers keep working.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_routable_bind", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        port = int(info["url"].rsplit(":", 1)[1])
+        assert info["url"] == f"http://203.0.113.9:{port}", (
+            "relay advertised a non-routable URL; sandboxed hooks cannot reach it"
+        )
+        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+            encoding="utf-8"
+        )
+        assert f"OMNIGENT_RELAY_URL='http://203.0.113.9:{port}'" in env_text
+        # Bound on all interfaces: local (loopback) consumers keep working
+        # even though the advertised host is not bindable here.
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            pass
+    finally:
+        relay.close()
+    assert not (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).exists(), (
+        "close() must recognise its own routable-host advertisement and unlink it"
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_all_interfaces_opt_in_falls_back_to_loopback_advertise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 0.0.0.0 opt-in advertises loopback when no routable address exists.
+
+    Binding all interfaces still includes loopback, so a local consumer keeps
+    working; a sandbox that filters loopback cannot be helped when the host has
+    no routable interface, but that is a misconfiguration, not this fix's path.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: None,
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_loopback_fallback", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+        )
+        assert info["url"].startswith("http://127.0.0.1:")
+    finally:
+        relay.close()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_tool_relay_bind_host_override_pins_advertised_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit bind-host override wins over routable-address detection."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "127.0.0.1")
+    bridge_dir = prepare_bridge_dir("conv_pinned_bind", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+        )
+        assert info["url"].startswith("http://127.0.0.1:")
+    finally:
+        relay.close()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_relay_ports_draw_from_stable_pool_with_bind_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pool ports are allocated with bind-retry, then fall back to ephemeral.
+
+    A sandbox network policy allowlists exact host+port pairs, so relay ports
+    must come from the configured pool. Multiple bridge servers run per host
+    (MCP ingress + one relay per session), so an occupied pool port is skipped
+    rather than fatal, and an exhausted pool degrades to an OS-assigned port
+    instead of refusing to start. The bind host is pinned to loopback so the
+    test occupies and probes ports on a single interface.
+    """
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "127.0.0.1")
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        taken_port = int(taken.getsockname()[1])
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = int(probe.getsockname()[1])
+        monkeypatch.setenv(
+            claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, f"{taken_port},{free_port}"
+        )
+
+        first_dir = prepare_bridge_dir("conv_pool_first", workspace=tmp_path)
+        first = start_tool_relay(
+            bridge_dir=first_dir,
+            tools=_relay_tools(),
+            tool_executor=_noop_relay_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        second = None
+        try:
+            first_info = json.loads(
+                (first_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+            )
+            assert first_info["url"] == f"http://127.0.0.1:{free_port}", (
+                "relay must skip the occupied pool port and bind the next one"
+            )
+
+            second_dir = prepare_bridge_dir("conv_pool_second", workspace=tmp_path)
+            second = start_tool_relay(
+                bridge_dir=second_dir,
+                tools=_relay_tools(),
+                tool_executor=_noop_relay_executor,
+                loop=asyncio.get_running_loop(),
+            )
+            second_info = json.loads(
+                (second_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+            )
+            second_port = int(second_info["url"].rsplit(":", 1)[1])
+            assert second_port not in (taken_port, free_port), (
+                "an exhausted pool must degrade to an OS-assigned port, not rebind"
+            )
+        finally:
+            first.close()
+            if second is not None:
+                second.close()
+
+
+def test_bridge_port_pool_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pool override accepts ports and inclusive ranges; junk is ignored."""
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "28800-28802,29000")
+    assert claude_native_bridge._bridge_port_pool() == (28800, 28801, 28802, 29000)
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "not-ports")
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "70000")
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, raising=False)
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_all_interfaces_opt_in_advertises_routable_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The MCP control ingress shares the relay's bind/advertise rules.
+
+    It is the bridge's second HTTP bind site; leaving it loopback-only under
+    the 0.0.0.0 opt-in would reintroduce the sandbox fail-closed path for
+    tools-changed control calls.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_ingress_bind", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+        )
+        port = int(info["url"].rsplit(":", 1)[1])
+        assert info["url"] == f"http://203.0.113.9:{port}"
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            pass
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

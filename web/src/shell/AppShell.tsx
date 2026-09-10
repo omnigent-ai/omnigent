@@ -73,7 +73,6 @@ import {
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { useGithubInfo } from "@/hooks/useGithub";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -96,6 +95,7 @@ import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
+import { GithubPanel } from "./GithubPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -381,6 +381,7 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
+  const [githubPanelOpen, setGithubPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
@@ -604,9 +605,8 @@ export function AppShell() {
   // Any viewer can fork a shared session, sub-agents included — forking a
   // child is how it gets promoted to a top-level session of its own. Gated on
   // knowing which the session is (sidebar row or loaded snapshot) so the
-  // affordance doesn't flicker in before that resolves. Surfaced as
-  // ForkDialogContext.canFork — the per-message "Fork from here" action is
-  // the only fork entry point.
+  // affordance doesn't flicker in before that resolves. Shared by the header
+  // menus and ForkDialogContext's per-message "Fork from here" action.
   const canClone =
     !!conversationId &&
     (isKnownTopLevel || isChildSession) &&
@@ -765,15 +765,6 @@ export function AppShell() {
     enabled: canBrowseWorkspace,
   });
   const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
-  // The GitHub tab needs a git checkout on disk: hide it once the session's
-  // GitHub info resolves to "not a git repo" — that panel is a dead end. Other
-  // unavailable reasons keep the tab: `host_outdated` renders an actionable
-  // "update your host" prompt, and `no_os_env` is already covered by the Files
-  // gate. While the info is still loading the tab stays, matching the Files
-  // gate's no-flash default. Shares ChatPage's status-line query cache, so no
-  // extra fetch.
-  const githubInfoQuery = useGithubInfo(serverConversationId);
-  const showGithubTab = showFilesPanel && githubInfoQuery.data?.reason !== "not_a_git_repo";
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -784,11 +775,9 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab: workspace gate plus the resolved GitHub info — a
-        // non-git workspace hides the tab instead of opening a dead-end
-        // panel. The panel still renders the "gh not installed" /
-        // "not signed in" / "update your host" states for a real checkout.
-        github: showGithubTab,
+        // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
+        // other unavailable reasons are shown as empty states in the panel.
+        github: showFilesPanel,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
         // older desktop build predates the `browser*` bridge — both hide the
@@ -802,7 +791,7 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel, showGithubTab],
+    [showFilesPanel],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1635,6 +1624,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setExecutionLogsKey(key);
   }
 
@@ -1647,6 +1637,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setFilesDrawerFlatView(flatView);
     setFilesPanelOpen(true);
   }
@@ -1662,6 +1653,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -1676,7 +1668,22 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setShellsPanelOpen(true);
+  }
+
+  // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
+  // (matches the desktop rail's GitHub tab; the panel handles all states —
+  // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
+  function openGithubPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(true);
   }
 
   function openMainExecutionLog() {
@@ -1845,9 +1852,8 @@ export function AppShell() {
     ],
   );
 
-  // Opener for the fork/clone dialog, shared with descendants via
-  // ForkDialogContext. ChatPage's per-message "Fork from here" action is
-  // the only fork entry point (no header/menu Clone button).
+  // Opener for the fork/clone dialog, shared by the header menu and descendants
+  // through ForkDialogContext's per-message "Fork from here" action.
   const forkDialogContextValue = useMemo<ForkDialogContextValue>(
     () => ({
       canFork: canClone,
@@ -1859,7 +1865,7 @@ export function AppShell() {
     [canClone],
   );
   const workspacePanelVisible = Boolean(
-    conversationId &&
+    serverConversationId &&
     hasRailContent &&
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
@@ -2013,9 +2019,11 @@ export function AppShell() {
                     boundAgent={boundAgent}
                     wrapperLabel={wrapperLabel}
                     canShare={canShare}
+                    canFork={canClone}
                     shareDisabled={shareDisabled}
                     shareDisabledReason={shareDisabledReason}
                     onShare={() => setShareOpen(true)}
+                    onFork={() => forkDialogContextValue.openForkDialog()}
                     hasAgentInfo={hasAgentInfo}
                     onAgentInfo={() => setAgentInfoOpen(true)}
                     hasHeaderMenu={hasHeaderMenu}
@@ -2031,6 +2039,7 @@ export function AppShell() {
                       filesPanelOpen,
                       subagentsPanelOpen,
                       shellsPanelOpen,
+                      githubPanelOpen,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2047,6 +2056,7 @@ export function AppShell() {
                       onOpenChanges: openChangesPanel,
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
+                      onOpenGithub: openGithubPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -2082,9 +2092,9 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && workspacePanelVisible && (
+                {serverConversationId && workspacePanelVisible && (
                   <WorkspacePanel
-                    conversationId={conversationId}
+                    conversationId={serverConversationId}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}
                     handleProps={inlinePanelHandleProps}
@@ -2193,12 +2203,22 @@ export function AppShell() {
                   />
                 </MobilePanelDrawer>
               )}
+              {conversationId && showFilesPanel && (
+                <MobilePanelDrawer
+                  open={githubPanelOpen}
+                  title="GitHub"
+                  onClose={() => setGithubPanelOpen(false)}
+                  testId="github-panel-drawer"
+                >
+                  <GithubPanel conversationId={conversationId} />
+                </MobilePanelDrawer>
+              )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
-              {conversationId && selectedFilePath !== null && (
+              {serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
                     open
-                    conversationId={conversationId}
+                    conversationId={serverConversationId}
                     path={selectedFilePath}
                     onClose={closeFileViewer}
                     onNavigateTo={openFileViewer}

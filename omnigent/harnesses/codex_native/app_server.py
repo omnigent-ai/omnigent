@@ -65,7 +65,7 @@ from omnigent.inner.codex_executor import (
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
-from omnigent.process_logging import log_info_once, log_once
+from omnigent.process_logging import log_info_once, log_once, redact_log_text
 
 _logger = logging.getLogger(__name__)
 
@@ -80,6 +80,8 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
+_MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
+_MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
@@ -119,6 +121,14 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 # interactive trust prompt may appear instead.
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
+
+
+@dataclass(frozen=True)
+class _CodexModelDiscoveryProcess:
+    """Short-lived Codex process plus its bounded stderr drain."""
+
+    process: asyncio.subprocess.Process
+    stderr_tail: asyncio.Task[str]
 
 
 def _string_object_dict(value: object) -> _JsonObject | None:
@@ -299,15 +309,7 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     from omnigent.util.reasoning_effort import clamp_effort_for_model
 
     config_path = codex_home / "config.toml"
-    # Same symlink-materialization dance as the MCP injection: never edit
-    # the user's real config.toml through the link.
-    if config_path.is_symlink():
-        target = config_path.resolve()
-        config_path.unlink()
-        if target.is_file():
-            import shutil
-
-            shutil.copy2(target, config_path)
+    _materialize_config_symlink(config_path)
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     pin_line = f"model = {json.dumps(model)}"
     lines = existing.splitlines()
@@ -330,6 +332,71 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     if not replaced:
         lines.insert(0, pin_line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -> None:
+    """
+    Write *effort* as the top-level ``model_reasoning_effort`` in the session config.
+
+    Like the model line, the copied ``model_reasoning_effort`` is whatever the
+    user last ran — NOT this session's persisted effort. Both the app-server
+    and the ``--remote`` TUI read this file when the thread is created, so
+    without the seed a session created or forked with an explicit effort runs
+    (and its TUI footer reports) the shared default until a web turn re-applies
+    it via ``thread/settings/update``. An in-TUI ``/effort`` later overwrites
+    the same line, so user switches still win.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param effort: Validated effort to pin, e.g. ``"ultra"``.
+    :param model: Pinned model id, or ``None``; the effort is clamped to a
+        level that model accepts (GLM has no ``xhigh``).
+    """
+    from omnigent.util.reasoning_effort import clamp_effort_for_model
+
+    config_path = codex_home / "config.toml"
+    _materialize_config_symlink(config_path)
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    clamped = clamp_effort_for_model(effort, model) or effort
+    pin_line = f"model_reasoning_effort = {json.dumps(clamped)}"
+    lines = existing.splitlines()
+    replaced = False
+    for i, line in enumerate(lines):
+        if line.startswith("["):
+            break
+        # Rewrite the value in place so the line's indentation and trailing
+        # comment survive, as the model pin's clamp does; a value the regex
+        # cannot parse (e.g. single-quoted) is replaced wholesale.
+        effort_match = _EFFORT_KEY_RE.match(line)
+        if effort_match:
+            lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
+            replaced = True
+            break
+        if re.match(r"^\s*model_reasoning_effort\s*=", line):
+            lines[i] = pin_line
+            replaced = True
+            break
+    if not replaced:
+        lines.insert(0, pin_line)
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _materialize_config_symlink(config_path: Path) -> None:
+    """
+    Replace a symlinked session ``config.toml`` with a private copy.
+
+    Same dance as the MCP injection: never edit the user's real config.toml
+    through the link.
+
+    :param config_path: The session config path, e.g. ``CODEX_HOME/config.toml``.
+    """
+    if not config_path.is_symlink():
+        return
+    target = config_path.resolve()
+    config_path.unlink()
+    if target.is_file():
+        import shutil
+
+        shutil.copy2(target, config_path)
 
 
 def _sync_codex_developer_instructions(
@@ -811,7 +878,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
             }:
                 env.pop(name)
         env["CODEX_HOME"] = str(codex_home)
-        process = await _start_codex_model_discovery_process(
+        discovery = await _start_codex_model_discovery_process(
             codex_path=resolved_codex,
             listen_url=listen_url,
             env=env,
@@ -819,7 +886,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
         )
         client: CodexAppServerClient | None = None
         try:
-            await _wait_for_discovery_listener(process, port)
+            await _wait_for_discovery_listener(discovery, port)
             client = CodexAppServerClient(
                 ws_url=listen_url,
                 client_name="omnigent-codex-model-discovery",
@@ -830,12 +897,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.close()
-            _proc.terminate_tree(process)
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-            except TimeoutError:
-                _proc.kill_tree(process)
-                await process.wait()
+            await _stop_codex_model_discovery_process(discovery)
 
     _model_discovery_cache[resolved_codex] = tuple(dict(option) for option in options)
     return options
@@ -848,12 +910,12 @@ async def _start_codex_model_discovery_process(
     env: dict[str, str],
     cwd: Path,
     config_overrides: Sequence[str] = (),
-) -> asyncio.subprocess.Process:
+) -> _CodexModelDiscoveryProcess:
     """Start the isolated Codex process used only for model discovery."""
     override_args: list[str] = []
     for override in config_overrides:
         override_args.extend(("-c", override))
-    return await asyncio.create_subprocess_exec(
+    process = await asyncio.create_subprocess_exec(
         codex_path,
         "app-server",
         "--listen",
@@ -861,11 +923,53 @@ async def _start_codex_model_discovery_process(
         *override_args,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
         env=env,
         cwd=str(cwd),
         **_proc.spawn_kwargs(),
     )
+    assert process.stderr is not None
+    stderr_tail = asyncio.create_task(
+        _capture_codex_discovery_stderr_tail(process.stderr),
+        name="codex-model-discovery-stderr",
+    )
+    return _CodexModelDiscoveryProcess(process=process, stderr_tail=stderr_tail)
+
+
+async def _capture_codex_discovery_stderr_tail(
+    stderr: asyncio.StreamReader,
+    *,
+    byte_limit: int = _MODEL_DISCOVERY_STDERR_TAIL_BYTES,
+) -> str:
+    """Drain stderr while retaining only a redacted final line in memory."""
+    tail = bytearray()
+    try:
+        while chunk := await stderr.read(8192):
+            if len(chunk) >= byte_limit:
+                tail = bytearray(chunk[-byte_limit:])
+                continue
+            overflow = len(tail) + len(chunk) - byte_limit
+            if overflow > 0:
+                del tail[:overflow]
+            tail.extend(chunk)
+    except OSError:
+        return ""
+    text = tail.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    return redact_log_text(text.splitlines()[-1].strip())[:_MODEL_DISCOVERY_STDERR_LINE_CHARS]
+
+
+async def _stop_codex_model_discovery_process(discovery: _CodexModelDiscoveryProcess) -> None:
+    """Terminate a discovery process and finish draining its stderr pipe."""
+    process = discovery.process
+    _proc.terminate_tree(process)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+    except TimeoutError:
+        _proc.kill_tree(process)
+        await process.wait()
+    await discovery.stderr_tail
 
 
 def _allocate_loopback_port() -> int:
@@ -876,14 +980,19 @@ def _allocate_loopback_port() -> int:
 
 
 async def _wait_for_discovery_listener(
-    process: asyncio.subprocess.Process,
+    discovery: _CodexModelDiscoveryProcess,
     port: int,
 ) -> None:
     """Wait until a discovery app-server accepts loopback connections."""
+    process = discovery.process
     deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
     while asyncio.get_running_loop().time() < deadline:
         if process.returncode is not None:
-            raise RuntimeError(f"Codex model discovery exited early ({process.returncode})")
+            message = f"Codex model discovery exited early ({process.returncode})"
+            detail = await discovery.stderr_tail
+            if detail:
+                message = f"{message}: {detail}"
+            raise RuntimeError(message)
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
         except OSError:
@@ -1010,7 +1119,7 @@ async def probe_codex_model_options(
     env["CODEX_HOME"] = str(codex_home)
     port = _allocate_loopback_port()
     listen_url = f"ws://127.0.0.1:{port}"
-    process = await _start_codex_model_discovery_process(
+    discovery = await _start_codex_model_discovery_process(
         codex_path=resolved_codex,
         listen_url=listen_url,
         env=env,
@@ -1019,7 +1128,7 @@ async def probe_codex_model_options(
     )
     client: CodexAppServerClient | None = None
     try:
-        await _wait_for_discovery_listener(process, port)
+        await _wait_for_discovery_listener(discovery, port)
         client = CodexAppServerClient(
             ws_url=listen_url,
             client_name="omnigent-codex-model-probe",
@@ -1030,12 +1139,7 @@ async def probe_codex_model_options(
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
-        _proc.terminate_tree(process)
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5.0)
-        except TimeoutError:
-            _proc.kill_tree(process)
-            await process.wait()
+        await _stop_codex_model_discovery_process(discovery)
     return mark_launch_default(rows, pinned_model)
 
 
@@ -1211,6 +1315,9 @@ class CodexNativeAppServer:
         per-session ``config.toml`` at start, or ``None``. Keeps the
         forwarder's config.toml model mirror (and the cost gate's hook
         read) consistent with what the session was launched to run.
+    :param pinned_effort: Session-persisted reasoning effort written as
+        ``model_reasoning_effort`` into the per-session ``config.toml`` at
+        start, or ``None`` to keep the copied config's value.
     :param trust_project: Whether to trust :attr:`cwd` in the private
         session config before startup. Runner-owned headless sessions set
         this because nobody can answer Codex's project-trust TUI prompt.
@@ -1248,6 +1355,7 @@ class CodexNativeAppServer:
     policy_hook_disabled_reason: str | None = None
     policy_notice_pending: bool = False
     pinned_model: str | None = None
+    pinned_effort: str | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
@@ -1338,6 +1446,8 @@ class CodexNativeAppServer:
                     self.pinned_model,
                     model_migration_target,
                 )
+        if self.pinned_effort:
+            _pin_codex_config_effort(self.codex_home, self.pinned_effort, self.pinned_model)
         _sync_codex_developer_instructions(
             self.codex_home,
             self.developer_instructions,
@@ -2336,6 +2446,7 @@ def build_codex_native_server(
     bypass_sandbox: bool = False,
     trust_project: bool = False,
     trust_all_hooks: bool = False,
+    reasoning_effort: str | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2380,6 +2491,10 @@ def build_codex_native_server(
         startup hook-review screen on a persistent ``resume`` attach (see
         :func:`trust_all_codex_hooks`). Interactive CLI sessions leave it
         disabled so a human reviews their own new or changed hooks.
+    :param reasoning_effort: Session-persisted reasoning effort to pin into
+        the private ``config.toml`` at start (see
+        :func:`_pin_codex_config_effort`), e.g. ``"ultra"``. ``None`` keeps
+        the copied config's value.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2441,6 +2556,7 @@ def build_codex_native_server(
         ap_auth_headers=ap_auth_headers,
         python_executable=python_executable,
         pinned_model=pinned_model,
+        pinned_effort=reasoning_effort,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
     )
@@ -3291,6 +3407,43 @@ async def preload_codex_thread_for_resume(
                 "excludeTurns": True,
                 **_codex_resume_permission_params(terminal_launch_args),
             },
+        )
+    finally:
+        await client.close()
+
+
+async def apply_codex_thread_effort(
+    transport: str,
+    thread_id: str,
+    effort: str,
+    *,
+    model: str | None = None,
+) -> None:
+    """
+    Set a loaded thread's reasoning effort via ``thread/settings/update``.
+
+    A resumed thread takes its effort from the rollout, not ``config.toml``.
+    After a runner restart the rollout is the cold-resume synthesis (no effort
+    recorded), and a forked clone's rollout carries the SOURCE's effort, so the
+    thread — and the TUI footer — would sit at the wrong level until a web turn
+    re-applied the session's effort. This is that re-application, run once the
+    thread has started.
+
+    :param transport: App-server transport, e.g. ``"ws://127.0.0.1:9876"``.
+    :param thread_id: Loaded Codex thread id, e.g. ``"019e96aa-..."``.
+    :param effort: Session-persisted effort, e.g. ``"ultra"``.
+    :param model: Model the thread runs, or ``None``; the effort is clamped to
+        a level that model accepts.
+    :raises Exception: If the app-server rejects the update.
+    """
+    from omnigent.util.reasoning_effort import clamp_effort_for_model
+
+    client = client_for_transport(transport, client_name="omnigent-codex-native-effort")
+    await client.connect()
+    try:
+        await client.request(
+            "thread/settings/update",
+            {"threadId": thread_id, "effort": clamp_effort_for_model(effort, model)},
         )
     finally:
         await client.close()

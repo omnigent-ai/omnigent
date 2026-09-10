@@ -1,14 +1,14 @@
 """E2E: hover-revealed timestamps on chat message bubbles.
 
-Chat bubbles show their send/receive time on hover next to the Copy/Fork
-controls, without taking permanent vertical space. This drives the full
-browser → SPA → server stack: send a message, wait for the mock-LLM reply,
-and assert for both the user and the assistant bubble that
+Chat bubbles show their send/receive time next to the Copy/Fork controls.
+Earlier rows reveal on hover; the final message row stays partially visible.
+This drives the full browser → SPA → server stack: send a message, wait for
+the mock-LLM reply, and assert for both the user and the assistant bubble that
 
   - the timestamp rides inside the existing 24px action row (no new row),
   - it matches a locale time format (``h:MM AM`` style),
-  - the action row is fully transparent at rest on desktop and reaches full
-    opacity on hover (the hover-reveal contract),
+  - the earlier user row is transparent at rest, while the final assistant
+    row rests at 40% opacity; both reach full opacity on hover,
   - the ordering matches the design target (user: timestamp → Copy at the
     right edge; assistant: Copy/Fork → timestamp at the left edge),
   - the stamp survives a full page reload (server-stamped path, not a
@@ -142,7 +142,9 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     expect(assistant_ts).to_have_text(_TIME_RE)
     assistant_row = _action_row(assistant_ts)
 
-    assert _opacity(assistant_row) == "0"
+    # The assistant response is the final message, so its actions remain
+    # partially visible without hover.
+    assert _opacity(assistant_row) == "0.4"
     assert round(assistant_row.bounding_box()["height"]) == 24
 
     assistant_bubble.hover()

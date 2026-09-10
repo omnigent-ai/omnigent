@@ -57,6 +57,7 @@ import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
@@ -99,6 +100,7 @@ import {
   insertNewRowsIntoPages,
   markRecentlyCreated,
   overlayTitleIntoCaches,
+  PROJECT_LABEL_KEY,
   removeIdsFromPages,
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
@@ -177,7 +179,16 @@ export interface SendOptions {
  * session). `provisional` marks the client-only `temp:` row so the sidebar
  * disables per-row mutations until it's rekeyed to the real id.
  */
-function makeConvRow(id: string, provisional = false): Conversation {
+export interface LocalConversationProject {
+  id: string | null;
+  name: string;
+}
+
+function makeConvRow(
+  id: string,
+  provisional = false,
+  project?: LocalConversationProject,
+): Conversation {
   const now = Math.floor(Date.now() / 1000);
   return {
     id,
@@ -185,8 +196,9 @@ function makeConvRow(id: string, provisional = false): Conversation {
     title: null,
     created_at: now,
     updated_at: now,
-    labels: {},
+    labels: project?.id === null ? { [PROJECT_LABEL_KEY]: project.name } : {},
     permission_level: null,
+    ...(project?.id ? { project_id: project.id } : {}),
     ...(provisional ? { provisional: true } : {}),
   };
 }
@@ -215,9 +227,14 @@ function upsertConvRow(row: Conversation, removeId?: string): void {
  * keeps it in the first-page fetch until the search index catches up; the WS
  * `session_added` frame then finds it present and skips it (no duplicate).
  */
-function rekeyConvRow(tempId: string, realId: string, text: string): void {
+function rekeyConvRow(
+  tempId: string,
+  realId: string,
+  text: string,
+  project?: LocalConversationProject,
+): void {
   if (queryClient === null) return;
-  const realConv = makeConvRow(realId);
+  const realConv = makeConvRow(realId, false, project);
   recordOptimisticTitle(realId, text);
   markRecentlyCreated(realConv);
   upsertConvRow(realConv, tempId);
@@ -249,6 +266,7 @@ export function beginLocalConversation(
   text: string,
   files: File[] | undefined,
   provisional = newTempConversation(),
+  project?: LocalConversationProject,
 ): { tempConvId: string; pendingMsgTempId: string; createToken: string } | null {
   if (queryClient === null) return null;
   const { id: tempConvId, token: createToken } = provisional;
@@ -257,7 +275,7 @@ export function beginLocalConversation(
 
   // Sidebar row under the same id the URL shows.
   recordOptimisticTitle(tempConvId, text);
-  upsertConvRow(makeConvRow(tempConvId, true));
+  upsertConvRow(makeConvRow(tempConvId, true, project));
 
   const fileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
     const filename = file.name || "image.png";
@@ -311,6 +329,7 @@ export function hydrateLocalConversation(
   skill: { name: string; args: string } | null,
   navigate: (to: string, opts?: { replace?: boolean }) => void,
   isStillViewing: () => boolean = () => true,
+  project?: LocalConversationProject,
 ): void {
   // Registry entry (carrying the optimistic bubble) + the sidebar row, both
   // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
@@ -318,7 +337,7 @@ export function hydrateLocalConversation(
   // id, so no send is ever keyed under it — the hydrating `send` below enters
   // the chain under the real id directly.
   conversationRegistry.rekey(tempConvId, realId);
-  rekeyConvRow(tempConvId, realId, text);
+  rekeyConvRow(tempConvId, realId, text, project);
 
   const stillViewing = useChatStore.getState().conversationId === tempConvId && isStillViewing();
   if (stillViewing) {
@@ -1088,6 +1107,11 @@ export interface ChatState extends ConversationState, AppChatState, ChatActions 
 
 let queryClient: QueryClient | null = null;
 
+// Any semantic stream event makes a snapshot already in flight potentially
+// stale. Heartbeats are filtered before this revision is bumped.
+const streamEventRevisions = new Map<string, number>();
+conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+
 /**
  * Evict a conversation from the live registry.
  *
@@ -1381,6 +1405,8 @@ const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 // instantly.
 const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
+export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
+export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
 // A reverse proxy serves 404 for the stream route for the ~10-60s a backend
 // container takes to restart (upgrade, config change, re-seed bounce), so a
 // 404 mid-restart must not be treated as permanent. Bound the retries instead
@@ -3896,7 +3922,8 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
 
 /**
  * Session-snapshot state every reconnect path recovers: `sessionStatus`,
- * token/context/cost counters, and — when the turn ended during the gap —
+ * token/context/cost counters, the MCP startup band, and — when the turn
+ * ended during the gap —
  * the terminal `activeResponse` transition the missed `session.status`
  * event would have applied, so "Working…" clears.
  *
@@ -3914,6 +3941,10 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
+  // Re-derive the MCP startup band from the snapshot: a settle (or update)
+  // `session.mcp_startup` event that fired into the gap is never replayed,
+  // so a stale band would otherwise stay stuck until a full reload.
+  patch.mcpStartup = activeMcpStartup(session.mcpStartup);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -3965,6 +3996,70 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
     patch.status = "streaming";
   }
   return patch;
+}
+
+/**
+ * Reconcile the visible conversation's lifecycle from its persisted snapshot.
+ *
+ * A stream pump can keep receiving heartbeats while missing a lifecycle event.
+ * Periodically re-read durable status, discarding a snapshot if any semantic
+ * stream event arrives during the fetch.
+ */
+async function reconcileActiveSessionStatus(
+  id: string,
+  controller: AbortController,
+  set: Setter,
+  get: Getter,
+): Promise<void> {
+  if (
+    queryClient === null ||
+    controller.signal.aborted ||
+    conversationRegistry.getActive()?.id !== id ||
+    get().abortController !== controller
+  ) {
+    return;
+  }
+  const stateBeforeFetch = get();
+  const revisionBeforeFetch = streamEventRevisions.get(id) ?? 0;
+  const snapshotController = new AbortController();
+  const abortSnapshot = () => snapshotController.abort();
+  controller.signal.addEventListener("abort", abortSnapshot, { once: true });
+  const snapshotTimeout = window.setTimeout(
+    abortSnapshot,
+    ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
+  );
+  let session: Session;
+  try {
+    // This read must not join the shared React Query request: an older request
+    // could have started before the live event this reconciliation follows.
+    session = await getSessionSlim(id, { signal: snapshotController.signal });
+  } catch {
+    return;
+  } finally {
+    window.clearTimeout(snapshotTimeout);
+    controller.signal.removeEventListener("abort", abortSnapshot);
+  }
+  const current = get();
+  if (
+    controller.signal.aborted ||
+    isConversationDisposed(id) ||
+    conversationRegistry.getActive()?.id !== id ||
+    get().abortController !== controller ||
+    (streamEventRevisions.get(id) ?? 0) !== revisionBeforeFetch ||
+    current.sessionStatus !== stateBeforeFetch.sessionStatus ||
+    current.status !== stateBeforeFetch.status ||
+    current.activeResponse !== stateBeforeFetch.activeResponse ||
+    current.backgroundTaskCount !== stateBeforeFetch.backgroundTaskCount ||
+    current.backgroundTasks !== stateBeforeFetch.backgroundTasks ||
+    current.mcpStartup !== stateBeforeFetch.mcpStartup ||
+    current.contextWindow !== stateBeforeFetch.contextWindow ||
+    current.tokensUsed !== stateBeforeFetch.tokensUsed ||
+    current.sessionCostUsd !== stateBeforeFetch.sessionCostUsd ||
+    current.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
+  ) {
+    return;
+  }
+  set((s) => reconnectStatusPatch(session, s));
 }
 
 /**
@@ -4442,6 +4537,17 @@ export async function startStreamPump(
   get: Getter,
 ): Promise<void> {
   let failedOpens = 0;
+  let statusReconcileInFlight = false;
+  const statusReconcileTimer =
+    typeof window === "undefined"
+      ? null
+      : window.setInterval(() => {
+          if (statusReconcileInFlight) return;
+          statusReconcileInFlight = true;
+          void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
+            statusReconcileInFlight = false;
+          });
+        }, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
   // Consecutive 404s only — reset on any non-404 outcome (success or a
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
@@ -4514,7 +4620,7 @@ export async function startStreamPump(
           // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
-            finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
+            failUnavailableStream(set, `stream unavailable (${streamRes.status})`);
             set({ status: "idle" });
             break;
           }
@@ -4610,6 +4716,7 @@ export async function startStreamPump(
       }
     }
   } finally {
+    if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
     if (get().abortController === controller) {
       set({ abortController: null });
     }
@@ -6517,6 +6624,9 @@ async function* tapSessionEvents(
   onElicitationResolved?: (elicitationId: string) => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
+    if (!isConversationDisposed(conversationId)) {
+      streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+    }
     handleSessionEvent(event, conversationId);
     if (event.type === "elicitation_resolved") {
       onElicitationResolved?.(event.elicitationId);
@@ -6573,6 +6683,39 @@ function finalizeActive(
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";
     return {
       activeResponse: { responseId, state, error, completedAt: Date.now() },
+    };
+  });
+}
+
+const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
+
+/** Fail the active turn and surface one fallback when no bubble can show it. */
+function failUnavailableStream(set: Setter, error: string): void {
+  set((s) => {
+    const activeResponse =
+      s.activeResponse === null
+        ? null
+        : { ...s.activeResponse, state: "failed" as const, error, completedAt: Date.now() };
+    const blocks = s.blocks.filter(
+      (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
+    );
+    const hasVisibleFailure =
+      activeResponse !== null &&
+      buildBubbles(blocks, activeResponse).some(
+        (bubble) => bubble.kind === "assistant" && bubble.responseId === activeResponse.responseId,
+      );
+    if (hasVisibleFailure) {
+      return blocks.length === s.blocks.length ? { activeResponse } : { activeResponse, blocks };
+    }
+    return {
+      ...(activeResponse !== null ? { activeResponse } : {}),
+      blocks: [
+        ...blocks,
+        makeClientErrorBlock(
+          "The live connection to the assistant is unavailable. Reload the page to reconnect.",
+          STREAM_UNAVAILABLE_CODE,
+        ),
+      ],
     };
   });
 }

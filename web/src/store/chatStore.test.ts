@@ -42,6 +42,7 @@ import {
   type OmnigentInteractionKind,
 } from "@/lib/host";
 import type {
+  McpServerStartup,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
@@ -55,6 +56,8 @@ import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
+  ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
+  ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
   beginLocalConversation,
   consumePendingInitialPrompt,
   handleSessionEvent,
@@ -252,6 +255,9 @@ let sessionCostControlOverrides: Map<string, "on" | "off">;
 let sessionSubagentRoutingOverrides: Map<string, "on" | "off">;
 // Per-session labels the snapshot/PATCH handlers serve.
 let sessionLabels: Map<string, Record<string, string>>;
+// Per-session MCP startup map the GET snapshot handler serves; absent key =
+// settled round (the server evicts its cache entry, so the wire field is null).
+let sessionMcpStartup: Map<string, Record<string, McpServerStartup>>;
 
 /** Default fetch router: dispatch by URL. Tests override per-call as needed. */
 function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Response {
@@ -375,6 +381,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
       subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
+      mcp_startup: sessionMcpStartup.get(sessionId) ?? null,
     });
   }
   if (url === "/v1/sessions" && init?.method === "POST") {
@@ -408,7 +415,7 @@ function conv(id: string, status: Conversation["status"]): Conversation {
 
 /** Seed the sidebar conversations infinite-query cache (default "" search variant). */
 function seedConversationsCache(convs: Conversation[]): void {
-  client.setQueryData<InfiniteData<ConversationsPage>>(["conversations", ""], {
+  client.setQueryData<InfiniteData<ConversationsPage>>(["conversations", "", false], {
     pages: [
       {
         data: convs,
@@ -423,7 +430,7 @@ function seedConversationsCache(convs: Conversation[]): void {
 
 /** Flatten the seeded conversations cache back to its rows. */
 function readConversationRows(): Conversation[] {
-  const data = client.getQueryData<InfiniteData<ConversationsPage>>(["conversations", ""]);
+  const data = client.getQueryData<InfiniteData<ConversationsPage>>(["conversations", "", false]);
   return data?.pages.flatMap((p) => p.data) ?? [];
 }
 
@@ -477,6 +484,7 @@ beforeEach(() => {
   sessionCostControlOverrides = new Map();
   sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
+  sessionMcpStartup = new Map();
   initChatStore(client);
   // Generous, deterministic slots for tests that aren't about the cap; the
   // dedicated stream-slot tests install their own small-capacity manager.
@@ -2438,6 +2446,43 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     await tick();
     await tick();
   }
+
+  it.each([
+    {
+      project: { id: "proj_alpha", name: "Alpha" },
+      expected: { project_id: "proj_alpha", labels: {} },
+    },
+    {
+      project: { id: null, name: "Legacy" },
+      expected: { labels: { omni_project: "Legacy" } },
+    },
+  ])("keeps project placement across the provisional-to-real rekey", ({ project, expected }) => {
+    seedSession("conv_real");
+    seedConversationsCache([]);
+
+    const begun = beginLocalConversation("hello there", undefined, undefined, project)!;
+    expect(readConversationRows()).toEqual([
+      expect.objectContaining({ id: begun.tempConvId, provisional: true, ...expected }),
+    ]);
+
+    hydrateLocalConversation(
+      begun.tempConvId,
+      "conv_real",
+      "agent_xyz",
+      "hello there",
+      undefined,
+      begun.pendingMsgTempId,
+      null,
+      noopNavigate,
+      undefined,
+      project,
+    );
+
+    expect(readConversationRows()).toEqual([
+      expect.objectContaining({ id: "conv_real", ...expected }),
+    ]);
+    expect(readConversationRows()[0]?.provisional).toBeUndefined();
+  });
 
   it("happy path: reuses the bubble (no duplicate), stays streaming, arms the latch", async () => {
     seedSession("conv_real");
@@ -8921,6 +8966,16 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     return sinks;
   }
 
+  async function advanceWithHeartbeats(sink: StreamSink, durationMs: number): Promise<void> {
+    /* oxlint-disable no-await-in-loop */
+    for (let elapsed = 0; elapsed < durationMs; elapsed += 15_000) {
+      sink.push(sse("session.heartbeat", {}));
+      await drainAsync(2);
+      await vi.advanceTimersByTimeAsync(15_000);
+    }
+    /* oxlint-enable no-await-in-loop */
+  }
+
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -8975,6 +9030,79 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     expect(sinks).toHaveLength(1); // no reconnect after abort
     expect(useChatStore.getState().abortController).toBeNull();
+  });
+
+  it("surfaces one error across repeated 401 give-ups when the active response has no bubble", async () => {
+    seedSession("conv_401_blank", []);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        return mockResponse({}, { ok: false, status: 401 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_401_blank",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_401_blank", state: "streaming", error: null },
+    });
+
+    const giveUp = async () => {
+      const controller = new AbortController();
+      useChatStore.setState({ abortController: controller });
+      const loop = startStreamPump("conv_401_blank", controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(6_000);
+      await loop;
+    };
+    await giveUp();
+    await giveUp();
+
+    const state = useChatStore.getState();
+    expect(state.activeResponse).toMatchObject({
+      responseId: "resp_401_blank",
+      state: "failed",
+      error: "stream unavailable (401)",
+    });
+    const errors = state.blocks.filter((block) => block.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ code: "stream_unavailable" });
+  });
+
+  it("renders a 401 failure on an existing assistant bubble without a standalone error", async () => {
+    const response = assistantMessage("resp_401_visible", "Partial reply");
+    seedSession("conv_401_visible", [response]);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        return mockResponse({}, { ok: false, status: 401 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_401_visible",
+      abortController: controller,
+      sessionStatus: "running",
+      blocks: itemsToBlocks([response]),
+      activeResponse: { responseId: "resp_401_visible", state: "streaming", error: null },
+    });
+
+    const loop = startStreamPump("conv_401_visible", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(6_000);
+    await loop;
+
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "error")).toHaveLength(0);
+    expect(buildBubbles(state.blocks, state.activeResponse)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "assistant",
+          responseId: "resp_401_visible",
+          lifecycle: "failed",
+          error: "stream unavailable (401)",
+        }),
+      ]),
+    );
   });
 
   it("gives up after exhausting the transient-404 retry cap", async () => {
@@ -9168,6 +9296,72 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("clears the MCP startup band when its settle event fired into the reconnect gap", async () => {
+    seedSession("conv_mcp_gap", []);
+    sessionMcpStartup.set("conv_mcp_gap", { safe: { status: "starting", error: null } });
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_mcp_gap",
+      abortController: controller,
+      // The band as the cold bind lit it from the pre-gap snapshot.
+      mcpStartup: { safe: { status: "starting", error: null } },
+    });
+
+    const loop = startStreamPump("conv_mcp_gap", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // The round settles while the socket is down: the server evicts its
+    // startup snapshot and the clearing `session.mcp_startup` event lands
+    // in the dead socket — the reconnect snapshot is the only recovery.
+    sessionMcpStartup.delete("conv_mcp_gap");
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    expect(useChatStore.getState().mcpStartup).toBeNull();
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps the MCP startup band across a reconnect while the round is still pending", async () => {
+    const starting: Record<string, McpServerStartup> = {
+      safe: { status: "starting", error: null },
+    };
+    seedSession("conv_mcp_live", []);
+    sessionMcpStartup.set("conv_mcp_live", starting);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_mcp_live",
+      abortController: controller,
+      mcpStartup: starting,
+    });
+
+    const loop = startStreamPump("conv_mcp_live", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // Drop and reconnect with the round still in flight: the snapshot
+    // still carries the starting map, so the band must survive.
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    expect(useChatStore.getState().mcpStartup).toEqual(starting);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a heartbeat-alive stream connected across many stall windows", async () => {
     seedSession("conv_hb", []);
     const sinks = routeStreamOpens();
@@ -9190,6 +9384,293 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     sinks[0]!.push("data: [DONE]\n\n");
     sinks[0]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("reconciles status when a heartbeat-only stream misses the idle event", async () => {
+    seedSession("conv_heartbeat_gap", []);
+    const sink = pushableStream();
+    let streamOpens = 0;
+    let snapshotFetches = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_heartbeat_gap/stream") {
+        streamOpens += 1;
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.startsWith("/v1/sessions/conv_heartbeat_gap?") && (init?.method ?? "GET") === "GET") {
+        snapshotFetches += 1;
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_heartbeat_gap", {
+      abortController: controller,
+      sessionStatus: "running",
+      status: "idle",
+      activeResponse: {
+        responseId: "resp_done",
+        state: "completed",
+        error: null,
+        completedAt: Date.now(),
+      },
+    });
+
+    const loop = startStreamPump("conv_heartbeat_gap", controller, bound.set, bound.get);
+    await drainAsync();
+    expect(streamOpens).toBe(1);
+
+    // The transport stays byte-active while the real idle edge is absent.
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+
+    expect(streamOpens).toBe(1);
+    expect(snapshotFetches).toBe(1);
+    expect(bound.get().sessionStatus).toBe("idle");
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
+
+    controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps a live status event that arrives during snapshot reconciliation", async () => {
+    seedSession("conv_status_race", []);
+    const sink = pushableStream();
+    let resolveSnapshot: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_status_race/stream") {
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.startsWith("/v1/sessions/conv_status_race?") && (init?.method ?? "GET") === "GET") {
+        return new Promise<Response>((resolve) => {
+          resolveSnapshot = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_status_race", {
+      abortController: controller,
+      sessionStatus: "idle",
+    });
+    const loop = startStreamPump("conv_status_race", controller, bound.set, bound.get);
+    await drainAsync();
+
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    expect(resolveSnapshot).not.toBeNull();
+
+    sink.push(
+      sse("session.status", {
+        conversation_id: "conv_status_race",
+        status: "running",
+        response_id: "resp_new",
+      }),
+    );
+    await drainAsync();
+    expect(bound.get().sessionStatus).toBe("running");
+
+    resolveSnapshot!(
+      mockResponse({
+        id: "conv_status_race",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        items: [],
+        labels: {},
+      }),
+    );
+    await drainAsync();
+
+    expect(bound.get().sessionStatus).toBe("running");
+    expect(bound.get().activeResponse).toMatchObject({
+      responseId: "resp_new",
+      state: "streaming",
+    });
+
+    controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("discards a stale snapshot after a same-value live status event", async () => {
+    seedSession("conv_same_status_race", []);
+    const sink = pushableStream();
+    let resolveSnapshot: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_same_status_race/stream") {
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (
+        url.startsWith("/v1/sessions/conv_same_status_race?") &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return new Promise<Response>((resolve) => {
+          resolveSnapshot = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_same_status_race", {
+      abortController: controller,
+      sessionStatus: "idle",
+      status: "idle",
+      activeResponse: null,
+    });
+    const loop = startStreamPump("conv_same_status_race", controller, bound.set, bound.get);
+    await drainAsync();
+
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    expect(resolveSnapshot).not.toBeNull();
+
+    // This live terminal edge is value-equal locally, but it proves that the
+    // earlier running snapshot resolving below is stale.
+    sink.push(
+      sse("session.status", {
+        conversation_id: "conv_same_status_race",
+        status: "idle",
+      }),
+    );
+    await drainAsync();
+    expect(bound.get().sessionStatus).toBe("idle");
+
+    resolveSnapshot!(
+      mockResponse({
+        id: "conv_same_status_race",
+        agent_id: "agent_xyz",
+        status: "running",
+        active_response_id: "resp_stale",
+        created_at: 0,
+        items: [],
+        labels: {},
+      }),
+    );
+    await drainAsync();
+
+    expect(bound.get().sessionStatus).toBe("idle");
+    expect(bound.get().status).toBe("idle");
+    expect(bound.get().activeResponse).toBeNull();
+
+    controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("does not join an older shared session query", async () => {
+    seedSession("conv_independent_snapshot", []);
+    let resolveSharedQuery: ((value: unknown) => void) | null = null;
+    const sharedQuery = client.fetchQuery<unknown>({
+      queryKey: ["session", "conv_independent_snapshot"],
+      queryFn: () =>
+        new Promise<unknown>((resolve) => {
+          resolveSharedQuery = resolve;
+        }),
+    });
+    await drainAsync();
+
+    const sink = pushableStream();
+    let snapshotFetches = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_independent_snapshot/stream") {
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (
+        url.startsWith("/v1/sessions/conv_independent_snapshot?") &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotFetches += 1;
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_independent_snapshot", {
+      abortController: controller,
+      sessionStatus: "running",
+    });
+    const loop = startStreamPump("conv_independent_snapshot", controller, bound.set, bound.get);
+    await drainAsync();
+
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+
+    expect(snapshotFetches).toBe(1);
+    expect(bound.get().sessionStatus).toBe("idle");
+
+    resolveSharedQuery!({ source: "older request" });
+    await sharedQuery;
+    controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("retries after a status snapshot request times out", async () => {
+    seedSession("conv_status_timeout", []);
+    const sink = pushableStream();
+    let snapshotFetches = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_status_timeout/stream") {
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (
+        url.startsWith("/v1/sessions/conv_status_timeout?") &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotFetches += 1;
+        if (snapshotFetches === 1) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("aborted", "AbortError")),
+              { once: true },
+            );
+          });
+        }
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_status_timeout", {
+      abortController: controller,
+      sessionStatus: "running",
+    });
+    const loop = startStreamPump("conv_status_timeout", controller, bound.set, bound.get);
+    await drainAsync();
+
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    expect(snapshotFetches).toBe(1);
+
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS);
+    await advanceWithHeartbeats(
+      sink,
+      ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS - ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
+    );
+    await drainAsync();
+
+    expect(snapshotFetches).toBe(2);
+    expect(bound.get().sessionStatus).toBe("idle");
+
+    controller.abort();
     await drainAsync(2);
     await loop;
   });

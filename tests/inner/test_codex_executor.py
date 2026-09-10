@@ -29,6 +29,10 @@ from omnigent.inner.codex_executor import (
     _provider_codex_config_overrides,
     _to_codex_input_items,
 )
+from omnigent.inner.codex_goal_command import (
+    GOAL_OBJECTIVE_MAX_CHARS,
+    goal_objective_length_error,
+)
 from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
@@ -380,6 +384,13 @@ class TestCodexExecutor(unittest.TestCase):
             )
         )
 
+    def test_goal_objective_length_error_boundary(self):
+        self.assertIsNone(goal_objective_length_error("x" * GOAL_OBJECTIVE_MAX_CHARS))
+        message = goal_objective_length_error("x" * (GOAL_OBJECTIVE_MAX_CHARS + 1))
+        self.assertIsNotNone(message)
+        self.assertIn(str(GOAL_OBJECTIVE_MAX_CHARS + 1), message)
+        self.assertIn(str(GOAL_OBJECTIVE_MAX_CHARS), message)
+
     def test_run_turn_delegates_to_app_server_session(self):
         async def _t():
             fake_session = _FakeAppSession(
@@ -677,6 +688,60 @@ class TestCodexExecutor(unittest.TestCase):
                     }
                 ],
             )
+
+        _run(_t())
+
+    def test_app_server_overlong_goal_fails_clearly_without_goal_set(self):
+        """A ``/goal`` past Codex's 4000-char cap never reaches thread/goal/set."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"goal": {"objective": "x"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            events = []
+            async for event in session.run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "/goal " + "x" * 4001}],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                events.append(event)
+            await inject_task
+
+            self.assertEqual([type(event) for event in events], [ExecutorError])
+            message = events[0].message
+            # A clear client-side limit message, not the raw JSON-RPC payload.
+            self.assertIn("4000", message)
+            self.assertNotIn("-32600", message)
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertNotIn("thread/goal/set", methods)
 
         _run(_t())
 

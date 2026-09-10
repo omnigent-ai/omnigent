@@ -1726,6 +1726,32 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
     assert body["data"]["compacted_messages"][0]["role"] == "user"
 
 
+def test_compaction_persist_failure_reason_includes_server_body() -> None:
+    """A rejected compaction persist must name the server's reason.
+
+    ``raise_for_status`` reports only the status and URL, so a 400 on this POST
+    left no way to tell which field the server objected to — the payload is
+    assembled from Codex's rollout, so the answer is only in the response body.
+    """
+    request = httpx.Request("POST", "https://example.invalid/v1/sessions/conv_x/events")
+    response = httpx.Response(
+        400,
+        request=request,
+        text='{"error_code":"INVALID_PARAMETER_VALUE","message":"last_item_id not found"}',
+    )
+    exc = httpx.HTTPStatusError("400 Bad Request", request=request, response=response)
+
+    reason = fwd._compaction_persist_failure_reason(exc)
+
+    assert "400" in reason
+    assert "last_item_id not found" in reason
+
+
+def test_compaction_persist_failure_reason_handles_non_http_errors() -> None:
+    """A non-HTTP failure still gets a one-line reason rather than an empty string."""
+    assert fwd._compaction_persist_failure_reason(RuntimeError("boom")) == "RuntimeError: boom"
+
+
 @pytest.mark.asyncio
 async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
     """When no items exist, last_item_id falls back to compact_boundary_ prefix."""

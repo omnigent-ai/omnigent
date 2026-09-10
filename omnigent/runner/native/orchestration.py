@@ -458,6 +458,10 @@ class _CodexNativeLaunchConfig:
         still has work to do. False on a session something already routed —
         a web create that pinned the model before the pane launched — so the
         ``UserPromptSubmit`` hook is never registered and no prompt is held.
+    :param reasoning_effort: Persisted per-session effort, e.g. ``"ultra"``,
+        pinned into the private ``config.toml`` at launch so the thread (and
+        the TUI footer) start at it instead of the shared config's default.
+        ``None`` leaves Codex's configured effort in place.
     """
 
     workspace: Path
@@ -472,6 +476,7 @@ class _CodexNativeLaunchConfig:
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
+    reasoning_effort: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1004,6 +1009,22 @@ async def _codex_native_launch_config(
         not isinstance(external_session_id, str) or not external_session_id
     ):
         raise RuntimeError(f"Invalid external_session_id for Codex session {session_id!r}.")
+    from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS, validate_effort
+
+    reasoning_effort = snapshot.get("reasoning_effort")
+    if reasoning_effort is not None:
+        try:
+            reasoning_effort = validate_effort(reasoning_effort, "codex", CODEX_NATIVE_EFFORTS)
+        except ValueError:
+            # An effort codex cannot take must not sink the launch: keep the
+            # configured default, as the per-turn override does.
+            _logger.warning(
+                "Ignoring unsupported reasoning_effort %r for Codex session %s",
+                reasoning_effort,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            reasoning_effort = None
     # The session's stored workspace is the worktree path for worktree
     # sessions (set by _create_session_worktree), or the repo root
     # otherwise. Use it as the Codex terminal cwd so worktree sessions
@@ -1063,6 +1084,7 @@ async def _codex_native_launch_config(
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -3864,6 +3886,7 @@ async def _auto_create_codex_terminal(
         _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         CodexAppServerClient,
         CodexAppServerResponseError,
+        apply_codex_thread_effort,
         build_codex_native_server,
         build_codex_remote_args,
         codex_session_meta_model_provider,
@@ -4276,6 +4299,7 @@ async def _auto_create_codex_terminal(
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
         developer_instructions=_codex_developer_instructions,
+        reasoning_effort=launch_config.reasoning_effort,
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
@@ -4383,6 +4407,25 @@ async def _auto_create_codex_terminal(
                     cwd=workspace,
                 ),
             )
+            if launch_config.reasoning_effort:
+                # A resumed thread runs the rollout's effort, not the config pin.
+                try:
+                    await apply_codex_thread_effort(
+                        codex_ws_url,
+                        launch_config.external_session_id,
+                        launch_config.reasoning_effort,
+                        model=_codex_launch.model,
+                    )
+                except Exception:  # noqa: BLE001 — a failed update must not sink the launch
+                    _logger.warning(
+                        "codex-native: could not apply reasoning effort %r to resumed thread "
+                        "%s for session %s; the next web turn re-applies it",
+                        launch_config.reasoning_effort,
+                        launch_config.external_session_id,
+                        session_id,
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
     if launch_config.external_session_id is None:
         try:
             # Connect the listener BEFORE launching the TUI so it observes the
@@ -7203,6 +7246,7 @@ async def _auto_create_claude_terminal(
         agent_name=agent_name,
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
             x

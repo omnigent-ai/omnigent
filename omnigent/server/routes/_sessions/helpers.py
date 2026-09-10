@@ -601,6 +601,21 @@ def announce_hosts_changed(user_id: str | None) -> None:
     user_session_stream.publish(_discovery_key(user_id), {"type": "hosts_changed"})
 
 
+def announce_projects_changed(user_id: str | None) -> None:
+    """
+    Push a ``projects_changed`` event to a user's session-updates streams.
+
+    Called after one of ``user_id``'s projects is created, updated (renamed,
+    config change), or deleted, so that user's other connected clients refresh
+    their projects cache instead of showing the stale name until a reload. A
+    no-op when the user has no stream connected.
+
+    :param user_id: Owner of the project that changed, or ``None`` in
+        single-user mode.
+    """
+    user_session_stream.publish(_discovery_key(user_id), {"type": "projects_changed"})
+
+
 def _native_ask_gate_lock(conversation_id: str, deciding_policy: str) -> asyncio.Lock:
     """
     Return the lock serializing native ASK gates for one (session, policy).
@@ -1033,6 +1048,7 @@ def _client_supplied_hook_elicitation_id(
 def _consume_pre_resolved_harness_elicitation(
     session_id: str,
     elicitation_id: str,
+    request_fingerprint: str | None = None,
 ) -> _PreResolvedHarnessElicitation | None:
     """
     Consume a resolution that arrived before the hook wait registered.
@@ -1040,6 +1056,16 @@ def _consume_pre_resolved_harness_elicitation(
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
     :param elicitation_id: Harness elicitation id, e.g.
         ``"elicit_codex_abc123"``.
+    :param request_fingerprint: Digest of the consuming re-park's request
+        params, e.g. a sha256 hex string. A verdict-carrying tombstone
+        is adopted ONLY on a proven same-question match: both sides
+        must carry a fingerprint and they must be equal. Any other
+        combination (either side ``None``, or a mismatch) fails closed
+        — the tombstone is dropped and the prompt is re-published — so
+        a stale approval can never gate a DIFFERENT question that
+        reused this id. Terminal-side tombstones (``result is None``)
+        skip the check: adopting one only fail-asks, and their producer
+        has no params to fingerprint.
     :returns: The consumed tombstone when one matched this session
         (its ``result`` carries the web verdict to honor, or ``None``
         for a terminal-side resolution), or ``None`` when nothing was
@@ -1049,10 +1075,23 @@ def _consume_pre_resolved_harness_elicitation(
     tombstone = _harness_pre_resolved_elicitations.pop(elicitation_id, None)
     if tombstone is None:
         return None
-    if tombstone.session_id == session_id:
-        return tombstone
-    _harness_pre_resolved_elicitations[elicitation_id] = tombstone
-    return None
+    if tombstone.session_id != session_id:
+        _harness_pre_resolved_elicitations[elicitation_id] = tombstone
+        return None
+    if tombstone.result is not None and (
+        tombstone.request_fingerprint is None
+        or request_fingerprint is None
+        or tombstone.request_fingerprint != request_fingerprint
+    ):
+        # A verdict is replayed only on a proven same-question match.
+        # A differing fingerprint means the id was reused by a LATER,
+        # different question; a missing fingerprint on either side
+        # means the match cannot be proven (e.g. the gap path found no
+        # valid pending prompt to digest). Both fail closed: drop the
+        # tombstone and let the new prompt be published — the safe cost
+        # is one re-ask, never a stale approval gating a new question.
+        return None
+    return tombstone
 
 
 def _prune_pre_resolved_harness_elicitations(now: float | None = None) -> None:
@@ -4257,6 +4296,8 @@ def _publish_status(
     background_task_count: int | None = None,
     background_tasks: list[BackgroundTaskInfo] | None = None,
     blocked_on: str | None = None,
+    persist_live_status: bool = True,
+    scheduled_run_outcome: Literal["auto", "failed"] = "auto",
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4310,7 +4351,8 @@ def _publish_status(
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
-    session_live_state.persist_live_status(session_id, status)
+    if persist_live_status:
+        session_live_state.persist_live_status(session_id, status)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
     # still-``running`` scheduled_task_run to succeeded/failed. This is the
@@ -4321,7 +4363,14 @@ def _publish_status(
     # the common case: interactive (non-scheduled) conversations have no
     # running run, and the reverse lookup cheaply returns None. running/waiting
     # edges are skipped entirely so the hot path pays nothing mid-turn.
-    if status == "idle":
+    if scheduled_run_outcome == "failed":
+        session_live_state.persist_scheduled_run_completion(
+            session_id,
+            "failed",
+            error_code="incomplete",
+            error="runner disappeared before the turn reached a terminal state",
+        )
+    elif status == "idle":
         session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
     elif status == "failed":
         # Canonical server-side broken-turn signal: every server-originated
@@ -4398,6 +4447,46 @@ def _publish_status(
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
+
+
+def reconcile_orphaned_running_status(
+    session_id: str,
+    conversation_store: ConversationStore,
+    stale_before: int,
+) -> bool:
+    """
+    Settle a session that reads ``running`` but whose runner is
+    confirmed gone down to a non-running resting state.
+
+    A ``running`` live-status is only meaningful while a runner is
+    actually executing the turn. When the runner (and its host) have
+    dropped past the liveness window — a server replica that restarted
+    and outlived the runner, a crashed host, a graceful disconnect
+    mid-turn — the persisted ``running`` is stale: no executor will
+    ever emit the terminal edge that would clear it, so it sticks
+    forever. The sidebar then shows a turn that isn't happening, and
+    ``stop_session`` reports a success it never delivered.
+
+    This is the lazy-on-read backstop for that stale state. The store performs
+    one conditional transition so a fresh liveness stamp or terminal status
+    written by another replica wins the race. A successful transition updates
+    the local cache and stream without issuing a second status write, and
+    classifies any associated scheduled run as failed/incomplete.
+
+    :param session_id: Session/conversation identifier to settle.
+    :param conversation_store: Store performing the conditional transition.
+    :param stale_before: Runner stamps at or after this epoch are fresh.
+    :returns: Whether this call performed the transition.
+    """
+    if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
+        return False
+    _publish_status(
+        session_id,
+        "idle",
+        persist_live_status=False,
+        scheduled_run_outcome="failed",
+    )
+    return True
 
 
 def _truncate_label(value: str) -> str:
@@ -6340,10 +6429,17 @@ def _build_new_item(
     """
     Construct a :class:`NewConversationItem` from a POSTed event.
 
-    Validates the data payload via ``parse_item_data`` (the same
-    validator the route boundary already invoked) and wraps the
+    Validates the data payload via ``parse_item_data`` and wraps the
     result with the response_id linkage required by the conversation
     store.
+
+    The item *type* is checked at the route boundary, but ``data`` is a
+    free-form dict there, so a caller can name a known type and omit the
+    fields it requires — ``{"type": "message"}`` with no ``role`` or
+    ``content`` is the shape seen in production. That is bad input, so the
+    raised ``ValidationError`` becomes an
+    :class:`~omnigent.errors.OmnigentError` the caller can act on rather
+    than escaping as an unhandled 500.
 
     :param body: Validated event input — guaranteed to be a known
         item type (the route checked ``_ALLOWED_EVENT_TYPES``).
@@ -6355,8 +6451,16 @@ def _build_new_item(
         single-user mode.
     :returns: A :class:`NewConversationItem` ready for delivery
         or persistence.
+    :raises OmnigentError: When ``body.data`` does not satisfy the
+        payload schema for ``body.type``.
     """
-    data = parse_item_data(body.type, {"type": body.type, **body.data})
+    try:
+        data = parse_item_data(body.type, {"type": body.type, **body.data})
+    except ValidationError as exc:
+        raise OmnigentError(
+            f"invalid data for {body.type!r} item: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
     return NewConversationItem(
         type=body.type,
         response_id=response_id,

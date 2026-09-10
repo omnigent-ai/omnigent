@@ -520,7 +520,8 @@ struct OmnigentWebView: UIViewRepresentable {
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
       if let url = webView.url,
         ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-        url.omnigentOrigin != pinnedOrigin
+        url.omnigentOrigin != pinnedOrigin,
+        !usesInWebViewAuth(pinnedOrigin)
       {
         webView.stopLoading()
         startLogin(in: webView)
@@ -618,6 +619,21 @@ struct OmnigentWebView: UIViewRepresentable {
         ["http", "https"].contains(scheme),
         url.omnigentOrigin != pinnedOrigin
       {
+        if usesInWebViewAuth(pinnedOrigin) {
+          // Databricks authentication sets its session cookies through the
+          // WebView redirect chain. Keep IdP interactions inline, but preserve
+          // normal external-link behavior for links tapped on the app page.
+          if webView.url?.omnigentOrigin == pinnedOrigin,
+            navigationAction.navigationType == .linkActivated
+          {
+            openExternal(url)
+            decisionHandler(.cancel)
+          } else {
+            decisionHandler(.allow)
+          }
+          return
+        }
+
         if navigationAction.navigationType == .linkActivated {
           openExternal(url)
         } else {

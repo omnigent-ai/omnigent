@@ -67,6 +67,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
+import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { randomUUID } from "@/lib/randomUUID";
@@ -4468,6 +4469,8 @@ export function NewChatLandingScreen() {
       // move). A label-only folder (no first-class row yet) keeps the legacy
       // label + post-create move, which creates the project row on demand.
       const createProjectId = selectedProject !== "" ? configProjectId : null;
+      const localProject =
+        selectedProject !== "" ? { id: createProjectId, name: selectedProject } : undefined;
       // Server-side default-fill: a slot still holding its untouched project-
       // config seed (per the source refs) is OMITTED so the server fills it
       // from the config. Any user interaction — even re-picking the exact
@@ -4548,7 +4551,7 @@ export function NewChatLandingScreen() {
         // Normal path: bind to an existing registered agent.
         const provisional = newTempConversation();
         try {
-          localConv = beginLocalConversation(initialPrompt, files, provisional);
+          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject);
           if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
         } catch {
           /* non-fatal: the response still opens the server session */
@@ -4559,7 +4562,10 @@ export function NewChatLandingScreen() {
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...backgroundSessionTitlesRequestHeaders(),
+          },
           body: JSON.stringify({
             // Config-seeded agent on a `project_id` create: omitted so the
             // server default-fills it from the project config.
@@ -4802,6 +4808,7 @@ export function NewChatLandingScreen() {
           skill,
           navigate,
           () => window.location.pathname.endsWith(tempRouteSuffix),
+          localProject,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
       } else {

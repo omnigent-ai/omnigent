@@ -8,8 +8,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  apiErrorFromResponse,
   approve,
   bindOnlyOnlineRunner,
+  createBundledSession,
   createSession,
   fetchSessionItemsPage,
   forkSession,
@@ -24,12 +26,16 @@ import {
   stopSession,
   updateSession,
 } from "./sessionsApi";
+import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 
-function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
+function mockJsonResponse(
+  body: unknown,
+  init?: { ok?: boolean; status?: number; statusText?: string },
+): Response {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
-    statusText: "OK",
+    statusText: init?.statusText ?? "OK",
     json: async () => body,
   } as unknown as Response;
 }
@@ -57,10 +63,49 @@ const fetchMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
   vi.stubGlobal("fetch", fetchMock);
+  localStorage.clear();
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  localStorage.clear();
+});
+
+describe("apiErrorFromResponse", () => {
+  it("reads the AP `error` envelope (message + code)", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        { error: { code: "conflict", message: "Session is busy." } },
+        { ok: false, status: 409 },
+      ),
+    );
+    expect(err.message).toBe("Session is busy.");
+    expect(err.code).toBe("conflict");
+    expect(err.status).toBe(409);
+  });
+
+  it("reads a top-level error envelope (error_code + message), as storage backends send", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        {
+          error_code: "INVALID_PARAMETER_VALUE",
+          message: "Workspace items cannot contain the '/' character",
+        },
+        { ok: false, status: 400 },
+      ),
+    );
+    expect(err.message).toBe("Workspace items cannot contain the '/' character");
+    expect(err.code).toBe("INVALID_PARAMETER_VALUE");
+    expect(err.status).toBe(400);
+  });
+
+  it("falls back to the status line when the body is not an error shape", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse({}, { ok: false, status: 404, statusText: "Not Found" }),
+    );
+    expect(err.message).toBe("404 Not Found");
+    expect(err.code).toBeNull();
+  });
 });
 
 describe("createSession", () => {
@@ -150,6 +195,23 @@ describe("createSession", () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string).initial_items).toEqual(seed);
+  });
+
+  it("sends the local opt-out header when background titles are disabled", async () => {
+    localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await createSession("agent_xyz");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 
   it("forwards parent_session_id, sub_agent_name and title for the Add-agent path", async () => {
@@ -280,6 +342,26 @@ describe("createSession", () => {
 
     const session = await createSession("agent_xyz");
     expect(session.activeResponseId).toBeNull();
+  });
+});
+
+describe("createBundledSession", () => {
+  it("sends the local opt-out header when background titles are disabled", async () => {
+    localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        session_id: "conv_bundle",
+      }),
+    );
+
+    const result = await createBundledSession(
+      new File([], "agent.tar.gz", { type: "application/gzip" }),
+      { workspace: "/tmp/project" },
+    );
+
+    expect(result.id).toBe("conv_bundle");
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 });
 
@@ -895,6 +977,16 @@ describe("postEvent", () => {
   it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 422 }));
     await expect(postEvent("conv_abc", { type: "bogus", data: {} })).rejects.toThrow(/422/);
+  });
+
+  it("sends the local opt-out header when background titles are disabled", async () => {
+    localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+
+    await postEvent("conv_abc", { type: "message", data: {} });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 
   it("reads pending_id for a native-terminal message", async () => {

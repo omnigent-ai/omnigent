@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pytest
 
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
+    OBSERVER_HOOK_STDERR_FILE,
     ClaudeNativeHookInterpreterMismatchError,
     build_hook_settings,
     prepare_bridge_dir,
@@ -1125,6 +1127,22 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
     assert any("evaluate-policy" not in cmd for cmd in user_prompt_cmds)
 
 
+def test_build_hook_settings_captures_observer_stderr(tmp_path: Path) -> None:
+    """Observer process failures are persisted where the forwarder can log them."""
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+
+    settings = build_hook_settings(
+        bridge_dir,
+        python_executable="/venv/bin/python",
+    )
+
+    expected_redirection = f"2>> {shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))}"
+    hooks = settings["hooks"]
+    for event_name in ("SessionStart", "UserPromptSubmit", "Stop", "StopFailure"):
+        command = hooks[event_name][0]["hooks"][0]["command"]
+        assert command.endswith(expected_redirection)
+
+
 def test_build_hook_settings_registers_message_display_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1917,6 +1935,40 @@ def test_build_hook_settings_omits_apikeyhelper_when_none(
     assert "apiKeyHelper" not in build_hook_settings(bridge_dir, api_key_helper=None)
     with_helper = build_hook_settings(bridge_dir, api_key_helper="printf tok")
     assert with_helper["apiKeyHelper"] == "printf tok"
+
+
+def test_build_hook_settings_merges_model_overrides_next_to_apikeyhelper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical-to-served rewrites land next to ``apiKeyHelper``."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+    overrides = {"claude-opus-4-8": "databricks-claude-opus-4-8"}
+
+    settings = build_hook_settings(
+        bridge_dir,
+        api_key_helper="printf tok",
+        model_overrides=overrides,
+    )
+
+    assert settings["apiKeyHelper"] == "printf tok"
+    assert settings["modelOverrides"] == overrides
+
+
+def test_build_hook_settings_omits_model_overrides_when_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty map leaves Claude Code as it behaves today."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+
+    assert "modelOverrides" not in build_hook_settings(bridge_dir)
+    assert "modelOverrides" not in build_hook_settings(bridge_dir, model_overrides=None)
+    assert "modelOverrides" not in build_hook_settings(bridge_dir, model_overrides={})
 
 
 def test_evaluate_policy_retries_5xx_and_succeeds(

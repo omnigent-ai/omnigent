@@ -36,6 +36,14 @@ vi.mock("@/hooks/useGithub", () => ({
     isFetching: false,
   }),
   fetchGithubFileContents: async () => ({ before: "old", after: "new" }),
+  // The account selector (shown in the repo-unresolved empty state) calls this;
+  // stub the mutation shape it reads.
+  useSetGithubPreference: () => ({
+    mutate: () => {},
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
 }));
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here
@@ -191,6 +199,21 @@ describe("GithubPanel", () => {
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
+  });
+
+  it.each([
+    ["OPEN", "Open", "text-green-700"],
+    ["CLOSED", "Closed", "text-red-700"],
+    ["MERGED", "Merged", "text-brand-accent"],
+  ])("shows a %s status pill beside the PR title", (stateName, label, tone) => {
+    state.info!.data!.pr!.state = stateName;
+    renderPanel();
+
+    const pill = screen.getByLabelText(`Pull request status: ${label}`);
+    expect(pill).toHaveTextContent(label);
+    expect(pill).toHaveClass(tone, "h-5", "rounded-full", "border", "text-xs");
+    expect(pill.parentElement).toHaveClass("flex-nowrap");
+    expect(screen.getByRole("link", { name: /chore: dummy PR/ })).not.toHaveClass("flex-1");
   });
 
   it("lands on the Summary tab, showing the PR description and comments", async () => {

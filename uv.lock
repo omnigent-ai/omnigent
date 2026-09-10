@@ -30,9 +30,9 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
-nimble-python = "2026-07-29T00:00:00Z"
 cwsandbox = "2026-06-12T00:00:00Z"
 google-antigravity = "2026-06-12T00:00:00Z"
+nimble-python = "2026-07-29T00:00:00Z"
 
 [manifest]
 members = [
@@ -3143,7 +3143,7 @@ wheels = [
 
 [[package]]
 name = "omnigent"
-version = "0.13.0.dev0"
+version = "0.14.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -3273,6 +3273,9 @@ nimble = [
 openshell = [
     { name = "openshell" },
 ]
+postgres = [
+    { name = "psycopg", extra = ["binary"] },
+]
 s3 = [
     { name = "boto3" },
     { name = "botocore" },
@@ -3389,6 +3392,7 @@ requires-dist = [
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0,<2" },
     { name = "nimble-python", marker = "extra == 'nimble'", specifier = ">=1.2.0,<2" },
     { name = "numpy", marker = "extra == 'dictation'", specifier = ">=1.24,<3" },
+    { name = "omnigent", extras = ["postgres"], marker = "extra == 'databricks'" },
     { name = "omnigent-client", editable = "sdks/python-client" },
     { name = "omnigent-slack", marker = "extra == 'slack'", editable = "integrations/slack" },
     { name = "omnigent-ui-sdk", editable = "sdks/ui" },
@@ -3418,7 +3422,7 @@ requires-dist = [
     { name = "protobuf", specifier = ">=6,<8" },
     { name = "protobuf", marker = "extra == 'antigravity'", specifier = ">=7,<8" },
     { name = "psutil", specifier = ">=5.9,<8" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'databricks'", specifier = ">=3.1,<4" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1,<4" },
     { name = "pydantic", specifier = ">=2.0,<3" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8,<3" },
     { name = "pymysql", marker = "extra == 'databricks'", specifier = ">=1.1,<2" },
@@ -3437,7 +3441,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "databricks", "loadtest"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3491,7 +3495,7 @@ test = [
 
 [[package]]
 name = "omnigent-client"
-version = "0.13.0.dev0"
+version = "0.14.0.dev0"
 source = { editable = "sdks/python-client" }
 dependencies = [
     { name = "httpx" },
@@ -3536,7 +3540,7 @@ dev = [
 
 [[package]]
 name = "omnigent-slack"
-version = "0.13.0.dev0"
+version = "0.14.0.dev0"
 source = { editable = "integrations/slack" }
 dependencies = [
     { name = "aiohttp" },
@@ -3561,7 +3565,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-ui-sdk"
-version = "0.13.0.dev0"
+version = "0.14.0.dev0"
 source = { editable = "sdks/ui" }
 dependencies = [
     { name = "omnigent-client" },
@@ -3572,7 +3576,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "omnigent-client", specifier = "==0.13.0.dev0" },
+    { name = "omnigent-client", specifier = "==0.14.0.dev0" },
     { name = "prompt-toolkit", specifier = ">=3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "rich", specifier = ">=13" },
@@ -4371,8 +4375,8 @@ name = "psycopg"
 version = "3.3.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
-    { name = "tzdata", marker = "sys_platform == 'win32'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "tzdata", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/db/2f/cb91e5502ec9de1de6f1b76cfbf69531932725361168bb06963620c77e2e/psycopg-3.3.4.tar.gz", hash = "sha256:e21207764952cff81b6b8bdacad9a3939f2793367fdac2987b3aac36a651b5bc", size = 165799, upload-time = "2026-05-01T23:31:55.179Z" }
 wheels = [
@@ -4381,7 +4385,7 @@ wheels = [
 
 [package.optional-dependencies]
 binary = [
-    { name = "psycopg-binary", marker = "implementation_name != 'pypy'" },
+    { name = "psycopg-binary", marker = "implementation_name != 'pypy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
 ]
 
 [[package]]

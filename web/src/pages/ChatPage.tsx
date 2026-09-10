@@ -1491,7 +1491,13 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
   const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
+  const [replyConversationId, setReplyConversationId] = useState(conversationId);
   const nextReplyQuoteId = useRef(0);
+
+  if (replyConversationId !== conversationId) {
+    setReplyConversationId(conversationId);
+    setReplyQuotes([]);
+  }
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1771,6 +1777,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showClaudePermissionMode={showClaudePermissionMode}
             showCodexApprovalMode={showCodexApprovalMode}
             showGoalControl={showGoalControl}
+            runnerOnline={runnerOnline}
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
             isTerminalFirst={isTerminalFirst}
@@ -1896,6 +1903,8 @@ interface ComposerProps {
   showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
+  /** Whether the active session's runner tunnel is connected. */
+  runnerOnline?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
@@ -2535,6 +2544,7 @@ function ComposerImpl({
   showClaudePermissionMode = false,
   showCodexApprovalMode = false,
   showGoalControl = false,
+  runnerOnline,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
   isTerminalFirst = false,
@@ -2605,7 +2615,10 @@ function ComposerImpl({
   // server-side (the runner blocks on the verdict Future), so a message
   // sent now would sit queued and unread until the card is answered —
   // and for native wrappers the injected text could land in the vendor
-  // TUI's permission prompt. Lock the composer until the verdict is in.
+  // TUI's permission prompt. Lock the SEND path until the verdict is in
+  // (submit() guard + disabled Send button), but keep the textarea itself
+  // editable: disabling it ejects browser focus mid-word when a prompt
+  // lands while the user is typing, silently dropping their keystrokes.
   // Mirrored sub-agent prompts (targetSessionId set to a child session)
   // don't gate this session's inbox, so they don't lock it.
   const hasPendingElicitation = useChatStore((s) =>
@@ -2674,7 +2687,10 @@ function ComposerImpl({
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
-  const { goal, setGoal: setGoalState } = useGoalState(composerSessionId, showGoalControl);
+  const { goal, setGoal: setGoalState } = useGoalState(
+    composerSessionId,
+    showGoalControl && runnerOnline === true,
+  );
   // "@"-file-mention is scoped to the native coding-agent harnesses: their
   // vendor CLIs run in the workspace and read an on-disk file from an
   // attachment marker the executor already emits. In-process SDK sessions
@@ -3352,7 +3368,7 @@ function ComposerImpl({
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isStreaming) {
+    if (e.key === "Escape" && isWorking && !isReadOnly) {
       e.preventDefault();
       onStop();
       return;
@@ -3612,8 +3628,15 @@ function ComposerImpl({
                           : "Send a message…"
             }
             rows={1}
-            disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
+            // A pending elicitation must NOT disable the textarea: disabling
+            // ejects focus to <body> mid-word and later keystrokes vanish.
+            // The draft stays typable; sending is still gated (submit() +
+            // the disabled Send button) until the prompt is answered.
+            disabled={disabled || isReadOnly || unreachable}
             data-slash-command={composerIsCommand ? "true" : undefined}
+            // Full send intent (text OR attachments OR mentions) for the
+            // approve hotkey's drafting guard, which only sees this element.
+            data-has-draft={hasDraft ? "true" : undefined}
             className={cn(
               "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
               // Hand glyph painting to the overlay while a command is drafted;
@@ -3695,7 +3718,10 @@ function ComposerImpl({
             {commandError}
           </div>
         )}
-        <div className="flex items-center justify-between gap-2 px-2 pb-2">
+        <div
+          className="@container/composer-actions flex items-center justify-between gap-2 px-2 pb-2"
+          data-testid="composer-action-row"
+        >
           {/* Attach + mic — left side of the action row */}
           <div className="flex shrink-0 items-center gap-0.5">
             <Button
@@ -3748,7 +3774,7 @@ function ComposerImpl({
                     size="sm"
                     variant={codexPlanMode ? "secondary" : "ghost"}
                     className={cn(
-                      "h-9 gap-1.5 px-2 text-sm md:h-8",
+                      "h-9 w-9 gap-0 px-0 text-sm md:h-8 @lg/composer-actions:w-auto @lg/composer-actions:gap-1.5 @lg/composer-actions:px-2",
                       codexPlanMode && "border border-ring/30 text-foreground",
                     )}
                     disabled={isReadOnly || planModeBusy}
@@ -3764,7 +3790,7 @@ function ComposerImpl({
                     ) : (
                       <FileTextIcon className="size-3.5" />
                     )}
-                    <span>Plan</span>
+                    <span className="hidden @lg/composer-actions:inline">Plan</span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>
@@ -5139,7 +5165,10 @@ function ComposerModelSource({
           <span
             tabIndex={0}
             data-testid="composer-model-source"
-            className="min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+            // `flex` keeps the min-width chain flowing through this wrapper:
+            // as a plain span the label inside loses its flex-imposed width
+            // and its `truncate` never engages, running under the Stop button.
+            className="flex min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
           >
             {children}
           </span>

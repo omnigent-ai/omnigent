@@ -229,12 +229,14 @@ def test_daemon_owner_is_live_flock_then_pid(
     assert cli._daemon_owner_is_live(_record(target, 999), target) is True
     lock.release()
 
-    # Free lock → fall back to the PID: alive PID (e.g. still starting) → alive.
-    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    # Free lock → fall back to pid identity: a pid that is still the
+    # recorded daemon (e.g. mid-startup, lock not yet grabbed) → alive.
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: True)
     assert cli._daemon_owner_is_live(_record(target, 999), target) is True
 
-    # Free lock + dead PID → dead (the only case that reaps).
-    monkeypatch.setattr(cli, "_pid_alive", lambda pid: False)
+    # Free lock + a pid that is no longer the recorded daemon (dead, or
+    # recycled to an unrelated process after a reboot) → dead (reapable).
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: False)
     assert cli._daemon_owner_is_live(_record(target, 999), target) is False
 
 

@@ -14,8 +14,8 @@
 // hooks/useGithub.ts), which shells out to `gh` + `git`. `deriveGithubPanelState`
 // is the single switch that turns the info query into what the panel shows: an
 // outdated host, a non-git workspace, a missing `gh` CLI, an unresolved
-// upstream repo, or no open PR each render their own empty state, and only an
-// open PR falls through to the header + stacked diff.
+// upstream repo, or no PR each render their own empty state, and an associated
+// PR falls through to the header + stacked diff.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -48,11 +48,19 @@ import {
 import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { MessageResponse } from "@/components/ai-elements/message";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -63,6 +71,7 @@ import {
   useGithubChangedFiles,
   useGithubInfo,
   useGithubPrDiff,
+  useSetGithubPreference,
   type GithubChangedFile,
   type GithubCheckRun,
   type GithubChecks,
@@ -83,22 +92,76 @@ function PanelMessage({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Full-panel empty state: an icon, a title, and an optional hint line. Used
- *  for every "no GitHub content to show" reason so they read as one family. */
+/** Full-panel empty state: an icon, a title, an optional hint line, and optional
+ *  children below (the account/remote selectors). Used for every "no GitHub
+ *  content to show" reason so they read as one family. */
 function GithubEmptyState({
   icon: Icon,
   title,
   hint,
+  children,
 }: {
   icon: LucideIcon;
   title: React.ReactNode;
   hint?: React.ReactNode;
+  children?: React.ReactNode;
 }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
       <Icon className="size-8 text-muted-foreground/50" />
       <p className="text-ui font-medium text-foreground">{title}</p>
       {hint && <p className="max-w-xs text-ui text-muted-foreground">{hint}</p>}
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Account switcher — the one PR-resolution lever that can't be inferred: it picks
+ * which signed-in identity `gh` runs as, i.e. which account can even see the repo.
+ * Shown ONLY when the upstream repo can't be reached (the `repo-unresolved` empty
+ * state), since that's an access problem the account can fix. Once the repo
+ * resolves, the account is correct — surfacing the knob then would just invite a
+ * misconfiguration, so it's absent from the header and the `no-pr` state. Renders
+ * nothing with a single account (nothing to choose).
+ */
+function GithubAccountSelector({
+  conversationId,
+  info,
+}: {
+  conversationId: string;
+  info: GithubInfo;
+}) {
+  const setPref = useSetGithubPreference(conversationId);
+  const accounts = info.accounts ?? [];
+  if (accounts.length <= 1) return null;
+
+  const selectedAccount = info.selected_account ?? undefined;
+
+  return (
+    <div className="flex w-full max-w-xs flex-col items-center gap-2 pt-2">
+      <Select
+        value={selectedAccount}
+        onValueChange={(login) => setPref.mutate({ account: login })}
+        disabled={setPref.isPending}
+      >
+        <SelectTrigger aria-label="GitHub account" className="h-8 w-full text-ui">
+          <SelectValue placeholder="Account" />
+        </SelectTrigger>
+        <SelectContent>
+          {accounts.map((a) => (
+            <SelectItem key={a.login} value={a.login}>
+              {a.login}
+              {a.active ? " (active)" : ""}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {setPref.isError && (
+        <p className="text-ui text-red-600 dark:text-red-400">
+          Couldn’t apply: {(setPref.error as Error).message}
+        </p>
+      )}
     </div>
   );
 }
@@ -121,7 +184,7 @@ export type GithubPanelState =
  *
  * Order matters: transient states (loading/offline/error) first, then the
  * git-first availability reasons, then the `gh` enhancement layer (CLI → auth
- * → repo → PR). `ready` is reached only with an open PR to render. */
+ * → repo → PR). `ready` is reached only with an associated PR to render. */
 export function deriveGithubPanelState(info: {
   isLoading: boolean;
   error: unknown;
@@ -176,6 +239,37 @@ function IconButton({
       </TooltipTrigger>
       <TooltipContent>{label}</TooltipContent>
     </Tooltip>
+  );
+}
+
+/** Compact PR state shown beside the title in the shared panel header. */
+function PullRequestStatus({ state }: { state: string }) {
+  const normalized = state.toUpperCase();
+  const visual =
+    normalized === "OPEN"
+      ? {
+          label: "Open",
+          className: "border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400",
+        }
+      : normalized === "MERGED"
+        ? {
+            label: "Merged",
+            className: "border-brand-accent/25 bg-brand-accent/10 text-brand-accent",
+          }
+        : normalized === "CLOSED"
+          ? {
+              label: "Closed",
+              className: "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400",
+            }
+          : { label: state, className: "border-border bg-muted text-muted-foreground" };
+
+  return (
+    <Badge
+      aria-label={`Pull request status: ${visual.label}`}
+      className={cn("h-5 rounded-full border px-2 py-px text-xs leading-none", visual.className)}
+    >
+      {visual.label}
+    </Badge>
   );
 }
 
@@ -884,14 +978,18 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           title="Can’t reach the upstream repo"
           hint={
             <>
-              Run <span className="font-mono">gh auth status</span> on the host to confirm the
-              GitHub CLI is signed in to the right account.
+              Pick the account to use, or run <span className="font-mono">gh auth status</span> on
+              the host to confirm the GitHub CLI is signed in.
             </>
           }
-        />
+        >
+          {info.data && <GithubAccountSelector conversationId={conversationId} info={info.data} />}
+        </GithubEmptyState>
       );
     case "no-pr":
       // TODO: offer a "Create PR" action here once the panel can open PRs.
+      // No account selector here: the repo resolved, so the account is correct —
+      // this is a genuine "no PR yet", not a misconfiguration to fix.
       return (
         <GithubEmptyState
           icon={GitPullRequestIcon}
@@ -913,7 +1011,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
       );
   }
 
-  // ── Ready: an open PR to render as its header + the stacked diff ─────────
+  // ── Ready: an associated PR to render as its header + stacked diff ───────
   const data = info.data!;
   const pr = data.pr!;
   const checks = pr.checks;
@@ -943,17 +1041,18 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                 </>
               )}
             </span>
-            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+            <div className="mt-1 flex flex-nowrap items-center gap-2">
               <a
                 href={pr.url}
                 target="_blank"
                 rel="noreferrer"
-                className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
+                className="group flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
               >
                 <span className="truncate">{pr.title}</span>
                 <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
                 <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
               </a>
+              <PullRequestStatus state={pr.state} />
             </div>
           </div>
           {/* Tab bar (Summary | Changes); the diff controls live inside the

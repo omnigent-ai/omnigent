@@ -467,14 +467,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def find_imported_conversation(
+    def find_conversation_by_external_session_id(
         self,
-        source: str,
         external_session_id: str,
     ) -> Conversation | None:
-        """Find the original session imported from one external transcript.
+        """Find an existing conversation wrapping one external (harness) session id.
 
-        :param source: Import source key, e.g. ``"claude"``.
+        Both an imported transcript and a natively-run session record the
+        external id, so import dedup resolves against either through this one
+        lookup. When several rows share the id, the earliest-created wins.
+
         :param external_session_id: Source harness session id.
         :returns: The matching conversation, or ``None``.
         """
@@ -1328,6 +1330,20 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        """
+        ...
+
+    @abstractmethod
+    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
+        """Atomically settle a stale running session to idle.
+
+        The update must require a bound runner, ``running``/``waiting`` live
+        status, and a missing or older ``runner_last_seen`` stamp. It must not
+        bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param stale_before: Runner stamps at or after this epoch are fresh.
+        :returns: Whether this call performed the transition.
         """
         ...
 

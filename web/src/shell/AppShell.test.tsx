@@ -589,6 +589,19 @@ describe("AppShell header", () => {
     expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "false");
   });
 
+  it("does not mount file viewers for a temp route with a stale file selection", () => {
+    writeSessionWorkspaceState("temp:12345678", {
+      open: true,
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
+    renderShell("/c/temp:12345678");
+
+    expect(screen.queryByTestId("file-viewer")).toBeNull();
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+  });
+
   it("shows owner actions for a top-level session omitted from conversation pages", () => {
     mockConversations([]);
     useSessionMock.mockReturnValue({
@@ -642,7 +655,10 @@ describe("AppShell header", () => {
 
     renderShell("/c/conv_child");
 
-    expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
+    fireEvent.pointerDown(screen.getByTestId("desktop-fork-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Fork" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Rename" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Delete" })).toBeNull();
   });
 
   it("defaults to chat view on a native Claude session", () => {
@@ -3864,7 +3880,7 @@ describe("AppShell share action", () => {
 });
 
 describe("Mobile header actions menu", () => {
-  // On mobile (`< md`) the Share / Clone / Agent-info buttons collapse
+  // On mobile (`< md`) the Share / Fork / Agent-info buttons collapse
   // into a single three-dot "Session actions" menu, gated by the same
   // permission booleans as the desktop buttons. jsdom doesn't apply the
   // responsive CSS, so both the desktop buttons and the mobile trigger are in
@@ -3888,7 +3904,7 @@ describe("Mobile header actions menu", () => {
     return trigger;
   }
 
-  it("offers Share and Clone for an owner of a top-level session", () => {
+  it("offers Share and Fork for an owner of a top-level session", () => {
     withWindowOrigin("https://app.example.com", () => {
       mockConversations([
         {
@@ -3908,9 +3924,7 @@ describe("Mobile header actions menu", () => {
       const shareItem = screen.getByRole("menuitem", { name: /^share$/i });
       expect(shareItem).toBeInTheDocument();
       expect(shareItem).not.toHaveAttribute("data-disabled");
-      // Clone is not a menu entry — forking lives on each assistant
-      // message's "Fork from here" action (ChatPage).
-      expect(screen.queryByRole("menuitem", { name: /^clone$/i })).toBeNull();
+      expect(screen.getByRole("menuitem", { name: /^fork$/i })).toBeInTheDocument();
       // Agent info is always available (policies section is shown for any session).
       expect(screen.getByRole("menuitem", { name: /agent info/i })).toBeInTheDocument();
       // Stop session is not a header action — it lives in the sidebar row's kebab.
@@ -3930,15 +3944,14 @@ describe("Mobile header actions menu", () => {
   });
 
   it("offers no Share to a read-only collaborator", () => {
-    // level 1 = read: can fork (via the per-message action), but not
-    // share (needs ≥3) — and Clone is not a menu entry at all.
+    // level 1 = read: can fork, but not share (needs ≥3).
     mockConversations([{ id: "conv_shared", permission_level: 1 }]);
 
     renderShell("/c/conv_shared");
     openActionsMenu();
 
     expect(screen.queryByRole("menuitem", { name: /^share$/i })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: /^clone$/i })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: /^fork$/i })).toBeInTheDocument();
   });
 
   it("shows the Agent info entry when the agent has tools or policies", () => {
@@ -3969,9 +3982,9 @@ describe("Mobile header actions menu", () => {
     expect(within(dialog).getByText("files")).toBeInTheDocument();
   });
 
-  it("shows only Agent info in the three-dot menu for a child session with no other actions", () => {
-    // A child session at level 1 (no share) and child (no clone) — only
-    // Agent info is available (policies are always accessible).
+  it("shows Fork and Agent info for a read-only child session", () => {
+    // A child session at level 1 can be forked but not shared. Agent info
+    // remains available because policies are always accessible.
     mockConversations([]);
     useSessionMock.mockReturnValue({
       session: {
@@ -3997,11 +4010,11 @@ describe("Mobile header actions menu", () => {
     renderShell("/c/conv_child");
     openActionsMenu();
 
-    // Child session: policy/tools info remains available, but every
-    // session-mutating action is hidden by permission or parent gating.
+    // Child session: policy/tools info and Fork remain available, while
+    // owner-only actions stay hidden.
     expect(screen.getByRole("menuitem", { name: /agent info/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^fork$/i })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /^share$/i })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: /^clone$/i })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: /^resume$/i })).toBeNull();
   });
 });

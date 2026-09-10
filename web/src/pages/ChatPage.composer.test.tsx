@@ -3,6 +3,7 @@ import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as GoalApiModule from "@/lib/goalApi";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
@@ -55,7 +56,12 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     copilot: "Copilot",
   }),
 }));
+vi.mock("@/lib/goalApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof GoalApiModule>()),
+  getGoal: vi.fn(),
+}));
 import type { ElicitationBlock } from "@/lib/blocks";
+import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage";
 import type { Session } from "@/lib/types";
@@ -143,6 +149,82 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
     (key) => key.textContent ?? "",
   );
 }
+
+describe("Composer Escape interrupt", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: "conv_escape", blocks: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+  });
+
+  it.each(["idle", "streaming"] as const)(
+    "interrupts a working session with local status %s without losing the draft",
+    (status) => {
+      const props = composerProps({ status, isWorking: true });
+      render(<Composer {...props} />);
+
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+      expect(props.onStop).toHaveBeenCalledTimes(1);
+
+      fireEvent.change(textarea(), { target: { value: "unfinished follow-up" } });
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+      expect(props.onStop).toHaveBeenCalledTimes(2);
+      expect(textarea()).toHaveValue("unfinished follow-up");
+      expect(props.onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["idle", "streaming"] as const)(
+    "does not interrupt an inactive session with local status %s",
+    (status) => {
+      const props = composerProps({ status });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "unfinished message" } });
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+      expect(props.onStop).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("unfinished message");
+    },
+  );
+
+  it.each([{ permissionLevel: 1 }, { readOnlyReason: "Session is read-only" }])(
+    "does not interrupt a read-only session: %j",
+    (overrides) => {
+      const props = composerProps({ status: "streaming", isWorking: true, ...overrides });
+      render(<Composer {...props} />);
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeDisabled();
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+      expect(props.onStop).not.toHaveBeenCalled();
+    },
+  );
+
+  it("dismisses slash suggestions before interrupting", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(activeRow()).not.toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(activeRow()).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves Escape to active IME composition", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.compositionStart(textarea());
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+    fireEvent.compositionEnd(textarea());
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("Composer session drafts", () => {
   beforeEach(() => {
@@ -344,6 +426,42 @@ describe("Composer Codex goal control", () => {
     fireEvent.click(screen.getByTestId("goal-start"));
 
     expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation and pass tests");
+  });
+});
+
+describe("Composer native goal state", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("loads the goal when a detached runner reconnects", async () => {
+    const mockGetGoal = vi.mocked(getGoal);
+    mockGetGoal.mockResolvedValueOnce({
+      goal: {
+        objective: "Finish the implementation",
+        status: "active",
+        tokenBudget: null,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: null,
+        updatedAt: null,
+      },
+    });
+    useChatStore.setState({ conversationId: "conv_goal" });
+
+    const { rerender } = renderWithTooltips(
+      <Composer {...composerProps({ showGoalControl: true, runnerOnline: false })} />,
+    );
+    expect(mockGetGoal).not.toHaveBeenCalled();
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ showGoalControl: true, runnerOnline: true })} />
+      </TooltipProvider>,
+    );
+
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_goal"));
   });
 });
 
@@ -748,6 +866,41 @@ describe("Composer slash-command submit routing", () => {
     expect(gearTooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
       gearTooltip.textContent?.indexOf("Effort:") ?? -1,
     );
+  });
+
+  it("keeps the label's truncation chain intact when the source tooltip wraps it", () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    // jsdom does no layout, so pin the CSS contract instead: the tooltip
+    // wrapper must be a shrinkable flex container (flex + min-w-0 + shrink),
+    // or the label's `truncate` never engages and a long model id runs under
+    // the Stop button on phone-width viewports.
+    const wrapper = screen.getByTestId("composer-model-source");
+    for (const cls of ["flex", "min-w-0", "shrink"]) {
+      expect(wrapper.classList.contains(cls), `wrapper is missing "${cls}"`).toBe(true);
+    }
+    const label = screen.getByTestId("composer-model-effort-label");
+    for (const cls of ["truncate", "min-w-0", "shrink"]) {
+      expect(label.classList.contains(cls), `label is missing "${cls}"`).toBe(true);
+    }
   });
 
   it("labels subscription provenance instead of showing an unexplained CLI name", async () => {
@@ -1454,6 +1607,15 @@ describe("Composer Codex Plan-mode control", () => {
     expect(button).toHaveAccessibleName("Exit Plan mode");
   });
 
+  it("collapses the visible Plan label in a narrow composer", () => {
+    renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
+
+    expect(screen.getByTestId("composer-action-row")).toHaveClass("@container/composer-actions");
+    const button = screen.getByRole("button", { name: "Enter Plan mode" });
+    expect(button).toHaveClass("w-9", "@lg/composer-actions:w-auto");
+    expect(within(button).getByText("Plan")).toHaveClass("hidden", "@lg/composer-actions:inline");
+  });
+
   it("hides the control when the session is not Codex-native", () => {
     render(<Composer {...composerProps({ showCodexPlanMode: false })} />);
     expect(screen.queryByTestId("codex-plan-mode-toggle")).toBeNull();
@@ -1809,21 +1971,24 @@ describe("Composer pending elicitation", () => {
     vi.restoreAllMocks();
   });
 
-  it("locks the textarea and send button while an elicitation is pending", () => {
+  it("keeps the textarea typable but blocks sending while an elicitation is pending", () => {
     useChatStore.setState({ blocks: [elicitationBlock()] });
     const onSend = vi.fn();
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
 
-    // The lock is the disabled textarea + the placeholder explaining why.
-    expect(ta.disabled).toBe(true);
+    // The textarea must stay ENABLED: disabling it ejects browser focus
+    // mid-word when the prompt lands while the user is typing, and their
+    // continued keystrokes silently vanish. Only sending is locked.
+    expect(ta.disabled).toBe(false);
     expect(ta.placeholder).toBe("Respond to the pending request above to continue");
 
-    // Models a draft that existed before the elicitation arrived (drafts
-    // persist per session): even with text present, Enter must not send —
-    // this exercises the submit() guard, which backstops the disabled
-    // attribute for programmatic paths.
-    fireEvent.change(ta, { target: { value: "queued while blocked" } });
+    // Typing keeps landing in the draft while the prompt is pending.
+    fireEvent.change(ta, { target: { value: "typed while pending" } });
+    expect(ta.value).toBe("typed while pending");
+
+    // But Enter must not send — the submit() guard parks the draft until
+    // the prompt is answered (a message sent now would sit queued unread).
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
 
@@ -1964,6 +2129,22 @@ describe("Composer file-attachment focus", () => {
     fireEvent.change(fileInput(), { target: { files: [file] } });
 
     expect(document.activeElement).toBe(ta);
+  });
+
+  it("marks the textarea with data-has-draft for an attachment-only draft", () => {
+    // The approve hotkey's drafting guard only sees the focused element, so
+    // the composer must advertise non-text drafts (attachments, mentions) on
+    // the textarea itself — with an empty value, an attached file is still a
+    // sendable draft, and Cmd/Ctrl+Enter must read as send intent there.
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    expect(ta.getAttribute("data-has-draft")).toBeNull();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.change(fileInput(), { target: { files: [file] } });
+
+    expect(ta.value).toBe("");
+    expect(ta.getAttribute("data-has-draft")).toBe("true");
   });
 
   it("does not focus the textarea when the attachment is rejected", () => {

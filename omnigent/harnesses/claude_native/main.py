@@ -39,7 +39,7 @@ if sys.platform != "win32":
     import termios
     import tty
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -117,6 +117,7 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    served_canonical_overrides,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
@@ -415,12 +416,17 @@ class ClaudeNativeUcodeConfig:
         so a router may pick it. Empty when the endpoint's catalog was
         not enumerated (cached ucode state, managed settings, a
         non-Databricks provider).
+    :param model_overrides: Provider-scoped canonical-to-served rewrites for
+        Claude Code's ``modelOverrides`` setting. Consumers treat both sides
+        as opaque ids; an empty map means the provider supplied no reliable
+        equivalence information.
     """
 
     env: dict[str, str]
     api_key_helper: str | None = None
     model: str | None = None
     routable_models: tuple[str, ...] = ()
+    model_overrides: dict[str, str] = field(default_factory=dict)
 
 
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
@@ -1223,6 +1229,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     """
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
+    from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, _ = resolve_claude_launch("claude", [])
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
@@ -1233,6 +1240,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         claude_config.model if claude_config is not None else None,
         binary_identity(command),
         ambient_gateway,
+        claude_managed_model_picker() if claude_config is None else None,
     )
 
 
@@ -1255,10 +1263,16 @@ async def claude_model_catalog(
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows, or ``None`` when the probe failed.
     """
+    from omnigent.onboarding.ambient import claude_managed_model_picker
+
+    managed_picker = claude_managed_model_picker() if claude_config is None else ()
+    managed_rows: list[dict[str, object]] = [
+        {"id": model, "model": model, "displayName": label} for model, label in managed_picker
+    ]
     probe = await probe_claude_model_options(claude_config)
     if probe is None:
-        return None
-    rows = list(probe.alias_rows)
+        return managed_rows or None
+    rows = managed_rows or list(probe.alias_rows)
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
     ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
@@ -2811,6 +2825,9 @@ def _ucode_config_for_profile(
         or configured_default
         or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         routable_models=routable_models,
+        # Databricks discovery reports ids that wrap the canonical Claude id.
+        # Keep that translation here; launch consumers treat ids as opaque.
+        model_overrides=served_canonical_overrides(routable_models),
     )
 
 
@@ -6017,6 +6034,7 @@ def _claude_terminal_request(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        model_overrides=claude_config.model_overrides if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )

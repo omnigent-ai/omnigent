@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
 
 import click
+import psutil
 import yaml
 from pydantic import BaseModel, ConfigDict
 from rich import box
@@ -77,7 +78,9 @@ from omnigent.host.daemon_lifecycle import (
 from omnigent.host.daemon_lifecycle import write_daemon_record as _write_daemon_record_impl
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
+    LocalServerStartupError,
     _pid_alive,
+    consume_failed_server_log_tail,
     ensure_local_omnigent_server,
     local_server_status,
     local_server_url_if_healthy,
@@ -650,6 +653,8 @@ _INTERNAL_BETA_BUNDLED_AGENTS: tuple[str, ...] = (
     "knowledge_work_agent.yaml",
 )
 _HOST_DAEMON_STOP_GRACE_S = 5.0
+_HOST_SESSION_STOP_MAX_WORKERS = 8
+_HOST_SESSION_ACTIVE_STATUSES = frozenset({"running", "waiting"})
 # How often ``omni upgrade`` re-polls the local server for in-flight
 # (connected) sessions while draining before it stops the server.
 _UPGRADE_DRAIN_POLL_S = 2.0
@@ -2163,6 +2168,40 @@ def _enforce_wrapper_guard() -> None:
         raise SystemExit(2)
 
 
+def _ensure_stdio_survives_unencodable_output() -> None:
+    """Keep stdio writes from aborting when the stream encoding is legacy.
+
+    A shell on a legacy non-UTF-8 encoding (Windows ANSI codepage like
+    cp1252, a C/latin-1 locale, or an explicit ``PYTHONIOENCODING``) hands
+    Python stdio streams that can't encode the CLI's decorative glyphs
+    (emoji, ``✓``, ``←``, …), so a plain ``print`` raises
+    ``UnicodeEncodeError`` mid-command. Reconfigure such streams so the
+    unencodable character degrades to a stand-in instead of killing the
+    command: on Windows switch to UTF-8 outright (modern terminals render
+    it, and it preserves the glyphs); elsewhere keep the stream's own
+    encoding and only relax the error handler, so output stays in the
+    encoding the consumer asked for. ``PYTHONUTF8`` can't help here since
+    PEP 540 reads it only at interpreter startup.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        if encoding in {"utf-8", "utf8"}:
+            continue
+        # Trade-off: errors="replace" is process-wide, so any genuinely
+        # unencodable output (not just decorative glyphs) degrades to "?"
+        # instead of raising — acceptable for a CLI's human-facing stdio.
+        # Detached/replaced streams (or a test's capture object) can't be
+        # reconfigured; the glyph fallback still guards the actual writes.
+        with contextlib.suppress(ValueError, OSError):
+            if sys.platform == "win32":
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -2202,6 +2241,11 @@ def main() -> None:
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
+
+    # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
+    # can't encode the CLI's glyphs; harden the streams before any command
+    # renders so the write degrades instead of aborting.
+    _ensure_stdio_survives_unencodable_output()
 
     # Relocate pre-rename ~/.omniagents state before anything reads ~/.omnigent
     # (update-check cache, diagnostics logs, config). No-op once migrated.
@@ -2278,6 +2322,7 @@ def main() -> None:
         log_cli_exception,
         print_stale_host_hint,
         setup_cli_logging,
+        suppresses_recovery_hint,
     )
 
     setup_cli_logging(argv)
@@ -2314,7 +2359,10 @@ def main() -> None:
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
-        if suggest_stale_host_recovery:
+        # Withhold the stale-host hint for failures `omnigent stop` cannot
+        # fix — a crashed background server (LocalServerStartupError) or a
+        # missing dependency — whose real cause is already surfaced above.
+        if suggest_stale_host_recovery and not suppresses_recovery_hint(exc):
             print_stale_host_hint()
         raise SystemExit(exc.exit_code) from exc
     except click.Abort as exc:
@@ -2477,10 +2525,15 @@ class _HostHttpResult:
         HTTP response was received because the request failed locally.
     :param body: Decoded JSON object or response text, e.g.
         ``{"data": []}`` or ``"not found"``.
+    :param unreachable: ``True`` when the request failed because nothing
+        answered at a loopback address (connection refused against the local
+        server), as opposed to a slow or erroring server or a transient
+        failure against a remote one.
     """
 
     status_code: int
     body: _HostJsonObject | str
+    unreachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -2511,11 +2564,14 @@ class _DaemonSessionsResult:
         local daemon's server cannot be discovered.
     :param sessions: Session rows owned by the daemon host id.
     :param error: Human-readable error text, or ``None`` on success.
+    :param unreachable: ``True`` when the error means the server is not
+        answering at all (dead or gone), not merely slow or erroring.
     """
 
     base_url: str | None
     sessions: list[_HostSessionRow]
     error: str | None
+    unreachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -2527,12 +2583,15 @@ class _SessionsPageResult:
     :param last_id: Last session id in the page, e.g. ``"conv_abc123"``.
     :param has_more: Whether another page should be fetched.
     :param error: Human-readable error text, or ``None`` on success.
+    :param unreachable: ``True`` when the page fetch failed because the
+        server is not answering at all.
     """
 
     sessions: list[_HostSessionRow]
     last_id: str | None
     has_more: bool
     error: str | None
+    unreachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -2542,10 +2601,13 @@ class _SessionPagesResult:
 
     :param sessions: Session rows across all fetched pages.
     :param error: Human-readable error text, or ``None`` on success.
+    :param unreachable: ``True`` when the query failed because the server
+        is not answering at all.
     """
 
     sessions: list[_HostSessionRow]
     error: str | None
+    unreachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -2929,9 +2991,11 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     A held record flock is a definitive live owner (the kernel drops it on
     death), so it is the fast positive signal. When the lock is free or can't
     be probed (no ``fcntl``, unreadable), fall back to whether the PID is
-    alive — so a daemon still mid-startup (hasn't grabbed the lock yet) is not
-    reaped. Reaping therefore requires both signals dead: a free lock and a
-    dead PID.
+    alive and still names the recorded daemon (see
+    :func:`_pid_is_recorded_daemon`) — so a daemon still mid-startup (hasn't
+    grabbed the lock yet) is not reaped, while a pid recycled to an unrelated
+    process is. Reaping therefore requires a free lock and a dead-or-foreign
+    PID.
 
     :param record: Existing daemon record for *target*.
     :param target: Normalized daemon target, e.g. ``"local"``.
@@ -2939,7 +3003,7 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     """
     if _record_flock_is_held(_daemon_record_path(target)) is True:
         return True
-    return _pid_alive(record.pid)
+    return _pid_is_recorded_daemon(record)
 
 
 def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
@@ -3119,6 +3183,50 @@ def _foreground_daemon_record(
     )
 
 
+_DAEMON_PID_START_TOLERANCE_S = 5.0
+
+
+def _describe_pid(pid: int) -> str:
+    """Name what actually holds *pid* — user and command — for error copy.
+
+    Best-effort: any psutil failure degrades to the bare pid.
+    """
+    try:
+        proc = psutil.Process(pid)
+        user = proc.username()
+        name = proc.name()
+        return f"pid={pid} ({name}, user {user})"
+    except Exception:  # noqa: BLE001 — diagnostics must never raise
+        return f"pid={pid}"
+
+
+def _pid_is_recorded_daemon(record: _HostDaemonRecord) -> bool:
+    """Whether *record*'s pid still names the recorded daemon, not a recycled pid.
+
+    A bare existence check keeps trusting the pid after a reboot: the kernel
+    recycles low pids, and a fresh system daemon can then hold the recorded
+    pid forever — the host refuses to start and ``host stop`` tries to signal
+    an unrelated process. The record's own ``started_at`` is the identity: a
+    process created *after* the record's start time (beyond a small clock
+    tolerance) cannot be the daemon that wrote it. The check is one-sided on
+    purpose — a daemon always exists before it writes its record, so a
+    creation time *earlier* than ``started_at`` (even by minutes of slow
+    startup or sign-in) is still ours. Legacy records without a start time,
+    and pids whose creation time can't be read, fall back to alive-only.
+    """
+    if not _pid_alive(record.pid):
+        return False
+    if record.started_at <= 0:
+        return True
+    try:
+        created = psutil.Process(record.pid).create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:  # noqa: BLE001 — unreadable creation time: alive-only
+        return True
+    return created <= record.started_at + _DAEMON_PID_START_TOLERANCE_S
+
+
 def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None:
     """
     Find a live daemon that already serves a foreground record target.
@@ -3130,12 +3238,18 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     :returns: Conflicting live record, or ``None``.
     """
     existing = _find_daemon_record(record.target)
-    if (
-        existing is not None
-        and existing.pid != record.pid
-        and _daemon_owner_is_live(existing, record.target)
-    ):
-        return existing
+    if existing is not None and existing.pid != record.pid:
+        if _daemon_owner_is_live(existing, record.target):
+            return existing
+        # Dead, or alive but not our daemon (pid recycled after a reboot):
+        # the record is stale, not a conflict — prune it and start normally.
+        if _pid_alive(existing.pid):
+            click.echo(
+                f"Removing stale daemon record for {_host_display_url(existing.target)!r}: "
+                f"{_describe_pid(existing.pid)} is not this daemon (pid recycled).",
+                err=True,
+            )
+        _delete_daemon_record(existing)
     if record.mode == "server" and record.server_url is not None:
         local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
         if (
@@ -3145,6 +3259,12 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
+        if (
+            local_record is not None
+            and local_record.pid != record.pid
+            and not _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+        ):
+            _delete_daemon_record(local_record)
     return None
 
 
@@ -3166,12 +3286,21 @@ def _claim_foreground_daemon_record(
         stop_command = _host_stop_command(conflict.server_url or "")
         raise click.ClickException(
             "A host daemon is already running for this server "
-            f"(pid={conflict.pid}, target={conflict.target}). "
+            f"({_describe_pid(conflict.pid)}, target={conflict.target}). "
             f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
             "to stop it first."
         )
     previous = _find_daemon_record(record.target)
-    if previous is not None and not _pid_alive(previous.pid):
+    if (
+        previous is not None
+        and previous.pid != record.pid
+        and not _pid_is_recorded_daemon(previous)
+    ):
+        # Stale for the same recycled-pid reason as the conflict path: the
+        # recorded pid exists but is not our daemon.
+        _delete_daemon_record(previous)
+        previous = None
+    elif previous is not None and not _pid_alive(previous.pid):
         _delete_daemon_record(previous)
         previous = None
     _write_daemon_record(record)
@@ -3577,7 +3706,7 @@ def _discover_local_server_url(
 
     :param timeout: Max seconds to wait, e.g. ``60.0``.
     :returns: The loopback server URL, e.g. ``"http://127.0.0.1:8123"``.
-    :raises click.ClickException: If the daemon exits first, or the server
+    :raises LocalServerStartupError: If the daemon exits first, or the server
         does not come up within the timeout.
     """
     import time
@@ -3588,13 +3717,23 @@ def _discover_local_server_url(
         if url is not None:
             return url
         if not _host_daemon_alive():
-            raise click.ClickException(
+            # The server crashed in the daemon's subprocess; surface its
+            # sanitized log tail here (attributed by daemon PID) — terminal
+            # stderr is the only place the user actually looks.
+            record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
+            daemon_pid = record.pid if record is not None else None
+            detail = ""
+            tail_info = consume_failed_server_log_tail(daemon_pid)
+            if tail_info is not None:
+                tail_path, tail = tail_info
+                detail = f"\n  Server log: {tail_path}\n\n  Last 50 lines:\n{tail}"
+            raise LocalServerStartupError(
                 "The local daemon exited before its Omnigent server became ready. "
                 f"See logs under {process_log_dir_reference('host')} and "
-                f"{process_log_dir_reference('server')}."
+                f"{process_log_dir_reference('server')}." + detail
             )
         time.sleep(0.2)
-    raise click.ClickException(
+    raise LocalServerStartupError(
         f"Timed out after {timeout:.0f}s waiting for the local Omnigent server to "
         f"start. See {process_log_dir_reference('server')} for details."
     )
@@ -4234,6 +4373,26 @@ def server(
 
             github_store = GithubConnectionStore(db_uri, cipher)
 
+    # Databricks Connect (per-user OAuth U2M). Shares the credential store's
+    # cipher; inert unless OMNIGENT_DATABRICKS_CLIENT_ID/_SECRET are set.
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logging.getLogger(__name__).error(
+                "Databricks Connect is configured but disabled: set the credential "
+                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
+
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
     # OMNIGENT_AUTH_PROVIDER=accounts), supply sensible defaults
@@ -4303,6 +4462,8 @@ def server(
         sandbox_config=sandbox_config,
         github_config=github_config,
         github_store=github_store,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
         server_config=title_server_config,
     )
 
@@ -6197,6 +6358,14 @@ def import_session_command(
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
 
+    # If this machine is itself a host, bind the imported session to it so it
+    # resumes where the transcript came from. Read-only: never mints an identity
+    # on a machine that isn't already a host. Read from the effective config
+    # path so an OMNIGENT_CONFIG_HOME override is honored.
+    from omnigent.host.identity import load_host_identity_if_present
+
+    host_identity = load_host_identity_if_present(_effective_global_config_path())
+
     def _import_one(target: tuple[ImportSource, str]) -> _SessionImportResult:
         # Each target carries its own harness so an "all" batch can span them.
         current_source, sid = target
@@ -6207,7 +6376,7 @@ def import_session_command(
         except (OSError, TypeError, ValueError) as exc:
             return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
 
-        payload = {
+        payload: dict[str, object] = {
             "source": imported.source,
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
@@ -6222,6 +6391,8 @@ def import_session_command(
                 for item in imported.items
             ],
         }
+        if host_identity is not None:
+            payload["host_id"] = host_identity.host_id
         try:
             response = httpx.post(
                 f"{base_url}/v1/imports",
@@ -6542,17 +6713,21 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     from omnigent.chat import _remote_headers
 
     cfg = _load_effective_config()
-    base_url = _resolve_attach_server(server, cfg.get("server"))
-    if base_url is None:
+    resolved_server = _resolve_attach_server_url(server, cfg.get("server"))
+    if resolved_server is None:
         startup = ensure_local_omnigent_server()
-        base_url = startup.url
+        resolved_server = ServerUrl(startup.url)
 
-    base_url = base_url.rstrip("/")
+    base_url = resolved_server.api_base
     out_path = Path(output) if output else Path(f"{session_id}.jsonl")
 
     with httpx.Client(
         base_url=base_url,
-        headers=_remote_headers(server_url=base_url, host_id=None),
+        headers=_remote_headers(
+            server_url=base_url,
+            host_id=None,
+            org_id=resolved_server.org_id,
+        ),
         timeout=30.0,
         trust_env=_trust_env_for(base_url),
     ) as client:
@@ -7813,11 +7988,25 @@ def _resolve_attach_server(server: str | None, configured_server: str | None) ->
         ``server`` key of the effective merged config), or ``None``.
     :returns: Normalized base URL without a trailing slash, or ``None``.
     """
+    resolved = _resolve_attach_server_url(server, configured_server)
+    return resolved.api_base if resolved is not None else None
+
+
+def _resolve_attach_server_url(
+    server: str | None, configured_server: str | None
+) -> ServerUrl | None:
+    """Resolve an attach target without discarding its workspace selector.
+
+    :param server: Explicit ``--server`` value, or ``None``.
+    :param configured_server: Configured server fallback, or ``None``.
+    :returns: The resolved server value, including a SPOG workspace selector,
+        or ``None`` when no remote or running local server is available.
+    """
     chosen = server if server is not None else configured_server
     if chosen:
-        return _resolve_server_url(chosen).api_base
+        return _resolve_server_url(chosen)
     local = local_server_url_if_healthy()
-    return local.rstrip("/") if local else None
+    return ServerUrl(local) if local else None
 
 
 def _require_live_conversation(
@@ -8809,6 +8998,18 @@ def _trust_env_for(base_url: str) -> bool:
     return not is_loopback_url(base_url)
 
 
+def _is_loopback_base_url(base_url: str) -> bool:
+    """
+    Report whether *base_url* targets this machine's loopback interface.
+
+    :param base_url: Server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :returns: ``True`` for loopback targets, ``False`` otherwise.
+    """
+    from omnigent_client._http import is_loopback_url
+
+    return is_loopback_url(base_url)
+
+
 def _host_http_json(
     *,
     base_url: str,
@@ -8868,6 +9069,15 @@ def _host_http_json(
         return _HostHttpResult(
             status_code=0,
             body=f"{type(exc).__name__}: {exc}",
+            # Nothing accepted the connection at a loopback address: the
+            # local server is gone, not merely slow (ReadTimeout) or erroring
+            # (HTTP status). Remote connect failures stay ``False`` — DNS
+            # hiccups, network blips, or TLS faults can be transient against
+            # a live server, so callers keep the loud ``--force`` guidance.
+            unreachable=(
+                _is_loopback_base_url(base_url)
+                and isinstance(exc, (httpx.ConnectError, ConnectionRefusedError))
+            ),
         )
     body: _HostJsonObject | str
     try:
@@ -8939,6 +9149,7 @@ def _decode_sessions_page(
             last_id=None,
             has_more=False,
             error=f"session list failed: {_host_error_text(result.body)}",
+            unreachable=result.unreachable,
         )
     if result.status_code >= 400:
         return _SessionsPageResult(
@@ -8946,6 +9157,9 @@ def _decode_sessions_page(
             last_id=None,
             has_more=False,
             error=(f"session list failed ({result.status_code}): {_host_error_text(result.body)}"),
+            # No producer sets ``unreachable`` alongside an HTTP status today;
+            # propagate defensively so a future one is not silently dropped.
+            unreachable=result.unreachable,
         )
     if not isinstance(result.body, dict):
         return _SessionsPageResult(
@@ -9001,11 +9215,43 @@ def _fetch_session_pages(
         )
         page = _decode_sessions_page(page_result)
         if page.error is not None:
-            return _SessionPagesResult(sessions=[], error=page.error)
+            # A server that already served a page is provably alive, so a
+            # mid-pagination failure is never ``unreachable``: only the very
+            # first request (``after is None``) may carry the flag through.
+            return _SessionPagesResult(
+                sessions=[],
+                error=page.error,
+                unreachable=page.unreachable and after is None,
+            )
         sessions.extend(page.sessions)
         if not page.has_more or page.last_id is None:
             return _SessionPagesResult(sessions=sessions, error=None)
         after = page.last_id
+
+
+def _local_server_confirmed_dead() -> bool:
+    """
+    Report whether the recorded local server process is confirmed dead.
+
+    A failed ``/health`` probe alone must not count: a live-but-slow server
+    misses the 2s probe too, and ``local_server_url_if_healthy`` collapses
+    both cases to ``None``. Only a missing pidfile or a recorded PID that
+    no longer runs proves the server is gone rather than slow.
+
+    :returns: ``True`` when no recorded local server process is alive.
+    """
+    from omnigent.host.local_server import _LOCAL_SERVER_PID_PATH, _read_local_server_pid_file
+
+    if not _LOCAL_SERVER_PID_PATH.exists():
+        # No pidfile means no recorded server that could still be alive.
+        return True
+    existing = _read_local_server_pid_file()
+    if existing is None:
+        # The pidfile exists but is unreadable/corrupt: the server's state
+        # is unknown, not provably dead — keep the loud ``--force`` path.
+        return False
+    pid, _port = existing
+    return not _pid_alive(pid)
 
 
 def _sessions_for_daemon(
@@ -9023,10 +9269,15 @@ def _sessions_for_daemon(
     """
     base_url = _daemon_base_url(record)
     if base_url is None:
+        # Local mode with no healthy server on record. A failed ``/health``
+        # probe may just be a slow or briefly erroring server, so "gone" is
+        # claimed only when the recorded server process is confirmed dead;
+        # otherwise the caller keeps the loud ``--force`` guidance.
         return _DaemonSessionsResult(
             base_url=None,
             sessions=[],
             error="local Omnigent server is not reachable",
+            unreachable=_local_server_confirmed_dead(),
         )
     host_id = record.host_id or _load_existing_host_id()
     if not host_id:
@@ -9040,7 +9291,12 @@ def _sessions_for_daemon(
         connected_only=connected_only,
     )
     if pages.error is not None:
-        return _DaemonSessionsResult(base_url=base_url, sessions=[], error=pages.error)
+        return _DaemonSessionsResult(
+            base_url=base_url,
+            sessions=[],
+            error=pages.error,
+            unreachable=pages.unreachable,
+        )
     owned = [s for s in pages.sessions if s.get("host_id") == host_id]
     return _DaemonSessionsResult(base_url=base_url, sessions=owned, error=None)
 
@@ -9129,7 +9385,7 @@ def _base_daemon_status_payload(record: _HostDaemonRecord) -> _HostPayload:
         "mode": record.mode,
         "server_url": base_url,
         "pid": record.pid,
-        "process": "online" if _pid_alive(record.pid) else "offline",
+        "process": "online" if _pid_is_recorded_daemon(record) else "offline",
         "log_path": record.log_path,
         "host_id": host_id,
         "host_status": None,
@@ -9769,23 +10025,23 @@ def _stop_session_on_server(
 
 def _stop_daemon_sessions(
     record: _HostDaemonRecord,
-    *,
-    force: bool,
 ) -> int:
     """
-    Stop sessions owned by a daemon before terminating it.
+    Stop active sessions owned by a daemon before terminating it.
 
     :param record: Daemon record whose host-bound sessions should stop.
-    :param force: Continue stopping remaining sessions after failures.
     :returns: Number of sessions successfully stopped.
-    :raises click.ClickException: If session listing or stop fails and
-        ``force`` is ``False``.
+    :raises click.ClickException: If session listing or any stop fails.
     """
     result = _sessions_for_daemon(record)
     if result.error is not None:
-        if force:
+        if result.unreachable:
+            # A dead server holds no reachable sessions to stop; failing here
+            # would strand the daemon and its record until the user discovers
+            # --force. Degrade to a daemon-only stop instead.
             click.echo(
-                f"{_host_display_url(record.target)}: skipping session stop: {result.error}",
+                f"{_host_display_url(record.target)}: server is unreachable; "
+                f"skipping session stop: {result.error}",
                 err=True,
             )
             return 0
@@ -9795,22 +10051,47 @@ def _stop_daemon_sessions(
         )
     if result.base_url is None:
         return 0
+    session_ids = [
+        session_id
+        for session in result.sessions
+        if isinstance((session_id := session.get("id")), str)
+        and session_id
+        and session.get("status") in _HOST_SESSION_ACTIVE_STATUSES
+    ]
+    if not session_ids:
+        return 0
+
+    total = len(session_ids)
+    click.echo(f"Stopping {total} active session(s)...")
+    failures: list[str] = []
     stopped = 0
-    for session in result.sessions:
-        session_id = session.get("id")
-        if not isinstance(session_id, str) or not session_id:
-            continue
-        try:
-            _stop_session_on_server(
+    max_workers = min(total, _HOST_SESSION_STOP_MAX_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _stop_session_on_server,
                 base_url=result.base_url,
                 session_id=session_id,
-            )
-        except click.ClickException as exc:
-            if not force:
-                raise
-            click.echo(str(exc), err=True)
-            continue
-        stopped += 1
+            ): session_id
+            for session_id in session_ids
+        }
+        for completed, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            session_id = futures[future]
+            try:
+                future.result()
+            except click.ClickException as exc:
+                failures.append(str(exc))
+                click.echo(f"Failed session {session_id} ({completed}/{total}): {exc}", err=True)
+            else:
+                stopped += 1
+                click.echo(f"Stopped session {session_id} ({completed}/{total}).")
+
+    if failures:
+        summary = f"Failed to stop {len(failures)} of {total} active session(s)"
+        raise click.ClickException(
+            f"{summary}; daemon left running. "
+            "Retry, or use --force to stop the daemon immediately."
+        )
     return stopped
 
 
@@ -9866,7 +10147,15 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     :param force: Send SIGKILL after the SIGTERM grace period.
     :raises click.ClickException: If the process stays alive.
     """
-    if not _pid_alive(record.pid):
+    if not _pid_is_recorded_daemon(record):
+        # Dead, or alive with a recycled pid (often another user's system
+        # daemon) — never signal it; the record is stale, so drop it.
+        if _pid_alive(record.pid):
+            click.echo(
+                f"Skipping stale daemon record for {_host_display_url(record.target)!r}: "
+                f"{_describe_pid(record.pid)} is not this daemon (pid recycled).",
+                err=True,
+            )
         _delete_daemon_record(record)
         return
     if _signal_daemon_pid(record, signal.SIGTERM):
@@ -9902,7 +10191,11 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     is_flag=True,
     help="Terminate daemon processes without first stopping sessions.",
 )
-@click.option("--force", is_flag=True, help="Continue after failures and use SIGKILL if needed.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Skip session draining and use SIGKILL if needed.",
+)
 @click.pass_context
 def host_stop(
     ctx: click.Context,
@@ -9919,7 +10212,7 @@ def host_stop(
         ``"https://example.databricksapps.com"``.
     :param all_targets: Whether to stop every known daemon target.
     :param daemon_only: Skip server-side session stop calls when ``True``.
-    :param force: Continue after failures and use SIGKILL if needed.
+    :param force: Skip session draining and use SIGKILL if needed.
     """
     if server is None:
         server = _host_group_option(ctx, "server")
@@ -9929,8 +10222,8 @@ def host_stop(
         return
     for record in records:
         stopped = 0
-        if not daemon_only:
-            stopped = _stop_daemon_sessions(record, force=force)
+        if not daemon_only and not force:
+            stopped = _stop_daemon_sessions(record)
         _terminate_daemon(record, force=force)
         click.echo(
             f"Stopped {_host_display_url(record.target)} daemon "
@@ -11445,7 +11738,18 @@ def _resolve_server_url(server: str) -> ServerUrl:
 
     def _resolved(api_base: str) -> ServerUrl:
         if org_id is not None:
-            return ServerUrl(api_base=api_base, org_id=org_id)
+            resolved = ServerUrl(api_base=api_base, org_id=org_id)
+            if resolved.is_workspace_hosted:
+                from omnigent.cli_auth import store_databricks_org_id
+
+                try:
+                    store_databricks_org_id(resolved.api_base, org_id)
+                except OSError as exc:
+                    raise click.ClickException(
+                        "Could not persist the workspace routing selector. "
+                        "Check that the Omnigent data directory is writable, then retry."
+                    ) from exc
+            return resolved
         return ServerUrl.from_api_base(api_base)
 
     # A URL copied from the browser while a conversation is open carries the
