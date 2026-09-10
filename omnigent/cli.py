@@ -6358,6 +6358,14 @@ def import_session_command(
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
 
+    # If this machine is itself a host, bind the imported session to it so it
+    # resumes where the transcript came from. Read-only: never mints an identity
+    # on a machine that isn't already a host. Read from the effective config
+    # path so an OMNIGENT_CONFIG_HOME override is honored.
+    from omnigent.host.identity import load_host_identity_if_present
+
+    host_identity = load_host_identity_if_present(_effective_global_config_path())
+
     def _import_one(target: tuple[ImportSource, str]) -> _SessionImportResult:
         # Each target carries its own harness so an "all" batch can span them.
         current_source, sid = target
@@ -6368,7 +6376,7 @@ def import_session_command(
         except (OSError, TypeError, ValueError) as exc:
             return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
 
-        payload = {
+        payload: dict[str, object] = {
             "source": imported.source,
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
@@ -6383,6 +6391,8 @@ def import_session_command(
                 for item in imported.items
             ],
         }
+        if host_identity is not None:
+            payload["host_id"] = host_identity.host_id
         try:
             response = httpx.post(
                 f"{base_url}/v1/imports",
@@ -11728,7 +11738,18 @@ def _resolve_server_url(server: str) -> ServerUrl:
 
     def _resolved(api_base: str) -> ServerUrl:
         if org_id is not None:
-            return ServerUrl(api_base=api_base, org_id=org_id)
+            resolved = ServerUrl(api_base=api_base, org_id=org_id)
+            if resolved.is_workspace_hosted:
+                from omnigent.cli_auth import store_databricks_org_id
+
+                try:
+                    store_databricks_org_id(resolved.api_base, org_id)
+                except OSError as exc:
+                    raise click.ClickException(
+                        "Could not persist the workspace routing selector. "
+                        "Check that the Omnigent data directory is writable, then retry."
+                    ) from exc
+            return resolved
         return ServerUrl.from_api_base(api_base)
 
     # A URL copied from the browser while a conversation is open carries the

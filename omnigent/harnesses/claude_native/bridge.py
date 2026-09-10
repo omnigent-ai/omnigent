@@ -94,6 +94,7 @@ _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 _STATE_FILE = "state.json"
 _HOOKS_FILE = "hooks.jsonl"
+OBSERVER_HOOK_STDERR_FILE = "observer_hook.stderr"
 _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
 _FORKED_FROM_LINE_LIMIT = 200
@@ -1200,6 +1201,7 @@ def prepare_bridge_dir(
         _SERVER_FILE,
         _STATE_FILE,
         _HOOKS_FILE,
+        OBSERVER_HOOK_STDERR_FILE,
         _TOOL_RELAY_FILE,
         _TMUX_FILE,
     ):
@@ -1620,7 +1622,10 @@ def build_hook_settings(
         "--bridge-dir",
         str(bridge_dir),
     ]
-    command = shlex.join(command_parts)
+    # Claude owns command-hook stderr, so it does not reach the runner logs.
+    # Persist it for the forwarder to relay with the Omnigent session id.
+    observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
+    command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
     session_start_hook = {
         "type": "command",

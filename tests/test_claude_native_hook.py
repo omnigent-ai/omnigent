@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pytest
 
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
+    OBSERVER_HOOK_STDERR_FILE,
     ClaudeNativeHookInterpreterMismatchError,
     build_hook_settings,
     prepare_bridge_dir,
@@ -1123,6 +1125,22 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
     )
     # The forwarder's status hook must survive (the policy hook is appended).
     assert any("evaluate-policy" not in cmd for cmd in user_prompt_cmds)
+
+
+def test_build_hook_settings_captures_observer_stderr(tmp_path: Path) -> None:
+    """Observer process failures are persisted where the forwarder can log them."""
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+
+    settings = build_hook_settings(
+        bridge_dir,
+        python_executable="/venv/bin/python",
+    )
+
+    expected_redirection = f"2>> {shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))}"
+    hooks = settings["hooks"]
+    for event_name in ("SessionStart", "UserPromptSubmit", "Stop", "StopFailure"):
+        command = hooks[event_name][0]["hooks"][0]["command"]
+        assert command.endswith(expected_redirection)
 
 
 def test_build_hook_settings_registers_message_display_hook(

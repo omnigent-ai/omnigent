@@ -94,6 +94,10 @@ class ImportSessionRequest(BaseModel):
     title: str | None = Field(default=None, max_length=512)
     force: bool = False
     project_id: str | None = None
+    # The importing CLI's own host, so the session binds back to the machine
+    # the transcript came from and resumes there. Bound only alongside a
+    # workspace (the workspace-required-for-host check constraint).
+    host_id: str | None = None
     items: list[ImportItemInput] = Field(min_length=1, max_length=_MAX_IMPORT_ITEMS)
 
     @field_validator("external_session_id")
@@ -450,6 +454,7 @@ def create_imports_router(
             user_id=user_id,
             native_title=body.title,
             project_id=body.project_id,
+            host_id=body.host_id,
         )
 
         response.status_code = 201
