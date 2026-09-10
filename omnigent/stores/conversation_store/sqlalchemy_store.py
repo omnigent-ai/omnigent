@@ -3372,9 +3372,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return result.rowcount == 1
 
-        return run_write_transaction(
-            self._session_immediate, "settle_orphaned_live_status", write
-        )
+        return run_write_transaction(self._session_immediate, "settle_orphaned_live_status", write)
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """
