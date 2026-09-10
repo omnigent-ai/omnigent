@@ -447,5 +447,16 @@ describe("parseEvent — response.elicitation_resolved", () => {
       type: "elicitation_resolved",
       elicitationId: "elic_5",
     } satisfies ElicitationResolved);
+    // A verdict and a no-verdict reason are exclusive: the verdict wins.
+    const both = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_6",
+      action: "decline",
+      reason: "unanswered",
+    });
+    expect(both).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_6",
+      action: "decline",
+    } satisfies ElicitationResolved);
   });
 });

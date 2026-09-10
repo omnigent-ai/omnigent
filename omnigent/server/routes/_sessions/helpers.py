@@ -3012,7 +3012,9 @@ def _publish_elicitation_resolved(
     :param reason: Why there is no verdict, e.g. ``"unanswered"`` when
         the hook stopped waiting before anyone answered, so the card
         can say the prompt expired instead of implying someone resolved
-        it. Omitted when unknown or not a recognised reason.
+        it. Omitted when unknown, not a recognised reason, or when a
+        verdict is present — a verdict and a no-verdict reason are
+        mutually exclusive on the wire.
     """
     payload: dict[str, Any] = {
         "type": "response.elicitation_resolved",
@@ -3020,7 +3022,7 @@ def _publish_elicitation_resolved(
     }
     if action in _VALID_ELICITATION_ACTIONS:
         payload["action"] = action
-    if reason in _VALID_ELICITATION_RESOLVED_REASONS:
+    elif reason in _VALID_ELICITATION_RESOLVED_REASONS:
         payload["reason"] = reason
     session_stream.publish(session_id, payload)
 
