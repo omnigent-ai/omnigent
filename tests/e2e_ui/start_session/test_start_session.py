@@ -578,11 +578,12 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             # Claude Code auto-selects (only built-in, ranked first); its config
             # (model / effort / permission mode) lives in the gear-icon modal.
             await _open_entry_config(page, "ag_claude_e2e")
-            # The permission select offers all six Claude permission modes.
+            # The permission select offers all seven Claude permission modes.
             perm = page.get_by_test_id("new-chat-landing-config-permission")
             await expect(perm).to_be_visible()
             await perm.click()
             perm_labels = (
+                "Default",
                 "Manual",
                 "Auto",
                 "Accept edits",
