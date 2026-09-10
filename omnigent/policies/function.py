@@ -39,9 +39,13 @@ Two YAML shapes parse into a :class:`FunctionRef`:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import inspect
+import sys
 from collections.abc import Awaitable, Callable
+from pathlib import Path
+from types import ModuleType
 from typing import Protocol, cast
 
 from omnigent.policies.base import Policy
@@ -257,10 +261,13 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
     """
     Build a :class:`FunctionPolicy` from its spec.
 
-    Resolves ``spec.function.path`` via :mod:`importlib`;
-    when the spec supplies ``arguments``, treats the
-    resolved path as a factory and calls it with those
-    kwargs. The factory's return value is the evaluator.
+    Resolves ``spec.function.path`` via :mod:`importlib`,
+    falling back to a module shipped inside the agent bundle
+    when the spec carries a ``bundle_root`` (see
+    :func:`resolve_function_target`); when the spec supplies
+    ``arguments``, treats the resolved path as a factory and
+    calls it with those kwargs. The factory's return value is
+    the evaluator.
 
     :param spec: Parsed :class:`FunctionPolicySpec` from the
         YAML policies block.
@@ -279,7 +286,10 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
             f"FunctionPolicy {spec.name!r} has no function reference; "
             f"parser should have rejected this at spec load.",
         )
-    target = cast(_DynamicCallable, _resolve_dotted_path(func_ref.path))
+    target = cast(
+        _DynamicCallable,
+        resolve_function_target(func_ref.path, bundle_root=spec.bundle_root),
+    )
     # ``arguments is not None`` distinguishes factory form (dict,
     # possibly empty ``{}``) from direct-callable form (``None``).
     # Using truthiness (``if func_ref.arguments``) would treat
@@ -341,6 +351,110 @@ def _resolve_dotted_path(path: str) -> object:
     module_path, attr = path.rsplit(".", 1)
     module = importlib.import_module(module_path)
     return cast(object, getattr(module, attr))
+
+
+def resolve_function_target(path: str, *, bundle_root: str | None = None) -> object:
+    """
+    Resolve a policy ``function.path`` to its target attribute.
+
+    Tries a normal :func:`importlib.import_module` resolution first
+    (installed packages, or paths importable from the evaluating
+    process's ``sys.path``). When the module is not importable and
+    *bundle_root* is set, falls back to the module file shipped
+    inside the agent bundle: pack authors write dotted paths
+    relative to their own repo root (e.g.
+    ``agents.mypack.policies.custom_policy``) while the bundle
+    contains only the pack directory, so the bundle is searched by
+    dotted-path suffix (``policies/custom_policy.py``).
+
+    :param path: Dotted ``module.attr`` path from the policy spec.
+    :param bundle_root: Absolute path of the extracted agent bundle
+        to search when the environment import fails. ``None``
+        disables the fallback (untrusted / non-bundle specs).
+    :returns: The resolved attribute.
+    :raises ValueError: On single-segment paths.
+    :raises ModuleNotFoundError: When the module resolves neither
+        from the environment nor from the bundle.
+    :raises AttributeError: If the attribute is missing on the
+        resolved module.
+    """
+    try:
+        return _resolve_dotted_path(path)
+    except ModuleNotFoundError as exc:
+        if bundle_root is None:
+            raise
+        target = _resolve_bundle_local_path(path, Path(bundle_root))
+        if target is None:
+            raise ModuleNotFoundError(
+                f"{exc}; also searched the agent bundle at "
+                f"{bundle_root!r} for a module matching {path!r}",
+            ) from exc
+        return target
+
+
+def _resolve_bundle_local_path(path: str, bundle_root: Path) -> object | None:
+    """
+    Resolve a dotted path against modules shipped in the bundle.
+
+    Pack-local dotted paths are written relative to the author's
+    repo root, while the bundle contains only the pack directory,
+    so the module is located by the longest suffix of the dotted
+    module path that names a file under *bundle_root*: e.g.
+    ``agents.mypack.policies.custom_policy`` matches
+    ``<bundle>/policies/custom_policy.py``.
+
+    :param path: Dotted ``module.attr`` path from the spec.
+    :param bundle_root: Extracted bundle directory to search.
+    :returns: The resolved attribute, or ``None`` when no module
+        file in the bundle matches.
+    :raises AttributeError: If a module matches but lacks the
+        target attribute.
+    """
+    module_path, attr = path.rsplit(".", 1)
+    segments = module_path.split(".")
+    # Segments double as filesystem components below; reject anything
+    # that is not a plain identifier (guards against traversal and
+    # malformed paths probing outside the bundle).
+    if not all(segment.isidentifier() for segment in segments):
+        return None
+    if not bundle_root.is_dir():
+        return None
+    for start in range(len(segments)):
+        tail = segments[start:]
+        base = bundle_root.joinpath(*tail)
+        if base.with_suffix(".py").is_file() or (base / "__init__.py").is_file():
+            module = _import_bundle_module(bundle_root, tail)
+            return getattr(module, attr)
+    return None
+
+
+def _import_bundle_module(bundle_root: Path, segments: list[str]) -> ModuleType:
+    """
+    Import ``<bundle_root>/<segments...>`` under a per-bundle anchor.
+
+    The module executes under a synthetic namespace package anchored
+    at *bundle_root* (``_omnigent_bundle_<digest>``), so same-named
+    modules from different bundles never collide in ``sys.modules``
+    and relative imports between bundle modules work. Repeat
+    resolutions reuse the cached module — the same staleness
+    semantics a plain :mod:`importlib` import has.
+
+    :param bundle_root: Extracted bundle directory (the anchor's
+        search path).
+    :param segments: Module path components relative to the bundle,
+        e.g. ``["policies", "custom_policy"]``.
+    :returns: The imported module.
+    """
+    digest = hashlib.sha256(str(bundle_root).encode("utf-8")).hexdigest()[:16]
+    anchor_name = f"_omnigent_bundle_{digest}"
+    anchor = sys.modules.get(anchor_name)
+    if anchor is None:
+        anchor = ModuleType(anchor_name)
+        # Mark it a package rooted at the bundle so the standard
+        # import machinery finds submodules beneath it.
+        anchor.__path__ = [str(bundle_root)]  # type: ignore[attr-defined]
+        sys.modules[anchor_name] = anchor
+    return importlib.import_module(".".join([anchor_name, *segments]))
 
 
 def _callable_arity(fn: object) -> int:

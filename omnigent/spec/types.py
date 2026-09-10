@@ -1384,11 +1384,21 @@ class FunctionPolicySpec(PolicySpec):
         YAML spec) and surfaced verbatim at evaluation time.
         ``None`` means no config declared; the callable receives
         an empty dict.
+    :param bundle_root: Runtime-only provenance (never in YAML):
+        absolute path of the extracted bundle this policy was
+        parsed from, used to resolve a pack-local
+        ``function.path`` whose module ships inside the bundle
+        and is not importable from the evaluating process's
+        ``sys.path``. Stamped by the parser only for
+        operator-authored (trusted) loads; ``None`` disables the
+        bundle fallback. Excluded from equality like
+        :attr:`AgentSpec.source_rel_dir`.
     """
 
     function: FunctionRef | None = None
     set_labels: list[str] | None = None
     config: dict[str, str] | None = None
+    bundle_root: str | None = field(default=None, compare=False)
 
 
 @dataclass
