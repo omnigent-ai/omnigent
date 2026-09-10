@@ -1,0 +1,33 @@
+name: Dependency Audit
+
+on:
+  schedule:
+    - cron: "37 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-audit-main
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Python dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UV_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+
+      - name: Audit uv.lock
+        run: bash .github/scripts/security-scan/audit-uv-lock.sh
