@@ -891,6 +891,7 @@ def _ensure_bound(args: argparse.Namespace) -> None:
             *_bundle_vars(args),
         ],
         cwd=_deploy_dir(),
+        env=_bundle_env(args),
         capture_output=True,
         text=True,
     )
@@ -940,10 +941,6 @@ def _ensure_compute_size(
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
     """CLI args to pass to `databricks bundle` as --var pairs."""
-    # The Apps API rejects an environment entry with an empty source. A single
-    # space is trimmed by the feature parser and therefore preserves the
-    # documented "no features" behavior while providing a valid value source.
-    features = args.features if args.features.strip() else " "
     return [
         "--var",
         f"app_name={args.app_name}",
@@ -955,9 +952,21 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
-        "--var",
-        f"features={features}",
     ]
+
+
+def _bundle_env(args: argparse.Namespace) -> dict[str, str]:
+    """Environment for `databricks bundle` calls.
+
+    The CLI splits `--var` values on commas, so a multi-feature list such as
+    "usage_page,canvas" has to travel as the BUNDLE_VAR_features variable.
+    """
+    env = os.environ.copy()
+    # The Apps API rejects an environment entry with an empty source. A single
+    # space is trimmed by the feature parser and therefore preserves the
+    # documented "no features" behavior while providing a valid value source.
+    env["BUNDLE_VAR_features"] = args.features if args.features.strip() else " "
+    return env
 
 
 def _profile_arg(args: argparse.Namespace) -> list[str]:
@@ -1155,6 +1164,7 @@ def main() -> int:
             *_bundle_vars(args),
         ],
         cwd=_deploy_dir(),
+        env=_bundle_env(args),
         check=True,
     )
 
@@ -1173,6 +1183,7 @@ def main() -> int:
             *_bundle_vars(args),
         ],
         cwd=_deploy_dir(),
+        env=_bundle_env(args),
         check=True,
     )
 
