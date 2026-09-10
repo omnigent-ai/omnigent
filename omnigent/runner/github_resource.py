@@ -39,8 +39,12 @@ Design notes:
   that differs from the local checkout and leaves no upstream tracking, ``gh``'s
   branch-name lookup misses. The pushed commit is the invariant that still links
   the checkout to its PR, so the fallback asks GitHub which PR a pushed commit
-  belongs to (``repos/{owner}/{repo}/commits/{sha}/pulls``), querying the repo it
-  was pushed to (the fork for a fork PR) — see :func:`_resolve_pr_via_commit`.
+  belongs to (``repos/{owner}/{repo}/commits/{sha}/pulls``). Which repo in the
+  fork network lists the PR varies (live github.com lists an open cross-fork PR
+  on the head fork's endpoint, not its base repo's — and the branch may have been
+  pushed to a remote that isn't tracking/origin), so every candidate is queried:
+  the configured base plus each checkout remote — see
+  :func:`_resolve_pr_via_commit`.
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
 """
@@ -420,14 +424,7 @@ def _remote_nwo(root: str, remote: str) -> str | None:
 
 
 def _commit_lookup_repo(root: str) -> str | None:
-    """The repo the branch was pushed to — where its commit (and PR) live.
-
-    The branch's tracking remote (``branch.<name>.remote``), else ``origin``. One
-    repo suffices: ``commits/{sha}/pulls`` resolves the PR across the fork network
-    (it reports the PR's own base repo, whatever that is), and a commit that
-    wasn't pushed to this repo won't be in the base repo either — so querying more
-    repos for the same commit is redundant.
-    """
+    """The branch's tracking repository, falling back to ``origin``."""
     rc, br, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
     branch = br.strip()
     if rc == 0 and branch and branch != "HEAD":
@@ -440,6 +437,15 @@ def _commit_lookup_repo(root: str) -> str | None:
     return _remote_nwo(root, "origin")
 
 
+def _commit_lookup_repos(root: str) -> list[str]:
+    """Candidate PR repositories, preferring the configured base over remotes."""
+    candidates = [_resolved_base_nwo(root), _commit_lookup_repo(root)]
+    rc, remotes, _ = _git(["remote"], cwd=root)
+    if rc == 0:
+        candidates.extend(_remote_nwo(root, remote) for remote in remotes.splitlines())
+    return list(dict.fromkeys(repo for repo in candidates if repo))
+
+
 def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int, str] | None:
     """Resolve ``(PR number, base owner/repo)`` by pushed-commit identity, or ``None``.
 
@@ -447,9 +453,13 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     (``repos/{owner}/{repo}/commits/{sha}/pulls``), so it finds the PR even when a
     stacking tool (git-stack, ``git pp``) pushed under a remote branch name that
     differs from the checkout, or a fork PR whose head ``gh`` can't name. The
-    commit lives in the repo it was pushed to (the fork for a fork PR), and the
-    response names the PR's own base repo — returned so the caller fetches the PR
-    from the right place regardless of the local ``gh repo set-default``.
+    repo whose endpoint lists a PR varies across the fork network (live
+    github.com lists an open cross-fork PR on the head fork's endpoint only,
+    while a merged one appears on the base's too — and the branch may have been
+    pushed to a remote that isn't tracking/origin), so every candidate repo is
+    queried: the configured base plus each checkout remote. The response names
+    the PR's own base repo — returned so the caller fetches the PR from the
+    right place regardless of the local ``gh repo set-default``.
 
     Only **open** PRs are accepted. For a commit already on the default branch
     (master/main, or any merged tip) the endpoint returns the *merged* PR that
@@ -457,38 +467,33 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     PR — so a closed/merged row is skipped rather than surfaced.
     """
     shas = _head_commit_shas(root)
-    repo = _commit_lookup_repo(root)
-    if not shas or not repo:
+    repos = _commit_lookup_repos(root)
+    if not shas or not repos:
         return None
     for sha in shas:
-        rc, out, _ = _gh(["api", f"repos/{repo}/commits/{sha}/pulls"], cwd=root, token=token)
-        if rc != 0:
-            continue
-        try:
-            rows = json.loads(out)
-        except ValueError:
-            continue
-        if not isinstance(rows, list) or not rows:
-            continue
+        for repo in repos:
+            rc, out, _ = _gh(["api", f"repos/{repo}/commits/{sha}/pulls"], cwd=root, token=token)
+            if rc != 0:
+                continue
+            try:
+                rows = json.loads(out)
+            except ValueError:
+                continue
+            if not isinstance(rows, list) or not rows:
+                continue
 
-        def _is_open(row: Any) -> bool:
-            return isinstance(row, dict) and str(row.get("state", "")).lower() == "open"
+            def _is_open(row: Any) -> bool:
+                return isinstance(row, dict) and str(row.get("state", "")).lower() == "open"
 
-        # Accept only an OPEN PR. On the default branch (and any branch whose tip
-        # is already merged) this endpoint returns the *merged* PR that introduced
-        # the commit — a false positive, since it's not the branch's own outgoing
-        # PR. A genuine fallback hit (a fork / renamed branch gh can't name) is
-        # always open, so a closed row is never the PR we want; skip it rather
-        # than falling back to the first row.
-        chosen = next((r for r in rows if _is_open(r)), None)
-        if chosen is None:
-            continue
-        number = chosen.get("number")
-        base = chosen.get("base")
-        base_repo = base.get("repo") if isinstance(base, dict) else None
-        base_full = base_repo.get("full_name") if isinstance(base_repo, dict) else None
-        if isinstance(number, int) and isinstance(base_full, str) and "/" in base_full:
-            return number, base_full
+            chosen = next((row for row in rows if _is_open(row)), None)
+            if chosen is None:
+                continue
+            number = chosen.get("number")
+            base = chosen.get("base")
+            base_repo = base.get("repo") if isinstance(base, dict) else None
+            base_full = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+            if isinstance(number, int) and isinstance(base_full, str) and "/" in base_full:
+                return number, base_full
     return None
 
 
