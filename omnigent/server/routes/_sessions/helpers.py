@@ -2848,9 +2848,14 @@ def _publish_external_conversation_item(
         item before append.
     :returns: None.
     """
-    if item.type == "message" and isinstance(item.data, MessageData) and item.data.role == "user":
-        _publish_input_consumed(session_id, item, cleared_pending_id=cleared_pending_id)
-        return
+    if item.type == "message" and isinstance(item.data, MessageData):
+        if item.data.role == "user":
+            _publish_input_consumed(session_id, item, cleared_pending_id=cleared_pending_id)
+            return
+        if item.data.is_meta:
+            # Hidden context on a non-user message has no live rendering
+            # path that filters on the flag, so keep it off the stream.
+            return
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
     session_stream.publish(session_id, event.model_dump())
 

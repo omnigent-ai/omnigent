@@ -2141,6 +2141,49 @@ async def test_external_meta_user_message_persists_and_publishes_flagged_input_e
     assert consumed["cleared_pending_id"] is None
 
 
+async def test_external_meta_assistant_message_persists_without_live_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A meta message that is not a user message stays off the live stream.
+
+    ``response.output_item.done`` has no ``is_meta`` filter on the web
+    live path, so hidden context on an assistant item must be persisted
+    for history yet never published.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "<hidden>context</hidden>"}],
+                    "is_meta": True,
+                },
+                "response_id": "resp_meta_assistant",
+                "source_id": "meta-assistant",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert [item["is_meta"] for item in items if item["type"] == "message"] == [True]
+    assert published == []
+
+
 async def test_external_user_message_folds_pending_image_into_durable_item(
     client: httpx.AsyncClient,
 ) -> None:

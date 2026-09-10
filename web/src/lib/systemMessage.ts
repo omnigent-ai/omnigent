@@ -188,7 +188,10 @@ export function isClaudeTaskNotificationText(text: string): boolean {
  */
 export function claudeTaskNotificationMarker(text: string): string | null {
   if (!isClaudeTaskNotificationText(text)) return null;
-  const taskId = /<task-id>([^<]*)<\/task-id>/.exec(text)?.[1]?.trim() || "unknown";
+  // The header regex takes the id as one token; an id with inner whitespace
+  // would otherwise stop the marker parsing as a background task.
+  const rawId = /<task-id>([^<]*)<\/task-id>/.exec(text)?.[1]?.trim() ?? "";
+  const taskId = rawId !== "" && !/\s/.test(rawId) ? rawId : "unknown";
   const rawStatus = /<status>([^<]*)<\/status>/.exec(text)?.[1]?.trim().toLowerCase();
   const status =
     rawStatus === "completed" || rawStatus === "failed" || rawStatus === "cancelled"

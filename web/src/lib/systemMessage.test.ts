@@ -206,6 +206,16 @@ describe("Claude background-task notifications", () => {
     ).toEqual({ kind: "generic", label: "Background task finished", body: "Monitor event" });
   });
 
+  it("falls back to an 'unknown' id when the task-id is empty or contains whitespace", () => {
+    for (const id of ["", "  ", "two words", "a\nb"]) {
+      const marker = claudeTaskNotificationMarker(
+        `<task-notification>\n<task-id>${id}</task-id>\n<status>completed</status>\n</task-notification>`,
+      );
+      expect(marker).toBe("[System: background task unknown completed]");
+      expect(parseSystemMessage(marker!)?.kind).toBe("task_completed");
+    }
+  });
+
   it("leaves ordinary user text and partial markup alone", () => {
     expect(claudeTaskNotificationMarker("please run the tests")).toBeNull();
     expect(claudeTaskNotificationMarker("<task-notification> unterminated")).toBeNull();
