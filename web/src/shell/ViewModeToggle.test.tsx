@@ -182,26 +182,6 @@ describe("ViewModeToggle", () => {
     fireEvent.click(chatSegment());
     expect(setView).toHaveBeenCalledWith("chat");
   });
-
-  it("sizes each segment for touch on mobile", () => {
-    // icon-xs alone is a 24px hit box; on a phone each segment must meet the
-    // 44px tap-target floor like the header's other controls, and the track
-    // sheds its padding so the floating pill stays 44px tall.
-    renderToggle(makeCtx());
-    for (const segment of [chatSegment(), terminalSegment()]) {
-      expect(segment).toHaveClass("max-md:size-11", "max-md:rounded-full");
-      expect(segment.querySelector("svg")).toHaveClass("max-md:size-5");
-    }
-    expect(screen.getByTestId("view-mode-toggle")).toHaveClass("max-md:p-0");
-  });
-
-  it("rounds the track into a capsule on mobile", () => {
-    // With max-md:p-0 the grey track sits flush to the fully-round 44px
-    // segments inside the round glass pill; keeping the 8px desktop radius
-    // there paints a squared grey box sandwiched between two capsules.
-    renderToggle(makeCtx());
-    expect(screen.getByTestId("view-mode-toggle")).toHaveClass("max-md:rounded-full");
-  });
 });
 
 describe("ViewModeMenuItems", () => {

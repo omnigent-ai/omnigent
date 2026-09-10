@@ -40,17 +40,11 @@ export function ViewModeToggle() {
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
-      // Lets the mobile header pill inset itself only when this segmented
-      // track is present — see MOBILE_GLASS_PILL.
-      data-slot="view-mode-toggle"
       // Inset track: p-0.5 around two size-6 segments lands the control at
-      // 32px tall, matching the header's other controls. On mobile the
-      // segments grow to the 44px tap-target floor and the padding drops so
-      // the track matches the pill's other 44px controls instead of
-      // stretching it — and the flush track must be a capsule like those
-      // segments and the glass pill, or its grey paints squared corners
-      // between two round shapes.
-      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5 max-md:rounded-full max-md:p-0"
+      // 32px tall, matching the header's other controls. Desktop-only — on a
+      // mobile viewport the component returns null and the switch folds into
+      // the header kebab instead (ViewModeMenuItems).
+      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
     >
       <ViewModeSegment
         label="Chat view"
@@ -59,7 +53,7 @@ export function ViewModeToggle() {
         testId="view-mode-chat"
         componentId="chat.header.view_chat"
       >
-        <MessagesSquareIcon className="size-3.5 max-md:size-5" />
+        <MessagesSquareIcon className="size-3.5" />
       </ViewModeSegment>
       <ViewModeSegment
         label={terminalLabel}
@@ -69,9 +63,9 @@ export function ViewModeToggle() {
         componentId="chat.header.view_terminal"
       >
         {terminalStartingUp ? (
-          <Loader2Icon className="size-3.5 animate-spin max-md:size-5" aria-hidden />
+          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
         ) : (
-          <TerminalIcon className="size-3.5 max-md:size-5" />
+          <TerminalIcon className="size-3.5" />
         )}
       </ViewModeSegment>
     </div>
@@ -113,9 +107,7 @@ function ViewModeSegment({
             data-testid={testId}
             componentId={componentId}
             className={cn(
-              // 44px tap-target floor on phones, matching the sibling header
-              // controls; icon-xs alone is a 24px hit box a finger misses.
-              "border-none max-md:size-11 max-md:rounded-full",
+              "border-none",
               active
                 ? "bg-background text-foreground shadow-sm hover:bg-background"
                 : "text-muted-foreground hover:bg-transparent hover:text-foreground",
