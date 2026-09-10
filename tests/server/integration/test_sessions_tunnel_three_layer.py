@@ -1768,6 +1768,7 @@ async def test_server_initiated_close_keeps_runner_liveness_stamp(
     ap_client = tunnel_three_layer_stack.ap_client
     ap_app = tunnel_three_layer_stack.ap_app
 
+    shutdown_state.reset_for_tests()
     monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", 0.4)
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
 
@@ -1823,8 +1824,8 @@ async def test_patch_rebind_stamps_runner_liveness(
     and the ping loop refreshes them every 30s. A session bound in between
     would carry no stamp until that next ping, so a server recycle inside the
     window would let the replacement replica's orphan backstop settle its
-    turn to ``idle``. Starting the relay is the moment the session begins
-    riding a live tunnel, so it stamps too.
+    turn to ``idle``. The runner acknowledging the session's relay stream is
+    the moment it provably rides a live tunnel, so that stamps too.
     """
     ap_client = tunnel_three_layer_stack.ap_client
 

@@ -482,7 +482,13 @@ def test_runner_less_session_remains_running_after_shutdown_and_stop(
         )
         client_b = httpx.Client(base_url=base_b, timeout=30.0, trust_env=False)
         # The runner is gone for good, but the replacement honours its liveness
-        # lease until the TTL lapses (a reconnecting runner looks identical).
+        # lease until the TTL lapses (a reconnecting runner looks identical), so
+        # the shutdown must have left the lease in place and the row running.
+        item_leased = _list_session(client_b, session_id)
+        assert item_leased is not None and item_leased.get("status") == "running", (
+            "Precondition failed: the replacement settled the session before the "
+            f"runner's liveness lease lapsed (item={item_leased!r})"
+        )
         _expire_runner_lease(db_path, runner_id)
 
         # ── 6. Observe what the CLI observes on the replacement server. ────
