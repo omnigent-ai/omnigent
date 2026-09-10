@@ -17,22 +17,28 @@ import pytest
 import tomllib
 import yaml
 
-from omnigent import codex_native, codex_native_app_server, codex_native_forwarder
 from omnigent._runner_startup import RunnerStartupProgress
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+from omnigent.harnesses.codex_native import main as codex_native
+from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     clear_bridge_state,
     read_bridge_state,
     write_bridge_state,
 )
-from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.spec import load
+
+# The default-stance auto-review override normalize_codex_permission_launch_args
+# adds when no explicit approval/sandbox/reviewer/profile choice is present.
+_AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']
 
 
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
@@ -758,7 +764,7 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
         return fake_client
 
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server.CodexAppServerClient",
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
         fake_client_factory,
     )
 
@@ -791,6 +797,64 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
         )
     ]
     assert fake_client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32603,
+                    "message": (
+                        "failed to read thread: thread-store internal error: failed to "
+                        "load thread history /codex-home/sessions/rollout.jsonl: stream "
+                        "did not contain valid UTF-8"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32603,
+                    "message": (
+                        "error resuming thread: Fatal error: Failed to initialize "
+                        "session: thread-store internal error: failed to resume local "
+                        "thread recorder: final paginated rollout record at "
+                        "/codex-home/sessions/rollout.jsonl is missing an ordinal"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32603, "message": "internal error: something unrelated"}
+            ),
+            False,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "thread 019e already has an active writer"}
+            ),
+            False,
+        ),
+        (RuntimeError("thread-store internal error: not an app-server error"), False),
+    ],
+)
+def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
+    """
+    Only codex's thread-store read failure counts as an unreadable thread.
+
+    A refused resume (another writer holds the thread) and a plain runtime
+    error must keep failing loud rather than silently starting a fresh thread.
+
+    :param exc: Exception raised by the resume request.
+    :param expected: Whether it classifies as an unreadable thread.
+    """
+    assert codex_native_app_server.is_unreadable_thread_error(exc) is expected
 
 
 def test_codex_resume_permission_params_parse_legacy_flags() -> None:
@@ -1108,21 +1172,27 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "unix:///tmp/app-server.sock",
-            ["--remote", "unix:///tmp/app-server.sock"],
+            [*_AUTO_REVIEW_ARGS, "--remote", "unix:///tmp/app-server.sock"],
         ),
         # Resume an existing thread over a Unix socket (local reattach).
         (
             (),
             "thread_local",
             "unix:///tmp/app-server.sock",
-            ["resume", "--remote", "unix:///tmp/app-server.sock", "thread_local"],
+            [
+                *_AUTO_REVIEW_ARGS,
+                "resume",
+                "--remote",
+                "unix:///tmp/app-server.sock",
+                "thread_local",
+            ],
         ),
         # Fresh thread over a loopback ws endpoint.
         (
             (),
             None,
             "ws://127.0.0.1:9876",
-            ["--remote", "ws://127.0.0.1:9876"],
+            [*_AUTO_REVIEW_ARGS, "--remote", "ws://127.0.0.1:9876"],
         ),
         # Resume an existing thread over a loopback ws endpoint: the
         # host-spawned runner path. The app-server listens on ws:// there
@@ -1133,7 +1203,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             "thread_host",
             "ws://127.0.0.1:9876",
-            ["resume", "--remote", "ws://127.0.0.1:9876", "thread_host"],
+            [*_AUTO_REVIEW_ARGS, "resume", "--remote", "ws://127.0.0.1:9876", "thread_host"],
         ),
         # Leading codex args are preserved ahead of the attach flags.
         (
@@ -1143,6 +1213,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             [
                 "--model",
                 "gpt-5.4-mini",
+                *_AUTO_REVIEW_ARGS,
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -1189,6 +1260,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
+                *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
@@ -1202,6 +1274,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
+                *_AUTO_REVIEW_ARGS,
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -1376,7 +1449,7 @@ def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
     sandbox`` and strips the conflicting ``--sandbox`` / ``--ask-for-approval``
     pairs.
 
-    See :func:`omnigent.codex_native_app_server._strip_approval_sandbox_flags`.
+    See :func:`omnigent.harnesses.codex_native.app_server._strip_approval_sandbox_flags`.
     Asserting the exact argv guards three things: the bypass flag is present
     exactly once, the conflicting flag pairs are removed (with their values),
     and the bypass flag lands before any ``resume`` subcommand (codex rejects
@@ -1723,7 +1796,7 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
     # Patch at the source: the forwarder builds its fallback client via
     # client_for_transport, which constructs the app_server module's class.
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server.CodexAppServerClient", fake_client_factory
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", fake_client_factory
     )
 
     async def run() -> None:
@@ -4591,7 +4664,15 @@ def test_forwarder_starts_default_turn_from_plan_implementation_prompt(
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        model="mock-model",
+        # A confirmed (config-read or live-notification) ABSENT read, the
+        # way a real forwarder session would have it by the time a plan
+        # prompt is answered — distinct from the never-yet-confirmed default,
+        # which now makes _default_collaboration_mode refuse to build a
+        # payload at all.
+        developer_instructions_known=True,
+    )
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -4701,7 +4782,12 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        model="mock-model",
+        # See the sibling default-turn test above: a confirmed read is a
+        # precondition for _default_collaboration_mode to build a payload.
+        developer_instructions_known=True,
+    )
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -4793,6 +4879,107 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
     assert state.active_turn_id == "turn_fresh"
 
 
+def test_clear_context_plan_implementation_refuses_before_creating_thread_when_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """
+    The clear-context plan-implementation flow must validate the
+    model/developer_instructions gate BEFORE creating (and switching to) a
+    new Codex thread — not after.
+
+    Regression: the old code only checked ``forwarder_state.model`` up
+    front, then unconditionally created a fresh thread and recorded it as
+    the bridge's active thread, and only THEN (inside
+    ``_start_plan_implementation_turn``) checked
+    ``developer_instructions_known`` and bailed. With never-confirmed
+    developer_instructions (``developer_instructions_known=False``, e.g.
+    every config.toml read so far has been UNREADABLE), that ordering let
+    a bare ``thread/start`` through, switched the bridge to the new (now
+    orphaned) empty thread, and silently never started the implementation
+    turn — the user's "clear context and implement" choice would appear
+    accepted but do nothing. Asserts NO ``thread/start`` (or any
+    other) request reaches Codex, and the bridge state's thread_id is
+    unchanged.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    fake_client = _FakeCodexAppServerClient()
+    # developer_instructions_known defaults to False — never confirmed.
+    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        fake_client.requests.append((method, params))
+        if method == "thread/start":
+            return {"result": {"thread": {"id": "thread_fresh"}}}
+        return {"result": {"turn": {"id": "turn_fresh"}}}
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "plan_implementation": {"answers": ["Yes, clear context and implement"]}
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            for event in [
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": {
+                            "type": "plan",
+                            "id": "item_plan",
+                            "text": "- do the work",
+                        },
+                    },
+                },
+                _completed_event("turn_123"),
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    assert fake_client.requests == [], (
+        f"No Codex app-server request should have been issued when "
+        f"developer_instructions_known is False; got {fake_client.requests!r}."
+    )
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == "thread_123", (
+        "Bridge state's active thread must be unchanged — no orphaned "
+        "empty thread switch on a refused gate."
+    )
+
+
 def test_forwarder_sends_codex_command_approval_response_to_app_server(
     tmp_path: Path,
 ) -> None:
@@ -4850,6 +5037,64 @@ def test_forwarder_sends_codex_command_approval_response_to_app_server(
     asyncio.run(run())
 
     assert fake_client.responses == [(14, {"decision": "accept"})]
+
+
+def test_forwarder_declines_codex_command_when_approval_hook_rejects_request(
+    tmp_path: Path,
+) -> None:
+    """A rejected Omnigent hook must not leave Codex waiting forever."""
+    fake_client = _FakeCodexAppServerClient()
+    codex_event = {
+        "id": 14,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "item_cmd",
+            "command": "date",
+            "availableDecisions": [
+                {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": [],
+                    }
+                }
+            ],
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_123/hooks/codex-elicitation-request"
+        assert json.loads(request.content) == codex_event
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "invalid_input",
+                    "message": ("Codex execpolicy amendment must be a non-empty list of strings."),
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            elicitation_tracker = _elicitation_tracker()
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=elicitation_tracker,
+                event=codex_event,
+                codex_client=fake_client,  # type: ignore[arg-type]
+            )
+            await elicitation_tracker.drain()
+
+    asyncio.run(run())
+
+    assert fake_client.responses == [(14, {"decision": "decline"})]
 
 
 def test_forwarder_routes_unregistered_child_command_approval_to_parent(
@@ -7372,7 +7617,7 @@ def test_record_launch_for_fresh_session_persists_current_cwd(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    from omnigent.codex_native_state import read_launch_state
+    from omnigent.harnesses.codex_native.state import read_launch_state
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -7397,7 +7642,7 @@ def test_align_working_directory_with_session_matching_cwd_is_noop(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -7429,7 +7674,7 @@ def test_align_working_directory_with_session_switches_to_recorded_cwd(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
 
     recorded = tmp_path / "recorded"
     current = tmp_path / "current"
@@ -7460,7 +7705,7 @@ def test_align_working_directory_with_session_missing_recorded_cwd_raises(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
 
     current = tmp_path / "current"
     missing = tmp_path / "missing"
@@ -7690,6 +7935,218 @@ def test_run_with_local_server_records_fresh_session_before_attach(
     )
 
     assert order == ["prepare", "record:conv_fresh", "attach"]
+
+
+def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+    """The ``omnigent codex`` wrapper's own materialized spec is resolvable.
+
+    Its ``prompt`` field is real ``AgentSpec.instructions`` content, not
+    framework-composed text, so it must reach ``developer_instructions``
+    like any other codex-native author instructions.
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+    result = codex_native._wrapper_spec_raw_instructions(spec_path)
+    assert result is not None
+    assert "Codex is running in the session terminal" in result
+
+
+def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+    """A malformed wrapper spec must not block the terminal launch."""
+    bad_spec = tmp_path / "bad.yaml"
+    bad_spec.write_text("not: [valid, agent, spec")
+    assert codex_native._wrapper_spec_raw_instructions(bad_spec) is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_codex_terminal_fresh_session_passes_developer_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Direct-wrapper fresh launch passes raw author instructions through to
+    ``build_codex_native_server`` as ``developer_instructions``.
+
+    The direct-wrapper call site in ``_prepare_codex_terminal``
+    (``codex_native.py``), where the CLI-launched path can discard the value
+    while the managed-host path still receives it.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-bridge"
+    )
+
+    async def _fake_create_session(_client: object, _bundle: bytes, *, bridge_id: str) -> str:
+        del _client, _bundle, bridge_id
+        return "conv_fresh_di"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        await codex_native._prepare_codex_terminal(
+            base_url="http://test",
+            headers={},
+            session_id=None,
+            runner_id=None,
+            session_bundle=b"fake-bundle",
+            codex_args=(),
+            command="codex",
+            model=None,
+            developer_instructions="Be a concise, careful coding assistant.",
+        )
+
+    assert captured.get("developer_instructions") == "Be a concise, careful coding assistant."
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The real outer call site (``_run_with_local_server``) threads the
+    wrapper spec's raw instructions all the way into ``_prepare_codex_terminal``
+    on a FRESH session — with ``_prepare_codex_terminal`` itself REAL, not
+    faked. Only ``build_codex_native_server`` — one level further in — is
+    faked (and made to raise immediately after capturing its kwargs), to
+    observe what the real ``_prepare_codex_terminal`` call actually
+    forwards, without needing to fake the rest of the app-server lifecycle.
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def _fake_create_session(_client: object, _bundle: bytes, *, bridge_id: str) -> str:
+        del _client, _bundle, bridge_id
+        return "conv_fresh_wiring"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12401)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(codex_native, "_resolve_session_id_for_resume", lambda **kwargs: None)
+    monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        codex_native._run_with_local_server(
+            spec_path,
+            session_id=None,
+            resume_picker=False,
+            codex_args=(),
+            command="codex",
+            model=None,
+            prompt=None,
+            auto_open_conversation=False,
+        )
+
+    assert captured.get("developer_instructions") is not None
+    assert "Codex is running in the session terminal" in captured["developer_instructions"]
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Same as the fresh-session sibling, but for an existing session id
+    (``resolved_session_id is not None`` — the RESUME branch of
+    ``_prepare_codex_terminal``, e.g. cold-resume with no live terminal).
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def _fake_fetch_codex_session(_client: object, _session_id: str) -> dict[str, Any]:
+        del _client, _session_id
+        return {
+            "labels": {codex_native._WRAPPER_LABEL_KEY: codex_native._WRAPPER_LABEL_VALUE},
+            "external_session_id": "019e96aa-0be2-7343-8d3b-6f914d60936b",
+        }
+
+    async def _fake_find_running_codex_terminal(_client: object, _session_id: str) -> None:
+        del _client, _session_id
+        return
+
+    async def _fake_ensure_local_codex_resume_rollout(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        return tmp_path / "rollout.jsonl"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12402)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr(
+        codex_native,
+        "_resolve_session_id_for_resume",
+        lambda **kwargs: "conv_resume_wiring",
+    )
+    monkeypatch.setattr(
+        codex_native, "_align_working_directory_with_session", lambda session_id: None
+    )
+    monkeypatch.setattr(codex_native, "_fetch_codex_session", _fake_fetch_codex_session)
+    monkeypatch.setattr(
+        codex_native, "_find_running_codex_terminal", _fake_find_running_codex_terminal
+    )
+    monkeypatch.setattr(
+        codex_native,
+        "_ensure_local_codex_resume_rollout",
+        _fake_ensure_local_codex_resume_rollout,
+    )
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        codex_native._run_with_local_server(
+            spec_path,
+            session_id="conv_resume_wiring",
+            resume_picker=False,
+            codex_args=(),
+            command="codex",
+            model=None,
+            prompt=None,
+            auto_open_conversation=False,
+        )
+
+    assert captured.get("developer_instructions") is not None
+    assert "Codex is running in the session terminal" in captured["developer_instructions"]
 
 
 @pytest.mark.asyncio
@@ -7940,8 +8397,13 @@ async def test_prepare_codex_terminal_via_daemon_live_resume_skips_config_patch(
     original_async_client = httpx.AsyncClient
     calls: list[tuple[str, str, object]] = []
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
     live_rollout = _write_source_rollout(
         codex_home=codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_live")),
@@ -8048,8 +8510,13 @@ async def test_prepare_codex_terminal_hot_resume_does_not_rewrite_rollout(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
     live_rollout = _write_source_rollout(
         codex_home=codex_home_for_bridge_dir(bridge_dir_for_bridge_id(bridge_id)),
@@ -8424,7 +8891,9 @@ def test_attach_with_forwarder_uses_direct_tmux_when_socket_is_local(
         """
         raise AssertionError("WebSocket attach path should not be used")
 
-    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.shutil.which", lambda _name: "/usr/bin/tmux"
+    )
     monkeypatch.setattr(codex_native, "_attach_direct_tmux", fake_attach_direct_tmux)
     monkeypatch.setattr(codex_native, "_attach_with_reconnect", fail_attach_with_reconnect)
 
@@ -8675,7 +9144,9 @@ def test_attach_terminal_resource_runner_owned_missing_socket_fails_loud(
         """
         raise AssertionError("Runner-owned Codex attach must not use WebSocket")
 
-    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.shutil.which", lambda _name: "/usr/bin/tmux"
+    )
     monkeypatch.setattr(codex_native, "_attach_with_reconnect", fail_attach_with_reconnect)
 
     with pytest.raises(click.ClickException) as exc_info:
@@ -8749,12 +9220,15 @@ def test_attach_with_forwarder_falls_back_when_tmux_socket_is_not_local(
         """
         attach_url = kwargs["attach_url"]
         assert isinstance(attach_url, str)
+        assert kwargs["session_name"] == "Codex"
         active_session_id_reader = kwargs["active_session_id_reader"]
         assert callable(active_session_id_reader)
         assert active_session_id_reader() == "conv_rotated"
         websocket_attaches.append(attach_url)
 
-    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.shutil.which", lambda _name: "/usr/bin/tmux"
+    )
     monkeypatch.setattr(codex_native, "_attach_direct_tmux", fail_attach_direct_tmux)
     monkeypatch.setattr(codex_native, "_attach_with_reconnect", fake_attach_with_reconnect)
 
@@ -9956,9 +10430,14 @@ def test_clone_codex_rollout_rewrites_id_and_structural_cwd_into_clone_home(
     workspace, the rollout lands in the CLONE's CODEX_HOME under the
     target id, and record order is preserved.
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     target_thread = "019eaa11-1111-7222-8333-444455556666"
     source_cwd = "/repo/worktree-source"
@@ -10010,9 +10489,14 @@ def test_clone_codex_rollout_leaves_historical_cwd_untouched(
     workspace; rewriting them would fabricate history. Only the two
     structural fields move.
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     target_thread = "019eaa11-1111-7222-8333-444455556666"
     source_cwd = "/repo/worktree-source"
@@ -10057,9 +10541,14 @@ def test_clone_codex_rollout_leaves_source_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The source rollout is read-only — cloning never mutates it."""
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     source_cwd = "/repo/worktree-source"
 
@@ -10093,9 +10582,14 @@ def test_clone_codex_rollout_returns_none_when_source_missing(
     the source rollout must not strand the clone pointing at a missing
     thread.
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     clone_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_clone"))
 
     result = codex_native._clone_codex_rollout(
@@ -10118,9 +10612,14 @@ def test_clone_codex_rollout_returns_none_for_unsafe_target_id(
     Guards against path traversal via the minted id being interpolated
     into the rollout filename.
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     source_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_source"))
     _write_source_rollout(codex_home=source_home, thread_id=source_thread, source_cwd="/repo/src")
@@ -10617,7 +11116,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
                     "encrypted_content": "gAAAA_encrypted",
                 },
             ],
-            "window_id": 2,
+            "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
             "response_id": "compact_1",
         },
         {
@@ -10652,7 +11151,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
     compacted_records = [r for r in records if r["type"] == "compacted"]
     assert len(compacted_records) == 1
     cp = compacted_records[0]["payload"]
-    assert cp["window_id"] == 2
+    assert cp["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
     assert len(cp["replacement_history"]) == 2
     assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
     # Post-compaction message should still be present
@@ -10801,12 +11300,77 @@ def test_resolve_native_codex_launch_databricks_provider_sets_summary(
     assert launch.summary == "Databricks ucode profile 'my-profile'"
 
 
+def test_resolve_native_codex_launch_connect_broker_managed_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No configured provider, but a managed connect host (host-only [omnigent]
+    profile + broker sidecar) routes Codex through the gateway with broker auth."""
+    from omnigent.inner import databricks_executor
+    from omnigent.onboarding import ambient, detected, provider_config
+    from omnigent.runtime import workflow
+
+    # Everything unconfigured, so resolution reaches the last-resort branch.
+    monkeypatch.setattr(provider_config, "load_config", dict)
+    monkeypatch.setattr(ambient, "codex_config_detection", lambda: None)
+    monkeypatch.setattr(detected, "dismissed_detection_names", lambda cfg: frozenset())
+    monkeypatch.setattr(detected, "effective_config_with_detected", lambda cfg: {})
+    monkeypatch.setattr(provider_config, "default_provider_for_harness", lambda cfg, harness: None)
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
+    # Managed connect signal: [omnigent] profile host + broker sidecar present.
+    monkeypatch.setattr(
+        databricks_executor, "_read_databrickscfg_host", lambda profile: "https://ws.example"
+    )
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.broker_token_command",
+        lambda host, *a, **k: "python3 -m omnigent.host.databricks_credential token --coords /x",
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_resolve_databricks_codex_model",
+        lambda host, profile, model: "system.ai.gpt-6-astra",
+    )
+
+    launch = codex_native_app_server.resolve_native_codex_launch(model=None)
+
+    assert launch.profile is None
+    assert launch.model == "system.ai.gpt-6-astra"  # ucode-served model
+    assert launch.config_overrides  # gateway provider table (base_url + broker auth)
+    assert "managed connect host" in launch.summary
+
+
+def test_resolve_native_codex_launch_no_broker_sidecar_falls_back_to_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No broker sidecar (e.g. a laptop) → connect-broker branch is skipped and
+    Codex falls back to CLI login, so non-sandbox auth is untouched."""
+    from omnigent.inner import databricks_executor
+    from omnigent.onboarding import ambient, detected, provider_config
+    from omnigent.runtime import workflow
+
+    monkeypatch.setattr(provider_config, "load_config", dict)
+    monkeypatch.setattr(ambient, "codex_config_detection", lambda: None)
+    monkeypatch.setattr(detected, "dismissed_detection_names", lambda cfg: frozenset())
+    monkeypatch.setattr(detected, "effective_config_with_detected", lambda cfg: {})
+    monkeypatch.setattr(provider_config, "default_provider_for_harness", lambda cfg, harness: None)
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
+    monkeypatch.setattr(
+        databricks_executor, "_read_databrickscfg_host", lambda profile: "https://ws.example"
+    )
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.broker_token_command", lambda host, *a, **k: None
+    )
+
+    launch = codex_native_app_server.resolve_native_codex_launch(model=None)
+
+    assert "no provider configured" in launch.summary  # CLI-login fallback, not the gateway
+
+
 def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A startup timeout records the launch routing summary in the bridge error (#2745)."""
-    from omnigent import codex_native_forwarder as _fwd
-    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
     from omnigent.runner.native import orchestration as native_orch
 
     bridge_dir = tmp_path / "bridge"
@@ -10827,6 +11391,7 @@ def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
             bridge_dir=bridge_dir,
             codex_ws_url="ws://127.0.0.1:9999",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_FakeClient(),
             routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
         )
@@ -10836,3 +11401,114 @@ def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     assert err is not None
     assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in err
     assert "startup timed out" in err
+
+
+# --- headless login-fallback fail-fast: no credential can start the TUI thread ---
+
+
+def test_codex_discover_thread_login_required_records_error_before_waiting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A login-doomed launch records the failure up front, before any wait.
+
+    When routing resolved to Codex's own login with no usable credential, the
+    TUI can only render the sign-in screen. The turn-facing error must exist
+    *before* thread discovery starts waiting, so a headless chat turn fails
+    immediately with an actionable message instead of burning the 30s
+    thread-start timeout (the "Codex TUI never started a thread" hang).
+    """
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    error_at_wait_time: list[str | None] = []
+
+    async def _wait(_client: object, *, timeout: float | None = 30.0) -> str:
+        # The fail-fast contract: the turn-facing error is already on disk
+        # when the (now unbounded) wait begins.
+        error_at_wait_time.append(read_bridge_startup_error(bridge_dir))
+        assert timeout is None, "login-gated discovery must wait without a deadline"
+        raise RuntimeError("stream ended")
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _wait)
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_FakeClient(),
+            routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
+            login_required=True,
+        )
+    )
+
+    assert error_at_wait_time and error_at_wait_time[0] is not None
+    recorded = error_at_wait_time[0]
+    assert "not signed in" in recorded
+    assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in recorded
+    # The pre-recorded error must not carry the timeout markers: the whole
+    # point is a clear, non-timeout failure.
+    assert "startup timed out" not in recorded
+    assert "never started a thread" not in recorded
+
+
+def test_codex_discover_thread_login_required_clears_error_on_thread_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An interactive sign-in that starts the thread clears the pre-recorded error.
+
+    The login-gated launch stays recoverable: a user signing in from the
+    attached terminal starts the thread, and the stale fail-fast cause must
+    not shadow the now-working bridge state.
+    """
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import (
+        read_bridge_startup_error,
+        read_bridge_state,
+    )
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    async def _wait(_client: object, *, timeout: float | None = 30.0) -> str:
+        return "thread_after_signin"
+
+    async def _forward(**_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _wait)
+    monkeypatch.setattr(_fwd, "supervise_forwarder", _forward)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:1")
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_FakeClient(),
+            routing_summary="Codex CLI login (no provider configured)",
+            login_required=True,
+        )
+    )
+
+    assert read_bridge_startup_error(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.thread_id == "thread_after_signin"

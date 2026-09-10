@@ -2,16 +2,25 @@
 //
 // The preference is stored as a discrete px choice and exposed to CSS through
 // `--desktop-ui-font-size`. index.css maps that value into Tailwind's typography
-// tokens at desktop widths while keeping the root rem grid fixed at 16px, so
-// text changes without resizing icons, controls, or spacing. Mobile keeps its
-// independent responsive root size and typography.
+// tokens while keeping the root rem grid fixed at 16px, so text changes without
+// resizing icons, controls, or spacing. Desktop consumes the value directly;
+// mobile scales its own touch-friendly base off it (see the width < 48rem
+// mapping in index.css), so the setting applies on both surfaces.
 //
 // Font family works the analogous way with `--ui-font-family`. Note it can't
 // reuse `--font-sans`: Tailwind v4's `@theme inline` block inlines the literal
 // stack into the `font-sans` utility instead of a `var()` reference, so setting
 // `--font-sans` at runtime is a no-op. The `html` rule reads
 // `var(--ui-font-family, var(--font-sans))`, so an unset family falls back to
-// the system stack and any value we set on documentElement wins.
+// the system stack and any value we set on the style root wins.
+//
+// The DOM mutations target `getStyleRoot()`, not `document.documentElement`
+// directly: embedded, the scoped `.omnigent-app` redefines the font tokens
+// locally, so a value set on the real document root is shadowed for the subtree
+// and must be set on the scope root instead. Standalone `getStyleRoot()` IS the
+// document root, so behavior is unchanged.
+
+import { getStyleRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:ui-font-size";
 
@@ -66,15 +75,14 @@ export function writeUiFontSizePx(px: number): void {
 /**
  * Apply the given discrete px size to the DOM by setting the
  * `--desktop-ui-font-size` variable on the document root. index.css reads this
- * into desktop typography tokens only, so layout geometry and mobile remain
- * independent. This is the single source of the DOM side-effect.
+ * into the typography tokens on every viewport (mobile derives its base from
+ * it), so layout geometry stays fixed while text scales. This is the single
+ * source of the DOM side-effect.
  */
 export function applyDesktopUiFontSize(px: number): void {
-  if (typeof document === "undefined") return;
-  document.documentElement.style.setProperty(
-    "--desktop-ui-font-size",
-    `${clampUiFontSizePx(px)}px`,
-  );
+  const root = getStyleRoot();
+  if (!root) return;
+  root.style.setProperty("--desktop-ui-font-size", `${clampUiFontSizePx(px)}px`);
 }
 
 // ---- Font family ---------------------------------------------------------
@@ -156,11 +164,12 @@ export function writeUiFontFamily(name: string): void {
  * DOM side-effect.
  */
 export function applyUiFontFamily(name: string): void {
-  if (typeof document === "undefined") return;
+  const root = getStyleRoot();
+  if (!root) return;
   const normalized = normalizeUiFontFamily(name);
   if (!normalized) {
-    document.documentElement.style.removeProperty("--ui-font-family");
+    root.style.removeProperty("--ui-font-family");
     return;
   }
-  document.documentElement.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
+  root.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
 }

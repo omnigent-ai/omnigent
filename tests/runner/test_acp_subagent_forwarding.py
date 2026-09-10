@@ -302,3 +302,104 @@ async def test_transcript_failure_does_not_break_the_turn() -> None:
         child_id_future=fut,
     )
     assert fut.result() == "child_abc", "the child id must survive a transcript failure"
+
+
+@pytest.mark.asyncio
+async def test_post_tool_call_appends_a_function_call_to_the_child() -> None:
+    """A sub-agent's own tool call lands in the child as a ``function_call`` card.
+
+    **What breaks if this fails**: the child chat shows only the task and summary,
+    never the work the sub-agent did — the gap this fix closes. The item must
+    carry the FunctionCallData fields (agent/name/arguments/call_id) or the server
+    rejects it, and share the messages' ``response_id`` so it groups into the turn.
+    """
+    child_url = "/v1/sessions/child_abc/events"
+    client = _RecordingServerClient([_ok(child_url)])
+    fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    fut.set_result("child_abc")
+
+    await runner_app_mod._post_acp_subagent_tool_call(
+        client,  # type: ignore[arg-type]
+        child_key="a0ac9364",
+        call_id="toolu_01",
+        name="Wrote mathutils.py",
+        arguments='{"file_path": "mathutils.py"}',
+        child_id_future=fut,
+        title="mathutils",
+    )
+
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert call.url == child_url
+    assert call.body["type"] == "external_conversation_item"
+    assert call.body["data"]["item_type"] == "function_call"
+    assert call.body["data"]["item_data"] == {
+        "agent": "mathutils",
+        "name": "Wrote mathutils.py",
+        "arguments": '{"file_path": "mathutils.py"}',
+        "call_id": "toolu_01",
+    }
+    assert call.body["data"]["response_id"] == "resp_acpsub_a0ac9364"
+
+
+@pytest.mark.asyncio
+async def test_post_tool_call_skips_when_mint_failed() -> None:
+    """If the start edge's mint failed, a tool-call post logs and skips — no POST."""
+    client = _RecordingServerClient([])  # any POST would fail loudly (empty queue)
+    fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    fut.set_exception(RuntimeError("mint failed"))
+
+    await runner_app_mod._post_acp_subagent_tool_call(
+        client,  # type: ignore[arg-type]
+        child_key="a0ac9364",
+        call_id="toolu_01",
+        name="Wrote x",
+        arguments="{}",
+        child_id_future=fut,
+    )
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_tool_call_defaults_agent_to_child_key() -> None:
+    """With no title, the card's author falls back to the child_key (never blank)."""
+    child_url = "/v1/sessions/c/events"
+    client = _RecordingServerClient([_ok(child_url)])
+    fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    fut.set_result("c")
+    await runner_app_mod._post_acp_subagent_tool_call(
+        client,  # type: ignore[arg-type]
+        child_key="k1",
+        call_id="t1",
+        name="Ran ls",
+        arguments="{}",
+        child_id_future=fut,
+    )
+    assert client.calls[0].body["data"]["item_data"]["agent"] == "k1"
+
+
+@pytest.mark.asyncio
+async def test_chain_orders_posts_and_survives_a_failure() -> None:
+    """The per-child chain runs posts in dispatch order, tolerating a bad one.
+
+    Ordering is the whole point: without it a sub-agent's summary could land before
+    a tool card. The chain must also not let one failed post strand the rest.
+    """
+    order: list[str] = []
+
+    async def _append(tag: str) -> None:
+        order.append(tag)
+
+    async def _boom() -> None:
+        order.append("boom")
+        raise RuntimeError("post failed")
+
+    # mint (no prev) -> tool1 -> failing tool2 -> summary, each chained on the last.
+    t = runner_app_mod._chain_acp_subagent_post(None, _append("mint"))
+    t = runner_app_mod._chain_acp_subagent_post(t, _append("tool1"))
+    t = runner_app_mod._chain_acp_subagent_post(t, _boom())
+    t = runner_app_mod._chain_acp_subagent_post(t, _append("summary"))
+    await t
+
+    # Order preserved, and the failing post did not stop the summary from running.
+    assert order == ["mint", "tool1", "boom", "summary"]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -278,6 +279,43 @@ def test_increment_session_usage(store: SqlAlchemyConversationStore) -> None:
     assert result["input_tokens"] == 100
     result2 = store.increment_session_usage(conv.id, {"input_tokens": 50})
     assert result2["input_tokens"] == 150
+
+
+def test_apply_session_usage_delta_drops_negative_and_non_finite_increments() -> None:
+    """A forged usage frame can't drive a cumulative counter backwards or poison it.
+
+    ``apply_session_usage_delta`` is the single merge point for the relay
+    ``increment_session_usage`` path, whose totals the cost-budget gate
+    enforces on. Negative and non-finite increments — flat or nested under
+    ``by_model`` — are dropped rather than applied; well-formed non-negative
+    increments still merge.
+    """
+    from omnigent.stores.conversation_store import apply_session_usage_delta
+
+    current: dict[str, Any] = {
+        "input_tokens": 100,
+        "total_cost_usd": 1.0,
+        "by_model": {"m": {"input_tokens": 100, "total_cost_usd": 1.0}},
+    }
+    apply_session_usage_delta(
+        current,
+        {
+            "input_tokens": -1_000_000,
+            "output_tokens": float("nan"),
+            "total_cost_usd": float("-inf"),
+            "by_model": {"m": {"input_tokens": -50, "total_cost_usd": float("inf")}},
+        },
+    )
+    assert current["input_tokens"] == 100
+    assert "output_tokens" not in current
+    assert current["total_cost_usd"] == 1.0
+    assert current["by_model"]["m"] == {"input_tokens": 100, "total_cost_usd": 1.0}
+
+    apply_session_usage_delta(
+        current, {"input_tokens": 25, "by_model": {"m": {"input_tokens": 25}}}
+    )
+    assert current["input_tokens"] == 125
+    assert current["by_model"]["m"]["input_tokens"] == 125
 
 
 def test_set_external_session_id(store: SqlAlchemyConversationStore) -> None:
@@ -596,3 +634,52 @@ def test_delete_conversation_keeps_template_agent(
 
     asyncio.run(store.delete_conversation(conv.id))
     assert _col(omnigent_db, "agents", "id") == ["191cbf904e3223e9e00ac9a1abfe79a5"]
+
+
+# ── Connection-checkout budget ─────────────────────────
+
+
+def test_get_conversation_takes_one_checkout_per_engine(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Split-DB keeps two checkouts — one per engine — and still reads metadata.
+
+    The single-DB collapse comes from ``shared_read_scope``, which keys its
+    shared session by engine. Here the metadata table genuinely lives on another
+    engine, so its checkout cannot be shared away; what must not regress is the
+    routing (metadata still read from the Omnigent DB) or the per-engine budget.
+    """
+    from sqlalchemy import event
+
+    created = store.create_conversation(
+        title="split-budget",
+        runner_id="runner_split",
+        host_id="a6bfc420101272fcd5906a9eff904dfd",
+        workspace="/tmp/ws",
+    )
+
+    per_engine: dict[str, int] = {"conv": 0, "omnigent": 0}
+
+    def _mk(tag: str) -> Any:
+        def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+            per_engine[tag] += 1
+
+        return _on_checkout
+
+    conv_hook, omni_hook = _mk("conv"), _mk("omnigent")
+    assert store._conv_engine is not store._engine, "fixture must be split-DB"
+    event.listen(store._conv_engine, "checkout", conv_hook)
+    event.listen(store._engine, "checkout", omni_hook)
+    try:
+        conv = store.get_conversation(created.id)
+    finally:
+        event.remove(store._conv_engine, "checkout", conv_hook)
+        event.remove(store._engine, "checkout", omni_hook)
+
+    assert per_engine == {"conv": 1, "omnigent": 1}, per_engine
+    assert conv is not None
+    assert conv.title == "split-budget"
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_split",
+        "a6bfc420101272fcd5906a9eff904dfd",
+    )

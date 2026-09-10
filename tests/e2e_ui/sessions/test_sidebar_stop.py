@@ -85,7 +85,7 @@ def test_stopped_session_shows_reconnect_affordance(
     ):
         page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
 
     health = httpx.get(f"{base_url}/health?session_id={session_id}", timeout=5).json()

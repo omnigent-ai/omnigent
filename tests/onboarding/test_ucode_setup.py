@@ -79,6 +79,7 @@ def test_build_ucode_configure_command_uses_workspaces() -> None:
         "https://one.example.databricks.com,https://two.example.databricks.com",
         "--agents",
         "claude,codex,pi",
+        "--enable-fable",
     ]
 
 
@@ -104,6 +105,7 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
         "https://one.example.databricks.com",
         "--agents",
         "claude,codex,pi",
+        "--enable-fable",
     ]
 
 
@@ -189,6 +191,7 @@ def test_configure_ucode_for_workspace_targets_single_workspace() -> None:
             "https://example.cloud.databricks.com",
             "--agents",
             "claude,codex,pi",
+            "--enable-fable",
         ]
     ]
 
@@ -227,4 +230,36 @@ def test_build_ucode_configure_command_normalizes_pasted_url() -> None:
         "https://example.cloud.databricks.com",
         "--agents",
         "claude",
+        "--enable-fable",
     ]
+
+
+def test_build_ucode_configure_command_for_profile_broker_mode() -> None:
+    from omnigent.onboarding.ucode_setup import build_ucode_configure_command_for_profile
+
+    argv = build_ucode_configure_command_for_profile(
+        ["ucode"], profile="omnigent", agents=["claude", "codex", "pi"]
+    )
+    assert argv == [
+        "ucode",
+        "configure",
+        "--profiles",
+        "omnigent",
+        "--agents",
+        "claude,codex,pi",
+        "--skip-validate",
+        "--skip-upgrade",
+        "--skip-unavailable",
+    ]
+    # broker mode: no --use-pat (the caller supplies DATABRICKS_BEARER_COMMAND)
+    assert "--use-pat" not in argv
+
+
+def test_build_ucode_configure_command_for_profile_pat_mode() -> None:
+    from omnigent.onboarding.ucode_setup import build_ucode_configure_command_for_profile
+
+    argv = build_ucode_configure_command_for_profile(
+        ["ucode"], profile="DEFAULT", agents=["claude"], use_pat=True
+    )
+    assert argv[-1] == "--use-pat"  # lakebox authenticates from the injected profile PAT
+    assert "claude" in argv[argv.index("--agents") + 1]

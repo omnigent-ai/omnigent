@@ -6,6 +6,7 @@ import { formatSessionCostUsd } from "@/lib/formatCost";
 
 interface Props {
   sessions: SessionUsage[];
+  now?: Date;
 }
 
 type SortKey = "title" | "harness" | "costUsd" | "updatedAt";
@@ -25,9 +26,8 @@ function primaryModel(models: Record<string, number>): string | null {
   return entries[0][0];
 }
 
-function formatRelativeDate(epochSec: number): string {
-  const now = Date.now() / 1000;
-  const diff = now - epochSec;
+function formatRelativeDate(epochSec: number, now: Date): string {
+  const diff = now.getTime() / 1000 - epochSec;
   if (diff < 60) return "just now";
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
@@ -54,7 +54,8 @@ function compareSessions(a: SessionUsage, b: SessionUsage, key: SortKey, dir: So
   return dir === "asc" ? cmp : -cmp;
 }
 
-export function UsageSessionTable({ sessions }: Props) {
+export function UsageSessionTable({ sessions, now }: Props) {
+  const currentTime = now ?? new Date();
   const [sortKey, setSortKey] = useState<SortKey>("updatedAt");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
 
@@ -146,7 +147,7 @@ export function UsageSessionTable({ sessions }: Props) {
                 {formatSessionCostUsd(s.costUsd)}
               </td>
               <td className="whitespace-nowrap px-3 py-2 text-right text-muted-foreground">
-                {formatRelativeDate(s.updatedAt)}
+                {formatRelativeDate(s.updatedAt, currentTime)}
               </td>
             </tr>
           ))}

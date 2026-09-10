@@ -3,8 +3,9 @@ import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
@@ -21,15 +22,34 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   };
 });
 
+// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// (default: no PR) so these tests don't need a QueryClientProvider, matching
+// the workspace-files stub above.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: () => useGithubInfoMock(),
+}));
+vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileViewerContextModule>()),
+  useOpenGithubTab: () => openGithubTabMock,
+}));
+
 // HostBadge now lives in the status-line tray (left of the worktree branch).
 // It reads the session's host binding via these hooks; stub them so the badge
 // renders deterministically without a QueryClient / RunnerHealth provider. The
 // default is "not host-bound", so the badge self-hides and the existing branch/
 // ring/harness assertions are unchanged; host-aware tests override per case.
-const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(() => ({
+const {
+  useSessionMock,
+  useHostsMock,
+  useSessionHostOnlineMock,
+  useGithubInfoMock,
+  openGithubTabMock,
+} = vi.hoisted(() => ({
   useSessionMock: vi.fn(),
   useHostsMock: vi.fn(),
   useSessionHostOnlineMock: vi.fn(),
+  useGithubInfoMock: vi.fn(),
+  openGithubTabMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
@@ -128,6 +148,8 @@ describe("Composer status line (branch + context ring)", () => {
     });
     useHostsMock.mockReset().mockReturnValue({ data: [] });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
+    useGithubInfoMock.mockReset().mockReturnValue({ data: undefined });
+    openGithubTabMock.mockReset();
     useChatStore.setState({
       conversationId: "conv_test",
       skills: [],
@@ -166,6 +188,42 @@ describe("Composer status line (branch + context ring)", () => {
     useChatStore.setState({ sessionCostUsd: 0.5 });
     renderComposer();
     expect(statusLine()).toBeNull();
+  });
+
+  it.each([
+    {
+      scenario: "a single PR from an older host",
+      data: { pr: { number: 42 } },
+      label: "#42",
+    },
+    {
+      scenario: "one tracked PR without fetched metadata",
+      data: { prs: [{ number: 42 }], pr: null },
+      label: "#42",
+    },
+    {
+      scenario: "multiple PRs with a selected PR",
+      data: { prs: [{ number: 42 }, { number: 42 }], pr: { number: 42 } },
+      label: "2 PRs",
+    },
+    {
+      scenario: "multiple PRs without fetched metadata",
+      data: { prs: [{ number: 42 }, { number: 43 }, { number: 44 }], pr: null },
+      label: "3 PRs",
+    },
+  ])("links $scenario to the GitHub panel", ({ data, label }) => {
+    useGithubInfoMock.mockReturnValue({ data });
+    renderComposer();
+    const indicator = screen.getByRole("button", { name: label });
+    expect(indicator).toHaveTextContent(label);
+    fireEvent.click(indicator);
+    expect(openGithubTabMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the PR indicator when the tracked list is empty", () => {
+    useGithubInfoMock.mockReturnValue({ data: { prs: [], pr: null } });
+    renderComposer();
+    expect(screen.queryByTestId("composer-pr-link")).not.toBeInTheDocument();
   });
 
   it("shows the context ring with the correct used percentage", () => {

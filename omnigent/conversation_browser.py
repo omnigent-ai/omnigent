@@ -10,9 +10,9 @@ import webbrowser
 from collections.abc import Callable
 
 # The server-URL shape (API mount, UI mount, display mapping) lives in
-# ``omnigent.server_url`` — the one representation of a server URL. The
+# ``omnigent.util.server_url`` — the one representation of a server URL. The
 # helpers below only borrow it to build browser links.
-from omnigent.server_url import WORKSPACE_UI_PATH, ServerUrl
+from omnigent.util.server_url import WORKSPACE_UI_PATH, ServerUrl
 
 # Client-side SPA route for one conversation (see web/src/App.tsx's
 # ``c/:conversationId``). ``conversation_url`` appends it; ``strip_conversation_path``
@@ -102,6 +102,43 @@ def open_conversation_url(url: str) -> bool:
         )
         return completed.returncode == 0
     return webbrowser.open(url)
+
+
+# Stable prefix for the "session created" announcement line. Emitted on a
+# line of its own so a wrapper (dev/resolve.py, dev/repro.py, or the CI
+# workflows that tee the run log) can grep the conversation URL the moment
+# the session exists — before the turn finishes — without polling the
+# sessions API. Keep this literal in sync with any log-scraping consumer.
+SESSION_URL_ANNOUNCE_PREFIX = "Omnigent session: "
+
+
+def announce_conversation_url(
+    *,
+    base_url: str,
+    conversation_id: str,
+    echo: Callable[[str], None] | None = None,
+) -> str:
+    """
+    Print the conversation URL on its own line as soon as the session exists.
+
+    Independent of the browser-open preference: this always emits a stable,
+    greppable ``"Omnigent session: <url>"`` line so headless callers (CI
+    wrappers) can surface the session link immediately, even when no browser
+    is opened. Returns the URL so callers can also use it programmatically.
+
+    :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param conversation_id: Conversation id, e.g. ``"conv_abc123"``.
+    :param echo: Output sink for the announcement line. Defaults to stderr
+        via ``print`` so it never intermixes with a one-shot's stdout answer.
+    :returns: The conversation URL that was announced.
+    """
+    url = conversation_url(base_url, conversation_id)
+    line = f"{SESSION_URL_ANNOUNCE_PREFIX}{url}"
+    if echo is not None:
+        echo(line)
+    else:
+        print(line, file=sys.stderr, flush=True)
+    return url
 
 
 def open_conversation_link_if_enabled(

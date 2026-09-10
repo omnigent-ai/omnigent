@@ -13,6 +13,8 @@ export const MOBILE_GLASS_SURFACE =
 /**
  * A control cluster's floating pill. No padding of its own so a single
  * ``size="icon"`` child stays exactly 40px — the sidebar toggle and the
- * session kebab must read as the same size.
+ * session kebab must read as the same size. On mobile the Chat/Terminal
+ * switcher folds into the kebab (ViewModeMenuItems), so the pill only ever
+ * wraps icon-only controls and needs no track inset.
  */
 export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full`;

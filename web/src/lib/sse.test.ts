@@ -3,7 +3,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseEvent, withStallGuard } from "./sse";
-import type { SessionStatusEvent, SessionSupersededEvent, TextDelta } from "./events";
+import type {
+  ElicitationResolved,
+  ReasoningDone,
+  SessionStatusEvent,
+  SessionSupersededEvent,
+  TextDelta,
+} from "./events";
 
 describe("withStallGuard", () => {
   beforeEach(() => {
@@ -130,6 +136,51 @@ describe("parseEvent — response.output_text.delta", () => {
 
   it("returns null when delta is not a string", () => {
     expect(parseEvent("response.output_text.delta", { delta: { text: "bad" } })).toBeNull();
+  });
+});
+
+describe("parseEvent — response.output_item.done (reasoning)", () => {
+  it("parses a persisted reasoning item into reasoning_done", () => {
+    // A settled thought mirrored by a native harness (claude-native
+    // thinking blocks) or persisted by an SDK turn. Content/summary
+    // blocks join with "\n\n", matching the history path
+    // (`itemsToBlocks.reasoningToBlock`).
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "it_1",
+        type: "reasoning",
+        response_id: "resp_1",
+        model: "claude-native-ui",
+        summary: [{ type: "summary_text", text: "a summary" }],
+        content: [
+          { type: "reasoning_text", text: "first thought" },
+          { type: "reasoning_text", text: "second thought" },
+        ],
+      },
+    });
+    expect(ev).toEqual({
+      type: "reasoning_done",
+      text: "first thought\n\nsecond thought",
+      summary: "a summary",
+      itemId: "it_1",
+      responseId: "resp_1",
+    } satisfies ReasoningDone);
+  });
+
+  it("drops a reasoning item with no readable text (redacted)", () => {
+    // Redacted reasoning carries only encrypted content — nothing a
+    // user could read on any surface, so no dead section is emitted.
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "it_1",
+        type: "reasoning",
+        response_id: "resp_1",
+        summary: [],
+        content: null,
+        encrypted_content: "opaque",
+      },
+    });
+    expect(ev).toBeNull();
   });
 });
 
@@ -298,5 +349,114 @@ describe("parseEvent — session.mcp_startup", () => {
     expect(
       parseEvent("session.mcp_startup", { conversation_id: "conv_a", servers: "nope" }),
     ).toBeNull();
+  });
+});
+
+describe("parseEvent — response.output_item.done error level", () => {
+  it("lifts level: info onto the error event and omits it otherwise", () => {
+    const item = {
+      id: "err_1",
+      response_id: "resp_1",
+      type: "error",
+      source: "harness",
+      code: "codex_thread_reset",
+      message: "Codex started a fresh thread.",
+    };
+    const info = parseEvent("response.output_item.done", { item: { ...item, level: "info" } });
+    expect(info).toMatchObject({
+      type: "error",
+      error: { code: "codex_thread_reset", level: "info" },
+    });
+    const plain = parseEvent("response.output_item.done", { item });
+    const plainError = plain?.type === "error" ? plain.error : null;
+    expect(plainError).not.toBeNull();
+    expect(plainError).not.toHaveProperty("level");
+  });
+});
+
+describe("parseEvent — response.compaction.in_progress", () => {
+  it("threads started_at so the elapsed counter anchors to the true start", () => {
+    // The server stamps every re-announcement of a long compaction with the
+    // FIRST report's wall-clock time; parse must surface it or the spinner
+    // restarts from each event's receive time (and from ~0 after a reload).
+    const ev = parseEvent("response.compaction.in_progress", { started_at: 1_700_000_123 });
+    expect(ev).toEqual({ type: "compaction_in_progress", startedAtS: 1_700_000_123 });
+  });
+
+  it("omits startedAtS when the emitter does not track a start", () => {
+    const ev = parseEvent("response.compaction.in_progress", {});
+    expect(ev).toEqual({ type: "compaction_in_progress" });
+  });
+});
+
+describe("parseEvent — response.elicitation_resolved", () => {
+  it("keeps the verdict the server delivered", () => {
+    // A prompt answered on another surface (native terminal popup, second
+    // tab, approve page) resolves with a real verdict. Dropping it here is
+    // what forced every such card to the ambiguous "Resolved elsewhere"
+    // pill instead of Approved/Rejected.
+    const ev = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_1",
+      action: "accept",
+    });
+    expect(ev).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_1",
+      action: "accept",
+    } satisfies ElicitationResolved);
+  });
+
+  it("omits a missing or unknown action rather than inventing one", () => {
+    // Tool-result auto-resolves publish no action; a malformed value must
+    // not leak through as a fake verdict.
+    const noAction = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_2",
+    });
+    expect(noAction).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_2",
+    } satisfies ElicitationResolved);
+    const junkAction = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_3",
+      action: "explode",
+    });
+    expect(junkAction).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_3",
+    } satisfies ElicitationResolved);
+  });
+
+  it("keeps the unanswered reason on a verdict-less clear", () => {
+    // The server's deferred clear (hook stopped waiting, nobody answered)
+    // says why there is no verdict; dropping it rendered the same
+    // "Resolved elsewhere" pill as an answer given on another surface.
+    const ev = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_4",
+      reason: "unanswered",
+    });
+    expect(ev).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_4",
+      reason: "unanswered",
+    } satisfies ElicitationResolved);
+    const junkReason = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_5",
+      reason: "because",
+    });
+    expect(junkReason).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_5",
+    } satisfies ElicitationResolved);
+    // A verdict and a no-verdict reason are exclusive: the verdict wins.
+    const both = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_6",
+      action: "decline",
+      reason: "unanswered",
+    });
+    expect(both).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_6",
+      action: "decline",
+    } satisfies ElicitationResolved);
   });
 });

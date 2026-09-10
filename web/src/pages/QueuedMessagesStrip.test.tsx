@@ -95,6 +95,31 @@ describe("QueuedMessagesStrip", () => {
     expect(onSteer).toHaveBeenCalledWith("q_2");
   });
 
+  it("gives every row action a 44px mobile tap target with a composer-sized icon", () => {
+    render(
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[msg("q_1", "first")]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+          onSteer={vi.fn()}
+          onReorder={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+    for (const name of [
+      "Reorder queued message",
+      "Send queued message now",
+      "Edit queued message",
+      "Remove queued message",
+    ]) {
+      const button = screen.getByRole("button", { name });
+      // Keep the 44px touch target while matching the composer's 16px glyphs.
+      expect(button, name).toHaveClass("max-md:size-11");
+      expect(button.querySelector("svg"), name).toHaveClass("max-md:size-4");
+    }
+  });
+
   it("shows a drag handle per row only when onReorder is provided", () => {
     const { rerender } = render(
       <QueuedMessagesStrip messages={[msg("q_1", "first")]} onDelete={vi.fn()} onEdit={vi.fn()} />,

@@ -107,6 +107,13 @@ export interface UpdateScheduledTaskInput {
   name?: string;
   prompt?: string;
   rrule?: string;
+  /**
+   * Rebind the task to a different agent, switching the harness its future
+   * firings run. The server clears `modelOverride` / `reasoningEffort` /
+   * `permissionMode` on a switch (a model id is provider-bound, permission mode
+   * is Claude-only) unless the same PATCH resends them.
+   */
+  agentId?: string;
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
@@ -288,6 +295,7 @@ export async function updateScheduledTask(
   if (input.name !== undefined) body.name = input.name;
   if (input.prompt !== undefined) body.prompt = input.prompt;
   if (input.rrule !== undefined) body.rrule = input.rrule;
+  if (input.agentId !== undefined) body.agent_id = input.agentId;
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;

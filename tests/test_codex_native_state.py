@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.codex_native_state import (
+from omnigent.harnesses.codex_native.state import (
     read_launch_state,
     write_launch_state,
 )
@@ -73,7 +73,7 @@ def test_conflicting_launch_state_write_keeps_original(
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "state"))
     # Defensive: sibling CLI/logging tests can leave the package
     # logger with propagation disabled in this xdist worker. The
-    # warning is emitted by ``omnigent.codex_native_state`` and
+    # warning is emitted by ``omnigent.harnesses.codex_native.state`` and
     # caplog's handler is attached at root.
     logging.getLogger("omnigent").propagate = True
     write_launch_state("conv_abc", "/original")

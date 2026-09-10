@@ -10,10 +10,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-)
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.runner import create_runner_app
@@ -52,6 +50,11 @@ async def test_interrupt_inserts_cancellation_items_in_history() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "85b147537400967b1fb8542367423306"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
 
         # Start the turn — it blocks after the first function_call
         # frame, before the second one and response.completed.
@@ -159,6 +162,11 @@ async def test_interrupt_cancel_floor_finalizes_stuck_turn() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "97d2b96d733e685433e2b3864eb97652"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -209,6 +217,11 @@ async def test_stop_session_cancels_inprocess_turn() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "422963919abf3c166633d99ea20f2b8e"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -357,6 +370,11 @@ async def test_interrupt_marker_instructs_model_to_disregard_abandoned_request()
 
     async with _runner_client(app) as client:
         conv_id = "86ba5bc9053ae8771fdb988e882f04b5"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -1069,6 +1087,122 @@ def test_subagent_terminal_delivery_retry_uses_latest_undelivered_report() -> No
     assert delivered["task_id"] == child_id
     assert delivered["status"] == "completed"
     assert delivered["output"] == "DONE_AFTER_RETRY"
+
+
+def test_stop_after_completed_does_not_downgrade_status() -> None:
+    """
+    A stop_session arriving after sub-agent completion must not downgrade status.
+
+    Sequence that triggers the bug:
+    1. The sub-agent completes — ``mark_subagent_work_terminal("completed")`` is
+       called, but delivery fails because the parent inbox is not yet registered.
+    2. ``stop_session`` fires — ``mark_subagent_work_terminal("cancelled")`` is
+       called with the inbox now available.
+
+    Before the fix, step 2 overwrites ``"completed"`` with ``"cancelled"`` and
+    the parent inbox receives the wrong status. After the fix, the first
+    terminal status that is not ``"cancelled"`` is preserved: the parent
+    receives ``"completed"``.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = "aa11bb22cc33dd44aa11bb22cc330001"
+    child_id = "aa11bb22cc33dd44aa11bb22cc330002"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="cursor-native",
+        title="task",
+    )
+
+    try:
+        # Sub-agent completes; inbox not yet registered — delivery fails.
+        completed_ack = runner_app.mark_subagent_work_terminal(
+            child_id,
+            status="completed",
+            output="Task done successfully.",
+        )
+        assert completed_ack.delivered is False
+        assert completed_ack.reason == "missing_parent_inbox"
+
+        # stop_session fires with the inbox now available.
+        runner_app._session_inboxes_ref[parent_id] = session_inbox
+        stop_ack = runner_app.mark_subagent_work_terminal(
+            child_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+
+        entry = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    # The stop report must have triggered delivery, but with the original status.
+    assert stop_ack.delivered is True
+    assert entry is not None and entry.delivered is True
+
+    assert session_inbox.qsize() == 1
+    delivered = session_inbox.get_nowait()
+    assert delivered["task_id"] == child_id
+    assert delivered["status"] == "completed", (
+        f"stop_session must not downgrade 'completed' to 'cancelled'; got {delivered['status']!r}"
+    )
+    assert delivered["output"] == "Task done successfully."
+
+
+def test_stop_after_failed_does_not_downgrade_status() -> None:
+    """
+    A stop_session arriving after a failed sub-agent must not downgrade to cancelled.
+
+    Same race as the completed case but with ``"failed"``: the sub-agent
+    reported failure before stop_session arrived, and the parent must see
+    ``"failed"`` rather than ``"cancelled"``.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = "aa11bb22cc33dd44aa11bb22cc330003"
+    child_id = "aa11bb22cc33dd44aa11bb22cc330004"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="cursor-native",
+        title="failing-task",
+    )
+
+    try:
+        failed_ack = runner_app.mark_subagent_work_terminal(
+            child_id,
+            status="failed",
+            output="Something went wrong.",
+        )
+        assert failed_ack.delivered is False
+
+        runner_app._session_inboxes_ref[parent_id] = session_inbox
+        stop_ack = runner_app.mark_subagent_work_terminal(
+            child_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+
+        entry = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert stop_ack.delivered is True
+    assert entry is not None and entry.delivered is True
+
+    assert session_inbox.qsize() == 1
+    delivered = session_inbox.get_nowait()
+    assert delivered["status"] == "failed", (
+        f"stop_session must not downgrade 'failed' to 'cancelled'; got {delivered['status']!r}"
+    )
+    assert delivered["output"] == "Something went wrong."
 
 
 def test_subagent_terminal_delivery_handles_missing_output() -> None:

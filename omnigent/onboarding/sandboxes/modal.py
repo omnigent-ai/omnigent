@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
@@ -149,7 +150,7 @@ def _lookup_sandbox(sandbox_id: str) -> modal.Sandbox:
         raise click.ClickException(
             f"Modal sandbox '{sandbox_id}' not found — it may have passed its "
             "24-hour lifetime. Create a fresh one with "
-            "`omnigent sandbox create --provider modal`."
+            f"`{cli_invocation()} sandbox create --provider modal`."
         ) from exc
 
 
@@ -413,7 +414,7 @@ class ModalSandboxLauncher(SandboxLauncher):
             raise click.ClickException(
                 f"Modal sandbox '{sandbox_id}' has terminated (sandboxes live "
                 "at most 24 hours). Create a fresh one with "
-                "`omnigent sandbox create --provider modal`."
+                f"`{cli_invocation()} sandbox create --provider modal`."
             )
 
     def keep_alive(self, sandbox_id: str) -> None:

@@ -377,6 +377,64 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     assert updated.updated_at is not None
 
 
+def test_update_rebinds_agent_and_keeps_run_history(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update(agent_id=...)`` switches the harness without touching past runs.
+
+    This is what makes an in-place harness switch preferable to recreating the
+    task: the run rows stay attached to the same task id.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_rebind"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=_uid("ag_old"),
+        timezone="UTC",
+    )
+    store.create_run(
+        run_id=_uid("sr_old"),
+        scheduled_task_id=_uid("st_rebind"),
+        status="succeeded",
+        scheduled_at=100,
+        conversation_id=_uid("conv_old"),
+        fired_at=101,
+        finished_at=102,
+    )
+
+    updated = store.update(_uid("st_rebind"), agent_id=_uid("ag_new"))
+    assert updated is not None
+    assert updated.agent_id == _uid("ag_new")
+    assert updated.updated_at is not None
+    reread = store.get(_uid("st_rebind"))
+    assert reread is not None and reread.agent_id == _uid("ag_new")
+
+    runs, _ = store.list_runs(_uid("st_rebind"))
+    assert [r.id for r in runs] == [_uid("sr_old")]
+    # The completed run keeps the conversation it actually ran in.
+    assert runs[0].conversation_id == _uid("conv_old")
+
+
+def test_update_omitting_agent_id_leaves_the_binding_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An ordinary edit must never silently retarget the harness."""
+    store.create(
+        scheduled_task_id=_uid("st_keepagent"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=_uid("ag_keep"),
+        timezone="UTC",
+    )
+    updated = store.update(_uid("st_keepagent"), name="renamed")
+    assert updated is not None
+    assert updated.agent_id == _uid("ag_keep")
+
+
 def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore) -> None:
     """An update that changes nothing does not stamp ``updated_at``."""
     store.create(

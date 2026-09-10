@@ -17,15 +17,16 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.runtime import pending_elicitations
-from omnigent.session_lifecycle import (
+from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
+from omnigent.spec import AgentSpec
+from omnigent.stores import ConversationStore
+from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
     CLOSED_TITLE_INFIX,
     is_session_closed,
 )
-from omnigent.spec import AgentSpec
-from omnigent.stores import ConversationStore
-from omnigent.tools.base import Tool, ToolContext
 
 # Maximum number of recent conversation items to include in
 # check_sub_agents activity for non-completed sub-agents.
@@ -97,9 +98,11 @@ class SysSessionSendTool(Tool):
 
     - ``unknown sub-agent type`` — ``agent`` is not one of the
       declared sub-agent names.
-    - ``sub_agent_busy`` — the existing session has a non-terminal
-      task already running. Wait for completion (it auto-delivers
-      via the drain) or cancel before sending again.
+    - a send to a child that is *still starting* its turn is refused
+      with a transient "still starting … retry" message — retry once it
+      is running. A send to a child whose turn is already running is not
+      refused: it is delivered as a tracked continuation (see the
+      concurrency note in :meth:`description`).
     - ``model`` / ``reasoning_effort`` rejections — these optional
       overrides are create-time-only and must be supported by the
       resolved child harness; invalid or continuation-time values fail loud.
@@ -138,12 +141,23 @@ class SysSessionSendTool(Tool):
             "sys_session_send tool_calls in the same response with a "
             "distinct task-based title for each independent session — "
             "they dispatch concurrently. Reusing a title continues the "
-            "same session and cannot run another turn concurrently. "
+            "same session rather than starting a second concurrent turn: if "
+            "its turn is idle this starts a new turn; if a turn is still "
+            "running the message is delivered into that turn and consumed at "
+            "its next step boundary (so you can nudge a running sub-agent), "
+            "but a turn wedged inside a single long-running step won't see it "
+            "until it yields — cancel with sys_cancel_task if you need to "
+            "stop such a turn. Either way the reply arrives once via "
+            "sys_read_inbox; don't resend to await it. "
             "To attach previously-uploaded files, "
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
             "cannot be used with session_id or when continuing an existing "
-            "named session."
+            "named session. When a dispatched child finishes, the Omnigent "
+            f"runtime posts `{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session "
+            "as a new message, starting a turn for you if you are idle. That "
+            "notice comes from the runtime, not from a person; respond by "
+            "calling sys_read_inbox to collect the result."
         )
 
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
@@ -405,9 +419,11 @@ def _build_sys_session_send_schema(
                                             "max_cost_usd": {
                                                 "type": "number",
                                                 "description": (
-                                                    "Optional hard limit in USD. "
-                                                    "Blocks tool calls once exceeded "
-                                                    "on expensive models."
+                                                    "Optional hard limit in USD. Once "
+                                                    "subtree spend reaches it, the next "
+                                                    "gate asks the user to approve "
+                                                    "lifting the cap; work stays blocked "
+                                                    "until they approve."
                                                 ),
                                             },
                                             "ask_thresholds_usd": {
@@ -649,7 +665,8 @@ class SysSessionGetInfoTool(Tool):
     permitted to access (bounded by the server's per-user permission
     model), not just the caller's spawn subtree. Reports lifecycle
     status, title, agent binding (id + name), runner binding and live
-    connectivity, host, reasoning effort, effective model, parent
+    connectivity, host and its reported harness readiness, reasoning effort,
+    effective model, parent
     linkage, workspace / git branch, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
@@ -661,8 +678,8 @@ class SysSessionGetInfoTool(Tool):
     session is described.
 
     Runner-dispatched: the runner proxies ``GET /v1/sessions/{id}``
-    (plus a best-effort ``GET /v1/runners/{id}/status`` for live
-    connectivity) and projects the result. Returns
+    (plus best-effort runner status and host readiness lookups) and projects
+    the result. Returns
     ``session_not_found`` when the id is unknown and ``access_denied``
     when the server refuses the read.
     """
@@ -678,7 +695,8 @@ class SysSessionGetInfoTool(Tool):
         return (
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
-            "host, reasoning effort, model, parent session, workspace, "
+            "host + configured harness readiness, reasoning effort, model, "
+            "parent session, workspace, "
             "persisted last-activity time, and outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "

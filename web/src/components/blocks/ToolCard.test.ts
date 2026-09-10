@@ -133,6 +133,7 @@ describe("ToolCard rendering", () => {
     const openFile = vi.fn();
     const ctx = {
       openFile,
+      openGithubTab: () => {},
       isChangedPath: () => false,
       conversationId: "c1",
       workspaceRoot: null,
@@ -164,6 +165,7 @@ describe("ToolCard rendering", () => {
     // sys_os_read path must render as plain text, never a clickable link.
     const ctx = {
       openFile: vi.fn(),
+      openGithubTab: () => {},
       isChangedPath: () => false,
       conversationId: "c1",
       workspaceRoot: null,

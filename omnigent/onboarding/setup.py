@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from omnigent.cli_invocation import cli_invocation
+
 if TYPE_CHECKING:
     from rich.console import Console
 
@@ -650,6 +652,6 @@ def maybe_run_onboarding() -> None:
         run_onboarding()
     else:
         console.print(
-            "  [dim]run `omnigent setup --internal-beta` when ready "
+            f"  [dim]run `{cli_invocation()} setup --internal-beta` when ready "
             f"(or `{SKIP_ENV_VAR}=1` to silence).[/dim]"
         )
