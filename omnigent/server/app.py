@@ -2745,11 +2745,13 @@ def create_app(
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
 
     # Pending per-runner grace timers: a disconnect schedules the
-    # failed-marking after RUNNER_DISCONNECT_GRACE_S instead of doing it
-    # immediately, so transient tunnel drops (ingress recycles,
-    # sleep-wake reconnects) that re-register within the grace never
-    # flap their sessions to failed.
+    # failed-marking after RUNNER_TURN_RESUME_WINDOW_S instead of doing
+    # it immediately, so tunnel drops whose runner re-registers inside
+    # the window (ingress recycles, sleep-wake reconnects, pod recycles
+    # with a slow cold start) never flap their sessions to failed.
     _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+    # How often the pending timer re-checks for the runner's reconnect.
+    _DISCONNECT_RECHECK_INTERVAL_S = 0.5
 
     def _cancel_disconnect_grace(runner_id: str) -> None:
         """Cancel and forget the pending disconnect-grace timer, if any."""
@@ -2758,13 +2760,20 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(runner_id: str) -> None:
-        """Reconcile a dropped runner's sessions once the grace expires.
+        """Reconcile a dropped runner's sessions once the resume window expires.
 
-        A runner that re-registered inside the grace makes this a no-op
-        via the live-tunnel re-check (the same newest-wins rule the
-        immediate path used); one still gone hands its bound sessions to
-        :func:`_mark_runner_sessions_offline`, which fails only the
-        interrupted turns and stamps the disconnect cause.
+        The only sessions this can fail are the ones the drop caught
+        mid-turn (:func:`_mark_runner_sessions_offline` skips idle ones),
+        and a mid-turn failure must wait out the full turn-resume window:
+        the runner outlives its tunnel through a pod recycle, keeps the
+        turn running, and resumes it on reconnect, so failing at the short
+        grace surfaced every reconnect slower than the grace — a recycled
+        pod's routine cold start — as a spurious hard turn failure. A
+        runner that re-registers anywhere inside the window makes this a
+        no-op via the reconnect poll (the same newest-wins rule the
+        immediate path used); one still gone at the deadline hands its
+        bound sessions to :func:`_mark_runner_sessions_offline`, which
+        fails only the interrupted turns and stamps the disconnect cause.
 
         A server that is itself shutting down skips the marking too: it
         closed the tunnel, and the runner cannot re-register with a
@@ -2774,24 +2783,32 @@ def create_app(
         :param runner_id: The disconnected runner's id.
         """
         from omnigent.server.routes.sessions import (
-            RUNNER_DISCONNECT_GRACE_S,
+            RUNNER_TURN_RESUME_WINDOW_S,
             _mark_runner_sessions_offline,
         )
         from omnigent.server.schemas import ErrorDetail
 
-        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
-        if shutdown_state.server_shutting_down():
-            _logger.info(
-                "Runner %s dropped because this server is shutting down; skipping offline-marking",
-                runner_id,
-            )
-            return
-        if tunnel_registry.get(runner_id) is not None:
-            _logger.info(
-                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
-                runner_id,
-            )
-            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + RUNNER_TURN_RESUME_WINDOW_S
+        while True:
+            if shutdown_state.server_shutting_down():
+                _logger.info(
+                    "Runner %s dropped because this server is shutting down; "
+                    "skipping offline-marking",
+                    runner_id,
+                )
+                return
+            if tunnel_registry.get(runner_id) is not None:
+                _logger.info(
+                    "Runner %s reconnected within the turn-resume window; "
+                    "skipping offline-marking",
+                    runner_id,
+                )
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(_DISCONNECT_RECHECK_INTERVAL_S, remaining))
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -2829,12 +2846,13 @@ def create_app(
         on them, so idle sub-agents keep their finished state and the
         interrupted ones read as a recoverable disconnect.
 
-        The user-visible failed flip waits out a reconnect grace
-        (``RUNNER_DISCONNECT_GRACE_S``): transient drops re-register
-        well inside it and the timer's live-tunnel re-check turns them
-        into no-ops, so routine recycles never flap sessions to failed.
-        Runner invalidation and liveness clearing stay immediate so
-        reconnect re-initialization still happens.
+        The user-visible failed flip waits out the turn-resume window
+        (``RUNNER_TURN_RESUME_WINDOW_S``): a runner that re-registers
+        anywhere inside it turns the timer into a no-op via its
+        live-tunnel re-check, so routine recycles — even ones whose
+        cold-start reconnect takes minutes — never flap sessions to
+        failed. Runner invalidation and liveness clearing stay immediate
+        so reconnect re-initialization still happens.
 
         :param runner_id: The disconnected runner's id.
         """

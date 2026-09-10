@@ -6114,6 +6114,18 @@ async def _dispatch_session_event_to_runner_impl(
 # so those drops resolve silently; a runner still gone afterwards fails
 # as before. Crash-reported runner deaths bypass this grace entirely.
 RUNNER_DISCONNECT_GRACE_S: float = 10.0
+# How long a turn caught in flight by a tunnel drop is held before the
+# disconnect is declared a turn failure. A tunnel close says nothing
+# about the runner process: through a server pod recycle the runner
+# keeps the turn running, queues its stream events runner-side, and
+# retries the reconnect, but the recycled endpoint can take a cold
+# start's worth of time (scheduling, image pull) to accept it. Failing
+# at the short grace turned those routine recycles into spurious
+# "Runner disconnected unexpectedly." failures on live turns. A runner
+# that genuinely died usually surfaces sooner through a crash report,
+# which fails the session immediately and independently of this window;
+# the window bounds only the silent-death case.
+RUNNER_TURN_RESUME_WINDOW_S: float = 300.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # Session statuses that mean a turn was in flight. A runner going away
@@ -6194,15 +6206,26 @@ async def _relay_runner_stream(
     lost stream retries inside that window instead of failing the
     session. An intentional Stop exits quietly at once.
 
-    Past the grace the runner is genuinely gone — unless this server is the
-    one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
-    it closed the tunnel itself, so the loss says nothing about the runner
-    and no session is failed. Otherwise only a session it caught mid-turn
-    (:func:`_runner_drop_interrupted_turn`) gets the
-    ``failed`` status and durable ``runner_disconnected`` labels — the same
-    rule :func:`_mark_runner_sessions_offline_impl` applies to the runner's
-    other sessions. An idle session had no work to interrupt, so it stays
-    idle and the disconnect surfaces through liveness instead.
+    Past the grace an *idle* session's relay ends: the runner may be gone
+    for good, nothing was interrupted, and the disconnect surfaces through
+    liveness (a reconnect restarts the relay via ``_on_runner_connect``).
+    A session caught **mid-turn** (:func:`_runner_drop_interrupted_turn`)
+    is different: its turn keeps running on the runner, which queues the
+    turn's stream events and retries the reconnect, so the relay holds the
+    turn — keeps retrying without publishing anything — up to
+    :data:`RUNNER_TURN_RESUME_WINDOW_S` from the outage's start. A runner
+    back inside that window resumes the turn where it left off. Only a
+    runner still gone past the window gets the ``failed`` status and
+    durable ``runner_disconnected`` labels — the same rule
+    :func:`_mark_runner_sessions_offline_impl` applies to the runner's
+    other sessions. The hold re-checks the session's state every retry, so
+    a crash report (or any other path that moves the session off mid-turn)
+    ends it early without publishing a second failure.
+
+    A server that is itself shutting down
+    (:func:`omnigent.server.shutdown_state.server_shutting_down`) closed
+    the tunnel on purpose, so the loss says nothing about the runner and
+    no session is failed.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -6213,7 +6236,8 @@ async def _relay_runner_stream(
         ready heartbeat; see :func:`_relay_runner_stream_once`.
     """
     loop = asyncio.get_running_loop()
-    deadline: float | None = None
+    outage_started: float | None = None
+    holding_mid_turn = False
     while True:
         started = loop.time()
         try:
@@ -6228,15 +6252,46 @@ async def _relay_runner_stream(
             now = loop.time()
             # An attempt that streamed longer than the grace was a live
             # tunnel dropping anew — give the new outage a fresh window.
-            if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
-                deadline = now + RUNNER_DISCONNECT_GRACE_S
-            if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
+            if outage_started is None or now - started > RUNNER_DISCONNECT_GRACE_S:
+                outage_started = now
+                holding_mid_turn = False
+            grace_deadline = outage_started + RUNNER_DISCONNECT_GRACE_S
+            if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < grace_deadline:
                 _logger.info(
                     "Relay: runner transport lost for session=%s; retrying for %.1fs",
                     session_id,
-                    deadline - now,
+                    grace_deadline - now,
                     extra={"session_id": session_id},
                 )
+                await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
+                continue
+            # Past the grace, a turn caught in flight is held across the
+            # outage: the runner outlives its tunnel through a pod recycle,
+            # keeps the turn running, and queues the turn's stream events,
+            # so a reconnect inside the resume window picks the turn up
+            # where it left off (the tunnel transport resolves the registry
+            # per request, so this same client reaches the re-registered
+            # tunnel). Failing here instead surfaced every reconnect slower
+            # than the grace — a routine recycled pod's cold start — as a
+            # hard "Runner disconnected unexpectedly." on the user's live
+            # stream. The state re-check each retry ends the hold early
+            # when something else settles the session (a crash report
+            # failing it, a Stop idling it).
+            if (
+                not lost.intentional
+                and now + _RELAY_RETRY_INTERVAL_S < outage_started + RUNNER_TURN_RESUME_WINDOW_S
+                and not shutdown_state.server_shutting_down()
+                and await _runner_drop_interrupted_turn(session_id, conversation_store)
+            ):
+                if not holding_mid_turn:
+                    holding_mid_turn = True
+                    _logger.info(
+                        "Relay: runner transport still lost for mid-turn session=%s; "
+                        "holding the turn for up to %.0fs more",
+                        session_id,
+                        outage_started + RUNNER_TURN_RESUME_WINDOW_S - now,
+                        extra={"session_id": session_id},
+                    )
                 await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
             _logger.warning(
