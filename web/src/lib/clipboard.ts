@@ -1,3 +1,32 @@
+/**
+ * Copy `text` to the clipboard alongside an image, as one clipboard item so a
+ * paste elsewhere gets both. Deliberately not `async`: `navigator.clipboard.write`
+ * must be called synchronously, in the same tick as the user gesture that
+ * triggered the copy — Safari and some Chromium builds reject a clipboard write
+ * that happens after an `await` because it no longer looks user-initiated.
+ * `loadImage`'s promise is handed to `ClipboardItem` directly, so the write
+ * starts immediately and only the item's data resolves later.
+ *
+ * Falls back to `copyText` (text only) when the Async Clipboard API's write
+ * path isn't available, or when the write itself rejects (e.g. `loadImage`
+ * fails, or the browser refuses the image) — but only when there is text to
+ * fall back to. An image-only copy (no text) that can't be written must
+ * reject rather than fall back: `copyText("")` would silently overwrite
+ * whatever the user already had on their clipboard with an empty string,
+ * which is worse than a failed copy the "Copied" state never confirms.
+ */
+export function copyTextWithImage(text: string, loadImage: () => Promise<Blob>): Promise<void> {
+  if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) {
+    return text ? copyText(text) : Promise.reject(new Error("Clipboard API not available"));
+  }
+  const data: Record<string, Blob | PromiseLike<Blob>> = {};
+  if (text) data["text/plain"] = new Blob([text], { type: "text/plain" });
+  data["image/png"] = loadImage();
+  return navigator.clipboard
+    .write([new ClipboardItem(data)])
+    .catch((error) => (text ? copyText(text) : Promise.reject(error)));
+}
+
 export async function copyText(text: string): Promise<void> {
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
     try {

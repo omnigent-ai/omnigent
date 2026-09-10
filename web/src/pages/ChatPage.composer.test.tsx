@@ -2218,6 +2218,54 @@ describe("Composer file-attachment focus", () => {
 
     expect(screen.queryByText(/can't be attached/)).toBeNull();
   });
+
+  /** A stub clipboardData carrying an optional pasted file plus plain text. */
+  function pasteClipboardData(opts: { file?: File; text?: string }) {
+    return {
+      items: opts.file ? [{ kind: "file", getAsFile: () => opts.file! }] : [],
+      getData: (type: string) => (type === "text/plain" ? (opts.text ?? "") : ""),
+    };
+  }
+
+  // jsdom doesn't expose a ClipboardEvent constructor, so a plain Event
+  // stands in and clipboardData is attached directly (same approach as the
+  // copy-event tests in clipboard.test.ts).
+  function firePaste(target: HTMLElement, clipboardData: unknown) {
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { configurable: true, value: clipboardData });
+    fireEvent(target, event);
+  }
+
+  it("keeps pasted text and attaches a pasted image together", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "look at this: " } });
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+
+    const file = new File([new Uint8Array(10)], "image.png", { type: "image/png" });
+    firePaste(ta, pasteClipboardData({ file, text: "a screenshot" }));
+
+    expect(ta.value).toBe("look at this: a screenshot");
+    expect(screen.getByRole("button", { name: "Remove image.png" })).toBeTruthy();
+  });
+
+  it("leaves the draft unchanged for a file-only paste", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "draft text" } });
+    // A non-empty selection strictly inside the draft: a collapsed
+    // end-of-string caret can't distinguish "no text to insert" from a
+    // missing empty-text guard, since inserting "" at a collapsed caret is a
+    // no-op either way. A real selection makes the two paths diverge — the
+    // guard leaves it alone, but an unguarded insert would delete it.
+    ta.setSelectionRange(3, 7);
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    firePaste(ta, pasteClipboardData({ file }));
+
+    expect(ta.value).toBe("draft text");
+    expect(screen.getByRole("button", { name: "Remove shot.png" })).toBeTruthy();
+  });
 });
 
 // The "Chatting with sub-agent …" tray peeks above the composer only when a

@@ -73,6 +73,7 @@ import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { randomUUID } from "@/lib/randomUUID";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import { insertTextAtCaret } from "@/lib/composerPaste";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -5045,15 +5046,31 @@ export function NewChatLandingScreen() {
                 }}
                 onPaste={(e) => {
                   // Pasted images/files attach instead of inserting as text,
-                  // mirroring the in-session composer.
+                  // mirroring the in-session composer. Any text/plain
+                  // alongside them still lands at the caret — see
+                  // insertTextAtCaret for why this can't be left to the
+                  // browser's native paste.
                   const pasted = Array.from(e.clipboardData.items)
                     .filter((item) => item.kind === "file")
                     .map((item) => item.getAsFile())
                     .filter((f): f is File => f !== null);
-                  if (pasted.length > 0) {
-                    e.preventDefault();
-                    addFiles(pasted);
+                  if (pasted.length === 0) return;
+                  e.preventDefault();
+                  const ta = e.currentTarget;
+                  const text = e.clipboardData.getData("text/plain");
+                  if (text) {
+                    const { next, caret } = insertTextAtCaret(
+                      message,
+                      ta.selectionStart,
+                      ta.selectionEnd,
+                      text,
+                    );
+                    setMessage(next);
+                    queueMicrotask(() => {
+                      ta.setSelectionRange(caret, caret);
+                    });
                   }
+                  addFiles(pasted);
                 }}
                 // Suppress the native placeholder when the overlay supplies its
                 // own prompt text; aria-label preserves the accessible name.
