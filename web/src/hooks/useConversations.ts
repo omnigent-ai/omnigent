@@ -28,6 +28,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
+  markRecentlyCreated,
   mergeItemsIntoPages,
   overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
@@ -36,6 +37,7 @@ import {
   PROJECT_LABEL_KEY,
   recentlyCreatedSessions,
   removeIdsFromPages,
+  unmarkRecentlyCreated,
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
@@ -391,7 +393,10 @@ function applySessionTombstones(page: ConversationsPage, dropArchiving = false):
 // The recently-created keep-alive map + its mutators live in the leaf
 // `sessionListCache` module (so the chat store can arm it on optimistic create
 // without an import cycle); re-exported here for existing callers.
-export { markRecentlyCreated, clearRecentlyCreated } from "@/lib/sessionListCache";
+// `markRecentlyCreated` is imported above for the undo path, so re-export the
+// local binding; `unmarkRecentlyCreated` stays internal.
+export { markRecentlyCreated };
+export { clearRecentlyCreated } from "@/lib/sessionListCache";
 
 /**
  * Prepend recently-created rows the first page doesn't yet include (the index
@@ -1270,6 +1275,75 @@ export function useBulkArchiveConversations() {
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
+}
+
+/**
+ * Unarchive a batch of sessions imperatively — the "Undo" behind the
+ * post-archive toast. Runs the same optimistic overlay + reconcile as
+ * `useBulkArchiveConversations({ archived: false })`, but as a plain async
+ * function rather than a hook: the toast is rendered by the app-level Toaster,
+ * outside the row/header/selection component that did the archiving. That
+ * component unmounts the moment its row leaves the sidebar (the optimistic
+ * overlay), so a mutation observer created there is already gone by the time
+ * Undo is clicked and its callbacks would never fire.
+ *
+ * Takes the full `Conversation` rows, not just ids, because the flag-flip
+ * overlay can only un-hide a row that's still in the list cache — and by the
+ * time Undo is clicked, a `["conversations"]` refetch (which excludes archived
+ * rows) may already have evicted them. So we ALSO arm the recently-created
+ * keep-alive with each row (archived cleared), which re-injects it into page 0
+ * and holds it there until the lagging search index reflects the unarchive —
+ * the additive mirror of the archive tombstone. Archiving bumped `updated_at`,
+ * so page 0 is the row's correct home and the injection doesn't duplicate it.
+ *
+ * Any id whose PATCH fails is dropped from the keep-alive and re-hidden, and a
+ * failure toast is shown. Mirrors the bulk hook's partial-failure path.
+ */
+export async function undoArchiveConversations(
+  queryClient: QueryClient,
+  conversations: readonly Conversation[],
+): Promise<void> {
+  if (conversations.length === 0) return;
+  const ids = conversations.map((c) => c.id);
+  // Un-hide any rows still in the list cache (flag flip). Rows a refetch already
+  // evicted aren't here to flip — the keep-alive below covers those.
+  await paintConversationsArchived(queryClient, ids, false);
+  for (const conv of conversations) markRecentlyCreated({ ...conv, archived: false });
+  // Refetch the sidebar list so `withRecentlyCreated` re-injects the kept-alive
+  // rows into page 0 at once, instead of waiting for the periodic reconcile.
+  // The keep-alive holds them there until the search index reflects the
+  // unarchive, so a lagging refetch can't drop them.
+  void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+  try {
+    const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, false)));
+    const failed: string[] = [];
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      if (result.status === "fulfilled") markConversationSeen(ids[i], result.value.updated_at);
+      else failed.push(ids[i]);
+    }
+    if (failed.length > 0) {
+      // The ids that stayed archived: drop them from the keep-alive so they stop
+      // being re-injected, and overlay archived=true so they leave the list
+      // again. The ids that DID unarchive stay visible.
+      for (const id of failed) {
+        unmarkRecentlyCreated(id);
+        overlayArchivedIntoCaches(queryClient, id, true);
+      }
+      reapplyLiveSessionTombstones(queryClient);
+      showToast(
+        failed.length === ids.length
+          ? failed.length === 1
+            ? "Couldn't restore the session."
+            : "Couldn't restore the sessions."
+          : "Couldn't restore some sessions.",
+      );
+    }
+  } finally {
+    void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+    void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+  }
 }
 
 /**

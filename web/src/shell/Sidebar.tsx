@@ -143,6 +143,7 @@ import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
+import { showArchiveUndoToast } from "./archiveUndoToast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -441,18 +442,6 @@ function useActiveNavItem(): {
  *     scrollback is fine; users typically want the conversations list
  *     to stay visible while they switch around.
  */
-/** Toast body shown after archiving a session — links to its new home. */
-function ArchivedToast() {
-  return (
-    <span>
-      View archived sessions in{" "}
-      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
-        Settings
-      </Link>
-    </span>
-  );
-}
-
 /**
  * Compute the set of IDs to add for a shift-click range selection.
  * Returns null when the range can't be computed (missing anchor or id).
@@ -467,11 +456,6 @@ export function computeShiftSelectRange(
   if (anchorIdx === -1 || targetIdx === -1) return null;
   const [start, end] = anchorIdx < targetIdx ? [anchorIdx, targetIdx] : [targetIdx, anchorIdx];
   return visibleIds.slice(start, end + 1);
-}
-
-/** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
-function showArchivedToast() {
-  showToast(<ArchivedToast />);
 }
 
 /** Stable empty array for the pinned-conversations fallback (referential
@@ -3538,6 +3522,7 @@ function ConversationRowImpl({
     if (!isActive) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [isActive]);
+  const queryClient = useQueryClient();
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
@@ -3796,11 +3781,13 @@ function ConversationRowImpl({
     // session they'd switched to meanwhile. Mirrors confirmDelete.
     if (nextArchived && isActive) navigate("/", { replace: true });
     archive.mutate({ id: conversation.id, archived: nextArchived });
-    // Point the user at where the session went — fire NOW, not in a mutate
-    // onSuccess: the optimistic overlay unmounts this row on the next frame,
-    // and per-call mutate callbacks don't fire once their observer unmounts.
-    // A failed archive reconciles the row back with its own error toast.
-    if (nextArchived) showArchivedToast();
+    // Offer an Undo (and point at where the session went) — fire NOW, not in a
+    // mutate onSuccess: the optimistic overlay unmounts this row on the next
+    // frame, and per-call mutate callbacks don't fire once their observer
+    // unmounts. A failed archive reconciles the row back with its own error
+    // toast. The toast is driven imperatively (module state + app-level
+    // Toaster), so it survives this row unmounting.
+    if (nextArchived) showArchiveUndoToast(queryClient, [conversation]);
   }
 
   function runUnarchive() {
@@ -5175,6 +5162,7 @@ function BulkActionBar({
   onProjectAssigned?: (projectName: string) => void;
 }) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
@@ -5281,6 +5269,10 @@ function BulkActionBar({
       navigate("/", { replace: true });
     onDeselectAll();
     bulkArchive.mutate({ ids: nonArchivedSelected.map((c) => c.id), archived: true });
+    // Offer Undo for the whole batch. Fire now, before this bar unmounts with
+    // the cleared selection; the toast is driven by module state + the
+    // app-level Toaster, so it outlives this component.
+    showArchiveUndoToast(queryClient, nonArchivedSelected);
   }
 
   function handleUnarchive() {
