@@ -487,6 +487,10 @@ export function ApprovalCard({
       // accept/reject decision the UI never witnessed.
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
       label = "Resolved elsewhere";
+    } else if (response.action === "cancel") {
+      // Dismissed without deciding — neither approved nor rejected.
+      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      label = "Cancelled";
     } else if (submittedAnswers !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Submitted";

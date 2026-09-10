@@ -290,6 +290,13 @@ export interface ElicitationRequest {
 export interface ElicitationResolved {
   type: "elicitation_resolved";
   elicitationId: string;
+  /**
+   * Verdict the prompt was resolved with, when the server knows it
+   * (answered on another surface: native terminal popup, another tab,
+   * the approve page). Absent when the resolution carried no verdict,
+   * e.g. a tool-result auto-resolve.
+   */
+  action?: "accept" | "decline" | "cancel";
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */

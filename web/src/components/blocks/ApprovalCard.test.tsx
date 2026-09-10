@@ -1431,3 +1431,26 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     );
   });
 });
+
+describe("ApprovalCard — cancel verdict", () => {
+  it("renders a cancel as Cancelled, not Rejected", () => {
+    // A prompt dismissed without a decision (turn aborted, prompt
+    // withdrawn on another surface) is not a rejection — labelling it
+    // "Rejected" implies a verdict the user never gave.
+    render(
+      <ApprovalCard
+        elicitationId="elic_cancel"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "cancel" }}
+      />,
+    );
+
+    expect(screen.getByText(/Cancelled/)).toBeDefined();
+    expect(screen.queryByText(/Rejected/)).toBeNull();
+  });
+});

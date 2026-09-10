@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseEvent, withStallGuard } from "./sse";
 import type {
+  ElicitationResolved,
   ReasoningDone,
   SessionStatusEvent,
   SessionSupersededEvent,
@@ -385,5 +386,43 @@ describe("parseEvent — response.compaction.in_progress", () => {
   it("omits startedAtS when the emitter does not track a start", () => {
     const ev = parseEvent("response.compaction.in_progress", {});
     expect(ev).toEqual({ type: "compaction_in_progress" });
+  });
+});
+
+describe("parseEvent — response.elicitation_resolved", () => {
+  it("keeps the verdict the server delivered", () => {
+    // A prompt answered on another surface (native terminal popup, second
+    // tab, approve page) resolves with a real verdict. Dropping it here is
+    // what forced every such card to the ambiguous "Resolved elsewhere"
+    // pill instead of Approved/Rejected.
+    const ev = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_1",
+      action: "accept",
+    });
+    expect(ev).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_1",
+      action: "accept",
+    } satisfies ElicitationResolved);
+  });
+
+  it("omits a missing or unknown action rather than inventing one", () => {
+    // Tool-result auto-resolves publish no action; a malformed value must
+    // not leak through as a fake verdict.
+    const noAction = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_2",
+    });
+    expect(noAction).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_2",
+    } satisfies ElicitationResolved);
+    const junkAction = parseEvent("response.elicitation_resolved", {
+      elicitation_id: "elic_3",
+      action: "explode",
+    });
+    expect(junkAction).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "elic_3",
+    } satisfies ElicitationResolved);
   });
 });

@@ -1103,9 +1103,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
   if (eventType === "response.elicitation_resolved") {
     const elicitationId = data.elicitation_id;
     if (typeof elicitationId !== "string" || !elicitationId) return null;
+    const action = data.action;
     return {
       type: "elicitation_resolved",
       elicitationId,
+      // Keep the verdict when present so the card can show it instead
+      // of the ambiguous "Resolved elsewhere" pill.
+      ...(action === "accept" || action === "decline" || action === "cancel" ? { action } : {}),
     } satisfies ElicitationResolved;
   }
 
