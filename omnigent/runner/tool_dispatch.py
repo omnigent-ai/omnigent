@@ -1476,21 +1476,6 @@ async def _post_child_message_event(
     )
 
 
-# Per-child locks serializing the classify+register step of an in-flight send,
-# so two concurrent sends (or a send racing completion bookkeeping) can't
-# install divergent work entries for the same child.
-_in_flight_send_locks: dict[str, asyncio.Lock] = {}
-
-
-def _in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
-    """Return the process-wide lock for one child's in-flight-send bookkeeping."""
-    lock = _in_flight_send_locks.get(child_session_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _in_flight_send_locks[child_session_id] = lock
-    return lock
-
-
 async def _send_to_in_flight_child(
     child_session_id: str,
     message: str,
@@ -1505,11 +1490,11 @@ async def _send_to_in_flight_child(
 ) -> str:
     """Steer a message into a sub-agent whose turn is already in flight.
 
-    The message is **posted first**. The server's ``/events`` ingest is atomic
-    and authoritative about what happened: it buffers the message into the live
-    turn when one is active, or starts a fresh turn when the child has just gone
-    idle. Registering or stamping only *after* a successful post is what keeps
-    this correct under the busy/idle race:
+    The message is **posted first**; work tracking is decided only *after* the
+    post succeeds, from the child's post-settled work state, under a per-child
+    lock. Live completion delivery is keyed by child id (the dispatch-id label
+    is read only on restart recovery), so the classify/register step is what
+    governs delivery:
 
     * post fails — nothing was registered or stamped, so the still-running
       turn's tracking is untouched and there is nothing to roll back (the child
@@ -1524,10 +1509,24 @@ async def _send_to_in_flight_child(
       leaves it alone) so the new/pre-existing turn's completion is delivered
       rather than dropped against a drained entry.
 
-    Live completion delivery is keyed by child id (the dispatch id label is only
-    read on restart recovery), so the classify/register step is what governs
-    delivery; it runs under a per-child lock so concurrent sends can't install
-    divergent entries.
+    Why the post→classify order is loss-safe: the completion path
+    ``_on_proxy_stream_end`` is synchronous — it frees the turn slot and marks
+    the work entry terminal in one run, with no ``await`` between. On the single
+    event loop the runner shares with its sub-agent turns, that makes those two
+    inseparable, so a turn that had ended by the time we classify is already
+    terminal in the registry — we register fresh for the new turn and never
+    reuse a drained entry. The one residual is benign: if a *buffered* turn
+    completes during the post's response round-trip, we register a fresh
+    ``running`` entry that no turn will complete — a harmless phantom (the real
+    result already delivered under the original entry) that is cleaned up with
+    the rest of the child's work on teardown. Eliminating even that would take
+    the server surfacing its own buffered-vs-accepted disposition back through
+    the message response; delivery is already loss-safe without it.
+
+    Concurrent sends to one child are serialized by the per-child lock so they
+    can't install divergent entries; the lock is cleaned up with the child's
+    work registry (see ``in_flight_send_lock`` /
+    ``unregister_subagent_work_for_session``).
 
     :param child_session_id: The in-flight child session id.
     :param message: Steering message text to inject.
@@ -1562,7 +1561,7 @@ async def _send_to_in_flight_child(
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
 
-    async with _in_flight_send_lock(child_session_id):
+    async with _runner_app.in_flight_send_lock(child_session_id):
         entry = _runner_app.get_subagent_work(child_session_id)
         if entry is not None and entry.status in ("running", "waiting"):
             # The tracked turn is still active, so the post was buffered into it.

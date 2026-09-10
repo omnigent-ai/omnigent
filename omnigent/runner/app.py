@@ -1613,6 +1613,28 @@ def new_subagent_work_id() -> str:
     return f"subagent_{uuid.uuid4().hex[:12]}"
 
 
+# Per-child locks serializing the classify+register step of an in-flight
+# sub-agent send (see ``tool_dispatch._send_to_in_flight_child``), so two
+# concurrent sends to one child can't install divergent work entries. Co-located
+# with the work registries so it is torn down alongside them — otherwise a
+# long-lived runner would accumulate one lock per steered child forever.
+_in_flight_send_locks: dict[str, asyncio.Lock] = {}
+
+
+def in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
+    """
+    Return (creating on first use) the per-child in-flight-send lock.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The lock guarding that child's in-flight-send bookkeeping.
+    """
+    lock = _in_flight_send_locks.get(child_session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _in_flight_send_locks[child_session_id] = lock
+    return lock
+
+
 def register_subagent_work(
     *,
     parent_session_id: str,
@@ -1724,6 +1746,7 @@ def unregister_subagent_work(
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
     _subagent_work_by_child.pop(child_session_id, None)
+    _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
     if children is None:
         return
@@ -1746,9 +1769,11 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     """
     unregister_subagent_work(session_id)
     _drained_delivered_subagent_children.discard(session_id)
+    _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
+        _in_flight_send_locks.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
 

@@ -11718,6 +11718,48 @@ async def test_in_flight_send_serializes_concurrent_adopts(
     assert work.status == "running"
 
 
+def test_in_flight_send_lock_is_cleaned_up_with_child_work() -> None:
+    """The per-child in-flight-send lock does not leak past the child's work.
+
+    ``in_flight_send_lock`` inserts into a process-global map; without a cleanup
+    path a long-lived runner accumulates one lock per steered child forever
+    (review issue #2). Unregistering the child's work — directly or via session
+    teardown — must remove its lock.
+    """
+    from omnigent.runner import app as runner_app
+
+    # Direct unregister of a child clears its lock.
+    child_id = "conv_lockleak_child"
+    runner_app.register_subagent_work(
+        parent_session_id="conv_lockleak_parent",
+        child_session_id=child_id,
+        agent="claude",
+        title="merge-task",
+    )
+    runner_app.in_flight_send_lock(child_id)
+    assert child_id in runner_app._in_flight_send_locks
+    runner_app.unregister_subagent_work(child_id)
+    assert child_id not in runner_app._in_flight_send_locks
+
+    # Session teardown clears the parent's and every child's lock.
+    parent_id, child_a, child_b = "conv_teardown_parent", "conv_teardown_a", "conv_teardown_b"
+    for cid in (child_a, child_b):
+        runner_app.register_subagent_work(
+            parent_session_id=parent_id, child_session_id=cid, agent="claude", title=cid
+        )
+        runner_app.in_flight_send_lock(cid)
+    runner_app.in_flight_send_lock(parent_id)
+    try:
+        runner_app.unregister_subagent_work_for_session(parent_id)
+        assert parent_id not in runner_app._in_flight_send_locks
+        assert child_a not in runner_app._in_flight_send_locks
+        assert child_b not in runner_app._in_flight_send_locks
+    finally:
+        for cid in (parent_id, child_a, child_b):
+            runner_app._in_flight_send_locks.pop(cid, None)
+            runner_app.unregister_subagent_work(cid)
+
+
 @pytest.mark.asyncio
 async def test_named_send_defers_when_child_turn_still_launching(
     monkeypatch: pytest.MonkeyPatch,
