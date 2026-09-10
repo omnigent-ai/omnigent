@@ -244,17 +244,25 @@ def api_key_auth_precludes_broker(spec: AgentSpec | None) -> bool:
     silently ignore the user's key, so claude/codex/pi gate their broker fallback
     on ``not api_key_auth_precludes_broker(...)``.
 
-    With a *spec*, its own ``executor.auth`` is authoritative (the resolver that
-    already ran consulted the global block for it). Without one (pi resolves off
-    machine config), the global ``auth:`` block carries the only key intent.
+    Precedence: a spec's own ``executor.auth`` wins; when the spec declares no
+    auth of its own (or there is no spec, e.g. pi resolving off machine config)
+    the global ``auth:`` block carries the key intent. A **global** ``ApiKeyAuth``
+    must also preclude the broker — the shared resolver returns ``None`` for it,
+    which would otherwise fall through to the broker fallback and silently reroute
+    the configured key.
     """
     from omnigent.spec.types import ApiKeyAuth
 
-    if spec is not None:
-        return isinstance(getattr(spec.executor, "auth", None), ApiKeyAuth)
-    from omnigent.runtime.workflow import _load_global_auth
+    # A spec's own explicit ApiKeyAuth precludes the broker outright.
+    if spec is not None and isinstance(getattr(spec.executor, "auth", None), ApiKeyAuth):
+        return True
+    # No spec, or a spec that declares no auth of its own → consult the global
+    # ``auth:`` block, which is the only remaining place a key intent can live.
+    if spec is None or getattr(spec.executor, "auth", None) is None:
+        from omnigent.runtime.workflow import _load_global_auth
 
-    return isinstance(_load_global_auth(), ApiKeyAuth)
+        return isinstance(_load_global_auth(), ApiKeyAuth)
+    return False
 
 
 def configure_host_databricks(server_url: str, host_id: str) -> bool:

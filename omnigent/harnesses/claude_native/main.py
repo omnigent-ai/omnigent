@@ -3206,7 +3206,16 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
         # host (mirrors the opencode guard); otherwise keep the profile-derived
         # route rather than forwarding the bearer to an unverified origin.
         if ucode_base_url and https_url_on_workspace_host(ucode_base_url, workspace_host):
-            env = {**env, **agent_state.env, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
+            # Forward only known gateway env keys from the writable state.json
+            # (ANTHROPIC_* / CLAUDE_CODE_*) — never PATH / NODE_OPTIONS / proxy
+            # vars — into the broker-authenticated process. The base-URL guard
+            # binds where the bearer goes; this bounds the rest of the environment.
+            allowed = {
+                k: v
+                for k, v in agent_state.env.items()
+                if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))
+            }
+            env = {**env, **allowed, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
             if agent_state.model:
                 model = agent_state.model
         elif ucode_base_url:

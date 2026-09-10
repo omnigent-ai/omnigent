@@ -280,11 +280,10 @@ def test_https_url_on_workspace_host(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_api_key_auth_precludes_broker(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Only an explicit ApiKeyAuth suppresses the managed-connect broker fallback.
-
-    A spec's own ``executor.auth`` is authoritative (the resolver already consulted
-    the global block for it); a spec-less launch (pi) falls back to the global
-    ``auth:`` block. A Databricks profile or no auth at all lets the broker run.
+    """An explicit ApiKeyAuth — spec-level OR the global ``auth:`` block — suppresses
+    the managed-connect broker fallback. A spec's own explicit key wins; when the
+    spec declares no auth (or there is no spec, e.g. pi), the global block decides.
+    A DatabricksAuth or no key anywhere lets the broker run.
     """
     from types import SimpleNamespace
 
@@ -293,18 +292,21 @@ def test_api_key_auth_precludes_broker(monkeypatch: pytest.MonkeyPatch) -> None:
     key_spec = SimpleNamespace(executor=SimpleNamespace(auth=ApiKeyAuth(api_key="sk-x")))
     dbx_spec = SimpleNamespace(executor=SimpleNamespace(auth=DatabricksAuth(profile="p")))
     bare_spec = SimpleNamespace(executor=SimpleNamespace(auth=None))
+
+    # No global auth configured: only a spec-level key precludes.
+    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
     assert dc.api_key_auth_precludes_broker(key_spec) is True
     assert dc.api_key_auth_precludes_broker(dbx_spec) is False
     assert dc.api_key_auth_precludes_broker(bare_spec) is False
+    assert dc.api_key_auth_precludes_broker(None) is False
 
-    # Spec-less (pi): the global auth block carries the only key intent.
+    # A GLOBAL ApiKeyAuth must also preclude the broker — including in the spec
+    # branch when the spec declares no auth of its own (the reroute bug this guards).
     monkeypatch.setattr(
         "omnigent.runtime.workflow._load_global_auth", lambda: ApiKeyAuth(api_key="sk-g")
     )
     assert dc.api_key_auth_precludes_broker(None) is True
-    monkeypatch.setattr(
-        "omnigent.runtime.workflow._load_global_auth", lambda: DatabricksAuth(profile="p")
-    )
-    assert dc.api_key_auth_precludes_broker(None) is False
-    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
-    assert dc.api_key_auth_precludes_broker(None) is False
+    assert dc.api_key_auth_precludes_broker(bare_spec) is True
+    # A spec-level DatabricksAuth is authoritative and is not a key, so the broker
+    # still runs even when a global key exists.
+    assert dc.api_key_auth_precludes_broker(dbx_spec) is False

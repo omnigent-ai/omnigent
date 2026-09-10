@@ -268,8 +268,8 @@ def configure_ucode_for_sandbox(
     from ``omnigent host`` boot with the broker command in ``extra_env``) and the
     lakebox launcher (``use_pat=True`` against its injected PAT).
 
-    ponytail: fire-and-forget per boot, no resume-skip; configure is idempotent
-    and cheap to repeat. Add a marker gate if warm-resume latency matters.
+    Fire-and-forget per boot (no resume-skip): configure is idempotent and cheap
+    to repeat, and concurrent runs are serialized by :func:`ucode_configure_lock`.
     """
     try:
         ucode_command = find_ucode_command()

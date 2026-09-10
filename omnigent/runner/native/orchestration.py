@@ -1314,13 +1314,11 @@ async def _auto_create_opencode_terminal(
         # the runner's event loop. None off a managed connect host.
         managed_config = await asyncio.to_thread(managed_connect_opencode_config, xdg_config_home)
         if managed_config:
-            config = managed_config
-            pinned = config.get("model")
-            if isinstance(pinned, str):
-                model_override = pinned
-            # Derive the broker command from the SAME sidecar the config gated on
-            # (not a separate profile read), so the two can't disagree. The auth
-            # plugin needs it to mint per request; log if it's somehow absent.
+            # The auth plugin needs the broker command to mint per request; derive
+            # it from the SAME sidecar the config gated on (not a separate profile
+            # read), so the two can't disagree. Only adopt the managed config when
+            # the command resolves — a provider block with no mint command can't
+            # authenticate, so without it leave opencode on its own login instead.
             from omnigent.host.databricks_credential import (
                 _read_sidecar,
                 _sidecar_path,
@@ -1331,13 +1329,17 @@ async def _auto_create_opencode_terminal(
             managed_opencode_broker_cmd = (
                 broker_token_command(_oc_sidecar["workspace_host"]) if _oc_sidecar else None
             )
-            if not managed_opencode_broker_cmd:
+            if managed_opencode_broker_cmd:
+                config = managed_config
+                pinned = config.get("model")
+                if isinstance(pinned, str):
+                    model_override = pinned
+            else:
                 _logger.warning(
                     "opencode managed connect: ucode config resolved but no broker command "
-                    "(sidecar missing/mismatched); the auth plugin cannot mint, so opencode "
-                    "will fall back to its own login."
+                    "(sidecar missing/mismatched); leaving opencode on its own login."
                 )
-        elif model_override:
+        if not config and model_override:
             # No custom provider, but a model is pinned (``omni opencode --model``
             # or the ``omni setup`` OpenCode default): write opencode's default
             # model so the native TUI and first turn use it instead of
