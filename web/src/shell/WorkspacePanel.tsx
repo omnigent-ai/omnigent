@@ -108,6 +108,7 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
     case "local_stranded":
       return "offline";
     case "runner_asleep":
+    case "stopped":
     case "host_asleep":
     case "starting":
       return "wakeable";
