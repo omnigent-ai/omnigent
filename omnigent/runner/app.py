@@ -2324,7 +2324,7 @@ def create_runner_app(
     if docloop_notebook_enabled:
         from omnigent.runner.docloop import runner_notebook_router
 
-        app.include_router(runner_notebook_router(process_manager))
+        app.include_router(runner_notebook_router(process_manager, auth_token))
 
     from omnigent.runtime import telemetry
 

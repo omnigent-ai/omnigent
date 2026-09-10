@@ -12,6 +12,9 @@ flowchart LR
     Runner --> Harness[Live Docloop harness]
     Harness --> Document[Shared notebook Store]
     Harness --> Executor[Existing workspace executor]
+    Browser --> Lab[JupyterLab iframe]
+    Lab --> AP
+    Harness --> Kernel[On-demand Jupyter server and kernel]
 ```
 
 ## Configuration
@@ -43,9 +46,23 @@ bounded history of edit receipts. A committed edit whose refreshed snapshot is
 unavailable is reported as applied, without suggesting a new change identifier.
 
 Use Chat for arbitrary instructions to modify the document, execute cells, or
-work with files. The pane is an addressed source editor for Org and ipynb. Full
-JupyterLab and kernel controls remain available in Docloop's standalone browser
-service; this host pane does not yet embed that Jupyter UI.
+work with files. With Docloop 0.2.6.dev2 and its Jupyter extra installed, ipynb
+opens in the real JupyterLab editor. Org retains its addressed source editor.
+Run, interrupt, restart, file access and saves travel over the same assigned
+runner. The only WebSocket addition is the session's kernel-channel path.
+Jupyter's server token stays inside the harness; browser credentials are not
+forwarded across transport hops. Compressed responses and split Unicode chunks
+are carried losslessly by the tunnel.
+
+Jupyter uses the configured local workspace, with a separate Python kernel from
+agent cell evaluation. Saved notebook state and files are shared. OCI environments
+retain Source/Chat execution; this native Lab kernel is currently local only.
+Native iframes require the normal browser cookie or authenticated proxy session.
+Embeds using only JavaScript host headers retain Source and Chat, and explain how
+to open the session directly for Jupyter. No new login token or grant is issued.
+
+The pane stays mounted across Chat/Notebook switches. Narrow panes use Jupyter's
+simple layout with collapsed sidebars, and show kernel status above the editor.
 
 ## Verification
 
@@ -59,3 +76,11 @@ select Notebook, change and save a note, then ask in Chat to use that note and
 execute a saved cell. Confirm the output and created file, reload the page, and
 verify that both survive. Check phone-width switching and a desktop split view.
 Local source tests and UI previews do not establish a live deployment receipt.
+
+The companion Docloop `tests/test_runner_jupyter.py` runs actual Jupyter and SDK
+HTTP/WebSockets through a private Unix socket, both relays and the actual tunnel
+frame handlers. Its carrier and session metadata are fixtures. It verifies real
+code execution, workspace files, versioned saves, two-editor conflicts, restart
+and process cleanup. Browser previews exercise the built UI's Run and Save
+buttons and retain the kernel while switching to Chat. Physical Android and live
+fleet adoption remain separate acceptance steps.

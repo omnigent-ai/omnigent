@@ -419,6 +419,7 @@ def register_docloop_forwarding(
     conversation_store=None,
     auth_provider=None,
     permission_store=None,
+    jupyter_transport=None,
 ) -> bool:
     """Opt-in host registration using its existing native permission helpers.
 
@@ -445,4 +446,15 @@ def register_docloop_forwarding(
         )
 
     router.include_router(notebook_gateway_router(authorize, transport, prefix=""))
+    if jupyter_transport is not None:
+        from omnigent.jupyter_gateway import jupyter_gateway_router
+
+        router.include_router(
+            jupyter_gateway_router(
+                authorize,
+                jupyter_transport.jupyter_client,
+                jupyter_transport.jupyter_channels,
+                prefix="",
+            )
+        )
     return True

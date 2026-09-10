@@ -82,6 +82,67 @@
 #docloop-notebook-pane[hidden] {
   display: none;
 }
+.docloop-notebook-surface {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.docloop-notebook-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.docloop-notebook-toolbar button,
+.docloop-notebook-toolbar a {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+}
+.docloop-notebook-toolbar button[aria-pressed="true"] {
+  background: var(--accent);
+}
+.docloop-notebook-toolbar a {
+  margin-left: auto;
+  color: var(--muted-foreground);
+}
+.docloop-notebook-toolbar :focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.docloop-jupyter-frame,
+.docloop-source-editor {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  border: 0;
+}
+.docloop-jupyter-frame[hidden],
+.docloop-source-editor[hidden] {
+  display: none;
+}
+.docloop-notebook-message {
+  padding: 20px;
+  line-height: 1.6;
+}
+.docloop-notebook-message button {
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.docloop-kernel-status {
+  margin: 0;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
 @container docloop (max-width: 760px) {
   .docloop-chat-layout.docloop-open {
     grid-template: "views" auto "notebook" minmax(0, 1fr) / minmax(0, 1fr);

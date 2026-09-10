@@ -85,6 +85,10 @@ class WrongReplicaWSError(RuntimeError):
 # construction, so the captured value feeds
 # ``router.client_for_existing_conversation()``.
 _RUNNER_PATH_RE = re.compile(r"^/v1/sessions/(?P<conv>[^/?]+)/resources/terminals/[^/?]+/attach")
+_JUPYTER_PATH_RE = re.compile(
+    r"^/v1/sessions/(?P<conv>[A-Za-z0-9_-]{1,128})/docloop/jupyter/api/kernels/"
+    r"[A-Za-z0-9_-]{1,128}/channels(?:\?[^#]*)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -156,7 +160,7 @@ def make_tunnel_ws_factory(
     """
 
     def factory(runner_path: str) -> _TunneledWSConn:
-        match = _RUNNER_PATH_RE.match(runner_path)
+        match = _RUNNER_PATH_RE.match(runner_path) or _JUPYTER_PATH_RE.fullmatch(runner_path)
         if match is None:
             raise ValueError(f"unrecognized runner_path: {runner_path!r}")
         conversation_id = match.group("conv")

@@ -634,13 +634,19 @@ def is_text_content_type(content_type: str) -> bool:
     return any(ct.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES)
 
 
-def encode_body(body: bytes, content_type: str) -> tuple[str, str]:
+def encode_body(
+    body: bytes, content_type: str, content_encoding: str = "identity"
+) -> tuple[str, str]:
     """Return ``(encoded_body, encoding)`` for a body+content-type pair.
 
     Picks utf-8 inline for text-shaped content, base64 otherwise.
     """
-    if is_text_content_type(content_type):
-        return body.decode("utf-8", errors="replace"), "utf-8"
+    if content_encoding.lower() == "identity" and is_text_content_type(content_type):
+        try:
+            return body.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            # A streaming chunk can split a Unicode character between frames.
+            pass
     return base64.b64encode(body).decode("ascii"), "base64"
 
 

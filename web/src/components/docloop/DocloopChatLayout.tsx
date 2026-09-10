@@ -1,8 +1,7 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useParams } from "@/lib/routing";
 import { BookOpen, MessageSquare } from "lucide-react";
-import { authenticatedFetch } from "@/lib/identity";
-import { mountNotebookPane } from "./notebook-pane.mjs";
+import { NativeNotebookSurface } from "./NativeNotebookSurface";
 import "./docloop-chat-layout.css";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -13,15 +12,6 @@ export function DocloopChatLayout({ children }: { children: ReactNode }) {
   const enabled = isFeatureEnabled(info, "docloop_notebook");
   const { conversationId } = useParams<{ conversationId: string }>();
   const [open, setOpen] = useState(false);
-  const panel = useRef<HTMLElement>(null);
-  useEffect(() => {
-    if (!enabled || !open || !conversationId || !panel.current) return;
-    const pane = mountNotebookPane(panel.current, {
-      sessionId: conversationId,
-      fetcher: authenticatedFetch,
-    });
-    return () => pane.dispose();
-  }, [enabled, open, conversationId]);
   if (!enabled) return children;
   return (
     <div className="docloop-chat-container">
@@ -46,8 +36,11 @@ export function DocloopChatLayout({ children }: { children: ReactNode }) {
           id="docloop-notebook-pane"
           aria-label="Session notebook"
           hidden={!open || !conversationId}
-          ref={panel}
-        />
+        >
+          {conversationId && (
+            <NativeNotebookSurface key={conversationId} sessionId={conversationId} active={open} />
+          )}
+        </aside>
       </div>
     </div>
   );

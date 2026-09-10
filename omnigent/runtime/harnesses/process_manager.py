@@ -31,7 +31,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -683,6 +683,47 @@ class HarnessProcessManager:
             "HarnessProcessManager started; instance_dir=%s",
             self._instance_dir,
         )
+
+    @contextlib.asynccontextmanager
+    async def jupyter_channels(self, conversation_id: str, path: str) -> AsyncIterator[Any]:
+        """Open kernel channels on the existing harness; never spawn or replace it."""
+        import re
+
+        from websockets.asyncio.client import connect, unix_connect
+
+        expected = (
+            rf"/v1/sessions/{re.escape(conversation_id)}/docloop/jupyter/api/kernels/"
+            r"[A-Za-z0-9_-]{1,128}/channels(?:\?[^#]*)?"
+        )
+        if re.fullmatch(expected, path) is None:
+            raise ValueError("Invalid Jupyter channel path")
+        client = await self.get_client(conversation_id, "any")
+        entry = self._entries.get(conversation_id)
+        if entry is None or entry.client is not client or entry.process.returncode is not None:
+            raise NoLiveHarnessError("Jupyter harness is unavailable")
+        endpoint = entry.endpoint
+        authorization = client.headers.get("authorization")
+        if not authorization:
+            raise NoLiveHarnessError("Jupyter harness authentication is unavailable")
+        options = {
+            "additional_headers": {"Authorization": authorization},
+            "max_size": 32_000_000,
+            "open_timeout": 45,
+            "close_timeout": 3,
+        }
+        uri = endpoint.base_url.replace("http://", "ws://", 1) + path
+        connection = (
+            unix_connect(str(endpoint.socket_path), uri=uri, **options)
+            if endpoint.socket_path is not None
+            else connect(uri, **options)
+        )
+        async with connection as websocket:
+            if (
+                self._entries.get(conversation_id) is not entry
+                or entry.process.returncode is not None
+            ):
+                raise NoLiveHarnessError("Jupyter harness changed during connection")
+            yield websocket
 
     async def get_client(
         self,

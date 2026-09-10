@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
+from starlette.requests import HTTPConnection
 
 from omnigent.docloop_gateway import (
     Method,
@@ -67,6 +69,20 @@ class AssignedRunnerNotebookTransport:
     def __init__(self, router: RunnerRouter | None) -> None:
         self.router = router
 
+    async def jupyter_client(self, session_id: str) -> httpx.AsyncClient:
+        if self.router is None:
+            raise NotebookUnavailable
+        routed = await asyncio.to_thread(self.router.client_for_session_resources, session_id)
+        return routed.client
+
+    def jupyter_channels(self, _session_id: str, path: str):
+        from omnigent.runtime import get_runner_ws_factory
+
+        factory = get_runner_ws_factory()
+        if factory is None:
+            raise NotebookUnavailable
+        return factory(path)
+
     async def forward_notebook(
         self, session_id: str, method: Method, body: bytes, *, max_response_bytes: int
     ) -> NotebookReply:
@@ -87,6 +103,16 @@ class LiveHarnessNotebookTransport:
     def __init__(self, manager: HarnessProcessManager | None) -> None:
         self.manager = manager
 
+    async def jupyter_client(self, session_id: str) -> httpx.AsyncClient:
+        if self.manager is None:
+            raise NotebookUnavailable
+        return await self.manager.get_client(session_id, "any")
+
+    def jupyter_channels(self, session_id: str, path: str):
+        if self.manager is None:
+            raise NotebookUnavailable
+        return self.manager.jupyter_channels(session_id, path)
+
     async def forward_notebook(
         self, session_id: str, method: Method, body: bytes, *, max_response_bytes: int
     ) -> NotebookReply:
@@ -101,10 +127,32 @@ class LiveHarnessNotebookTransport:
         )
 
 
-def runner_notebook_router(manager: HarnessProcessManager | None) -> APIRouter:
+def runner_notebook_router(
+    manager: HarnessProcessManager | None, auth_token: str | None = None
+) -> APIRouter:
     """Registered behind the runner app's existing authenticated tunnel boundary."""
 
     async def authorize(_request: Request, _session_id: str) -> None:
         pass
 
-    return notebook_gateway_router(authorize, LiveHarnessNotebookTransport(manager))
+    from omnigent.jupyter_gateway import jupyter_gateway_router
+
+    async def authorize_jupyter(connection: HTTPConnection, _session_id: str) -> None:
+        if connection.client and connection.client.host == "tunnel":
+            return
+        provided = connection.headers.get("authorization", "")
+        if not auth_token or not hmac.compare_digest(provided, "Bearer " + auth_token):
+            raise HTTPException(401, "Runner authentication required")
+
+    transport = LiveHarnessNotebookTransport(manager)
+    router = notebook_gateway_router(authorize, transport)
+    router.include_router(
+        jupyter_gateway_router(
+            authorize_jupyter,
+            transport.jupyter_client,
+            transport.jupyter_channels,
+            prefix="",
+            trusted_tunnel=True,
+        )
+    )
+    return router

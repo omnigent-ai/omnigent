@@ -876,6 +876,7 @@ def create_sessions_router(
             router,
             enabled=True,
             transport=AssignedRunnerNotebookTransport(runner_router),
+            jupyter_transport=AssignedRunnerNotebookTransport(runner_router),
             conversation_store=conversation_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
