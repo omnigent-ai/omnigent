@@ -3504,6 +3504,40 @@ def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
     assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
 
 
+def test_clean_codex_env_stamps_omnigent_originator(monkeypatch) -> None:
+    """Every codex subprocess is tagged as Omnigent-originated.
+
+    Without the stamp codex falls back to a per-surface default
+    (``codex-tui``), which is also what a user's own codex run reports.
+    """
+    from omnigent.inner.codex_executor import (
+        CODEX_ORIGINATOR,
+        CODEX_ORIGINATOR_ENV_VAR,
+        _clean_codex_env,
+    )
+
+    monkeypatch.delenv(CODEX_ORIGINATOR_ENV_VAR, raising=False)
+
+    assert _clean_codex_env()[CODEX_ORIGINATOR_ENV_VAR] == CODEX_ORIGINATOR
+
+
+def test_clean_codex_env_originator_overrides_host_value(monkeypatch) -> None:
+    """A host originator must not survive into the codex subprocess.
+
+    An Omnigent session launched from inside another agent would otherwise
+    inherit that outer process's originator and be attributed to it.
+    """
+    from omnigent.inner.codex_executor import (
+        CODEX_ORIGINATOR,
+        CODEX_ORIGINATOR_ENV_VAR,
+        _clean_codex_env,
+    )
+
+    monkeypatch.setenv(CODEX_ORIGINATOR_ENV_VAR, "some-other-harness")
+
+    assert _clean_codex_env()[CODEX_ORIGINATOR_ENV_VAR] == CODEX_ORIGINATOR
+
+
 # ---------------------------------------------------------------------------
 # Tests for _to_codex_input_items — input_file → inline text conversion
 # ---------------------------------------------------------------------------

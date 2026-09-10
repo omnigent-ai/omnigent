@@ -174,6 +174,15 @@ _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 # developer API key that would charge separately.
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
+# Codex derives the ``originator`` it reports — on its API user agent and its
+# own telemetry — from this variable, falling back to a built-in per-surface
+# value (``codex-tui`` for the TUI, ``codex_vscode`` for the extension). Left
+# unset, a codex process Omnigent launched reports the same originator as one
+# the user started themselves, so the two cannot be told apart downstream.
+CODEX_ORIGINATOR_ENV_VAR = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"
+#: Value reported by codex processes Omnigent launches.
+CODEX_ORIGINATOR = "omnigent"
+
 # The codex CLI logs a rejected gateway request to stderr as
 # ``unexpected status <code> <reason>: {...}, url: <url>`` and precedes it with
 # ``Reconnecting... N/5`` retry lines. These parse that shape so the head can
@@ -498,9 +507,12 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     codex signals back out of it, so those names have to survive the filter
     (see :data:`_CODEX_OMNIGENT_LAUNCH_ENV_VARS`).
 
+    Also stamps :data:`CODEX_ORIGINATOR_ENV_VAR` so codex attributes the
+    process to Omnigent instead of its own per-surface default.
+
     :returns: Filtered environment dict.
     """
-    return clean_agent_env(
+    env = clean_agent_env(
         allow_prefixes=("OPENAI_", "REQUESTS_", "CODEX_HOME"),
         allow_exact=(
             "PYTHONUTF8",
@@ -520,6 +532,11 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
     )
+    # Set after the filter, not allowed through it: a host value would
+    # otherwise survive into the child and mis-attribute an Omnigent session
+    # as whatever launched the outer process.
+    env[CODEX_ORIGINATOR_ENV_VAR] = CODEX_ORIGINATOR
+    return env
 
 
 def codex_skill_sources(
