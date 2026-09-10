@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Any, TypeAlias
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
+from omnigent.debug_logging import debug_event
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
@@ -932,6 +934,8 @@ class TerminalInstance:
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
     _last_pane_snapshot: str | None = field(default=None, repr=False)
+    _last_capture_at: float | None = field(default=None, repr=False)
+    diagnostic_id: str = field(default_factory=lambda: uuid.uuid4().hex, init=False, repr=False)
     # Exit status of the pane's inner process, captured from tmux
     # ``#{pane_dead_status}`` the first time a dead pane is observed (only
     # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
@@ -980,6 +984,31 @@ class TerminalInstance:
     def _remember_pane_snapshot(self, snapshot: str) -> None:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
+        self._last_capture_at = time.monotonic()
+
+    def _probe_log_extra(
+        self, event_name: str, consecutive_failures: int | None = None
+    ) -> dict[str, object]:
+        """Correlate probe failures with lifecycle events without recording pane contents."""
+        return debug_event(
+            event_name,
+            terminal_instance_id=self.diagnostic_id,
+            terminal_name=self.name,
+            terminal_key=self.session_key,
+            consecutive_probe_failures=consecutive_failures,
+            keep_alive_after_exit=self.keep_alive_after_exit,
+            last_capture_age_ms=(
+                round((time.monotonic() - self._last_capture_at) * 1000)
+                if self._last_capture_at is not None
+                else None
+            ),
+            pane_output_seen=bool(self._last_pane_snapshot),
+            terminal_exit_status=self._last_exit_status,
+            shutdown_requested=(
+                not self.running
+                or (self._idle_stop_event is not None and self._idle_stop_event.is_set())
+            ),
+        )
 
     def last_exit_status(self) -> int | None:
         """Return the inner process's exit code, if the pane has died.
@@ -1449,6 +1478,7 @@ class TerminalInstance:
                     self.name,
                     self.session_key,
                     exc,
+                    extra=self._probe_log_extra("terminal_probe_failed"),
                 )
                 if await self._tmux_session_exists_async():
                     consecutive_capture_failures = 0
@@ -1461,6 +1491,9 @@ class TerminalInstance:
                     consecutive_capture_failures,
                     self.name,
                     self.session_key,
+                    extra=self._probe_log_extra(
+                        "terminal_unavailable", consecutive_capture_failures
+                    ),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1644,6 +1677,9 @@ class TerminalInstance:
                     consecutive_capture_failures,
                     self.name,
                     self.session_key,
+                    extra=self._probe_log_extra(
+                        "terminal_unavailable", consecutive_capture_failures
+                    ),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1712,6 +1748,7 @@ class TerminalInstance:
                 self.name,
                 self.session_key,
                 exc,
+                extra=self._probe_log_extra("terminal_probe_failed"),
             )
             return None
 

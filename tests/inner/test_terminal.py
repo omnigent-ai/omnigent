@@ -62,7 +62,9 @@ def contains_subsequence(values: list[str], expected: list[str]) -> bool:
     )
 
 
-def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
+def test_threaded_idle_watcher_reports_terminal_exit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """
     The threaded watcher reports tmux disappearance instead of exiting silently.
 
@@ -87,6 +89,51 @@ def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
 
     assert exited.wait(timeout=1.0)
     assert instance.running is False
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].event_name == "terminal_unavailable"
+    assert errors[0].attributes["terminal_instance_id"] == instance.diagnostic_id
+    assert errors[0].attributes["consecutive_probe_failures"] == 3
+    assert errors[0].attributes["pane_output_seen"] is False
+    assert errors[0].attributes["shutdown_requested"] is False
+
+
+async def test_async_idle_watcher_logs_correlated_probe_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+        keep_alive_after_exit=True,
+    )
+    instance._remember_pane_snapshot("private-terminal-output")
+
+    async def fail_probe(*args: str) -> str:
+        raise RuntimeError("no server running")
+
+    async def session_missing() -> bool:
+        return False
+
+    monkeypatch.setattr(instance, "_tmux_output", fail_probe)
+    monkeypatch.setattr(instance, "_tmux_session_exists_async", session_missing)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.001)
+    await asyncio.wait_for(instance._idle_watch_loop(lambda: None), timeout=1.0)
+
+    records = [record for record in caplog.records if record.name == terminal_mod.__name__]
+    assert len(records) == 4
+    assert {record.attributes["terminal_instance_id"] for record in records} == {
+        instance.diagnostic_id
+    }
+    attributes = records[-1].attributes
+    assert attributes["consecutive_probe_failures"] == 3
+    assert attributes["keep_alive_after_exit"] is True
+    assert attributes["pane_output_seen"] is True
+    assert attributes["last_capture_age_ms"] >= 0
+    assert "private-terminal-output" not in str(attributes)
+    assert str(tmp_path) not in str(attributes)
 
 
 def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> None:
@@ -249,6 +296,9 @@ def test_capture_probe_logs_command_return_code_and_stderr(
     assert str(instance.socket_path) in message
     assert "capture-pane -t main -p -e" in message
     assert "fork failed: resource temporarily unavailable" in message
+    record = next(record for record in caplog.records if record.name == terminal_mod.__name__)
+    assert record.event_name == "terminal_probe_failed"
+    assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
 
 
 def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:

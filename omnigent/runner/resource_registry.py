@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -1438,7 +1438,8 @@ class SessionResourceRegistry:
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
         # Idle = clean shutdown after the turn finished. Anything else (running,
         # or never observed → boot failure) stays a failure.
-        session_was_idle = self._take_session_status_memo(session_id) == "idle"
+        session_status_before_exit = self._take_session_status_memo(session_id)
+        session_was_idle = session_status_before_exit == "idle"
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1459,6 +1460,28 @@ class SessionResourceRegistry:
                     superseded_by = current
 
         publisher = self._terminal_exit_publisher
+        _logger.info(
+            "Terminal exit observed: session=%s terminal=%s:%s "
+            "lifecycle=%s status=%s superseded=%s",
+            session_id,
+            terminal_name,
+            session_key,
+            lifecycle.value,
+            session_status_before_exit or "unknown",
+            superseded_by is not None,
+            extra=debug_event(
+                "terminal_exit_observed",
+                session_id=session_id,
+                terminal_instance_id=instance.diagnostic_id if instance is not None else None,
+                terminal_id=terminal_id,
+                terminal_name=terminal_name,
+                terminal_key=session_key,
+                terminal_lifecycle=lifecycle.value,
+                session_status_before_exit=session_status_before_exit or "unknown",
+                terminal_exit_status=exit_status,
+                superseded=superseded_by is not None,
+            ),
+        )
         if superseded_by is not None:
             _logger.info(
                 "Skipping exit event for superseded terminal: session=%s terminal=%s:%s",
@@ -1501,6 +1524,17 @@ class SessionResourceRegistry:
             session_id,
         ):
             if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
+                _logger.info(
+                    "Terminal close requested: session=%s terminal=%s",
+                    session_id,
+                    terminal_id,
+                    extra=debug_event(
+                        "terminal_close_requested",
+                        session_id=session_id,
+                        terminal_id=terminal_id,
+                        terminal_instance_id=entry.instance.diagnostic_id,
+                    ),
+                )
                 closed = await self._terminal_registry.close(
                     session_id,
                     entry.terminal_name,
