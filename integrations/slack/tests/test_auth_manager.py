@@ -435,7 +435,7 @@ async def test_rotator_transient_failure_keeps_token(tmp_path: Path) -> None:
     # discard a still-valid refresh grant. It raises TokenRefreshTransientError
     # (so the caller keeps the current access token and skips a re-login prompt),
     # and the stored refresh token is untouched.
-    from omnigent_slack.omnigent import TokenRefreshTransientError
+    from omnigent_bot_core.omnigent import TokenRefreshTransientError
 
     store = EncryptedTokenStore(tmp_path / "t.sqlite3", Fernet.generate_key().decode())
     await store.initialize()

@@ -4,8 +4,9 @@ import logging
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
+from omnigent_bot_core.omnigent import OutputFile
+
 from omnigent_slack.models import ThreadKey
-from omnigent_slack.omnigent import OutputFile
 from omnigent_slack.text import GENERIC_FAILURE_TEXT, truncate_for_slack
 
 if TYPE_CHECKING:
