@@ -1018,6 +1018,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // offers the "Accept & allow all edits" button (switches the
     // session to acceptEdits mode on accept).
     const allowAllEdits = p.allow_all_edits === true;
+    const allowAutoMode = p.allow_auto_mode === true;
     // claude-native non-edit tool prompts stamp this so the ApprovalCard
     // offers the persistent "don't ask again" button (installs a
     // session-scoped allow rule on accept). `tool` is the gated tool;
@@ -1093,6 +1094,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
             }
           : null,
       allowAllEdits,
+      allowAutoMode,
       rememberScope,
       codexPersistModes,
     } satisfies ElicitationRequest;

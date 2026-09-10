@@ -253,6 +253,7 @@ export interface ElicitationRequest {
    * mode switch is meaningful.
    */
   allowAllEdits?: boolean;
+  allowAutoMode?: boolean;
   /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that

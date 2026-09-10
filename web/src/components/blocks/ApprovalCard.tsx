@@ -151,6 +151,7 @@ interface ApprovalCardProps {
    * mode switch would be a no-op.
    */
   allowAllEdits?: boolean;
+  allowAutoMode?: boolean;
   /**
    * Claude-native non-edit tool prompts only: when set, the binary
    * approve/reject card grows a third "Approve & don't ask again for
@@ -189,6 +190,7 @@ export function ApprovalCard({
   exitPlanMode,
   codexCommand,
   allowAllEdits,
+  allowAutoMode,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
@@ -222,6 +224,9 @@ export function ApprovalCard({
   };
   const submitExecPolicyAmendment = (amendment: string[]) => {
     submit(elicitationId, "accept", { execpolicy_amendment: amendment });
+  };
+  const submitAutoMode = () => {
+    submit(elicitationId, "accept", { allow_auto_mode: true });
   };
   const submitAllowAllEdits = () => {
     // Accept AND ask the server to switch the session's permission
@@ -315,6 +320,8 @@ export function ApprovalCard({
     Array.isArray(response?.content?.execpolicy_amendment) &&
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
+  const acceptedAutoMode =
+    response?.action === "accept" && response.content?.allow_auto_mode === true;
   const acceptedRemember = response?.content?.remember === true;
   const acceptedCodexPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
@@ -355,6 +362,18 @@ export function ApprovalCard({
         >
           <CheckIcon className="mr-1 size-3.5" />
           Always allow
+        </Button>
+      )}
+      {allowAutoMode && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={submitAutoMode}
+          title="Approve this request and let Claude review future tool permissions automatically for this session"
+          componentId="approval.approve_auto_mode"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve &amp; switch to auto mode
         </Button>
       )}
       {allowAllEdits && (
@@ -471,6 +490,9 @@ export function ApprovalCard({
     } else if (acceptedWithExecPolicy) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved and remembered";
+    } else if (acceptedAutoMode) {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved · auto mode";
     } else if (acceptedAllEdits) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved · auto mode" : "Approved · auto-accepting edits";
@@ -695,6 +717,7 @@ export function ElicitationCard({
       exitPlanMode={item.exitPlanMode}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
+      allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
       onSubmit={onSubmit}

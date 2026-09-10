@@ -617,6 +617,7 @@ export interface ElicitationBlock {
    * switch is a no-op.
    */
   allowAllEdits?: boolean;
+  allowAutoMode?: boolean;
   /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button
