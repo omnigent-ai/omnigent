@@ -8,6 +8,7 @@ few attributes off each, so a real store would add setup without adding cover.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -247,3 +248,21 @@ def test_configure_snapshots_the_shared_interval(monkeypatch: pytest.MonkeyPatch
     )
     managed_host_keepalive.configure(SimpleNamespace(), None, None)
     assert managed_host_keepalive._min_interval_s == resolve_managed_keepalive_interval_s() == 45.0
+
+
+def test_successful_keepalive_logs_at_info_on_the_server_logger(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The keepalive INFO is emitted from the server layer (this module), whose
+    logger surfaces in the server log — unlike the onboarding-layer launcher.
+    """
+    launcher = _Launcher()
+    _wire(
+        monkeypatch,
+        launcher=launcher,
+        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")
+    assert any("kept managed sandbox sbx1 alive" in r.getMessage() for r in caplog.records)

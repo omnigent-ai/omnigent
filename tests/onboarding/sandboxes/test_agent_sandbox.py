@@ -362,17 +362,17 @@ def test_lowering_the_interval_lowers_the_floor(monkeypatch: pytest.MonkeyPatch)
     assert resolve_shutdown_window_s() == 30
 
 
-def test_keep_alive_logs_the_extend_on_the_lifecycle_logger(
+def test_keep_alive_extend_is_logged_at_debug(
     fake_clients: tuple[_FakeCore, _FakeCustom], caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    The keepalive-extend is visible at INFO on the dedicated lifecycle logger, so
-    an operator can watch the deadline march forward while a runner is live.
+    The provider logs the new deadline at debug (detail); the user-visible INFO
+    is emitted by the server keepalive loop (see test_managed_host_keepalive),
+    because onboarding-layer loggers do not surface in the server log.
     """
-    with caplog.at_level(logging.INFO, logger="omnigent.sandbox.lifecycle"):
+    with caplog.at_level(logging.DEBUG, logger="omnigent.onboarding.sandboxes.agent_sandbox"):
         _launcher().keep_alive(_SANDBOX_ID)
-    msgs = [r.getMessage() for r in caplog.records if r.name == "omnigent.sandbox.lifecycle"]
-    assert any("kept alive" in m for m in msgs), msgs
+    assert any("extended agent-sandbox" in r.getMessage() for r in caplog.records)
 
 
 # ── keep_alive ─────────────────────────────────────────

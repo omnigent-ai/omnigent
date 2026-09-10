@@ -79,13 +79,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Dedicated logger for the sandbox lifecycle transitions the server drives
-# (keepalive-extend while busy, wake from an idle suspend), so an operator can
-# watch just these — e.g. `--log-filter omnigent.sandbox.lifecycle`. Wording is
-# kept distinct from the managed-sandbox reaper's so an idle *suspend*
-# (resumable) is never read as a *terminate* (reaped for good).
-_lifecycle_logger = logging.getLogger("omnigent.sandbox.lifecycle")
-
 
 # ── Constants ──────────────────────────────────────────
 
@@ -387,10 +380,10 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
             {"spec": spec},
             _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
         )
-        # Logged only after the patch lands, so a failed wake never reads as a
-        # successful transition.
-        _lifecycle_logger.info(
-            "sandbox %s was reclaimed while idle (suspended); waking it in place",
+        # Debug detail; the user-visible "waking" INFO is the server-layer resume
+        # log. Logged after the patch lands so a failed wake never reads as success.
+        _logger.debug(
+            "patched agent-sandbox '%s' back to Running (idle wake)",
             body["metadata"]["name"],  # type: ignore[index]
         )
 
@@ -481,9 +474,7 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
                 _api_reason(exc),
             )
         else:
-            _lifecycle_logger.info(
-                "sandbox %s kept alive: shutdownTime -> %s", sandbox_id, shutdown_time
-            )
+            _logger.debug("extended agent-sandbox '%s' to %s", sandbox_id, shutdown_time)
         finally:
             self._close_clients()
 
