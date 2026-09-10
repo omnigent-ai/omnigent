@@ -45,12 +45,20 @@ from rich.text import Text
 #     render by leaking the reset's tail ``0m`` as visible text before the
 #     URL. Real URLs never contain raw control bytes (they are
 #     percent-encoded), so excluding them is always safe.
+#   - the ellipsis (…) used by display elision — it is never part of a
+#     real URL, and a fragment cut at an ellipsis has lost its tail.
 # Trailing punctuation (``.,;:!?``) is stripped in the substitution
 # callback rather than excluded by the regex — e.g. "Visit
 # https://example.com." should fire OSC 8 over the URL but leave
 # the period after the close-OSC8.
-_URL = r"https?://[^\s\)\]\>\"'<\x00-\x1f\x7f]+"
+_URL = r"https?://[^\s\)\]\>\"'<…\x00-\x1f\x7f]+"
 _URL_RE = re.compile(_URL)
+
+# Display-elision marker. A URL match that runs into an ellipsis was cut
+# for display (e.g. the 80-char tool-args summary); its true destination
+# is unknowable here, so it must not be hyperlinked at all — a link to
+# the visible fragment opens a wrong page.
+_ELLIPSIS = "…"
 
 # Match a complete pre-existing OSC 8 hyperlink block so we don't
 # re-wrap a URL that was already linkified (some agent paths emit
@@ -101,7 +109,13 @@ class LinkifyingConsole(Console):
                 renderable, highlight=render_options.highlight, markup=render_options.markup
             )
         if isinstance(renderable, Text) and not self.get_style(renderable.style).link:
-            matches = list(_URL_RE.finditer(renderable.plain))
+            plain = renderable.plain
+            matches = [
+                match
+                for match in _URL_RE.finditer(plain)
+                # Skip fragments cut by display elision — see _ELLIPSIS.
+                if plain[match.end() : match.end() + 1] != _ELLIPSIS
+            ]
             if matches:
                 renderable = renderable.copy()
                 for match in matches:
@@ -146,6 +160,9 @@ def linkify_ansi(text: str) -> str:
         # An IndexError here would mean the regex changed in a
         # way that no longer guarantees the prefix — fail loud.
         url = match.group(2)
+        # Skip fragments cut by display elision — see _ELLIPSIS.
+        if match.string[match.end(2) : match.end(2) + 1] == _ELLIPSIS:
+            return url
         trailing = ""
         while url[-1] in _TRAILING_PUNCT:
             trailing = url[-1] + trailing

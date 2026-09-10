@@ -12,6 +12,7 @@ from omnigent_ui_sdk.terminal._formatter import (
     StreamReplace,
 )
 from omnigent_ui_sdk.terminal._host import TerminalHost
+from omnigent_ui_sdk.terminal._linkify import linkify_ansi
 from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -33,6 +34,16 @@ def _styled_text(url: str) -> Text:
     text = Text(url, style="bold")
     text.stylize("cyan", 15, 55)
     return text
+
+
+def _linked_targets(output: str) -> set[str]:
+    text = Text.from_ansi(output)
+    console = Console()
+    return {
+        text.get_style_at_offset(console, offset).link
+        for offset in range(len(text.plain))
+        if text.get_style_at_offset(console, offset).link
+    }
 
 
 def _assert_link(output: str, url: str, *, label: str | None = None) -> None:
@@ -142,3 +153,41 @@ def test_real_newline_does_not_join_unrelated_text_into_link(
     host = TerminalHost(model_name="test")
     host.output(Text("https://example.com/first\nnot-a-url"))
     _assert_link(capsys.readouterr().out, "https://example.com/first")
+
+
+def test_elided_url_fragment_is_not_linked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A URL cut by display elision (…) must not be hyperlinked: its
+    full destination is unknowable, so a link would open a wrong
+    page. The tool-call summary line elides its args to 80 chars
+    this way.
+    """
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_width", lambda: 120)
+    summary = '⏵ sys_os_shell({"command": "echo Visit https://example.com/long-path/long-path/lo…'
+    host = TerminalHost(model_name="test")
+    host.output(Text(summary))
+    output = capsys.readouterr().out
+    assert not _linked_targets(output)
+    assert "…" in Text.from_ansi(output).plain
+
+
+def test_complete_url_is_linked_when_elision_cuts_later_text(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The elision guard only fires when … abuts the URL itself."""
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_width", lambda: 120)
+    host = TerminalHost(model_name="test")
+    host.output(Text("Visit https://example.com/docs before the cut he…"))
+    _assert_link(capsys.readouterr().out, "https://example.com/docs")
+
+
+def test_linkify_ansi_skips_elided_fragment_but_links_complete_urls() -> None:
+    """The raw-ANSI fallback applies the same elision rule."""
+    out = linkify_ansi("see https://example.com/long-path/lo… and https://example.org/ok")
+    assert "\x1b]8;;https://example.org/ok\x1b\\" in out
+    assert "\x1b]8;;https://example.com" not in out
+    assert "https://example.com/long-path/lo…" in out
