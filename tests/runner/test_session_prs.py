@@ -661,6 +661,24 @@ def test_pr_reads_use_structured_identity(command: str) -> None:
     assert not created
 
 
+@pytest.mark.parametrize(
+    "result,urls",
+    [
+        # Rendered output naming several PRs (a body linking another PR plus the
+        # view footer) cannot say which one the call was about.
+        (f"Fix typo\n\nSupersedes {B}.\nView this pull request on GitHub: {A}", []),
+        # A single embedded URL is unambiguous, as in comment confirmations.
+        (f"posted: [view]({A}#issuecomment-9)", [A]),
+        # A standalone result line stays authoritative over embedded prose links.
+        (f"See {B} for background\n{A}", [A]),
+    ],
+)
+def test_embedded_urls_associate_only_when_unambiguous(result: str, urls: list[str]) -> None:
+    refs, created = extract_prs("Bash", {"command": "gh pr view 42"}, result)
+    assert [ref.url for ref in refs] == urls
+    assert not created
+
+
 @pytest.mark.parametrize("envelope", [False, True])
 def test_rest_create_with_jq_and_multiline_shell(envelope: bool) -> None:
     url = "https://github.com/example/project-dev/pull/123"

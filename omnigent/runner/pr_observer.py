@@ -371,12 +371,6 @@ def extract_prs(
         text = _output_text(result)
         if re.search(r"\[exit code: [1-9]|Process exited with code [1-9]", text):
             return [], False
-        for obj in _objects(result):
-            if ref := _reference(obj.get("html_url", obj.get("url"))):
-                references.append(ref)
-        for url in re.findall(r"https://[^\s<>\"'`]+", text):
-            if ref := _reference(url):
-                references.append(ref)
         # Mixed reads/writes still associate PRs, but cannot establish creation.
         created = all(_creates_pr(tokens) for tokens in commands)
         for tokens in commands:
@@ -391,6 +385,22 @@ def extract_prs(
                     )
                 if ref:
                     references.append(ref)
+        for obj in _objects(result):
+            if ref := _reference(obj.get("html_url", obj.get("url"))):
+                references.append(ref)
+        # Standalone URL lines are gh's own operation results. URLs embedded in
+        # rendered bodies/diffs (pr view, pr diff) can name unrelated PRs, so
+        # they count only when the output is otherwise unattributed and names
+        # exactly one PR.
+        references.extend(ref for line in text.splitlines() if (ref := _reference(line.strip())))
+        if not references:
+            embedded = {
+                ref.url: ref
+                for url in re.findall(r"https://[^\s<>\"'`]+", text)
+                if (ref := _reference(url))
+            }
+            if len(embedded) == 1:
+                references.extend(embedded.values())
     else:
         name = tool_name.rsplit("__", 1)[-1].removeprefix("github_")
         if name == "write_api_call":
