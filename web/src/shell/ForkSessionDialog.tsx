@@ -92,6 +92,12 @@ import {
 // clones the source's agent.
 const SAME_AS_SOURCE = "__same__";
 
+// This dialog's pickers use the compact `text-sm` font (matching the Agent
+// field), on both the trigger value and the open dropdown's options. Items set
+// their own `text-ui`, so the option font is shrunk via a descendant selector
+// on the dropdown content rather than plain inheritance.
+const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
+
 /**
  * Compact host label for the Select item — mirrors NewChatDialog's
  * HostOption (which is private to that module).
@@ -459,6 +465,8 @@ function ForkRunConfig({
             testId="fork-session-config-model"
             models={modelSelectOptions}
             defaultLabel={defaultModelLabel(modelOptions)}
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
             componentId="fork_session.config.model"
           >
             {modelsLoading && (
@@ -483,13 +491,13 @@ function ForkRunConfig({
               valueHasNoPii
             >
               <SelectTrigger
-                className="w-full cursor-pointer"
+                className="w-full cursor-pointer text-sm"
                 data-testid="fork-session-config-effort"
                 aria-label="Reasoning effort"
               >
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
+              <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
                 <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                 {CLAUDE_NATIVE_EFFORTS.map((e) => (
                   <SelectItem key={e.value} value={e.value}>
@@ -507,6 +515,8 @@ function ForkRunConfig({
               options={CLAUDE_NATIVE_PERMISSION_MODES}
               testId="fork-session-config-permission"
               ariaLabel="Permissions"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
@@ -530,6 +540,8 @@ function ForkRunConfig({
               }
               testId="fork-session-config-approval"
               ariaLabel="Approval"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.approval"
             />
           </ForkConfigRow>
@@ -557,6 +569,8 @@ function ForkRunConfig({
             options={CURSOR_NATIVE_EXEC_MODES}
             testId="fork-session-config-cursor-mode"
             ariaLabel="Mode"
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
             componentId="fork_session.config.cursor_mode"
           />
         </ForkConfigRow>
@@ -571,6 +585,8 @@ function ForkRunConfig({
               options={AGY_NATIVE_SKIP_MODES}
               testId="fork-session-config-agy-skip"
               ariaLabel="Permissions"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
