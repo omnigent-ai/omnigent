@@ -24,7 +24,7 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
-import { authenticatedFetch } from "@/lib/identity";
+import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
@@ -1315,8 +1315,12 @@ export async function undoArchiveConversations(
   // so Undo's result is visible on the next frame — the flag flip above only
   // covers rows a refetch hasn't evicted yet, and waiting on the refetch below
   // leaves a visible gap where the user wonders whether Undo worked. Same
-  // filter-aware insertion the WS `session_added` path uses, so search lists
-  // and non-member variants are untouched.
+  // filter-aware insertion the WS `session_added` path uses (with the viewer id
+  // and delete-tombstone skip), so the "My sessions" tab (visibility="mine")
+  // still admits the owner's rows on a multi-user server — omitting the viewer
+  // id there fails the ownership check and drops the restore back onto the slow
+  // refetch. Search lists and non-member variants stay untouched.
+  const viewerId = getCurrentUserId();
   const candidates = new Map(restored.map((conv) => [conv.id, conv]));
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
@@ -1326,6 +1330,8 @@ export async function undoArchiveConversations(
       data,
       candidates,
       filtersFromConversationQueryKey(key),
+      isSessionDeleting,
+      viewerId,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
