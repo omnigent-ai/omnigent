@@ -4640,6 +4640,17 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     errors = [record for record in caplog.records if record.levelno == logging.ERROR]
     assert len(errors) == 1
     assert "3 consecutive connections but never responded" in errors[0].message
+    assert errors[0].event_name == "host_tunnel_unresponsive"
+    attributes = errors[0].attributes
+    assert attributes["host_id"] == host._identity.host_id
+    assert attributes["connection_attempt"] == 3
+    assert attributes["connection_phase"] == "receive"
+    assert attributes["upgrade_accepted"] is True
+    assert attributes["hello_sent"] is True
+    assert attributes["frame_received"] is False
+    assert attributes["consecutive_silent_connections"] == 3
+    assert attributes["connection_elapsed_ms"] >= 0
+    assert attributes["disconnect_reason"] == "transport_error"
     assert capsys.readouterr().err.count("never responded") == 1
     reconnects = [
         record.message for record in caplog.records if "Reconnecting in" in record.message
@@ -4663,11 +4674,48 @@ async def test_inbound_frame_resets_silent_connect_streak(
     _patch_connect(monkeypatch, spy)
     host = _host()
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
         await host.run()
 
     assert host._silent_connect_streak == 2
     assert not [record for record in caplog.records if record.levelno == logging.ERROR]
+    recovered = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "host_tunnel_responsive"
+    ]
+    assert len(recovered) == 1
+    assert recovered[0].attributes["connection_attempt"] == 3
+    assert recovered[0].attributes["consecutive_silent_connections"] == 2
+    assert recovered[0].attributes["frame_received"] is True
+
+
+async def test_silent_connection_diagnostics_distinguish_owner_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 1)
+    spy = _ConnectSpy([None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    async def fail_owner_lookup() -> None:
+        raise RuntimeError("private-owner-lookup-detail")
+
+    monkeypatch.setattr(host, "_ensure_owner_user_id", fail_owner_lookup)
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1
+    attributes = errors[0].attributes
+    assert attributes["connection_phase"] == "owner_lookup"
+    assert attributes["hello_sent"] is False
+    assert attributes["exception_type"] == "RuntimeError"
+    assert "private-owner-lookup-detail" not in str(attributes)
+    assert host._server_url not in str(attributes)
 
 
 async def test_connection_error_frame_fails_loudly_on_live_receive_path() -> None:
