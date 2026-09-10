@@ -84,20 +84,26 @@ async def _create_parent_session(
     return resp.json()
 
 
+_DERIVE_SUB_AGENT_NAME = "__derive_from_title__"
+
+
 def _seed_child(
     *,
     conv_store: SqlAlchemyConversationStore,
     parent_id: str,
     title: str,
     agent_id: str | None = None,
+    sub_agent_name: str | None = _DERIVE_SUB_AGENT_NAME,
 ) -> Conversation:
     """
     Create a child sub-agent conversation.
 
-    Mirrors what :func:`omnigent.tools.builtins.spawn._spawn_one` does,
-    minus the workflow start and SSE publish. The tasks table has been
-    removed — ``current_task_id``, ``current_task_status``, and
-    ``agent_name`` fields in the summary are always ``None``.
+    Mirrors what the framework spawn paths do, minus the workflow start
+    and SSE publish — including the ``sub_agent_name`` stamp every named
+    spawn writes alongside its ``"{agent_type}:{session_name}"`` title.
+    The tasks table has been removed — ``current_task_id``,
+    ``current_task_status``, and ``agent_name`` fields in the summary
+    are always ``None``.
 
     :param conv_store: Store for the child conversation.
     :param parent_id: Parent conversation id, e.g. ``"0c4b962f26d3fb76dce69d9dade142f5"``.
@@ -106,13 +112,21 @@ def _seed_child(
         e.g. ``"researcher:auth"``.
     :param agent_id: Agent id to bind to this conversation (populates
         the ``agent_id`` field in the summary).
+    :param sub_agent_name: Explicit stamp for the row. Defaults to the
+        title's pre-colon head (the named-spawn convention); pass
+        ``None`` to seed an unstamped child — a ``sys_session_create``
+        verbatim title or a Web-UI "Add agent" row.
     :returns: The created child :class:`Conversation`.
     """
+    if sub_agent_name == _DERIVE_SUB_AGENT_NAME:
+        head, sep, _ = title.partition(":")
+        sub_agent_name = head if sep else None
     return conv_store.create_conversation(
         kind="sub_agent",
         title=title,
         parent_conversation_id=parent_id,
         agent_id=agent_id,
+        sub_agent_name=sub_agent_name,
     )
 
 
@@ -853,6 +867,9 @@ async def test_child_sessions_parses_ui_added_agent_title(
         parent_id=session["id"],
         title=title,
         agent_id=session["agent_id"],
+        # The Add Agent flow stamps no sub_agent_name; the reserved "ui"
+        # head alone must keep the 3-segment parse working.
+        sub_agent_name=None,
     )
 
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
@@ -861,6 +878,80 @@ async def test_child_sessions_parses_ui_added_agent_title(
     assert row["title"] == title
     assert row["tool"] == expected_tool
     assert row["session_name"] == expected_session_name
+
+
+async def test_child_sessions_keeps_verbatim_colon_title_whole(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A verbatim colon-bearing title on an unstamped child is not split.
+
+    A ``sys_session_create`` child stores the caller's title verbatim
+    and carries no ``sub_agent_name``, so a colon in it is punctuation,
+    not the ``"<agent>:<title>"`` spawn convention. The route must keep
+    the whole title in ``session_name`` (the Agents rail's row label)
+    and leave ``tool`` unset instead of surfacing a bogus agent handle
+    with a truncated name.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="research:pricing",
+        agent_id=session["agent_id"],
+        sub_agent_name=None,
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert resp.status_code == 200
+    rows = resp.json()["data"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["id"] == child.id
+    assert row["title"] == "research:pricing"
+    # No bogus handle: attribution comes from the agent binding.
+    assert row["tool"] is None
+    # The row label carries the full verbatim title, not the tail.
+    assert row["session_name"] == "research:pricing"
+
+
+async def test_child_sessions_splits_stamped_child_with_colon_in_name(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A stamped (framework-named) child still splits on the first colon.
+
+    The named-spawn paths write ``"<agent>:<title>"`` and stamp
+    ``sub_agent_name``; that stamp is what licenses the split, so the
+    parse keeps working even when the instance name itself contains a
+    colon.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:queue:retry",
+        agent_id=session["agent_id"],
+        sub_agent_name="researcher",
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["tool"] == "researcher"
+    assert row["session_name"] == "queue:retry"
 
 
 # ── Multiple children, ordering, pagination ───────────────
