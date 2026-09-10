@@ -6,6 +6,7 @@ import {
   GitForkIcon,
   InfoIcon,
   ListIcon,
+  MessagesSquareIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
@@ -180,8 +181,99 @@ interface ChatHeaderProps {
   rightPanelOpen: boolean;
   /** Toggle the right workspace panel. */
   onToggleRightPanel: () => void;
+  /** Show dependency-free disabled chrome while the server session is pending. */
+  pending?: boolean;
   /** Gating + handlers for the mobile session-menu FAB. */
   mobileMenu: MobileSessionMenuProps;
+}
+
+const PENDING_ACTION_TITLE = "Available when the session starts";
+
+function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
+  if (isMobile) {
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        aria-label="Session actions"
+        title={PENDING_ACTION_TITLE}
+        disabled
+        className="text-muted-foreground md:hidden max-md:size-11 max-md:rounded-full"
+      >
+        <EllipsisVerticalIcon className="size-4 max-md:size-5" />
+      </Button>
+    );
+  }
+
+  return (
+    <>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-xs"
+        aria-label="Agent tools and policies"
+        title={PENDING_ACTION_TITLE}
+        disabled
+        className="hidden border-none text-muted-foreground md:inline-flex"
+      >
+        <InfoIcon className="size-4" />
+      </Button>
+      <div
+        role="group"
+        aria-label="Switch between chat and terminal"
+        aria-disabled="true"
+        title={PENDING_ACTION_TITLE}
+        className="hidden items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5 md:flex"
+      >
+        <Button
+          type="button"
+          variant="secondary"
+          size="icon-xs"
+          aria-label="Chat view"
+          aria-pressed="true"
+          disabled
+          className="border-none bg-background text-foreground shadow-sm"
+        >
+          <MessagesSquareIcon className="size-3.5" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Terminal view"
+          aria-pressed="false"
+          disabled
+          className="border-none text-muted-foreground"
+        >
+          <TerminalIcon className="size-3.5" />
+        </Button>
+      </div>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-xs"
+        aria-label="Conversation actions"
+        title={PENDING_ACTION_TITLE}
+        disabled
+        className="hidden border-none text-muted-foreground md:inline-flex"
+      >
+        <EllipsisVerticalIcon className="size-3.5" />
+      </Button>
+      <Button
+        type="button"
+        aria-label="Share session"
+        title={PENDING_ACTION_TITLE}
+        disabled
+        className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white md:inline-flex"
+      >
+        <span className="flex size-4 shrink-0 items-center justify-center">
+          <UserPlusIcon />
+        </span>
+        Share
+      </Button>
+    </>
+  );
 }
 
 /**
@@ -232,6 +324,7 @@ export function ChatHeader({
   hasRailContent,
   rightPanelOpen,
   onToggleRightPanel,
+  pending = false,
   mobileMenu,
 }: ChatHeaderProps) {
   // Dwell on the toggle for 400ms to peek the sidebar; leaving before then cancels
@@ -278,6 +371,7 @@ export function ChatHeader({
   // inline in main and no drawer is mounted.
   const workspaceItems =
     conversationId &&
+    !pending &&
     !mobileMenu.fileViewerOpen &&
     (!mobileMenu.panelOpen || mobileMenu.terminalFirst) &&
     !mobileMenu.executionLogsOpen &&
@@ -372,27 +466,29 @@ export function ChatHeader({
         )}
       </>
     ) : null;
+  const showShare = !pending && canShare;
   // Session actions (pin/share/rename/project/archive/delete). Desktop hangs
   // them off the breadcrumb title; mobile puts the kebab in the right-hand
   // control cluster instead — the native iOS/Android shells hide the
   // breadcrumb entirely (their own chrome names the session), so a
   // title-adjacent trigger would be unreachable there.
-  const conversationMenu = actionConversation ? (
-    <HeaderConversationMenu
-      conversation={actionConversation}
-      currentProject={projectName}
-      canShare={canShare}
-      canFork={canFork}
-      shareDisabled={shareDisabled}
-      shareDisabledReason={shareDisabledReason}
-      onShare={onShare}
-      onFork={onFork}
-      hasAgentInfo={isMobile && hasAgentInfo}
-      onAgentInfo={onAgentInfo}
-      viewItems={isMobile ? <ViewModeMenuItems /> : null}
-      workspaceItems={isMobile ? workspaceItems : null}
-    />
-  ) : null;
+  const conversationMenu =
+    !pending && actionConversation ? (
+      <HeaderConversationMenu
+        conversation={actionConversation}
+        currentProject={projectName}
+        canShare={canShare}
+        canFork={canFork}
+        shareDisabled={shareDisabled}
+        shareDisabledReason={shareDisabledReason}
+        onShare={onShare}
+        onFork={onFork}
+        hasAgentInfo={isMobile && hasAgentInfo}
+        onAgentInfo={onAgentInfo}
+        viewItems={isMobile ? <ViewModeMenuItems /> : null}
+        workspaceItems={isMobile ? workspaceItems : null}
+      />
+    ) : null;
   // Slack-style "Move to…" shortcut on the breadcrumb's folder tag: click it to
   // file/move/unfile the session without opening the kebab. Desktop-only (the
   // tag is hidden on mobile; the mobile menu keeps its own move item) and only
@@ -400,7 +496,7 @@ export function ChatHeader({
   // the title keeps its back-to-parent role. `null` falls back to the static
   // folder icon in the breadcrumb.
   const projectTag =
-    !isMobile && actionConversation && !isChildSession ? (
+    !pending && !isMobile && actionConversation && !isChildSession ? (
       <HeaderProjectTag
         conversationId={actionConversation.id}
         projectName={projectName}
@@ -412,7 +508,7 @@ export function ChatHeader({
   // back-to-parent link (titleLinkTo wins over titleSlot in the breadcrumb),
   // and mobile keeps the Rename item in the kebab.
   const titleSlot =
-    !isMobile && actionConversation && !isChildSession ? (
+    !pending && !isMobile && actionConversation && !isChildSession ? (
       <HeaderTitle
         conversationId={actionConversation.id}
         title={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
@@ -527,13 +623,16 @@ export function ChatHeader({
         {/* Desktop (md+) action buttons. On mobile these collapse into
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
+        {pending && <PendingHeaderActions isMobile={isMobile} />}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
-        {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
+        {!pending && conversationId && (
+          <AgentInfoButton agent={boundAgent} sessionId={conversationId} />
+        )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
-        {conversationId && <ViewModeToggle />}
-        {!actionConversation && canFork && (
+        {!pending && conversationId && <ViewModeToggle />}
+        {!pending && !actionConversation && canFork && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -558,7 +657,8 @@ export function ChatHeader({
         {/* Fallback mobile kebab for sessions with no owner-managed menu.
             It carries Fork, Share, Agent info, and the workspace-rail entries
             so a phone still needs only one trigger. */}
-        {(hasHeaderMenu || workspaceItems || canFork || (isMobile && mobileMenu.terminalFirst)) &&
+        {!pending &&
+          (hasHeaderMenu || workspaceItems || canFork || (isMobile && mobileMenu.terminalFirst)) &&
           (!actionConversation || !isMobile) && (
             // Non-modal on mobile: modal mode's body-wide pointer-events:none
             // makes the menu the sole touch target, so touch-target adjustment
@@ -624,7 +724,7 @@ export function ChatHeader({
               </DropdownMenuContent>
             </DropdownMenu>
           )}
-        {canShare && shareDisabled && shareDisabledReason ? (
+        {showShare && shareDisabled && shareDisabledReason ? (
           <Tooltip>
             <TooltipTrigger asChild>
               {/* Disabled buttons don't receive pointer events, so the wrapper
@@ -652,7 +752,7 @@ export function ChatHeader({
             </TooltipTrigger>
             <TooltipContent side="bottom">{shareDisabledReason}</TooltipContent>
           </Tooltip>
-        ) : canShare ? (
+        ) : showShare ? (
           <Button
             type="button"
             aria-label="Share session"

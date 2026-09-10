@@ -52,7 +52,7 @@ import threading
 from collections.abc import Coroutine
 from typing import Any
 
-from playwright.async_api import Route, async_playwright, expect
+from playwright.async_api import Request, Route, async_playwright, expect
 
 # Stubbed host the composer auto-selects (the tunneled runner registers no
 # host). Keyed identically in the recent-workspaces localStorage seed.
@@ -637,6 +637,13 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
         page = await browser.new_page()
         try:
             create_bodies: list[dict[str, Any]] = []
+            temp_scoped_requests: list[str] = []
+
+            def capture_temp_scoped_request(request: Request) -> None:
+                if re.search(r"/v1/sessions/temp(?::|%3A)", request.url, re.IGNORECASE):
+                    temp_scoped_requests.append(request.url)
+
+            page.on("request", capture_temp_scoped_request)
             # A gate the create handler awaits before responding, so the POST
             # stays pending long enough to observe the temporary chat.
             release_create = asyncio.Event()
@@ -720,10 +727,43 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             await expect(
                 page.get_by_test_id("message-bubble").get_by_text("set up the project", exact=True)
             ).to_be_visible()
+            await expect(
+                page.get_by_role("navigation", name="Conversation").get_by_text(
+                    "set up the project", exact=True
+                )
+            ).to_be_visible()
+            header = page.locator("header.chat-header")
+            for action_name in (
+                "Agent tools and policies",
+                "Chat view",
+                "Terminal view",
+                "Conversation actions",
+                "Share session",
+            ):
+                await expect(
+                    header.get_by_role("button", name=action_name, exact=True)
+                ).to_be_disabled()
+            await expect(
+                header.get_by_role("button", name="Collapse right panel", exact=True)
+            ).to_be_enabled()
+            workspace = page.get_by_role("complementary", name="Workspace")
+            await expect(workspace).to_be_visible()
+            for tab_name in ("Files", "Changes", "GitHub", "Agents"):
+                await expect(
+                    workspace.get_by_role("tab", name=re.compile(tab_name))
+                ).to_be_disabled()
+            await expect(workspace.get_by_role("button", name="Full screen")).to_be_disabled()
+            await expect(
+                workspace.get_by_role("separator", name="Resize panel")
+            ).to_have_attribute("aria-disabled", "true")
+            await expect(workspace.get_by_text("Starting workspace…", exact=True)).to_be_visible()
+            assert temp_scoped_requests == []
 
             # Release the create: the same chat hydrates onto the real id.
             release_create.set()
             await expect(page).to_have_url(f"{base_url}/c/{session_id}", timeout=30_000)
+            await expect(workspace.get_by_text("Starting workspace…", exact=True)).to_have_count(0)
+            await expect(workspace.get_by_role("tab", name=re.compile("Agents"))).to_be_enabled()
         finally:
             await browser.close()
 
