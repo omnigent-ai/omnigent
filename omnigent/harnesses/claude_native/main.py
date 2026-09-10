@@ -3129,6 +3129,28 @@ _BROKER_APIKEY_HELPER_TTL_MS = 900_000
 _DATABRICKS_GATEWAY_MODEL_ENV = "OMNIGENT_DATABRICKS_GATEWAY_MODEL"
 
 
+# Routing/model env keys the connect-broker path accepts from the *writable* ucode
+# ``state.json``. An explicit allowlist (mirroring the discipline of
+# ``_ucode_config_for_profile``), not a prefix match: it must exclude credential
+# keys — ``ANTHROPIC_API_KEY`` (raw key + the broker apiKeyHelper hard-fails
+# ``build_native_claude_terminal_env``) and ``ANTHROPIC_AUTH_TOKEN`` (would
+# override the helper) — and arbitrary process env.
+_CONNECT_BROKER_UCODE_ENV_ALLOWLIST = frozenset(
+    {
+        _UCODE_CLAUDE_BASE_URL_ENV,
+        _CLAUDE_CODE_USE_GATEWAY_ENV,
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV,
+        _ANTHROPIC_MODEL_ENV,
+        _ANTHROPIC_DEFAULT_FABLE_MODEL_ENV,
+        _ANTHROPIC_DEFAULT_OPUS_MODEL_ENV,
+        _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
+        _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
+    }
+)
+
+
 def _connect_broker_default_model() -> str:
     """The model a managed connect session pins: the deployment override if set,
     else the bundled Databricks Claude catalog default."""
@@ -3206,16 +3228,18 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
         # host (mirrors the opencode guard); otherwise keep the profile-derived
         # route rather than forwarding the bearer to an unverified origin.
         if ucode_base_url and https_url_on_workspace_host(ucode_base_url, workspace_host):
-            # Forward only known gateway env keys from the writable state.json
-            # (ANTHROPIC_* / CLAUDE_CODE_*) — never PATH / NODE_OPTIONS / proxy
-            # vars — into the broker-authenticated process. The base-URL guard
-            # binds where the bearer goes; this bounds the rest of the environment.
+            # Adopt only the explicit routing/model keys from the writable
+            # state.json — never credential keys or arbitrary process env — then
+            # re-pin the base URL to the guarded value.
             allowed = {
                 k: v
                 for k, v in agent_state.env.items()
-                if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))
+                if k in _CONNECT_BROKER_UCODE_ENV_ALLOWLIST
             }
             env = {**env, **allowed, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
+            # The served model is adopted only alongside a trusted (guarded) base
+            # URL; a model with no/off-host URL falls back to the catalog default
+            # rather than trusting a half-validated state entry.
             if agent_state.model:
                 model = agent_state.model
         elif ucode_base_url:
