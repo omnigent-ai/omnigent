@@ -279,10 +279,10 @@ jobs:
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL }}
           OMNIGENT_OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
-          : "${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}"
+          : "${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL}"
           : "${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}"
           mkdir -p "$HOME/.omnigent"
           # Use python to write the config safely — avoids interpolating
