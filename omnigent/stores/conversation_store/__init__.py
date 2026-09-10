@@ -1303,9 +1303,9 @@ class ConversationStore(ABC):
         """
         Clear ``runner_last_seen`` for every session bound to a runner.
 
-        Called on a graceful tunnel disconnect so the sidebar flips
-        offline immediately instead of waiting out
-        :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
+        Called on a genuine runner disconnect so the sidebar flips offline
+        immediately instead of waiting out :data:`RUNNER_LIVENESS_TTL_S`.
+        Server shutdowns preserve the lease. Must NOT bump ``updated_at``.
 
         :param runner_id: The disconnected runner's id.
         """

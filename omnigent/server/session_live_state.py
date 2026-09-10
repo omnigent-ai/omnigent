@@ -298,11 +298,11 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
 
 def clear_runner_liveness(runner_id: str) -> None:
     """
-    Clear ``runner_last_seen`` for a gracefully-disconnected runner.
+    Clear ``runner_last_seen`` for a genuine runner disconnect.
 
     Flips the sidebar offline immediately instead of waiting out the
-    freshness TTL. An ungraceful death (host / replica crash) never
-    reaches this — the TTL self-corrects it.
+    freshness TTL. Server shutdowns preserve the lease so a replacement
+    can adopt the runner; crashes rely on the TTL to self-correct.
 
     :param runner_id: The disconnected runner's id.
     """

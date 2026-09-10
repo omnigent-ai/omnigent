@@ -2107,9 +2107,9 @@ def create_app(
             if tunnel_registry.get(conn.runner_id) is not None:
                 return True
             # Another replica may hold the tunnel: it stamps
-            # ``runner_last_seen`` on connect + a periodic sweep, and
-            # clears it on graceful disconnect; an ungraceful death goes
-            # stale and self-corrects after the TTL.
+            # ``runner_last_seen`` on connect + a periodic sweep. Genuine
+            # runner disconnects clear it; crashes and server recycles rely
+            # on the TTL so a replacement can adopt a reconnecting runner.
             return runner_seen_is_fresh(conn.runner_last_seen, now=liveness_now)
 
         # Resolve host liveness for every bound host in one query, so
