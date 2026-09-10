@@ -32,6 +32,7 @@ from omnigent.inner.pi_executor import (
     _build_models_json,
     _databricks_model_wire_catalog,
     _generate_extension_js,
+    _global_pi_model_limits,
     _pi_provider_for_model,
     _PiRpcSession,
     _redact_argv_for_log,
@@ -3559,7 +3560,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 
-def test_build_models_json_registers_unknown_model_with_routed_provider() -> None:
+def test_build_models_json_registers_unknown_model_with_routed_provider(tmp_path: Path) -> None:
     """A model outside the static Databricks lists is registered so Pi resolves it.
 
     Reproduces the OpenRouter failure: ``moonshotai/kimi-k2.6`` routes to
@@ -3575,6 +3576,9 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
         "or-key",
         {"openai": "https://openrouter.ai/api/v1"},
         model="moonshotai/kimi-k2.6",
+        # Empty agent dir: the entry below is asserted exactly, so it must not
+        # pick up limits from the developer's real ~/.pi/agent/models.json.
+        global_agent_dir=tmp_path,
     )
     completions = result["providers"]["databricks-completions"]
     # The run model is registered (so Pi resolves it) under the provider
@@ -3593,6 +3597,121 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
         for name in ("databricks", "databricks-anthropic")
         for m in result["providers"][name]["models"]
     )
+
+
+def _write_global_models_json(agent_dir: Path, providers: dict[str, object]) -> None:
+    """Write a global Pi ``models.json`` into *agent_dir*.
+
+    :param agent_dir: Stands in for ``~/.pi/agent``.
+    :param providers: The ``providers`` mapping to serialize.
+    """
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "models.json").write_text(
+        json.dumps({"providers": providers}), encoding="utf-8"
+    )
+
+
+def test_dynamic_model_carries_limits_from_global_models_json(tmp_path: Path) -> None:
+    """A dynamically-registered entry adopts the limits the user declared.
+
+    Catalog entries already carry ``contextWindow``/``maxTokens`` via
+    ``pi_model_json_entry``; the dynamic-registration path did not, so Pi
+    applied its own 128000/16384 defaults and began auto-compacting at
+    ``contextWindow - maxTokens`` (~111.6k tokens) against a gateway
+    declaring far more. The provider name in the user's file is deliberately
+    unrelated to the generated one, so ids are matched across all providers.
+    """
+    _write_global_models_json(
+        tmp_path,
+        {
+            "moose": {
+                "models": [
+                    {"id": "glm-5.2", "contextWindow": 1_048_576, "maxTokens": 1_048_576},
+                ]
+            }
+        },
+    )
+    result = _build_models_json(
+        "https://unused.example.com",
+        "key",
+        {"openai": "https://gateway.example.com/v1"},
+        model="glm-5.2",
+        global_agent_dir=tmp_path,
+    )
+    entry = next(
+        e for e in result["providers"]["databricks-completions"]["models"] if e["id"] == "glm-5.2"
+    )
+    assert entry["contextWindow"] == 1_048_576
+    assert entry["maxTokens"] == 1_048_576
+
+
+def test_dynamic_model_absent_from_global_models_json_declares_no_limits(
+    tmp_path: Path,
+) -> None:
+    """An id the user never declared is left on Pi's defaults, not guessed."""
+    _write_global_models_json(
+        tmp_path, {"moose": {"models": [{"id": "other-model", "contextWindow": 999}]}}
+    )
+    result = _build_models_json(
+        "https://unused.example.com",
+        "key",
+        {"openai": "https://gateway.example.com/v1"},
+        model="glm-5.2",
+        global_agent_dir=tmp_path,
+    )
+    entry = next(
+        e for e in result["providers"]["databricks-completions"]["models"] if e["id"] == "glm-5.2"
+    )
+    assert "contextWindow" not in entry
+    assert "maxTokens" not in entry
+
+
+def test_global_pi_model_limits_missing_file_is_empty(tmp_path: Path) -> None:
+    """No global models.json degrades to current behaviour rather than raising."""
+    assert _global_pi_model_limits(tmp_path) == {}
+
+
+def test_global_pi_model_limits_ignores_malformed_declarations(tmp_path: Path) -> None:
+    """Malformed shapes and non-positive/boolean values are skipped, not carried."""
+    _write_global_models_json(
+        tmp_path,
+        {
+            "not-a-dict": [],
+            "bad-models": {"models": "nope"},
+            "mixed": {
+                "models": [
+                    "not-a-dict",
+                    {"no": "id"},
+                    {"id": 17, "contextWindow": 10},
+                    # ``bool`` is an ``int`` subclass — must not be read as a limit.
+                    {"id": "bool-limits", "contextWindow": True, "maxTokens": 0},
+                    {"id": "partial", "maxTokens": 8192},
+                ]
+            },
+        },
+    )
+    limits = _global_pi_model_limits(tmp_path)
+    # Only the one usable declaration survives, and only its usable key.
+    assert limits == {"partial": {"maxTokens": 8192}}
+
+
+def test_global_pi_model_limits_unreadable_file_is_empty(tmp_path: Path) -> None:
+    """Invalid JSON yields no limits instead of blocking a spawn."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models.json").write_text("{not json", encoding="utf-8")
+    assert _global_pi_model_limits(tmp_path) == {}
+
+
+def test_global_pi_model_limits_first_provider_declaring_an_id_wins(tmp_path: Path) -> None:
+    """A duplicated id resolves to the first provider that declared it."""
+    _write_global_models_json(
+        tmp_path,
+        {
+            "first": {"models": [{"id": "dup", "contextWindow": 111}]},
+            "second": {"models": [{"id": "dup", "contextWindow": 222}]},
+        },
+    )
+    assert _global_pi_model_limits(tmp_path)["dup"]["contextWindow"] == 111
 
 
 def test_build_models_json_known_catalog_model_not_duplicated() -> None:

@@ -693,6 +693,68 @@ def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
     return redacted
 
 
+# Limit keys carried from the user's global Pi ``models.json`` onto entries
+# this module registers dynamically.
+_PI_LIMIT_KEYS: tuple[str, ...] = ("contextWindow", "maxTokens")
+
+
+def _global_pi_model_limits(
+    global_agent_dir: pathlib.Path | None = None,
+) -> dict[str, _JsonObject]:
+    """Index declared context/output limits from the user's global ``models.json``.
+
+    A dynamically-registered entry declares no limits, so Pi falls back to its
+    own defaults (``contextWindow`` 128000, ``maxTokens`` 16384) and begins
+    auto-compacting at ``contextWindow - maxTokens`` (~111.6k tokens) — far
+    below what these gateway models actually accept. The user's global
+    ``~/.pi/agent/models.json`` declares the real numbers, so reuse them.
+    Gateway mode relocates Pi's agent root to a per-session temp dir and
+    :func:`~omnigent.inner.pi_settings.prepare_managed_pi_agent_dir` copies
+    only ``settings.json``, so the generated ``models.json`` is the sole
+    carrier of these limits.
+
+    Ids are matched exactly across *every* provider in that file: the provider
+    name there is unrelated to the generated one (e.g. ``moose`` there vs.
+    ``databricks-completions`` here). First provider declaring an id wins.
+
+    Never raises: an absent, unreadable or malformed file yields ``{}``, which
+    leaves callers on Pi's default behaviour rather than blocking a spawn.
+
+    :param global_agent_dir: Override for tests; defaults to
+        :data:`~omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR`.
+    :returns: Model id → whichever of ``contextWindow``/``maxTokens`` are
+        present as positive integers.
+    """
+    from omnigent.inner.pi_settings import DEFAULT_PI_AGENT_DIR, _read_settings_file
+
+    agent_root = global_agent_dir if global_agent_dir is not None else DEFAULT_PI_AGENT_DIR
+    providers = _read_settings_file(agent_root / "models.json").get("providers")
+    if not isinstance(providers, dict):
+        return {}
+    limits: dict[str, _JsonObject] = {}
+    for provider in providers.values():
+        if not isinstance(provider, dict):
+            continue
+        declared_models = provider.get("models")
+        if not isinstance(declared_models, list):
+            continue
+        for declared in declared_models:
+            if not isinstance(declared, dict):
+                continue
+            model_id = declared.get("id")
+            if not isinstance(model_id, str):
+                continue
+            declared_limits: _JsonObject = {}
+            for key in _PI_LIMIT_KEYS:
+                value = declared.get(key)
+                # ``bool`` is an ``int`` subclass; a JSON ``true`` is not a limit.
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    declared_limits[key] = value
+            if declared_limits:
+                limits.setdefault(model_id, declared_limits)
+    return limits
+
+
 def _build_models_json(
     host: str,
     token: str,
@@ -701,6 +763,8 @@ def _build_models_json(
     catalog_models: Sequence[model_catalog.ModelEntry] = (),
     model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
     openai_wire_api: str | None = None,
+    *,
+    global_agent_dir: pathlib.Path | None = None,
 ) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
     """Build a Pi ``models.json`` with protocol-specific gateway providers.
@@ -728,6 +792,9 @@ def _build_models_json(
         wire surfaces. Missing GPT metadata defaults to Responses.
     :param openai_wire_api: Configured wire for a generic OpenAI-compatible
         provider. ``None`` defaults generic providers to Chat Completions.
+    :param global_agent_dir: Override for tests; where the user's global Pi
+        ``models.json`` is read from for declared limits. Defaults to
+        :data:`~omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR`.
     :returns: Pi ``models.json`` contents.
     """
     h = host.rstrip("/")
@@ -878,6 +945,13 @@ def _build_models_json(
             entry: _JsonObject = {"id": model, "input": ["text", "image"]}
             if pi_model_is_reasoning(model):
                 entry["reasoning"] = True
+            # Carry any limits the user's global models.json declares for this
+            # id. Catalog entries already get theirs via
+            # ``pi_model_json_entry``; without the same treatment here Pi
+            # applies 128000/16384 and starts auto-compacting at
+            # ``contextWindow - maxTokens`` (~111.6k), truncating long runs on
+            # models that accept far more. A no-op when the id is absent.
+            entry.update(_global_pi_model_limits(global_agent_dir).get(model, {}))
             provider["models"] = [*provider["models"], entry]
     return config
 
