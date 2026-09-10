@@ -81,6 +81,11 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
   const addNote = button("+ Note", () => create("markdown"));
   const addCode = button("+ Cell", () => create("code"));
   header.append(title, mode, refresh, addNote, addCode);
+  const recovery = button("Repair version history", () => repairHistory());
+  recovery.hidden = true;
+  header.append(recovery);
+  const storageStatus = textElement("div", "", "notice");
+  storageStatus.setAttribute("role", "status");
   const summary = textElement("div", "Loading the session-bound document…", "summary");
   const notice = textElement("div", "", "notice");
   notice.setAttribute("role", "status");
@@ -91,7 +96,7 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
     "Use Chat to ask the agent to change the notebook, run cells, or work with files.",
     "hint",
   );
-  pane.append(header, summary, notice, body, hint);
+  pane.append(header, summary, storageStatus, notice, body, hint);
   root.append(style, pane);
 
   let snapshot = null,
@@ -116,8 +121,13 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
     const blocked = !snapshot || saving || reading || state.drafts.size > 0;
     addNote.disabled = blocked;
     addCode.disabled = blocked;
+    recovery.disabled = !snapshot || saving || reading;
+    if (state.storageFailure) {
+      addNote.disabled = true;
+      addCode.disabled = true;
+    }
     if (state.pendingCreate) {
-      addNote.textContent = "Retry add";
+      addNote.textContent = state.storageFailure ? "Add needs review" : "Retry add";
       addCode.disabled = true;
     } else addNote.textContent = "+ Note";
   }
@@ -132,6 +142,7 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
       const message = value.error || value.detail || `Notebook request failed (${response.status})`;
       const error = new Error(typeof message === "string" ? message : JSON.stringify(message));
       error.status = response.status;
+      error.outcome = value;
       throw error;
     }
     return value;
@@ -177,6 +188,16 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
     }
     state.binding = value.binding_id;
     snapshot = value;
+    const history = value.history_status;
+    recovery.hidden = false;
+    recovery.textContent =
+      state.storageFailure || (history && history.status !== "recorded")
+        ? "Repair version history"
+        : "Verify version history";
+    storageStatus.textContent =
+      history && history.status !== "recorded"
+        ? `Version history: ${history.status}. Repair records saved bytes only; no action is repeated.`
+        : "";
     title.textContent = value.document_name;
     summary.textContent = `Session ${sessionId} · ${value.format.toUpperCase()} · revision ${value.revision.slice(0, 12)}`;
     render();
@@ -195,7 +216,8 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
       const value = await readJSON(response);
       if (disposed || generation !== current) return;
       accept(value);
-      if (manual)
+      if (state.storageError) report(state.storageError, !state.storageVerified);
+      else if (manual)
         report(
           state.drafts.size
             ? "Refreshed; your unsaved drafts are retained."
@@ -255,9 +277,10 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
               ? "Unsaved draft."
               : "";
     card.save.textContent = draft?.pending ? "Retry same save" : "Save";
-    card.save.disabled = !draft || saving || reading || !node.editable;
+    card.save.disabled =
+      !draft || saving || reading || !node.editable || Boolean(draft?.storageFailure);
     card.discard.disabled = !draft || saving;
-    card.compare.hidden = !changed;
+    card.compare.hidden = !changed && !draft?.storageFailure;
     card.output.textContent = prettyJSON(node.output_text || "");
     if (node.output_truncated) card.output.textContent += "\n[Output truncated]";
     card.output.hidden = !node.output_text && !node.output_truncated;
@@ -332,6 +355,52 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
     }
     busy();
   }
+  async function inspectStorageFailure(error) {
+    state.storageVerified = false;
+    state.storageFailure = true;
+    recovery.hidden = false;
+    state.storageError =
+      error.message +
+      " Current state is loaded for review; no edit was replayed. Your draft is retained.";
+    try {
+      const current = await readJSON(await fetcher(endpoint, { cache: "no-store" }));
+      if (!disposed) accept(current);
+    } catch {
+      state.storageError += " Current document could not be refreshed.";
+    }
+    error.message = state.storageError;
+  }
+  async function repairHistory() {
+    if (!snapshot || saving || reading || disposed) return;
+    saving = true;
+    busy();
+    try {
+      const current = await readJSON(
+        await fetcher(endpoint.replace(/document$/, "recover-history"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Docloop-Edit": "1" },
+          body: JSON.stringify({ revision: snapshot.revision, binding_id: snapshot.binding_id }),
+        }),
+      );
+      if (disposed) return;
+      accept(current);
+      state.storageVerified = true;
+      state.storageFailure = false;
+      recovery.textContent = "Verify version history";
+      state.pendingCreate = null;
+      state.storageError =
+        "Version history verified. No edit or execution was repeated. Your draft remains for review.";
+      report(state.storageError);
+    } catch (error) {
+      if (!disposed) report(error.message, true);
+    } finally {
+      if (!disposed) {
+        saving = false;
+        render();
+        busy();
+      }
+    }
+  }
   async function postEdit(payload) {
     writeController = new AbortController();
     return readJSON(
@@ -387,6 +456,11 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
         );
     } catch (error) {
       if (disposed || state.drafts.get(id) !== draft || draft.pending !== payload) return;
+      if (error.outcome?.retry_action === false) {
+        draft.pending = null;
+        draft.storageFailure = true;
+        await inspectStorageFailure(error);
+      }
       if ([400, 403, 404, 409, 413, 415].includes(error.status)) draft.pending = null;
       if (!disposed)
         report(
@@ -420,6 +494,7 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
     dialog.append(
       button("Keep editing; do not rebase", () => dialog.close()),
       button("Rebase my draft onto this revision", () => {
+        draft.storageFailure = false;
         draft.original = current.source;
         draft.revision = comparedRevision;
         draft.binding = comparedBinding;
@@ -470,6 +545,7 @@ export function mountNotebookPane(host, { sessionId, fetcher, pollMs = 2500 }) {
       }
     } catch (error) {
       if (disposed || state.pendingCreate !== payload) return;
+      if (error.outcome?.retry_action === false) await inspectStorageFailure(error);
       if ([400, 403, 404, 409, 413, 415].includes(error.status)) state.pendingCreate = null;
       if (!disposed)
         report(

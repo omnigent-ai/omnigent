@@ -218,3 +218,82 @@ async def test_unconfirmed_write_is_not_retried_or_reported_as_unapplied(status)
         assert response.json()["outcome"] == "unknown"
         assert "untrusted" not in response.text
         assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_storage_outcomes_and_explicit_recovery_survive_both_relays():
+    seen = []
+    failure = {
+        "code": "save_failed",
+        "phase": "history_ref",
+        "installed": True,
+        "durability": "confirmed",
+        "history": "pending",
+        "history_durability": "unknown",
+        "attempted_revision": "c" * 64,
+        "current_revision": "c" * 64,
+        "revision": "c" * 64,
+        "retry_action": False,
+        "error": "private runner exception text",
+        "connection_headers": {"secret": "hidden"},
+    }
+
+    harness_app = FastAPI()
+
+    @harness_app.api_route(
+        "/v1/sessions/{sid}/docloop/{operation}", methods=["GET", "PATCH", "POST"]
+    )
+    async def harness(request: Request, sid: str, operation: str):
+        seen.append(
+            {"path": request.url.path, "headers": request.headers, "body": await request.body()}
+        )
+        if request.method == "PATCH":
+            return JSONResponse(failure, status_code=503)
+        result = snapshot()
+        result["revision"] = "c" * 64
+        result["history_status"] = {"status": "recorded", "private": "hidden"}
+        return JSONResponse(result)
+
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(harness_app), base_url="http://harness"
+    )
+    transport = LiveHarnessNotebookTransport(
+        SimpleNamespace(get_client=AsyncMock(return_value=client))
+    )
+    app = FastAPI()
+    app.include_router(notebook_gateway_router(allow, transport))
+    runner_client = httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://runner")
+    assigned = AssignedRunnerNotebookTransport(
+        SimpleNamespace(
+            client_for_session_resources=lambda sid: SimpleNamespace(client=runner_client)
+        )
+    )
+    central = FastAPI()
+    central.include_router(notebook_gateway_router(allow, assigned))
+    async with (
+        client,
+        runner_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(central), base_url="http://central"
+        ) as browser,
+    ):
+        headers = {"X-Docloop-Edit": "1"}
+        response = await browser.patch(URL, json=EDIT, headers=headers)
+        assert response.status_code == 503 and response.json()["retry_action"] is False
+        assert response.json()["current_revision"] == "c" * 64
+        assert "private" not in response.text and "secret" not in response.text
+        recovery = {"binding_id": "b" * 64, "revision": "c" * 64}
+        path = URL.replace("document", "recover-history")
+        assert (await browser.post(path, json=recovery)).status_code == 403
+        result = await browser.post(path, json=recovery, headers=headers)
+        assert result.status_code == 200 and result.json()["history_status"] == {
+            "status": "recorded"
+        }
+        assert len(seen) == 2 and seen[1]["path"] == path
+        assert seen[1]["headers"]["x-docloop-edit"] == "1"
+        assert json.loads(seen[1]["body"]) == recovery
+        failure["phase"] = "untrusted arbitrary private details"
+        rejected = await browser.patch(URL, json=EDIT, headers=headers)
+        assert (
+            rejected.status_code == 502 and rejected.json()["code"] == "notebook_edit_unconfirmed"
+        )

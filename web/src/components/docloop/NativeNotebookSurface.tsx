@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { authenticatedFetch, fetchWithBrowserSession } from "@/lib/identity";
 import { mountNotebookPane } from "./notebook-pane.mjs";
+import { NotebookStorageStatus } from "./NotebookStorageStatus";
 import { NotebookHistory } from "./NotebookHistory";
 
 const LOAD_TIMEOUT_MS = 120_000;
@@ -165,6 +166,7 @@ export function NativeNotebookSurface({
   if (!started) return null;
   return (
     <div className="docloop-notebook-surface">
+      {history && <NotebookStorageStatus sessionId={sessionId} active={active} />}
       <div className="docloop-notebook-toolbar" aria-label="Notebook editor">
         {!org && (
           <button

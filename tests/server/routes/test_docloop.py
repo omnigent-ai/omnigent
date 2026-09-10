@@ -20,7 +20,7 @@ class Identity(AuthProvider):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["GET", "PATCH"])
+@pytest.mark.parametrize("method", ["GET", "PATCH", "POST"])
 @pytest.mark.parametrize(
     ("user", "level", "expected"),
     [
@@ -76,7 +76,11 @@ async def test_auth_and_grants_precede_runner_lookup(db_uri, method, user, level
         transport=httpx.ASGITransport(app=app), base_url="http://central"
     ) as client:
         response = await client.request(
-            method, f"/v1/sessions/{session.id}/docloop/document", headers=headers, json=edit
+            method,
+            f"/v1/sessions/{session.id}/docloop/"
+            + ("recover-history" if method == "POST" else "document"),
+            headers=headers,
+            json={k: edit[k] for k in ("revision", "binding_id")} if method == "POST" else edit,
         )
     assert response.status_code == expected, response.text
     assert lookups == ([session.id] if expected == 503 else [])

@@ -22,7 +22,7 @@ SESSION = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 MAX_REQUEST = 1024 * 1024
 MAX_RESPONSE = 16 * 1024 * 1024
-Method = Literal["GET", "PATCH"]
+Method = Literal["GET", "PATCH", "POST"]
 Authorize = Callable[[Request, str], Awaitable[None]]
 
 
@@ -64,6 +64,67 @@ def _response(value: dict, status: int = 200) -> JSONResponse:
 
 def _error(status: int, code: str, message: str, outcome: str) -> JSONResponse:
     return _response({"error": message, "code": code, "outcome": outcome}, status)
+
+
+def _storage_failure(value):
+    """Project only the closed storage contract; never relay runner exception text."""
+    if not isinstance(value, dict) or value.get("code") not in {"save_failed", "history_failed"}:
+        raise ValueError("Invalid storage error")
+    phases = {
+        "encode",
+        "read",
+        "temporary_write",
+        "replace",
+        "history_init",
+        "history_pending",
+        "history_version",
+    }
+    phases |= {
+        prefix + phase
+        for prefix in ("", "preserve_", "recovery_")
+        for phase in (
+            "read",
+            "file_sync",
+            "directory_sync",
+            "history_read",
+            "history_blob",
+            "history_index",
+            "history_tree",
+            "history_commit",
+            "history_ref",
+            "history_sync",
+            "history_worktree_index",
+        )
+    }
+    if value.get("phase") not in phases or value.get("retry_action") is not False:
+        raise ValueError("Invalid storage phase/retry contract")
+    if value.get("installed") is not None and type(value["installed"]) is not bool:
+        raise ValueError("Invalid storage outcome")
+    if value.get("durability") not in {"confirmed", "unknown", "unchanged"}:
+        raise ValueError("Invalid storage durability")
+    if value.get("history") not in {"recorded", "pending", "unavailable", "unknown"}:
+        raise ValueError("Invalid storage history")
+    result = {
+        k: value[k]
+        for k in ("code", "phase", "installed", "durability", "history", "retry_action")
+    }
+    for key in ("attempted_revision", "current_revision", "revision"):
+        revision = value.get(key)
+        if revision is not None and (
+            not isinstance(revision, str) or not DIGEST.fullmatch(revision)
+        ):
+            raise ValueError("Invalid storage revision")
+        result[key] = revision
+    durability = value.get("history_durability", "unknown")
+    if durability not in {"confirmed", "unknown"}:
+        raise ValueError("Invalid history durability")
+    result["history_durability"] = durability
+    installed = "Document updated;" if result["installed"] is True else "Save incomplete;"
+    result["error"] = (
+        f"{installed} history {result['history']}, history durability {durability}. "
+        "No action was retried. Verify version history and inspect the current document."
+    )
+    return result
 
 
 def _snapshot(value: object, session_id: str) -> dict:
@@ -133,7 +194,7 @@ def _snapshot(value: object, session_id: str) -> dict:
         raise ValueError("Invalid notebook capabilities")
     if caps["direct_execution"]:
         raise ValueError("No new executor through the notebook gateway")
-    return {
+    result = {
         "schema_version": 1,
         "session_id": session_id,
         "binding_id": value["binding_id"],
@@ -144,6 +205,17 @@ def _snapshot(value: object, session_id: str) -> dict:
         "capabilities": {k: caps[k] for k in ("edit_source", "create_node", "direct_execution")},
         "execution_hint": "Ask this session's agent to execute cells.",
     }
+    if "history_status" in value:
+        history = value["history_status"]
+        if not isinstance(history, dict) or history.get("status") not in {
+            "recorded",
+            "pending",
+            "unborn",
+            "unavailable",
+        }:
+            raise ValueError("Invalid history status")
+        result["history_status"] = {"status": history["status"]}
+    return result
 
 
 def notebook_gateway_router(
@@ -157,8 +229,8 @@ def notebook_gateway_router(
 ) -> APIRouter:
     """Forward only notebook reads/edits after central authorization.
 
-    Any failure after dispatch retains an unknown edit outcome. The browser may
-    explicitly retry its original change_id; the gateway never retries a write.
+    Validated storage failures retain their explicit no-replay outcome. Transport
+    failures leave edits unconfirmed; the gateway never retries a write.
     """
     if not callable(authorize) or not callable(getattr(transport, "forward_notebook", None)):
         raise ValueError("Authorizer and assigned-runner notebook transport are required")
@@ -190,7 +262,7 @@ def notebook_gateway_router(
             )
         body = b""
         submitted: dict = {}
-        if method == "PATCH":
+        if method in {"PATCH", "POST"}:
             if (
                 request.headers.get("x-docloop-edit") != "1"
                 or request.headers.get("sec-fetch-site") == "cross-site"
@@ -264,11 +336,15 @@ def notebook_gateway_router(
                         submitted[key]
                     ):
                         raise ValueError("Invalid edit identity")
-                from uuid import UUID
+                if method == "POST":
+                    if set(submitted) != {"revision", "binding_id"}:
+                        raise ValueError("Invalid history recovery envelope")
+                else:
+                    from uuid import UUID
 
-                change = UUID(submitted["change_id"])
-                if change.version != 4 or str(change) != submitted["change_id"]:
-                    raise ValueError("Invalid edit receipt identity")
+                    change = UUID(submitted["change_id"])
+                    if change.version != 4 or str(change) != submitted["change_id"]:
+                        raise ValueError("Invalid edit receipt identity")
             except (ValueError, TypeError, KeyError, UnicodeError, AttributeError, RecursionError):
                 return _error(
                     400,
@@ -297,7 +373,11 @@ def notebook_gateway_router(
             return _error(
                 504,
                 "notebook_timeout",
-                "Runner timed out; retry the same save to confirm its outcome",
+                (
+                    "History verification timed out; refresh before verifying again"
+                    if method == "POST"
+                    else "Runner timed out; retry the same save to confirm its outcome"
+                ),
                 outcome,
             )
         except Exception:  # noqa: BLE001 — transport errors may include private runner details.
@@ -312,8 +392,10 @@ def notebook_gateway_router(
                 raise ValueError("Invalid reply status")
             payload = json.loads(reply.body)
             if reply.status == 200:
-                if method == "GET":
+                if method in {"GET", "POST"}:
                     result = _snapshot(payload, session_id)
+                    if method == "POST" and result["binding_id"] != submitted["binding_id"]:
+                        raise ValueError("Recovery receipt binding changed")
                 else:
                     if not isinstance(payload, dict) or type(payload.get("replayed")) is not bool:
                         raise ValueError("Invalid edit receipt")
@@ -327,7 +409,13 @@ def notebook_gateway_router(
                 if len(response.body) > max_response_bytes:
                     raise ValueError("Projected reply exceeds its bound")
                 return response
-            if method == "PATCH":
+            if (
+                reply.status == 503
+                and isinstance(payload, dict)
+                and payload.get("code") in {"save_failed", "history_failed"}
+            ):
+                return _response(_storage_failure(payload), 503)
+            if method in {"PATCH", "POST"}:
                 if (
                     isinstance(payload, dict)
                     and reply.status == 409
@@ -371,6 +459,13 @@ def notebook_gateway_router(
                         },
                         503,
                     )
+                if method == "POST":
+                    return _error(
+                        502,
+                        "history_verification_unconfirmed",
+                        "History verification is unconfirmed; refresh before verifying again",
+                        "unknown",
+                    )
                 # An older runner can commit, then fail while building its view.
                 # Never turn a downstream 4xx into permission to mint a new ID.
                 return _error(
@@ -403,6 +498,10 @@ def notebook_gateway_router(
     @router.get("/sessions/{session_id}/docloop/document")
     async def get_document(request: Request, session_id: str):
         return await handle(request, session_id, "GET")
+
+    @router.post("/sessions/{session_id}/docloop/recover-history")
+    async def recover_history(request: Request, session_id: str):
+        return await handle(request, session_id, "POST")
 
     @router.patch("/sessions/{session_id}/docloop/document")
     async def edit_document(request: Request, session_id: str):

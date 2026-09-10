@@ -30,11 +30,12 @@ async def _forward(
 ) -> NotebookReply:
     # Credentials belong to the existing client; browser headers never cross a hop.
     headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
-    if method == "PATCH":
+    if method in {"PATCH", "POST"}:
         headers.update({"Content-Type": "application/json", "X-Docloop-Edit": "1"})
     async with client.stream(
         method,
-        f"/v1/sessions/{session_id}/docloop/document",
+        f"/v1/sessions/{session_id}/docloop/"
+        + ("recover-history" if method == "POST" else "document"),
         content=body,
         headers=headers,
         follow_redirects=False,
