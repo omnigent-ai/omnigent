@@ -4257,24 +4257,6 @@ def _generate_ucode_configs() -> None:
     )
 
 
-def _configure_jcode_gateway() -> None:
-    """At host boot, have jcode configure the Databricks gateway provider (OSS connect).
-
-    The OSS managed-connect gate: only when the host-only ``[omnigent]`` profile +
-    broker sidecar are present (the owner linked Databricks via the connect flow)
-    do we drive jcode, similar to _generate_ucode_configs. Wraps the reusable
-    :func:`omnigent.host.jcode_databricks.configure_jcode_for_sandbox` (a background,
-    best-effort configuration of jcode's provider), so the runner can inject a fresh
-    bearer at spawn time without jcode needing to know about the broker.
-
-    Gated the same way as ucode: absent sidecar or no broker command → pure no-op,
-    so non-connected hosts are untouched.
-    """
-    from omnigent.host.jcode_databricks import configure_jcode_for_sandbox
-
-    configure_jcode_for_sandbox()
-
-
 def run_host_process(
     server_url: str,
     config_path: Path | None = None,
@@ -4378,7 +4360,6 @@ def run_host_process(
 
     configure_host_databricks(server_url, identity.host_id)
     _generate_ucode_configs()
-    _configure_jcode_gateway()
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)

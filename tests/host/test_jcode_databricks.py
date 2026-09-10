@@ -1,4 +1,4 @@
-"""Tests for jcode Databricks gateway configuration."""
+"""Tests for jcode Databricks managed-connect gateway wiring (session-private config)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import tomllib
 
 from omnigent.host import databricks_credential as dc
 from omnigent.host import jcode_databricks as jd
@@ -18,379 +19,161 @@ from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # These tests model a managed sandbox host, where IS_SANDBOX=1 is baked into
-    # the image and the host token is present.
+    # Model a managed sandbox host (IS_SANDBOX baked into the image).
     monkeypatch.setenv("IS_SANDBOX", "1")
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "host-tok")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    # Route per-session jcode runtime dirs under tmp_path (not the real /tmp), and
-    # isolate jcode's config.toml reads to tmp_path (not the developer's real ~/.jcode).
+    # Per-session jcode homes are created under the harness tmp parent → tmp_path.
     monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(tmp_path))
-    monkeypatch.setenv("JCODE_HOME", str(tmp_path / ".jcode"))
+    # Pin the model so _jcode_default_model doesn't depend on the bundled catalog.
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "system.ai.claude-sonnet-4-6")
 
 
-def _write_profile_and_sidecar(tmp_path: Path) -> None:
-    """Helper to write a host profile and broker sidecar."""
-    cfg_path = tmp_path / ".databrickscfg"
-    cfg_path.write_text("[omnigent]\nhost = https://ws.example\n")
+def _write_sidecar(tmp_path: Path, workspace_host: str = "https://ws.example") -> None:
+    """Write the broker sidecar (the managed-connect signal)."""
     sidecar_path = tmp_path / dc._SIDECAR_NAME
-    sidecar_data = {
-        "server": "https://omni.example",
-        "host_id": "host-1",
-        "host_token": "host-tok",
-        "workspace_host": "https://ws.example",
-    }
-    sidecar_path.write_text(json.dumps(sidecar_data))
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "server": "https://omni.example",
+                "host_id": "host-1",
+                "host_token": "host-tok",
+                "workspace_host": workspace_host,
+            }
+        )
+    )
     os.chmod(sidecar_path, 0o600)
 
 
-def _write_jcode_config(
-    tmp_path: Path, base_url: str = "https://ws.example/ai-gateway/openai/v1"
-) -> None:
-    """Write jcode's config.toml with a `dbx` provider at *base_url* (as boot would)."""
-    jcode_home = tmp_path / ".jcode"
-    jcode_home.mkdir(parents=True, exist_ok=True)
-    (jcode_home / "config.toml").write_text(
-        f'[providers.dbx]\ntype = "openai-compatible"\nbase_url = "{base_url}"\n'
-    )
-
-
-class TestBuildJcodeConfigureCommand:
-    """Tests for build_jcode_configure_command."""
-
-    def test_builds_openai_compatible_provider_command(self) -> None:
-        """The command configures jcode's openai-compatible provider with Databricks gateway."""
-        cmd = jd.build_jcode_configure_command(
-            ["/usr/bin/jcode"],
-            host="https://ws.example.databricks.com",
-            model="system.ai.claude-sonnet-4-6",
-        )
-        assert cmd == [
-            "/usr/bin/jcode",
-            "provider",
-            "add",
-            "dbx",
-            "--base-url",
-            "https://ws.example.databricks.com/ai-gateway/openai/v1",
-            "--model",
-            "system.ai.claude-sonnet-4-6",
-            "--auth",
-            "bearer",
-            "--api-key-env",
-            "JCODE_DBX_TOKEN",
-            "--set-default",
-            "--overwrite",
-            "--quiet",
-        ]
-
-    def test_strips_trailing_slash_from_host(self) -> None:
-        """A trailing slash on the host is stripped before constructing base_url."""
-        cmd = jd.build_jcode_configure_command(
-            ["jcode"],
-            host="https://ws.example/",
-            model="system.ai.claude-sonnet-4-6",
-        )
-        assert "--base-url" in cmd
-        idx = cmd.index("--base-url")
-        assert cmd[idx + 1] == "https://ws.example/ai-gateway/openai/v1"
-
-    def test_raises_when_host_is_empty(self) -> None:
-        """Raises ValueError when host is empty or whitespace."""
-        with pytest.raises(ValueError, match="host and model must not be empty"):
-            jd.build_jcode_configure_command(
-                ["jcode"], host="", model="system.ai.claude-sonnet-4-6"
-            )
-
-    def test_raises_when_model_is_empty(self) -> None:
-        """Raises ValueError when model is empty or whitespace."""
-        with pytest.raises(ValueError, match="host and model must not be empty"):
-            jd.build_jcode_configure_command(["jcode"], host="https://ws.example", model="")
+def _mock_broker(
+    monkeypatch: pytest.MonkeyPatch, *, workspace: str, bearer: str = "fresh-bearer"
+) -> Mock:
+    m = Mock(return_value=(workspace, bearer))
+    monkeypatch.setattr("omnigent.host.jcode_databricks.fetch_broker_bearer", m)
+    return m
 
 
 class TestConnectJcodeGatewayEnv:
-    """Tests for connect_jcode_gateway_env."""
+    def test_returns_none_without_sidecar(self, tmp_path: Path) -> None:
+        """No broker sidecar → complete no-op (not a managed-connect host)."""
+        assert jd.connect_jcode_gateway_env(session_id="s") is None
 
-    def test_returns_none_without_sidecar(
+    def test_writes_session_private_config_and_returns_env(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Returns None when no sidecar is present (not a managed-connect host)."""
-        result = jd.connect_jcode_gateway_env()
-        assert result is None
-
-    def test_returns_bearer_and_runtime_dir_with_sidecar(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Returns a dict with JCODE_DBX_TOKEN and JCODE_RUNTIME_DIR when sidecar is present."""
-        _write_profile_and_sidecar(tmp_path)
-        _write_jcode_config(tmp_path)
-
-        # Monkeypatch fetch_broker_bearer to return a fresh bearer.
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.fetch_broker_bearer",
-            Mock(return_value=("https://ws.example", "fresh-bearer-token")),
-        )
+        """On a connect host: a session-private JCODE_HOME with a config.toml pinning the
+        dbx gateway provider, a per-session runtime dir, and the bearer — with base_url
+        set by Omnigent (not read from a shared file) and the bearer never on disk."""
+        _write_sidecar(tmp_path)
+        _mock_broker(monkeypatch, workspace="https://ws.example", bearer="tok-123")
 
         result = jd.connect_jcode_gateway_env(session_id="sess-abc")
         assert result is not None
-        assert result["JCODE_DBX_TOKEN"] == "fresh-bearer-token"
-        assert "JCODE_RUNTIME_DIR" in result
-        # Runtime dir exists and sits under the harness tmp parent's run-dir root
-        # (the leaf is a hash of the session id, not the raw id — no path traversal).
-        runtime_dir = result["JCODE_RUNTIME_DIR"]
-        assert Path(runtime_dir).exists()
-        assert str(tmp_path) in runtime_dir
-        assert "/omnigent-jcode-run/" in runtime_dir
-        assert "sess-abc" not in runtime_dir  # raw id never appears in the path
+        assert result["JCODE_DBX_TOKEN"] == "tok-123"
 
-    def test_same_session_reuses_dir_new_session_differs_and_always_mints(
+        home = Path(result["JCODE_HOME"])
+        assert home.exists() and str(tmp_path) in str(home)
+        assert "/omnigent-jcode-run/" in str(home)
+        assert "sess-abc" not in str(home)  # raw session id never in the path
+        # Runtime dir is under the private home.
+        assert result["JCODE_RUNTIME_DIR"] == str(home / "run")
+        assert Path(result["JCODE_RUNTIME_DIR"]).exists()
+
+        # Config pins the dbx provider at the workspace openai gateway, by construction.
+        cfg = tomllib.loads((home / "config.toml").read_text())
+        assert cfg["provider"]["default_provider"] == "dbx"
+        dbx = cfg["providers"]["dbx"]
+        assert dbx["base_url"] == "https://ws.example/ai-gateway/openai/v1"
+        assert dbx["type"] == "openai-compatible"
+        assert dbx["api_key_env"] == "JCODE_DBX_TOKEN"
+        # The bearer VALUE must never be persisted — only the env-var name.
+        assert "tok-123" not in (home / "config.toml").read_text()
+
+    def test_home_0700_and_config_0600(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A session reuses one runtime dir across spawns (no per-turn leak); a
-        different session gets its own dir; and the bearer is minted on every call
-        (so a re-spawn after the jcode daemon idle-exits re-authenticates)."""
-        _write_profile_and_sidecar(tmp_path)
-        _write_jcode_config(tmp_path)
-        fetch = Mock(return_value=("https://ws.example", "bearer"))
-        monkeypatch.setattr("omnigent.host.jcode_databricks.fetch_broker_bearer", fetch)
+        _write_sidecar(tmp_path)
+        _mock_broker(monkeypatch, workspace="https://ws.example")
+        result = jd.connect_jcode_gateway_env(session_id="s")
+        assert result is not None
+        home = Path(result["JCODE_HOME"])
+        assert stat.S_IMODE(os.stat(home).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(home / "config.toml").st_mode) == 0o600
 
+    def test_same_session_reuses_home_new_session_differs_and_always_mints(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _write_sidecar(tmp_path)
+        fetch = _mock_broker(monkeypatch, workspace="https://ws.example")
         a1 = jd.connect_jcode_gateway_env(session_id="A")
         a2 = jd.connect_jcode_gateway_env(session_id="A")
         b1 = jd.connect_jcode_gateway_env(session_id="B")
-        assert a1 is not None and a2 is not None and b1 is not None
-        # Same session → same dir (idempotent, no accumulation); different session differs.
-        assert a1["JCODE_RUNTIME_DIR"] == a2["JCODE_RUNTIME_DIR"]
-        assert b1["JCODE_RUNTIME_DIR"] != a1["JCODE_RUNTIME_DIR"]
-        # The broker is called on every spawn — refresh stays correct for re-spawns.
-        assert fetch.call_count == 3
-
-    def test_runtime_dir_has_0700_permissions(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """The created runtime dir has 0700 permissions (owner only)."""
-        _write_profile_and_sidecar(tmp_path)
-        _write_jcode_config(tmp_path)
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.fetch_broker_bearer",
-            Mock(return_value=("https://ws.example", "bearer")),
-        )
-
-        result = jd.connect_jcode_gateway_env()
-        assert result is not None
-        runtime_dir = result["JCODE_RUNTIME_DIR"]
-        assert stat.S_IMODE(os.stat(runtime_dir).st_mode) == 0o700
+        assert a1 and a2 and b1
+        assert a1["JCODE_HOME"] == a2["JCODE_HOME"]  # same session → same home
+        assert b1["JCODE_HOME"] != a1["JCODE_HOME"]  # different session → different
+        assert fetch.call_count == 3  # bearer minted every spawn
 
     def test_returns_none_when_broker_fails(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Returns None when the broker is unreachable or raises an exception."""
-        _write_profile_and_sidecar(tmp_path)
+        _write_sidecar(tmp_path)
         monkeypatch.setattr(
             "omnigent.host.jcode_databricks.fetch_broker_bearer",
             Mock(side_effect=Exception("broker down")),
         )
-
-        result = jd.connect_jcode_gateway_env()
-        assert result is None
+        assert jd.connect_jcode_gateway_env(session_id="s") is None
 
     def test_returns_none_when_broker_declines(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Returns None when the broker returns None (owner not connected)."""
-        _write_profile_and_sidecar(tmp_path)
+        _write_sidecar(tmp_path)
         monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.fetch_broker_bearer",
-            Mock(return_value=None),
+            "omnigent.host.jcode_databricks.fetch_broker_bearer", Mock(return_value=None)
         )
-
-        result = jd.connect_jcode_gateway_env()
-        assert result is None
-
-    def test_returns_none_on_runtime_dir_creation_failure(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Returns None if the runtime dir cannot be created."""
-        _write_profile_and_sidecar(tmp_path)
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.fetch_broker_bearer",
-            Mock(return_value=("https://ws.example", "bearer")),
-        )
-        # Monkeypatch os.makedirs (used by _session_runtime_dir) to raise.
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.os.makedirs",
-            Mock(side_effect=OSError("permission denied")),
-        )
-
-        result = jd.connect_jcode_gateway_env(session_id="sess-x")
-        assert result is None
+        assert jd.connect_jcode_gateway_env(session_id="s") is None
 
     def test_returns_none_on_workspace_mismatch(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Reconnect guard: if the broker vends a workspace different from the sidecar's
-        pinned workspace (owner reconnected elsewhere), the bearer is withheld."""
-        _write_profile_and_sidecar(tmp_path)  # sidecar pins https://ws.example
-        _write_jcode_config(tmp_path)
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.fetch_broker_bearer",
-            Mock(return_value=("https://other.example", "bearer-for-other-ws")),
-        )
-
-        result = jd.connect_jcode_gateway_env()
-        assert result is None
-
-    def test_withholds_bearer_when_dbx_base_url_off_workspace(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Origin guard: if config.toml's dbx base_url points at another origin (a
-        tampered/rewritten config), the bearer is withheld even though the broker + sidecar
-        agree — the token must never be forwarded off the pinned workspace."""
-        _write_profile_and_sidecar(tmp_path)  # workspace https://ws.example
-        _write_jcode_config(tmp_path, base_url="https://evil.example/ai-gateway/openai/v1")
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.fetch_broker_bearer",
-            Mock(return_value=("https://ws.example", "bearer")),
-        )
-
+        """Reconnect guard: broker vends a different workspace than the sidecar pins."""
+        _write_sidecar(tmp_path, workspace_host="https://ws.example")
+        _mock_broker(monkeypatch, workspace="https://other.example")
         assert jd.connect_jcode_gateway_env(session_id="s") is None
 
-    def test_withholds_bearer_when_no_dbx_config(
+    def test_malicious_session_id_stays_within_root(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Fail closed: no config.toml (e.g. boot-config hasn't landed yet) → no bearer,
-        rather than forwarding a token to a provider that isn't pinned to the workspace."""
-        _write_profile_and_sidecar(tmp_path)  # note: no _write_jcode_config
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.fetch_broker_bearer",
-            Mock(return_value=("https://ws.example", "bearer")),
-        )
-
-        assert jd.connect_jcode_gateway_env(session_id="s") is None
+        """A traversal-shaped session id can't escape the run-dir root (hashed leaf)."""
+        _write_sidecar(tmp_path)
+        _mock_broker(monkeypatch, workspace="https://ws.example")
+        result = jd.connect_jcode_gateway_env(session_id="../../etc/evil")
+        assert result is not None
+        root = os.path.realpath(str(tmp_path / "omnigent-jcode-run"))
+        assert os.path.realpath(result["JCODE_HOME"]).startswith(root + os.sep)
 
 
-class TestConfigureJcodeForSandbox:
-    """Tests for configure_jcode_for_sandbox (daemon thread behavior)."""
+class TestDefaultModel:
+    def test_env_override_wins(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _write_sidecar(tmp_path)
+        _mock_broker(monkeypatch, workspace="https://ws.example")
+        monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-claude-sonnet-4-6")
+        result = jd.connect_jcode_gateway_env(session_id="s")
+        assert result is not None
+        cfg = tomllib.loads((Path(result["JCODE_HOME"]) / "config.toml").read_text())
+        assert cfg["providers"]["dbx"]["default_model"] == "databricks-claude-sonnet-4-6"
 
-    def test_noop_without_managed_connect_signals(
+    def test_falls_back_to_catalog_without_override(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """No sidecar/profile → the gate fails before building or running anything."""
-        # No sidecar written, so the gate is not satisfied.
-        build_spy = Mock()
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.build_jcode_configure_command", build_spy
-        )
-        jd.configure_jcode_for_sandbox()
-        build_spy.assert_not_called()
-
-    def test_noop_when_jcode_not_found(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """jcode binary absent → no configure command is built or run."""
-        _write_profile_and_sidecar(tmp_path)
-        monkeypatch.setattr("omnigent.host.jcode_databricks.shutil.which", Mock(return_value=None))
-        build_spy = Mock()
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.build_jcode_configure_command", build_spy
-        )
-
-        jd.configure_jcode_for_sandbox()
-        build_spy.assert_not_called()
-
-    def test_spawns_configure_thread_when_ready(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """With all gates satisfied, the configure command is built for the connected
-        workspace's openai gateway (resolved synchronously, before the daemon thread)."""
-        _write_profile_and_sidecar(tmp_path)  # workspace https://ws.example
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.shutil.which",
-            Mock(return_value="/usr/bin/jcode"),
-        )
-        monkeypatch.setattr(
-            "omnigent.models.model_catalog.resolve_catalog_model",
-            lambda *a, **k: SimpleNamespace(model_id="databricks-claude-from-catalog"),
-        )
-        original_build = jd.build_jcode_configure_command
-
-        def capture_build(*args, **kwargs):
-            capture_build.argv = original_build(*args, **kwargs)
-            return capture_build.argv
-
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.build_jcode_configure_command", capture_build
-        )
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.subprocess.run",
-            Mock(return_value=Mock(return_value=Mock(returncode=0))),
-        )
-
-        jd.configure_jcode_for_sandbox()
-
-        assert "provider" in capture_build.argv and "add" in capture_build.argv
-        assert "https://ws.example/ai-gateway/openai/v1" in capture_build.argv
-
-    def test_uses_env_override_for_model(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Uses OMNIGENT_DATABRICKS_GATEWAY_MODEL_ENV override if set."""
-        _write_profile_and_sidecar(tmp_path)
-        monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "system.ai.claude-opus-4-6")
-
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.shutil.which",
-            Mock(return_value="/usr/bin/jcode"),
-        )
-
-        # Mock build_jcode_configure_command to capture the call.
-        original_build = jd.build_jcode_configure_command
-
-        def capture_build(*args, **kwargs):
-            capture_build.last_model = kwargs.get("model")
-            return original_build(*args, **kwargs)
-
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.build_jcode_configure_command", capture_build
-        )
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.subprocess.run", Mock(return_value=Mock(returncode=0))
-        )
-
-        jd.configure_jcode_for_sandbox()
-
-        # The model is resolved synchronously (before the daemon thread starts), so the
-        # capture is populated by the time configure_jcode_for_sandbox returns.
-        assert capture_build.last_model == "system.ai.claude-opus-4-6"
-
-    def test_falls_back_to_catalog_default_without_override(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """With no OMNIGENT_DATABRICKS_GATEWAY_MODEL, the default is resolved from the
-        model catalog (not hardcoded), mirroring claude-native."""
-        _write_profile_and_sidecar(tmp_path)
+        _write_sidecar(tmp_path)
+        _mock_broker(monkeypatch, workspace="https://ws.example")
         monkeypatch.delenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", raising=False)
         monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.shutil.which",
-            Mock(return_value="/usr/bin/jcode"),
-        )
-        # Stub the catalog so the test doesn't depend on the bundled default id.
-        monkeypatch.setattr(
             "omnigent.models.model_catalog.resolve_catalog_model",
             lambda *a, **k: SimpleNamespace(model_id="databricks-claude-from-catalog"),
         )
-        original_build = jd.build_jcode_configure_command
-
-        def capture_build(*args, **kwargs):
-            capture_build.last_model = kwargs.get("model")
-            return original_build(*args, **kwargs)
-
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.build_jcode_configure_command", capture_build
-        )
-        monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.subprocess.run", Mock(return_value=Mock(returncode=0))
-        )
-
-        jd.configure_jcode_for_sandbox()
-
-        assert capture_build.last_model == "databricks-claude-from-catalog"
+        result = jd.connect_jcode_gateway_env(session_id="s")
+        assert result is not None
+        cfg = tomllib.loads((Path(result["JCODE_HOME"]) / "config.toml").read_text())
+        assert cfg["providers"]["dbx"]["default_model"] == "databricks-claude-from-catalog"

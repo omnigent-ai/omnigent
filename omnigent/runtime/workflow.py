@@ -1583,26 +1583,21 @@ def _build_acp_cli_spawn_env(
     if permission_mode is not None:
         env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
 
-    # Managed-connect support for jcode: inject a fresh bearer and per-spawn runtime dir.
-    # The jcode daemon is spawned per-session with its own config, and the bearer is never
-    # persisted. This is a no-op when not connected (connect_jcode_gateway_env returns None).
+    # Managed-connect support for jcode: point it at a session-private JCODE_HOME
+    # (with a config.toml pinning the gateway provider) + a fresh broker bearer. A
+    # no-op when not connected (connect_jcode_gateway_env returns None).
     if harness == "jcode":
-        from omnigent.host.jcode_databricks import (
-            _JCODE_BEARER_ENV,
-            _JCODE_RUNTIME_DIR_ENV,
-            connect_jcode_gateway_env,
-        )
+        from omnigent.host.jcode_databricks import connect_jcode_gateway_env
 
         gateway_env = connect_jcode_gateway_env(session_id=session_id)
         if gateway_env is not None:
             env.update(gateway_env)
-            # Extend HARNESS_ACP_ENV_PASSTHROUGH to include the bearer and runtime dir names.
-            # Preserve any existing value, dedupe, and join.
+            # The ACP wrap forwards only passthrough-named vars to the jcode subprocess,
+            # so name every managed-connect var (JCODE_DBX_TOKEN / JCODE_HOME /
+            # JCODE_RUNTIME_DIR). Preserve any existing value, dedupe, and join.
             existing = env.get("HARNESS_ACP_ENV_PASSTHROUGH", "").split(",")
-            all_names = {name.strip() for name in existing if name.strip()}
-            all_names.add(_JCODE_BEARER_ENV)
-            all_names.add(_JCODE_RUNTIME_DIR_ENV)
-            env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(sorted(all_names))
+            names = {n.strip() for n in existing if n.strip()} | set(gateway_env)
+            env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(sorted(names))
 
     return env
 
