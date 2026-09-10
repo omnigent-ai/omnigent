@@ -28,15 +28,11 @@ import {
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
 import { useNavigate, useParams } from "@/lib/routing";
-import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
+  type ComposerKeyIntent,
   COMPOSER_COLUMN_WIDTH,
-  ComposerInputArea,
-  ComposerTextarea,
-  ComposerActionRow,
-  ComposerActionGroup,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
@@ -105,7 +101,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
-import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -2593,7 +2589,6 @@ function ComposerImpl({
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(value, setValue, textareaRef);
-  const isComposingRef = useRef(false);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -3314,33 +3309,10 @@ function ComposerImpl({
     });
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
-      return;
-    }
-
-    // Touch-primary newline behavior outranks autocomplete and desktop submit
-    // preferences. Leave the event untouched so the textarea inserts it.
-    if (preventsKeyboardSubmit && e.key === "Enter") {
-      return;
-    }
-
-    const shouldSubmitFromKeyboard = isComposerSendKey(
-      {
-        key: e.key,
-        shiftKey: e.shiftKey,
-        metaKey: e.metaKey,
-        ctrlKey: e.ctrlKey,
-        altKey: e.altKey,
-        isComposing: e.nativeEvent.isComposing,
-      },
-      submitWithModEnter,
-      preventsKeyboardSubmit,
-    );
-    // Plain Enter still completes an open suggestion. In Mod+Enter mode, the
-    // explicit send chord bypasses suggestions so the modifier has one meaning.
-    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
-
+  const handleKeyDown = (
+    e: KeyboardEvent<HTMLTextAreaElement>,
+    { shouldSubmitFromKeyboard, shouldPreferSendOverCompletion }: ComposerKeyIntent,
+  ) => {
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
@@ -3541,64 +3513,136 @@ function ComposerImpl({
         </ComposerWorkspaceBar>
       </div>
       <ChatComposer
+        keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
         ref={bindComposerCard}
         className={cn(
           "mx-auto",
           COMPOSER_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
-      >
-        {/* Slash-command suggestions — floats above the composer box */}
-        {menuOpen && (
-          <SlashCommandMenu
-            query={menuQuery}
-            activeIndex={menuIndex}
-            onSelect={applyMenuSelection}
-            commands={slashCommands}
-          />
-        )}
-        {/* "@"-file-mention browser — native coding-agent sessions only.
+        input={{
+          ref: textareaRef,
+          value,
+          onChange: (e) => {
+            setValue(e.target.value);
+            dirtyRef.current = true;
+            if (commandError !== null) setCommandError(null);
+            // A rejected attachment is never added, so there's no chip to
+            // remove and nothing else would ever clear this. Left sticky it
+            // reads as a blocker on a composer the user can actually submit.
+            if (attachmentError !== null) setAttachmentError(null);
+            // Recompute the active "@"-mention from the caret on every
+            // keystroke (native coding-agent sessions — ``mentionEnabled``).
+            setMention(
+              mentionEnabled
+                ? detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length)
+                : null,
+            );
+            // Treat user-driven changes as exiting recall mode. Recall-
+            // driven setValue toggles `recallingRef` first so we skip the
+            // reset for that one tick.
+            if (recallingRef.current) recallingRef.current = false;
+            else resetCursor();
+          },
+          onFocus: () => {
+            // From here the textarea's caret is one the user placed, so
+            // dictation inserts there instead of at the end of the draft.
+            dictation.noteFocus();
+          },
+          onKeyDown: handleKeyDown,
+          onBlur: () => {
+            // Dismiss the "@"-mention menu when focus leaves the textarea
+            // (clicking a chip's ✕, the Send button, or another field).
+            // Menu rows ``preventDefault`` on mousedown so selecting an entry
+            // keeps focus and does NOT blur — this only fires for genuine
+            // focus-out, where the lingering menu would otherwise float.
+            dismissMention();
+          },
+          onPaste: handlePaste,
+          onScroll: (e) => {
+            // Keep the overlay's scroll position locked to the textarea's.
+            if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
+          },
+          "aria-label": "Message the agent",
+          placeholder:
+            readOnlyReason !== null
+              ? readOnlyReason
+              : isReadOnly
+                ? "You have read-only access to this session"
+                : unreachable
+                  ? "Session offline — reconnect below to continue"
+                  : hasPendingElicitation
+                    ? "Respond to the pending request above to continue"
+                    : disabled
+                      ? "Waiting for agents…"
+                      : isStreaming
+                        ? "Send a follow-up (queued) — Esc to stop"
+                        : "Send a message…",
+          rows: 1,
+          disabled: disabled || isReadOnly || unreachable,
+          "data-slash-command": composerIsCommand ? "true" : undefined,
+          "data-has-draft": hasDraft ? "true" : undefined,
+          className: cn(
+            // Hand glyph painting to the overlay while a command is drafted;
+            // the caret stays visible via caret-foreground.
+            composerIsCommand && "text-transparent caret-foreground",
+          ),
+        }}
+        slots={{
+          beforeInput: (
+            <>
+              {/* Slash-command suggestions — floats above the composer box */}
+              {menuOpen && (
+                <SlashCommandMenu
+                  query={menuQuery}
+                  activeIndex={menuIndex}
+                  onSelect={applyMenuSelection}
+                  commands={slashCommands}
+                />
+              )}
+              {/* "@"-file-mention browser — native coding-agent sessions only.
             Also shown (as a loading row) while the listing is still fetching,
             so "@" isn't silently dead during runner cold-boot or a drill-in. */}
-        {(mentionOpen || mentionListingPending) && (
-          <FileMentionMenu
-            currentDir={mentionDir}
-            activeIndex={mentionIndex}
-            entries={mentionEntries}
-            loading={mentionListingPending}
-            onOpenDir={openMentionDir}
-            onAttach={attachMention}
-          />
-        )}
-        {/* Quote chips — one per quoted selection, shown above the textarea */}
-        {replyQuotes.length > 0 && (
-          <div className="flex flex-col gap-1.5 px-4 pt-3 pb-0">
-            {replyQuotes.map((quote, i) => (
-              <div key={quote.id} className="flex items-start gap-2">
-                <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-sm text-muted-foreground">
-                  <span className="block truncate">
-                    {quote.text.length > 120 ? `${quote.text.slice(0, 120)}…` : quote.text}
-                  </span>
+              {(mentionOpen || mentionListingPending) && (
+                <FileMentionMenu
+                  currentDir={mentionDir}
+                  activeIndex={mentionIndex}
+                  entries={mentionEntries}
+                  loading={mentionListingPending}
+                  onOpenDir={openMentionDir}
+                  onAttach={attachMention}
+                />
+              )}
+              {/* Quote chips — one per quoted selection, shown above the textarea */}
+              {replyQuotes.length > 0 && (
+                <div className="flex flex-col gap-1.5 px-4 pt-3 pb-0">
+                  {replyQuotes.map((quote, i) => (
+                    <div key={quote.id} className="flex items-start gap-2">
+                      <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-sm text-muted-foreground">
+                        <span className="block truncate">
+                          {quote.text.length > 120 ? `${quote.text.slice(0, 120)}…` : quote.text}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => onRemoveQuote(i)}
+                        className="mt-0.5 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+                        aria-label="Remove quote"
+                      >
+                        <XIcon className="size-3.5" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => onRemoveQuote(i)}
-                  className="mt-0.5 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
-                  aria-label="Remove quote"
-                >
-                  <XIcon className="size-3.5" />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-        {/* Highlight overlay: a textarea can only paint its text one color, so
+              )}
+              {/* Highlight overlay: a textarea can only paint its text one color, so
             to tint just the `/skill` token we hide the textarea's own glyphs
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
-        <ComposerInputArea>
-          {composerIsCommand && (
+            </>
+          ),
+          inputBackdrop: composerIsCommand && (
             <div
               ref={backdropRef}
               aria-hidden
@@ -3617,286 +3661,211 @@ function ComposerImpl({
                 );
               })()}
             </div>
-          )}
-          <ComposerTextarea
-            ref={textareaRef}
-            value={value}
-            onChange={(e) => {
-              setValue(e.target.value);
-              dirtyRef.current = true;
-              if (commandError !== null) setCommandError(null);
-              // A rejected attachment is never added, so there's no chip to
-              // remove and nothing else would ever clear this. Left sticky it
-              // reads as a blocker on a composer the user can actually submit.
-              if (attachmentError !== null) setAttachmentError(null);
-              // Recompute the active "@"-mention from the caret on every
-              // keystroke (native coding-agent sessions — ``mentionEnabled``).
-              setMention(
-                mentionEnabled
-                  ? detectMentionAt(
-                      e.target.value,
-                      e.target.selectionStart ?? e.target.value.length,
-                    )
-                  : null,
-              );
-              // Treat user-driven changes as exiting recall mode. Recall-
-              // driven setValue toggles `recallingRef` first so we skip the
-              // reset for that one tick.
-              if (recallingRef.current) recallingRef.current = false;
-              else resetCursor();
-            }}
-            onFocus={() => {
-              // From here the textarea's caret is one the user placed, so
-              // dictation inserts there instead of at the end of the draft.
-              dictation.noteFocus();
-            }}
-            onCompositionStart={() => {
-              isComposingRef.current = true;
-            }}
-            onCompositionEnd={() => {
-              isComposingRef.current = false;
-            }}
-            onKeyDown={handleKeyDown}
-            onBlur={() => {
-              // Dismiss the "@"-mention menu when focus leaves the textarea
-              // (clicking a chip's ✕, the Send button, or another field).
-              // Menu rows ``preventDefault`` on mousedown so selecting an entry
-              // keeps focus and does NOT blur — this only fires for genuine
-              // focus-out, where the lingering menu would otherwise float.
-              dismissMention();
-            }}
-            onPaste={handlePaste}
-            onScroll={(e) => {
-              // Keep the overlay's scroll position locked to the textarea's.
-              if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
-            }}
-            aria-label="Message the agent"
-            placeholder={
-              readOnlyReason !== null
-                ? readOnlyReason
-                : isReadOnly
-                  ? "You have read-only access to this session"
-                  : unreachable
-                    ? "Session offline — reconnect below to continue"
-                    : hasPendingElicitation
-                      ? "Respond to the pending request above to continue"
-                      : disabled
-                        ? "Waiting for agents…"
-                        : isStreaming
-                          ? "Send a follow-up (queued) — Esc to stop"
-                          : "Send a message…"
-            }
-            rows={1}
-            // A pending elicitation must NOT disable the textarea: disabling
-            // ejects focus to <body> mid-word and later keystrokes vanish.
-            // The draft stays typable; sending is still gated (submit() +
-            // the disabled Send button) until the prompt is answered.
-            disabled={disabled || isReadOnly || unreachable}
-            data-slash-command={composerIsCommand ? "true" : undefined}
-            // Full send intent (text OR attachments OR mentions) for the
-            // approve hotkey's drafting guard, which only sees this element.
-            data-has-draft={hasDraft ? "true" : undefined}
-            className={cn(
-              // Hand glyph painting to the overlay while a command is drafted;
-              // the caret stays visible via caret-foreground.
-              composerIsCommand && "text-transparent caret-foreground",
-            )}
-          />
-        </ComposerInputArea>
-        {/* File chips — shown below textarea when files are attached */}
-        {files.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-            {files.map((file, i) => (
-              <span
-                key={attachmentKey(file)}
-                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-              >
-                {file.type.startsWith("image/") ? (
-                  <ImageIcon className="size-3 shrink-0" />
-                ) : (
-                  <FileTextIcon className="size-3 shrink-0" />
-                )}
-                <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
-                <button
-                  type="button"
-                  onClick={() => removeFile(i)}
-                  className="ml-0.5 rounded-full hover:text-foreground"
-                  aria-label={`Remove ${file.name || "image.png"}`}
-                >
-                  <XIcon className="size-3" />
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-        {/* Rejected-attachment feedback: unsupported type or too large */}
-        {attachmentError !== null && (
-          <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
-            {attachmentError}
-          </div>
-        )}
-        {/* "@"-mention chips — one per tagged workspace file/folder. Each is
+          ),
+          attachments: (
+            <>
+              {/* File chips — shown below textarea when files are attached */}
+              {files.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                  {files.map((file, i) => (
+                    <span
+                      key={attachmentKey(file)}
+                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                    >
+                      {file.type.startsWith("image/") ? (
+                        <ImageIcon className="size-3 shrink-0" />
+                      ) : (
+                        <FileTextIcon className="size-3 shrink-0" />
+                      )}
+                      <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
+                      <button
+                        type="button"
+                        onClick={() => removeFile(i)}
+                        className="ml-0.5 rounded-full hover:text-foreground"
+                        aria-label={`Remove ${file.name || "image.png"}`}
+                      >
+                        <XIcon className="size-3" />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {/* Rejected-attachment feedback: unsupported type or too large */}
+              {attachmentError !== null && (
+                <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
+                  {attachmentError}
+                </div>
+              )}
+              {/* "@"-mention chips — one per tagged workspace file/folder. Each is
             delivered as a "[Attached: <path>]" marker at send time. */}
-        {mentionedItems.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-            {mentionedItems.map((item, i) => (
-              <span
-                key={mentionItemPath(item)}
-                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-              >
-                {item.isDir ? (
-                  <FolderIcon className="size-3 shrink-0" />
-                ) : (
-                  <FileTextIcon className="size-3 shrink-0" />
-                )}
-                <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
-                  @{item.path}
-                  {item.isDir ? "/" : ""}
-                </span>
-                {item.lineRange && (
-                  <span className="shrink-0">
-                    :{item.lineRange.start}-{item.lineRange.end}
-                  </span>
-                )}
-                <button
-                  type="button"
-                  onClick={() => removeMentionedItem(i)}
-                  className="ml-0.5 rounded-full hover:text-foreground"
-                  aria-label={`Remove ${item.path}`}
-                >
-                  <XIcon className="size-3" />
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-        {/* Inline slash-command feedback: errors and /help output */}
-        {commandError !== null && (
-          <div className="px-4 pb-2 text-sm text-muted-foreground whitespace-pre-wrap">
-            {commandError}
-          </div>
-        )}
-        <ComposerActionRow data-testid="composer-action-row">
-          <ComposerActionGroup side="left">
-            <ComposerAddMenu
-              disabled={false}
-              attachDisabled={disabled || isReadOnly || hasPendingElicitation}
-              onAttach={() => fileInputRef.current?.click()}
-              showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
-              onGoal={() => setGoalDialogOpen(true)}
-              goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
-              goalActive={goal !== null}
-              goalDescription={goal ? "View or update your goal" : "Set a goal for this session"}
-              showPlan={showCodexPlanMode}
-              onPlan={() => void toggleCodexPlanMode()}
-              planDisabled={isReadOnly || planModeBusy}
-              planActive={codexPlanMode}
-              planLabel={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
-            />
-            {!subAgentLabel && composerSessionId && (
-              <HostBadge
-                sessionId={composerSessionId}
-                appearance="composer"
-                readOnly={isReadOnly}
-                onReconnect={onShowReconnectHelp}
+              {mentionedItems.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                  {mentionedItems.map((item, i) => (
+                    <span
+                      key={mentionItemPath(item)}
+                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                    >
+                      {item.isDir ? (
+                        <FolderIcon className="size-3 shrink-0" />
+                      ) : (
+                        <FileTextIcon className="size-3 shrink-0" />
+                      )}
+                      <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
+                        @{item.path}
+                        {item.isDir ? "/" : ""}
+                      </span>
+                      {item.lineRange && (
+                        <span className="shrink-0">
+                          :{item.lineRange.start}-{item.lineRange.end}
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => removeMentionedItem(i)}
+                        className="ml-0.5 rounded-full hover:text-foreground"
+                        aria-label={`Remove ${item.path}`}
+                      >
+                        <XIcon className="size-3" />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {/* Inline slash-command feedback: errors and /help output */}
+              {commandError !== null && (
+                <div className="px-4 pb-2 text-sm text-muted-foreground whitespace-pre-wrap">
+                  {commandError}
+                </div>
+              )}
+            </>
+          ),
+        }}
+        actions={{
+          leading: (
+            <>
+              <ComposerAddMenu
+                disabled={false}
+                attachDisabled={disabled || isReadOnly || hasPendingElicitation}
+                onAttach={() => fileInputRef.current?.click()}
+                showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
+                onGoal={() => setGoalDialogOpen(true)}
+                goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
+                goalActive={goal !== null}
+                goalDescription={goal ? "View or update your goal" : "Set a goal for this session"}
+                showPlan={showCodexPlanMode}
+                onPlan={() => void toggleCodexPlanMode()}
+                planDisabled={isReadOnly || planModeBusy}
+                planActive={codexPlanMode}
+                planLabel={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
               />
-            )}
-            {(showClaudePermissionMode || showCodexApprovalMode) && (
-              <ComposerPermissionPicker
-                label="Permissions"
-                value={permissionLabel || "Permissions"}
-                options={permissionOptions}
-                disabled={isReadOnly || unreachable || configBusy}
-                onSelect={(mode) => void changePermission(mode)}
-              />
-            )}
-          </ComposerActionGroup>
-          <ComposerActionGroup side="right">
-            <div className="flex min-w-0 items-center rounded-lg">
-              <ComposerModelSource
-                modelPickerKind={modelPickerKind}
-                codexModelOptions={codexModelOptions}
-                costRoutingEligible={costRoutingEligible}
-              >
-                <SessionHarnessPicker
-                  busy={configBusy}
-                  busyRef={configBusyRef}
-                  setBusy={setConfigBusy}
-                  agentName={
-                    subAgentName ??
-                    agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                    agents?.[0]?.name ??
-                    null
-                  }
-                  harnessLabel={harnessLabel}
-                  showModels={showModels}
-                  showEffort={showEffort}
-                  showClaudePermissionMode={showClaudePermissionMode}
-                  showCodexApprovalMode={showCodexApprovalMode}
-                  effortLevels={effortLevels}
+              {!subAgentLabel && composerSessionId && (
+                <HostBadge
+                  sessionId={composerSessionId}
+                  appearance="composer"
+                  readOnly={isReadOnly}
+                  onReconnect={onShowReconnectHelp}
+                />
+              )}
+              {(showClaudePermissionMode || showCodexApprovalMode) && (
+                <ComposerPermissionPicker
+                  label="Permissions"
+                  value={permissionLabel || "Permissions"}
+                  options={permissionOptions}
+                  disabled={isReadOnly || unreachable || configBusy}
+                  onSelect={(mode) => void changePermission(mode)}
+                />
+              )}
+            </>
+          ),
+          trailing: (
+            <>
+              <div className="flex min-w-0 items-center rounded-lg">
+                <ComposerModelSource
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
                   costRoutingEligible={costRoutingEligible}
-                  subagentRoutingEligible={subagentRoutingEligible}
-                  // Config changes persist server-side and apply on the next
-                  // wake/turn (the runner forward is best-effort), so the gear
-                  // stays live wherever a message could be sent — including
-                  // asleep/starting/unknown. Only read-only viewers and sessions
-                  // no message can wake (unreachable) get an inert gear.
-                  disabled={isReadOnly || unreachable}
-                  openNonce={pickerOpenNonce}
-                />
-              </ComposerModelSource>
-            </div>
-            <ComposerMicButton
-              className="size-8 md:size-7"
-              enableHotkey
-              disabled={disabled || isReadOnly || hasPendingElicitation}
-              onVoiceStart={() => {
-                voiceSnapshotRef.current = value;
-              }}
-              onVoiceDiscard={() => {
-                setValue(voiceSnapshotRef.current);
-              }}
-              onTranscript={(text) => {
-                dictation.appendFinal(text);
-                dirtyRef.current = true;
-                // Dictation is a user-driven edit — exit prompt-recall mode
-                // so ArrowUp/ArrowDown don't clobber the dictated text.
-                resetCursor();
-                if (commandError !== null) setCommandError(null);
-              }}
-              onInterim={(text) => {
-                dictation.replaceInterim(text);
-                dirtyRef.current = true;
-                resetCursor();
-              }}
-            />
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <ComposerSendButton
-                    interrupt={showInterruptButton}
-                    disabled={
-                      showInterruptButton
-                        ? isReadOnly
-                        : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                >
+                  <SessionHarnessPicker
+                    busy={configBusy}
+                    busyRef={configBusyRef}
+                    setBusy={setConfigBusy}
+                    agentName={
+                      subAgentName ??
+                      agents?.find((agent) => agent.id === selectedAgentId)?.name ??
+                      agents?.[0]?.name ??
+                      null
                     }
-                    title={showInterruptButton ? "Interrupt" : undefined}
-                    label={showInterruptButton ? "Interrupt" : "Send"}
+                    harnessLabel={harnessLabel}
+                    showModels={showModels}
+                    showEffort={showEffort}
+                    showClaudePermissionMode={showClaudePermissionMode}
+                    showCodexApprovalMode={showCodexApprovalMode}
+                    effortLevels={effortLevels}
+                    modelPickerKind={modelPickerKind}
+                    codexModelOptions={codexModelOptions}
+                    costRoutingEligible={costRoutingEligible}
+                    subagentRoutingEligible={subagentRoutingEligible}
+                    // Config changes persist server-side and apply on the next
+                    // wake/turn (the runner forward is best-effort), so the gear
+                    // stays live wherever a message could be sent — including
+                    // asleep/starting/unknown. Only read-only viewers and sessions
+                    // no message can wake (unreachable) get an inert gear.
+                    disabled={isReadOnly || unreachable}
+                    openNonce={pickerOpenNonce}
                   />
-                </TooltipTrigger>
-                {!showInterruptButton && !preventsKeyboardSubmit && (
-                  <KeyboardShortcutTooltipContent
-                    label="Send"
-                    keys={composerSendShortcutKeys(submitWithModEnter)}
-                  />
-                )}
-              </Tooltip>
-            </TooltipProvider>
-          </ComposerActionGroup>
-        </ComposerActionRow>
-      </ChatComposer>
+                </ComposerModelSource>
+              </div>
+              <ComposerMicButton
+                className="size-8 md:size-7"
+                enableHotkey
+                disabled={disabled || isReadOnly || hasPendingElicitation}
+                onVoiceStart={() => {
+                  voiceSnapshotRef.current = value;
+                }}
+                onVoiceDiscard={() => {
+                  setValue(voiceSnapshotRef.current);
+                }}
+                onTranscript={(text) => {
+                  dictation.appendFinal(text);
+                  dirtyRef.current = true;
+                  // Dictation is a user-driven edit — exit prompt-recall mode
+                  // so ArrowUp/ArrowDown don't clobber the dictated text.
+                  resetCursor();
+                  if (commandError !== null) setCommandError(null);
+                }}
+                onInterim={(text) => {
+                  dictation.replaceInterim(text);
+                  dirtyRef.current = true;
+                  resetCursor();
+                }}
+              />
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <ComposerSendButton
+                      interrupt={showInterruptButton}
+                      disabled={
+                        showInterruptButton
+                          ? isReadOnly
+                          : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                      }
+                      title={showInterruptButton ? "Interrupt" : undefined}
+                      label={showInterruptButton ? "Interrupt" : "Send"}
+                    />
+                  </TooltipTrigger>
+                  {!showInterruptButton && !preventsKeyboardSubmit && (
+                    <KeyboardShortcutTooltipContent
+                      label="Send"
+                      keys={composerSendShortcutKeys(submitWithModEnter)}
+                    />
+                  )}
+                </Tooltip>
+              </TooltipProvider>
+            </>
+          ),
+          testId: "composer-action-row",
+        }}
+      />
       {showGoalControl ? (
         <GoalDialog
           open={goalDialogOpen}

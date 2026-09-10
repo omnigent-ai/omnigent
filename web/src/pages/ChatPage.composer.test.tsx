@@ -1524,6 +1524,11 @@ describe("Composer shared visible controls", () => {
       />,
     );
     const workspace = screen.getByTestId("composer-workspace-controls");
+    const card = textarea().closest("[data-composer-card]");
+    const actions = screen.getByTestId("composer-action-row");
+    expect(textarea().parentElement?.parentElement).toBe(card);
+    expect(actions.parentElement).toBe(card);
+    expect(actions.children).toHaveLength(2);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
     expect(within(workspace).getByTestId("composer-git-branch")).toHaveTextContent(
       "feature/shared-composer",

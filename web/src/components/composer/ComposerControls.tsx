@@ -114,14 +114,14 @@ export function ComposerPermissionPicker({
         <button
           type="button"
           disabled={disabled}
-          className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-lg bg-transparent p-0 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7 md:w-auto md:gap-1 md:px-2"
+          className="flex h-8 w-auto shrink-0 cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7"
           aria-label={`${label}: ${value}`}
           title={`${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span className="hidden max-w-20 truncate text-ui font-normal md:block">{value}</span>
-          <ChevronDownIcon className="hidden size-4 shrink-0 opacity-60 md:block" />
+          <span className="max-w-20 truncate text-ui font-normal">{value}</span>
+          <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent

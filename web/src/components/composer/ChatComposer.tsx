@@ -1,25 +1,97 @@
-import { forwardRef, type ComponentPropsWithoutRef } from "react";
+import {
+  forwardRef,
+  useRef,
+  type ComponentPropsWithRef,
+  type ComponentPropsWithoutRef,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { isComposerSendKey } from "@/lib/composerSendShortcutPreferences";
 
 export const COMPOSER_COLUMN_WIDTH = "w-full max-w-[720px]";
 
-export const ChatComposer = forwardRef<HTMLDivElement, ComponentPropsWithoutRef<"div">>(
-  function ChatComposer({ className, ...props }, ref) {
-    return (
-      <div
-        ref={ref}
-        data-composer-card
-        className={cn(
-          "composer-reference-surface relative flex min-h-[105px] w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
-          className,
-        )}
-        {...props}
-      />
-    );
-  },
-);
+export interface ComposerKeyIntent {
+  shouldSubmitFromKeyboard: boolean;
+  shouldPreferSendOverCompletion: boolean;
+}
+
+interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
+  keyboard: {
+    submitWithModEnter: boolean;
+    preventsKeyboardSubmit: boolean;
+  };
+  input: Omit<ComponentPropsWithRef<"textarea">, "onKeyDown"> & {
+    onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => void;
+    "data-testid"?: string;
+    "data-slash-command"?: string;
+    "data-has-draft"?: string;
+  };
+  slots?: {
+    beforeInput?: ReactNode;
+    inputBackdrop?: ReactNode;
+    inputHint?: ReactNode;
+    attachments?: ReactNode;
+  };
+  actions: {
+    leading: ReactNode;
+    trailing: ReactNode;
+    testId?: string;
+    leadingTestId?: string;
+    trailingTestId?: string;
+  };
+}
+
+export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
+  { className, input, keyboard, slots, actions, ...props },
+  ref,
+) {
+  return (
+    <div
+      ref={ref}
+      data-composer-card
+      className={cn(
+        "composer-reference-surface relative flex min-h-[105px] w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+        className,
+      )}
+      {...props}
+    >
+      {slots?.beforeInput}
+      <ComposerInputArea>
+        {slots?.inputBackdrop}
+        <ComposerTextarea
+          {...input}
+          onKeyDown={(event) => {
+            if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+            const shouldSubmitFromKeyboard = isComposerSendKey(
+              { ...event, isComposing: event.nativeEvent.isComposing },
+              keyboard.submitWithModEnter,
+              keyboard.preventsKeyboardSubmit,
+            );
+            input.onKeyDown?.(event, {
+              shouldSubmitFromKeyboard,
+              shouldPreferSendOverCompletion:
+                keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
+            });
+          }}
+        />
+        {slots?.inputHint}
+      </ComposerInputArea>
+      {slots?.attachments}
+      <ComposerActionRow data-testid={actions.testId}>
+        <ComposerActionGroup side="left" data-testid={actions.leadingTestId}>
+          {actions.leading}
+        </ComposerActionGroup>
+        <ComposerActionGroup side="right" data-testid={actions.trailingTestId}>
+          {actions.trailing}
+        </ComposerActionGroup>
+      </ComposerActionRow>
+    </div>
+  );
+});
 
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
@@ -36,7 +108,11 @@ export function ComposerInputArea({ className, ...props }: ComponentPropsWithout
 export const ComposerTextarea = forwardRef<
   HTMLTextAreaElement,
   ComponentPropsWithoutRef<"textarea">
->(function ComposerTextarea({ className, ...props }, ref) {
+>(function ComposerTextarea(
+  { className, onKeyDown, onCompositionStart, onCompositionEnd, ...props },
+  ref,
+) {
+  const isComposingRef = useRef(false);
   return (
     <textarea
       ref={ref}
@@ -45,6 +121,17 @@ export const ComposerTextarea = forwardRef<
         className,
       )}
       {...props}
+      onCompositionStart={(event) => {
+        isComposingRef.current = true;
+        onCompositionStart?.(event);
+      }}
+      onCompositionEnd={(event) => {
+        isComposingRef.current = false;
+        onCompositionEnd?.(event);
+      }}
+      onKeyDown={(event) => {
+        if (!isImeCompositionKeyEvent(event, isComposingRef.current)) onKeyDown?.(event);
+      }}
     />
   );
 });

@@ -52,7 +52,10 @@ describe("shared composer controls", () => {
         onSelect={onSelect}
       />,
     );
-    fireEvent.keyDown(screen.getByRole("button", { name: "Permissions: Manual" }), {
+    const trigger = screen.getByRole("button", { name: "Permissions: Manual" });
+    expect(screen.getByText("Manual")).not.toHaveClass("hidden");
+    expect(trigger).toHaveClass("w-auto", "gap-1", "px-2");
+    fireEvent.keyDown(trigger, {
       key: "ArrowDown",
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));

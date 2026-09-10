@@ -1587,25 +1587,19 @@ describe("NewChatLandingScreen", () => {
     expect(hostChip).toHaveClass("justify-center");
     expect(hostChip).toHaveAttribute("title", "Host: This machine, Online");
     expect(permission).toHaveClass(
-      "size-8",
+      "h-8",
+      "w-auto",
       "justify-center",
       "rounded-lg",
       "bg-transparent",
-      "p-0",
+      "px-2",
       "md:h-7",
-      "md:w-auto",
-      "md:gap-1",
-      "md:px-2",
+      "gap-1",
     );
     expect(permission.querySelectorAll("svg")[0]).toHaveClass("size-3");
-    expect(permission.querySelectorAll("svg")[1]).toHaveClass("hidden", "size-4", "md:block");
-    expect(permission.querySelector("span")).toHaveClass(
-      "hidden",
-      "max-w-20",
-      "truncate",
-      "text-ui",
-      "md:block",
-    );
+    expect(permission.querySelectorAll("svg")[1]).toHaveClass("size-4");
+    expect(permission.querySelector("span")).toHaveClass("max-w-20", "truncate", "text-ui");
+    expect(permission.querySelector("span")).not.toHaveClass("hidden");
     expect(worktree).toHaveClass(
       "h-6",
       "max-w-[180px]",
@@ -1646,6 +1640,9 @@ describe("NewChatLandingScreen", () => {
     expect(submit).toHaveClass("size-8", "md:size-7");
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
     const rightControls = screen.getByTestId("new-chat-landing-right-controls");
+    const card = screen.getByTestId("new-chat-landing-composer");
+    expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toBe(card);
+    expect(actions.parentElement).toBe(card);
     expect(Array.from(actions.children)).toEqual([leftControls, rightControls]);
     expect(leftControls).toHaveClass("min-w-0", "flex-1", "gap-1", "overflow-visible");
     expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "absolute");
@@ -1758,7 +1755,9 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-a1")).not.toContainElement(editConfig);
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
     const menus = screen.getAllByRole("menu");
-    expect(menus.at(-1)).toHaveClass("w-[13.75rem]", "min-w-0", "composer-agent-config-menu");
+    expect(menus).toHaveLength(1);
+    expect(menus[0]).toBe(rootMenu);
+    expect(menus[0]).toHaveClass("w-[17.5rem]", "min-w-0", "composer-agent-config-menu");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Sonnet 4.6");
     expect(screen.getByTestId("new-chat-landing-agent-models").textContent).not.toContain("`");
@@ -2041,11 +2040,77 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
-    expect(within(picker).getByTestId("new-chat-landing-agent-config-value")).toBeEmptyDOMElement();
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Models unavailable",
+    );
     expect(picker).toHaveAccessibleName("Claude Code, Model Default, Effort Default");
 
     selectAgent("a2");
     expect(picker).toHaveAccessibleName("Codex, Model GPT-5.5, Effort Default");
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "GPT-5.5",
+    );
+  });
+
+  it("keeps the Codex model visible when its default model is unresolved", () => {
+    useHostModelOptionsMock.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    renderLanding();
+    selectAgent("a2");
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Codex, Model Default, Effort Default");
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Models unavailable",
+    );
+  });
+
+  it("opens Edit in place and keeps models reachable until returning to harnesses", () => {
+    renderLanding();
+    selectAgent("a2");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const menu = screen.getByRole("menu");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a2"));
+
+    expect(screen.getAllByRole("menu")).toEqual([menu]);
+    expect(screen.queryByTestId("new-chat-landing-agent-a2")).not.toBeInTheDocument();
+    const model = screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" });
+    fireEvent.pointerMove(model, { pointerType: "mouse" });
+    fireEvent.click(model);
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("GPT-5.6");
+    expect(screen.getByRole("menu")).toBe(menu);
+    fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
+    expect(screen.getByTestId("new-chat-landing-agent-config-a2")).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-agent-models")).not.toBeInTheDocument();
+  });
+
+  it("names the default Codex model once and preserves default-following selection", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a2"));
+
+    const models = within(screen.getByTestId("new-chat-landing-agent-models"));
+    expect(models.queryByText("Default")).not.toBeInTheDocument();
+    expect(models.getAllByText("GPT-5.5")).toHaveLength(1);
+    const defaultModel = models.getByRole("menuitemcheckbox", { name: "GPT-5.5" });
+    expect(defaultModel).toHaveAttribute("aria-checked", "true");
+
+    fireEvent.click(models.getByRole("menuitemcheckbox", { name: "GPT-5.6" }));
+    expect(defaultModel).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(defaultModel);
+    expect(defaultModel).toHaveAttribute("aria-checked", "true");
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a2");
+    expect(body.model_override).toBeUndefined();
   });
 
   it("names Pi model and thinking-level details in the harness trigger", () => {
@@ -2804,6 +2869,50 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
   });
 
+  it.each([false, true])(
+    "suppresses IME creation and then sends once with submitWithModEnter=%s",
+    async (submitWithModEnter) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(submitWithModEnter));
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding();
+      const input = screen.getByTestId("new-chat-landing-input");
+      const sendKey = { key: "Enter", ctrlKey: submitWithModEnter };
+      const createRequests = () =>
+        authenticatedFetchMock.mock.calls.filter(
+          ([url, init]) =>
+            url === "/v1/sessions" && (init as RequestInit | undefined)?.method === "POST",
+        );
+      fireEvent.change(input, { target: { value: "run the build" } });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+
+      await act(async () => {
+        fireEvent.compositionStart(input);
+        fireEvent.keyDown(input, sendKey);
+      });
+      expect(createRequests()).toHaveLength(0);
+      fireEvent.compositionEnd(input);
+
+      await act(async () => {
+        fireEvent.keyDown(input, { ...sendKey, isComposing: true });
+      });
+      expect(createRequests()).toHaveLength(0);
+
+      await act(async () => {
+        fireEvent.keyDown(input, { ...sendKey, isComposing: false, keyCode: 229 });
+      });
+      expect(createRequests()).toHaveLength(0);
+      expect(input).toHaveValue("run the build");
+
+      await act(async () => {
+        fireEvent.keyDown(input, sendKey);
+      });
+      await waitFor(() => expect(createRequests()).toHaveLength(1));
+    },
+  );
+
   it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
     renderLanding();
     // Open Codex's (a2) config modal; bypass is the most-permissive Approval
@@ -2913,13 +3022,12 @@ describe("NewChatLandingScreen", () => {
       "md:h-7",
     );
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveClass(
-      "size-8",
-      "p-0",
+      "h-8",
+      "w-auto",
+      "px-2",
       "bg-transparent",
       "md:h-7",
-      "md:w-auto",
-      "md:gap-1",
-      "md:px-2",
+      "gap-1",
     );
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();
   });
@@ -4694,7 +4802,9 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     openAgentConfig("a1");
     pickSelectOption("new-chat-landing-config-permission", "Plan");
     saveConfig();
-    expect(screen.getByTestId("new-chat-landing-agent-select")).not.toHaveTextContent("Default");
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Models unavailable",
+    );
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
   });
 
