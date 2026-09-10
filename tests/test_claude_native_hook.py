@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -2502,9 +2503,10 @@ def test_reattach_held_poll_sever_resets_backoff(monkeypatch: pytest.MonkeyPatch
     """After a held-poll sever the next re-POST waits only the initial backoff.
 
     The server clears the approval card ``_HARNESS_ELICITATION_REPARK_GRACE_S``
-    (10s) after a severed wait unless the same id re-parks first, so a
-    backoff that kept doubling past 10s flipped the card to "Resolved
-    elsewhere" on every proxy sever. Growth is reserved for hard failures.
+    (30s) after a severed wait unless the same id re-parks first, so a
+    backoff that kept doubling towards its 30s cap flipped the card to
+    "Resolved elsewhere" on every proxy sever. Growth is reserved for hard
+    failures.
     """
     floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
     client = _scripted_client(
@@ -2586,6 +2588,131 @@ def test_reattach_holds_the_approval_wait_marker_until_the_wait_ends(
         "the marker must read fresh on every attempt, including after a sever"
     )
     assert not approval_wait_marker_path(session_id).exists()
+
+
+def test_reattach_marker_stays_fresh_through_an_unsevered_held_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One long held POST keeps the marker fresh past the TTL while in flight.
+
+    A direct server (no front door) holds the poll for the whole wait, so the
+    single touch a per-attempt refresh made went stale after the TTL and the
+    idle reaper killed the parked pane an hour later. Real clock, scaled TTL.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT", tmp_path / "approval-waits"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.APPROVAL_WAIT_MARKER_REFRESH_S", 0.05
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.APPROVAL_WAIT_MARKER_TTL_S", 0.5)
+    session_id = "conv_direct"
+    marker = approval_wait_marker_path(session_id)
+    marker.parent.mkdir(parents=True)
+    freshness: list[bool] = []
+
+    class _HoldingClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _HoldingClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            for _ in range(3):
+                time.sleep(0.5)  # each hold spans a whole TTL
+                freshness.append(approval_wait_is_fresh(session_id))
+            return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _HoldingClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_direct/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        wait_marker=marker,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert freshness == [True, True, True], "the marker must stay fresh for the whole held poll"
+    assert not marker.exists()
+
+
+def test_reattach_reauths_again_after_a_held_poll_sever(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Every token lapse across a long wait is re-minted, not only the first.
+
+    A parked approval outlives the ~1h token: the server bounces the lapsed
+    bearer, the hook re-mints once, the gateway severs the next held poll, and
+    an hour later the fresh token lapses too. The held poll must re-arm the
+    one-shot re-mint, or the second bounce fail-asks into the unwatched TUI.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+    # Per attempt: a bounce, a gateway sever after a held poll, a second bounce,
+    # then the verdict.
+    script = [("302", 0.0), ("severed", floor + 290.0), ("302", 0.0), ("ok", 0.0)]
+    seen_auth: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            seen_auth.append(self._headers.get("Authorization", ""))
+            kind, held_s = script[len(seen_auth) - 1]
+            clock["t"] += held_s
+            req = httpx.Request("POST", url)
+            if kind == "302":
+                return httpx.Response(
+                    302,
+                    headers={"Location": "https://w.example.com/oidc/oauth2/v2.0/authorize"},
+                    request=req,
+                )
+            if kind == "severed":
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    minted: list[int] = []
+
+    def _reauth() -> dict[str, str]:
+        """
+        Mint a distinguishable fresh bearer.
+
+        :returns: Headers carrying the new token.
+        """
+        minted.append(len(minted) + 1)
+        return {"Authorization": f"Bearer fresh{len(minted)}"}
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        reauth=_reauth,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert minted == [1, 2], "the second lapse must be re-minted too"
+    assert seen_auth == ["Bearer stale", "Bearer fresh1", "Bearer fresh1", "Bearer fresh2"]
 
 
 def test_reattach_fast_flapping_connection_is_hard_failure(

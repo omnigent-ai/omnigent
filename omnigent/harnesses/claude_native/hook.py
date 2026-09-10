@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     approval_wait_marker_path,
-    clear_approval_wait_marker,
+    hold_approval_wait_marker,
     read_active_session_id,
     read_bridge_id,
     read_claude_session_id,
@@ -24,7 +25,6 @@ from omnigent.harnesses.claude_native.bridge import (
     read_permission_hook_config,
     read_seen_claude_session_ids,
     record_hook_event,
-    touch_approval_wait_marker,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -707,19 +707,23 @@ def _post_hook_with_reattach(
 
     Residual limitation (by design): a *sick* backend behind a proxy/LB that
     accepts the connection and then silently severs it after its upstream
-    timeout (>= the floor) is indistinguishable at the transport layer from a
-    proxy severing a genuinely-parked human poll — both surface as an
-    established-then-severed error after N seconds, and the server holds the
+    timeout (>= the floor) — or whose proxy answers that timeout with a 5xx —
+    is indistinguishable at the transport layer from a proxy severing a
+    genuinely-parked human poll — both surface as an established-then-severed
+    error (or a late gateway 5xx) after N seconds, and the server holds the
     POST silently with no client-visible "parked" ack. So this case resets the
     counter and is NOT caught by the consecutive-hard-failure cap; it is bounded
     only by the absolute :data:`_PERMISSION_TIMEOUT_S` ceiling below (the same
     day-long human-answer window). That is the tightest safe client-side bound:
-    capping it sooner would necessarily cap a real slow human on the same
-    topology. The blast radius is limited — this loop only re-POSTs over HTTP
-    from one hook process (it does not itself respawn harness/tool
-    subprocesses), and the host-side orphan reaper (#1782 Bug A) reclaims any
-    subprocesses a re-driven turn does spawn — so the worst case is one hook
-    slow-retrying for up to a day, not the original zombie pileup.
+    capping it sooner — or raising the floor for 5xx above the 10s shared with
+    torn connections — would necessarily cap a real slow human behind any
+    gateway that answers sooner than the floor, which is the very wedge this
+    loop exists to prevent. The blast radius is limited — this loop only
+    re-POSTs over HTTP from one hook process (it does not itself respawn
+    harness/tool subprocesses), and the host-side orphan reaper (#1782 Bug A)
+    reclaims any subprocesses a re-driven turn does spawn — so the worst case is
+    one hook re-POSTing once per proxy timeout for up to a day, which also
+    keeps the card alive until the server recovers.
 
     The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling bounds the total wait on
     every path, matching the day-long human-answer window.
@@ -734,12 +738,15 @@ def _post_hook_with_reattach(
     :param reauth: Optional callable that re-mints fresh auth headers when the
         server bounces the POST to its OAuth login flow (Apps 302→``/oidc/``)
         or returns ``401`` — i.e. the one-shot ``ap_auth_headers`` token lapsed.
-        Called at most once; new headers trigger an immediate retry with them.
-        ``None`` keeps the legacy behavior.
-    :param wait_marker: Approval-wait marker kept fresh for the life of the
-        wait, from :func:`approval_wait_marker_path`, so the idle pane reaper
-        spares a pane parked on this prompt. ``None`` skips the marker
-        (non-approval callers).
+        Called at most once per accepted poll: new headers trigger an immediate
+        retry, and a poll the server then held past the floor re-arms it, so a
+        wait longer than the token lifetime survives every lapse while two
+        rejections in a row still fail-ask. ``None`` keeps the legacy behavior.
+    :param wait_marker: Approval-wait marker held fresh for the life of the
+        wait (see :func:`hold_approval_wait_marker`), from
+        :func:`approval_wait_marker_path`, so the idle pane reaper spares a
+        pane parked on this prompt. ``None`` skips the marker (non-approval
+        callers).
     :returns: The successful (2xx) response, or ``None`` when rejected
         or out of budget — callers fail-ask as before.
     """
@@ -759,13 +766,14 @@ def _post_hook_with_reattach(
     deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     reauthed = False
     consecutive_hard_failures = 0
-    try:
+    marker_scope = (
+        hold_approval_wait_marker(wait_marker)
+        if wait_marker is not None
+        else contextlib.nullcontext()
+    )
+    with marker_scope:
         while True:
             attempt_started = time.monotonic()
-            if wait_marker is not None:
-                # Refreshed per attempt: a pane parked on this prompt makes no
-                # output, so without it the idle reaper kills the prompt.
-                touch_approval_wait_marker(wait_marker)
             try:
                 with httpx.Client(headers=headers, timeout=timeout) as client:
                     resp = client.post(url, json=body)
@@ -836,6 +844,10 @@ def _post_hook_with_reattach(
                 # re-park grace instead of letting the card clear between polls.
                 consecutive_hard_failures = 0
                 backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
+                # The held poll proves this token was accepted, so the one-shot
+                # re-mint is armed again: a wait longer than the token lifetime
+                # lapses once an hour, and each lapse must be re-mintable.
+                reauthed = False
             if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
                 print(
                     f"omnigent {hook_label} hook: giving up after "
@@ -854,9 +866,6 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
                 return None
-    finally:
-        if wait_marker is not None:
-            clear_approval_wait_marker(wait_marker)
 
 
 def _main_permission_request(argv: list[str]) -> int:

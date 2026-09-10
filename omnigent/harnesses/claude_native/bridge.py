@@ -45,7 +45,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -117,10 +117,13 @@ _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
 # it (see ``native_bridge_common.prune_orphaned_dirs``).
 _APPROVAL_WAIT_DIR_NAME = "approval-waits"
 _APPROVAL_WAIT_ROOT = _BRIDGE_ROOT / _APPROVAL_WAIT_DIR_NAME
+# A parked hook re-touches its marker this often for as long as its POST is
+# held, so the marker stays fresh whether or not a gateway ever severs the poll
+# (a direct server holds one POST for the whole wait).
+APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
 # A marker touched more recently than this means a hook is still waiting.
-# Above one full long-poll (the Databricks front door caps a request at 300s)
-# plus a retry backoff, so a marker refreshed once per POST attempt never
-# reads stale while the hook is alive.
+# Several refresh intervals of slack, so a hook that is slow to wake never
+# reads stale; a hook killed mid-wait leaves a marker that expires on its own.
 APPROVAL_WAIT_MARKER_TTL_S = 420.0
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
@@ -1207,9 +1210,23 @@ def bridge_dir_for_conversation_id(conversation_id: str) -> Path:
     return bridge_dir_for_bridge_id(conversation_id)
 
 
+def _approval_wait_digest(session_id: str) -> str:
+    """
+    Return the filename stem shared by every marker for one session.
+
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :returns: Hex digest prefix, e.g. ``"3f0e..."`` (32 chars).
+    """
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+
+
 def approval_wait_marker_path(session_id: str, *, bridge_dir: Path | None = None) -> Path:
     """
     Return the marker path a parked permission hook keeps fresh.
+
+    One marker per hook process: concurrent prompts on one session (a
+    permission request and an AskUserQuestion, or parallel tool calls) each
+    own a file, so the first to finish never clears another's evidence.
 
     :param session_id: Omnigent session id whose verdict a hook is waiting
         on, e.g. ``"conv_abc123"``.
@@ -1221,22 +1238,23 @@ def approval_wait_marker_path(session_id: str, *, bridge_dir: Path | None = None
         computed root could — and a marker written where the reaper never looks
         would fail silently. ``None`` uses this process's own root, which is
         the runner side including the pane reaper.
-    :returns: Absolute marker path under ``<temp root>/approval-waits``.
+    :returns: Absolute marker path under ``<temp root>/approval-waits``, e.g.
+        ``.../approval-waits/<digest>.<pid>.wait``.
     """
     root = (
         bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME
         if bridge_dir is not None
         else _APPROVAL_WAIT_ROOT
     )
-    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
-    return root / f"{digest}.wait"
+    return root / f"{_approval_wait_digest(session_id)}.{os.getpid()}.wait"
 
 
 def touch_approval_wait_marker(marker: Path) -> None:
     """
     Stamp an approval-wait marker with the current time.
 
-    Refreshed once per hook POST attempt so the idle pane reaper can tell a
+    Refreshed on a timer for the life of a hook's wait (see
+    :func:`hold_approval_wait_marker`) so the idle pane reaper can tell a
     pane parked on a permission prompt — which emits no output and reports no
     active turn — from an abandoned one. The root is created and validated by
     :func:`prepare_bridge_dir` in the runner, so this only writes inside an
@@ -1271,17 +1289,66 @@ def approval_wait_is_fresh(session_id: str) -> bool:
     """
     Whether a permission hook is parked on this session's verdict right now.
 
+    Scans every hook's marker for the session; a stale one (a hook killed
+    mid-wait) is removed on the way so they never accumulate.
+
     :param session_id: Omnigent session id to check, e.g.
         ``"conv_abc123"``.
-    :returns: ``True`` when the marker was touched within
-        :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when it is missing,
-        stale, or unreadable.
+    :returns: ``True`` when any marker was touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
+        are stale, or the root is unreadable.
     """
     try:
-        touched_at = approval_wait_marker_path(session_id).stat().st_mtime
+        markers = list(_APPROVAL_WAIT_ROOT.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
     except OSError:
         return False
-    return time.time() - touched_at < APPROVAL_WAIT_MARKER_TTL_S
+    now = time.time()
+    fresh = False
+    for marker in markers:
+        try:
+            touched_at = marker.stat().st_mtime
+        except OSError:
+            continue
+        if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
+            fresh = True
+        else:
+            clear_approval_wait_marker(marker)
+    return fresh
+
+
+@contextlib.contextmanager
+def hold_approval_wait_marker(marker: Path) -> Iterator[None]:
+    """
+    Keep *marker* fresh for the duration of the block, then remove it.
+
+    Touches the marker at once and again every
+    :data:`APPROVAL_WAIT_MARKER_REFRESH_S` on a daemon thread, so a hook
+    blocked in one long POST (a direct server holds the poll for the whole
+    wait) reads as parked exactly like one a gateway severs every few
+    minutes. The refresher is stopped before the marker is cleared so a late
+    touch cannot resurrect it; a hook killed mid-wait takes the thread with
+    it and its marker simply expires.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: ``None`` for the duration of the block.
+    """
+    stop = threading.Event()
+
+    def _refresh() -> None:
+        while not stop.wait(APPROVAL_WAIT_MARKER_REFRESH_S):
+            touch_approval_wait_marker(marker)
+
+    touch_approval_wait_marker(marker)
+    refresher = threading.Thread(
+        target=_refresh, name="omnigent-approval-wait-marker", daemon=True
+    )
+    refresher.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        refresher.join(timeout=5.0)
+        clear_approval_wait_marker(marker)
 
 
 def build_claude_native_spawn_env(
