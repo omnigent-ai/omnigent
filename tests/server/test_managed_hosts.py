@@ -1056,6 +1056,111 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
     assert fake.pvc_mounts is None
 
 
+def test_parse_kubernetes_tolerations_normalizes_and_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tolerations parse into normalized entries (operator defaults 'Equal') on the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "tolerations": [
+                    {
+                        "key": "sei.io/node-role",
+                        "value": "omnigent-sandbox",
+                        "effect": "NoSchedule",
+                    },
+                    {"operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.tolerations == [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        },
+        {"operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+    ]
+
+
+def test_parse_kubernetes_without_tolerations_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted (or empty) tolerations reach the launcher as None — no tolerations added."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"tolerations": []},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.tolerations is None
+
+
+@pytest.mark.parametrize(
+    ("tolerations", "expected_fragment"),
+    [
+        # Wrong container shapes.
+        ("sei.io/node-role", "must be a list"),
+        ([["sei.io/node-role"]], "must be a mapping"),
+        ([{"bogus": "x"}], "unknown key"),
+        # key/value field shape.
+        ([{"key": "", "operator": "Equal"}], "key.*must be a non-empty string"),
+        ([{"key": "k", "value": 123}], "value.*must be a string"),
+        # key/value Kubernetes label format.
+        ([{"key": "sei.io/node role", "operator": "Exists"}], "not a valid Kubernetes label key"),
+        (
+            [{"key": "k", "operator": "Equal", "value": "x" * 64}],
+            "not a valid Kubernetes label value",
+        ),
+        # operator/effect given the wrong Python type outright (a config typo
+        # nesting a mapping/list under a scalar field) must still fail as
+        # ValueError, not escape as an unhandled TypeError from the `in`
+        # membership test against an unhashable value.
+        ([{"operator": {"nested": "mapping"}}], "operator.*must be one of"),
+        ([{"key": "k", "effect": ["NoSchedule"]}], "effect.*must be one of"),
+        # key/operator combinations Kubernetes itself would reject.
+        ([{"operator": "Equal"}], "only pairs with 'Exists'"),
+        ([{"key": "sei.io/x", "operator": "Maybe"}], "operator.*must be one of"),
+        ([{"operator": "Exists", "value": "x"}], "not allowed with operator 'Exists'"),
+        # effect / tolerationSeconds combinations.
+        ([{"key": "sei.io/x", "effect": "Sometimes"}], "effect.*must be one of"),
+        (
+            [{"key": "sei.io/x", "effect": "NoSchedule", "tolerationSeconds": 60}],
+            "only applies with effect 'NoExecute'",
+        ),
+        (
+            [{"key": "sei.io/x", "tolerationSeconds": "60"}],
+            "tolerationSeconds.*must be an integer",
+        ),
+    ],
+)
+def test_parse_kubernetes_tolerations_invalid_fails_loud(
+    tolerations: object, expected_fragment: str
+) -> None:
+    """An operator typo in tolerations fails at parse (server startup), not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"tolerations": tolerations},
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("pvc_mounts", "expected_fragment"),
     [

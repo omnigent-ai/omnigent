@@ -122,8 +122,14 @@ export function SidebarServerPicker() {
           </Button>
         </DropdownMenuTrigger>
         {/* side="top" — the trigger sits at the bottom of the window, so the
-            menu must grow upward rather than off-screen. */}
-        <DropdownMenuContent side="top" align="start" className="min-w-56">
+            menu must grow upward rather than off-screen. max-w caps the width so
+            a long host (the default menu is w-max) truncates in place instead of
+            overflowing the viewport on a narrow phone. */}
+        <DropdownMenuContent
+          side="top"
+          align="start"
+          className="min-w-56 max-w-[min(20rem,calc(100vw-1rem))]"
+        >
           {managed.length > 0 ? (
             <>
               <DropdownMenuLabel className="text-muted-foreground">
@@ -143,7 +149,7 @@ export function SidebarServerPicker() {
                     ) : (
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
-                    <span className={cn("truncate", isCurrent && "font-medium")}>
+                    <span className={cn("min-w-0 truncate", isCurrent && "font-medium")}>
                       {hostOf(url)}
                     </span>
                   </DropdownMenuItem>
@@ -158,7 +164,7 @@ export function SidebarServerPicker() {
               {!currentIsManaged ? (
                 <DropdownMenuItem disabled className="gap-2 opacity-100">
                   <CheckIcon className="size-4 shrink-0" />
-                  <span className="truncate font-medium">{currentHost}</span>
+                  <span className="min-w-0 truncate font-medium">{currentHost}</span>
                 </DropdownMenuItem>
               ) : null}
               {recentOthers.map((url) => (
@@ -168,7 +174,7 @@ export function SidebarServerPicker() {
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="truncate">{hostOf(url)}</span>
+                  <span className="min-w-0 truncate">{hostOf(url)}</span>
                 </DropdownMenuItem>
               ))}
             </>

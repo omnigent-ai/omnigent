@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ import queue
 import re
 import secrets
 import shlex
+import socket
 import stat
 import sys
 import tempfile
@@ -80,6 +82,23 @@ _logger = logging.getLogger(__name__)
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
+
+# Bind/advertise coordinates for the bridge's HTTP servers (the tool relay and
+# the MCP control ingress). These default to loopback (127.0.0.1) so an
+# ordinary host keeps them off every other interface. Sandbox backends with
+# SSRF hardening (e.g. OpenShell) deny loopback destinations unconditionally,
+# making a loopback-advertised relay unreachable from hook subprocesses there;
+# such an integrator opts into an all-interfaces bind by setting
+# BRIDGE_BIND_HOST_ENV_VAR to "0.0.0.0" (the servers then advertise the host's
+# routable address so those hooks can reach them). Ports come from a small
+# stable pool a sandbox network policy can allowlist by exact host+port —
+# OS-assigned ephemeral ports cannot be.
+BRIDGE_BIND_HOST_ENV_VAR = "OMNIGENT_BRIDGE_BIND_HOST"
+BRIDGE_PORT_POOL_ENV_VAR = "OMNIGENT_BRIDGE_PORT_POOL"
+# Kept below Linux's default ephemeral range (32768+) so OS-assigned ports
+# never collide with the pool. Several servers coexist per host (the MCP
+# ingress plus one tool relay per session), hence a pool rather than one port.
+DEFAULT_BRIDGE_PORT_POOL: tuple[int, ...] = tuple(range(28700, 28716))
 
 # Root for the per-process Claude bridge tree. Namespaced by uid so
 # other Unix users on the same host cannot read the bearer token or
@@ -883,6 +902,96 @@ def _http_server_host_port(httpd: ThreadingHTTPServer) -> tuple[str, int]:
     return cast(tuple[str, int], httpd.server_address)
 
 
+def _routable_local_address() -> str | None:
+    """Return this host's routable IPv4 source address, or ``None``.
+
+    Uses the UDP-connect trick: no packet is sent; the kernel just reports
+    the source address it would pick to reach a routable destination
+    (TEST-NET-1 here, never actually contacted). Hosts without a routable
+    interface (or without a default route) return ``None``.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 80))
+            address = str(probe.getsockname()[0])
+        parsed = ipaddress.ip_address(address)
+    except (OSError, ValueError):
+        return None
+    if parsed.is_loopback or parsed.is_link_local or parsed.is_unspecified:
+        return None
+    return address
+
+
+def _bridge_bind_hosts() -> tuple[str, str]:
+    """Return ``(bind_host, advertised_host)`` for bridge HTTP servers.
+
+    Defaults to loopback (``127.0.0.1``) so the servers stay off every other
+    interface on an ordinary host. :data:`BRIDGE_BIND_HOST_ENV_VAR` opts into
+    a different posture: ``0.0.0.0`` binds all interfaces and advertises the
+    host's routable address (falling back to loopback when none exists) —
+    the setting an SSRF-hardened sandbox integrator uses, since such a
+    sandbox denies the loopback default unconditionally. Any other value
+    pins that exact host for both bind and advertisement.
+    """
+    override = os.environ.get(BRIDGE_BIND_HOST_ENV_VAR, "").strip()
+    if not override:
+        return "127.0.0.1", "127.0.0.1"
+    if override != "0.0.0.0":
+        return override, override
+    return "0.0.0.0", _routable_local_address() or "127.0.0.1"
+
+
+def _bridge_port_pool() -> tuple[int, ...]:
+    """Return candidate bridge server ports: env override or the stable pool.
+
+    :data:`BRIDGE_PORT_POOL_ENV_VAR` accepts comma-separated ports and
+    inclusive ``start-end`` ranges, e.g. ``"28700-28703,29000"``. Malformed
+    values fall back to :data:`DEFAULT_BRIDGE_PORT_POOL`.
+    """
+    raw = os.environ.get(BRIDGE_PORT_POOL_ENV_VAR, "").strip()
+    if not raw:
+        return DEFAULT_BRIDGE_PORT_POOL
+    ports: list[int] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        start_text, _, end_text = entry.partition("-")
+        try:
+            start = int(start_text)
+            end = int(end_text) if end_text else start
+        except ValueError:
+            return DEFAULT_BRIDGE_PORT_POOL
+        if not 0 < start <= end <= 65535:
+            return DEFAULT_BRIDGE_PORT_POOL
+        ports.extend(range(start, end + 1))
+    return tuple(ports) if ports else DEFAULT_BRIDGE_PORT_POOL
+
+
+def _start_bridge_http_server(
+    handler_cls: type[BaseHTTPRequestHandler],
+) -> tuple[ThreadingHTTPServer, str]:
+    """Bind a bridge HTTP server and return it with its advertised base URL.
+
+    Tries each pool port in order (skipping ports already bound by other
+    bridge servers or unrelated processes), then falls back to an
+    OS-assigned port so local use never fails when the pool is exhausted —
+    though a sandbox allowlisting only the pool cannot reach that fallback.
+    """
+    bind_host, advertised_host = _bridge_bind_hosts()
+    httpd: ThreadingHTTPServer | None = None
+    for port in _bridge_port_pool():
+        try:
+            httpd = ThreadingHTTPServer((bind_host, port), handler_cls)
+        except OSError:
+            continue
+        break
+    if httpd is None:
+        httpd = ThreadingHTTPServer((bind_host, 0), handler_cls)
+    _, port = _http_server_host_port(httpd)
+    return httpd, f"http://{advertised_host}:{port}"
+
+
 class ClaudeNativeToolRelay:
     """
     HTTP relay for Claude MCP tool calls, scoped to its caller's lifetime.
@@ -900,21 +1009,26 @@ class ClaudeNativeToolRelay:
 
     :param bridge_dir: Bridge directory containing
         ``tool_relay.json``, e.g. ``/tmp/omnigent/claude-native/x``.
-    :param httpd: Started localhost HTTP server for tool calls. Its bound
-        address identifies this relay's advertisement on close.
+    :param httpd: Started HTTP server for tool calls.
+    :param advertised_url: Base URL written to ``tool_relay.json``; it
+        identifies this relay's advertisement on close.
     """
 
-    def __init__(self, *, bridge_dir: Path, httpd: ThreadingHTTPServer) -> None:
+    def __init__(
+        self, *, bridge_dir: Path, httpd: ThreadingHTTPServer, advertised_url: str
+    ) -> None:
         """
         Initialize the relay handle.
 
         :param bridge_dir: Bridge directory containing the relay
             advertisement, e.g. ``Path("/tmp/omnigent/...")``.
-        :param httpd: Started localhost HTTP server for tool calls.
+        :param httpd: Started HTTP server for tool calls.
+        :param advertised_url: Base URL advertised in ``tool_relay.json``.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
         self._httpd = httpd
+        self._advertised_url = advertised_url
 
     def close(self) -> None:
         """
@@ -932,11 +1046,10 @@ class ClaudeNativeToolRelay:
         :returns: None.
         """
         relay_file = self._bridge_dir / _TOOL_RELAY_FILE
-        host, port = _http_server_host_port(self._httpd)
         # A newer relay that overwrote the file advertises a different url
         # (this relay's socket is still bound, so its port is unique), so the
         # file is left for that relay to own.
-        if _read_json_file(relay_file).get("url") == f"http://{host}:{port}":
+        if _read_json_file(relay_file).get("url") == self._advertised_url:
             with contextlib.suppress(FileNotFoundError):
                 relay_file.unlink()
         self._httpd.shutdown()
@@ -4754,10 +4867,11 @@ def start_tool_relay(
     """
     Start a relay for Omnigent tool calls from Claude.
 
-    Writes ``tool_relay.json`` and starts the localhost HTTP server that
-    backs it. The caller owns the relay's lifetime (a single turn or a
-    whole session) and must call :meth:`ClaudeNativeToolRelay.close` when
-    that scope ends.
+    Writes ``tool_relay.json`` and starts the HTTP server that backs it
+    (see :func:`_start_bridge_http_server` for the bind/advertise rules).
+    The caller owns the relay's lifetime (a single turn or a whole
+    session) and must call :meth:`ClaudeNativeToolRelay.close` when that
+    scope ends.
 
     When ``policy_client`` and ``session_id`` are provided the relay also
     exposes ``POST /policies/evaluate``, which proxies requests to the
@@ -4782,10 +4896,9 @@ def start_tool_relay(
         session_id=session_id,
         bridge_dir=bridge_dir,
     )
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = _http_server_host_port(httpd)
+    httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
-        "url": f"http://{host}:{port}",
+        "url": advertised_url,
         "token": token,
         "tools": _normalize_relay_tool_specs(tools),
         "pid": os.getpid(),
@@ -4797,7 +4910,7 @@ def start_tool_relay(
     # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
     env_path = bridge_dir / _TOOL_RELAY_ENV_FILE
     env_path.write_text(
-        f"OMNIGENT_RELAY_URL='http://{host}:{port}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
+        f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
         encoding="utf-8",
     )
     os.chmod(env_path, 0o600)
@@ -4807,7 +4920,7 @@ def start_tool_relay(
         daemon=True,
     )
     thread.start()
-    return ClaudeNativeToolRelay(bridge_dir=bridge_dir, httpd=httpd)
+    return ClaudeNativeToolRelay(bridge_dir=bridge_dir, httpd=httpd, advertised_url=advertised_url)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -4881,7 +4994,7 @@ def _start_http_ingress(
     notification_queue: queue.Queue[_JsonObject | None],
 ) -> ThreadingHTTPServer:
     """
-    Start the localhost control HTTP server.
+    Start the bridge control HTTP server.
 
     Currently only serves ``POST /tools-changed``, which queues a
     standard MCP ``notifications/tools/list_changed`` for the stdio
@@ -4894,10 +5007,9 @@ def _start_http_ingress(
     :returns: Started :class:`ThreadingHTTPServer`.
     """
     handler_cls = _handler_factory(token, notification_queue)
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = _http_server_host_port(httpd)
+    httpd, advertised_url = _start_bridge_http_server(handler_cls)
     server_info: _JsonObject = {
-        "url": f"http://{host}:{port}",
+        "url": advertised_url,
         "token": token,
         "pid": os.getpid(),
         "updated_at": time.time(),

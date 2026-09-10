@@ -244,6 +244,79 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
     ]
 
 
+def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``/goal`` past Codex's 4000-char cap fails with a clear client error."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+            cwd=str(tmp_path),
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "/goal " + "x" * 4001)
+
+    assert [type(event) for event in events] == [ExecutorError]
+    message = events[0].message
+    # The user sees the limit, not the raw JSON-RPC rejection the
+    # app-server would have produced.
+    assert "4000" in message
+    assert "-32600" not in message
+    assert "Codex native executor error" not in message
+    # The doomed objective never reaches the app-server.
+    assert _FakeCodexNativeClient.requests == []
+
+
+def test_goal_command_at_the_exact_codex_cap_is_sent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An objective exactly at the 4000-char cap still activates the goal."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+            cwd=str(tmp_path),
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    objective = "x" * 4000
+    events = _collect_turn_events(executor, f"/goal {objective}")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests[0] == (
+        "thread/goal/set",
+        {"threadId": "thread_123", "objective": objective},
+    )
+
+
 def test_system_prompt_does_not_override_collaboration_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

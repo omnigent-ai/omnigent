@@ -75,6 +75,32 @@ def _normalize_server_url(server_url: str) -> str:
     return server_url.rstrip("/")
 
 
+def _safe_log_url(url: str) -> str:
+    """Strip credential-bearing parts from a URL before it reaches a log.
+
+    A URL can carry secrets in its userinfo (``https://user:token@host``) or
+    query string (``?access_token=...``), so logging one verbatim risks
+    leaking them. Keep the non-secret identity — scheme, host, port, path —
+    and drop userinfo, query, and fragment. Server URLs here carry no
+    credentials, but sanitizing at the sink keeps that guarantee local to the
+    log call instead of trusting every caller.
+
+    :param url: A server URL, e.g. ``"https://ws.example.com/api/2.0/omnigent"``.
+    :returns: The sanitized URL, or ``"<server>"`` when it cannot be parsed.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "<server>"
+    if not parts.scheme or not host:
+        return "<server>"
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 def _write_tokens_file(path: Path, data: dict[str, dict[str, str | float]]) -> None:
     """Atomically write the auth-tokens file, never exposing it readable.
 
@@ -442,6 +468,9 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
 
 def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | None:
     """Perform the refresh exchange; caller holds the token-file lock."""
+    # Log only the sanitized URL — the raw one may embed credentials, and the
+    # refresh token is never logged.
+    safe = _safe_log_url(normalized)
     entry = _load_entry(server_url)
     if entry is None:
         return None
@@ -469,31 +498,53 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             timeout=timeout,
         )
     except httpx.HTTPError as exc:
-        _logger.warning("Token refresh against %s failed: %s", normalized, exc)
+        _logger.warning("Token refresh against %s failed: %s", safe, exc)
+        return None
+    if resp.status_code == 404:
+        # No ``/oauth/token`` route: a local/header-mode dev server or an
+        # older build that never issues refreshable sessions. Re-login
+        # cannot add the route, so the "run `omnigent login`" advice below
+        # is misleading. On a loopback target this is the expected case and
+        # would otherwise spam a warning on every near-expiry reconnect, so
+        # keep it at debug; a remote 404 (wrong URL / too-old server) still
+        # warrants a visible, non-credential-blaming note.
+        from omnigent_client._http import is_loopback_url
+
+        if is_loopback_url(normalized):
+            _logger.debug(
+                "Token refresh against %s skipped: server has no /oauth/token endpoint.",
+                safe,
+            )
+        else:
+            _logger.warning(
+                "Token refresh against %s returned HTTP 404 — the server does not "
+                "expose /oauth/token (wrong URL or a build without session refresh).",
+                safe,
+            )
         return None
     if resp.status_code != 200:
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
             "to re-authenticate.",
-            normalized,
+            safe,
             resp.status_code,
-            normalized,
+            safe,
         )
         return None
     try:
         payload = resp.json()
     except ValueError:
-        _logger.warning("Token refresh against %s returned a malformed response", normalized)
+        _logger.warning("Token refresh against %s returned a malformed response", safe)
         return None
     if not isinstance(payload, dict):
-        _logger.warning("Token refresh against %s returned a malformed response", normalized)
+        _logger.warning("Token refresh against %s returned a malformed response", safe)
         return None
     access_token = payload.get("access_token")
     new_refresh = payload.get("refresh_token")
     # Only overwrite the stored pair with genuinely usable material —
     # a null/non-string field must never clobber a working credential.
     if not isinstance(access_token, str) or not access_token:
-        _logger.warning("Token refresh against %s returned no access token", normalized)
+        _logger.warning("Token refresh against %s returned no access token", safe)
         return None
     if not isinstance(new_refresh, str) or not new_refresh:
         # A server that renews without returning refresh material keeps the
@@ -512,7 +563,7 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     # A fresh token means any earlier expiry warning is stale; allow
     # a new one if this credential ever lapses again.
     _warned_expired_servers.discard(normalized)
-    _logger.info("Refreshed login session for %s", normalized)
+    _logger.info("Refreshed login session for %s", safe)
     return access_token
 
 
