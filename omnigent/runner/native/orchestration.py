@@ -1288,12 +1288,14 @@ async def _auto_create_opencode_terminal(
     config: dict[str, object] = {}
     xdg_config_home = xdg_config_home_for_bridge_dir(bridge_dir)
     managed_opencode_broker_cmd: str | None = None
-    # A spec/CLI-selected Databricks gateway wins first (an explicit ``--model`` or
-    # a spec naming a profile), exactly as claude/codex/pi resolve the spec
-    # provider before their broker fallback. ``resolve_databricks_gateway`` returns
-    # None when no profile is selected (the bare managed-connect host), so the
-    # ucode-config path below is the genuine last resort — it never overrides an
-    # explicit selection.
+    # A spec/CLI-selected Databricks gateway wins first (an explicit ``--model``
+    # that names a gateway endpoint, or a spec profile), exactly as claude/codex/pi
+    # resolve the spec provider before their broker fallback.
+    # ``resolve_databricks_gateway`` returns None when no profile is selected (the
+    # bare managed-connect host); the ucode-config path below is then the last
+    # resort. On that bare host it adopts ucode's pinned served model — replacing an
+    # unrecognized explicit ``--model`` (logged below), since the workspace gateway
+    # is the only working provider there.
     gateway = resolve_databricks_gateway(
         _opencode_native_profile_from_spec(agent_spec), model_id=model_override
     )
@@ -1333,6 +1335,14 @@ async def _auto_create_opencode_terminal(
                 config = managed_config
                 pinned = config.get("model")
                 if isinstance(pinned, str):
+                    if model_override and model_override != pinned:
+                        _logger.info(
+                            "opencode managed connect: replacing requested model %r with the "
+                            "ucode-pinned served model %r (the workspace gateway is the only "
+                            "provider on this host).",
+                            model_override,
+                            pinned,
+                        )
                     model_override = pinned
             else:
                 _logger.warning(

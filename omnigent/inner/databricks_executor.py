@@ -286,16 +286,21 @@ def databricks_bearer_token_command(
     """
     # In a managed connect sandbox the owner's workspace profile is host-only
     # (its bearer lives in the credential broker, not on disk), so
-    # ``databricks auth token`` finds no OAuth cache and yields nothing. When the
-    # caller named no other fallback and *host* is that connected workspace,
-    # default it to the broker fetch so the harness re-mints per use as them.
+    # ``databricks auth token`` finds no OAuth cache and yields nothing. Default
+    # ONLY that connect profile to the broker fetch. Gate on the profile, not
+    # just the host: a *different* credential-less profile that happens to share
+    # the connected workspace host must not silently mint as the owner (distinct
+    # profiles on one host can be different users/service principals).
     if fallback_command is None:
-        try:
-            from omnigent.host.databricks_credential import broker_token_command
+        from omnigent.host.databricks_credential import HOST_DATABRICKS_PROFILE
 
-            fallback_command = broker_token_command(host)
-        except Exception as exc:  # noqa: BLE001 - best-effort; no sidecar ⇒ no fallback.
-            logger.info("databricks bearer: broker fallback lookup failed: %r", exc)
+        if profile == HOST_DATABRICKS_PROFILE:
+            try:
+                from omnigent.host.databricks_credential import broker_token_command
+
+                fallback_command = broker_token_command(host)
+            except Exception as exc:  # noqa: BLE001 - best-effort; no sidecar ⇒ no fallback.
+                logger.info("databricks bearer: broker fallback lookup failed: %r", exc)
     selector = (
         f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
     )

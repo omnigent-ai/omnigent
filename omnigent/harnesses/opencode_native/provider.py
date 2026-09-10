@@ -647,16 +647,14 @@ def _configure_opencode_on_demand() -> None:
             argv = build_ucode_configure_command_for_profile(
                 find_ucode_command(), profile=HOST_DATABRICKS_PROFILE, agents=["opencode"]
             )
-            subprocess.run(
-                argv,
-                capture_output=True,
-                timeout=120,
-                env={
-                    **os.environ,
-                    "DATABRICKS_BEARER_COMMAND": bearer_command,
-                    "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,
-                },
-            )
+            configure_env = {
+                **os.environ,
+                "DATABRICKS_BEARER_COMMAND": bearer_command,
+                "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,
+            }
+            # ucode has no use for the host's launch token; don't hand it over.
+            configure_env.pop("OMNIGENT_HOST_TOKEN", None)
+            subprocess.run(argv, capture_output=True, timeout=120, env=configure_env)
     except Exception:  # noqa: BLE001 - best-effort; the caller declines if config is still absent.
         _logger.info("opencode on-demand ucode configure failed", exc_info=True)
 

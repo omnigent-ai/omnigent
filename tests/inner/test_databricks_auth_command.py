@@ -288,6 +288,21 @@ def test_the_broker_sidecar_is_ignored_for_a_different_workspace(
     assert "omnigent.host.databricks_credential" not in command
 
 
+def test_the_broker_is_ignored_for_a_different_profile_on_the_connected_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Identity boundary: only the host-only connect profile (HOST_DATABRICKS_PROFILE)
+    borrows the owner's broker bearer. A different, credential-less profile that
+    happens to share the connected workspace host must NOT silently mint as the
+    owner — distinct profiles on one host can be different users/service principals."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    # Same connected workspace host as the sidecar, but NOT the connect profile.
+    command = databricks_bearer_token_command("https://example.databricks.com", "someone-else")
+    assert "omnigent.host.databricks_credential" not in command
+
+
 def test_an_explicit_fallback_is_not_overridden_by_the_broker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -279,6 +279,9 @@ def configure_ucode_for_sandbox(
         ucode_command, profile=profile, agents=agents, use_pat=use_pat
     )
     env = {**os.environ, **(extra_env or {})}
+    # ucode has no use for the host's launch token; don't hand it to the external
+    # tool (it mints via DATABRICKS_BEARER_COMMAND, passed in extra_env).
+    env.pop("OMNIGENT_HOST_TOKEN", None)
 
     def _run() -> None:
         try:
@@ -288,15 +291,14 @@ def configure_ucode_for_sandbox(
                 )
         except (OSError, subprocess.SubprocessError) as exc:
             # A failed/timed-out configure silently forces the harness hand-built
-            # fallback; log it (with the exception) so the field isn't blind.
-            _logger.info("ucode: sandbox configure failed (profile=%s): %r", profile, exc)
+            # fallback; log at WARNING so the field isn't blind.
+            _logger.warning("ucode: sandbox configure failed (profile=%s): %r", profile, exc)
             return
         if result.returncode != 0:
-            _logger.info(
-                "ucode: sandbox configure exit=%s (profile=%s): %s",
-                result.returncode,
-                profile,
-                result.stderr.decode("utf-8", "replace")[-500:].strip(),
+            # Log the returncode, not ucode's stderr body — stderr could echo a
+            # secret, and the code is enough to flag the fallback was taken.
+            _logger.warning(
+                "ucode: sandbox configure exit=%s (profile=%s)", result.returncode, profile
             )
         else:
             _logger.info("ucode: sandbox configure ok (profile=%s)", profile)
