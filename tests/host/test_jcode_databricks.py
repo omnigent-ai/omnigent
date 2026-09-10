@@ -24,8 +24,10 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "host-tok")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    # Route per-session jcode runtime dirs under tmp_path (not the real /tmp).
+    # Route per-session jcode runtime dirs under tmp_path (not the real /tmp), and
+    # isolate jcode's config.toml reads to tmp_path (not the developer's real ~/.jcode).
     monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(tmp_path))
+    monkeypatch.setenv("JCODE_HOME", str(tmp_path / ".jcode"))
 
 
 def _write_profile_and_sidecar(tmp_path: Path) -> None:
@@ -41,6 +43,17 @@ def _write_profile_and_sidecar(tmp_path: Path) -> None:
     }
     sidecar_path.write_text(json.dumps(sidecar_data))
     os.chmod(sidecar_path, 0o600)
+
+
+def _write_jcode_config(
+    tmp_path: Path, base_url: str = "https://ws.example/ai-gateway/openai/v1"
+) -> None:
+    """Write jcode's config.toml with a `dbx` provider at *base_url* (as boot would)."""
+    jcode_home = tmp_path / ".jcode"
+    jcode_home.mkdir(parents=True, exist_ok=True)
+    (jcode_home / "config.toml").write_text(
+        f'[providers.dbx]\ntype = "openai-compatible"\nbase_url = "{base_url}"\n'
+    )
 
 
 class TestBuildJcodeConfigureCommand:
@@ -110,6 +123,7 @@ class TestConnectJcodeGatewayEnv:
     ) -> None:
         """Returns a dict with JCODE_DBX_TOKEN and JCODE_RUNTIME_DIR when sidecar is present."""
         _write_profile_and_sidecar(tmp_path)
+        _write_jcode_config(tmp_path)
 
         # Monkeypatch fetch_broker_bearer to return a fresh bearer.
         monkeypatch.setattr(
@@ -136,6 +150,7 @@ class TestConnectJcodeGatewayEnv:
         different session gets its own dir; and the bearer is minted on every call
         (so a re-spawn after the jcode daemon idle-exits re-authenticates)."""
         _write_profile_and_sidecar(tmp_path)
+        _write_jcode_config(tmp_path)
         fetch = Mock(return_value=("https://ws.example", "bearer"))
         monkeypatch.setattr("omnigent.host.jcode_databricks.fetch_broker_bearer", fetch)
 
@@ -154,6 +169,7 @@ class TestConnectJcodeGatewayEnv:
     ) -> None:
         """The created runtime dir has 0700 permissions (owner only)."""
         _write_profile_and_sidecar(tmp_path)
+        _write_jcode_config(tmp_path)
         monkeypatch.setattr(
             "omnigent.host.jcode_databricks.fetch_broker_bearer",
             Mock(return_value=("https://ws.example", "bearer")),
@@ -214,6 +230,7 @@ class TestConnectJcodeGatewayEnv:
         """Reconnect guard: if the broker vends a workspace different from the sidecar's
         pinned workspace (owner reconnected elsewhere), the bearer is withheld."""
         _write_profile_and_sidecar(tmp_path)  # sidecar pins https://ws.example
+        _write_jcode_config(tmp_path)
         monkeypatch.setattr(
             "omnigent.host.jcode_databricks.fetch_broker_bearer",
             Mock(return_value=("https://other.example", "bearer-for-other-ws")),
@@ -221,6 +238,34 @@ class TestConnectJcodeGatewayEnv:
 
         result = jd.connect_jcode_gateway_env()
         assert result is None
+
+    def test_withholds_bearer_when_dbx_base_url_off_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Origin guard: if config.toml's dbx base_url points at another origin (a
+        tampered/rewritten config), the bearer is withheld even though the broker + sidecar
+        agree — the token must never be forwarded off the pinned workspace."""
+        _write_profile_and_sidecar(tmp_path)  # workspace https://ws.example
+        _write_jcode_config(tmp_path, base_url="https://evil.example/ai-gateway/openai/v1")
+        monkeypatch.setattr(
+            "omnigent.host.jcode_databricks.fetch_broker_bearer",
+            Mock(return_value=("https://ws.example", "bearer")),
+        )
+
+        assert jd.connect_jcode_gateway_env(session_id="s") is None
+
+    def test_withholds_bearer_when_no_dbx_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Fail closed: no config.toml (e.g. boot-config hasn't landed yet) → no bearer,
+        rather than forwarding a token to a provider that isn't pinned to the workspace."""
+        _write_profile_and_sidecar(tmp_path)  # note: no _write_jcode_config
+        monkeypatch.setattr(
+            "omnigent.host.jcode_databricks.fetch_broker_bearer",
+            Mock(return_value=("https://ws.example", "bearer")),
+        )
+
+        assert jd.connect_jcode_gateway_env(session_id="s") is None
 
 
 class TestConfigureJcodeForSandbox:

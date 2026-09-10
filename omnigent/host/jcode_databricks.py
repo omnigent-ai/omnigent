@@ -24,6 +24,9 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from pathlib import Path
+
+import tomllib
 
 from omnigent.host.databricks_credential import (
     HOST_DATABRICKS_PROFILE,
@@ -31,6 +34,7 @@ from omnigent.host.databricks_credential import (
     _sidecar_path,
     broker_token_command,
     fetch_broker_bearer,
+    https_url_on_workspace_host,
 )
 from omnigent.inner.databricks_executor import _read_databrickscfg_host
 
@@ -205,6 +209,36 @@ def configure_jcode_for_sandbox() -> None:
     threading.Thread(target=_run, name="jcode-configure", daemon=True).start()
 
 
+def _jcode_config_path() -> Path:
+    """Path to jcode's config.toml (``$JCODE_HOME/config.toml``, else ``~/.jcode``).
+
+    Matches jcode's own resolution, so it points at the same file
+    :func:`configure_jcode_for_sandbox` wrote at host boot.
+    """
+    home = os.environ.get("JCODE_HOME") or str(Path.home() / ".jcode")
+    return Path(home) / "config.toml"
+
+
+def _dbx_provider_base_url_on_workspace(workspace_host: str) -> bool:
+    """True when jcode's on-disk ``dbx`` provider base URL is HTTPS on *workspace_host*.
+
+    ``config.toml`` is a same-user-writable file shared across sessions, and the
+    spawn forwards a live Databricks bearer to whatever ``providers.dbx.base_url``
+    it names. Re-pin at spawn (mirrors the opencode-native config-origin check): a
+    rewritten base URL pointing at another origin must not receive the token. A
+    missing/unreadable config or provider fails closed (``False``).
+    """
+    try:
+        with open(_jcode_config_path(), "rb") as handle:
+            cfg = tomllib.load(handle)
+    except (OSError, ValueError):
+        return False
+    providers = cfg.get("providers")
+    dbx = providers.get(_JCODE_PROVIDER_ID) if isinstance(providers, dict) else None
+    base_url = dbx.get("base_url") if isinstance(dbx, dict) else None
+    return isinstance(base_url, str) and https_url_on_workspace_host(base_url, workspace_host)
+
+
 def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str] | None:
     """Mint a fresh Databricks bearer + this session's runtime dir for a jcode spawn.
 
@@ -212,13 +246,17 @@ def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str
     if present and valid, fetches a **fresh** bearer via the broker and returns the
     two env vars jcode needs (``JCODE_DBX_TOKEN``, ``JCODE_RUNTIME_DIR``).
 
-    **Refresh:** the bearer is minted on every call. The spawn-env builder runs per
-    message, and the harness process manager only applies the env when it actually
-    (re)spawns the jcode subprocess — but a jcode daemon idle-exits after a few
-    minutes, so a later turn can re-spawn it, and minting every time guarantees that
-    re-spawn re-authenticates with a current token rather than a stale one. (On a
-    turn that reuses a live daemon the mint is unused; that is a small per-turn broker
-    call, the tradeoff for keeping re-spawns fresh without a jcode-side token command.)
+    **Token lifetime (no mid-session refresh).** The bearer is captured into the
+    *outer* generic-ACP harness process's env when the harness process manager first
+    spawns it; on a cache hit it ignores the freshly-built env, and when the inner
+    jcode daemon idle-exits the ACP executor restarts it from that harness process's
+    original env. So the token is effectively fixed for the life of the harness
+    process and only refreshes when *that* process is recycled (its idle-reap), not
+    on an inner-daemon respawn. A single session outliving the ~1h broker token can
+    therefore start failing inference — accepted for a first cut (a jcode-side
+    per-request token command is the follow-up). Minting on every call is harmless
+    (the value is consumed only when the harness process actually (re)spawns) and
+    keeps that (re)spawn current; it's a small per-turn broker call.
 
     **Runtime dir:** keyed by *session_id* (see :func:`_session_runtime_dir`) and
     created idempotently, so the session reuses one dir (its own daemon) across turns
@@ -227,8 +265,9 @@ def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str
 
     Returns ``None`` (a complete no-op — jcode keeps its ambient config) when the
     sidecar is absent (not a managed-connect host), the broker is unreachable or
-    declines, or the broker's workspace no longer matches the sidecar pin. Best-effort:
-    errors are logged, never raised.
+    declines, the broker's workspace no longer matches the sidecar pin, or jcode's
+    on-disk ``dbx`` base URL isn't on the pinned workspace. Best-effort: errors are
+    logged, never raised.
 
     :param session_id: The session/conversation id, used to scope the runtime dir.
     :returns: ``{JCODE_DBX_TOKEN, JCODE_RUNTIME_DIR}``, or ``None`` off the managed
@@ -254,6 +293,17 @@ def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str
     # pins (the owner reconnected elsewhere), don't forward this bearer to jcode's
     # config, which is pinned to the sidecar workspace. Mirrors databricks_credential.main.
     if workspace_host.rstrip("/") != coords["workspace_host"].rstrip("/"):
+        return None
+
+    # Origin guard: the bearer is forwarded to whatever base URL jcode's on-disk `dbx`
+    # provider names (a same-user-writable, cross-session config.toml). Withhold it
+    # unless that base URL is still HTTPS on the pinned workspace, so a rewritten
+    # config can't redirect the Databricks token to another origin.
+    if not _dbx_provider_base_url_on_workspace(workspace_host):
+        _logger.warning(
+            "jcode: dbx provider base URL is missing or not on the connected workspace; "
+            "withholding the bearer."
+        )
         return None
 
     try:
