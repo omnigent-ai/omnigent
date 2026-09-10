@@ -30,38 +30,57 @@ async function ensureDatabricksSession(ses, origin, { interactive = true, nextPa
 
 /**
  * GET /auth/session/create with a bearer token and store the returned DBAUTH
- * cookie in ``ses``. Uses redirect:"manual" so we read the 302 (and its
- * Set-Cookie) directly instead of following it. Rejects on a non-2xx/302 or a
- * missing DBAUTH — surfacing, e.g., the 403 you'd get if the endpoint's SAFE
- * allowlist doesn't include this client_id.
+ * cookie in ``ses``. Uses redirect:"manual" so we capture the 302 (and its
+ * Set-Cookie) without following it to next_url. In manual mode Electron delivers
+ * a 3xx via the "redirect" event (NOT "response"); we read the cookie there and
+ * abort. A 200 (no redirect) is handled on "response". Rejects on a missing
+ * DBAUTH — surfacing, e.g., the 403 you'd get if the endpoint's SAFE allowlist
+ * doesn't include this client_id.
  */
 function mintSessionCookie(ses, origin, accessToken, nextPath) {
   return new Promise((resolve, reject) => {
     const url = `${origin}${SESSION_CREATE_PATH}?next_url=${encodeURIComponent(nextPath)}`;
     const request = net.request({ method: "GET", url, session: ses, redirect: "manual" });
     request.setHeader("Authorization", `Bearer ${accessToken}`);
+    let captured = false;
+
+    function applyFrom(status, setCookies) {
+      const dbauth = setCookies.map(parseSetCookie).find((c) => c && c.name === "DBAUTH");
+      if (!dbauth) {
+        reject(new Error(`${SESSION_CREATE_PATH} ${status} but no DBAUTH cookie in the response`));
+        return;
+      }
+      applyCookie(ses, origin, dbauth).then(() => {
+        console.log(`[omnigent] databricks session: DBAUTH cookie set for ${origin} (via HTTP ${status})`);
+        resolve();
+      }, reject);
+    }
+
+    // The success case is a 302 to next_url; manual mode surfaces it here.
+    request.on("redirect", (statusCode, _method, _redirectUrl, responseHeaders) => {
+      captured = true;
+      request.abort(); // we only want the Set-Cookie, not the redirect target
+      applyFrom(statusCode, headerValues(responseHeaders, "set-cookie"));
+    });
+
+    // A 200 (no redirect) carries the Set-Cookie on the response itself.
     request.on("response", (response) => {
       const status = response.statusCode;
       const setCookies = headerValues(response.headers, "set-cookie");
-      // Drain the body so the connection closes.
       response.on("data", () => {});
       response.on("end", () => {
-        if (status !== 302 && status !== 200) {
+        if (status !== 200) {
           reject(new Error(`${SESSION_CREATE_PATH} returned ${status}`));
           return;
         }
-        const dbauth = setCookies.map(parseSetCookie).find((c) => c && c.name === "DBAUTH");
-        if (!dbauth) {
-          reject(new Error(`${SESSION_CREATE_PATH} ${status} but no DBAUTH cookie in the response`));
-          return;
-        }
-        applyCookie(ses, origin, dbauth).then(() => {
-          console.log(`[omnigent] databricks session: DBAUTH cookie set for ${origin} (via HTTP ${status})`);
-          resolve();
-        }, reject);
+        applyFrom(status, setCookies);
       });
     });
-    request.on("error", reject);
+
+    request.on("error", (err) => {
+      if (captured) return; // abort() after capturing the redirect lands here — expected
+      reject(err);
+    });
     request.end();
   });
 }
