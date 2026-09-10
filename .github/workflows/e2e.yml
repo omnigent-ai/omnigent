@@ -118,10 +118,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          # PRs (same-repo and fork) test the merge result (refs/pull/N/merge --
-          # absent when the PR conflicts, so a conflicted PR fails checkout by
-          # design). Schedule / dispatch fall back to the branch / ref.
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
+          # For PRs check out the base; the next step merges the head SHA on top,
+          # reproducing the merge result (see that step for why, and for what the
+          # merge ref does on Forgejo). Non-PR triggers keep their previous behaviour.
+          ref: ${{ github.event.pull_request.base.sha || github.event.inputs.branch || github.ref }}
+          fetch-depth: 0
+      # Test the merge result, not the branch: refs/pull/N/merge does not exist on
+      # Forgejo, so merge the immutable head SHA onto the immutable base SHA here.
+      # A real conflict still fails the job.
+      - name: Construct PR merge result
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name  "ci-merge"
+          git config user.email "ci-merge@local"
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+          git checkout --detach "$BASE_SHA"
+          if ! git merge --no-edit --no-ff "$HEAD_SHA"; then
+            echo "::error::PR does not merge cleanly into its base ($BASE_SHA)"
+            git merge --abort || true
+            exit 1
+          fi
+          echo "merged $HEAD_SHA into $BASE_SHA -> $(git rev-parse HEAD)"
 
       # Steps below are shared verbatim with server-compat.yml's backcompat-e2e
       # job via the composite action, so the two never drift. server_version
