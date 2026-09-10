@@ -19,6 +19,7 @@ import contextlib
 import logging
 import os
 import random
+import socket
 from collections.abc import Awaitable, Callable
 from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -61,6 +62,11 @@ from omnigent.runtime.websocket_metrics import (
 )
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.ws_proxy import (
+    open_proxy_connect_socket,
+    redact_proxy_url,
+    ws_env_proxy_url,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -116,6 +122,10 @@ _RUNNER_TUNNEL_CLOSE_TIMEOUT_S = 0.25
 # loopback. Only paid on graceful shutdown; server-initiated recycles close
 # via the exception path where our close() is already a no-op.
 _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
+
+# Dial + CONNECT-handshake budget for a mandatory egress proxy, matching
+# the websockets library's default open_timeout for the upgrade itself.
+_PROXY_CONNECT_TIMEOUT_S = 10.0
 # Bound on how long the graceful drain waits for in-flight dispatch tasks
 # (the ``GET /stream`` relays, plus any live request) to finish after the
 # end-of-stream sentinel is enqueued. A task still running past this is
@@ -846,12 +856,30 @@ async def _serve_tunnel_once(
         if shutdown_event is not None
         else _RUNNER_TUNNEL_CLOSE_TIMEOUT_S
     )
+    # In a sandbox whose only egress is a mandatory CONNECT proxy, the pinned
+    # websockets<15 client would dial the server directly and fail name
+    # resolution forever; honor the proxy env by establishing the CONNECT
+    # tunnel ourselves. Symmetric with the host tunnel (host/connect.py).
+    proxy_url = ws_env_proxy_url(tunnel_url)
+    proxy_sock: socket.socket | None = None
+    if proxy_url is not None:
+        _logger.info(
+            "Connecting runner tunnel via CONNECT proxy %s",
+            redact_proxy_url(proxy_url),
+            extra={"session_id": runner_primary_session_id()},
+        )
+        proxy_sock = await open_proxy_connect_socket(
+            proxy_url, tunnel_url, timeout=_PROXY_CONNECT_TIMEOUT_S
+        )
     async with websockets.connect(
         tunnel_url,
         additional_headers=headers,
         close_timeout=close_timeout,
         max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
         ssl=ssl_ctx,
+        # Pre-connected through the mandatory egress proxy (None dials
+        # direct); TLS for wss:// is layered on top by connect().
+        sock=proxy_sock,
         # Protocol keepalive aligned to the server's 90 s app-level budget (not the
         # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
         # Also the runner's only liveness probe for a silently-dead server.

@@ -5947,3 +5947,111 @@ async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
     """An unknown write op fails loud rather than silently no-op'ing."""
     with pytest.raises(ValueError, match="unknown fs write op"):
         HostProcess._dispatch_fs_write_op("/ws", "bogus", {})
+
+
+class _StopAfterConnect(Exception):
+    """Sentinel aborting ``_connect_and_serve`` right after the connect call."""
+
+
+class _CapturingWsConnect:
+    """Fake ``websockets`` connect that records kwargs, then aborts the attempt."""
+
+    def __init__(self, captured: dict[str, object]) -> None:
+        self._captured = captured
+
+    def __call__(self, url: str, **kwargs: object) -> _CapturingWsConnect:
+        self._captured["url"] = url
+        self._captured["kwargs"] = kwargs
+        return self
+
+    async def __aenter__(self) -> object:
+        raise _StopAfterConnect
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+
+def _proxy_test_host(monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]) -> HostProcess:
+    """Build a host against a non-loopback server with connect captured.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param captured: Dict receiving the ``websockets`` connect url/kwargs.
+    :returns: A :class:`HostProcess` whose next connect attempt is captured.
+    """
+    from omnigent.host import connect as connect_mod
+
+    monkeypatch.setattr(
+        connect_mod.websockets.asyncio.client, "connect", _CapturingWsConnect(captured)
+    )
+    # Auth header minting is not under test; keep it off the network.
+    monkeypatch.setattr(HostProcess, "_build_connect_headers", lambda _self: {})
+    identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
+    return HostProcess(identity, "http://server.sandbox.test:8000")
+
+
+async def test_connect_and_serve_dials_through_mandatory_env_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With proxy-mandated egress, connect() gets the CONNECT-tunneled socket.
+
+    In a sandbox whose only network path is the env-configured CONNECT proxy
+    (no direct DNS/TCP egress), the host tunnel must ride the proxy like the
+    host's own HTTP calls — dialing direct loops on name resolution forever
+    and the host never comes online.
+    """
+    import socket
+
+    from omnigent.host import connect as connect_mod
+
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:3128")
+    monkeypatch.setenv("no_proxy", "localhost,127.0.0.1,::1")
+    dialed: dict[str, object] = {}
+    proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    async def _fake_dial(proxy_url: str, ws_url: str, *, timeout: float) -> socket.socket:
+        del timeout
+        dialed["proxy_url"] = proxy_url
+        dialed["ws_url"] = ws_url
+        return proxy_sock
+
+    monkeypatch.setattr(connect_mod, "open_proxy_connect_socket", _fake_dial)
+    captured: dict[str, object] = {}
+    host = _proxy_test_host(monkeypatch, captured)
+
+    try:
+        with pytest.raises(_StopAfterConnect):
+            await host._connect_and_serve()
+
+        tunnel_url = "ws://server.sandbox.test:8000/v1/hosts/host_test_connect/tunnel"
+        assert dialed == {"proxy_url": "http://127.0.0.1:3128", "ws_url": tunnel_url}
+        assert captured["url"] == tunnel_url
+        kwargs = captured["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs["sock"] is proxy_sock
+        # The aborted attempt must not leak the tunneled socket.
+        assert proxy_sock.fileno() == -1
+    finally:
+        proxy_sock.close()
+
+
+async def test_connect_and_serve_dials_direct_without_proxy_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without proxy env (the default), no CONNECT dial happens at all."""
+    import socket
+
+    from omnigent.host import connect as connect_mod
+
+    async def _must_not_dial(*_args: object, **_kwargs: object) -> socket.socket:
+        raise AssertionError("the CONNECT dialer must not run without proxy env")
+
+    monkeypatch.setattr(connect_mod, "open_proxy_connect_socket", _must_not_dial)
+    captured: dict[str, object] = {}
+    host = _proxy_test_host(monkeypatch, captured)
+
+    with pytest.raises(_StopAfterConnect):
+        await host._connect_and_serve()
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["sock"] is None

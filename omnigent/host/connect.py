@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -152,6 +153,11 @@ from omnigent.runtime.websocket_metrics import (
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.ws_proxy import (
+    open_proxy_connect_socket,
+    redact_proxy_url,
+    ws_env_proxy_url,
+)
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -3693,8 +3699,21 @@ class HostProcess:
         self._conn_frame_received = False
         url = self._tunnel_url()
         headers = self._build_connect_headers()
+        open_timeout = (
+            _RECONNECT_OPEN_TIMEOUT_S if self._ever_connected else _INITIAL_CONNECT_OPEN_TIMEOUT_S
+        )
 
-        _logger.info("Connecting to %s", url)
+        # In a sandbox whose only egress is a mandatory CONNECT proxy, the
+        # pinned websockets<15 client would dial the server directly and fail
+        # name resolution forever; honor the proxy env like the host's own
+        # HTTP calls by establishing the CONNECT tunnel ourselves.
+        proxy_url = ws_env_proxy_url(url)
+        proxy_sock: socket.socket | None = None
+        if proxy_url is None:
+            _logger.info("Connecting to %s", url)
+        else:
+            _logger.info("Connecting to %s via CONNECT proxy %s", url, redact_proxy_url(proxy_url))
+            proxy_sock = await open_proxy_connect_socket(proxy_url, url, timeout=open_timeout)
         # Build a verifying SSL context from a real CA bundle for wss:// — a bare
         # default context loads zero roots on uv / python-build-standalone Pythons
         # (no OpenSSL default cert path), which fails handshake verification.
@@ -3706,11 +3725,10 @@ class HostProcess:
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
-                open_timeout=(
-                    _RECONNECT_OPEN_TIMEOUT_S
-                    if self._ever_connected
-                    else _INITIAL_CONNECT_OPEN_TIMEOUT_S
-                ),
+                # Pre-connected through the mandatory egress proxy (None dials
+                # direct); TLS for wss:// is layered on top by connect().
+                sock=proxy_sock,
+                open_timeout=open_timeout,
                 # Align the host->server tunnel's protocol keepalive to the same
                 # 90 s app-level budget as the runner tunnel (not the 20 s library
                 # default that drops a busy-but-healthy tunnel with 1011 — #1116).
@@ -3719,13 +3737,20 @@ class HostProcess:
                 ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             )
             ws = await ws_cm.__aenter__()
-        except (InvalidURI, InvalidStatus) as exc:
-            # The upgrade itself was rejected. Fail loud on permanent
-            # failures (auth / authorization / outdated server); let the
-            # reconnect loop retry transient ones.
-            fatal = self._fatal_upgrade_error(exc)
-            if fatal is not None:
-                raise fatal from exc
+        except BaseException as exc:
+            # The event loop owns the proxied socket once create_connection is
+            # reached; close it for failures before that hand-off (a second
+            # close of an already-closed socket is harmless).
+            if proxy_sock is not None:
+                with contextlib.suppress(OSError):
+                    proxy_sock.close()
+            if isinstance(exc, InvalidURI | InvalidStatus):
+                # The upgrade itself was rejected. Fail loud on permanent
+                # failures (auth / authorization / outdated server); let the
+                # reconnect loop retry transient ones.
+                fatal = self._fatal_upgrade_error(exc)
+                if fatal is not None:
+                    raise fatal from exc
             raise
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
