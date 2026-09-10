@@ -662,9 +662,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
             }
           >
-            {/* Inline image previews — one non-wrapping strip. */}
+            {/* Inline image previews. Wrap rather than scroll horizontally:
+                a landscape image fills the bubble width, so a second one in a
+                non-wrapping strip would sit off-screen in the overflow and
+                look like it never rendered. */}
             {images.length > 0 && (
-              <div className="mb-1.5 flex gap-2 overflow-x-auto">
+              <div className="mb-1.5 flex flex-wrap gap-2">
                 {keyedAttachments(
                   images,
                   (img) => img.file_id ?? img.image_url ?? img.filename,

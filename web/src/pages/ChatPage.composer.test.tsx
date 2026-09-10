@@ -1971,21 +1971,24 @@ describe("Composer pending elicitation", () => {
     vi.restoreAllMocks();
   });
 
-  it("locks the textarea and send button while an elicitation is pending", () => {
+  it("keeps the textarea typable but blocks sending while an elicitation is pending", () => {
     useChatStore.setState({ blocks: [elicitationBlock()] });
     const onSend = vi.fn();
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
 
-    // The lock is the disabled textarea + the placeholder explaining why.
-    expect(ta.disabled).toBe(true);
+    // The textarea must stay ENABLED: disabling it ejects browser focus
+    // mid-word when the prompt lands while the user is typing, and their
+    // continued keystrokes silently vanish. Only sending is locked.
+    expect(ta.disabled).toBe(false);
     expect(ta.placeholder).toBe("Respond to the pending request above to continue");
 
-    // Models a draft that existed before the elicitation arrived (drafts
-    // persist per session): even with text present, Enter must not send —
-    // this exercises the submit() guard, which backstops the disabled
-    // attribute for programmatic paths.
-    fireEvent.change(ta, { target: { value: "queued while blocked" } });
+    // Typing keeps landing in the draft while the prompt is pending.
+    fireEvent.change(ta, { target: { value: "typed while pending" } });
+    expect(ta.value).toBe("typed while pending");
+
+    // But Enter must not send — the submit() guard parks the draft until
+    // the prompt is answered (a message sent now would sit queued unread).
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
 
@@ -2126,6 +2129,22 @@ describe("Composer file-attachment focus", () => {
     fireEvent.change(fileInput(), { target: { files: [file] } });
 
     expect(document.activeElement).toBe(ta);
+  });
+
+  it("marks the textarea with data-has-draft for an attachment-only draft", () => {
+    // The approve hotkey's drafting guard only sees the focused element, so
+    // the composer must advertise non-text drafts (attachments, mentions) on
+    // the textarea itself — with an empty value, an attached file is still a
+    // sendable draft, and Cmd/Ctrl+Enter must read as send intent there.
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    expect(ta.getAttribute("data-has-draft")).toBeNull();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.change(fileInput(), { target: { files: [file] } });
+
+    expect(ta.value).toBe("");
+    expect(ta.getAttribute("data-has-draft")).toBe("true");
   });
 
   it("does not focus the textarea when the attachment is rejected", () => {

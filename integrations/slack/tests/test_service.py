@@ -239,6 +239,7 @@ class FakeOmnigentClient:
         self.turn_host_types: list[str] = []
         self.bound: list[str] = []
         self.launched: list[tuple[str, str, str | None]] = []
+        self.deleted: list[str] = []
         self.turns: list[tuple[str, str]] = []
         self.resolved: list[tuple[str, str, bool]] = []
         self.resolved_content: list[dict[str, Any] | None] = []
@@ -290,6 +291,9 @@ class FakeOmnigentClient:
         self.bound.append(session_id)
         self.launched.append((session_id, workspace, host_id))
         return "runner_1"
+
+    async def delete_session(self, session_id: str) -> None:
+        self.deleted.append(session_id)
 
     async def run_turn(
         self,
@@ -676,6 +680,65 @@ async def test_no_ack_when_session_cannot_start_host_unavailable(tmp_path: Path)
 
     assert slack.acks == []
     # The only durable post is the guidance.
+    assert len(slack.posts) == 1
+    assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
+
+
+async def test_failed_launch_deletes_the_created_session(tmp_path: Path) -> None:
+    # A launch failure aborts the turn before the thread->session binding is
+    # recorded, so the bot must delete the session it just created rather than
+    # strand it on the server as an orphan.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = HostUnavailableClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await service.shutdown()
+
+    # The created session was cleaned up, no binding was recorded, and the user
+    # still got the launch guidance.
+    assert omnigent.deleted == ["conv_1"]
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    assert await store.get_session(key) is None
+    assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
+
+
+class CleanupFailsClient(FakeOmnigentClient):
+    async def launch_runner(
+        self, session_id: str, *, workspace: str, host_id: str | None = None
+    ) -> str:
+        raise HostUnavailableError("no host")
+
+    async def delete_session(self, session_id: str) -> None:
+        raise OmnigentError("delete failed")
+
+
+async def test_failed_launch_cleanup_failure_still_posts_guidance(tmp_path: Path) -> None:
+    # The orphan cleanup is best-effort: a delete that itself fails is swallowed
+    # and never replaces the user's launch-failure message.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = CleanupFailsClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await service.shutdown()
+
     assert len(slack.posts) == 1
     assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
 

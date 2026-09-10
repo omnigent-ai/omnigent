@@ -345,12 +345,15 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          # server.log + runner.log from the live_server fixture's tmp dir,
-          # plus the native bridge dirs and the Claude / Codex transcripts
-          # staged above -- all needed to triage a native render-parity failure.
+          # server.log + runner.log from the live_server and mocked-Codex
+          # fixtures' tmp dirs, plus the native bridge dirs and the Claude /
+          # Codex transcripts staged above -- all needed to triage a native
+          # render-parity or restart failure.
           path: |
             /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
             /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
+            /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/server.log
+            /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/runner.log
             /tmp/omnigent-*/claude-native/**
             /tmp/claude-home-dump/**
             /tmp/codex-home-dump/**

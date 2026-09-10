@@ -11592,3 +11592,610 @@ def test_response_failed_event_llm_source_is_preserved() -> None:
     )
     payload = _json.loads(raw.decode().split("data: ", 1)[1])
     assert payload["source"] == "llm"
+
+
+# ---------------------------------------------------------------------------
+# Steering an in-flight sub-agent turn instead of bouncing the send.
+#
+# A sub-agent whose turn is still running used to make the parent's same-title /
+# same-session send bounce with "already has a launching or running turn",
+# leaving cancellation as the only lever. The runner now steers the child's
+# in-flight turn instead of refusing, on a path that keeps the turn's SINGLE
+# work entry rather than replacing it:
+#   * a locally-tracked running/waiting turn reuses its existing entry verbatim
+#     (no re-stamp, no re-register), so the one completion always maps to it;
+#   * a server-busy-but-untracked turn (e.g. after a runner restart) is adopted
+#     by registering one entry directly in "running" (not "launching", so the
+#     launch-timeout reaper leaves it alone) with a freshly stamped id.
+# On a post failure the child is never torn down: a reused turn stays tracked
+# and alive; an adopted registration is rolled back to the prior untracked
+# state. Only a child that has not started streaming yet ("launching") is
+# deferred with a transient retry. Together these close the completion-race,
+# post-failure, and false-reap hazards of a re-stamping continuation (Polly
+# review issues #1/#2/#3); the fresh register+stamp continuation path is used
+# only for a genuinely idle child.
+# ---------------------------------------------------------------------------
+
+
+def _running_child_server_handler(
+    parent_id: str,
+    child_id: str,
+    *,
+    stamped: list[str],
+    event_posts: list[dict[str, Any]],
+    create_posts: list[int],
+    child_busy: bool = False,
+    delete_posts: list[int] | None = None,
+    events_status: int = 200,
+) -> Any:
+    """Build a MockTransport handler for a named-mode in-flight-send test.
+
+    Serves the parent turn-actor label and a single matching child (busy flag
+    per ``child_busy``), records the stamped dispatch id on PATCH and the posted
+    message on the child's /events, and 500s any duplicate-create POST so an
+    accidental untracked create is caught. ``events_status`` forces the child's
+    /events response code (e.g. 500 to exercise a post failure), and any DELETE
+    of the child is recorded in ``delete_posts`` so a test can assert a still-live
+    turn is never torn down.
+    """
+    from omnigent.runner import app as runner_app
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == f"/v1/sessions/{parent_id}":
+            return httpx.Response(
+                200, json={"labels": {"omnigent.turn_actor": "alice@example.com"}}
+            )
+        if request.method == "GET" and path == f"/v1/sessions/{parent_id}/child_sessions":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": child_id,
+                            "tool": "claude",
+                            "session_name": "merge-task",
+                            "busy": child_busy,
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            create_posts.append(1)
+            return httpx.Response(500, json={"error": "duplicate"})
+        if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
+            labels = json.loads(request.content)["labels"]
+            stamped.append(labels[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "DELETE" and path == f"/v1/sessions/{child_id}":
+            if delete_posts is not None:
+                delete_posts.append(1)
+            return httpx.Response(204)
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(events_status, json={"ok": events_status < 400})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    return _handler
+
+
+async def _run_named_continuation(parent_id: str, handler: Any) -> str:
+    """Drive a named-mode ``sys_session_send`` continuation against ``handler``."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    ) as server_client:
+        return await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {
+                    "agent": "claude",
+                    "title": "merge-task",
+                    "args": "stop and report where the merge stands",
+                }
+            ),
+            server_client=server_client,
+            conversation_id=parent_id,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+            session_inbox=session_inbox,
+        )
+
+
+@pytest.mark.parametrize("work_status", ["running", "waiting"])
+@pytest.mark.asyncio
+async def test_named_send_reuses_tracked_in_flight_entry_without_restamp(
+    monkeypatch: pytest.MonkeyPatch,
+    work_status: str,
+) -> None:
+    """A same-title send to a locally-tracked running/waiting child reuses its entry.
+
+    Pre-PR this bounced with "already has a launching or running turn". The fix
+    must deliver the message while keeping the turn's SINGLE existing work entry:
+    no fresh dispatch id is stamped and no new entry is registered, so the one
+    in-flight completion always maps back to the original entry rather than being
+    orphaned under a replacement id (review issue #1). ``waiting`` (own turn
+    ended, descendants active) is steered the same way, not refused (review
+    issue #2).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = f"conv_parent_{work_status}", f"conv_child_{work_status}"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    entry.status = work_status
+    original_work_id = entry.work_id
+
+    handler = _running_child_server_handler(
+        parent_id, child_id, stamped=stamped, event_posts=event_posts, create_posts=create_posts
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert "already has a launching or running turn" not in output
+    payload = json.loads(output)
+    # A steered in-flight turn reports "running" (it continues the live turn),
+    # not "launching" (which would arm the launch-timeout reaper).
+    assert payload["status"] == "running"
+    assert payload["conversation_id"] == child_id
+    assert create_posts == [], "steering must not create a duplicate child session"
+    # The load-bearing invariant against misattribution: no re-stamp, and the
+    # entry is the same one (same work_id) that already tracks the in-flight turn.
+    assert stamped == [], "reusing a tracked in-flight turn must not re-stamp a new id"
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == work_status
+    assert len(event_posts) == 1
+    assert event_posts[0]["created_by"] == "alice@example.com"
+    assert event_posts[0]["data"]["content"][0]["text"] == "stop and report where the merge stands"
+
+
+@pytest.mark.asyncio
+async def test_named_send_reused_in_flight_post_failure_keeps_tracking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed post to a reused in-flight turn must not destroy its tracking.
+
+    The original turn is still alive, so a post failure must leave its work entry
+    intact (and never delete the child) -- otherwise the running turn's eventual
+    result becomes untracked and undeliverable, a regression that was impossible
+    while such sends were refused (review issue #2).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_postfail", "conv_child_postfail"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+    delete_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    entry.status = "running"
+    original_work_id = entry.work_id
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        delete_posts=delete_posts,
+        events_status=500,
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert output.startswith("Error: failed to steer in-flight sub-agent")
+    # The still-running turn stays tracked under its original entry, and the
+    # child session is not deleted.
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == "running"
+    assert delete_posts == [], "a reused, still-live turn must never be torn down"
+    assert create_posts == []
+
+
+@pytest.mark.asyncio
+async def test_named_send_adopts_busy_child_as_running_not_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-busy child with no local work entry is adopted as a running turn.
+
+    After a runner restart the in-flight turn's local bookkeeping is gone, but the
+    server still reports the child busy. Pre-PR this was refused ("is already
+    running"); the fix adopts it -- stamping a dispatch id and registering one
+    entry so its result is delivered (review issue #1) -- and registers that entry
+    directly in ``running`` (not ``launching``), so the launch-timeout reaper
+    cannot fail a long-running steered turn whose buffered nudge is waiting for it
+    to yield (review issue #3).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_busy", "conv_busy_child"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        child_busy=True,
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert "already has a launching or running turn" not in output
+    assert "is already running" not in output
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    assert payload["conversation_id"] == child_id
+    assert create_posts == []
+    assert len(stamped) == 1, "an untracked server-busy turn must be adopted with one stamp"
+    # Adopted directly as running (not launching) so it is safe from the reaper,
+    # and the entry carries the freshly stamped id so its completion delivers.
+    assert work is not None and work.work_id == stamped[0]
+    assert work.status == "running"
+    assert len(event_posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The busy→ended race registers a fresh entry, not the drained one.
+
+    If the child's tracked turn completes (and is delivered/drained) between the
+    pre-post snapshot and the post, the server starts a brand-new turn. Because
+    the message is posted first and tracking is decided from the *post-settled*
+    work state, a stale terminal entry is not reused — a fresh entry is
+    registered so the new turn's completion is delivered rather than dropped
+    against the already-delivered entry (review issue #1). The stale entry here
+    stands in for that just-drained old turn; the server snapshot still reports
+    the child busy (the new turn).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_ended", "conv_child_ended"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    # A stale entry from the turn that just ended: terminal and already delivered.
+    stale = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    stale.status = "completed"
+    stale.delivered = True
+    stale_work_id = stale.work_id
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        child_busy=True,
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    # A fresh entry is registered under a NEW dispatch id (not the drained one),
+    # in "running", so the new turn's completion has a live entry to deliver to.
+    assert len(stamped) == 1
+    assert work is not None
+    assert work.work_id == stamped[0]
+    assert work.work_id != stale_work_id
+    assert work.status == "running"
+    assert work.delivered is False
+    assert len(event_posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_in_flight_send_serializes_concurrent_adopts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent sends to a busy, untracked child install exactly one entry.
+
+    Two parallel steers to the same server-busy child (no local work entry) must
+    not stamp divergent dispatch ids or clobber each other's registration. The
+    per-child classify/register lock serializes them: the first adopts the turn
+    (one stamp, one entry), the second finds it running and reuses it (no second
+    stamp), so a single coherent entry remains (review issue #2).
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id, child_id = "conv_parent_concurrent", "conv_child_concurrent"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        child_busy=True,
+    )
+
+    async def _one_send(server_client: httpx.AsyncClient) -> str:
+        return await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {"agent": "claude", "title": "merge-task", "args": "stop and report"}
+            ),
+            server_client=server_client,
+            conversation_id=parent_id,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+            session_inbox=asyncio.Queue(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            outputs = await asyncio.gather(_one_send(server_client), _one_send(server_client))
+            work = runner_app.get_subagent_work(child_id)
+        finally:
+            runner_app.unregister_subagent_work(child_id)
+            runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert all(json.loads(o)["status"] == "running" for o in outputs)
+    assert len(event_posts) == 2, "both concurrent sends deliver their message"
+    # Exactly one dispatch id is stamped (the adopt); the second send reuses the
+    # now-running entry. Both handles point at the same coherent work entry.
+    assert len(stamped) == 1, f"concurrent adopts must not stamp divergent ids: {stamped}"
+    assert work is not None and work.work_id == stamped[0]
+    assert work.status == "running"
+
+
+def test_in_flight_send_lock_is_cleaned_up_with_child_work() -> None:
+    """The per-child in-flight-send lock does not leak past the child's work.
+
+    ``in_flight_send_lock`` inserts into a process-global map; without a cleanup
+    path a long-lived runner accumulates one lock per steered child forever
+    (review issue #2). Unregistering the child's work — directly or via session
+    teardown — must remove its lock.
+    """
+    from omnigent.runner import app as runner_app
+
+    # Direct unregister of a child clears its lock.
+    child_id = "conv_lockleak_child"
+    runner_app.register_subagent_work(
+        parent_session_id="conv_lockleak_parent",
+        child_session_id=child_id,
+        agent="claude",
+        title="merge-task",
+    )
+    runner_app.in_flight_send_lock(child_id)
+    assert child_id in runner_app._in_flight_send_locks
+    runner_app.unregister_subagent_work(child_id)
+    assert child_id not in runner_app._in_flight_send_locks
+
+    # Session teardown clears the parent's and every child's lock.
+    parent_id, child_a, child_b = "conv_teardown_parent", "conv_teardown_a", "conv_teardown_b"
+    for cid in (child_a, child_b):
+        runner_app.register_subagent_work(
+            parent_session_id=parent_id, child_session_id=cid, agent="claude", title=cid
+        )
+        runner_app.in_flight_send_lock(cid)
+    runner_app.in_flight_send_lock(parent_id)
+    try:
+        runner_app.unregister_subagent_work_for_session(parent_id)
+        assert parent_id not in runner_app._in_flight_send_locks
+        assert child_a not in runner_app._in_flight_send_locks
+        assert child_b not in runner_app._in_flight_send_locks
+    finally:
+        for cid in (parent_id, child_a, child_b):
+            runner_app._in_flight_send_locks.pop(cid, None)
+            runner_app.unregister_subagent_work(cid)
+
+
+@pytest.mark.asyncio
+async def test_named_send_defers_when_child_turn_still_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child whose turn has not started streaming defers with a retry.
+
+    There is no active turn yet and posting now could race a parallel start, so
+    the send returns a transient "still starting ... retry" error and posts
+    nothing -- distinct from both the old blanket refusal and the tracked
+    continuation used once the turn is running.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_launch":
+            return httpx.Response(
+                200, json={"labels": {"omnigent.turn_actor": "alice@example.com"}}
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_launch/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_launching_coder",
+                            "tool": "claude",
+                            "session_name": "merge-task",
+                            "busy": False,
+                        }
+                    ]
+                },
+            )
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_launching_coder/events"
+        ):
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    # Default status of freshly registered work is "launching".
+    runner_app.register_subagent_work(
+        parent_session_id="conv_parent_launch",
+        child_session_id="conv_launching_coder",
+        agent="claude",
+        title="merge-task",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "claude", "title": "merge-task", "args": "please stop and report"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_launch",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_launching_coder")
+            runner_app._session_inboxes_ref.pop("conv_parent_launch", None)
+
+    assert "already has a launching or running turn" not in output
+    assert "still starting its turn" in output
+    assert "retry the send in a moment" in output
+    assert event_posts == [], "a launching turn is not posted into"
+
+
+@pytest.mark.asyncio
+async def test_send_by_session_id_reuses_running_child_without_restamp() -> None:
+    """By-session-id send steers a running direct child reusing its one entry.
+
+    The by-id path shares the fix: a locally-tracked running child is steered
+    into its in-flight turn without a re-stamp or a new entry, rather than bounced
+    with "already has a launching or running turn". Keeping the single existing
+    entry is what keeps the turn's one completion deliverable and correctly
+    attributed (review issue #1).
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    stamped: list[str] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_byid":
+            return httpx.Response(
+                200, json={"labels": {"omnigent.turn_actor": "alice@example.com"}}
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_byid_coder":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_byid_coder",
+                    "parent_session_id": "conv_parent_byid",
+                    "title": "claude:merge-task",
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_byid_coder":
+            labels = json.loads(request.content)["labels"]
+            stamped.append(labels[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_byid_coder/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id="conv_parent_byid",
+        child_session_id="conv_byid_coder",
+        agent="claude",
+        title="merge-task",
+    )
+    entry.status = "running"
+    original_work_id = entry.work_id
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"session_id": "conv_byid_coder", "args": "please stop and report"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_byid",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+            work = runner_app.get_subagent_work("conv_byid_coder")
+        finally:
+            runner_app.unregister_subagent_work("conv_byid_coder")
+            runner_app._session_inboxes_ref.pop("conv_parent_byid", None)
+
+    assert "already has a launching or running turn" not in output
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    assert payload["conversation_id"] == "conv_byid_coder"
+    assert stamped == [], "reusing a tracked in-flight turn must not re-stamp a new id"
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == "running"
+    assert len(event_posts) == 1
+    assert event_posts[0]["created_by"] == "alice@example.com"
+    assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"

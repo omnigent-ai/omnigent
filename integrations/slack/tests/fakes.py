@@ -221,6 +221,7 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     ("GET", "/v1/hosts/{host_id}/filesystem", True),
     # Session lifecycle.
     ("POST", "/v1/sessions", True),
+    ("DELETE", "/v1/sessions/{session_id}", True),
     ("GET", "/v1/sessions/{session_id}", True),
     ("GET", "/v1/sessions/{session_id}/items", True),
     ("GET", "/v1/sessions/{session_id}/stream", True),
@@ -421,6 +422,14 @@ class FakeOmnigentServer:
             return httpx.Response(201, json={"id": self.session_id})
 
         respx_mock.post(b + "/v1/sessions").mock(side_effect=_create_session)
+
+        # Session delete — cleanup of a session whose runner launch failed.
+        def _delete_session(request: httpx.Request) -> httpx.Response:
+            self._record(request)
+            deleted_id = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json={"id": deleted_id, "deleted": True})
+
+        respx_mock.delete(url__regex=rf"{b}/v1/sessions/[^/]+$").mock(side_effect=_delete_session)
 
         def _launch_runner(request: httpx.Request) -> httpx.Response:
             self._record(request)

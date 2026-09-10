@@ -1856,13 +1856,16 @@ def _codex_policy_hooks_settings(
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
+    from omnigent.native.tool_observer_hook import hook_settings
+
+    observer = hook_settings(bridge_dir, python_executable or sys.executable, _POLICY_HOOK_MODULE)
     prompt_submit: list[_JsonObject] = [hook]
     if turn_routing:
         prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
     return {
         "hooks": {
             "PreToolUse": [{"hooks": [hook]}],
-            "PostToolUse": [{"hooks": [hook]}],
+            "PostToolUse": [{"hooks": [hook, observer]}],
             "UserPromptSubmit": [{"hooks": prompt_submit}],
         }
     }
