@@ -734,6 +734,155 @@ async def test_update_rejects_invalid_reasoning_effort(
     assert bad.status_code == 400, bad.text
 
 
+async def test_create_with_active_range_echoes_both_fields(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The default create-body rrule fires at 09:00, inside a 08:00-10:00 window."""
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(active_range_start="08:00", active_range_end="10:00"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["active_range_start"] == "08:00"
+    assert created["active_range_end"] == "10:00"
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.json()["active_range_start"] == "08:00"
+    assert got.json()["active_range_end"] == "10:00"
+
+
+async def test_create_with_no_range_returns_null_for_both(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Backward compat: a create with no range at all returns null for both."""
+    _make_user(db_uri)
+    resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["active_range_start"] is None
+    assert created["active_range_end"] is None
+
+
+async def test_create_rejects_one_sided_active_range(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(active_range_start="08:00"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_create_rejects_equal_active_range_bounds(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(active_range_start="09:00", active_range_end="09:00"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_create_rejects_active_range_the_schedule_never_fires_within(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+            active_range_start="18:00",
+            active_range_end="20:00",
+        ),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_update_sets_active_range_on_task_with_none(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    assert created["active_range_start"] is None
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"active_range_start": "08:00", "active_range_end": "10:00"},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["active_range_start"] == "08:00"
+    assert patched.json()["active_range_end"] == "10:00"
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.json()["active_range_start"] == "08:00"
+    assert got.json()["active_range_end"] == "10:00"
+
+
+async def test_update_clears_active_range_with_explicit_null(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(active_range_start="08:00", active_range_end="10:00"),
+            headers=_headers(),
+        )
+    ).json()
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"active_range_start": None, "active_range_end": None},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["active_range_start"] is None
+    assert patched.json()["active_range_end"] is None
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.json()["active_range_start"] is None
+    assert got.json()["active_range_end"] is None
+
+
+async def test_update_rejects_patch_that_would_leave_one_sided_range(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A PATCH setting only one bound must validate against the MERGED effective
+    pair (the new value plus whatever is already stored), not just the raw
+    patch body — so a task can never end up with only one bound set."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(active_range_start="08:00", active_range_end="10:00"),
+            headers=_headers(),
+        )
+    ).json()
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"active_range_start": None},
+        headers=_headers(),
+    )
+    assert patched.status_code == 400, patched.text
+
+    # The stored row is untouched by the rejected patch.
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.json()["active_range_start"] == "08:00"
+    assert got.json()["active_range_end"] == "10:00"
+
+
 async def test_delete_removes_task(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     created = (

@@ -815,6 +815,118 @@ def test_update_clearing_already_null_field_is_noop_for_updated_at(
     assert result.updated_at is None
 
 
+# ── active range ─────────────────────────────────────────────────────────────
+
+
+def test_create_with_active_range_round_trips(store: SqlAlchemyScheduledTaskStore) -> None:
+    """``active_range_start``/``active_range_end`` round-trip through create."""
+    task = store.create(
+        scheduled_task_id=_uid("st_range_create"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=HOURLY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        active_range_start="09:00",
+        active_range_end="17:00",
+    )
+    assert task.active_range_start == "09:00"
+    assert task.active_range_end == "17:00"
+    fetched = store.get(_uid("st_range_create"))
+    assert fetched is not None
+    assert fetched.active_range_start == "09:00"
+    assert fetched.active_range_end == "17:00"
+
+
+def test_create_without_active_range_defaults_to_none(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Omitting the active-range bounds leaves the task unrestricted."""
+    task = store.create(
+        scheduled_task_id=_uid("st_range_default"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=HOURLY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    assert task.active_range_start is None
+    assert task.active_range_end is None
+
+
+def test_update_active_range_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Setting the active range via ``update`` reads the new bounds back."""
+    store.create(
+        scheduled_task_id=_uid("st_range_update"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=HOURLY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    updated = store.update(
+        _uid("st_range_update"),
+        active_range_start="22:00",
+        active_range_end="06:00",
+    )
+    assert updated is not None
+    assert updated.active_range_start == "22:00"
+    assert updated.active_range_end == "06:00"
+
+
+def test_update_active_range_can_be_cleared_to_none(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Explicitly passing ``None`` for both bounds clears the task back to always-active."""
+    store.create(
+        scheduled_task_id=_uid("st_range_clear"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=HOURLY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        active_range_start="09:00",
+        active_range_end="17:00",
+    )
+    updated = store.update(
+        _uid("st_range_clear"),
+        active_range_start=None,
+        active_range_end=None,
+    )
+    assert updated is not None
+    assert updated.active_range_start is None
+    assert updated.active_range_end is None
+    fetched = store.get(_uid("st_range_clear"))
+    assert fetched is not None
+    assert fetched.active_range_start is None
+    assert fetched.active_range_end is None
+
+
+def test_update_omitting_active_range_leaves_it_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Omitting the active-range params does NOT clear them (sentinel = unchanged)."""
+    store.create(
+        scheduled_task_id=_uid("st_range_keep"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=HOURLY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        active_range_start="09:00",
+        active_range_end="17:00",
+    )
+    updated = store.update(_uid("st_range_keep"), name="renamed")
+    assert updated is not None
+    assert updated.active_range_start == "09:00"
+    assert updated.active_range_end == "17:00"
+
+
 # ── delete: cascade cleanup of runs (Finding 2) ──────────────────────────────
 
 

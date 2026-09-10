@@ -42,6 +42,8 @@ const TASK_WIRE = {
   state: "active",
   last_run_at: null,
   last_run_conversation_id: null,
+  active_range_start: null,
+  active_range_end: null,
 };
 
 const fetchMock = vi.fn();
@@ -172,6 +174,67 @@ describe("updateScheduledTask", () => {
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body)).toEqual({ state: "paused" });
     expect(updated.state).toBe("paused");
+  });
+});
+
+describe("active range wire mapping", () => {
+  it("camelCases active_range_start/end when the server sets them", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TASK_WIRE, active_range_start: "09:00", active_range_end: "17:00" }),
+    );
+    const task = await getScheduledTask("st_1");
+    expect(task.activeRangeStart).toBe("09:00");
+    expect(task.activeRangeEnd).toBe("17:00");
+  });
+
+  it("maps both to null for a task without a range", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    const task = await getScheduledTask("st_1");
+    expect(task.activeRangeStart).toBeNull();
+    expect(task.activeRangeEnd).toBeNull();
+  });
+
+  it("createScheduledTask sends active_range_start/end only when both are set", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await createScheduledTask({
+      name: "n",
+      prompt: "p",
+      rrule: "FREQ=HOURLY;BYMINUTE=0",
+      agentId: "ag_1",
+      activeRangeStart: "09:00",
+      activeRangeEnd: "17:00",
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.active_range_start).toBe("09:00");
+    expect(body.active_range_end).toBe("17:00");
+  });
+
+  it("createScheduledTask omits active_range_start/end when unset", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await createScheduledTask({
+      name: "n",
+      prompt: "p",
+      rrule: "FREQ=HOURLY;BYMINUTE=0",
+      agentId: "ag_1",
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty("active_range_start");
+    expect(body).not.toHaveProperty("active_range_end");
+  });
+
+  it("updateScheduledTask sends explicit nulls to clear a previously-set range", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await updateScheduledTask("st_1", { activeRangeStart: null, activeRangeEnd: null });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).toEqual({ active_range_start: null, active_range_end: null });
+  });
+
+  it("updateScheduledTask omits the keys when left unset (untouched server-side)", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await updateScheduledTask("st_1", { state: "paused" });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty("active_range_start");
+    expect(body).not.toHaveProperty("active_range_end");
   });
 });
 

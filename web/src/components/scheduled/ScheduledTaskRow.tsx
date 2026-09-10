@@ -63,7 +63,13 @@ export function ScheduledTaskRow({
   // (active tasks only — a paused task has null nextRunAt). We only format the
   // delta from the server value against the ticking `now`; we never recompute
   // WHICH instant is next on the client.
-  const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
+  const scheduleSummary = useMemo(() => {
+    const activeRange =
+      task.activeRangeStart != null && task.activeRangeEnd != null
+        ? { start: task.activeRangeStart, end: task.activeRangeEnd }
+        : null;
+    return describeSchedule(task.rrule, activeRange);
+  }, [task.rrule, task.activeRangeStart, task.activeRangeEnd]);
   const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt, now), [task.nextRunAt, now]);
 
   return (
