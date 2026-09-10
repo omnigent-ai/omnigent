@@ -246,6 +246,39 @@ def test_main_ignores_unknown_operation(
     assert capsys.readouterr().out == ""
 
 
+def test_main_withholds_token_when_broker_workspace_changed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reconnect edge: the sidecar pins workspace A, but the owner has since
+    reconnected to workspace B, so the broker now vends B's bearer. main() must
+    withhold it rather than present B's token to the A-pinned gateway base URL."""
+    _connected(monkeypatch)  # sidecar pinned to https://ws.example
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    _patch_get(
+        monkeypatch,
+        _Resp(
+            200,
+            {"connected": True, "token": "dbx-tok-B", "workspace_host": "https://ws-b.example"},
+        ),
+    )
+    capsys.readouterr()  # discard configure-time log output
+    assert dc.main(["token"]) == 0
+    assert capsys.readouterr().out == ""  # withheld: workspace mismatch
+
+
+def test_https_url_on_workspace_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only HTTPS URLs on the workspace host's netloc are accepted; other schemes,
+    other hosts, and empty inputs are refused. A scheme-less workspace host is
+    treated as HTTPS."""
+    ok = dc.https_url_on_workspace_host
+    assert ok("https://ws.example/ai-gateway/anthropic", "https://ws.example") is True
+    assert ok("https://ws.example/x", "ws.example") is True  # scheme-less host
+    assert ok("http://ws.example/x", "https://ws.example") is False  # not HTTPS
+    assert ok("https://evil.example/x", "https://ws.example") is False  # other host
+    assert ok("", "https://ws.example") is False
+    assert ok("https://ws.example/x", "") is False
+
+
 def test_api_key_auth_precludes_broker(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only an explicit ApiKeyAuth suppresses the managed-connect broker fallback.
 

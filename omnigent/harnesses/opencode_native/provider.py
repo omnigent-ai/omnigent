@@ -630,26 +630,33 @@ def _configure_opencode_on_demand() -> None:
     from omnigent.onboarding.ucode_setup import (
         build_ucode_configure_command_for_profile,
         find_ucode_command,
+        ucode_configure_lock,
     )
 
     host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
     bearer_command = broker_token_command(host.rstrip("/")) if host else None
     if not bearer_command:
         return
+    ucode_config = Path.home() / ".ucode" / "opencode-xdg" / "opencode" / "opencode.json"
     try:
-        argv = build_ucode_configure_command_for_profile(
-            find_ucode_command(), profile=HOST_DATABRICKS_PROFILE, agents=["opencode"]
-        )
-        subprocess.run(
-            argv,
-            capture_output=True,
-            timeout=120,
-            env={
-                **os.environ,
-                "DATABRICKS_BEARER_COMMAND": bearer_command,
-                "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,
-            },
-        )
+        with ucode_configure_lock():
+            # The boot-time all-agent configure may have written opencode's config
+            # while we waited for the lock — skip a redundant run if so.
+            if ucode_config.exists():
+                return
+            argv = build_ucode_configure_command_for_profile(
+                find_ucode_command(), profile=HOST_DATABRICKS_PROFILE, agents=["opencode"]
+            )
+            subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=120,
+                env={
+                    **os.environ,
+                    "DATABRICKS_BEARER_COMMAND": bearer_command,
+                    "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,
+                },
+            )
     except Exception:  # noqa: BLE001 - best-effort; the caller declines if config is still absent.
         _logger.info("opencode on-demand ucode configure failed", exc_info=True)
 
@@ -663,11 +670,8 @@ def _provider_base_urls_match_host(config: Mapping[str, object], workspace_host:
     origin must not be trusted. Requires at least one base URL (a provider block
     with none is not a usable gateway target).
     """
-    from urllib.parse import urlsplit
+    from omnigent.host.databricks_credential import https_url_on_workspace_host
 
-    expected = urlsplit(
-        workspace_host if "://" in workspace_host else f"https://{workspace_host}"
-    ).netloc
     providers = config.get("provider")
     if not isinstance(providers, Mapping):
         return False
@@ -678,8 +682,7 @@ def _provider_base_urls_match_host(config: Mapping[str, object], workspace_host:
         if not isinstance(base_url, str) or not base_url:
             continue
         saw_url = True
-        parts = urlsplit(base_url)
-        if parts.scheme != "https" or parts.netloc != expected:
+        if not https_url_on_workspace_host(base_url, workspace_host):
             return False
     return saw_url
 
@@ -724,9 +727,15 @@ def managed_connect_opencode_config(xdg_config_home: Path) -> dict[str, object] 
         _configure_opencode_on_demand()
     try:
         config = json.loads(ucode_config.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        _logger.info("opencode managed config: unreadable ucode config %s: %r", ucode_config, exc)
         return None
     if not isinstance(config, dict) or "provider" not in config:
+        _logger.info(
+            "opencode managed config: ucode did not configure opencode (no provider block in %s); "
+            "opencode falls back to its own login.",
+            ucode_config,
+        )
         return None  # ucode did not configure opencode (e.g. not in --agents)
     # Security: the config on disk carries the provider base URL, and we forward a
     # freshly-minted broker bearer to it. A stale config (left from a previous
@@ -745,7 +754,13 @@ def managed_connect_opencode_config(xdg_config_home: Path) -> dict[str, object] 
     ucode_plugin = ucode_config_dir / "plugin" / "ucode-auth.js"
     try:
         plugin_src = ucode_plugin.read_text(encoding="utf-8")
-    except OSError:
+    except OSError as exc:
+        _logger.info(
+            "opencode managed config: provider block present but the refresh plugin %s is "
+            "unreadable (%r); declining so no static bearer is used.",
+            ucode_plugin,
+            exc,
+        )
         return None  # provider block without the refresh plugin is not usable
     session_plugin_dir = xdg_config_home / "opencode" / "plugin"
     session_plugin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)

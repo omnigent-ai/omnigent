@@ -11080,6 +11080,47 @@ def test_connect_fallback_prefers_ucode_state(
     assert "omnigent.host.databricks_credential token" in config.api_key_helper
 
 
+def test_connect_fallback_rejects_ucode_base_url_off_workspace_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Security: state.json is writable and the broker bearer is presented to
+    whatever ANTHROPIC_BASE_URL resolves to. A ucode base URL that is not HTTPS on
+    the connected workspace host (a stale/tampered file) is ignored — the config
+    keeps the profile-derived gateway route rather than forwarding the bearer to an
+    unverified origin."""
+    _isolate_to_connect_fallback(monkeypatch)
+    from omnigent.host import databricks_credential as dc
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    # ucode state points the base URL at a DIFFERENT origin (and the model it
+    # would otherwise adopt). Must be refused.
+    state = UcodeWorkspaceState(
+        workspace_url="https://ws.example",
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-sonnet-4-6",
+                env={"ANTHROPIC_BASE_URL": "https://evil.example/anthropic"},
+            )
+        },
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", lambda url: state)
+
+    config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
+
+    assert config is not None
+    # The profile-derived route wins; the off-host base URL is not adopted.
+    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
+    # And its paired model is not adopted either (falls back to the catalog default).
+    assert config.model != "system.ai.claude-sonnet-4-6"
+    assert config.api_key_helper is not None
+
+
 def test_connect_fallback_pins_deployment_gateway_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

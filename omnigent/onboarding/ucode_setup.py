@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
 import subprocess
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms have no flock
+    fcntl = None  # type: ignore[assignment]
 
 import click
 
@@ -21,12 +28,6 @@ _logger = logging.getLogger(__name__)
 _SANDBOX_CONFIGURE_TIMEOUT_S = 120
 
 _UCODE_AGENT_NAMES: tuple[str, ...] = ("claude", "codex", "pi")
-# The OSS managed-connect flow (``omnigent host`` boot) also configures opencode,
-# so its config is ready at first launch instead of forcing a synchronous
-# on-demand ``ucode configure`` on the runner's event loop. Kept off
-# ``_UCODE_AGENT_NAMES`` so lakebox's own ``--use-pat`` claude/codex/pi wrappers,
-# which don't ship opencode, are unaffected.
-_CONNECT_AGENT_NAMES: tuple[str, ...] = (*_UCODE_AGENT_NAMES, "opencode")
 # Pin ucode to a fixed commit so setup is reproducible, rather than tracking
 # ucode's ``main`` HEAD (a mutable ref that can move under us between runs and
 # break setup unexpectedly). A full SHA is immutable, so uvx caches the built
@@ -169,6 +170,46 @@ def find_ucode_command() -> list[str]:
     return [ucode]
 
 
+# Lock file shared by every sandbox ``ucode configure`` run, so they serialize
+# their writes to ``~/.ucode/state.json``.
+_CONFIGURE_LOCK_PATH = Path.home() / ".ucode" / ".omnigent-configure.lock"
+
+
+@contextlib.contextmanager
+def ucode_configure_lock() -> Iterator[None]:
+    """Serialize concurrent ``ucode configure`` runs across processes and threads.
+
+    At managed-connect boot the host runs ``ucode configure`` for all agents in a
+    daemon thread; independently, opencode's launch can run a second
+    ``ucode configure --agents opencode`` on demand. Both write
+    ``~/.ucode/state.json``, so overlapping runs can interleave and drop an agent's
+    entry or leave torn JSON. An advisory ``flock`` on a shared lock file
+    serializes them (and concurrent host starts). Best-effort: if the lock file
+    can't be created or the platform has no ``flock``, run unserialized rather than
+    block the launch.
+    """
+    if fcntl is None:
+        yield  # non-POSIX platform, no flock — degrade to unserialized
+        return
+    try:
+        _CONFIGURE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(_CONFIGURE_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield  # can't create the lock file — degrade to unserialized
+        return
+    locked = False
+    try:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+        yield
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def build_ucode_configure_command_for_profile(
     ucode_command: Sequence[str],
     *,
@@ -241,9 +282,10 @@ def configure_ucode_for_sandbox(
 
     def _run() -> None:
         try:
-            result = subprocess.run(
-                argv, capture_output=True, timeout=_SANDBOX_CONFIGURE_TIMEOUT_S, env=env
-            )
+            with ucode_configure_lock():
+                result = subprocess.run(
+                    argv, capture_output=True, timeout=_SANDBOX_CONFIGURE_TIMEOUT_S, env=env
+                )
         except (OSError, subprocess.SubprocessError) as exc:
             # A failed/timed-out configure silently forces the harness hand-built
             # fallback; log it (with the exception) so the field isn't blind.

@@ -1318,16 +1318,25 @@ async def _auto_create_opencode_terminal(
             pinned = config.get("model")
             if isinstance(pinned, str):
                 model_override = pinned
+            # Derive the broker command from the SAME sidecar the config gated on
+            # (not a separate profile read), so the two can't disagree. The auth
+            # plugin needs it to mint per request; log if it's somehow absent.
             from omnigent.host.databricks_credential import (
-                HOST_DATABRICKS_PROFILE,
+                _read_sidecar,
+                _sidecar_path,
                 broker_token_command,
             )
-            from omnigent.inner.databricks_executor import _read_databrickscfg_host
 
-            _oc_host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+            _oc_sidecar = _read_sidecar(_sidecar_path())
             managed_opencode_broker_cmd = (
-                broker_token_command(_oc_host.rstrip("/")) if _oc_host else None
+                broker_token_command(_oc_sidecar["workspace_host"]) if _oc_sidecar else None
             )
+            if not managed_opencode_broker_cmd:
+                _logger.warning(
+                    "opencode managed connect: ucode config resolved but no broker command "
+                    "(sidecar missing/mismatched); the auth plugin cannot mint, so opencode "
+                    "will fall back to its own login."
+                )
         elif model_override:
             # No custom provider, but a model is pinned (``omni opencode --model``
             # or the ``omni setup`` OpenCode default): write opencode's default

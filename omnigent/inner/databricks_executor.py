@@ -294,8 +294,8 @@ def databricks_bearer_token_command(
             from omnigent.host.databricks_credential import broker_token_command
 
             fallback_command = broker_token_command(host)
-        except Exception:  # noqa: BLE001 - best-effort; no sidecar ⇒ no fallback.
-            pass
+        except Exception as exc:  # noqa: BLE001 - best-effort; no sidecar ⇒ no fallback.
+            logger.info("databricks bearer: broker fallback lookup failed: %r", exc)
     selector = (
         f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
     )

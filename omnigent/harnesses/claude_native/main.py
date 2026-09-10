@@ -3159,6 +3159,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
     from omnigent.host.databricks_credential import (
         HOST_DATABRICKS_PROFILE,
         broker_token_command,
+        https_url_on_workspace_host,
     )
     from omnigent.inner.databricks_executor import _read_databrickscfg_host
 
@@ -3199,10 +3200,20 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
     agent_state = workspace_state.agent(_UCODE_CLAUDE_AGENT_NAME) if workspace_state else None
     if agent_state is not None:
         ucode_base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
-        if ucode_base_url:
+        # Security: state.json is writable, and the broker bearer (apiKeyHelper)
+        # is presented to whatever ANTHROPIC_BASE_URL resolves to. Only adopt
+        # ucode's env/model when its base URL is HTTPS on the connected workspace
+        # host (mirrors the opencode guard); otherwise keep the profile-derived
+        # route rather than forwarding the bearer to an unverified origin.
+        if ucode_base_url and https_url_on_workspace_host(ucode_base_url, workspace_host):
             env = {**env, **agent_state.env, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
-        if agent_state.model:
-            model = agent_state.model
+            if agent_state.model:
+                model = agent_state.model
+        elif ucode_base_url:
+            _logger.warning(
+                "native-claude connect: ignoring ucode state base URL (not HTTPS on the "
+                "connected workspace host) — using the profile-derived gateway route.",
+            )
 
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
     return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)

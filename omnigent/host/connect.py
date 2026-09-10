@@ -4195,7 +4195,7 @@ def _generate_ucode_configs() -> None:
     background, best-effort populate of ``~/.ucode/state.json``), which the
     managed lakebox launcher shares with ``use_pat=True`` against its injected PAT.
 
-    Configures opencode too (``_CONNECT_AGENT_NAMES``), overlapping host boot, so
+    Configures opencode too (alongside claude/codex/pi), overlapping host boot, so
     the runner never has to fall back to a synchronous on-demand ``ucode
     configure`` when opencode first launches — the slow path for opencode startup.
     """
@@ -4204,7 +4204,7 @@ def _generate_ucode_configs() -> None:
         broker_token_command,
     )
     from omnigent.inner.databricks_executor import _read_databrickscfg_host
-    from omnigent.onboarding.ucode_setup import _CONNECT_AGENT_NAMES, configure_ucode_for_sandbox
+    from omnigent.onboarding.ucode_setup import configure_ucode_for_sandbox
 
     workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
     if not workspace:
@@ -4212,9 +4212,12 @@ def _generate_ucode_configs() -> None:
     bearer_command = broker_token_command(workspace)
     if not bearer_command:
         return  # no broker sidecar → not a managed connect host
+    # opencode is included here (unlike lakebox's claude/codex/pi ``--use-pat``
+    # wrappers) so its config is ready at first launch instead of forcing a
+    # synchronous on-demand ``ucode configure`` on the runner.
     configure_ucode_for_sandbox(
         HOST_DATABRICKS_PROFILE,
-        agents=_CONNECT_AGENT_NAMES,
+        agents=("claude", "codex", "pi", "opencode"),
         extra_env={
             "DATABRICKS_BEARER_COMMAND": bearer_command,
             "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,

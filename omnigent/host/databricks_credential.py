@@ -211,6 +211,28 @@ def broker_token_command(host: str, cfg_path: Path | None = None) -> str | None:
     return f"python3 -m {module} token --coords {shlex.quote(str(path))}"
 
 
+def https_url_on_workspace_host(url: str, workspace_host: str) -> bool:
+    """True when *url* is HTTPS and shares *workspace_host*'s network location.
+
+    The managed-connect harnesses forward a broker-minted bearer to a base URL
+    that ultimately comes from a writable on-disk file (ucode ``state.json`` or
+    the generated opencode config). Bind that destination to the sidecar/profile
+    workspace so a stale or tampered file can't aim the bearer at another origin.
+    A scheme-less *workspace_host* is treated as HTTPS.
+    """
+    from urllib.parse import urlsplit
+
+    if not url:
+        return False
+    expected = urlsplit(
+        workspace_host if "://" in workspace_host else f"https://{workspace_host}"
+    ).netloc
+    if not expected:
+        return False
+    parts = urlsplit(url)
+    return parts.scheme == "https" and parts.netloc == expected
+
+
 def api_key_auth_precludes_broker(spec: AgentSpec | None) -> bool:
     """True when an explicit ``ApiKeyAuth`` is configured, so the managed-connect
     broker fallback must not reroute it through the owner's Databricks gateway.
@@ -297,7 +319,13 @@ def main(argv: list[str] | None = None) -> int:
     resolved = fetch_broker_bearer(coords["server"], coords["host_id"], coords["host_token"])
     if resolved is None:
         return 0
-    _workspace_host, bearer = resolved
+    refreshed_host, bearer = resolved
+    # The harness's gateway base URL is pinned to the sidecar's workspace. If the
+    # owner has since reconnected to a different workspace, the broker now vends
+    # that workspace's bearer — emitting it would present a token to the pinned
+    # (now-wrong) origin. Withhold it so auth fails cleanly instead.
+    if refreshed_host.rstrip("/") != coords["workspace_host"].rstrip("/"):
+        return 0
     sys.stdout.write(bearer + "\n")
     return 0
 

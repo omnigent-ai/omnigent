@@ -18,6 +18,7 @@ from omnigent.harnesses.opencode_native.provider import (
     build_opencode_model_default_config,
     build_opencode_omnigent_mcp_server,
     build_opencode_provider_config,
+    managed_connect_opencode_config,
     maybe_merge_user_provider_config,
     resolve_databricks_gateway,
     write_opencode_provider_config,
@@ -750,8 +751,6 @@ def test_managed_connect_opencode_config_consumes_ucode(
     """On a managed connect host, opencode reuses ucode's generated config
     (provider block + system.ai model) and its refreshing auth plugin, copied into
     the per-session XDG dir."""
-    import omnigent.harnesses.opencode_native.provider as prov
-
     monkeypatch.setenv("HOME", str(tmp_path))
     # ucode's generated opencode config + auth plugin (its own XDG root).
     ucode_dir = tmp_path / ".ucode" / "opencode-xdg" / "opencode"
@@ -778,7 +777,7 @@ def test_managed_connect_opencode_config_consumes_ucode(
     )
 
     session_xdg = tmp_path / "session-xdg"
-    config = prov.managed_connect_opencode_config(session_xdg)
+    config = managed_connect_opencode_config(session_xdg)
 
     assert config is not None
     assert config["model"] == "databricks-anthropic/system.ai.claude-opus-4-8"  # system.ai
@@ -794,10 +793,8 @@ def test_managed_connect_opencode_config_none_without_sidecar(
 ) -> None:
     """No broker sidecar (e.g. a laptop) → None, so opencode's normal launch is
     untouched off a managed sandbox."""
-    import omnigent.harnesses.opencode_native.provider as prov
-
     monkeypatch.setattr("omnigent.host.databricks_credential._read_sidecar", lambda path: None)
-    assert prov.managed_connect_opencode_config(Path("/tmp/unused-xdg")) is None
+    assert managed_connect_opencode_config(Path("/tmp/unused-xdg")) is None
 
 
 @pytest.mark.parametrize("bad_url", ["https://evil.example/x", "http://ws/x"])
@@ -808,8 +805,6 @@ def test_managed_connect_opencode_config_rejects_untrusted_base_url(
     workspace host (a stale file from a prior connection, or a tampered one) is
     refused, so the freshly-minted broker bearer is never forwarded to an
     unverified origin."""
-    import omnigent.harnesses.opencode_native.provider as prov
-
     monkeypatch.setenv("HOME", str(tmp_path))
     ucode_dir = tmp_path / ".ucode" / "opencode-xdg" / "opencode"
     (ucode_dir / "plugin").mkdir(parents=True)
@@ -832,4 +827,4 @@ def test_managed_connect_opencode_config_rejects_untrusted_base_url(
         },
     )
 
-    assert prov.managed_connect_opencode_config(tmp_path / "session-xdg") is None
+    assert managed_connect_opencode_config(tmp_path / "session-xdg") is None
