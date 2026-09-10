@@ -37,6 +37,7 @@ import contextlib
 import io
 import json
 import tarfile
+import threading
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -1728,3 +1729,125 @@ async def test_on_runner_disconnect_spares_idle_sessions_and_labels_interrupted_
             await communicator.wait(timeout=2.0)
         for session_id in session_ids:
             sessions_module._session_status_cache.pop(session_id, None)
+
+
+def _drain_session_live_state() -> None:
+    """Block until every live-state write queued so far has run."""
+    from omnigent.server import session_live_state
+
+    drained = threading.Event()
+    session_live_state.submit("test-drain", drained.set)
+    assert drained.wait(5.0), "session live-state worker did not drain"
+
+
+def _runner_last_seen(session_id: str) -> int | None:
+    """Read the session's persisted ``runner_last_seen`` stamp."""
+    from omnigent.runtime import get_conversation_store
+
+    connectivity = get_conversation_store().get_session_connectivity([session_id])
+    return connectivity[session_id].runner_last_seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_server_initiated_close_keeps_runner_liveness_stamp(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel THIS server closed (code 1012) leaves ``runner_last_seen`` intact.
+
+    A genuine drop clears the stamp so other replicas flip the runner offline
+    at once. A server closing tunnels on its own way down must not: the runner
+    is alive and re-tunnels to the replacement replica, whose orphan backstop
+    would read a cleared stamp as a dead runner and settle the runner's
+    mid-turn sessions to ``idle`` before it reconnects.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import shutdown_state
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", 0.4)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-server-close-stamp"
+    get_conversation_store().replace_runner_id(session_id, runner_id)
+
+    try:
+        # Baseline: a genuine drop clears the stamp the connect hook wrote.
+        communicator = await _connect_runner_tunnel(ap_app, runner_id)
+        await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+        _drain_session_live_state()
+        assert _runner_last_seen(session_id) is not None
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=2.0)
+        _drain_session_live_state()
+        assert _runner_last_seen(session_id) is None
+
+        # Server-initiated close: the reconnect re-stamps and the close keeps it.
+        communicator = await _connect_runner_tunnel(ap_app, runner_id)
+        await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+        _drain_session_live_state()
+        assert _runner_last_seen(session_id) is not None
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1012})
+        await communicator.wait(timeout=2.0)
+        assert shutdown_state.server_shutting_down(), "a 1012 close did not mark server shutdown"
+        _drain_session_live_state()
+        assert _runner_last_seen(session_id) is not None
+    finally:
+        shutdown_state.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_patch_rebind_stamps_runner_liveness(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """Binding a session to an already-connected runner stamps ``runner_last_seen``.
+
+    The connect hook stamps only the sessions bound when the tunnel opened,
+    and the ping loop refreshes them every 30s. A session bound in between
+    would carry no stamp until that next ping, so a server recycle inside the
+    window would let the replacement replica's orphan backstop settle its
+    turn to ``idle``. Starting the relay is the moment the session begins
+    riding a live tunnel, so it stamps too.
+    """
+    ap_client = tunnel_three_layer_stack.ap_client
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    assert _runner_last_seen(session_id) is None
+
+    patch_resp = await ap_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"runner_id": _RUNNER_ID},
+    )
+    assert patch_resp.status_code == 200, patch_resp.text
+
+    _drain_session_live_state()
+    assert _runner_last_seen(session_id) is not None

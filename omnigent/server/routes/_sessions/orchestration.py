@@ -6971,6 +6971,10 @@ def _ensure_runner_relay(
             runner_id,
             extra={"session_id": session_id},
         )
+    # A session bound to an already-connected runner has no ``runner_last_seen``
+    # until the tunnel's next ping; stamp it now so a server recycle inside that
+    # window cannot read the fresh binding as an orphaned runner.
+    session_live_state.touch_runner_liveness([runner_id])
     ready = asyncio.Event()
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
