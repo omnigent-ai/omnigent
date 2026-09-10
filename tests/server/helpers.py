@@ -732,6 +732,7 @@ def register_test_runner(
 def build_agent_bundle(
     name: str,
     description: str | None = None,
+    short_description: str | None = None,
     sub_agents: list[dict[str, Any]] | None = None,
     max_iterations: int | None = None,
     executor: dict[str, Any] | None = None,
@@ -750,6 +751,7 @@ def build_agent_bundle(
 
     :param name: Agent name, e.g. ``"test-agent"``.
     :param description: Optional description.
+    :param short_description: Optional one-line picker blurb.
     :param sub_agents: Optional list of sub-agent config dicts.
         Each must have at least a ``"name"`` key, e.g.
         ``[{"name": "researcher", "description": "..."}]``.
@@ -793,6 +795,8 @@ def build_agent_bundle(
         }
     if description is not None:
         config["description"] = description
+    if short_description is not None:
+        config["short_description"] = short_description
     if guardrails is not None:
         config["guardrails"] = guardrails
     if terminals is not None:
@@ -954,6 +958,7 @@ async def create_test_session(
     client: httpx.AsyncClient,
     name: str = "test-agent",
     description: str | None = None,
+    short_description: str | None = None,
     title: str | None = None,
     labels: dict[str, str] | None = None,
     max_iterations: int | None = None,
@@ -972,6 +977,7 @@ async def create_test_session(
     :param name: Agent name to write into the uploaded bundle, e.g.
         ``"test-agent"``.
     :param description: Optional agent description.
+    :param short_description: Optional one-line picker blurb.
     :param title: Optional session title, e.g. ``"debug run"``.
     :param labels: Optional initial labels, e.g.
         ``{"env": "test"}``.
@@ -991,6 +997,7 @@ async def create_test_session(
     bundle = build_agent_bundle(
         name=name,
         description=description,
+        short_description=short_description,
         max_iterations=max_iterations,
         executor=executor,
         skills=skills,

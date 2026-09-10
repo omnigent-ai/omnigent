@@ -309,6 +309,41 @@ describe("useAvailableAgents", () => {
     ]);
   });
 
+  it("passes through a spec-provided short_description, omitting the key when the server doesn't send one", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "ag_custom",
+            name: "custom-reviewer",
+            description: "A much longer paragraph meant for a hover tooltip.",
+            short_description: "Reviews PRs",
+            harness: "claude-sdk",
+          },
+          // No short_description at all — mirrors an older server that
+          // predates the field.
+          { id: "ag_plain", name: "plain-agent", harness: "claude-sdk" },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const custom = result.current.data?.find((a) => a.id === "ag_custom");
+    expect(custom?.short_description).toBe("Reviews PRs");
+
+    const plain = result.current.data?.find((a) => a.id === "ag_plain");
+    // Absent on the wire → absent on the mapped object (not `null`), so
+    // the picker's `??` fallback to AGENT_PICKER_DESCRIPTIONS still applies
+    // and existing `toEqual` assertions elsewhere in this file don't gain
+    // an unexpected key.
+    expect(plain).not.toHaveProperty("short_description");
+  });
+
   it("defaults a missing harness to null", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
