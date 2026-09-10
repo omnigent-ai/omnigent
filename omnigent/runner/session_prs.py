@@ -19,6 +19,24 @@ from pydantic import BaseModel, Field
 from omnigent.process_logging import data_dir
 
 
+def _valid_hostname(host: str) -> bool:
+    """Validate bounded ASCII DNS labels without hostname regex backtracking."""
+    if len(host) > 253 or not host.isascii():
+        return False
+    labels = host.split(".")
+    return (
+        len(labels) > 1
+        and all(
+            1 <= len(label) <= 63
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and label.replace("-", "").isalnum()
+            for label in labels
+        )
+        and labels[-1][0].isalpha()
+    )
+
+
 class PullRequestRef(BaseModel):
     """A PR belongs to its base repository, including for fork PRs."""
 
@@ -39,7 +57,7 @@ class PullRequestRef(BaseModel):
         )
         if (
             parsed.scheme != "https"
-            or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z][a-z0-9-]*", host)
+            or not _valid_hostname(host)
             or parsed.netloc.lower() != host
             or match is None
         ):

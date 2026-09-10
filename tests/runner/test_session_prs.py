@@ -80,6 +80,39 @@ def test_reference_normalizes_identity() -> None:
 
 
 @pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1",
+        "git..example.com",
+        "-git.example.com",
+        "git-.example.com",
+        "git_host.example.com",
+        "github.com.",
+        "gíthub.com",
+        pytest.param("a" * 64 + ".example.com", id="overlong-label"),
+        pytest.param(".".join(["a" * 63] * 4), id="overlong-host"),
+        pytest.param("0" * 100_000, id="large-numeric-host"),
+    ],
+)
+def test_reference_rejects_invalid_hostname(host: str) -> None:
+    with pytest.raises(ValueError):
+        PullRequestRef.from_url(f"https://{host}/example/one/pull/42")
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "github.com",
+        "git-2.example.internal",
+        pytest.param(".".join(["a" * 63] * 3 + ["a" * 61]), id="maximum-dns-length"),
+    ],
+)
+def test_reference_accepts_dns_hostname(host: str) -> None:
+    url = f"https://{host}/example/one/pull/42"
+    assert PullRequestRef.from_url(url).url == url
+
+
+@pytest.mark.parametrize(
     "name,args,result,urls",
     [
         ("Bash", {"command": "gh pr create --title test"}, {"stdout": A + "\n"}, [A]),

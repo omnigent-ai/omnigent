@@ -2527,7 +2527,7 @@ def test_observer_records_raw_output_in_omnigent_session(tmp_path, monkeypatch) 
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter = ExecutorAdapter(executor_factory=_StubExecutor)
     ctx = _RecordingTurnContext(response_id="resp_pr")
     url = "https://github.com/example/sdk/pull/42"
     ctx.session_id = "conv_sdk"
