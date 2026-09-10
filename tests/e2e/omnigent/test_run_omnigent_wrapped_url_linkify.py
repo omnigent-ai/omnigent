@@ -280,8 +280,8 @@ def _assert_full_destination(
         f"destination(s):\n"
         + "".join(f"  {t!r}\n" for t in truncated)
         + "\nA terminal user clicking the displayed URL opens the "
-        f"truncated destination above, losing the path tail, query "
-        f"string, and fragment (URL detection ran after Rich/text "
-        f"wrapping and elision, so the link was cut at the row "
-        f"boundary)."
+        "truncated destination above, losing the path tail, query "
+        "string, and fragment (URL detection ran after Rich/text "
+        "wrapping and elision, so the link was cut at the row "
+        "boundary)."
     )
