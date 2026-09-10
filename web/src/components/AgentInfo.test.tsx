@@ -981,6 +981,79 @@ describe("McpServersSection", () => {
   });
 });
 
+describe("MCP startup failure diagnostics", () => {
+  beforeEach(() => {
+    useChatStore.setState({ mcpStartupFailures: null });
+  });
+  afterEach(() => {
+    useChatStore.setState({ mcpStartupFailures: null });
+  });
+
+  it("keeps the plain info icon when nothing is failing", () => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_mcp_ok");
+    expect(screen.queryByTestId("agent-info-mcp-failure-icon")).toBeNull();
+    expect(screen.getByTestId("agent-info-trigger").getAttribute("aria-label")).toBe(
+      "Agent tools and policies",
+    );
+  });
+
+  it("swaps the header trigger to the warning state when a server failed", () => {
+    useChatStore.setState({ mcpStartupFailures: { pipeshub: "401 Unauthorized" } });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_mcp_failed");
+    expect(screen.getByTestId("agent-info-mcp-failure-icon")).toBeTruthy();
+    expect(screen.getByTestId("agent-info-trigger").getAttribute("aria-label")).toContain(
+      "MCP server startup failed",
+    );
+  });
+
+  it("names each failed server with its error in the Tools section", () => {
+    useChatStore.setState({
+      mcpStartupFailures: { pipeshub: "ConnectError: connection refused" },
+    });
+    renderContent("conv_mcp_failed");
+    const block = screen.getByTestId("mcp-startup-failures");
+    expect(block.textContent).toContain("pipeshub");
+    expect(block.textContent).toContain("failed to start: ConnectError: connection refused");
+  });
+
+  it("shows the failure block even when the agent record lists no MCP servers", () => {
+    // An SDK session can fail on a server the bound-agent record doesn't
+    // carry a pill for; the diagnostics must not depend on a matching pill.
+    useChatStore.setState({ mcpStartupFailures: { pipeshub: "401 Unauthorized" } });
+    const bareAgent: Agent = { id: "agent_bare", name: "hello_world" };
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <AgentInfoContent agent={bareAgent} sessionId="conv_mcp_bare" />
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    const block = screen.getByTestId("mcp-startup-failures");
+    expect(block.textContent).toContain("pipeshub");
+    expect(block.textContent).toContain("401 Unauthorized");
+  });
+
+  it("gives the failing server's pill the warning treatment", () => {
+    useChatStore.setState({ mcpStartupFailures: { slack: "401 Unauthorized" } });
+    renderContent("conv_mcp_failed");
+    const pill = screen.getByRole("button", { name: "slack" });
+    expect(pill.className).toContain("text-yellow-700");
+  });
+
+  it("clears the warning once the store reports recovery", () => {
+    useChatStore.setState({ mcpStartupFailures: { pipeshub: "401 Unauthorized" } });
+    renderContent("conv_mcp_recovers");
+    expect(screen.getByTestId("mcp-startup-failures")).toBeTruthy();
+    act(() => {
+      useChatStore.setState({ mcpStartupFailures: null });
+    });
+    expect(screen.queryByTestId("mcp-startup-failures")).toBeNull();
+  });
+});
+
 describe("agentDisplayLabel", () => {
   it("maps native wrapper slugs to their display name", () => {
     expect(agentDisplayLabel("pi-native-ui")).toBe("Pi");

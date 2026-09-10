@@ -172,6 +172,69 @@ async def test_partial_failure_surfaces_healthy_servers(
 
 
 @pytest.mark.asyncio
+async def test_connect_failure_strips_url_credentials_from_failures(
+    patch_connection: dict[str, Any],
+) -> None:
+    """A connect error that embeds the request URL must not leak a
+    query-string credential into ``failures`` — the message is forwarded
+    to the browser via the session's MCP startup events.
+    """
+    patch_connection["__raise_for__"]["bad"] = RuntimeError(
+        "Client error '401 Unauthorized' for url "
+        "'https://mcp.example.com/sse?api_key=sk-live-abc123'"
+    )
+
+    spec = _make_spec(_make_config("bad"))
+    manager = RunnerMcpManager()
+    try:
+        result = await manager.schemas_for(spec)
+    finally:
+        await manager.shutdown()
+
+    assert "sk-live-abc123" not in result.failures["bad"]
+    assert "https://mcp.example.com/sse?<redacted>" in result.failures["bad"]
+
+
+class TestDescribeConnectError:
+    """Unit tests for the redaction helper in isolation from the pool.
+
+    The helper is imported inside the tests (not at module top) so this
+    module still collects — and the behavioral leak test above still
+    fails on the leak, not on an ImportError — on a tree without the fix.
+    """
+
+    def test_strips_query_string_from_url(self) -> None:
+        from omnigent.runner.mcp_manager import _describe_connect_error
+
+        exc = RuntimeError("failed for url 'https://mcp.example.com/sse?token=secret123'")
+        described = _describe_connect_error(exc)
+        assert "secret123" not in described
+        assert "https://mcp.example.com/sse?<redacted>" in described
+
+    def test_strips_fragment_from_url(self) -> None:
+        from omnigent.runner.mcp_manager import _describe_connect_error
+
+        exc = RuntimeError("see https://mcp.example.com/sse#token=secret123 for details")
+        described = _describe_connect_error(exc)
+        assert "secret123" not in described
+        assert "https://mcp.example.com/sse?<redacted>" in described
+
+    def test_leaves_plain_message_unchanged(self) -> None:
+        from omnigent.runner.mcp_manager import _describe_connect_error
+
+        exc = ConnectionRefusedError("connection refused")
+        described = _describe_connect_error(exc)
+        assert described == "ConnectionRefusedError: connection refused"
+
+    def test_leaves_bare_url_without_query_unchanged(self) -> None:
+        from omnigent.runner.mcp_manager import _describe_connect_error
+
+        exc = RuntimeError("unreachable: https://mcp.example.com/sse")
+        described = _describe_connect_error(exc)
+        assert described == "RuntimeError: unreachable: https://mcp.example.com/sse"
+
+
+@pytest.mark.asyncio
 async def test_pool_reuses_connection_for_same_spec(
     patch_connection: dict[str, Any],
 ) -> None:

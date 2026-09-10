@@ -84,26 +84,44 @@ export function agentDisplayLabel(name: string): string {
   return nativeAgent?.displayName ?? capitalizeAgentName(baseName);
 }
 
+/** Pill styling for a server whose startup failed — the warning treatment. */
+const MCP_PILL_FAILED_CLASSES =
+  "border-yellow-600/40 bg-yellow-500/10 text-yellow-700 dark:text-yellow-400";
+
+/** Pill styling for a healthy (or unknown-state) server. */
+const MCP_PILL_DEFAULT_CLASSES = "border-border bg-muted text-muted-foreground";
+
 /** Compact pill row listing MCP servers attached to an agent. */
 export function McpServerList({
   servers,
   onDelete,
+  failures,
 }: {
   servers: McpServerSummary[];
   onDelete?: (name: string) => void;
+  /** Startup failures by server name — matching pills get the warning treatment. */
+  failures?: Record<string, string> | null;
 }) {
   return (
     <div className="flex flex-wrap gap-1">
-      {servers.map((srv) =>
-        onDelete ? (
+      {servers.map((srv) => {
+        const failure = failures?.[srv.name] ?? null;
+        const pillIcon = failure ? (
+          <AlertTriangleIcon className="size-2.5 shrink-0" />
+        ) : (
+          <ServerIcon className="size-2.5 shrink-0" />
+        );
+        return onDelete ? (
           <Popover key={srv.name}>
             <PopoverTrigger asChild>
               <button
                 type="button"
-                className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/80"
+                className={`flex cursor-pointer items-center gap-0.5 rounded-full border px-1.5 py-0.5 font-mono text-[10px] hover:bg-muted/80 ${
+                  failure ? MCP_PILL_FAILED_CLASSES : MCP_PILL_DEFAULT_CLASSES
+                }`}
                 onClick={(e) => e.stopPropagation()}
               >
-                <ServerIcon className="size-2.5 shrink-0" />
+                {pillIcon}
                 {srv.name}
               </button>
             </PopoverTrigger>
@@ -121,6 +139,11 @@ export function McpServerList({
                 {srv.description && (
                   <p className="text-sm text-muted-foreground">{srv.description}</p>
                 )}
+                {failure && (
+                  <p className="break-words text-sm text-yellow-700 dark:text-yellow-400">
+                    Startup failed: {failure}
+                  </p>
+                )}
                 <button
                   type="button"
                   onClick={() => onDelete(srv.name)}
@@ -135,14 +158,18 @@ export function McpServerList({
         ) : (
           <span
             key={srv.name}
-            title={srv.description ?? srv.name}
-            className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+            title={
+              failure ? `${srv.name} — startup failed: ${failure}` : (srv.description ?? srv.name)
+            }
+            className={`flex items-center gap-0.5 rounded-full border px-1.5 py-0.5 font-mono text-[10px] ${
+              failure ? MCP_PILL_FAILED_CLASSES : MCP_PILL_DEFAULT_CLASSES
+            }`}
           >
-            <ServerIcon className="size-2.5 shrink-0" />
+            {pillIcon}
             {srv.name}
           </span>
-        ),
-      )}
+        );
+      })}
     </div>
   );
 }
@@ -1088,7 +1115,12 @@ function McpServersSection({
       }),
     [deleteServer, setMcpDirty],
   );
-  const showSection = servers.length > 0 || canEdit;
+  // Startup failures live in the chat store (fed by `session.mcp_startup`),
+  // keyed by server name. Shown here — the diagnostics surface — because
+  // they are deliberately kept out of the conversation viewport.
+  const startupFailures = useChatStore((s) => s.mcpStartupFailures);
+  const failedNames = startupFailures ? Object.keys(startupFailures).sort() : [];
+  const showSection = servers.length > 0 || canEdit || failedNames.length > 0;
   if (!showSection) return null;
 
   return (
@@ -1113,8 +1145,28 @@ function McpServersSection({
           Restart to apply changes
         </p>
       )}
+      {failedNames.length > 0 && (
+        <div className="flex flex-col gap-1" data-testid="mcp-startup-failures">
+          {failedNames.map((name) => (
+            <p
+              key={name}
+              className="flex items-start gap-1 text-sm text-yellow-700 dark:text-yellow-400"
+            >
+              <AlertTriangleIcon className="mt-0.5 size-3 shrink-0" />
+              <span className="min-w-0 break-words">
+                <span className="font-medium">{name}</span> failed to start:{" "}
+                {startupFailures?.[name]}
+              </span>
+            </p>
+          ))}
+        </div>
+      )}
       {servers.length > 0 ? (
-        <McpServerList servers={servers} onDelete={canEdit ? handleDeleteServer : undefined} />
+        <McpServerList
+          servers={servers}
+          onDelete={canEdit ? handleDeleteServer : undefined}
+          failures={startupFailures}
+        />
       ) : (
         <p className="text-sm text-muted-foreground">No MCP servers</p>
       )}
@@ -1452,6 +1504,11 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   const [open, setOpen] = useState(false);
   const [mcpDirty, setMcpDirty] = useState(false);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // MCP startup failures tint the trigger and swap its icon so the failure
+  // is noticeable from the header without polluting the conversation
+  // viewport; the popover's Tools section carries the per-server detail.
+  const mcpStartupFailures = useChatStore((s) => s.mcpStartupFailures);
+  const hasMcpFailures = mcpStartupFailures !== null && Object.keys(mcpStartupFailures).length > 0;
   const subdialogOpenRef = useRef(false);
   // Tracks whether the current open came from hover, so we can suppress Radix's
   // focus move into the panel on hover-open (which would steal focus and could
@@ -1550,20 +1607,36 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label="Agent tools and policies"
+              aria-label={
+                hasMcpFailures
+                  ? "Agent tools and policies — MCP server startup failed"
+                  : "Agent tools and policies"
+              }
               data-testid="agent-info-trigger"
-              className="hidden text-muted-foreground hover:text-foreground md:inline-flex border-none"
+              className={`hidden md:inline-flex border-none ${
+                hasMcpFailures
+                  ? "text-yellow-700 hover:text-yellow-600 dark:text-yellow-400 dark:hover:text-yellow-300"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
               onPointerEnter={openOnHover}
               onPointerLeave={scheduleCloseOnLeave}
               onFocus={() => {
                 openedByHoverRef.current = false;
               }}
             >
-              <InfoIcon className="size-4" />
+              {hasMcpFailures ? (
+                <AlertTriangleIcon className="size-4" data-testid="agent-info-mcp-failure-icon" />
+              ) : (
+                <InfoIcon className="size-4" />
+              )}
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>
-        <TooltipContent>Agent tools &amp; policies</TooltipContent>
+        <TooltipContent>
+          {hasMcpFailures
+            ? "MCP server startup failed — open for details"
+            : "Agent tools & policies"}
+        </TooltipContent>
       </Tooltip>
       <PopoverContent
         align="end"
