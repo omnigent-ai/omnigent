@@ -287,6 +287,8 @@ async def test_host_model_options_returns_prelaunch_catalog(
         # The frame's routable set reaches the web client instead of being
         # dropped at the route boundary.
         "routable_models": ["system.ai.claude-sonnet-4-6[1m]"],
+        # A healthy catalog has no reason to report.
+        "error": None,
     }
 
 
@@ -313,6 +315,44 @@ async def test_host_model_options_probe_failure_returns_bad_gateway(
 
     assert resp.status_code == 502
     assert resp.json() == {"detail": "the codex model probe failed — see the host log"}
+
+
+async def test_host_model_options_reports_probe_error_without_500(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An empty catalog carries the host's reason instead of failing the request.
+
+    The host answers ``status="ok"`` with no models and an ``error`` string
+    explaining why (a failed probe is not a transport failure, so it is not a
+    502). The reason has to survive response serialization — a response model
+    that does not declare ``error`` drops the explanation, and a route
+    annotated ``dict[str, list[Any]]`` rejected the string outright as a 500.
+    """
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex-native"] = {
+        "status": "ok",
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed — see the host log",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed — see the host log",
+    }
 
 
 async def test_list_filesystem_returns_paginated_entries(
