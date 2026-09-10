@@ -1649,6 +1649,44 @@ async def test_server_initiated_close_never_fails_the_turn(
         sessions_module._session_status_cache.pop(session_id, None)
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_binding_to_connected_runner_stamps_liveness(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """A session riding an existing tunnel gets a liveness lease immediately."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    store = get_conversation_store()
+    assert store.get_session_connectivity([session_id])[session_id].runner_last_seen is None
+
+    patch_resp = await ap_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"runner_id": _RUNNER_ID},
+    )
+    assert patch_resp.status_code == 200, patch_resp.text
+
+    writes_drained = threading.Event()
+    session_live_state.submit("test_barrier", writes_drained.set)
+    assert await asyncio.to_thread(writes_drained.wait, 10.0)
+    assert store.get_session_connectivity([session_id])[session_id].runner_last_seen is not None
+
+
 # TODO: factor ``FakeProcessManager`` and ``_build_harness_agent_bundle``
 # out of ``test_sessions_three_layer.py`` + this file into a shared
 # ``_three_layer_helpers.py`` module once a third caller arrives. Kept

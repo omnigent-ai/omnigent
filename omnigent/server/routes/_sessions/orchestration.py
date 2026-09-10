@@ -6971,6 +6971,9 @@ def _ensure_runner_relay(
             runner_id,
             extra={"session_id": session_id},
         )
+    # A binding created after tunnel connect misses the connect-time stamp
+    # until the next sweep. Stamp now so a restart cannot orphan it.
+    session_live_state.touch_runner_liveness([runner_id])
     ready = asyncio.Event()
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
