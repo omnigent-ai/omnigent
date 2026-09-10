@@ -65,3 +65,25 @@ def test_all_error_codes_have_http_status_mapping(code: str, expected_status: in
     default.
     """
     assert _CODE_TO_HTTP_STATUS[code] == expected_status
+
+
+def test_explicit_http_status_overrides_code_mapping() -> None:
+    """An explicit ``http_status`` wins over the code's mapped status.
+
+    The filesystem proxy mirrors runner/host error codes verbatim (e.g.
+    ``git_status_failed``); the upstream's own HTTP status must survive
+    with them instead of snapping to the unknown-code default.
+    """
+    err = OmnigentError(
+        "git status exited 128: fatal: bad config line 1 in file .git/config",
+        code="git_status_failed",
+        http_status=502,
+    )
+    assert err.http_status == 502
+    assert err.code == "git_status_failed"
+
+
+def test_unknown_code_without_override_defaults_to_500() -> None:
+    """Without an override, an unmapped code keeps the 500 default."""
+    err = OmnigentError("boom", code="git_status_failed")
+    assert err.http_status == 500
