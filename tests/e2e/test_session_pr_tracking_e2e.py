@@ -38,6 +38,7 @@ async def test_native_session_tracks_prs_across_repositories(
         f"#!{sys.executable}\n"
         "import json, sys\n"
         "args = sys.argv[1:]\n"
+        "if args[0] not in {'pr', 'api'}: sys.exit(0)\n"
         "repo = (args[1].strip('/').removeprefix('repos/').removesuffix('/pulls')\n"
         "        if args[0] == 'api' else "
         "args[args.index('-R') + 1].removeprefix('github.com/'))\n"
@@ -63,9 +64,15 @@ async def test_native_session_tracks_prs_across_repositories(
     hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
     command = shlex.split(str(hook["command"]))
     try:
-        shell_command = "gh pr create -R example/one"
-        output = subprocess.check_output(shlex.split(shell_command), text=True, cwd=workspace)
+        shell_command = (
+            "gh auth switch --user example-user; gh repo set-default example/one && "
+            "gh pr create -R example/one; gh config set pager cat"
+        )
+        output = subprocess.check_output(
+            ["/bin/sh", "-c", shell_command], text=True, cwd=workspace
+        )
         rest_command = (
+            "gh auth switch --user example-user; "
             "printf 'HEAD SHA: fixture\\n' && gh api /repos/example/three/pulls \\\n"
             "  --method POST \\\n"
             "  --field title='fixture PR' \\\n"

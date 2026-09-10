@@ -361,7 +361,10 @@ def extract_prs(
         command = arguments.get("command", arguments.get("cmd"))
         if not isinstance(command, str) or len(command) > 100_000:
             return [], False
-        commands = _gh_commands(command)
+        # Only PR/API clauses participate in PR evidence and ambiguity checks.
+        commands = [
+            tokens for tokens in _gh_commands(command) if tokens and tokens[0] in {"pr", "api"}
+        ]
         text = _output_text(result)
         if re.search(r"\[exit code: [1-9]|Process exited with code [1-9]", text):
             return [], False

@@ -255,6 +255,120 @@ def test_mixed_operations_do_not_claim_creation() -> None:
     assert not created
 
 
+@pytest.mark.parametrize("tool_name", ["Bash", "exec_command"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_auth_switch_before_creating_two_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str, structured: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    for index, url in enumerate((A, B)):
+        push = "git push -u origin topic && " if index else ""
+        command = (
+            "gh auth switch --user example-user 2>/dev/null; cd /worktree && "
+            + push
+            + '''gh pr create \\
+  --title 'README wording' \\
+  --body "$(cat <<'EOF'
+## Summary
+Update `README.md` wording.
+EOF
+)"'''
+        )
+        stdout = (
+            "remote: https://github.com/example/two/pull/new/topic\nPushed topic\n"
+            if index
+            else ""
+        ) + url
+        result = (
+            {
+                "stdout": stdout,
+                "stderr": "Shell cwd was reset to /workspace",
+                "interrupted": False,
+                "gitOperation": {"pr": {"number": 42, "url": url, "action": "created"}},
+            }
+            if structured
+            else {"content": stdout + "\nShell cwd was reset to /workspace", "is_error": False}
+        )
+        observe_hook(
+            "conv_auth_switch",
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool_name,
+                "tool_input": {"command": command},
+                "tool_response": result,
+                "tool_use_id": f"create-{index}",
+            },
+        )
+    entries = SessionPrRegistry("conv_auth_switch").list()
+    assert {entry.url for entry in entries} == {A, B}
+    assert all(entry.relationship == "created" for entry in entries)
+
+
+@pytest.mark.parametrize(
+    "command,result,urls,created",
+    [
+        ("gh auth status; gh pr create", A, [A], True),
+        ("gh auth setup-git && gh pr edit 42 -R example/one", "Updated", [A], False),
+        (
+            "gh auth switch --user example-user; "
+            "gh api repos/example/one/pulls -X POST --jq .html_url",
+            A,
+            [A],
+            True,
+        ),
+        ("gh auth status", A, [], False),
+        ("gh auth switch --user example-user; gh pr list", A, [], False),
+        ("gh auth switch --user example-user; gh pr view; gh pr create", A, [], False),
+        (
+            "gh auth switch --user example-user; gh api repos/example/one/pulls/42; gh pr create",
+            A,
+            [],
+            False,
+        ),
+        ("gh auth switch --user example-user; gh pr create || true", A, [], False),
+        (
+            "gh auth switch --user example-user; gh pr create",
+            {"stdout": A, "exit_code": 1},
+            [],
+            False,
+        ),
+        (
+            "gh auth switch --user example-user; gh pr create",
+            {"stdout": A, "backgroundTaskId": "pending"},
+            [],
+            False,
+        ),
+    ],
+)
+def test_auth_commands_do_not_supply_pr_evidence(
+    command: str, result: object, urls: list[str], created: bool
+) -> None:
+    refs, was_created = extract_prs("Bash", {"command": command}, result)
+    assert [ref.url for ref in refs] == urls
+    assert was_created is created
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        "gh repo set-default example/one",
+        "gh config set pager cat",
+        "gh arbitrary-extension --option value",
+        "git push -u origin topic",
+        "printf '%s' 'gh pr list'",
+    ],
+)
+@pytest.mark.parametrize("before", [False, True])
+@pytest.mark.parametrize(
+    "write", ["gh pr create", "gh api repos/example/one/pulls -X POST --jq .html_url"]
+)
+def test_unrelated_commands_do_not_hide_pr_write(other: str, before: bool, write: str) -> None:
+    command = f"{other}; {write}" if before else f"{write}; {other}"
+    refs, created = extract_prs("Bash", {"command": command}, {"stdout": A, "exit_code": 0})
+    assert [ref.url for ref in refs] == [A]
+    assert created
+
+
 def test_rest_proxy_wrapper() -> None:
     refs, created = extract_prs(
         "mcp__custom__github_write_api_call",
