@@ -33,7 +33,7 @@ _UCODE_AGENT_NAMES: tuple[str, ...] = ("claude", "codex", "pi")
 # break setup unexpectedly). A full SHA is immutable, so uvx caches the built
 # wheel by ref and reuses it across runs — no ``--refresh-package`` needed to
 # defeat a mutable branch's stale cache.
-_UCODE_GIT_REF = "94271a78c7139220b7333bcae91e522f95ef3af3"
+_UCODE_GIT_REF = "304e4a29c5ca73b3bfaaf1911e38d0080833fda4"
 _UCODE_UVX_SOURCE = f"git+https://github.com/databricks/ucode@{_UCODE_GIT_REF}"
 
 
