@@ -2833,8 +2833,10 @@ def create_app(
         (``RUNNER_DISCONNECT_GRACE_S``): transient drops re-register
         well inside it and the timer's live-tunnel re-check turns them
         into no-ops, so routine recycles never flap sessions to failed.
-        Runner invalidation and liveness clearing stay immediate so
-        reconnect re-initialization still happens.
+        Runner invalidation stays immediate so reconnect re-initialization
+        still happens. Liveness clearing is skipped when this server closed
+        the tunnel itself: the surviving stamp gives its replacement time to
+        adopt the runner without treating the turn as orphaned.
 
         :param runner_id: The disconnected runner's id.
         """
@@ -2857,9 +2859,16 @@ def create_app(
             )
             return
         runner_session_initializer.invalidate_runner(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other
-        # replicas flip offline immediately rather than after the TTL.
-        session_live_state.clear_runner_liveness(runner_id)
+        # A server recycle closes a healthy runner's tunnel. Preserve the
+        # lease so the replacement does not classify it as orphaned while it
+        # reconnects. Genuine runner disconnects still flip offline at once.
+        if shutdown_state.server_shutting_down():
+            _logger.info(
+                "Runner %s tunnel closed during server shutdown; preserving liveness lease",
+                runner_id,
+            )
+        else:
+            session_live_state.clear_runner_liveness(runner_id)
 
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.

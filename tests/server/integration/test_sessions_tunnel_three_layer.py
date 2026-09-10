@@ -37,6 +37,8 @@ import contextlib
 import io
 import json
 import tarfile
+import threading
+import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -1574,12 +1576,13 @@ async def test_server_initiated_close_never_fails_the_turn(
 
     A deploy shuts the server down: uvicorn closes every runner tunnel with
     close code 1012 and stops listening, so no runner can re-register inside
-    the grace even though all of them are alive. The grace timer must read
-    that close as the server's own shutdown and skip the offline-marking —
-    no ``failed`` status, no ``runner_disconnected`` labels.
+    the grace even though all of them are alive. The disconnect path must
+    preserve both the turn and the runner's durable liveness lease. Otherwise
+    a cold replacement server can mistake the reconnecting turn for an orphan
+    and persist ``idle`` before the runner arrives.
     """
     from omnigent.runtime import get_conversation_store
-    from omnigent.server import shutdown_state
+    from omnigent.server import session_live_state, shutdown_state
     from omnigent.server.routes import sessions as sessions_module
 
     ap_client = tunnel_three_layer_stack.ap_client
@@ -1605,6 +1608,8 @@ async def test_server_initiated_close_never_fails_the_turn(
     runner_id = "runner-server-close"
     store = get_conversation_store()
     store.replace_runner_id(session_id, runner_id)
+    store.set_session_live_status(session_id, "running")
+    store.touch_runner_liveness([runner_id], int(time.time()))
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
@@ -1620,6 +1625,25 @@ async def test_server_initiated_close_never_fails_the_turn(
         conv = store.get_conversation(session_id)
         assert conv is not None
         assert sessions_module._last_task_error_from_labels(conv.labels) is None
+
+        # Drain live-state writes queued by the disconnect hook before reading
+        # the row. This makes the lease assertion deterministic on loaded CI.
+        writes_drained = threading.Event()
+        session_live_state.submit("test_barrier", writes_drained.set)
+        assert await asyncio.to_thread(writes_drained.wait, 10.0)
+
+        restarted = store.get_conversation(session_id)
+        assert restarted is not None
+        assert restarted.runner_last_seen is not None
+
+        # Model the replacement process: its relay cache starts empty and its
+        # runner tunnel may not have reconnected before the sidebar's first
+        # list request. The preserved lease must keep durable running status.
+        sessions_module._session_status_cache.pop(session_id, None)
+        listed = await ap_client.get("/v1/sessions")
+        assert listed.status_code == 200
+        item = next(item for item in listed.json()["data"] if item["id"] == session_id)
+        assert item["status"] == "running"
     finally:
         shutdown_state.reset_for_tests()
         sessions_module._session_status_cache.pop(session_id, None)
