@@ -447,12 +447,17 @@ def register_core_routes(
                 harness=harness,
             )
         )
-        host_registry.send_text(conn, launch_frame)
         try:
+            host_registry.send_text(conn, launch_frame)
             launch_result = await asyncio.wait_for(future, timeout=30.0)
+        except ConnectionError as exc:
+            launch_result = {"status": "failed", "error": str(exc)}
         except asyncio.TimeoutError:
-            conn.pending_launches.pop(request_id, None)
             launch_result = {"status": "failed", "error": "host launch timed out"}
+        finally:
+            conn.pending_launches.pop(request_id, None)
+            if not future.done():
+                future.cancel()
         launch_failed = launch_result.get("status") == "failed"
         if launch_failed:
             _logger.warning(
