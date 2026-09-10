@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import {
   AGENT_TERMINAL_IDS,
   findAgentTerminal,
+  terminalAttachReadOnly,
   terminalTabKey,
   useTerminals,
 } from "@/hooks/useTerminals";
@@ -50,14 +51,15 @@ interface MainTerminalViewProps {
    */
   visible?: boolean;
   /**
-   * When true, attach every terminal (agent TUI and user shells)
-   * read-only — the viewer can watch but not type. Set for non-owners:
-   * a shared PTY's keystrokes carry no per-user identity, so only the
-   * owner may drive it (the server enforces this and refuses a
-   * non-owner write attach). Non-owners interact via the chat composer
-   * instead. Default false (owner / single-user).
+   * Caller's effective permission level for the session, or `null`
+   * (single-user / still loading — treated permissively). Read-only is
+   * resolved per terminal (see ``terminalAttachReadOnly``, mirroring
+   * the server's attach gate): the agent's own pane is owner-only — its
+   * keystrokes persist into history as the owner — while a user shell
+   * accepts input from edit-level collaborators. Viewers below those
+   * levels watch read-only and interact via the chat composer.
    */
-  readOnly?: boolean;
+  permissionLevel?: number | null;
   /** Known runner-tunnel state for the active session. */
   runnerOnline?: boolean;
   /** Relaunch or reconnect the session without replaying user input. */
@@ -73,7 +75,7 @@ export function MainTerminalView({
   conversationId,
   initialTerminalKey,
   visible = true,
-  readOnly = false,
+  permissionLevel = null,
   runnerOnline,
   onResume,
   onSurfaceElement,
@@ -280,7 +282,7 @@ export function MainTerminalView({
                     <TerminalView
                       sessionId={conversationId}
                       terminalId={activeTerminal.id}
-                      readOnly={readOnly}
+                      readOnly={terminalAttachReadOnly(activeTerminal.id, permissionLevel)}
                       active={visible}
                       directAttachUrl={activeTerminal.directAttachUrl}
                       onResume={runnerOffline && onResume ? handleResume : undefined}

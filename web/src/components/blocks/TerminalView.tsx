@@ -8,7 +8,7 @@
 // returned cleanup directly — no `useEffect` + `useRef` dance, no
 // guard against a missing `ref.current`.
 
-import { Loader2Icon } from "lucide-react";
+import { EyeIcon, Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Button } from "@/components/ui/button";
@@ -757,6 +757,18 @@ export function TerminalView({
       <div className="min-h-0 flex-1 overflow-hidden p-1">
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
       </div>
+      {readOnly && state.kind === "connected" && (
+        // Without this badge a read-only attach looks broken: output
+        // streams but keystrokes are silently dropped (tmux refuses input
+        // from a `-r` client). Tell the viewer they're watching, not typing.
+        <div
+          data-testid="terminal-read-only-badge"
+          className="pointer-events-none absolute top-1.5 right-2 z-[10000] flex items-center gap-1 rounded-sm bg-background/80 px-1.5 py-0.5 text-muted-foreground text-xs backdrop-blur-[1px]"
+        >
+          <EyeIcon className="size-3" />
+          View only
+        </div>
+      )}
       {state.kind !== "connected" && (
         <StatusOverlay
           state={state}

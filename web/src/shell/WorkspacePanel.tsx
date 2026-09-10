@@ -24,7 +24,7 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
-import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { isEditorLevel } from "@/lib/permissionsApi";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -41,7 +41,12 @@ import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
-import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
+import {
+  terminalAttachReadOnly,
+  terminalTabKey,
+  useCreateTerminal,
+  useTerminals,
+} from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
@@ -518,12 +523,14 @@ function TerminalTabsStrip({
 function RailTerminalView({
   conversationId,
   terminalKey,
-  readOnly,
+  permissionLevel,
   autoFocus,
 }: {
   conversationId: string;
   terminalKey: string;
-  readOnly: boolean;
+  /** Caller's effective permission level — decides per terminal whether the
+   *  attach is read-only (see ``terminalAttachReadOnly``). */
+  permissionLevel: number | null;
   /** Grab keyboard focus when the WS connects. Only for a shell the user just
    *  opened by hand — a shell restored on a session switch leaves focus in the
    *  chat composer. */
@@ -545,7 +552,7 @@ function RailTerminalView({
         <TerminalView
           sessionId={conversationId}
           terminalId={terminal.id}
-          readOnly={readOnly}
+          readOnly={terminalAttachReadOnly(terminal.id, permissionLevel)}
           focusOnConnect={autoFocus}
           directAttachUrl={terminal.directAttachUrl}
           onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
@@ -1039,7 +1046,7 @@ function WorkspacePanelImpl({
           <RailTerminalView
             conversationId={conversationId}
             terminalKey={selectedTerminalKey}
-            readOnly={!isOwnerLevel(permissionLevel)}
+            permissionLevel={permissionLevel}
             autoFocus={autoFocusSelectedTerminal}
           />
         ) : selectedFilePath !== null ? (

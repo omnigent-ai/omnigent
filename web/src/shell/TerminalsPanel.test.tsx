@@ -73,14 +73,14 @@ function mockTerminalList(terminals: TerminalInfo[]) {
 
 function renderPanel({
   initialTerminalKey = null,
-  readOnly = false,
+  permissionLevel = null,
   terminals = [
     makeTerminal("terminal_main", "main", "s1"),
     makeTerminal("terminal_worker", "worker", "s2"),
   ],
 }: {
   initialTerminalKey?: string | null;
-  readOnly?: boolean;
+  permissionLevel?: number | null;
   terminals?: TerminalInfo[];
 } = {}) {
   mockTerminalList(terminals);
@@ -89,7 +89,7 @@ function renderPanel({
       open
       conversationId="conv_terminal"
       initialTerminalKey={initialTerminalKey}
-      readOnly={readOnly}
+      permissionLevel={permissionLevel}
       onClose={vi.fn()}
     />,
   );
@@ -172,15 +172,42 @@ describe("TerminalsPanel navigation", () => {
     expect(screen.queryByTestId("terminal-view")).toBeNull();
   });
 
-  it("forwards readOnly so non-owners attach shells view-only", () => {
-    renderPanel({ initialTerminalKey: "terminal:terminal_main", readOnly: true });
+  it("keeps a user shell interactive for edit collaborators", () => {
+    // Typing into a user shell is workspace mutation editors already
+    // hold (they can open/close these shells and run agent turns), so
+    // an edit-level collaborator attaches interactive.
+    renderPanel({ initialTerminalKey: "terminal:terminal_main", permissionLevel: 2 });
 
     act(() => {
       vi.advanceTimersByTime(180);
     });
 
-    // A non-owner sees the shell but cannot type — the shared PTY runs
-    // as the owner, so keystrokes can't be attributed per-user.
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "false");
+  });
+
+  it("attaches a user shell view-only for read-level collaborators", () => {
+    renderPanel({ initialTerminalKey: "terminal:terminal_main", permissionLevel: 1 });
+
+    act(() => {
+      vi.advanceTimersByTime(180);
+    });
+
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
+  });
+
+  it("attaches the agent pane view-only for non-owners", () => {
+    // Input typed into the agent's own pane persists into history as
+    // the owner, so even an edit collaborator only watches it.
+    renderPanel({
+      initialTerminalKey: "terminal:terminal_claude_main",
+      terminals: [makeTerminal("terminal_claude_main", "claude", "main")],
+      permissionLevel: 2,
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(180);
+    });
+
     expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
   });
 
@@ -205,7 +232,6 @@ describe("TerminalsPanel navigation", () => {
         open
         conversationId="conv_other"
         initialTerminalKey="terminal:terminal_claude_main"
-        readOnly={false}
         onClose={vi.fn()}
       />,
     );

@@ -18,6 +18,7 @@ import {
   inventoryTerminals,
   isAgentTerminalKey,
   PENDING_RECONCILE_INTERVAL_MS,
+  terminalAttachReadOnly,
   terminalInfoFromResource,
   terminalsReconcileInterval,
   terminalTabKey,
@@ -669,6 +670,34 @@ describe("terminalTabKey", () => {
     };
     const after: TerminalInfo = { ...before, name: "bash-renamed", session: "s2" };
     expect(terminalTabKey(before)).toBe(terminalTabKey(after));
+  });
+});
+
+describe("terminalAttachReadOnly", () => {
+  // Mirrors the server's `_authorize_terminal_attach` gate: the agent's
+  // own pane is owner-only (typing there persists into history as the
+  // owner), while a user shell accepts input from edit collaborators —
+  // the shared-session behavior this guards is an editor's shell being
+  // silently unresponsive (keystrokes dropped with no feedback).
+  it("keeps a user shell interactive for edit and above, read-only below", () => {
+    expect(terminalAttachReadOnly("terminal_zsh_u1a2b3", 2)).toBe(false);
+    expect(terminalAttachReadOnly("terminal_zsh_u1a2b3", 3)).toBe(false);
+    expect(terminalAttachReadOnly("terminal_zsh_u1a2b3", 4)).toBe(false);
+    expect(terminalAttachReadOnly("terminal_zsh_u1a2b3", 1)).toBe(true);
+  });
+
+  it("keeps the agent pane owner-only", () => {
+    for (const pane of ["terminal_tui_main", "terminal_claude_main", "terminal_codex_main"]) {
+      expect(terminalAttachReadOnly(pane, 4)).toBe(false);
+      expect(terminalAttachReadOnly(pane, 3)).toBe(true);
+      expect(terminalAttachReadOnly(pane, 2)).toBe(true);
+      expect(terminalAttachReadOnly(pane, 1)).toBe(true);
+    }
+  });
+
+  it("stays permissive on a null level (single-user / still loading)", () => {
+    expect(terminalAttachReadOnly("terminal_tui_main", null)).toBe(false);
+    expect(terminalAttachReadOnly("terminal_zsh_u1a2b3", null)).toBe(false);
   });
 });
 

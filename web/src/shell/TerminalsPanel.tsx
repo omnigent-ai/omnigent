@@ -29,7 +29,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
-import { terminalTabKey } from "@/hooks/useTerminals";
+import { terminalAttachReadOnly, terminalTabKey } from "@/hooks/useTerminals";
 import { cn } from "@/lib/utils";
 import { NewTerminalButton } from "./NewTerminalButton";
 import { TerminalStatusBadge } from "./terminalStatus";
@@ -59,13 +59,13 @@ interface TerminalsPanelProps {
    */
   fluid?: boolean;
   /**
-   * When true, attach terminals read-only — the viewer can watch but
-   * not type. Set for non-owners: a shared PTY's keystrokes carry no
-   * per-user identity, so only the owner may drive it (the server
-   * enforces this and refuses a non-owner write attach). Default false
-   * (owner / single-user).
+   * Caller's effective permission level for the session, or `null`
+   * (single-user / still loading — treated permissively). Decides per
+   * terminal whether the attach is read-only: the agent's own pane is
+   * owner-only, a user shell needs edit access (mirrors the server's
+   * attach gate — see ``terminalAttachReadOnly``).
    */
-  readOnly?: boolean;
+  permissionLevel?: number | null;
 }
 
 export function TerminalsPanel({
@@ -74,7 +74,7 @@ export function TerminalsPanel({
   initialTerminalKey,
   onClose,
   fluid = false,
-  readOnly = false,
+  permissionLevel = null,
 }: TerminalsPanelProps) {
   const [expanded, setExpanded] = useState(false);
   const ref = useRef<HTMLElement>(null);
@@ -246,7 +246,7 @@ export function TerminalsPanel({
                 <TerminalView
                   sessionId={conversationId}
                   terminalId={activeTerminal.id}
-                  readOnly={readOnly}
+                  readOnly={terminalAttachReadOnly(activeTerminal.id, permissionLevel)}
                   directAttachUrl={activeTerminal.directAttachUrl}
                   onStateChange={(state) => {
                     setTerminalConnectionState(activeTerminal.id, state);
