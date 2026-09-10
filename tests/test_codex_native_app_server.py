@@ -3103,3 +3103,34 @@ async def test_discovery_early_exit_without_stderr_keeps_plain_error() -> None:
     )
     with pytest.raises(RuntimeError, match=r"^Codex model discovery exited early \(1\)$"):
         await codex_native_app_server._wait_for_discovery_listener(discovery, port=1)
+
+
+def test_codex_terminal_env_keeps_omnigent_originator(tmp_path) -> None:
+    """The TUI keeps the originator stamp; unrelated host vars stay filtered.
+
+    ``codex_terminal_env`` is an allowlist, so a new env var that the
+    app-server sets is dropped from the terminal unless it is listed there.
+    """
+    from omnigent.harnesses.codex_native.app_server import codex_terminal_env
+    from omnigent.inner.codex_executor import (
+        CODEX_ORIGINATOR,
+        CODEX_ORIGINATOR_ENV_VAR,
+    )
+
+    class _FakeAppServer:
+        """Minimal app-server object used by ``codex_terminal_env``."""
+
+        def __init__(self) -> None:
+            """:returns: None."""
+            self.env = {
+                CODEX_ORIGINATOR_ENV_VAR: CODEX_ORIGINATOR,
+                "DATABRICKS_HOST": "https://example.invalid",
+                "UNRELATED": "dropped",
+            }
+            self.codex_home = tmp_path / "codex-home"
+
+    env = codex_terminal_env(cast(Any, _FakeAppServer()))
+
+    assert env[CODEX_ORIGINATOR_ENV_VAR] == CODEX_ORIGINATOR
+    assert env["DATABRICKS_HOST"] == "https://example.invalid"
+    assert "UNRELATED" not in env

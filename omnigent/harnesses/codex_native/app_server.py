@@ -45,6 +45,7 @@ from omnigent.harnesses.codex_native.process_registry import (
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
+    CODEX_ORIGINATOR_ENV_VAR,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -3456,13 +3457,23 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     """
     Build terminal env overrides for the native Codex TUI.
 
+    The TUI is a separate process from the app-server, so
+    :data:`CODEX_ORIGINATOR_ENV_VAR` has to survive this allowlist too or the
+    terminal half of a session reports codex's own ``codex-tui`` default.
+
     :param app_server: Running app-server wrapper.
     :returns: Environment variables for the terminal process.
     """
     return {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
-        if key in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
+        if key
+        in {
+            "CODEX_HOME",
+            "DATABRICKS_HOST",
+            "DATABRICKS_CODEX_TOKEN",
+            CODEX_ORIGINATOR_ENV_VAR,
+        }
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
 
