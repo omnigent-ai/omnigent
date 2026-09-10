@@ -29,15 +29,15 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
   build: {
     // Ship straight into the Electron package so electron-builder picks it up.
-    outDir: path.resolve(__dirname, "./electron/overlay"),
+    outDir: path.resolve(import.meta.dirname, "./electron/overlay"),
     emptyOutDir: true,
     rollupOptions: {
-      input: path.resolve(__dirname, "./update-overlay.html"),
+      input: path.resolve(import.meta.dirname, "./update-overlay.html"),
     },
   },
 });
