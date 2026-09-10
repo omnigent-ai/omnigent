@@ -82,6 +82,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { registerComposerFocus } from "@/lib/composerFocus";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -2753,6 +2754,22 @@ function ComposerImpl({
     if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
     setSessionDraft(conversationId, { text: value, files });
   }, [conversationId, settledConversationId, value, files]);
+
+  // The ⌘K palette hands focus here after a session pick: its dialog's
+  // close-time focus handling fires after this composer's own focus effect,
+  // so that effect alone loses the race. Mobile keeps its tap-to-focus
+  // behavior — declining tells the palette to keep its default restore.
+  useEffect(
+    () =>
+      registerComposerFocus(() => {
+        if (isMobileRef.current) return false;
+        const el = textareaRef.current;
+        if (!el) return false;
+        el.focus();
+        return document.activeElement === el;
+      }),
+    [],
+  );
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
   // caret straight into the composer so the user can type immediately. Only

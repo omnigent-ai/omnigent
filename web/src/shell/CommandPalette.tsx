@@ -17,7 +17,7 @@
 // groups react to the same input.
 
 import type React from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -29,6 +29,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
+import { focusComposer } from "@/lib/composerFocus";
 import { useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
@@ -60,6 +61,11 @@ interface ActionCommand {
   icon: LucideIcon;
   /** Extra terms the client-side filter matches against (beyond the label). */
   keywords: string[];
+  /** True when `run` lands on a page that mounts a composer: the close-time
+      focus restore is then suppressed once that composer takes focus (see
+      onCloseAutoFocus). Composer-less navigations and toggles leave it unset
+      so the dialog's default restore applies. */
+  focusesComposer?: boolean;
   run: () => void;
 }
 
@@ -108,12 +114,17 @@ export function CommandPalette({
   const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  // Set by a navigating selection, consumed in onCloseAutoFocus below.
+  const focusDestinationRef = useRef(false);
 
-  // Reset the query when the palette closes so it reopens clean.
+  // Reset the query when the palette closes so it reopens clean. Reopening
+  // mid-close also clears a pending hand-off (its close never unmounted).
   useEffect(() => {
     if (!open) {
       setQuery("");
       setDebouncedQuery("");
+    } else {
+      focusDestinationRef.current = false;
     }
   }, [open]);
 
@@ -131,6 +142,7 @@ export function CommandPalette({
         label: "New chat",
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
+        focusesComposer: true,
         run: () => navigate("/"),
       },
       {
@@ -211,11 +223,13 @@ export function CommandPalette({
   }, [data, debouncedQuery]);
 
   const runAction = (action: ActionCommand): void => {
+    focusDestinationRef.current = action.focusesComposer === true;
     close();
     action.run();
   };
 
   const goToSession = (id: string): void => {
+    focusDestinationRef.current = true;
     close();
     navigate(`/c/${id}`);
   };
@@ -249,6 +263,16 @@ export function CommandPalette({
             : undefined
         }
         showCloseButton={false}
+        // After a selection that lands on a composer page, the dialog's
+        // default restore would blur that composer (its old target is stale).
+        // Suppress it only when the composer actually took focus — otherwise
+        // (mobile's tap-to-focus, a torn-down composer) the default restore
+        // keeps focus somewhere sensible instead of stranding it on <body>.
+        onCloseAutoFocus={(e) => {
+          if (!focusDestinationRef.current) return;
+          focusDestinationRef.current = false;
+          if (focusComposer()) e.preventDefault();
+        }}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions

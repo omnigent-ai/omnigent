@@ -72,6 +72,7 @@ import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/gi
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { randomUUID } from "@/lib/randomUUID";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { registerComposerFocus } from "@/lib/composerFocus";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -2443,6 +2444,33 @@ export function NewChatLandingScreen() {
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
   useAutoGrowTextarea(textareaRef, message, 9);
+
+  // The ⌘K palette's "New chat" lands here while its dialog is still tearing
+  // down, so the textarea's mount autoFocus loses to the dialog's close-time
+  // focus handling; register so the palette can hand focus over once it's
+  // gone. A phone expects a tap before the keyboard appears — declining
+  // tells the palette to keep its default restore.
+  useEffect(
+    () =>
+      registerComposerFocus(() => {
+        if (isMobileViewport) return false;
+        const el = textareaRef.current;
+        if (!el) return false;
+        el.focus();
+        return document.activeElement === el;
+      }),
+    [isMobileViewport],
+  );
+
+  // The textarea's autoFocus fires on mount only, but a project's "New
+  // session" pencil swaps `?project=` while this screen stays mounted —
+  // refocus on the swap so every arrival at the composer is ready to type.
+  const focusedProjectParamRef = useRef(projectParam);
+  useEffect(() => {
+    if (focusedProjectParamRef.current === projectParam) return;
+    focusedProjectParamRef.current = projectParam;
+    if (!isMobileViewport) textareaRef.current?.focus();
+  }, [projectParam, isMobileViewport]);
 
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending

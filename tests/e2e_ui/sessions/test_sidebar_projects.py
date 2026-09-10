@@ -335,3 +335,38 @@ def test_project_new_session_folds_into_kebab_on_touch(
         expect(menu_item).to_have_attribute("href", f"/?project={project.replace(' ', '%20')}")
     finally:
         context.close()
+
+
+def test_project_pencil_focuses_landing_composer(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The folder pencil pre-files the composer AND leaves the caret in it.
+
+    The pencil swaps ``?project=`` while the landing screen stays mounted, so
+    the textarea's mount-time autofocus never re-fires; the screen must refocus
+    on the swap so the all-keyboard journey (pencil -> type -> send) works
+    without reaching for the mouse.
+    """
+    base_url, _session_id = seeded_session
+    project = f"Project {uuid.uuid4().hex[:6]}"
+
+    page.goto(f"{base_url}/")
+    landing = page.get_by_test_id("new-chat-landing-input")
+    expect(landing).to_be_visible(timeout=30_000)
+
+    _create_project(page, project)
+    header = page.get_by_role("button", name=project, exact=True)
+    expect(header).to_be_visible()
+
+    # The pencil is hover-revealed on fine-pointer profiles.
+    header.hover()
+    pencil = page.get_by_role("link", name=f"New session in {project}")
+    expect(pencil).to_be_visible()
+    pencil.click()
+
+    expect(page).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}", timeout=10_000)
+    # The point: the param swap alone must put the caret back in the composer.
+    expect(landing).to_be_focused()
+    page.keyboard.type("plan a weekend hike")
+    expect(landing).to_have_value("plan a weekend hike")
