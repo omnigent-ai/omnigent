@@ -36,6 +36,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import (
+    _ensure_runner_online,
     configure_mock_llm,
     open_right_rail,
     set_fallback_mock_llm,
@@ -112,9 +113,29 @@ def _git(*args: str) -> None:
 
 
 @pytest.fixture
-def pr_probe_session(
+def pr_probe_runner_id(
     live_server: str,
     runner_id: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """Recover the shared runner after an earlier crash test in the shard."""
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    try:
+        yield runner_id
+    finally:
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def pr_probe_session(
+    live_server: str,
+    pr_probe_runner_id: str,
     mock_llm_server_url: str,
 ) -> Iterator[tuple[str, str, str, Path, Path]]:
     """An isolated runner-bound session whose workspace can run the commands.
@@ -165,7 +186,7 @@ def pr_probe_session(
     try:
         httpx.patch(
             f"{live_server}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
+            json={"runner_id": pr_probe_runner_id},
             timeout=10.0,
         ).raise_for_status()
         yield (live_server, session_id, model, stub, worktree)
