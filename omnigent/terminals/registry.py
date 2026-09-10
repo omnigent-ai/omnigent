@@ -352,8 +352,8 @@ class TerminalRegistry:
             for (name, key), instance in slot.items()
         ]
 
-    def native_panes(self) -> list[tuple[str, str, Path]]:
-        """Return live native-harness CLI panes as ``(conversation_id, name, socket_path)``.
+    def native_panes(self) -> list[tuple[str, str, Path, TerminalInstance]]:
+        """Return live native CLI panes as ``(conversation_id, name, socket_path, instance)``.
 
         A "native pane" is a terminal whose name is a native harness short name
         (``claude`` / ``codex`` / ``cursor`` / ...) with session key ``"main"``.
@@ -363,17 +363,19 @@ class TerminalRegistry:
         terminal that merely shares the name is never reclaimed. Snapshot
         semantics; sync (map read only, no tmux I/O).
 
-        :returns: ``(conversation_id, terminal_name, tmux_socket_path)`` per live
-            name-matching native pane.
+        :returns: ``(conversation_id, terminal_name, tmux_socket_path, instance)``
+            per live name-matching native pane. The instance is the exact object
+            registered at snapshot time, so the reaper can scope its teardown to
+            the pane it observed rather than whatever later holds the key.
         """
         from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
 
-        out: list[tuple[str, str, Path]] = []
+        out: list[tuple[str, str, Path, TerminalInstance]] = []
         with self._lock:
             for conv_id, slot in self._by_conversation.items():
                 for (name, key), instance in slot.items():
                     if key == "main" and name in NATIVE_PANE_TERMINAL_NAMES:
-                        out.append((conv_id, name, instance.socket_path))
+                        out.append((conv_id, name, instance.socket_path, instance))
         return out
 
     def transfer(
