@@ -1091,11 +1091,18 @@ class _CommentRelayBinding:
         the spec could not be resolved and the fallback surface was used.
     :param bridge_dir: Directory the relay wrote ``tool_relay.json`` into,
         e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
+    :param browser_tools_advertised: Whether the advertised surface includes
+        the ``browser_*`` family. Recording it lets
+        ``_ensure_comment_relay_started`` rebuild the relay when the server's
+        per-turn renderer hint flips — e.g. a headless sandbox session must
+        withdraw browser tools, and opening the session in the desktop app
+        must restore them.
     """
 
     relay: ClaudeNativeToolRelay
     spec_entry: _SpecEntry | None
     bridge_dir: Path
+    browser_tools_advertised: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7094,7 +7101,13 @@ def create_runner_app(
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
+        browser_renderer_available: bool | None = None,
     ) -> None:
+        # browser_renderer_available is the server's per-turn renderer hint:
+        # True/False rebuilds the advertised surface when it disagrees with
+        # the running relay's; None (no signal — launch paths, older servers)
+        # preserves the current surface, defaulting to advertised on first
+        # build (matching the pre-hint behavior).
         import json as _json
 
         from omnigent.harnesses.claude_native.bridge import (
@@ -7138,7 +7151,17 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
-        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+        advertise_browser = (
+            browser_renderer_available
+            if browser_renderer_available is not None
+            else (current.browser_tools_advertised if current is not None else True)
+        )
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and current.browser_tools_advertised == advertise_browser
+            and known_bridge_dir is None
+        ):
             return
 
         bridge_dir = known_bridge_dir
@@ -7155,17 +7178,23 @@ def create_runner_app(
         # Re-read after the awaits above: a concurrent caller may have
         # installed a relay that already matches the current agent.
         current = _session_comment_relays.get(session_id)
+        if browser_renderer_available is None and current is not None:
+            # No renderer signal from this caller: preserve whatever surface
+            # a concurrent hint-carrying turn may have just installed.
+            advertise_browser = current.browser_tools_advertised
         if (
             current is not None
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
+            and current.browser_tools_advertised == advertise_browser
         ):
             return
 
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
-            _unwrap_spec_entry(spec_entry)
+            _unwrap_spec_entry(spec_entry),
+            browser_renderer_available=advertise_browser,
         )
 
         _captured_session_id = session_id
@@ -7207,6 +7236,7 @@ def create_runner_app(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
+            browser_tools_advertised=advertise_browser,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -7607,9 +7637,9 @@ def create_runner_app(
 
         _spec_tools = _session_tool_schemas.get(conv) or []
         # Request-driven harnesses should not advertise browser tools when no
-        # renderer is subscribed. Native harnesses ignore this per-turn list
-        # and keep their session-scoped relay surface; their calls still use
-        # the prompt no-renderer failure below. An absent hint from an older
+        # renderer is subscribed. Native harnesses ignore this per-turn list;
+        # their session-scoped relay surface is gated separately below via
+        # _ensure_comment_relay_started. An absent hint from an older
         # server preserves the previous advertised surface. Only the spec
         # surface is filtered; request-supplied tools remain caller-owned.
         if msg_body.get("browser_renderer_available") is False:
@@ -7638,11 +7668,20 @@ def create_runner_app(
         startup_envelope = _fresh_session_init_envelope(conv)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
 
+        # The server's per-turn renderer hint also gates the NATIVE relay
+        # surface: a native session in a headless sandbox must not be offered
+        # browser_* tools whose approval prompt dead-ends with "no browser
+        # renderer is connected". Non-bool/absent (older servers) means no
+        # signal — the relay keeps its current surface.
+        _renderer_hint = msg_body.get("browser_renderer_available")
+        turn_browser_renderer = _renderer_hint if isinstance(_renderer_hint, bool) else None
+
         if harness_name == "claude-native":
             await _ensure_comment_relay_started(
                 conv,
                 await_notify=False,
                 session_labels=startup_labels,
+                browser_renderer_available=turn_browser_renderer,
             )
         elif harness_name == "codex-native":
             from omnigent.harnesses.codex_native.bridge import (
@@ -7661,7 +7700,10 @@ def create_runner_app(
             codex_bdir = codex_bridge_dir_for_id(codex_bid or conv)
             write_mcp_bridge_config(codex_bdir)
             await _ensure_comment_relay_started(
-                conv, explicit_bridge_dir=codex_bdir, await_notify=False
+                conv,
+                explicit_bridge_dir=codex_bdir,
+                await_notify=False,
+                browser_renderer_available=turn_browser_renderer,
             )
         elif harness_name == "antigravity-native":
             from omnigent.harnesses.antigravity_native.bridge import (
@@ -7680,7 +7722,10 @@ def create_runner_app(
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
             write_mcp_bridge_config(antigravity_bdir)
             await _ensure_comment_relay_started(
-                conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
+                conv,
+                explicit_bridge_dir=antigravity_bdir,
+                await_notify=False,
+                browser_renderer_available=turn_browser_renderer,
             )
         elif harness_name == "hermes":
             from omnigent.harnesses.hermes_native.bridge import (
@@ -7691,6 +7736,7 @@ def create_runner_app(
                 conv,
                 explicit_bridge_dir=hermes_bridge_dir_for_session(conv),
                 await_notify=False,
+                browser_renderer_available=turn_browser_renderer,
             )
 
         try:

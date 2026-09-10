@@ -99,9 +99,16 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    note that and carry on — it is not a reproduction failure. When `public` is
    absent or false (the default), skip this — do not call `sys_session_share`.
 2. **Confirm the workspace** (see above) and that you can reach the app and your
-   tooling with one `sys_os_shell` / tool check: the browser tools
-   (`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`)
-   for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
+   tooling with one `sys_os_shell` / tool check: `sys_session_*` / HTTP for
+   backend journeys, and — only if they appear in your tool list — the browser
+   tools (`browser_navigate` / `browser_snapshot` / `browser_click` /
+   `browser_type`) for UI journeys. The browser tools exist only while a
+   renderer-capable Omnigent UI — the desktop app's embedded-browser bridge —
+   has this session open; on a headless run (CI) the server strips them from
+   your tool list, and a call that slips through anyway always returns
+   `{"error": "no browser renderer is connected"}`. Their absence on a
+   headless run is therefore expected — not an operational failure — and UI
+   journeys go through the Playwright lane instead (Step 2). Confirm you
    can read the report: `gh` is available for a GitHub issue, or a Linear key
    (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
    (if it isn't, stop and report an infrastructure/configuration failure without
@@ -244,14 +251,23 @@ Drive the running app through the journey and **observe the failure yourself**.
 Do this for **each** sub-symptom you enumerated in Step 1 — reproduce them
 independently, because a compound bug can be partly fixed:
 
-- **UI bugs** — use the browser tools to navigate the app, click/type through the
-  reconstructed steps, and `browser_snapshot` the state that shows the failure
-  (e.g. a missing picker, a wrong value, an error toast). The browser tools drive
-  the desktop app's embedded browser, so a UI-journey reproduction expects a
-  desktop / embedded-browser context; if you have no browser pane to drive, say
-  so and fall back to the backend path. If no valid lane is available, report an
-  operational failure without a verdict handoff so the workflow retries; missing
-  browser/tool access is not `needs_more_info`.
+- **UI bugs** — when the browser tools are in your tool list (a renderer-capable
+  Omnigent UI — the desktop app — has this session open), use them to
+  navigate the app, click/type
+  through the reconstructed steps, and `browser_snapshot` the state that shows
+  the failure (e.g. a missing picker, a wrong value, an error toast). On a
+  headless run no renderer is attached, so those tools are stripped from your
+  tool list — and a call that slips through anyway only returns
+  `{"error": "no browser renderer is connected"}`; never call
+  `browser_navigate` hoping a renderer appears. Drive the same journey with
+  Playwright instead: the `tests/e2e_ui/` fixtures and mock LLM below are the
+  headless UI lane (and the lane your authored test runs on regardless), so
+  reproduce by scripting the journey there and observing the failing state it
+  asserts. Missing browser tools on a headless run is the expected shape of
+  that lane, not a blocker. Only if no valid lane is available at all —
+  Playwright cannot drive the journey either — report an operational failure
+  without a verdict handoff so the workflow retries; missing browser/tool
+  access is not `needs_more_info`.
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.

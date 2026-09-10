@@ -382,6 +382,10 @@ class _FakeProcessManager:
         """Reaper in-flight clear — no-op for this stub (issue #1414)."""
         del conversation_id
 
+    async def forward_cancel(self, conversation_id: str) -> None:
+        """Session-delete cancel forwarding — no-op for this stub."""
+        del conversation_id
+
     async def release(self, conversation_id: str, **kwargs: object) -> None:
         """Agent-switch subprocess release — no-op for this stub."""
         del conversation_id, kwargs
@@ -2412,6 +2416,92 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         # clear the spinner but tell the user nothing.
         assert isinstance(error, dict)
         assert _STREAM_FAILURE_MESSAGE in error["message"]
+
+
+@pytest.mark.asyncio
+async def test_native_relay_browser_tools_follow_renderer_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The native relay surface follows the turn's renderer-capability hint.
+
+    A native (codex-native) session in a headless sandbox must not be
+    offered ``browser_*`` tools: the harness sees ONLY the session-scoped
+    relay surface, so an unconditional advertisement prompts the user to
+    approve ``browser_navigate`` even where no renderer can ever claim it
+    and every call dead-ends with "no browser renderer is connected". The
+    turn dispatch carries ``browser_renderer_available``; a ``False`` hint
+    must rebuild the relay without the browser family, and a later ``True``
+    (the user opened the session in the desktop app) must restore it.
+    """
+    from omnigent.codex_native_bridge import (
+        bridge_dir_for_bridge_id as codex_bridge_dir_for_id,
+    )
+
+    conv = f"conv_renderer_gate_{os.urandom(4).hex()}"
+    # Keep bridge writes out of the real ~/.omnigent/codex-native tree.
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path)
+    # No real MCP bridge server runs here; without the stub the notify
+    # worker blocks a executor thread for its full ready timeout.
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.post_tools_changed",
+        lambda *args, **kwargs: None,
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="renderer-gate-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(
+                _FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED])
+            ),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    relay_file = codex_bridge_dir_for_id(conv) / "tool_relay.json"
+
+    async def _dispatch_turn(
+        http: httpx.AsyncClient, *, browser_renderer_available: bool
+    ) -> set[str]:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_renderer_gate",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+                "browser_renderer_available": browser_renderer_available,
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        return {t["name"] for t in json.loads(relay_file.read_text())["tools"]}
+
+    async with _runner_test_client(app) as http:
+        try:
+            headless = await _dispatch_turn(http, browser_renderer_available=False)
+            offered = {n for n in headless if n.startswith("browser_")}
+            assert not offered, (
+                f"headless turn still advertises browser tools on the native relay: {offered}"
+            )
+            # The gate withdraws only the browser family, not the relay.
+            assert "list_comments" in headless
+
+            rendered = await _dispatch_turn(http, browser_renderer_available=True)
+            assert {n for n in rendered if n.startswith("browser_")}, (
+                "a renderer-backed turn must restore the browser tools on the relay"
+            )
+        finally:
+            await http.delete(f"/v1/sessions/{conv}")
 
 
 # ── Runner-local OS env dispatch ────────────────────────

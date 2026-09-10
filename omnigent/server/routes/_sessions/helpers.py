@@ -6719,8 +6719,11 @@ async def _dispatch_skill_slash_command_to_runner(
         "model": agent.name,
         "has_mcp_servers": has_mcp_servers,
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
-        # the turn when no renderer is subscribed to the session stream.
-        "browser_renderer_available": session_stream.has_subscribers(session_id),
+        # the turn when no renderer-capable subscriber is on the session
+        # stream. Capability, not presence: a generic consumer (the CLI's
+        # own stream pump on a headless run) must not keep tools
+        # advertised that no renderer can serve.
+        "browser_renderer_available": session_stream.has_browser_renderer(session_id),
         # The forwarded message carries ``meta_content`` — i.e. the
         # META item (persisted_items[1]), not the user-visible item.
         # Hand the runner that id so a cold-cache reload drops the
@@ -8321,6 +8324,7 @@ async def _stream_live_events(
     viewer_user_id: str | None = None,
     viewer_idle: bool = False,
     presence_root_id: str | None = None,
+    browser_renderer: bool = False,
 ) -> AsyncIterator[str]:
     """
     Yield SSE-formatted events from the conversation's live stream.
@@ -8387,6 +8391,12 @@ async def _stream_live_events(
         viewers of different agents/sub-agents in one session see
         each other. Required when *viewer_user_id* is set; ignored
         otherwise.
+    :param browser_renderer: ``True`` when this stream's client can claim
+        and execute embedded-browser actions (from the route's
+        ``browser_renderer`` query param). Forwarded to
+        :func:`session_stream.subscribe` so the renderer-capability
+        registry reflects this subscriber; generic consumers leave the
+        default ``False``.
     :returns: An async iterator of SSE message strings.
     :raises ValueError: If *viewer_user_id* is set without
         *presence_root_id* — a per-conversation presence scope would
@@ -8418,6 +8428,7 @@ async def _stream_live_events(
                 # awaits and is not dedup-sensitive.
                 pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
                 on_subscribed=on_subscribed,
+                browser_renderer=browser_renderer,
             )
         ) as live_events:
             async for event in live_events:

@@ -247,9 +247,9 @@ def test_native_relay_includes_browser_for_bare_spec() -> None:
     ``browser_*`` schemas on the native relay — because ToolManager
     always registers them, the relay (which filters ToolManager's
     schemas by the union) always emits them. The desktop app runs native
-    sessions that see only the relay, so this is the load-bearing path. The
-    no-renderer mitigation does not dynamically rewrite this session-scoped
-    surface; native calls instead fail promptly when nobody claims them.
+    sessions that see only the relay, so this is the load-bearing path.
+    Without a renderer signal the builder defaults to advertising (older
+    servers send no hint); the no-renderer withdrawal is exercised below.
     """
     schemas = build_native_relay_tool_schemas(AgentSpec(spec_version=1))
     names = {s["name"] for s in schemas if s["name"].startswith("browser_")}
@@ -259,6 +259,25 @@ def test_native_relay_includes_browser_for_bare_spec() -> None:
         if schema["name"].startswith("browser_"):
             assert schema["description"]
             assert schema["parameters"]["type"] == "object"
+
+
+def test_native_relay_withdraws_browser_without_renderer() -> None:
+    """
+    ``browser_renderer_available=False`` removes EXACTLY the ``browser_*``
+    family from the native relay surface — nothing else. A native session
+    in a headless sandbox (no browser-capable renderer) must not be offered
+    tools whose approval prompt can only dead-end with "no browser renderer
+    is connected", and the gate must not disturb the rest of the surface.
+    """
+    spec = AgentSpec(spec_version=1)
+    advertised = {s["name"] for s in build_native_relay_tool_schemas(spec)}
+    gated = {
+        s["name"] for s in build_native_relay_tool_schemas(spec, browser_renderer_available=False)
+    }
+    assert not (gated & _EXPECTED_BROWSER_NAMES)
+    assert advertised - gated == _EXPECTED_BROWSER_NAMES
+    # The always-on relay surface survives the gate.
+    assert "list_comments" in gated
 
 
 # ── Headless schema stripping ────────────────────────────────────────

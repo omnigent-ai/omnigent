@@ -488,8 +488,9 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
 
     Used for request-driven harnesses when the turn's dispatch says no
     renderer is subscribed to the session stream. Native harnesses use a
-    session-scoped relay surface instead of the per-turn schema list, so they
-    retain the browser tools and rely on the server's prompt failure path.
+    session-scoped relay surface instead of the per-turn schema list; that
+    surface applies the same renderer gate at build time (see
+    :func:`build_native_relay_tool_schemas`).
     Handles both the nested OpenAI shape
     (``{"function": {"name": ...}}``) and the flat relay shape
     (``{"name": ...}``).
@@ -509,7 +510,11 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     return kept
 
 
-def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
+def build_native_relay_tool_schemas(
+    spec: AgentSpec | None,
+    *,
+    browser_renderer_available: bool = True,
+) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -526,6 +531,13 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     :param spec: The session's resolved agent spec. ``None`` falls back to the
         always-on read/discovery surface (never the opt-in spawn writes, whose
         gate can't be evaluated without the spec), mirroring the relay.
+    :param browser_renderer_available: Whether a browser-capable renderer is
+        serving the session (the server's per-turn dispatch hint). ``False``
+        drops the ``browser_*`` family from the surface — a native session in
+        a headless sandbox must not be offered tools whose approval prompt
+        can only lead to "no browser renderer is connected". Defaults to
+        ``True`` for callers with no renderer signal (launch-time surfaces,
+        older servers whose dispatch carries no hint).
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -566,12 +578,19 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             }
         )
 
+    # Browser tools only enter via the spec path's union filter; the
+    # renderer gate narrows the union rather than post-filtering so the
+    # no-renderer surface never even builds the browser schemas.
+    allowed_builtins = _NATIVE_RELAY_BUILTIN_TOOLS
+    if not browser_renderer_available:
+        allowed_builtins = allowed_builtins - _BROWSER_TOOLS
+
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
         for schema in ToolManager(spec).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
-            if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
+            if function is not None and function.get("name") in allowed_builtins:
                 _append(function)
     else:
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool

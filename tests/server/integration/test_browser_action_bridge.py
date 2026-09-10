@@ -147,9 +147,12 @@ async def _drain_until_action_request(
     """
     Block on a session stream until a ``browser.action_request`` arrives.
 
-    The request route publishes the SSE event before awaiting the
-    Future, so subscribing is how a test learns the minted ``action_id``
-    without monkey-patching ``secrets``.
+    Subscribes with ``browser_renderer=True`` — modelling the desktop
+    app's relay — because the request route only parks and publishes an
+    action while a renderer-capable subscriber is registered. The route
+    publishes the SSE event before awaiting the Future, so subscribing is
+    how a test learns the minted ``action_id`` without monkey-patching
+    ``secrets``.
 
     :param session_id: Session to subscribe to.
     :param subscribed: Optional event set once the subscriber registers.
@@ -163,7 +166,9 @@ async def _drain_until_action_request(
         return ()
 
     async with asyncio.timeout(timeout_s):
-        async for event in session_stream.subscribe(session_id, on_subscribed=_on_subscribed):
+        async for event in session_stream.subscribe(
+            session_id, on_subscribed=_on_subscribed, browser_renderer=True
+        ):
             if event.get("type") == "browser.action_request":
                 return event
     raise AssertionError("subscribe loop ended without a browser.action_request event")
@@ -422,15 +427,15 @@ async def test_second_result_after_done_is_noop(client: httpx.AsyncClient) -> No
 # ── timeout / cleanup ────────────────────────────────────────────
 
 
-async def test_unclaimed_subscriber_fails_after_claim_grace_and_cleans_registry(
+async def test_unclaimed_renderer_fails_after_claim_grace_and_cleans_registry(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A stream subscriber that is not a browser renderer observes the request but
-    never claims it. The route returns after the short claim grace rather than
-    waiting the full renderer-result timeout, and all registry entries are
-    cleaned up.
+    A renderer-capable subscriber observes the request but never claims
+    it (e.g. an older desktop build whose bridge predates the action).
+    The route returns after the short claim grace rather than waiting the
+    full renderer-result timeout, and all registry entries are cleaned up.
     """
     monkeypatch.setattr(sessions_routes, "_BROWSER_ACTION_CLAIM_GRACE_S", 0.05)
 
@@ -479,6 +484,67 @@ async def test_claimed_renderer_uses_result_timeout(
     resp = await request_task
     assert resp.status_code == 200, resp.text
     assert "timed out" in resp.json()["error"]
+    assert sessions_routes._browser_action_registry == {}
+    assert sessions_routes._browser_action_claim_events == {}
+    assert sessions_routes._browser_action_owners == {}
+    assert sessions_routes._browser_action_claims == {}
+
+
+async def test_non_renderer_subscriber_fails_fast_without_publish(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A plain stream subscriber — the shape of a headless ``omnigent run``,
+    whose CLI keeps its own stream pump open for the whole turn — must
+    not make the route park and publish an action no renderer can serve.
+    The request returns the no-renderer result immediately (no claim
+    grace burned), the subscriber never sees a ``browser.action_request``
+    event, and the registries stay clean.
+    """
+    import time
+
+    agent = await create_test_agent(client, "test-browser-plain-subscriber")
+    session_id = await _create_session(client, agent["id"])
+
+    observed: list[dict[str, Any]] = []
+    subscribed = asyncio.Event()
+
+    async def _on_subscribed() -> tuple[dict[str, Any], ...]:
+        subscribed.set()
+        return ()
+
+    async def _plain_pump() -> None:
+        # Deliberately NOT ``browser_renderer=True``: this subscriber
+        # models a generic consumer that can never claim the action.
+        async for event in session_stream.subscribe(session_id, on_subscribed=_on_subscribed):
+            observed.append(event)
+
+    pump = asyncio.create_task(_plain_pump())
+    await subscribed.wait()
+    try:
+        start = time.monotonic()
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/browser/action_request",
+            json={"action": "navigate", "args": {"url": "https://example.com"}},
+        )
+        elapsed = time.monotonic() - start
+        # Give any (wrong) publish a chance to land on the pump's queue
+        # before asserting nothing arrived.
+        await asyncio.sleep(0)
+    finally:
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"error": "no browser renderer is connected"}
+    assert elapsed < 1.0, (
+        f"action_request took {elapsed:.1f}s with only a plain subscriber — the "
+        "route must fail fast instead of burning the claim grace"
+    )
+    assert not any(event.get("type") == "browser.action_request" for event in observed), (
+        f"an unanswerable action_request was published to a non-renderer subscriber: {observed!r}"
+    )
+    # Nothing was parked: registries stay clean.
     assert sessions_routes._browser_action_registry == {}
     assert sessions_routes._browser_action_claim_events == {}
     assert sessions_routes._browser_action_owners == {}
