@@ -336,6 +336,7 @@ export function InboxPage() {
                   allowAllEdits={item.elicitation.allowAllEdits}
                   rememberScope={item.elicitation.rememberScope}
                   codexPersistModes={item.elicitation.codexPersistModes}
+                  agyPermission={item.elicitation.agyPermission}
                   onSubmit={makeSubmit(item)}
                 />
               )}

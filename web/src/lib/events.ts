@@ -10,6 +10,7 @@
 
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type {
+  AgyPermission,
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
@@ -271,6 +272,15 @@ export interface ElicitationRequest {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /**
+   * Producer-supplied extra (agy-native permission prompts only): the
+   * prompt details agy's own TUI shows — the action description and,
+   * when agy offers an always-allow choice, its advertised persist
+   * pattern. The ApprovalCard renders the description and an "Always
+   * allow <pattern>" button whose accept verdict carries
+   * ``_meta.persist == "always"``. Null for every other elicitation.
+   */
+  agyPermission?: AgyPermission | null;
 }
 
 /**

@@ -73,6 +73,7 @@ import type {
 import { NATIVE_TOOL_TYPES } from "./events";
 import { routingExtrasFromWire } from "./routingDecision";
 import type {
+  AgyPermission,
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
@@ -1037,6 +1038,26 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 : undefined,
           }
         : null;
+    // The agy permission mapper stamps the prompt's action description
+    // and, when agy's own prompt offers an always-allow choice, the
+    // advertised persist pattern. Surface them so the ApprovalCard shows
+    // the same prompt the agy TUI does (description + always-allow
+    // affordance) instead of a bare binary Approve/Reject.
+    const actionDescriptionRaw = p.action_description;
+    const alwaysAllowPatternRaw = p.always_allow_pattern;
+    const agyPermission: AgyPermission | null =
+      phase === "agy_permission"
+        ? {
+            actionDescription:
+              typeof actionDescriptionRaw === "string" && actionDescriptionRaw
+                ? actionDescriptionRaw
+                : null,
+            alwaysAllowPattern:
+              typeof alwaysAllowPatternRaw === "string" && alwaysAllowPatternRaw
+                ? alwaysAllowPatternRaw
+                : null,
+          }
+        : null;
     const codexMetaRaw = p["_meta"];
     const codexMeta =
       codexMetaRaw && typeof codexMetaRaw === "object" && !Array.isArray(codexMetaRaw)
@@ -1095,6 +1116,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       allowAllEdits,
       rememberScope,
       codexPersistModes,
+      agyPermission,
     } satisfies ElicitationRequest;
   }
 

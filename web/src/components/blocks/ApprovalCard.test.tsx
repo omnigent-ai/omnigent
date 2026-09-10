@@ -454,6 +454,68 @@ describe("ApprovalCard — Codex MCP persistence choices", () => {
   });
 });
 
+describe("ApprovalCard — Antigravity permission prompt details", () => {
+  const baseProps = {
+    elicitationId: "elic_agy_perm",
+    message: "Antigravity wants to run: pwd",
+    phase: "agy_permission",
+    policyName: "agy_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+  } as const;
+
+  it("shows the action description and an always-allow choice when advertised", () => {
+    // agy's own TUI prompt describes the action and offers an
+    // always-allow persist entry; the card must surface both instead
+    // of a bare binary Approve/Reject.
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    expect(screen.getByText("Running pwd command")).toBeDefined();
+    const alwaysButton = screen.getByRole("button", { name: /always allow/i });
+    fireEvent.click(alwaysButton);
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "always",
+    });
+  });
+
+  it("offers no always-allow choice when agy's prompt advertises none", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: null }}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-card-agy-always-allow")).toBeNull();
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
+  });
+
+  it("labels an always-allow accept on the responded pill", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "always" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText(/always allowed/i)).toBeDefined();
+  });
+});
+
 describe("ApprovalCard — multi-choice options", () => {
   beforeEach(() => {
     useChatStore.setState({
