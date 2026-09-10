@@ -3,6 +3,8 @@ import { authenticatedFetch, fetchWithBrowserSession } from "@/lib/identity";
 import { mountNotebookPane } from "./notebook-pane.mjs";
 import { NotebookHistory } from "./NotebookHistory";
 
+const LOAD_TIMEOUT_MS = 120_000;
+
 /** Keep Lab mounted while switching to Chat so its kernel connection survives. */
 export function NativeNotebookSurface({
   sessionId,
@@ -14,6 +16,7 @@ export function NativeNotebookSurface({
   const [started, setStarted] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [message, setMessage] = useState("Opening notebook…");
+  const [failure, setFailure] = useState<string | null>(null);
   const [source, setSource] = useState(false);
   const [history, setHistory] = useState(false);
   const [org, setOrg] = useState(false);
@@ -26,6 +29,18 @@ export function NativeNotebookSurface({
     const iframe = frame.current;
     let stopped = false;
     let restored = false;
+    const fail = (reason: string) => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      clearTimeout(deadline);
+      setFailure(reason);
+    };
+    const deadline = window.setTimeout(
+      () =>
+        fail("JupyterLab did not finish loading within two minutes. Retry or use Source and Chat."),
+      LOAD_TIMEOUT_MS,
+    );
     let compactBefore: boolean | undefined;
     interface Lab {
       restored: Promise<void>;
@@ -53,8 +68,7 @@ export function NativeNotebookSurface({
       try {
         current = (iframe.contentWindow as (Window & { jupyterapp?: Lab }) | null)?.jupyterapp;
       } catch {
-        clearInterval(timer);
-        setKernelStatus("Open Notebook again to return to JupyterLab.");
+        fail("JupyterLab is no longer accessible. Retry or open it in a full page.");
         return;
       }
       if (restored && current) {
@@ -63,18 +77,25 @@ export function NativeNotebookSurface({
       }
       if (!current || current === lab) return;
       lab = current;
-      void current.restored.then(() => {
-        if (!stopped && lab === current) {
-          restored = true;
-          resize();
-        }
-      });
+      void current.restored
+        .then(() => {
+          if (!stopped && lab === current) {
+            restored = true;
+            clearTimeout(deadline);
+            resize();
+          }
+        })
+        .catch(() => {
+          if (lab === current)
+            fail("JupyterLab could not restore the notebook. Retry or use Source and Chat.");
+        });
     }, 250);
     const observer = new ResizeObserver(resize);
     observer.observe(iframe);
     return () => {
       stopped = true;
       clearInterval(timer);
+      clearTimeout(deadline);
       observer.disconnect();
     };
   }, [url]);
@@ -84,6 +105,10 @@ export function NativeNotebookSurface({
   useEffect(() => {
     if (!started) return;
     const abort = new AbortController();
+    const deadline = window.setTimeout(() => {
+      setFailure("Opening the notebook timed out. Retry or use Source and Chat.");
+      abort.abort();
+    }, LOAD_TIMEOUT_MS);
     const base = `/v1/sessions/${encodeURIComponent(sessionId)}/docloop`;
     void (async () => {
       try {
@@ -91,6 +116,7 @@ export function NativeNotebookSurface({
         if (!response.ok)
           throw new Error("Send a message in Chat to open this session’s notebook.");
         const document = await response.json();
+        if (abort.signal.aborted) return;
         if (document.format === "org") {
           setOrg(true);
           setSource(true);
@@ -109,20 +135,33 @@ export function NativeNotebookSurface({
         ) {
           throw new Error(descriptor.error || "Jupyter is unavailable for this environment.");
         }
+        if (abort.signal.aborted) return;
         setUrl(descriptor.url);
         setMessage("");
       } catch (error) {
         if (!abort.signal.aborted)
-          setMessage(error instanceof Error ? error.message : "Notebook unavailable.");
+          setFailure(error instanceof Error ? error.message : "Notebook unavailable.");
+      } finally {
+        clearTimeout(deadline);
       }
     })();
-    return () => abort.abort();
+    return () => {
+      abort.abort();
+      clearTimeout(deadline);
+    };
   }, [started, sessionId, attempt]);
   useEffect(() => {
     if (!source || !editor.current) return;
     const pane = mountNotebookPane(editor.current, { sessionId, fetcher: authenticatedFetch });
     return () => pane.dispose();
   }, [source, sessionId]);
+  const retry = () => {
+    setUrl(null);
+    setFailure(null);
+    setMessage("Opening notebook…");
+    setKernelStatus("Loading JupyterLab…");
+    setAttempt((value) => value + 1);
+  };
   if (!started) return null;
   return (
     <div className="docloop-notebook-surface">
@@ -158,15 +197,17 @@ export function NativeNotebookSurface({
           </a>
         )}
       </div>
-      {!source && !history && message && (
+      {!source && !history && (failure || message) && (
         <div className="docloop-notebook-message">
-          <p role="status">{message}</p>
-          <button type="button" onClick={() => setAttempt((value) => value + 1)}>
-            Try again
-          </button>
+          <p role={failure ? "alert" : "status"}>{failure || message}</p>
+          {failure && (
+            <button type="button" onClick={retry}>
+              Try again
+            </button>
+          )}
         </div>
       )}
-      {url && !source && !history && (
+      {url && !failure && !source && !history && (
         <p className="docloop-kernel-status" role="status">
           {kernelStatus}
         </p>
