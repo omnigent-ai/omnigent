@@ -43,6 +43,8 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import AsyncIterator, Collection
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -146,7 +148,7 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
-        except RuntimeError:
+        except (RuntimeError, OSError):
             _logger.exception(
                 "failed to send cursor keystroke %r (of %r); session=%s", key, keys, session_id
             )
@@ -798,6 +800,31 @@ async def _yolo_auto_accept(
     return _YoloAccept.SENT
 
 
+async def _cancel_cursor_elicitation_tasks(tasks: Collection[asyncio.Task[None]]) -> None:
+    pending = tuple(tasks)
+    for task in pending:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _report_cursor_elicitation_result(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _logger.error("cursor elicitation task failed: %s", task.get_name(), exc_info=error)
+
+
+@asynccontextmanager
+async def _cursor_elicitation_tasks() -> AsyncIterator[set[asyncio.Task[None]]]:
+    tasks: set[asyncio.Task[None]] = set()
+    try:
+        yield tasks
+    finally:
+        await _cancel_cursor_elicitation_tasks(tasks)
+
+
 async def supervise_cursor_transcript_elicitations(
     *,
     base_url: str,
@@ -864,7 +891,10 @@ async def supervise_cursor_transcript_elicitations(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        _cursor_elicitation_tasks() as pending_tasks,
+    ):
         while True:
             try:
                 if store_path is None or not store_path.exists():
@@ -884,6 +914,7 @@ async def supervise_cursor_transcript_elicitations(
                     entry = active.pop(tool_call_id)
                     task = entry["task"]
                     if isinstance(task, asyncio.Task) and not task.done():
+                        await _cancel_cursor_elicitation_tasks((task,))
                         await _post_external_elicitation_resolved(
                             client, session_id, str(entry["elicitation_id"])
                         )
@@ -961,6 +992,9 @@ async def supervise_cursor_transcript_elicitations(
                             elicitation_id=elicitation_id,
                         )
                     task = asyncio.create_task(coro, name=f"cursor-approval-{elicitation_id}")
+                    pending_tasks.add(task)
+                    task.add_done_callback(pending_tasks.discard)
+                    task.add_done_callback(_report_cursor_elicitation_result)
                     active[call.tool_call_id] = {
                         "elicitation_id": elicitation_id,
                         "task": task,
