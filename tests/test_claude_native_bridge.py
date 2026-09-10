@@ -9669,11 +9669,12 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
 # ---------------------------------------------------------------------------
 # Bridge HTTP server bind/advertise behavior.
 #
-# Sandbox backends with SSRF hardening (e.g. OpenShell) deny loopback
-# destinations unconditionally, so a relay advertised at 127.0.0.1 is
-# unreachable from the hook subprocesses inside such a sandbox. The bridge
-# servers therefore advertise a routable local address when one exists and
-# draw ports from a stable, allowlistable pool.
+# The servers default to loopback (127.0.0.1). Sandbox backends with SSRF
+# hardening (e.g. OpenShell) deny loopback destinations unconditionally, so a
+# loopback-advertised relay is unreachable from hook subprocesses inside such
+# a sandbox; that integrator opts into an all-interfaces bind via
+# OMNIGENT_BRIDGE_BIND_HOST="0.0.0.0", which advertises the host's routable
+# address. Ports come from a stable, allowlistable pool.
 # ---------------------------------------------------------------------------
 
 
@@ -9696,21 +9697,61 @@ def _no_ambient_bridge_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("_no_ambient_bridge_network")
-async def test_tool_relay_advertises_routable_host_reachable_from_sandbox(
+async def test_tool_relay_defaults_to_loopback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The relay must not advertise loopback when a routable address exists.
+    """With no override the relay stays loopback-only, even given a routable IP.
 
-    A loopback advertisement is unreachable from an SSRF-hardened sandbox
-    (loopback is denied unconditionally there), which fail-closes every
-    prompt. TEST-NET-3 stands in for the detected routable address; it is
-    deliberately not locally bindable, proving the server listens on all
-    interfaces rather than on the advertised address itself.
+    Loopback is the default posture so an ordinary host keeps the relay off
+    every other interface. A routable address is present here (mocked) to
+    prove detection alone never widens the bind without the opt-in.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._routable_local_address",
         lambda: "203.0.113.9",
     )
+    bridge_dir = prepare_bridge_dir("conv_default_loopback", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert info["url"].startswith("http://127.0.0.1:"), (
+            "detecting a routable address must not widen the default bind"
+        )
+        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+            encoding="utf-8"
+        )
+        assert "OMNIGENT_RELAY_URL='http://127.0.0.1:" in env_text
+    finally:
+        relay.close()
+    assert not (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).exists(), (
+        "close() must recognise its own advertisement and unlink it"
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_all_interfaces_opt_in_advertises_routable_host_reachable_locally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OMNIGENT_BRIDGE_BIND_HOST=0.0.0.0 advertises the routable host.
+
+    This is the sandbox integrator's opt-in: a loopback advertisement is
+    unreachable from an SSRF-hardened sandbox, so the relay must advertise a
+    routable host while still binding all interfaces. TEST-NET-3 stands in for
+    the detected routable address; it is deliberately not locally bindable,
+    proving the server listens on all interfaces rather than on the advertised
+    address itself, so loopback consumers keep working.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
     bridge_dir = prepare_bridge_dir("conv_routable_bind", workspace=tmp_path)
     relay = start_tool_relay(
         bridge_dir=bridge_dir,
@@ -9741,14 +9782,20 @@ async def test_tool_relay_advertises_routable_host_reachable_from_sandbox(
 
 
 @pytest.mark.usefixtures("_no_ambient_bridge_network")
-async def test_tool_relay_falls_back_to_loopback_without_routable_address(
+async def test_all_interfaces_opt_in_falls_back_to_loopback_advertise(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Hosts with no routable interface keep the loopback-only posture."""
+    """The 0.0.0.0 opt-in advertises loopback when no routable address exists.
+
+    Binding all interfaces still includes loopback, so a local consumer keeps
+    working; a sandbox that filters loopback cannot be helped when the host has
+    no routable interface, but that is a misconfiguration, not this fix's path.
+    """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._routable_local_address",
         lambda: None,
     )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
     bridge_dir = prepare_bridge_dir("conv_loopback_fallback", workspace=tmp_path)
     relay = start_tool_relay(
         bridge_dir=bridge_dir,
@@ -9769,7 +9816,7 @@ async def test_tool_relay_falls_back_to_loopback_without_routable_address(
 async def test_tool_relay_bind_host_override_pins_advertised_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bind-host env override wins over routable-address detection."""
+    """An explicit bind-host override wins over routable-address detection."""
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._routable_local_address",
         lambda: "203.0.113.9",
@@ -9797,22 +9844,20 @@ async def test_relay_ports_draw_from_stable_pool_with_bind_retry(
 ) -> None:
     """Pool ports are allocated with bind-retry, then fall back to ephemeral.
 
-    A sandbox network policy allowlists exact host+port pairs, so relay
-    ports must come from the configured pool. Multiple bridge servers run
-    per host (MCP ingress + one relay per session), so an occupied pool
-    port is skipped rather than fatal, and an exhausted pool degrades to
-    an OS-assigned port instead of refusing to start.
+    A sandbox network policy allowlists exact host+port pairs, so relay ports
+    must come from the configured pool. Multiple bridge servers run per host
+    (MCP ingress + one relay per session), so an occupied pool port is skipped
+    rather than fatal, and an exhausted pool degrades to an OS-assigned port
+    instead of refusing to start. The bind host is pinned to loopback so the
+    test occupies and probes ports on a single interface.
     """
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._routable_local_address",
-        lambda: "203.0.113.9",
-    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "127.0.0.1")
     with socket.socket() as taken:
-        taken.bind(("0.0.0.0", 0))
+        taken.bind(("127.0.0.1", 0))
         taken.listen(1)
         taken_port = int(taken.getsockname()[1])
         with socket.socket() as probe:
-            probe.bind(("0.0.0.0", 0))
+            probe.bind(("127.0.0.1", 0))
             free_port = int(probe.getsockname()[1])
         monkeypatch.setenv(
             claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, f"{taken_port},{free_port}"
@@ -9830,7 +9875,7 @@ async def test_relay_ports_draw_from_stable_pool_with_bind_retry(
             first_info = json.loads(
                 (first_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
             )
-            assert first_info["url"] == f"http://203.0.113.9:{free_port}", (
+            assert first_info["url"] == f"http://127.0.0.1:{free_port}", (
                 "relay must skip the occupied pool port and bind the next one"
             )
 
@@ -9873,18 +9918,20 @@ def test_bridge_port_pool_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("_no_ambient_bridge_network")
-def test_http_ingress_advertises_routable_host(
+def test_http_ingress_all_interfaces_opt_in_advertises_routable_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The MCP control ingress shares the relay's bind/advertise rules.
 
-    It is the bridge's second HTTP bind site; leaving it on loopback would
-    reintroduce the sandbox fail-closed path for tools-changed control calls.
+    It is the bridge's second HTTP bind site; leaving it loopback-only under
+    the 0.0.0.0 opt-in would reintroduce the sandbox fail-closed path for
+    tools-changed control calls.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._routable_local_address",
         lambda: "203.0.113.9",
     )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
     bridge_dir = prepare_bridge_dir("conv_ingress_bind", workspace=tmp_path)
     notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
     httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)

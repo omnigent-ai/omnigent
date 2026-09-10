@@ -377,11 +377,15 @@ def _decision(hook_stdout: bytes) -> dict[str, object]:
 def test_claude_native_prompt_survives_loopback_filtering_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A prompt submit must not fail-closed just because the relay bound loopback.
+    """A prompt submit must not fail-closed once the sandbox opt-in is set.
 
-    Fails on the buggy build (relay advertised at ``127.0.0.1`` → the sandbox
-    stand-in denies the hook's POST → the prompt is blocked); passes once the
-    relay binds a routable, policy-evaluable address the sandbox forwards.
+    Models the documented remediation: an SSRF-hardened sandbox integrator
+    sets ``OMNIGENT_BRIDGE_BIND_HOST=0.0.0.0`` so the relay advertises the
+    host's routable address. Fails on the buggy build (the relay ignored the
+    setting and advertised ``127.0.0.1`` → the sandbox stand-in denies the
+    hook's POST → the prompt is blocked); passes once the relay honours the
+    opt-in and advertises a routable, policy-evaluable address the sandbox
+    forwards.
     """
     from omnigent.harnesses.claude_native.bridge import (
         prepare_bridge_dir,
@@ -389,9 +393,11 @@ def test_claude_native_prompt_survives_loopback_filtering_sandbox(
         write_active_session_id,
     )
 
-    # The relay's bind/advertise decision is env-tunable; ambient overrides
-    # must not steer this journey away from the default sandbox posture.
-    monkeypatch.delenv("OMNIGENT_BRIDGE_BIND_HOST", raising=False)
+    # The sandbox integrator's opt-in: bind all interfaces and advertise the
+    # host's real routable address. The SSRF stand-in forwards that routable
+    # destination (rewriting it to the relay's loopback socket, modelling how
+    # a real sandbox routes it), while the control leg reaches it directly.
+    monkeypatch.setenv("OMNIGENT_BRIDGE_BIND_HOST", "0.0.0.0")
     monkeypatch.delenv("OMNIGENT_BRIDGE_PORT_POOL", raising=False)
 
     proxy = _SsrfHardenedProxy()

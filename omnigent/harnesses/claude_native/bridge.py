@@ -84,13 +84,15 @@ REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 
 # Bind/advertise coordinates for the bridge's HTTP servers (the tool relay and
-# the MCP control ingress). Sandbox backends with SSRF hardening (e.g.
-# OpenShell) deny loopback/link-local/metadata destinations unconditionally,
-# so a relay advertised at 127.0.0.1 is unreachable from hook subprocesses
-# there. The servers therefore advertise a routable local address when one
-# exists (listening on all interfaces so loopback consumers keep working) and
-# draw ports from a small stable pool that sandbox network policies can
-# allowlist by exact host+port — OS-assigned ephemeral ports cannot be.
+# the MCP control ingress). These default to loopback (127.0.0.1) so an
+# ordinary host keeps them off every other interface. Sandbox backends with
+# SSRF hardening (e.g. OpenShell) deny loopback destinations unconditionally,
+# making a loopback-advertised relay unreachable from hook subprocesses there;
+# such an integrator opts into an all-interfaces bind by setting
+# BRIDGE_BIND_HOST_ENV_VAR to "0.0.0.0" (the servers then advertise the host's
+# routable address so those hooks can reach them). Ports come from a small
+# stable pool a sandbox network policy can allowlist by exact host+port —
+# OS-assigned ephemeral ports cannot be.
 BRIDGE_BIND_HOST_ENV_VAR = "OMNIGENT_BRIDGE_BIND_HOST"
 BRIDGE_PORT_POOL_ENV_VAR = "OMNIGENT_BRIDGE_PORT_POOL"
 # Kept below Linux's default ephemeral range (32768+) so OS-assigned ports
@@ -911,20 +913,20 @@ def _routable_local_address() -> str | None:
 def _bridge_bind_hosts() -> tuple[str, str]:
     """Return ``(bind_host, advertised_host)`` for bridge HTTP servers.
 
-    Defaults to advertising the routable local address (bound on all
-    interfaces so loopback consumers keep working), because SSRF-hardened
-    sandboxes deny loopback destinations unconditionally. Falls back to
-    loopback when no routable address exists. Set
-    :data:`BRIDGE_BIND_HOST_ENV_VAR` to pin a host — ``127.0.0.1`` restores
-    the loopback-only posture.
+    Defaults to loopback (``127.0.0.1``) so the servers stay off every other
+    interface on an ordinary host. :data:`BRIDGE_BIND_HOST_ENV_VAR` opts into
+    a different posture: ``0.0.0.0`` binds all interfaces and advertises the
+    host's routable address (falling back to loopback when none exists) —
+    the setting an SSRF-hardened sandbox integrator uses, since such a
+    sandbox denies the loopback default unconditionally. Any other value
+    pins that exact host for both bind and advertisement.
     """
     override = os.environ.get(BRIDGE_BIND_HOST_ENV_VAR, "").strip()
-    if override and override != "0.0.0.0":
+    if not override:
+        return "127.0.0.1", "127.0.0.1"
+    if override != "0.0.0.0":
         return override, override
-    routable = _routable_local_address()
-    if override == "0.0.0.0" or routable is not None:
-        return "0.0.0.0", routable or "127.0.0.1"
-    return "127.0.0.1", "127.0.0.1"
+    return "0.0.0.0", _routable_local_address() or "127.0.0.1"
 
 
 def _bridge_port_pool() -> tuple[int, ...]:
