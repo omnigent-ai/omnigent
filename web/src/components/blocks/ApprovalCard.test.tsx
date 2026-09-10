@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard } from "./ApprovalCard";
 
@@ -1320,5 +1321,50 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     expect(screen.getByTestId("plan-rejection-feedback").textContent).toContain(
       "Too risky, split it up.",
     );
+  });
+});
+
+describe("ApprovalCard — resolved-elsewhere pill", () => {
+  // The neutral pill renders when the store clears a pending card without a
+  // UI verdict (answered in the vendor TUI, another tab, or the approve
+  // page). Its ⓘ icon implies hover-for-detail, so the icon must actually
+  // explain the state instead of rendering bare.
+  const props = {
+    elicitationId: "elic_auto",
+    message: "Cursor wants approval to run a shell command",
+    phase: "pre_tool_use",
+    policyName: "cursor_native_permission",
+    contentPreview: "Bash({})",
+    requestedSchema: {},
+    status: "responded",
+    response: { action: "auto_resolved" },
+  } as const;
+
+  it("explains the status from the info icon's accessible label", () => {
+    // The app mounts one TooltipProvider at the root (main.tsx); mirror it.
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("Resolved elsewhere")).toBeDefined();
+    // The explanation rides the tooltip trigger's aria-label so it is
+    // reachable by hover, focus, and assistive tech alike.
+    const trigger = screen.getByLabelText(/answered outside this view/i);
+    expect(trigger).toBeDefined();
+    // It must explain, not merely repeat the pill label.
+    expect(trigger.getAttribute("aria-label")?.toLowerCase()).not.toBe("resolved elsewhere");
+  });
+
+  it("keeps the trigger keyboard-reachable so the tooltip opens on focus", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} />
+      </TooltipProvider>,
+    );
+
+    const trigger = screen.getByLabelText(/answered outside this view/i);
+    expect(trigger.getAttribute("tabindex")).toBe("0");
   });
 });

@@ -43,6 +43,7 @@ import {
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -61,6 +62,13 @@ import {
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+
+// Hover detail for the neutral "Resolved elsewhere" pill: the prompt was
+// answered outside this view, so the UI never saw the verdict.
+const AUTO_RESOLVED_DETAIL =
+  "This request was answered outside this view — for example in the " +
+  "agent's own terminal, another tab, or the approve page — so the " +
+  "verdict isn't shown here.";
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -454,13 +462,20 @@ export function ApprovalCard({
     let icon = <XIcon className="size-4 text-destructive" />;
     let label = isExitPlanMode ? "Plan rejected" : "Rejected";
     if (autoResolved) {
-      // Card was cleared by the chat store when the gated tool's
-      // function_call_output arrived without a UI verdict —
-      // typically because the user approved (or denied) via Claude
-      // Code's TUI prompt directly. We can't know the actual
-      // verdict, so render a neutral pill rather than implying an
-      // accept/reject decision the UI never witnessed.
-      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      // Card was cleared without a UI verdict — the prompt was answered
+      // outside this view (the harness's own TUI, another tab, or the
+      // approve page). We can't know the actual verdict, so render a
+      // neutral pill; the ⓘ tooltip explains what the state means.
+      icon = (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={0} className="inline-flex" aria-label={AUTO_RESOLVED_DETAIL}>
+              <InfoIcon className="size-4 text-muted-foreground" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-72">{AUTO_RESOLVED_DETAIL}</TooltipContent>
+        </Tooltip>
+      );
       label = "Resolved elsewhere";
     } else if (submittedAnswers !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
