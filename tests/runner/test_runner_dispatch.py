@@ -11594,6 +11594,131 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
 
 
 @pytest.mark.asyncio
+async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The busy→ended race registers a fresh entry, not the drained one.
+
+    If the child's tracked turn completes (and is delivered/drained) between the
+    pre-post snapshot and the post, the server starts a brand-new turn. Because
+    the message is posted first and tracking is decided from the *post-settled*
+    work state, a stale terminal entry is not reused — a fresh entry is
+    registered so the new turn's completion is delivered rather than dropped
+    against the already-delivered entry (review issue #1). The stale entry here
+    stands in for that just-drained old turn; the server snapshot still reports
+    the child busy (the new turn).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_ended", "conv_child_ended"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    # A stale entry from the turn that just ended: terminal and already delivered.
+    stale = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    stale.status = "completed"
+    stale.delivered = True
+    stale_work_id = stale.work_id
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        child_busy=True,
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    # A fresh entry is registered under a NEW dispatch id (not the drained one),
+    # in "running", so the new turn's completion has a live entry to deliver to.
+    assert len(stamped) == 1
+    assert work is not None
+    assert work.work_id == stamped[0]
+    assert work.work_id != stale_work_id
+    assert work.status == "running"
+    assert work.delivered is False
+    assert len(event_posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_in_flight_send_serializes_concurrent_adopts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent sends to a busy, untracked child install exactly one entry.
+
+    Two parallel steers to the same server-busy child (no local work entry) must
+    not stamp divergent dispatch ids or clobber each other's registration. The
+    per-child classify/register lock serializes them: the first adopts the turn
+    (one stamp, one entry), the second finds it running and reuses it (no second
+    stamp), so a single coherent entry remains (review issue #2).
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id, child_id = "conv_parent_concurrent", "conv_child_concurrent"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        child_busy=True,
+    )
+
+    async def _one_send(server_client: httpx.AsyncClient) -> str:
+        return await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {"agent": "claude", "title": "merge-task", "args": "stop and report"}
+            ),
+            server_client=server_client,
+            conversation_id=parent_id,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+            session_inbox=asyncio.Queue(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            outputs = await asyncio.gather(_one_send(server_client), _one_send(server_client))
+            work = runner_app.get_subagent_work(child_id)
+        finally:
+            runner_app.unregister_subagent_work(child_id)
+            runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert all(json.loads(o)["status"] == "running" for o in outputs)
+    assert len(event_posts) == 2, "both concurrent sends deliver their message"
+    # Exactly one dispatch id is stamped (the adopt); the second send reuses the
+    # now-running entry. Both handles point at the same coherent work entry.
+    assert len(stamped) == 1, f"concurrent adopts must not stamp divergent ids: {stamped}"
+    assert work is not None and work.work_id == stamped[0]
+    assert work.status == "running"
+
+
+@pytest.mark.asyncio
 async def test_named_send_defers_when_child_turn_still_launching(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
