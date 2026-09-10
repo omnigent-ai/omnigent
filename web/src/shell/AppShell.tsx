@@ -287,6 +287,19 @@ export function AppShell() {
   // Live open fraction (0→1) while the iOS edge-swipe drags the sidebar; null
   // when not dragging. Drives the mobile overlay's finger-tracking transform.
   const [sidebarDragProgress, setSidebarDragProgress] = useState<number | null>(null);
+  // Folding a docked sidebar into an overlay must not cover the active page.
+  // Settings keeps its navigation visible because it contains the only exit.
+  useEffect(() => {
+    const desktop = window.matchMedia("(min-width: 768px)");
+    const onBreakpointChange = (event: MediaQueryListEvent) => {
+      if (event.matches || inSettings) return;
+      setSidebarOpen(false);
+      setSidebarPeek(false);
+      setSidebarDragProgress(null);
+    };
+    desktop.addEventListener("change", onBreakpointChange);
+    return () => desktop.removeEventListener("change", onBreakpointChange);
+  }, [inSettings]);
   // The iOS shell repurposes the left-edge swipe (normally back-navigation) to
   // drive the sidebar as an interactive drawer, streaming it over the native
   // bridge. begin/move track the finger (mobile overlay only — the desktop
