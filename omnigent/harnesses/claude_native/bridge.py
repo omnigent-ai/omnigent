@@ -45,7 +45,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -109,6 +109,22 @@ DEFAULT_BRIDGE_PORT_POOL: tuple[int, ...] = tuple(range(28700, 28716))
 _TRUSTED_PARENT = Path(tempfile.gettempdir())
 _BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
+# Markers for permission hooks parked on a verdict, keyed by SESSION id: the
+# idle pane reaper's busy check holds a pane's conversation id, and resolving
+# that to a bridge id needs a session-label fetch no per-scan check can afford.
+# Inside the bridge root so it inherits the same owner-only validation; it
+# carries no ``owner.pid``, which is exactly what makes the orphan pruner skip
+# it (see ``native_bridge_common.prune_orphaned_dirs``).
+_APPROVAL_WAIT_DIR_NAME = "approval-waits"
+_APPROVAL_WAIT_ROOT = _BRIDGE_ROOT / _APPROVAL_WAIT_DIR_NAME
+# A parked hook re-touches its marker this often for as long as its POST is
+# held, so the marker stays fresh whether or not a gateway ever severs the poll
+# (a direct server holds one POST for the whole wait).
+APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
+# A marker touched more recently than this means a hook is still waiting.
+# Several refresh intervals of slack, so a hook that is slow to wake never
+# reads stale; a hook killed mid-wait leaves a marker that expires on its own.
+APPROVAL_WAIT_MARKER_TTL_S = 420.0
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 _STATE_FILE = "state.json"
@@ -1194,6 +1210,147 @@ def bridge_dir_for_conversation_id(conversation_id: str) -> Path:
     return bridge_dir_for_bridge_id(conversation_id)
 
 
+def _approval_wait_digest(session_id: str) -> str:
+    """
+    Return the filename stem shared by every marker for one session.
+
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :returns: Hex digest prefix, e.g. ``"3f0e..."`` (32 chars).
+    """
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+
+
+def approval_wait_marker_path(session_id: str, *, bridge_dir: Path | None = None) -> Path:
+    """
+    Return the marker path a parked permission hook keeps fresh.
+
+    One marker per hook process: concurrent prompts on one session (a
+    permission request and an AskUserQuestion, or parallel tool calls) each
+    own a file, so the first to finish never clears another's evidence.
+
+    :param session_id: Omnigent session id whose verdict a hook is waiting
+        on, e.g. ``"conv_abc123"``.
+    :param bridge_dir: The caller's own bridge directory, e.g.
+        ``/tmp/omnigent-501/claude-native/<digest>``. When given, the marker
+        root is derived from it instead of from this process's own temp root: a
+        hook subprocess is *told* its bridge dir, so deriving from it cannot
+        disagree with the runner about ``$TMPDIR`` the way an independently
+        computed root could — and a marker written where the reaper never looks
+        would fail silently. ``None`` uses this process's own root, which is
+        the runner side including the pane reaper.
+    :returns: Absolute marker path under ``<temp root>/approval-waits``, e.g.
+        ``.../approval-waits/<digest>.<pid>.wait``.
+    """
+    root = (
+        bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME
+        if bridge_dir is not None
+        else _APPROVAL_WAIT_ROOT
+    )
+    return root / f"{_approval_wait_digest(session_id)}.{os.getpid()}.wait"
+
+
+def touch_approval_wait_marker(marker: Path) -> None:
+    """
+    Stamp an approval-wait marker with the current time.
+
+    Refreshed on a timer for the life of a hook's wait (see
+    :func:`hold_approval_wait_marker`) so the idle pane reaper can tell a
+    pane parked on a permission prompt — which emits no output and reports no
+    active turn — from an abandoned one. The root is created and validated by
+    :func:`prepare_bridge_dir` in the runner, so this only writes inside an
+    already-trusted directory. Best-effort: a marker that cannot be written
+    only costs the pre-existing reap behavior.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: None.
+    """
+    try:
+        marker.touch()
+    except OSError:
+        _logger.debug("Could not touch approval-wait marker", exc_info=True)
+
+
+def clear_approval_wait_marker(marker: Path) -> None:
+    """
+    Remove an approval-wait marker.
+
+    Called when the hook stops waiting (verdict, rejection, give-up, or a
+    signal that kills it mid-wait) so the pane returns to normal idle
+    accounting at once rather than after :data:`APPROVAL_WAIT_MARKER_TTL_S`.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: None.
+    """
+    with contextlib.suppress(OSError):
+        marker.unlink(missing_ok=True)
+
+
+def approval_wait_is_fresh(session_id: str) -> bool:
+    """
+    Whether a permission hook is parked on this session's verdict right now.
+
+    Scans every hook's marker for the session; a stale one (a hook killed
+    mid-wait) is removed on the way so they never accumulate.
+
+    :param session_id: Omnigent session id to check, e.g.
+        ``"conv_abc123"``.
+    :returns: ``True`` when any marker was touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
+        are stale, or the root is unreadable.
+    """
+    try:
+        markers = list(_APPROVAL_WAIT_ROOT.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
+    except OSError:
+        return False
+    now = time.time()
+    fresh = False
+    for marker in markers:
+        try:
+            touched_at = marker.stat().st_mtime
+        except OSError:
+            continue
+        if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
+            fresh = True
+        else:
+            clear_approval_wait_marker(marker)
+    return fresh
+
+
+@contextlib.contextmanager
+def hold_approval_wait_marker(marker: Path) -> Iterator[None]:
+    """
+    Keep *marker* fresh for the duration of the block, then remove it.
+
+    Touches the marker at once and again every
+    :data:`APPROVAL_WAIT_MARKER_REFRESH_S` on a daemon thread, so a hook
+    blocked in one long POST (a direct server holds the poll for the whole
+    wait) reads as parked exactly like one a gateway severs every few
+    minutes. The refresher is stopped before the marker is cleared so a late
+    touch cannot resurrect it; a hook killed mid-wait takes the thread with
+    it and its marker simply expires.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: ``None`` for the duration of the block.
+    """
+    stop = threading.Event()
+
+    def _refresh() -> None:
+        while not stop.wait(APPROVAL_WAIT_MARKER_REFRESH_S):
+            touch_approval_wait_marker(marker)
+
+    touch_approval_wait_marker(marker)
+    refresher = threading.Thread(
+        target=_refresh, name="omnigent-approval-wait-marker", daemon=True
+    )
+    refresher.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        refresher.join(timeout=5.0)
+        clear_approval_wait_marker(marker)
+
+
 def build_claude_native_spawn_env(
     conversation_id: str,
     *,
@@ -1282,6 +1439,11 @@ def prepare_bridge_dir(
     resolved_bridge_id = bridge_id or conversation_id
     bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
     _ensure_secure_dir(bridge_dir)
+    # A parked permission hook only touches files in this root, so the runner
+    # owns creating and validating it before any hook can fire. Derived from the
+    # bridge dir just validated rather than read from the module global, so it
+    # lands in the same tree the caller asked for.
+    _ensure_secure_dir(bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME)
     config = _read_json_file(bridge_dir / _CONFIG_FILE)
     token = config.get("token") if isinstance(config, dict) else None
     if not isinstance(token, str) or not token:

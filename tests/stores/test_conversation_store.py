@@ -3981,6 +3981,66 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+@pytest.mark.parametrize("up_to_response_id", [None, "resp_001", "resp_002"])
+def test_fork_conversation_preserves_item_timestamps(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    up_to_response_id: str | None,
+) -> None:
+    """Copied history keeps its timing; the fork and new items use the current time."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    current_time = 1000
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: current_time)
+    source = conversation_store.create_conversation()
+    for index, created_at in enumerate((1010, 1116, 1210, 1252)):
+        current_time = created_at
+        conversation_store.append(
+            source.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_00{index // 2 + 1}",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": f"Step {index}"}],
+                        agent="test-agent",
+                    ),
+                )
+            ],
+        )
+
+    source_items = conversation_store.list_items(source.id).data
+    expected_count = 2 if up_to_response_id == "resp_001" else 4
+    expected_timestamps = [item.created_at for item in source_items[:expected_count]]
+    parent_id = source.id
+    for fork_time in (2000, 3000):
+        current_time = fork_time
+        fork = conversation_store.fork_conversation(parent_id, up_to_response_id=up_to_response_id)
+        assert fork.created_at == fork_time
+        assert fork.updated_at == fork_time
+        fork_items = conversation_store.list_items(fork.id).data
+        assert [item.created_at for item in fork_items] == expected_timestamps
+        assert fork_items[1].created_at - fork_items[0].created_at == 106
+        parent_id = fork.id
+
+    current_time = 4000
+    [new_item] = conversation_store.append(
+        parent_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_new",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "Continue"}]
+                ),
+            )
+        ],
+    )
+    assert new_item.created_at == current_time
+    assert conversation_store.list_items(source.id).data == source_items
+
+
 def test_fork_remaps_compaction_boundary_to_copied_item(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

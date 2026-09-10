@@ -3906,8 +3906,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         (``kind="default"``, ``parent_conversation_id=None``)
         with the source's ``reasoning_effort``,
         ``terminal_launch_args``, and (unless overridden)
-        ``agent_id``, copies each item with a fresh ID and position,
-        and inserts FTS records for each copied item. Identity-bound
+        ``agent_id``, copies each item with a fresh ID and position
+        while preserving its original timestamp, and inserts FTS records
+        for each copied item. Identity-bound
         columns (``external_session_id``, ``workspace``,
         ``git_branch``) are deliberately NOT copied — a fork is a
         fresh session that re-binds those on its own launch. Source
@@ -4236,12 +4237,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # compaction data alone is rewritten (the sole payload that
                 # contains an item ID).
                 new_item_id = copied_item_ids[src_item.id]
+                # Forked items keep the source item's original timestamp
+                # (#6924); only the conversation row itself is stamped `now`.
                 prepared_item_rows.append(
                     {
                         "id": new_item_id,
                         "conversation_id": new_conv_id,
                         "response_id": src_item.response_id,
-                        "created_at": now,
+                        "created_at": src_item.created_at,
                         "status": src_item.status,
                         "position": pos,
                         "type": src_item.type,

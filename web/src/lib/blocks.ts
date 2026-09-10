@@ -618,6 +618,12 @@ export interface ElicitationBlock {
    */
   allowAllEdits?: boolean;
   /**
+   * Eligible Claude-native tool prompts: when true, the card offers an
+   * "Approve & switch to auto mode" button (accept + session-scoped
+   * ``setMode(auto)``). Absent/false for all other elicitations.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button
    * that installs a session-scoped allow rule on accept (the web

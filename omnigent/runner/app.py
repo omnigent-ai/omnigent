@@ -45,7 +45,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import phase_scope, runner_primary_session_id
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -53,7 +53,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, ErrorPhase, OmnigentError
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -7278,47 +7278,50 @@ def create_runner_app(
         # can't suppress this turn's legitimate terminal publish.
         _desynced_sessions.discard(conv)
         _desync_terminalized.pop(conv, None)
-        try:
-            await _run_turn_bg_setup_and_stream(msg_body, conv)
-        except _ContextWindowOverflow:
-            # Re-raise so the streaming-phase handler (which publishes the
-            # error event) is never shadowed by the generic except below.
-            raise
-        except asyncio.CancelledError as exc:
-            _logger.error(
-                "turn cancelled for %s: %s",
-                conv,
-                exc,
-                exc_info=True,
-                extra={"session_id": conv},
-            )
-            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
-            raise
-        except Exception as exc:
-            _logger.error(
-                "turn setup failed for %s: %s",
-                conv,
-                exc,
-                exc_info=True,
-                extra={"session_id": conv},
-            )
-            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
-        finally:
-            # Permanent-wedge floor: guarantee _active_turns is never left stale,
-            # however the body exits — including a BaseException that escapes
-            # ``except Exception``. A setup-phase abnormal exit otherwise leaves
-            # the slot set and every later message buffers forever.
-            #
-            # Identity compare-and-clear: only finalize when the slot STILL holds
-            # THIS turn's own task. A turn that ended cleanly already popped its
-            # slot via _on_proxy_stream_end, which schedules a continuation that
-            # can bind a NEW turn's task under the same conv — a bare
-            # ``conv in _active_turns`` check would then let this stale finally
-            # clobber the newer turn (the same class of bug the ExecutorAdapter
-            # identity CAS fixes). When the slot is a None sentinel or a
-            # different task, this turn is already accounted for — skip.
-            if _active_turns.get(conv) is _own_task and _own_task is not None:
-                _on_proxy_stream_end(conv)
+        # Locate any uncoded exception logged below in the turn phase (this task's
+        # context carries it for its lifetime). Coded errors keep their own phase.
+        with phase_scope(ErrorPhase.TURN):
+            try:
+                await _run_turn_bg_setup_and_stream(msg_body, conv)
+            except _ContextWindowOverflow:
+                # Re-raise so the streaming-phase handler (which publishes the
+                # error event) is never shadowed by the generic except below.
+                raise
+            except asyncio.CancelledError as exc:
+                _logger.error(
+                    "turn cancelled for %s: %s",
+                    conv,
+                    exc,
+                    exc_info=True,
+                    extra={"session_id": conv},
+                )
+                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                raise
+            except Exception as exc:
+                _logger.error(
+                    "turn setup failed for %s: %s",
+                    conv,
+                    exc,
+                    exc_info=True,
+                    extra={"session_id": conv},
+                )
+                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            finally:
+                # Permanent-wedge floor: guarantee _active_turns is never left stale,
+                # however the body exits — including a BaseException that escapes
+                # ``except Exception``. A setup-phase abnormal exit otherwise leaves
+                # the slot set and every later message buffers forever.
+                #
+                # Identity compare-and-clear: only finalize when the slot STILL holds
+                # THIS turn's own task. A turn that ended cleanly already popped its
+                # slot via _on_proxy_stream_end, which schedules a continuation that
+                # can bind a NEW turn's task under the same conv — a bare
+                # ``conv in _active_turns`` check would then let this stale finally
+                # clobber the newer turn (the same class of bug the ExecutorAdapter
+                # identity CAS fixes). When the slot is a None sentinel or a
+                # different task, this turn is already accounted for — skip.
+                if _active_turns.get(conv) is _own_task and _own_task is not None:
+                    _on_proxy_stream_end(conv)
 
     def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
         """Reasoning block to forward on a turn, or ``None`` when unset.
@@ -11696,6 +11699,7 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
+        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
@@ -11721,6 +11725,11 @@ def create_runner_app(
             ):
                 return True
             if _native_pane_status.get(conv_id) == "running":
+                return True
+            # A pane parked on a permission prompt emits nothing and reports no
+            # active turn, so every signal above reads idle. Reaping it kills the
+            # prompt and strands its approval card unanswerable.
+            if approval_wait_is_fresh(conv_id):
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             if clients:

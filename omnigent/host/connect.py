@@ -33,7 +33,9 @@ from omnigent.debug_logging import (
     ORIGIN_WORKSPACE_ID_ENV_VAR,
     PRIMARY_SESSION_ID_ENV_VAR,
     USER_ID_ENV_VAR,
+    debug_event,
 )
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -2163,7 +2165,21 @@ class HostProcess:
             _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
+        # A non-zero runner exit is a runner-process fault that blocks the
+        # session; the specific cause lives in the unparsed log tail (lifecycle
+        # stage unknown).
+        _logger.warning(
+            "Runner %s died unexpectedly: %s",
+            runner_id,
+            error,
+            extra=debug_event(
+                "runner_died",
+                runner_id=runner_id,
+                error_category=ErrorCategory.RUNNER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
+            ),
+        )
         await self._report_runner_exit(runner_id, error)
 
     async def _report_runner_exit(self, runner_id: str, error: str) -> None:

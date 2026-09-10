@@ -477,6 +477,151 @@ async def test_permission_request_hook_deny_round_trip(
     assert body["hookSpecificOutput"]["decision"]["behavior"] == "deny"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "permission_mode"),
+    [
+        ("Bash", "default"),
+        ("Edit", "default"),
+        ("Write", "default"),
+        ("MultiEdit", "default"),
+        ("NotebookEdit", "default"),
+        ("WebFetch", "default"),
+        ("mcp__example__tool", "default"),
+        ("Bash", "acceptEdits"),
+        ("Bash", None),
+    ],
+)
+async def test_permission_request_hook_auto_mode_round_trip(
+    client: httpx.AsyncClient, tool_name: str, permission_mode: str | None
+) -> None:
+    agent = await create_test_agent(client, "test-permission-auto-mode")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name=tool_name)
+    if permission_mode is None:
+        payload.pop("permission_mode")
+    else:
+        payload["permission_mode"] = permission_mode
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+
+    event = await drain_task
+    assert event["params"]["allow_auto_mode"] is True
+    verdict = await _post_approval(
+        client, session_id, event["elicitation_id"], "accept", {"allow_auto_mode": True}
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow",
+        "updatedPermissions": [{"type": "setMode", "mode": "auto", "destination": "session"}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "permission_mode"),
+    [
+        ("AskUserQuestion", "default"),
+        ("ExitPlanMode", "plan"),
+        ("Bash", "plan"),
+        ("Bash", "auto"),
+        ("Bash", "bypassPermissions"),
+        ("Bash", "dontAsk"),
+        ("Bash", "unknown"),
+    ],
+)
+async def test_permission_request_hook_ineligible_auto_mode_not_offered_or_honored(
+    client: httpx.AsyncClient, tool_name: str, permission_mode: str
+) -> None:
+    agent = await create_test_agent(client, "test-permission-auto-mode-ineligible")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name=tool_name)
+    payload["permission_mode"] = permission_mode
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+
+    event = await drain_task
+    assert "allow_auto_mode" not in event["params"]
+    verdict = await _post_approval(
+        client, session_id, event["elicitation_id"], "accept", {"allow_auto_mode": True}
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    decision = response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    if tool_name == "ExitPlanMode":
+        assert decision["updatedPermissions"] == [
+            {"type": "setMode", "mode": "default", "destination": "session"}
+        ]
+    else:
+        assert "updatedPermissions" not in decision
+
+
+@pytest.mark.parametrize(
+    ("action", "content"),
+    [
+        ("accept", None),
+        ("accept", {"allow_auto_mode": False}),
+        ("accept", {"allow_auto_mode": "true"}),
+        ("accept", {"allow_auto_mode": 1}),
+        ("decline", {"allow_auto_mode": True}),
+    ],
+)
+async def test_permission_request_hook_auto_mode_requires_explicit_accept(
+    client: httpx.AsyncClient, action: str, content: dict[str, Any] | None
+) -> None:
+    agent = await create_test_agent(client, "test-permission-auto-mode-explicit")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload()
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+
+    event = await drain_task
+    assert event["params"]["allow_auto_mode"] is True
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], action, content)
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    decision = response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == ("allow" if action == "accept" else "deny")
+    assert "updatedPermissions" not in decision
+
+
+@pytest.mark.parametrize("tool_name", ["Bash", "Edit"])
+async def test_permission_request_hook_auto_mode_not_overwritten_by_other_approval_flags(
+    client: httpx.AsyncClient, tool_name: str
+) -> None:
+    agent = await create_test_agent(client, "test-permission-auto-mode-precedence")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name=tool_name)
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+
+    event = await drain_task
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        {"allow_auto_mode": True, "allow_all_edits": True, "remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"]["updatedPermissions"] == [
+        {"type": "setMode", "mode": "auto", "destination": "session"}
+    ]
+
+
 async def test_permission_request_hook_allow_all_edits_round_trip(
     client: httpx.AsyncClient,
 ) -> None:

@@ -381,6 +381,25 @@ def _publish_policy_denied(session_id: str, reason: str, phase: str) -> None:
     session_stream.publish(session_id, event.model_dump())
 
 
+def _allow_auto_mode_eligible(tool_name: str, permission_mode: str | None) -> bool:
+    """
+    Whether a regular Claude permission prompt may offer a session-scoped auto-mode switch.
+
+    Reuses the remember-ineligible set on purpose: those are exactly the
+    bespoke-card tools (ExitPlanMode, AskUserQuestion) with their own
+    approval flows, where a generic auto-mode button never belongs.
+
+    :param tool_name: The gated tool from Claude's PermissionRequest payload.
+    :param permission_mode: Claude's current permission mode, or None when absent.
+    :returns: True for tool approvals outside planning and already-automatic modes.
+    """
+    return tool_name not in _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS and permission_mode in (
+        None,
+        "default",
+        "acceptEdits",
+    )
+
+
 def _allow_all_edits_eligible(tool_name: str, permission_mode: str | None) -> bool:
     """
     Whether a claude-native PermissionRequest may offer / honor the

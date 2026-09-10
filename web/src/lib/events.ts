@@ -254,6 +254,13 @@ export interface ElicitationRequest {
    */
   allowAllEdits?: boolean;
   /**
+   * Producer-supplied extra (eligible claude-native tool prompts): when
+   * true, the ApprovalCard offers "Approve & switch to auto mode" —
+   * accepting with ``allow_auto_mode`` echoes a session-scoped
+   * ``setMode(auto)`` in the hook decision.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
    * supports a persistent "don't ask again" allow rule (everything
