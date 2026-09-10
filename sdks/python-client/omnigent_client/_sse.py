@@ -25,6 +25,7 @@ from ._events import (
     NativeToolCall,
     OutputFileDone,
     ReasoningDelta,
+    ReasoningDone,
     ReasoningStarted,
     ReasoningSummaryDelta,
     ResponseCancelled,
@@ -364,15 +365,38 @@ def _parse_output_item(data: dict[str, Any]) -> StreamEvent | None:
             content=content if isinstance(content, list) else [],
         )
 
+    if item_type == "reasoning":
+        # Same join as history renderers so live and reloaded
+        # transcripts show the thought identically.
+        text = _joined_block_text(item.get("content"))
+        summary = _joined_block_text(item.get("summary"))
+        # Redacted/empty reasoning has no readable text anywhere —
+        # nothing to render, so don't emit a dead reasoning section.
+        if not text and not summary:
+            return None
+        return ReasoningDone(text=text, summary=summary)
+
     if item_type in NATIVE_TOOL_TYPES:
         return NativeToolCall(
             tool_type=item_type,
             data=item,
         )
 
-    # Compaction items, reasoning items, etc. — skip
+    # Compaction items, etc. — skip
     _log.debug("Skipping output item type: %s", item_type)
     return None
+
+
+def _joined_block_text(raw: Any) -> str:
+    """Join ``{text}`` blocks the way history renderers do (``"\\n\\n"``)."""
+    if not isinstance(raw, list):
+        return ""
+    parts = [
+        str(block.get("text", ""))
+        for block in raw
+        if isinstance(block, dict) and block.get("text")
+    ]
+    return "\n\n".join(parts)
 
 
 def _parse_response(data: dict[str, Any]) -> Response:

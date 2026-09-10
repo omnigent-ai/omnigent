@@ -92,6 +92,11 @@ from omnigent.runner.background_titles import (
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.mcp_execution_registry import (
+    McpExecutionConflict,
+    McpExecutionRegistry,
+    McpExecutionResult,
+)
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
     _COST_POPUP_REPOP_TASKS,
@@ -1626,6 +1631,28 @@ def new_subagent_work_id() -> str:
     return f"subagent_{uuid.uuid4().hex[:12]}"
 
 
+# Per-child locks serializing the classify+register step of an in-flight
+# sub-agent send (see ``tool_dispatch._send_to_in_flight_child``), so two
+# concurrent sends to one child can't install divergent work entries. Co-located
+# with the work registries so it is torn down alongside them — otherwise a
+# long-lived runner would accumulate one lock per steered child forever.
+_in_flight_send_locks: dict[str, asyncio.Lock] = {}
+
+
+def in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
+    """
+    Return (creating on first use) the per-child in-flight-send lock.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The lock guarding that child's in-flight-send bookkeeping.
+    """
+    lock = _in_flight_send_locks.get(child_session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _in_flight_send_locks[child_session_id] = lock
+    return lock
+
+
 def register_subagent_work(
     *,
     parent_session_id: str,
@@ -1737,6 +1764,7 @@ def unregister_subagent_work(
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
     _subagent_work_by_child.pop(child_session_id, None)
+    _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
     if children is None:
         return
@@ -1759,9 +1787,11 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     """
     unregister_subagent_work(session_id)
     _drained_delivered_subagent_children.discard(session_id)
+    _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
+        _in_flight_send_locks.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
 
@@ -2693,6 +2723,8 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+    mcp_execution_registry = McpExecutionRegistry()
+    app.state.mcp_execution_registry = mcp_execution_registry
 
     from omnigent.runtime import telemetry
 
@@ -4374,6 +4406,7 @@ def create_runner_app(
             turn_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await turn_task
+        await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
@@ -7167,7 +7200,10 @@ def create_runner_app(
             arguments: _JsonObject,
         ) -> _JsonObject:
             result_str = await ProxyMcpManager(
-                _captured_session_id, server_client, publish_event=_publish_event
+                _captured_session_id,
+                server_client,
+                publish_event=_publish_event,
+                execution_registry=mcp_execution_registry,
             ).call_tool(None, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
@@ -7209,10 +7245,15 @@ def create_runner_app(
                 await asyncio.get_running_loop().run_in_executor(
                     None, post_tools_changed, bridge_dir
                 )
-            except RuntimeError:
+            except (RuntimeError, OSError):
+                # Fire-and-forget below, so anything escaping here resurfaces as
+                # an unretrieved task exception at ERROR. Re-advertising the tool
+                # list is best-effort; a stale list costs one turn, a dead task
+                # loop costs the session.
                 _logger.debug(
                     "tools-changed notification skipped for session=%s (bridge server not ready)",
                     session_id,
+                    exc_info=True,
                     extra={"session_id": session_id},
                 )
 
@@ -7557,7 +7598,11 @@ def create_runner_app(
 
             _mcp_hash = compute_spec_hash(list(cached_spec.mcp_servers))
             if _mcp_hash != _session_mcp_spec_hash.get(conv):
-                _session_mcp_proxy = ProxyMcpManager(conv, server_client)
+                _session_mcp_proxy = ProxyMcpManager(
+                    conv,
+                    server_client,
+                    execution_registry=mcp_execution_registry,
+                )
                 try:
                     mcp_result = await _session_mcp_proxy.schemas_for(
                         cached_spec,
@@ -7875,7 +7920,11 @@ def create_runner_app(
                         _spec_cache[_turn_agent_id] = _resolved_turn_spec
                         _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
-            _turn_mcp = ProxyMcpManager(conv_id, server_client)
+            _turn_mcp = ProxyMcpManager(
+                conv_id,
+                server_client,
+                execution_registry=mcp_execution_registry,
+            )
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
                     _mcp = await _turn_mcp.schemas_for(cast(AgentSpec, _turn_spec))
@@ -8260,6 +8309,7 @@ def create_runner_app(
                                             conv_id,
                                             server_client,
                                             publish_event=_publish_event,
+                                            execution_registry=mcp_execution_registry,
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
@@ -11084,6 +11134,58 @@ def create_runner_app(
         method: str = body.get("method") or ""
         params: _JsonObject = body.get("params") or {}
 
+        raw_operation = body.get("_omnigent_operation")
+        if method == "tools/call" and raw_operation is not None:
+            operation = raw_operation if isinstance(raw_operation, dict) else {}
+            operation_id = operation.get("id")
+            operation_step = operation.get("step")
+            if not (
+                isinstance(operation_id, str)
+                and 1 <= len(operation_id) <= 128
+                and isinstance(operation_step, str)
+                and 1 <= len(operation_step) <= 64
+            ):
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "error": {
+                            "code": -32000,
+                            "message": "Invalid runner MCP operation metadata",
+                        }
+                    },
+                )
+
+            nested_body = cast("_JsonObject", {**body, "_omnigent_operation": None})
+            nested_body.pop("_omnigent_operation")
+
+            async def _run_retained_mcp_execution() -> McpExecutionResult:
+                nested_response = await mcp_execute(
+                    session_id,
+                    cast("Request", _BodyRequest(nested_body)),
+                )
+                nested_content = json.loads(bytes(nested_response.body))
+                if not isinstance(nested_content, dict):
+                    raise RuntimeError("Runner MCP execution returned a non-object response")
+                return McpExecutionResult(
+                    status_code=nested_response.status_code,
+                    content=cast("_JsonObject", nested_content),
+                )
+
+            try:
+                retained = await mcp_execution_registry.execute(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    step=operation_step,
+                    params=cast("_JsonObject", {"method": method, "params": params}),
+                    run=_run_retained_mcp_execution,
+                )
+            except McpExecutionConflict as exc:
+                return JSONResponse(
+                    status_code=200,
+                    content={"error": {"code": -32000, "message": str(exc)}},
+                )
+            return JSONResponse(status_code=retained.status_code, content=retained.content)
+
         if method == "tools/list":
             if mcp_manager is None:
                 return JSONResponse(
@@ -11501,6 +11603,13 @@ def create_runner_app(
             )
 
     async def _catch_up_scan() -> None:
+        recreated_prompts = pending_approvals.notify_server_reconnect()
+        if recreated_prompts:
+            _logger.info(
+                "Recreating %d pending approval or elicitation request(s) after reconnect",
+                recreated_prompts,
+                extra={"session_id": runner_primary_session_id()},
+            )
         # The tunnel just reconnected, which usually means the SERVER restarted
         # (deploy, crash, replica failover) and lost its in-memory session-status
         # cache. This runner did not restart, so every status source still

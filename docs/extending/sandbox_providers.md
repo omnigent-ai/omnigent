@@ -172,3 +172,35 @@ Providers declare their feature set via a `capabilities` property returning
 | `file_copy` | Supports copying files into the sandbox |
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
+
+## Network policy for harness bridge servers
+
+Native harnesses (e.g. `claude-native`) run small HTTP servers on the sandbox
+host — a tool relay and an MCP control ingress — that the harness's hook and
+helper subprocesses call back into. **By default these bind loopback only
+(`127.0.0.1`)**, so an ordinary host keeps them off every other interface.
+
+A sandbox whose SSRF hardening denies loopback destinations unconditionally
+(e.g. OpenShell) cannot reach a loopback-advertised relay, which fail-closes
+every prompt. Such an integrator opts into an all-interfaces bind by setting
+`OMNIGENT_BRIDGE_BIND_HOST=0.0.0.0`: the servers then listen on all interfaces
+(loopback consumers keep working) and advertise the host's routable address so
+the in-sandbox hooks can reach them. Their ports come from a small stable pool
+a network policy can allowlist by exact host+port:
+
+- **`OMNIGENT_BRIDGE_BIND_HOST`** selects the posture. Unset (default) is
+  loopback-only. `0.0.0.0` binds all interfaces and advertises the detected
+  routable address (falling back to loopback when the host has none). Any
+  other value pins that exact host for both bind and advertisement.
+- **Default port pool:** `28700`–`28715`
+  (`omnigent.harnesses.claude_native.bridge.DEFAULT_BRIDGE_PORT_POOL`).
+  Several servers coexist per host (the MCP ingress plus one tool relay per
+  session), so allowlist the whole pool, not a single port. When the pool is
+  exhausted the servers fall back to an OS-assigned ephemeral port, which an
+  exact-port policy cannot cover.
+- **`OMNIGENT_BRIDGE_PORT_POOL`** overrides the pool: comma-separated ports
+  and inclusive ranges, e.g. `28700-28703,29000`.
+
+Every endpoint on these servers (other than `GET /health`) requires a
+per-relay bearer token, so allowlisting their coordinates does not expose
+unauthenticated functionality.

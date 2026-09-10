@@ -1491,7 +1491,13 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
   const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
+  const [replyConversationId, setReplyConversationId] = useState(conversationId);
   const nextReplyQuoteId = useRef(0);
+
+  if (replyConversationId !== conversationId) {
+    setReplyConversationId(conversationId);
+    setReplyQuotes([]);
+  }
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1771,6 +1777,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showClaudePermissionMode={showClaudePermissionMode}
             showCodexApprovalMode={showCodexApprovalMode}
             showGoalControl={showGoalControl}
+            runnerOnline={runnerOnline}
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
             isTerminalFirst={isTerminalFirst}
@@ -1896,6 +1903,8 @@ interface ComposerProps {
   showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
+  /** Whether the active session's runner tunnel is connected. */
+  runnerOnline?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
@@ -2535,6 +2544,7 @@ function ComposerImpl({
   showClaudePermissionMode = false,
   showCodexApprovalMode = false,
   showGoalControl = false,
+  runnerOnline,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
   isTerminalFirst = false,
@@ -2674,7 +2684,10 @@ function ComposerImpl({
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
-  const { goal, setGoal: setGoalState } = useGoalState(composerSessionId, showGoalControl);
+  const { goal, setGoal: setGoalState } = useGoalState(
+    composerSessionId,
+    showGoalControl && runnerOnline === true,
+  );
   // "@"-file-mention is scoped to the native coding-agent harnesses: their
   // vendor CLIs run in the workspace and read an on-disk file from an
   // attachment marker the executor already emits. In-process SDK sessions
@@ -3352,7 +3365,7 @@ function ComposerImpl({
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isStreaming) {
+    if (e.key === "Escape" && isWorking && !isReadOnly) {
       e.preventDefault();
       onStop();
       return;

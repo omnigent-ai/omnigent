@@ -822,6 +822,7 @@ function AssistantBubble({
     isLastAssistant,
     hasPendingElicitation,
     showsWorking,
+    defaultExpanded: bubble.defaultExpanded,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -859,6 +860,7 @@ function AssistantBubble({
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
+            defaultExpanded={bubble.defaultExpanded}
             onRetryError={handleRetryError}
           />
         </MessageContent>

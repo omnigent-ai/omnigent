@@ -22,7 +22,7 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
+from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -77,10 +77,7 @@ from omnigent.entities import (
     parse_item_data,
 )
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.session_import.models import (
-    IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
-    IMPORT_SOURCE_LABEL_KEY,
-)
+from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
@@ -1097,38 +1094,32 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = self._get_meta(conversation_id)
             return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
 
-    def find_imported_conversation(
+    def find_conversation_by_external_session_id(
         self,
-        source: str,
         external_session_id: str,
     ) -> Conversation | None:
-        """Find the original conversation carrying an import provenance pair."""
-        source_label = aliased(SqlConversationLabel)
-        external_label = aliased(SqlConversationLabel)
-        with self._conv_session("select_imported_conversation") as session:
-            conversation_id = session.execute(
-                select(SqlConversation.id)
-                .join(
-                    source_label,
-                    (source_label.workspace_id == SqlConversation.workspace_id)
-                    & (source_label.conversation_id == SqlConversation.id),
-                )
-                .join(
-                    external_label,
-                    (external_label.workspace_id == SqlConversation.workspace_id)
-                    & (external_label.conversation_id == SqlConversation.id),
-                )
-                .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    source_label.key == IMPORT_SOURCE_LABEL_KEY,
-                    source_label.value == source,
-                    external_label.key == IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
-                    external_label.value == external_session_id,
-                )
-                .order_by(SqlConversation.created_at, SqlConversation.id)
-                .limit(1)
-            ).scalar_one_or_none()
-        return self.get_conversation(conversation_id) if conversation_id is not None else None
+        """Find an existing conversation wrapping one external (harness) session id.
+
+        Matches the ``external_session_id`` column, which both an imported
+        transcript and a natively-run session populate, so an import dedupes
+        against a prior import and against a native run of the same underlying
+        session alike. Returns the earliest-created match when more than one row
+        carries the id (the historical duplicate a fixed dedup should collapse).
+        """
+        with self._session("select_conversation_by_external_session_id") as session:
+            ids = list(
+                session.execute(
+                    select(SqlConversationMetadata.id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.external_session_id == external_session_id,
+                    )
+                ).scalars()
+            )
+        matches = sorted(
+            (c for c in (self.get_conversation(cid) for cid in ids) if c is not None),
+            key=lambda c: (c.created_at, c.id),
+        )
+        return matches[0] if matches else None
 
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """

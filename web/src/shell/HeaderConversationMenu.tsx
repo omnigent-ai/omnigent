@@ -72,6 +72,12 @@ interface HeaderConversationMenuProps {
   onFork: () => void;
   hasAgentInfo?: boolean;
   onAgentInfo?: () => void;
+  /**
+   * Mobile Chat/Terminal view switch (ViewModeMenuItems) — leads the menu on
+   * terminal-first sessions and carries its own trailing separator. `null`
+   * otherwise.
+   */
+  viewItems?: ReactNode;
   /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
   workspaceItems?: ReactNode;
 }
@@ -102,6 +108,7 @@ export function HeaderConversationMenu({
   onFork,
   hasAgentInfo = false,
   onAgentInfo,
+  viewItems = null,
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
@@ -192,6 +199,9 @@ export function HeaderConversationMenu({
 
   const mainItems = (
     <>
+      {/* Chat/Terminal switch leads the menu on terminal-first sessions; it
+          renders its own trailing separator (null on other sessions). */}
+      {viewItems}
       <DropdownMenuItem
         data-testid="header-pin-conversation"
         className={itemClass}

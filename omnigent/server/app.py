@@ -1083,6 +1083,8 @@ def create_app(
     sandbox_config: ManagedSandboxDeployment | None = None,
     github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
+    databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
+    databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
@@ -1572,7 +1574,10 @@ def create_app(
     # enabled_connections list and the router mounting below both read these.
     from omnigent.server.connections_registry import connection_providers
 
-    _connection_inputs = {"github": (github_config, github_store)}
+    _connection_inputs = {
+        "github": (github_config, github_store),
+        "databricks": (databricks_config, databricks_store),
+    }
     for _provider in connection_providers():
         _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
         _on = _cfg is not None and _store is not None
@@ -2382,7 +2387,7 @@ def create_app(
         # and its connection store are present.
         enabled_connections = [
             provider
-            for provider in ("github",)
+            for provider in ("github", "databricks")
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]

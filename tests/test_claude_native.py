@@ -256,6 +256,73 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     assert all("sk-sentinel-do-not-use" not in arg for arg in args)
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert "hooks" in settings
+    assert "modelOverrides" not in settings
+
+
+def test_native_config_does_not_infer_overrides_from_routable_models() -> None:
+    """Provider-local ids remain opaque without a provider-supplied map."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        api_key_helper="printf token",
+        model="deployment-current",
+        routable_models=(
+            "deployment-current",
+            "name-containing-claude-opus-4-8",
+        ),
+    )
+
+    assert config.model_overrides == {}
+
+
+def test_claude_terminal_request_threads_provider_model_overrides_into_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI terminal writes an explicit provider map without parsing ids."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        api_key_helper="printf token",
+        model="deployment-current",
+        routable_models=("deployment-current", "deployment-17"),
+        model_overrides={
+            "claude-opus-5": "deployment-current",
+            "claude-opus-4-8": "deployment-17",
+        },
+    )
+
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    settings = _load_invocation_settings(body["spec"]["args"])
+    assert settings["modelOverrides"] == {
+        "claude-opus-5": "deployment-current",
+        "claude-opus-4-8": "deployment-17",
+    }
+
+
+def test_claude_terminal_request_does_not_infer_gateway_model_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gateway model name alone is not authoritative identity metadata."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        api_key_helper="printf token",
+        model="name-containing-claude-opus-4-8",
+        routable_models=("name-containing-claude-opus-4-8",),
+    )
+
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    settings = _load_invocation_settings(body["spec"]["args"])
+    assert "modelOverrides" not in settings
 
 
 def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch) -> None:
@@ -704,6 +771,11 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
     assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-10"
     assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-5"
     assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in config.env
+    assert config.model_overrides == {
+        "claude-opus-4-10": "system.ai.claude-opus-4-10",
+        "claude-sonnet-5": "system.ai.claude-sonnet-5",
+        "claude-sonnet-4-6": "system.ai.claude-sonnet-4-6",
+    }
     assert claude_native.claude_native_model_options(config) == [
         {
             "id": "opus",
@@ -10234,6 +10306,54 @@ async def test_claude_model_catalog_marks_the_enumerated_default(
     assert [row["id"] for row in rows] == ["sonnet", "opus"]
     assert "isDefault" not in rows[0]
     assert rows[1]["isDefault"] is True
+
+
+async def test_claude_model_catalog_honors_managed_replacement_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed replacement rows override Claude's headless alias output."""
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[{"id": "fable", "model": "fable", "displayName": "fable"}],
+            default_model="gateway-opus",
+            default_label="Opus",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_model_picker",
+        lambda: (("gateway-opus", "Opus"), ("gateway-sonnet", "Sonnet")),
+    )
+
+    assert await claude_native.claude_model_catalog(None) == [
+        {
+            "id": "gateway-opus",
+            "model": "gateway-opus",
+            "displayName": "Opus",
+            "isDefault": True,
+        },
+        {"id": "gateway-sonnet", "model": "gateway-sonnet", "displayName": "Sonnet"},
+    ]
+
+
+async def test_claude_model_catalog_keeps_managed_picker_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _failed_probe(config: object) -> None:
+        del config
+        return
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _failed_probe)
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_model_picker",
+        lambda: (("gateway-opus", "Opus"),),
+    )
+
+    assert await claude_native.claude_model_catalog(None) == [
+        {"id": "gateway-opus", "model": "gateway-opus", "displayName": "Opus"}
+    ]
 
 
 async def test_claude_model_catalog_appends_an_off_list_default(

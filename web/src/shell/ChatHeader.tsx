@@ -37,7 +37,7 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_PILL, MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
-import { ViewModeToggle } from "./ViewModeToggle";
+import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
@@ -389,6 +389,7 @@ export function ChatHeader({
       onFork={onFork}
       hasAgentInfo={isMobile && hasAgentInfo}
       onAgentInfo={onAgentInfo}
+      viewItems={isMobile ? <ViewModeMenuItems /> : null}
       workspaceItems={isMobile ? workspaceItems : null}
     />
   ) : null;
@@ -557,68 +558,72 @@ export function ChatHeader({
         {/* Fallback mobile kebab for sessions with no owner-managed menu.
             It carries Fork, Share, Agent info, and the workspace-rail entries
             so a phone still needs only one trigger. */}
-        {(hasHeaderMenu || workspaceItems || canFork) && (!actionConversation || !isMobile) && (
-          // Non-modal on mobile: modal mode's body-wide pointer-events:none
-          // makes the menu the sole touch target, so touch-target adjustment
-          // snaps outside taps onto it and the menu can't be dismissed (see
-          // HeaderConversationMenu).
-          <DropdownMenu modal={!isMobile}>
-            <DropdownMenuTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label="Session actions"
-                data-testid="session-actions-menu"
-                className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11 max-md:rounded-full"
-              >
-                <EllipsisVerticalIcon className="size-4 max-md:size-5" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className={cn("min-w-44", MOBILE_GLASS_SURFACE)}>
-              {canFork && (
-                <DropdownMenuItem onSelect={onFork} data-testid="fallback-fork-conversation">
-                  <GitForkIcon className="size-4" />
-                  Fork
-                </DropdownMenuItem>
-              )}
-              {canShare && (
-                <DropdownMenuItem
-                  onSelect={
-                    shareDisabled
-                      ? undefined
-                      : () => {
-                          trackClick("chat.header.mobile_share", "button");
-                          onShare();
-                        }
-                  }
-                  disabled={shareDisabled}
-                  data-testid="mobile-share-session"
-                  title={shareDisabledReason}
-                  className="gap-2.5 px-2.5 py-2 text-ui"
+        {(hasHeaderMenu || workspaceItems || canFork || (isMobile && mobileMenu.terminalFirst)) &&
+          (!actionConversation || !isMobile) && (
+            // Non-modal on mobile: modal mode's body-wide pointer-events:none
+            // makes the menu the sole touch target, so touch-target adjustment
+            // snaps outside taps onto it and the menu can't be dismissed (see
+            // HeaderConversationMenu).
+            <DropdownMenu modal={!isMobile}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Session actions"
+                  data-testid="session-actions-menu"
+                  className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11 max-md:rounded-full"
                 >
-                  <ShareIcon className="size-4" />
-                  Share
-                </DropdownMenuItem>
-              )}
-              {hasAgentInfo && (
-                <DropdownMenuItem
-                  onSelect={() => {
-                    trackClick("chat.header.mobile_agent_info", "button");
-                    onAgentInfo();
-                  }}
-                  data-testid="mobile-agent-info"
-                  className="gap-2.5 px-2.5 py-2 text-ui"
-                >
-                  <InfoIcon className="size-4" />
-                  Agent info
-                </DropdownMenuItem>
-              )}
-              {hasHeaderMenu && workspaceItems && <DropdownMenuSeparator />}
-              {workspaceItems}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
+                  <EllipsisVerticalIcon className="size-4 max-md:size-5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className={cn("min-w-44", MOBILE_GLASS_SURFACE)}>
+                {/* Chat/Terminal switch (terminal-first sessions) — self-gates to
+                  null otherwise, and renders its own trailing separator. */}
+                {isMobile && <ViewModeMenuItems />}
+                {canFork && (
+                  <DropdownMenuItem onSelect={onFork} data-testid="fallback-fork-conversation">
+                    <GitForkIcon className="size-4" />
+                    Fork
+                  </DropdownMenuItem>
+                )}
+                {canShare && (
+                  <DropdownMenuItem
+                    onSelect={
+                      shareDisabled
+                        ? undefined
+                        : () => {
+                            trackClick("chat.header.mobile_share", "button");
+                            onShare();
+                          }
+                    }
+                    disabled={shareDisabled}
+                    data-testid="mobile-share-session"
+                    title={shareDisabledReason}
+                    className="gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <ShareIcon className="size-4" />
+                    Share
+                  </DropdownMenuItem>
+                )}
+                {hasAgentInfo && (
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      trackClick("chat.header.mobile_agent_info", "button");
+                      onAgentInfo();
+                    }}
+                    data-testid="mobile-agent-info"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <InfoIcon className="size-4" />
+                    Agent info
+                  </DropdownMenuItem>
+                )}
+                {hasHeaderMenu && workspaceItems && <DropdownMenuSeparator />}
+                {workspaceItems}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         {canShare && shareDisabled && shareDisabledReason ? (
           <Tooltip>
             <TooltipTrigger asChild>

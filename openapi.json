@@ -2597,8 +2597,19 @@
         "type": "object"
       },
       "HostModelOptionsResponse": {
-        "description": "Pre-launch model choices resolved by a host harness.",
+        "description": "Pre-launch model choices resolved by a host harness.\n\n`error` carries the host's reason for an empty catalog \u2014 a probe that\nfailed on the host is not a transport failure, so the request still\nsucceeds and the picker can say WHY it is empty instead of a generic\n\"Models unavailable\".",
         "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
           "models": {
             "items": {
               "additionalProperties": true,
@@ -2662,6 +2673,17 @@
             "default": false,
             "title": "Force",
             "type": "boolean"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
           },
           "items": {
             "items": {
