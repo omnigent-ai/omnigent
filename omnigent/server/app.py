@@ -152,6 +152,10 @@ class ServerInfoResponse(BaseModel):
     managed_sandboxes_enabled: bool
     sandbox_provider: str | None
     sandbox_providers: list[str]
+    # UI-relevant capability flags per launchable provider, e.g.
+    # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
+    # (multi-repo picker vs single). Providers absent from the map default off.
+    sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -2457,10 +2461,12 @@ def create_app(
         managed_sandboxes_enabled = False
         sandbox_provider = None
         sandbox_providers: list[str] = []
+        sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
+            sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -2535,6 +2541,7 @@ def create_app(
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
+                "sandbox_provider_capabilities": sandbox_provider_capabilities,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,

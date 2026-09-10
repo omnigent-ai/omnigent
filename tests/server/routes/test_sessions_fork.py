@@ -1486,7 +1486,9 @@ async def test_fork_reversed_native_spelling_carry_gating(
 # ── Managed-sandbox fork ─────────────────────────────────────────
 
 
-def _arm_managed_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+def _arm_managed_app(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch, *, provider: str = "modal"
+) -> list[dict[str, Any]]:
     """
     Wire the app for managed forks and capture the scheduled launches.
 
@@ -1497,10 +1499,12 @@ def _arm_managed_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict
 
     :param app: The app under test.
     :param monkeypatch: Fixture used to swap the background launch.
+    :param provider: Sandbox provider to configure. ``"modal"`` (default) is
+        single-repo; pass ``"kubernetes"`` for a multi-repo provider.
     :returns: The list the recorder appends each launch's kwargs to.
     """
     app.state.sandbox_config = parse_sandbox_config(
-        {"provider": "modal", "server_url": "https://managed-test.example.com"}
+        {"provider": provider, "server_url": "https://managed-test.example.com"}
     )
     # Never dereferenced: the recorder replaces the only consumer.
     app.state.host_store = object()
@@ -1543,7 +1547,7 @@ async def test_fork_managed_schedules_sandbox_launch(
     assert launch["session_id"] == body["id"]
     assert launch["provider"] == "modal"
     # No repository on either side, so the clone gets an empty sandbox.
-    assert launch["repo"] is None
+    assert launch["repos"] == []
     assert conv_store.label_writes == []
 
 
@@ -1676,15 +1680,68 @@ async def test_fork_managed_inherits_source_repository(
     )
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    repo = launches[0]["repo"]
-    assert repo is not None
-    assert repo.url == "https://github.com/org/repo"
-    assert repo.branch == "release-1.2"
-    # Recorded on the FORK too, so its own sandbox relaunch re-clones it.
+    repos = launches[0]["repos"]
+    assert len(repos) == 1
+    assert repos[0].url == "https://github.com/org/repo"
+    assert repos[0].branch == "release-1.2"
+    # Recorded on the FORK too (one label per repo, plus the bare compat key),
+    # so its own sandbox relaunch re-clones it. The source here uses the legacy
+    # single-value label, exercising the read fallback.
     assert conv_store.label_writes == [
         (
             resp.json()["id"],
-            {MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#release-1.2"},
+            {
+                f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/repo#release-1.2",
+                MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#release-1.2",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_inherits_all_source_repositories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-repo source hands the fork EVERY repository it recorded.
+
+    The source records one label per repo; the fork reads them all back and
+    re-stamps its own per-repo labels — cloning a multi-repo sandbox session
+    lands the fork with all of its checkouts, not just the first.
+    """
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    # Multi-repo provider — inheriting several repos is only allowed where the
+    # provider supports it (a single-repo provider rejects it; see the guard test).
+    launches = _arm_managed_app(app, monkeypatch, provider="kubernetes")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    repos = launches[0]["repos"]
+    assert [(r.url, r.branch) for r in repos] == [
+        ("https://github.com/org/api", "main"),
+        ("https://github.com/org/web", None),
+    ]
+    # The fork re-stamps its own per-repo labels (plus the bare compat key) for
+    # relaunch.
+    assert conv_store.label_writes == [
+        (
+            resp.json()["id"],
+            {
+                f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+                f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+                MANAGED_REPO_LABEL_KEY: "https://github.com/org/api#main https://github.com/org/web",
+            },
         )
     ]
 
@@ -1716,8 +1773,8 @@ async def test_fork_managed_explicit_workspace_overrides_inherited(
 
     assert chosen.status_code == 201, f"got {chosen.status_code}: {chosen.text}"
     assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
-    assert launches[0]["repo"].url == "https://github.com/org/other"
-    assert launches[1]["repo"] is None, "an explicit null workspace means an empty sandbox"
+    assert [r.url for r in launches[0]["repos"]] == ["https://github.com/org/other"]
+    assert launches[1]["repos"] == [], "an explicit null workspace means an empty sandbox"
 
 
 @pytest.mark.asyncio
@@ -1783,7 +1840,7 @@ async def test_fork_managed_restamps_resolved_repository(
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
     fork = conv_store.get_conversation(resp.json()["id"])
     assert fork is not None
-    assert fork.labels[MANAGED_REPO_LABEL_KEY] == "https://github.com/org/other#dev"
+    assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.0"] == "https://github.com/org/other#dev"
 
 
 @pytest.mark.asyncio
@@ -1846,6 +1903,34 @@ async def test_fork_managed_rejects_unoffered_provider(
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
     assert "is not configured on this server" in resp.json()["error"]["message"]
     assert launches == []
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-repo source forked onto a single-repo provider fails the POST with
+    a clear 400 (modal is exec-model → single-repo), rather than a background
+    clone failure. The web picker caps this per provider; this guards the API."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)  # provider "modal" (single-repo)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert "clones only one repository" in resp.json()["error"]["message"]
+    assert launches == [], "a rejected multi-repo fork must schedule no launch"
 
 
 @pytest.mark.asyncio

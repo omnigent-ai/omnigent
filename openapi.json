@@ -4550,6 +4550,17 @@
             ],
             "title": "Sandbox Provider"
           },
+          "sandbox_provider_capabilities": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "boolean"
+              },
+              "type": "object"
+            },
+            "default": {},
+            "title": "Sandbox Provider Capabilities",
+            "type": "object"
+          },
           "sandbox_providers": {
             "items": {
               "type": "string"
