@@ -351,6 +351,41 @@ describe("parseEvent — session.mcp_startup", () => {
   });
 });
 
+describe("parseEvent — session.codex_startup_prompt", () => {
+  it("parses a prompt description while the pane is blocked", () => {
+    const ev = parseEvent("session.codex_startup_prompt", {
+      conversation_id: "conv_a",
+      prompt: "a hook-review prompt",
+    });
+    expect(ev).toEqual({
+      type: "session_codex_startup_prompt",
+      conversationId: "conv_a",
+      prompt: "a hook-review prompt",
+    });
+  });
+
+  it("normalizes a null/empty prompt to null (banner clear)", () => {
+    expect(
+      parseEvent("session.codex_startup_prompt", { conversation_id: "conv_a", prompt: null }),
+    ).toEqual({
+      type: "session_codex_startup_prompt",
+      conversationId: "conv_a",
+      prompt: null,
+    });
+    expect(
+      parseEvent("session.codex_startup_prompt", { conversation_id: "conv_a", prompt: "" }),
+    ).toEqual({
+      type: "session_codex_startup_prompt",
+      conversationId: "conv_a",
+      prompt: null,
+    });
+  });
+
+  it("rejects frames without a conversation id", () => {
+    expect(parseEvent("session.codex_startup_prompt", { prompt: "x" })).toBeNull();
+  });
+});
+
 describe("parseEvent — response.output_item.done error level", () => {
   it("lifts level: info onto the error event and omits it otherwise", () => {
     const item = {

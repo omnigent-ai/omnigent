@@ -2155,6 +2155,12 @@ class SessionResponse(BaseModel):
     # ``_session_mcp_startup_cache`` at snapshot build time so a client
     # opening the session mid-startup sees the startup band.
     mcp_startup: dict[str, McpServerStartup] | None = None
+    # Short description of the interactive terminal prompt a runner-owned Codex
+    # session is parked on at startup (directory-trust, hook-review, a TERM
+    # "Continue anyway?" gate), or ``None`` when it is not blocked. Sourced from
+    # ``_session_codex_startup_prompt_cache`` so a client opening the session
+    # while it is blocked seeds the "answer it in the Terminal" banner.
+    codex_startup_prompt: str | None = None
     active_response_id: str | None = None
     # First-class project this session is filed under, or ``None`` when
     # unfiled. Distinct from the legacy ``omni_project`` label (surfaced in
@@ -3345,6 +3351,33 @@ class SessionMcpStartupEvent(_SSEEventBase):
     type: Literal["session.mcp_startup"]
     conversation_id: str
     servers: dict[str, McpServerStartup]
+
+
+class SessionCodexStartupPromptEvent(_SSEEventBase):
+    """
+    A runner-owned Codex session is parked on an interactive startup prompt.
+
+    A detached Codex TUI can park its startup on a prompt only a human at the
+    terminal can answer — a directory-trust screen, a hook-review screen, or a
+    ``TERM`` "Continue anyway?" gate. The runner detects this on the
+    thread-start timeout and posts ``external_codex_startup_prompt``,
+    republished here so the web UI shows a proactive "answer it in the Terminal"
+    banner instead of a session that looks hung until the user sends a message.
+
+    :param type: Always ``"session.codex_startup_prompt"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param prompt: Short description of what the pane is waiting for (e.g.
+        ``"a hook-review prompt"``), or ``None`` once the thread starts and the
+        banner should clear.
+
+    Category: **transient** (SSE + snapshot cache). Not persisted; a client
+    connecting while blocked seeds from the snapshot's ``codex_startup_prompt``
+    field and updates live off this event.
+    """
+
+    type: Literal["session.codex_startup_prompt"]
+    conversation_id: str
+    prompt: str | None = None
 
 
 class SessionSkillsEvent(_SSEEventBase):
@@ -4594,6 +4627,7 @@ ServerStreamEvent = Annotated[
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionMcpStartupEvent
+    | SessionCodexStartupPromptEvent
     | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent

@@ -124,6 +124,9 @@ _EXTERNAL_MCP_STARTUP_STATUS_VALUES: frozenset[str] = frozenset(
 )
 
 
+_EXTERNAL_CODEX_STARTUP_PROMPT_TYPE: str = "external_codex_startup_prompt"
+
+
 _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
 
 
@@ -562,6 +565,13 @@ _session_sandbox_status_cache: dict[str, SandboxStatus] = {}
 
 
 _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
+
+
+# Short description of the interactive terminal prompt a runner-owned Codex
+# session is parked on (directory-trust, hook-review, TERM "Continue anyway?"),
+# or absent when it is not blocked. Retained so a client opening the session
+# while it is blocked seeds the banner from the snapshot.
+_session_codex_startup_prompt_cache: dict[str, str] = {}
 
 
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}

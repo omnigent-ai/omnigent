@@ -722,6 +722,21 @@ export interface SessionMcpStartupEvent {
 }
 
 /**
+ * `session.codex_startup_prompt` — a runner-owned Codex session is parked on
+ * (or has cleared) an interactive terminal startup prompt only a human can
+ * answer: a directory-trust screen, a hook-review screen, or a `TERM`
+ * "Continue anyway?" gate. Drives a proactive "answer it in the Terminal"
+ * banner so the session doesn't look hung until the user sends a message.
+ * `prompt` is a short description while blocked, or `null` once the thread
+ * starts and the banner should clear.
+ */
+export interface SessionCodexStartupPromptEvent {
+  type: "session_codex_startup_prompt";
+  conversationId: string;
+  prompt: string | null;
+}
+
+/**
  * `session.input.consumed` — a queued input item was persisted into
  * conversation history. Used to backfill optimistic user-bubble
  * `itemId`s with the server-assigned id. Does NOT carry
@@ -997,6 +1012,7 @@ export type StreamEvent =
   | SessionTerminalPendingEvent
   | SessionSandboxStatusEvent
   | SessionMcpStartupEvent
+  | SessionCodexStartupPromptEvent
   | SessionInputConsumedEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent

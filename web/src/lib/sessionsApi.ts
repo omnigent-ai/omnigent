@@ -254,6 +254,7 @@ interface SessionResponseWire {
    */
   sandbox_status?: SandboxStatus | null;
   mcp_startup?: Record<string, McpServerStartup> | null;
+  codex_startup_prompt?: string | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
    * idle. Lets a client reconnecting mid-turn reopen a streaming
@@ -355,6 +356,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
     mcpStartup: wire.mcp_startup ?? null,
+    codexStartupPrompt: wire.codex_startup_prompt ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
 }

@@ -27,7 +27,11 @@ import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-import { RunnerStartingIndicator, McpStartupIndicator } from "@/pages/ChatIndicators";
+import {
+  RunnerStartingIndicator,
+  McpStartupIndicator,
+  CodexStartupPromptIndicator,
+} from "@/pages/ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import {
   type ConversationScroller,
@@ -124,6 +128,7 @@ function TranscriptImpl({
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
+  const codexStartupPromptActive = useChatStore((s) => s.codexStartupPrompt !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
   const conversationId = useChatStore((s) => s.conversationId);
 
@@ -191,6 +196,7 @@ function TranscriptImpl({
         committedUserIds.size > 0 || blocks.some((block) => block.type !== "user_message"),
       hasTasks,
       mcpStartupActive,
+      codexStartupPromptActive,
       hasMoreHistory,
       loadingMoreHistory,
       showsWorking,
@@ -204,6 +210,7 @@ function TranscriptImpl({
       committedUserIds,
       hasTasks,
       mcpStartupActive,
+      codexStartupPromptActive,
       hasMoreHistory,
       loadingMoreHistory,
       showsWorking,
@@ -329,7 +336,10 @@ function TranscriptImpl({
             <KeepBottomOnViewportResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
-            {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
+            {display.bubbles.length === 0 &&
+            !showWorkingIndicator &&
+            !display.mcpStartupActive &&
+            !display.codexStartupPromptActive ? (
               (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
               sandboxLaunching ? (
                 <RunnerStartingIndicator variant="hero" />
@@ -385,6 +395,9 @@ function TranscriptImpl({
                 {/* MCP-server startup band (codex-native); clears once the
                 round settles (failures stay in host logs, not the chat). */}
                 <McpStartupIndicator />
+                {/* Codex parked on an interactive terminal startup prompt
+                (trust / hooks / TERM); clears once the thread starts. */}
+                <CodexStartupPromptIndicator />
               </>
             )}
             {/* Frames the initially loaded turn at the top of the viewport. */}

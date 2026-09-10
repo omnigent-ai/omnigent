@@ -510,6 +510,14 @@ export interface Session {
    */
   mcpStartup?: Record<string, McpServerStartup> | null;
   /**
+   * Short description of the interactive terminal prompt a runner-owned Codex
+   * session is parked on at startup (directory-trust, hook-review, a `TERM`
+   * "Continue anyway?" gate), or `null` when not blocked. Sourced from the
+   * server's `_session_codex_startup_prompt_cache` at snapshot build time so a
+   * client opening the session while it is blocked seeds the banner.
+   */
+  codexStartupPrompt?: string | null;
+  /**
    * Response id of the turn currently in flight, or `null`/absent when
    * the session is idle. Sourced from the server's
    * `_session_active_response_cache` at snapshot build time so a client

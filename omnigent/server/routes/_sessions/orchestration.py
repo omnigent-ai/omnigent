@@ -201,6 +201,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_codex_startup_prompt_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -1207,6 +1208,9 @@ def _build_session_response(
         # Replay harness MCP-server startup state (codex-native) so a
         # client opening the session mid-startup sees the startup band.
         mcp_startup=_session_mcp_startup_cache.get(conv.id),
+        # Replay a codex startup-prompt banner so a client opening the session
+        # while it is parked on a terminal prompt sees the banner.
+        codex_startup_prompt=_session_codex_startup_prompt_cache.get(conv.id),
         # In-flight turn id so a mid-turn reconnect can reopen a streaming
         # ``activeResponse`` (the turn-start ``running`` edge that carried it
         # is not replayed on the SSE stream). Populated for native-terminal

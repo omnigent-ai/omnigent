@@ -94,6 +94,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    _EXTERNAL_CODEX_STARTUP_PROMPT_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_COMPACTION_STATUS_VALUES,
@@ -127,6 +128,7 @@ from omnigent.server.routes._sessions.common import (
     _interrupt_fenced_sessions,
     _logger,
     _pushed_model_options_cache,
+    _session_codex_startup_prompt_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     get_server_runner_router,
@@ -162,6 +164,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_policy_deny_sentinel,
     _persist_session_status_error_labels,
     _prune_session_read_state,
+    _publish_codex_startup_prompt,
     _publish_compaction_completed,
     _publish_compaction_failed,
     _publish_compaction_in_progress,
@@ -1541,6 +1544,21 @@ def register_events_routes(
                 )
             _publish_mcp_startup(session_id, mcp_servers)
             return {"queued": False}
+        if body.type == _EXTERNAL_CODEX_STARTUP_PROMPT_TYPE:
+            # Runner-owned Codex parked on (or cleared) an interactive terminal
+            # startup prompt: republish as a ``session.codex_startup_prompt``
+            # SSE so the web UI shows a proactive "answer it in the Terminal"
+            # banner. ``prompt`` is a short description while blocked, or null
+            # to clear once the thread starts.
+            raw_prompt = body.data.get("prompt")
+            if not (raw_prompt is None or isinstance(raw_prompt, str)):
+                raise OmnigentError(
+                    "external_codex_startup_prompt requires data.prompt to be a "
+                    f"string or null; got {raw_prompt!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            _publish_codex_startup_prompt(session_id, raw_prompt or None)
+            return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
             # Persist the harness-reported cumulative usage so the
             # tool-call cost gate can read the running
@@ -2446,6 +2464,9 @@ def register_events_routes(
         # for reload visibility while the session exists, so a session
         # whose MCP startup never settled clean would leak its entry.
         _session_mcp_startup_cache.pop(session_id, None)
+        # Same for a codex startup-prompt banner left set on a session that
+        # was deleted while still blocked.
+        _session_codex_startup_prompt_cache.pop(session_id, None)
         # Same for the extension-pushed model catalog: kept across reloads
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.

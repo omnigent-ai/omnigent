@@ -58,6 +58,7 @@ import type {
   SessionTodosEvent,
   SessionSandboxStatusEvent,
   McpServerStartup,
+  SessionCodexStartupPromptEvent,
   SessionMcpStartupEvent,
   SessionTerminalPendingEvent,
   SessionUsageEvent,
@@ -809,6 +810,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       servers,
     } satisfies SessionMcpStartupEvent;
+  }
+  if (eventType === "session.codex_startup_prompt") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const rawPrompt = data.prompt;
+    // A string means blocked; null/absent clears the banner.
+    const prompt = typeof rawPrompt === "string" && rawPrompt ? rawPrompt : null;
+    return {
+      type: "session_codex_startup_prompt",
+      conversationId,
+      prompt,
+    } satisfies SessionCodexStartupPromptEvent;
   }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.

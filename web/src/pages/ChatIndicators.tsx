@@ -1,4 +1,4 @@
-import { Loader2Icon, WifiOffIcon } from "lucide-react";
+import { Loader2Icon, TerminalIcon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
@@ -258,6 +258,34 @@ export function McpStartupIndicator() {
         <span className="flex items-center gap-2 text-muted-foreground text-ui">
           <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
           {mcpStartingLine(starting, names.length)}
+        </span>
+      </MessageContent>
+    </Message>
+  );
+}
+
+/**
+ * Banner for a runner-owned Codex session parked on an interactive terminal
+ * startup prompt (directory-trust, hook-review, a `TERM` "Continue anyway?"
+ * gate). The detached TUI cannot answer it on its own, so the session would
+ * otherwise look hung until the user sent a message; this points them at the
+ * Terminal to answer it, and clears once the thread starts.
+ */
+export function CodexStartupPromptIndicator() {
+  const codexStartupPrompt = useChatStore((s) => s.codexStartupPrompt);
+  if (!codexStartupPrompt) return null;
+  return (
+    <Message
+      from="assistant"
+      data-testid="codex-startup-prompt-indicator"
+      role="status"
+      aria-live="polite"
+    >
+      <MessageContent>
+        <span className="flex items-center gap-2 text-muted-foreground text-ui">
+          <TerminalIcon className="size-4 shrink-0" aria-hidden />
+          Codex is waiting on {codexStartupPrompt} — open the Terminal for this session and answer
+          it to continue.
         </span>
       </MessageContent>
     </Message>

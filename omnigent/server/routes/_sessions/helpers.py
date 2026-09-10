@@ -207,6 +207,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_codex_startup_prompt_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -241,6 +242,7 @@ from omnigent.server.schemas import (
     SandboxStatus,
     SessionChildSessionUpdatedEvent,
     SessionCodexApprovalModeEvent,
+    SessionCodexStartupPromptEvent,
     SessionCollaborationModeEvent,
     SessionCreatedEvent,
     SessionCreateMetadata,
@@ -4724,6 +4726,33 @@ def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) 
         type="session.mcp_startup",
         conversation_id=session_id,
         servers=servers,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_codex_startup_prompt(session_id: str, prompt: str | None) -> None:
+    """
+    Publish a typed :class:`SessionCodexStartupPromptEvent` to the live stream.
+
+    Fired when a runner-owned Codex session parks on (``prompt`` set) or clears
+    (``prompt is None``) an interactive terminal startup prompt, so the web UI
+    can show a proactive "answer it in the Terminal" banner. Also updates the
+    snapshot cache so a client opening the session while it is blocked seeds the
+    banner from the snapshot's ``codex_startup_prompt`` field; clearing evicts
+    the entry so a reloading client never seeds a banner for a session that has
+    since started.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param prompt: Short prompt description, or ``None`` to clear.
+    """
+    if prompt:
+        _session_codex_startup_prompt_cache[session_id] = prompt
+    else:
+        _session_codex_startup_prompt_cache.pop(session_id, None)
+    event = SessionCodexStartupPromptEvent(
+        type="session.codex_startup_prompt",
+        conversation_id=session_id,
+        prompt=prompt,
     )
     session_stream.publish(session_id, event.model_dump())
 

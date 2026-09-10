@@ -4760,6 +4760,55 @@ async def _codex_pane_interactive_prompt(
     return None
 
 
+async def _publish_codex_startup_prompt(session_id: str, prompt: str | None) -> None:
+    """
+    Surface (or clear) the Codex startup-prompt banner on the web UI.
+
+    Posts an ``external_codex_startup_prompt`` session event that the server
+    republishes as ``session.codex_startup_prompt``, so a session parked on an
+    interactive terminal prompt shows a proactive "answer it in the Terminal"
+    banner instead of looking hung until the user sends a message. ``prompt`` is
+    a short description while the pane is blocked, or ``None`` to clear the
+    banner once the thread starts. Fully best-effort: a post failure only means
+    the banner lags, so it must never affect recovery.
+
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param prompt: Short prompt description, or ``None`` to clear.
+    :returns: None.
+    """
+    from omnigent.cli_auth import open_server_client
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    try:
+        server_url = _required_runner_env("RUNNER_SERVER_URL")
+    except RuntimeError:
+        return
+    auth_factory = _make_auth_token_factory()
+    auth_token = auth_factory() if auth_factory is not None else None
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    try:
+        async with open_server_client(
+            server_url,
+            headers=headers,
+            auth=_RunnerDatabricksAuth(auth_factory),
+            timeout=httpx.Timeout(10.0),
+        ) as client:
+            resp = await client.post(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+                json={"type": "external_codex_startup_prompt", "data": {"prompt": prompt}},
+            )
+        if resp.status_code >= 400:
+            _logger.warning(
+                "server rejected codex startup-prompt banner (%s) for %s",
+                resp.status_code,
+                session_id,
+            )
+    except Exception:  # noqa: BLE001 - the banner is best-effort
+        _logger.debug(
+            "codex startup-prompt banner post failed for %s", session_id, exc_info=True
+        )
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -4860,6 +4909,10 @@ async def _codex_discover_thread_and_forward(
             "(`omnigent setup`), then send the message again.",
         )
 
+    # Set to the prompt description if the thread-start wait finds the pane
+    # parked on an interactive prompt, so the success path knows to clear the
+    # web banner it surfaced.
+    startup_prompt_banner: str | None = None
     try:
         try:
             if login_required:
@@ -4895,6 +4948,10 @@ async def _codex_discover_thread_and_forward(
                         "start this turn yet. Open the Terminal for this session and "
                         f"answer the prompt to continue. Launch routing: {routing_summary}.",
                     )
+                    # Proactively surface the prompt on the web UI so the user
+                    # sees it without first sending a message into a dead chat.
+                    startup_prompt_banner = prompt
+                    await _publish_codex_startup_prompt(session_id, prompt)
                     thread_id = await wait_for_thread_started(event_client, timeout=None)
         except (TimeoutError, RuntimeError) as exc:
             # Expected failure modes of wait_for_thread_started: the TUI exited
@@ -4924,6 +4981,9 @@ async def _codex_discover_thread_and_forward(
         # or the interactive-prompt notice recorded on the thread-start
         # timeout. Clearing when nothing was recorded is a harmless no-op.
         clear_bridge_startup_error(bridge_dir)
+        if startup_prompt_banner is not None:
+            # The user answered the prompt; retract the web banner we surfaced.
+            await _publish_codex_startup_prompt(session_id, None)
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(

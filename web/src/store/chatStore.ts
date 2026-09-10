@@ -841,6 +841,12 @@ export interface ConversationState {
    * MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
+  /**
+   * Short description of the interactive terminal prompt a runner-owned Codex
+   * session is parked on at startup (e.g. `"a hook-review prompt"`), or `null`
+   * when not blocked. Drives a proactive "answer it in the Terminal" banner.
+   */
+  codexStartupPrompt: string | null;
 
   // Internal mutable bookkeeping. NOT meant to be subscribed to.
   abortController: AbortController | null;
@@ -1654,6 +1660,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
+  codexStartupPrompt: null,
   abortController: null,
   historyGeneration: 0,
 
@@ -3401,6 +3408,7 @@ function sessionBindingPatch(
   | "terminalPending"
   | "sandboxStatus"
   | "mcpStartup"
+  | "codexStartupPrompt"
 > {
   return {
     isNativeTerminalSession: isNativeTerminalSessionFn(session),
@@ -3432,6 +3440,7 @@ function sessionBindingPatch(
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
     mcpStartup: activeMcpStartup(session.mcpStartup),
+    codexStartupPrompt: session.codexStartupPrompt ?? null,
   };
 }
 
@@ -3945,6 +3954,9 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   // `session.mcp_startup` event that fired into the gap is never replayed,
   // so a stale band would otherwise stay stuck until a full reload.
   patch.mcpStartup = activeMcpStartup(session.mcpStartup);
+  // Same for the codex startup-prompt banner: a clear that fired into the gap
+  // is never replayed, so re-derive it from the snapshot on reconnect.
+  patch.codexStartupPrompt = session.codexStartupPrompt ?? null;
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -5748,6 +5760,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation({ mcpStartup: activeMcpStartup(event.servers) });
       return;
     }
+    case "session_codex_startup_prompt":
+      // Show/clear the "answer it in the Terminal" banner for a Codex session
+      // parked on an interactive startup prompt.
+      applyToConversation({ codexStartupPrompt: event.prompt });
+      return;
     case "session_usage": {
       // Apply only fields that arrived; a window-only broadcast must
       // not clobber tokensUsed (and vice versa), and a cost-only
