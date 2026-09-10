@@ -2117,7 +2117,7 @@ describe("Composer file-attachment focus", () => {
     return el;
   }
 
-  it("focuses the textarea after a file is attached", () => {
+  it("focuses the textarea after a file is attached", async () => {
     render(<Composer {...composerProps()} />);
     const ta = textarea();
     // The mount effect focuses on conversation bind; blur so the assertion
@@ -2128,10 +2128,10 @@ describe("Composer file-attachment focus", () => {
     const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
     fireEvent.change(fileInput(), { target: { files: [file] } });
 
-    expect(document.activeElement).toBe(ta);
+    await waitFor(() => expect(document.activeElement).toBe(ta));
   });
 
-  it("marks the textarea with data-has-draft for an attachment-only draft", () => {
+  it("marks the textarea with data-has-draft for an attachment-only draft", async () => {
     // The approve hotkey's drafting guard only sees the focused element, so
     // the composer must advertise non-text drafts (attachments, mentions) on
     // the textarea itself — with an empty value, an attached file is still a
@@ -2144,7 +2144,7 @@ describe("Composer file-attachment focus", () => {
     fireEvent.change(fileInput(), { target: { files: [file] } });
 
     expect(ta.value).toBe("");
-    expect(ta.getAttribute("data-has-draft")).toBe("true");
+    await waitFor(() => expect(ta.getAttribute("data-has-draft")).toBe("true"));
   });
 
   it("does not focus the textarea when the attachment is rejected", () => {
@@ -2164,7 +2164,7 @@ describe("Composer file-attachment focus", () => {
   // The drop target is the chat column (``[data-chat-surface]``, SessionLayout),
   // which the composer resolves from its own card. Unhandled, a drop on the
   // transcript makes the browser navigate away to render the file.
-  it("attaches a file dropped elsewhere in the chat column", () => {
+  it("attaches a file dropped elsewhere in the chat column", async () => {
     render(
       <div data-chat-surface>
         <div data-testid="transcript">transcript</div>
@@ -2180,7 +2180,7 @@ describe("Composer file-attachment focus", () => {
     fireEvent.drop(transcript, { dataTransfer: { types: ["Files"], files: [file] } });
 
     // getAllBy: the chip pairs the visible name with a hover title.
-    expect(screen.getAllByText("shot.png").length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("shot.png")).length).toBeGreaterThan(0);
     expect(screen.queryByTestId("file-drop-overlay")).toBeNull();
   });
 
@@ -2205,14 +2205,14 @@ describe("Composer file-attachment focus", () => {
     expect(screen.queryByText("shot.png")).toBeNull();
   });
 
-  it("clears the rejection notice once the user types", () => {
+  it("clears the rejection notice once the user types", async () => {
     // The rejected file is never attached, so there is no chip to remove and
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
     render(<Composer {...composerProps()} />);
     const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
     fireEvent.change(fileInput(), { target: { files: [bad] } });
-    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    expect(await screen.findByText(/can't be attached/)).toBeTruthy();
 
     fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
 

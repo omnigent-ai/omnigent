@@ -944,6 +944,8 @@ describe("NewChatLandingScreen create flow", () => {
       target: { files: [file] },
     });
     typeMessage("what is in this image?");
+    // Submit stays disabled while the image is being prepared.
+    await screen.findByText("diagram.png");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     // The picked File rides the pending-prompt handoff so ChatPage's

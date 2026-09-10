@@ -1,3 +1,4 @@
+import type * as ImageCompressionModule from "@/lib/imageCompression";
 import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
@@ -58,6 +59,13 @@ import {
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
+
+const { prepareImageAttachmentMock } = vi.hoisted(() => ({ prepareImageAttachmentMock: vi.fn() }));
+
+vi.mock("@/lib/imageCompression", async (importOriginal) => ({
+  ...(await importOriginal<typeof ImageCompressionModule>()),
+  prepareImageAttachment: prepareImageAttachmentMock,
+}));
 
 // Only authenticatedFetch is stubbed (the create POST under test);
 // the module's other exports stay real for any other consumer in the tree.
@@ -726,6 +734,12 @@ function mockAgents(agents: AvailableAgent[]) {
 // directory-session / runner-health / filesystem stubs, and a persisted
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
+  prepareImageAttachmentMock.mockReset();
+  prepareImageAttachmentMock.mockImplementation(async (file: File) => ({
+    ok: true as const,
+    file,
+    converted: false,
+  }));
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
   useHostModelOptionsMock.mockReset();
@@ -1224,7 +1238,7 @@ describe("NewChatLandingScreen", () => {
     expect(footer.parentElement).toHaveClass("gap-1");
   });
 
-  it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
+  it("preserves the typed message and attachments when the landing screen unmounts and remounts", async () => {
     // Navigating into an existing session and back unmounts the landing
     // screen; the draft is stashed at module scope so the half-composed
     // message and its attachments survive the round-trip instead of being
@@ -1236,7 +1250,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [file] },
     });
-    expect(screen.getByText("diagram.png")).toBeTruthy();
+    expect(await screen.findByText("diagram.png")).toBeTruthy();
     first.unmount();
 
     renderLanding();
@@ -3412,6 +3426,48 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.queryByText("notes.txt")).toBeNull();
   });
 
+  it("uses the prepared image in the first-message draft", async () => {
+    const original = new File(["heic"], "photo.heic", { type: "image/heic" });
+    const prepared = new File(["jpeg"], "photo.jpg", { type: "image/jpeg" });
+    prepareImageAttachmentMock.mockResolvedValueOnce({ ok: true, file: prepared, converted: true });
+    renderLanding();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [original] },
+    });
+
+    await waitFor(() => expect(screen.getByText("photo.jpg")).toBeTruthy());
+    expect(screen.queryByText("photo.heic")).toBeNull();
+  });
+
+  it("keeps a newer rejection visible while an image is preparing", async () => {
+    const image = new File(["heic"], "photo.heic", { type: "image/heic" });
+    let resolveImage: ((result: { ok: true; file: File; converted: false }) => void) | undefined;
+    prepareImageAttachmentMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveImage = resolve;
+        }),
+    );
+    renderLanding();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [image] },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [new File(["zip"], "photos.zip", { type: "application/zip" })] },
+    });
+    expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
+      "only images, PDF, and text/code files are supported",
+    );
+
+    resolveImage?.({ ok: true, file: image, converted: false });
+    await waitFor(() => expect(screen.getByText("photo.heic")).toBeTruthy());
+    expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
+      "only images, PDF, and text/code files are supported",
+    );
+  });
+
   it("attaches files dropped onto the composer and surfaces a drop overlay", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
@@ -3427,14 +3483,14 @@ describe("NewChatLandingScreen attachments", () => {
   });
 
   // The whole landing surface is the drop target, not just the composer box.
-  it("attaches files dropped anywhere on the landing surface, not just on the composer", () => {
+  it("attaches files dropped anywhere on the landing surface, not just on the composer", async () => {
     renderLanding();
     const surface = screen.getByTestId("new-chat-landing");
     fireEvent.dragEnter(surface, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     const file = new File(["hello"], "shot.png", { type: "image/png" });
     fireEvent.drop(surface, { dataTransfer: fileDrag([file]) });
-    expect(screen.getByText("shot.png")).toBeTruthy();
+    expect(await screen.findByText("shot.png")).toBeTruthy();
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
