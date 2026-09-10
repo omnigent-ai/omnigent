@@ -523,6 +523,46 @@ xcrun stapler validate -v dist/Omnigent-*-arm64.dmg
 are missing, if Apple rejects a DMG, or if stapling fails. That's intentional,
 so a release artifact can't silently ship unsigned or unnotarized.
 
+## Windows code signing
+
+The Windows executable and NSIS installer are signed with **SHA-256
+Authenticode** whenever signing material is present. Like macOS, signing is
+driven entirely by what credentials are present — there are no code changes
+between a dev build and a release build:
+
+| Credentials present                | Result                                                                        |
+| ---------------------------------- | ----------------------------------------------------------------------------- |
+| none                               | unsigned installer; managed Windows devices that require signatures refuse it |
+| Authenticode cert (`WIN_CSC_LINK`) | executable + installer signed; installs cleanly on managed devices            |
+
+Export the certificate and private key as a password-protected `.pfx` and set:
+
+```bash
+export WIN_CSC_LINK=/path/to/authenticode.pfx   # or a base64 string / https URL
+export WIN_CSC_KEY_PASSWORD='the pfx password'
+```
+
+then:
+
+```bash
+pnpm run build:win          # signed if WIN_CSC_LINK is set, unsigned otherwise
+pnpm run build:win:release  # aborts unless every artifact is signed
+```
+
+`build:win:release` sets `forceCodeSigning`, so a release build **fails
+loudly** when signing material is missing or signing fails — a release
+installer can't silently ship unsigned. On a non-Windows build host,
+electron-builder signs via its bundled osslsigncode; if the organization
+later adopts Azure Trusted Signing instead of a `.pfx`, swap
+`build.win.signtoolOptions` for `azureSignOptions`. Verify a signed
+installer with:
+
+```powershell
+Get-AuthenticodeSignature 'dist\Omnigent Setup <version>.exe'   # → Status: Valid
+```
+
+(or `signtool verify /pa /v <installer>.exe` from the Windows SDK).
+
 ## Getting a server to point at
 
 Any reachable Omnigent server works. For a quick local target, run the
