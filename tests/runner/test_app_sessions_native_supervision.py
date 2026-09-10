@@ -557,6 +557,9 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
         entry = runner_app.get_subagent_work(child_id)
         assert entry is not None
         assert entry.status == "running"
+        # A running native child pins the idle watchdog: reaping the runner
+        # mid-child-turn would lose the child's completion wake.
+        assert app.state.has_active_work() is True
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:

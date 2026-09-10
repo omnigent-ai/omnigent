@@ -306,6 +306,12 @@ for _builder_name in (
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# Native pane statuses that mean a terminal turn is in flight; "waiting"
+# covers a pane blocked on user elicitation, like a parked approval.
+_NATIVE_PANE_TURN_STATUSES = ("running", "waiting")
+# Native status edges are sparse, so terminal output refreshes this bounded
+# liveness window; an abandoned pane stops pinning the runner once it expires.
+_NATIVE_PANE_TURN_STALE_S = 120.0
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -2571,6 +2577,29 @@ def _has_live_async_tasks(
     )
 
 
+def _has_fresh_native_pane_turn(
+    statuses: Mapping[str, str],
+    activity_at: Mapping[str, float],
+    *,
+    now: float | None = None,
+) -> bool:
+    """Return whether a native pane recently showed an in-flight turn.
+
+    :param statuses: Latest ``session.status`` value per session.
+    :param activity_at: Monotonic time of each session's last status edge or
+        terminal output.
+    :param now: Optional monotonic-clock override for tests.
+    :returns: ``True`` while a ``running``/``waiting`` pane is fresh.
+    """
+    stamp = time.monotonic() if now is None else now
+    return any(
+        status in _NATIVE_PANE_TURN_STATUSES
+        and (seen_at := activity_at.get(session_id)) is not None
+        and stamp - seen_at <= _NATIVE_PANE_TURN_STALE_S
+        for session_id, status in statuses.items()
+    )
+
+
 def register_timer(
     session_id: str,
     timer_id: str,
@@ -2892,6 +2921,8 @@ def create_runner_app(
     app.state.active_turns = _active_turns
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
+    _native_pane_activity_at: dict[str, float] = {}
+    app.state.native_pane_activity_at = _native_pane_activity_at
     # Detached watchers answering a /model confirm dialog that pops after
     # the active turn settles (a mid-turn switch queues in the composer).
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
@@ -2933,6 +2964,27 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    def _set_native_pane_status(session_id: str, status: str) -> None:
+        _native_pane_status[session_id] = status
+        _native_pane_activity_at[session_id] = time.monotonic()
+
+    def _touch_native_pane_turn(session_id: str) -> None:
+        # Refresh only panes the native status channel has stamped; a generic
+        # side terminal's output must not conjure a pin for an in-process
+        # turn (those are counted via ``_active_turns``).
+        if (
+            session_id in _native_pane_activity_at
+            and _native_pane_status.get(session_id) in _NATIVE_PANE_TURN_STATUSES
+        ):
+            _native_pane_activity_at[session_id] = time.monotonic()
+
+    def _mark_runner_activity() -> None:
+        # Resets the idle watchdog's activity clock, which otherwise only
+        # inbound tunnel frames refresh.
+        mark_activity = getattr(app.state, "mark_activity", None)
+        if callable(mark_activity):
+            mark_activity()
+
     def _has_active_work() -> bool:
         if _active_turns:
             return True
@@ -2948,6 +3000,8 @@ def create_runner_app(
             session_ids = set(_session_start_cache) | set(_session_agent_ids)
             if any(process_manager.has_active_turn(session_id) for session_id in session_ids):
                 return True
+        if _has_fresh_native_pane_turn(_native_pane_status, _native_pane_activity_at):
+            return True
         return False
 
     app.state.has_active_work = _has_active_work
@@ -2965,10 +3019,15 @@ def create_runner_app(
             queue = asyncio.Queue()
             _session_event_queues[session_id] = queue
         queue.put_nowait(event_body)
-        if event_body.get("type") == "session.status":
+        event_type = event_body.get("type")
+        if event_type == "session.status":
             _status_value = event_body.get("status")
             if isinstance(_status_value, str):
                 _native_pane_status[session_id] = _status_value
+        elif event_type == "session.terminal.activity":
+            # A producing native pane is live agent work the idle watchdog
+            # must not preempt.
+            _touch_native_pane_turn(session_id)
         _fan_out_child_delta_to_parent(session_id, event_body)
 
     def _child_preview_from_status(
@@ -3135,6 +3194,12 @@ def create_runner_app(
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        # This channel carries native pane lifecycle edges (the PTY watcher
+        # and native forwarders), so it drives the idle watchdog's native
+        # turn pin and refreshes the runner activity clock the way inbound
+        # tunnel frames do — a settling edge restarts the idle window.
+        _set_native_pane_status(session_id, status)
+        _mark_runner_activity()
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -4414,6 +4479,7 @@ def create_runner_app(
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _native_pane_status.pop(session_id, None)
+        _native_pane_activity_at.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -8713,6 +8779,7 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
+                _set_native_pane_status(conversation_id, status)
                 resource_registry.note_external_session_status(conversation_id, status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,

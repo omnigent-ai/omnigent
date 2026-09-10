@@ -9,6 +9,7 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -17,6 +18,8 @@ from fastapi import FastAPI
 from omnigent.runner import create_runner_app, pending_approvals
 from omnigent.runner._entry import _run_inactivity_monitor
 from omnigent.runner.app import (
+    _NATIVE_PANE_TURN_STALE_S,
+    _has_fresh_native_pane_turn,
     _has_live_async_tasks,
     _session_timers,
     register_timer,
@@ -319,3 +322,158 @@ async def test_drain_session_streams_enqueues_done_sentinel() -> None:
     finally:
         _session_event_queues_ref.pop("conv_drain_a", None)
         _session_event_queues_ref.pop("conv_drain_b", None)
+
+
+@pytest.mark.asyncio
+async def test_native_pane_running_blocks_idle_shutdown() -> None:
+    """A running native terminal turn keeps the runner alive until it settles.
+
+    Native turns leave ``_active_turns`` once terminal delivery takes over, so
+    the watchdog must count the pane's ``running`` status instead.
+
+    :returns: None.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    app = _scaffold_app()
+    publish_status = app.state.session_resource_registry._session_status_publisher
+    assert callable(publish_status)
+    try:
+        publish_status("conv_native_running", "running")
+        assert app.state.has_active_work() is True
+
+        async def _release() -> None:
+            publish_status("conv_native_running", "idle")
+
+        await _assert_monitor_blocked_then_shuts_down(
+            has_active_work=app.state.has_active_work,
+            release=_release,
+        )
+        assert app.state.has_active_work() is False
+    finally:
+        _session_event_queues_ref.pop("conv_native_running", None)
+
+
+@pytest.mark.asyncio
+async def test_native_pane_waiting_blocks_idle_shutdown() -> None:
+    """A native pane blocked on user elicitation input is active work.
+
+    ``waiting`` is a mid-turn state (the agent asked the user something); a
+    shutdown there loses the user's answer, like reaping a parked approval.
+
+    :returns: None.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    app = _scaffold_app()
+    publish_status = app.state.session_resource_registry._session_status_publisher
+    assert callable(publish_status)
+    try:
+        publish_status("conv_native_waiting", "waiting")
+        assert app.state.has_active_work() is True
+
+        async def _release() -> None:
+            publish_status("conv_native_waiting", "idle")
+
+        await _assert_monitor_blocked_then_shuts_down(
+            has_active_work=app.state.has_active_work,
+            release=_release,
+        )
+        assert app.state.has_active_work() is False
+    finally:
+        _session_event_queues_ref.pop("conv_native_waiting", None)
+
+
+def test_native_pane_turn_pin_expires_without_activity() -> None:
+    """A stale native status cannot keep an abandoned runner alive forever.
+
+    :returns: None.
+    """
+    activity_at = {"conv_native": 100.0}
+    for status in ("running", "waiting"):
+        statuses = {"conv_native": status}
+        assert _has_fresh_native_pane_turn(statuses, activity_at, now=100.0) is True
+        assert (
+            _has_fresh_native_pane_turn(
+                statuses,
+                activity_at,
+                now=100.0 + _NATIVE_PANE_TURN_STALE_S + 1.0,
+            )
+            is False
+        )
+    # A settled pane never pins, and a status without a stamp never pins.
+    assert _has_fresh_native_pane_turn({"conv_native": "idle"}, activity_at, now=100.0) is False
+    assert _has_fresh_native_pane_turn({"conv_native": "running"}, {}, now=100.0) is False
+
+
+def test_native_terminal_activity_refreshes_turn_pin_and_idle_timer() -> None:
+    """Terminal output refreshes the native turn pin and the runner idle clock.
+
+    Native status edges are sparse (one ``running`` at turn start), so a long
+    producing turn must stay pinned via ``session.terminal.activity`` pulses;
+    a settled pane's output must not re-pin. Each native status edge also
+    resets the runner-level activity clock, so a settling turn restarts the
+    idle window instead of being reaped the instant it finishes.
+
+    :returns: None.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    app = _scaffold_app()
+    registry = app.state.session_resource_registry
+    publish_status = registry._session_status_publisher
+    publish_activity = registry._terminal_activity_publisher
+    assert callable(publish_status)
+    assert callable(publish_activity)
+    activity_marks: list[str] = []
+    app.state.mark_activity = lambda: activity_marks.append("activity")
+    try:
+        for status in ("running", "waiting"):
+            publish_status("conv_native_refresh", status)
+            # The pane has produced nothing for longer than the staleness bound.
+            app.state.native_pane_activity_at["conv_native_refresh"] = (
+                time.monotonic() - _NATIVE_PANE_TURN_STALE_S - 1.0
+            )
+            assert app.state.has_active_work() is False
+
+            publish_activity("conv_native_refresh", "terminal_codex_main")
+            assert app.state.has_active_work() is True
+
+        publish_status("conv_native_refresh", "idle")
+        assert app.state.has_active_work() is False
+        # Output from a settled pane must not resurrect the pin.
+        publish_activity("conv_native_refresh", "terminal_codex_main")
+        assert app.state.has_active_work() is False
+        # Each of the 3 native status edges reset the runner idle clock.
+        assert activity_marks == ["activity"] * 3
+    finally:
+        _session_event_queues_ref.pop("conv_native_refresh", None)
+
+
+def test_inprocess_turn_status_does_not_pin_idle_watchdog() -> None:
+    """A ``running`` edge from an in-process turn never creates a pane pin.
+
+    In-process turns are counted via ``_active_turns`` and publish their
+    status edges through ``_publish_event`` without the native channel's
+    stamp; they may settle without a trailing ``idle`` status event, so
+    counting them here would pin the runner after the turn ended. A side
+    terminal's output must not conjure a pin for them either.
+
+    :returns: None.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    app = _scaffold_app()
+    publish_activity = app.state.session_resource_registry._terminal_activity_publisher
+    assert callable(publish_activity)
+    try:
+        # The recorded-but-unstamped state an in-process turn's status edge
+        # leaves behind in ``_publish_event``.
+        app.state.native_pane_status["conv_inprocess"] = "running"
+        assert app.state.has_active_work() is False
+
+        # A side shell producing output must not stamp (and so pin) it.
+        publish_activity("conv_inprocess", "terminal_side_shell")
+        assert app.state.has_active_work() is False
+    finally:
+        _session_event_queues_ref.pop("conv_inprocess", None)

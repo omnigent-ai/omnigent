@@ -222,7 +222,8 @@ async def _run_inactivity_monitor(
     :param get_last_activity: Callback returning the most recent real
         activity time from the event loop's monotonic clock.
     :param has_active_work: Callback returning whether delivery-critical
-        work is outstanding (turns, live async tools, timers, approvals).
+        work is outstanding (turns, live async tools, timers, approvals,
+        fresh native terminal turns).
     :param request_shutdown: Callback that requests graceful runner shutdown.
     :param poll_interval_s: Optional test override for the monitor cadence,
         e.g. ``0.01``. ``None`` derives a bounded production cadence from
@@ -1690,12 +1691,14 @@ async def _run_tunnel_from_env() -> None:
         """Record real runner work for the inactivity watchdog.
 
         Called by the WebSocket tunnel frame dispatcher for non-keepalive
-        request frames.
+        request frames and by native terminal lifecycle events.
 
         :returns: None.
         """
         nonlocal last_activity_at
         last_activity_at = loop.time()
+
+    app.state.mark_activity = _mark_activity
 
     def _last_activity() -> float:
         """Return the last real runner activity time.
