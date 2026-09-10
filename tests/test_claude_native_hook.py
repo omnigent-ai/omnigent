@@ -2273,7 +2273,9 @@ def _scripted_client(
       * ``"connect"`` — :class:`httpx.ConnectError` (server never reached: hard)
       * ``"severed"`` — :class:`httpx.RemoteProtocolError` (established then
         dropped: a held-poll sever iff ``held_s`` >= the floor)
-      * ``"5xx"``     — a 503 response (server sick: hard)
+      * ``"5xx"``     — a 503 response (hard iff ``held_s`` < the floor; a
+        gateway 5xx ending a held poll is a sever)
+      * ``"ok"``      — a 200 response (the human answered: final)
 
     :param script: Per-attempt ``(kind, held_s)`` plan.
     :param monkeypatch: Installs the fake clock + no-op sleep.
@@ -2310,6 +2312,8 @@ def _scripted_client(
                 raise httpx.RemoteProtocolError("server dropped the poll", request=req)
             if kind == "5xx":
                 return httpx.Response(503, text="upstream down", request=req)
+            if kind == "ok":
+                return httpx.Response(200, json={"ok": True}, request=req)
             raise AssertionError(f"unknown scripted kind {kind!r}")
 
     _ScriptedClient.calls = calls
@@ -2459,6 +2463,67 @@ def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyP
         "a slow human behind a severing proxy was capped — the #1782 regression"
     )
     assert len(calls) == n_severs + 1  # retried through every sever, then answered
+
+
+def test_reattach_gateway_5xx_after_held_poll_never_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway 5xx that ends a HELD poll is a sever, not a sick server.
+
+    The Databricks front door answers an idle long-poll with 504 after 300s.
+    Counting those as hard failures fail-asked a parked approval into the
+    unwatched TUI after ``cap`` severs (40 minutes). Held past the floor, a
+    5xx must reset the counter exactly like a torn connection does.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    client = _scripted_client(
+        script=[("5xx", held)] * (cap * 3) + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200, (
+        "a slow human behind a 504-answering gateway was capped"
+    )
+    assert len(client.calls) == cap * 3 + 1
+
+
+def test_reattach_held_poll_sever_resets_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a held-poll sever the next re-POST waits only the initial backoff.
+
+    The server clears the approval card ``_HARNESS_ELICITATION_REPARK_GRACE_S``
+    (10s) after a severed wait unless the same id re-parks first, so a
+    backoff that kept doubling past 10s flipped the card to "Resolved
+    elsewhere" on every proxy sever. Growth is reserved for hard failures.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    client = _scripted_client(
+        script=[("connect", 0.0)] * 3 + [("severed", floor + 290.0)] * 2 + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(claude_native_hook.time, "sleep", sleeps.append)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200
+    initial = claude_native_hook._PERMISSION_RETRY_INITIAL_BACKOFF_S
+    # Three hard failures double the wait; each held-poll sever resets it.
+    assert sleeps == [initial, initial * 2, initial * 4, initial, initial]
 
 
 def test_reattach_fast_flapping_connection_is_hard_failure(

@@ -50,8 +50,9 @@ if TYPE_CHECKING:
 # respawning harness/tool subprocesses) every ≤30s for 24h — the spin-loop half
 # of the zombie pileup.
 _PERMISSION_TIMEOUT_S = 86400.0
-# First retry must land inside the server's re-park grace (proxies
-# sever idle long-polls); later retries back off.
+# Every retry after a held-poll sever must land inside the server's
+# re-park grace (proxies sever idle long-polls); only hard failures
+# back off.
 _PERMISSION_RETRY_INITIAL_BACKOFF_S = 1.0
 _PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
 # Fail unreachable-server connects fast into the backoff loop instead
@@ -680,18 +681,23 @@ def _post_hook_with_reattach(
 
     Failure classification:
 
-    * **Hard failure → count toward the cap.** A 5xx, or a connection that
-      never established (:func:`_never_connected_errors`), or an established
-      connection that dropped in under :data:`_PERMISSION_HELD_POLL_FLOOR_S`
-      (a flapping/crash-looping server). This is the spin.
-    * **Held-poll sever → reset the counter.** An established connection that
-      dropped mid-poll after being held ≥ the floor. That is a proxy severing
-      an idle long-poll — the re-park mechanism working as intended — so it
-      must NOT count, or a legitimately-parked human approval behind a
-      severing proxy would be capped after a handful of severs. Classifying by
-      *how the request failed* (established-then-severed vs never-connected),
-      not by elapsed wall-clock, is what makes "a slow human is never capped"
-      hold even when the proxy severs every 30-60s.
+    * **Hard failure → count toward the cap.** A 5xx returned in under
+      :data:`_PERMISSION_HELD_POLL_FLOOR_S`, or a connection that never
+      established (:func:`_never_connected_errors`), or an established
+      connection that dropped in under the floor (a flapping/crash-looping
+      server). This is the spin.
+    * **Held-poll sever → reset the counter and the backoff.** An established
+      connection that dropped mid-poll after being held ≥ the floor, or a
+      gateway 5xx (the Databricks front door answers an idle long-poll with
+      504 after 300s) that arrived after the poll was held ≥ the floor. Either
+      is a proxy severing an idle long-poll — the re-park mechanism working as
+      intended — so it must NOT count, or a legitimately-parked human approval
+      behind a severing proxy would be capped after a handful of severs.
+      Classifying by *how the request failed* (established-then-severed vs
+      never-connected), not by elapsed wall-clock alone, is what makes "a slow
+      human is never capped" hold even when the proxy severs every 30-60s. The
+      backoff resets too, so the re-POST re-parks the same id inside the
+      server's re-park grace and the approval card never clears between polls.
 
     A hard 4xx is final (bad request won't succeed on retry).
 
@@ -778,10 +784,14 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
                 return None
-            # 5xx: server responded but is sick — a hard failure (the spin).
-            is_hard_failure = True
+            # A fast 5xx is a sick server (the spin). One that arrives only
+            # after the poll was held past the floor is a gateway timing out
+            # an idle long-poll (a 504 at 300s) — a held-poll sever.
+            held_s = time.monotonic() - attempt_started
+            is_hard_failure = held_s < _PERMISSION_HELD_POLL_FLOOR_S
+            kind = "sick" if is_hard_failure else "held-poll severed by gateway"
             print(
-                f"omnigent {hook_label} hook: Omnigent request failed; retrying: {exc}",
+                f"omnigent {hook_label} hook: Omnigent request failed ({kind}); retrying: {exc}",
                 file=sys.stderr,
             )
         except httpx.HTTPError as exc:
@@ -806,8 +816,11 @@ def _post_hook_with_reattach(
             consecutive_hard_failures += 1
         else:
             # A proxy severed a genuinely-held poll — the re-park mechanism
-            # working as intended. Reset so a slow human is never capped.
+            # working as intended. Reset so a slow human is never capped, and
+            # re-POST promptly so the same id re-parks inside the server's
+            # re-park grace instead of letting the card clear between polls.
             consecutive_hard_failures = 0
+            backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
         if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
             print(
                 f"omnigent {hook_label} hook: giving up after "
