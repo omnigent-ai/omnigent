@@ -6972,9 +6972,13 @@ def _ensure_runner_relay(
             extra={"session_id": session_id},
         )
     # A session bound to an already-connected runner has no ``runner_last_seen``
-    # until the tunnel's next ping; stamp it now so a server recycle inside that
-    # window cannot read the fresh binding as an orphaned runner.
-    session_live_state.touch_runner_liveness([runner_id])
+    # until the next ping; stamp it now so a recycle in that window cannot read
+    # it as orphaned. Registered tunnels only: a mid-rebind drop must not re-stamp.
+    from omnigent.runtime import get_runner_router
+
+    runner_router = get_runner_router()
+    if runner_router is None or runner_router.runner_is_online(runner_id):
+        session_live_state.touch_runner_liveness([runner_id])
     ready = asyncio.Event()
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
