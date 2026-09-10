@@ -1051,9 +1051,45 @@ def _cross_family_routing_warning(
         f"'{expected}' family is missing, or lacks a base URL, credential, or "
         f"model), so the session was routed to its '{family_name}' endpoint. "
         "If that endpoint does not serve this model, every turn will fail (for "
-        f"example with a 404). Add a usable '{expected}' family to the provider "
-        f"config, or pick a model its '{family_name}' family serves."
+        f"example with a 404). Add an '{expected}' family to the provider config "
+        f"pointing at that surface's base URL, or pick a model the '{family_name}' "
+        "family serves."
     )
+
+
+def _databricks_gateway_anthropic_surface(
+    family_name: str, base_url: str, model_id: str
+) -> str | None:
+    """Derived Anthropic Messages base URL for a Claude id on a Databricks gateway.
+
+    A ``kind: gateway`` provider commonly declares only its OpenAI-compatible
+    (Codex/Responses) family, pasting the Databricks AI Gateway ``.../codex/v1``
+    base URL. Claude is not served on that OpenAI ``/chat/completions`` surface;
+    the same gateway origin serves it at ``/anthropic``, which Pi speaks
+    natively. So a Claude id that would otherwise fall through to the OpenAI
+    family is routed to the derived Anthropic surface for real, instead of
+    404-ing on ``/chat/completions``.
+
+    Fires only for a recognized Databricks AI Gateway base URL (host allowlist
+    + path shape, via :func:`is_databricks_ai_gateway_url`); a generic gateway's
+    Messages URL is not derivable, so those keep the advisory-warning
+    fallthrough (declare an ``anthropic`` family with the Messages base URL to
+    route natively there). The model id is left verbatim — the user named it for
+    this gateway, and we only change which surface it is sent to.
+
+    :param family_name: The family being resolved; only ``"openai"`` derives.
+    :param base_url: That family's configured base URL.
+    :param model_id: The resolved model id.
+    :returns: The ``/anthropic`` base URL when this is a Claude id on a
+        Databricks-AI-Gateway OpenAI family, else ``None``.
+    """
+    if family_name != "openai":
+        return None
+    if model_catalog.model_family_token(model_id) != "claude":
+        return None
+    if not _is_databricks_ai_gateway_url(base_url):
+        return None
+    return _gateway_anthropic_base_url(base_url)
 
 
 def _gateway_pi_model_entry(
@@ -1167,13 +1203,6 @@ def _inline_family_pi_provider(
         family = entry.family(family_name)
         if family is None or not family.base_url:
             continue
-        # Determine the API type based on family and wire_api setting.
-        if family_name == "anthropic":
-            api = "anthropic-messages"
-        elif family.wire_api == CHAT_WIRE_API:
-            api = "openai-completions"
-        else:
-            api = "openai-responses"
         # A static key (or $VAR) — Pi reads a literal/env apiKey directly; an
         # auth_command becomes a "!command" Pi resolves at request time.
         if family.api_key:
@@ -1198,6 +1227,35 @@ def _inline_family_pi_provider(
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
         # Anthropic API but rejected by the Databricks AI Gateway.
         resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
+        # Pick the API surface. A Claude id that would otherwise fall through to
+        # a gateway's OpenAI family is routed to that gateway's Anthropic
+        # Messages surface when the base URL is a recognized Databricks AI
+        # Gateway — Pi speaks it natively and Claude lives there, so the model
+        # works for real instead of 404-ing on /chat/completions. A generic
+        # gateway's Messages URL can't be derived, so those keep the advisory
+        # warning below.
+        derived_anthropic = _databricks_gateway_anthropic_surface(
+            family_name, family.base_url, resolved_model
+        )
+        credential_warning: str | None
+        if derived_anthropic is not None:
+            base_url = derived_anthropic
+            api = "anthropic-messages"
+            # The Databricks AI Gateway authenticates with Authorization: Bearer
+            # regardless of the family's declared credential form.
+            auth_header = True
+            credential_warning = None
+        else:
+            base_url = family.base_url
+            if family_name == "anthropic":
+                api = "anthropic-messages"
+            elif family.wire_api == CHAT_WIRE_API:
+                api = "openai-completions"
+            else:
+                api = "openai-responses"
+            # Advisory when the model landed on the other family's wire; a raw
+            # passthrough endpoint rejects it, and silence reads as a hang.
+            credential_warning = _cross_family_routing_warning(entry, family_name, resolved_model)
         model_entry = _gateway_pi_model_entry(
             resolved_model,
             configured_context_window=family.context_window,
@@ -1205,14 +1263,12 @@ def _inline_family_pi_provider(
         )
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
-            base_url=family.base_url,
+            base_url=base_url,
             api=api,
             model=resolved_model,
             api_key=api_key,
             auth_header=auth_header,
-            # Advisory when the model landed on the other family's wire; a raw
-            # passthrough endpoint rejects it, and silence reads as a hang.
-            credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
+            credential_warning=credential_warning,
             extra_models=[model_entry],
         )
     return None
