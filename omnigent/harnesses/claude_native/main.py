@@ -23,6 +23,7 @@ import sys
 import uuid
 
 from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.runtime.context_saver import CONTEXT_SAVER_AVAILABLE_ENV
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
@@ -1407,6 +1408,9 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
+    context_saver_available = os.environ.get(CONTEXT_SAVER_AVAILABLE_ENV)
+    if context_saver_available is not None:
+        terminal_env[CONTEXT_SAVER_AVAILABLE_ENV] = context_saver_available
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.

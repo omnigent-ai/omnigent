@@ -67,6 +67,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysReadInboxTool,
 )
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
+from omnigent.tools.builtins.context_read import SysContextReadTool
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
@@ -239,6 +240,8 @@ _OS_ENV_TOOLS = frozenset(
         SysOsShellTool.name(),
     }
 )
+
+_CONTEXT_SAVER_TOOLS = frozenset({SysContextReadTool.name()})
 
 # Priority 5b: REST-backed tools — runner calls server REST APIs.
 # (sys_call_async / sys_cancel_async moved to _ASYNC_INBOX_TOOLS)
@@ -480,6 +483,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # what discovers host-scope skills (``.agents/skills`` and friends), and a
     # native session's only tool surface is this relay.
     | _SKILL_TOOLS
+    | _CONTEXT_SAVER_TOOLS
 )
 
 
@@ -533,6 +537,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         SysAgentGetTool,
         SysAgentListTool,
     )
+    from omnigent.tools.builtins.context_read import SysContextReadTool
     from omnigent.tools.builtins.list_comments import ListCommentsTool
     from omnigent.tools.builtins.os_env import (
         SysOsEditTool,
@@ -548,11 +553,15 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
     schemas: list[_JsonObject] = []
+    seen: set[str] = set()
 
     def _append(function_dict: _JsonObject) -> None:
         name = function_dict.get("name")
         if not isinstance(name, str):
             return
+        if name in seen:
+            return
+        seen.add(name)
         description = function_dict.get("description")
         parameters = _string_object_dict(function_dict.get("parameters")) or {
             "type": "object",
@@ -632,6 +641,39 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             "Could not create OSEnvironment for native relay OS tool schemas",
             extra={"session_id": runner_primary_session_id()},
         )
+
+    # The runner process does not share the server's RuntimeCaps object. Load
+    # the same user/project setting from the authoritative session workspace
+    # so native harnesses receive the relay tool when enabled.
+    from omnigent.runtime import get_caps
+    from omnigent.runtime.context_saver import (
+        context_saver_has_filesystem_access,
+        load_context_saver_settings,
+    )
+
+    workspace = Path(os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd())))
+    caps = get_caps()
+    context_settings = None
+    if caps.context_saver_available:
+        context_settings = caps.context_saver
+        if not context_settings.enabled:
+            try:
+                context_settings = load_context_saver_settings(workspace)
+            except ValueError:
+                context_settings = None
+    harness = spec.executor.harness_kind if spec is not None else None
+    if (
+        context_settings is not None
+        and context_settings.enabled
+        and context_saver_has_filesystem_access(
+            harness=harness,
+            os_env_available=spec is not None and spec.os_env is not None,
+        )
+    ):
+        context_schema = _string_object_dict(SysContextReadTool().get_schema())
+        function = _string_object_dict(context_schema.get("function")) if context_schema else None
+        if function is not None:
+            _append(function)
 
     return schemas
 
@@ -879,6 +921,7 @@ def _bounded_discovery_result(
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
     _OS_ENV_TOOLS
+    | _CONTEXT_SAVER_TOOLS
     | _REST_TOOLS
     | _FILE_TOOLS
     | _TERMINAL_TOOLS
@@ -6205,10 +6248,11 @@ async def execute_tool(
             if agent_spec is None:
                 return "Error: agent_spec not available for MCP dispatch"
             output = await mcp_manager.call_tool(agent_spec, tool_name, args)
-        elif tool_name in _OS_ENV_TOOLS:
+        elif tool_name in (_OS_ENV_TOOLS | _CONTEXT_SAVER_TOOLS):
             output = await _execute_os_env_tool(
                 tool_name,
                 args,
+                server_client=server_client,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 runner_workspace=runner_workspace,
@@ -6757,6 +6801,7 @@ async def _execute_os_env_tool(
     tool_name: str,
     args: _JsonObject,
     *,
+    server_client: httpx.AsyncClient | None = None,
     agent_spec: AgentSpec | None = None,
     conversation_id: str | None = None,
     runner_workspace: Path | None = None,
@@ -6767,6 +6812,8 @@ async def _execute_os_env_tool(
 
     :param tool_name: Built-in OS tool name, e.g. ``"sys_os_read"``.
     :param args: Parsed tool-call arguments.
+    :param server_client: Authenticated runner-to-server client used for
+        caller-scoped Context Saver inference when available.
     :param agent_spec: Agent spec resolved for the current turn, or
         ``None`` when unavailable.
     :param conversation_id: Conversation id used for the fallback
@@ -6782,18 +6829,98 @@ async def _execute_os_env_tool(
     :returns: Serialized tool result string.
     """
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
+    from omnigent.runtime import get_caps
+    from omnigent.runtime.context_saver import (
+        ContextFile,
+        ContextReadRequest,
+        ContextSaverAction,
+        ContextSaverDecision,
+        ContextSaverSettings,
+        classify_file_read,
+        classify_shell_candidates,
+        context_saver_has_filesystem_access,
+        load_context_saver_settings,
+        record_context_saver_event,
+        redirect_tool_result,
+        shell_read_candidates,
+    )
+    from omnigent.runtime.focused_read import (
+        ConfiguredFocusedReadWorker,
+        FocusedReadTechnique,
+        ServerProxyFocusedReadWorker,
+        resolve_configured_focused_read_connection,
+    )
+
+    harness = (
+        getattr(agent_spec.executor, "harness_kind", None) if agent_spec is not None else None
+    )
+    context_read_authorized = context_saver_has_filesystem_access(
+        harness=harness,
+        os_env_available=agent_spec is not None and agent_spec.os_env is not None,
+    )
+    if tool_name == SysContextReadTool.name() and not context_read_authorized:
+        return json.dumps(
+            {"error": "sys_context_read requires an authorized filesystem capability"}
+        )
+
+    os_env_spec = _effective_runner_os_env_spec(
+        agent_spec,
+        conversation_id,
+        runner_workspace,
+    )
+    assert os_env_spec.cwd is not None
+    workspace = runner_workspace or Path(os_env_spec.cwd)
+    caps = get_caps()
+    if tool_name == SysContextReadTool.name() and not caps.context_saver_available:
+        return json.dumps({"error": "Context Saver is unavailable in this deployment"})
+    context_settings = ContextSaverSettings()
+    if caps.context_saver_available:
+        context_settings = caps.context_saver
+        if not context_settings.enabled:
+            try:
+                context_settings = load_context_saver_settings(workspace)
+            except ValueError as exc:
+                return json.dumps({"error": f"invalid Context Saver configuration: {exc}"})
 
     os_env = None
     try:
-        os_env = create_os_environment(
-            _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
-        )
+        os_env = create_os_environment(os_env_spec)
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 
         if tool_name == SysOsReadTool.name():
+            path = cast("str", args.get("path", ""))
+            if context_settings.enabled:
+                preflight = await os_env.read_metadata(path=path)
+                if isinstance(preflight, dict) and preflight.get("encoding") == "utf-8":
+                    total_lines = preflight.get("total_lines")
+                    total_bytes = preflight.get("total_bytes")
+                    if isinstance(total_lines, int):
+                        decision = classify_file_read(
+                            path=path,
+                            offset=args.get("offset"),
+                            limit=args.get("limit"),
+                            total_lines=total_lines,
+                            settings=context_settings,
+                        )
+                        if decision.action is ContextSaverAction.REDIRECT:
+                            redirect = redirect_tool_result(decision)
+                            record_context_saver_event(
+                                decision,
+                                harness=(
+                                    getattr(agent_spec.executor, "harness_kind", None)
+                                    if agent_spec is not None
+                                    else "unknown"
+                                )
+                                or "unknown",
+                                tool_name=tool_name,
+                                outcome="redirect",
+                                input_bytes=total_bytes if isinstance(total_bytes, int) else None,
+                                output_bytes=len(redirect.encode("utf-8")),
+                            )
+                            return redirect
             result = await os_env.read(
-                path=cast("str", args.get("path", "")),
+                path=path,
                 offset=cast("int", args.get("offset", 1)),
                 # Unspecified limit → agent-tool default (2 000 lines).
                 # None is now "unlimited" in _read_impl, so we must be explicit.
@@ -6832,10 +6959,225 @@ async def _execute_os_env_tool(
             if filesystem_registry is not None and conversation_id is not None:
                 filesystem_registry.record_change(_path, "modified", conversation_id)
         elif tool_name == SysOsShellTool.name():
+            command = cast("str", args.get("command", ""))
+            if context_settings.enabled:
+                candidates = shell_read_candidates(
+                    command,
+                    max_bounded_lines=context_settings.focused_read.min_lines,
+                )
+                line_counts: dict[str, int | None] = {}
+                total_bytes = 0
+                for candidate in candidates.paths:
+                    preflight = await os_env.read_metadata(path=candidate)
+                    if not isinstance(preflight, dict) or preflight.get("encoding") != "utf-8":
+                        line_counts[candidate] = None
+                        continue
+                    candidate_lines = preflight.get("total_lines")
+                    line_counts[candidate] = (
+                        candidate_lines if isinstance(candidate_lines, int) else None
+                    )
+                    candidate_bytes = preflight.get("total_bytes")
+                    if isinstance(candidate_bytes, int):
+                        total_bytes += candidate_bytes
+                decision = classify_shell_candidates(
+                    candidates,
+                    settings=context_settings,
+                    line_counts=line_counts,
+                )
+                if decision.action is ContextSaverAction.REDIRECT:
+                    redirect = redirect_tool_result(decision)
+                    record_context_saver_event(
+                        decision,
+                        harness=(
+                            getattr(agent_spec.executor, "harness_kind", None)
+                            if agent_spec is not None
+                            else "unknown"
+                        )
+                        or "unknown",
+                        tool_name=tool_name,
+                        outcome="redirect",
+                        input_bytes=total_bytes,
+                        output_bytes=len(redirect.encode("utf-8")),
+                    )
+                    return redirect
+                if decision.action is ContextSaverAction.UNKNOWN:
+                    record_context_saver_event(
+                        decision,
+                        harness=(
+                            getattr(agent_spec.executor, "harness_kind", None)
+                            if agent_spec is not None
+                            else "unknown"
+                        )
+                        or "unknown",
+                        tool_name=tool_name,
+                        outcome="unknown",
+                    )
             result = await os_env.shell(
-                command=cast("str", args.get("command", "")),
+                command=command,
                 timeout=cast("int | None", args.get("timeout")),
             )
+        elif tool_name == SysContextReadTool.name():
+            if not context_settings.enabled:
+                return json.dumps({"error": "Context Saver is disabled"})
+            technique_name = args.get("technique", "focused_read")
+            if technique_name != "focused_read" or not context_settings.focused_read.enabled:
+                return json.dumps({"error": "No requested Context Saver technique is enabled"})
+            raw_paths = args.get("paths")
+            question = args.get("question")
+            if (
+                not isinstance(raw_paths, list)
+                or not all(isinstance(path, str) and path for path in raw_paths)
+                or not isinstance(question, str)
+            ):
+                return json.dumps(
+                    {"error": "sys_context_read requires string paths and a string question"}
+                )
+
+            class _Reader:
+                def __init__(self) -> None:
+                    self._total_bytes = 0
+
+                async def read(self, path: str) -> ContextFile:
+                    metadata = await os_env.read_metadata(path=path)
+                    if not isinstance(metadata, dict):
+                        raise ValueError("metadata read returned an invalid result")
+                    if error := metadata.get("error"):
+                        raise ValueError(str(error))
+                    if metadata.get("encoding") != "utf-8":
+                        raise ValueError("binary and unsupported files are not supported")
+                    total_bytes = metadata.get("total_bytes")
+                    if not isinstance(total_bytes, int):
+                        raise ValueError("metadata read returned invalid size metadata")
+                    self._total_bytes += total_bytes
+                    if self._total_bytes > context_settings.focused_read.max_total_bytes:
+                        raise ValueError("worker input exceeds the configured byte limit")
+                    raw = await os_env.read(
+                        path=path,
+                        offset=1,
+                        limit=None,
+                        max_text_bytes=total_bytes,
+                    )
+                    if not isinstance(raw, dict):
+                        raise ValueError("read returned an invalid result")
+                    if error := raw.get("error"):
+                        raise ValueError(str(error))
+                    if raw.get("encoding") != "utf-8":
+                        raise ValueError("binary and unsupported files are not supported")
+                    content = raw.get("content")
+                    total_lines = raw.get("total_lines")
+                    actual_total_bytes = raw.get("total_bytes")
+                    if (
+                        not isinstance(content, str)
+                        or not isinstance(total_lines, int)
+                        or not isinstance(actual_total_bytes, int)
+                    ):
+                        raise ValueError("read returned invalid text metadata")
+                    if actual_total_bytes != total_bytes:
+                        raise ValueError("file changed while it was being read")
+                    encoded_content_bytes = sum(
+                        len(content[index : index + 64 * 1024].encode("utf-8"))
+                        for index in range(0, len(content), 64 * 1024)
+                    )
+                    if encoded_content_bytes != actual_total_bytes:
+                        raise ValueError("read returned inconsistent byte metadata")
+                    return ContextFile(
+                        path=path,
+                        content=content,
+                        total_lines=total_lines,
+                        total_bytes=actual_total_bytes,
+                    )
+
+            worker = caps.context_saver_worker
+            if worker is None and server_client is not None and conversation_id is not None:
+                if await ServerProxyFocusedReadWorker.available(server_client, conversation_id):
+                    worker = ServerProxyFocusedReadWorker(server_client, conversation_id)
+            if worker is None:
+                databricks_profile = None
+                if context_settings.focused_read.worker_model.startswith("databricks/"):
+                    from omnigent.spec.types import DatabricksAuth
+
+                    if agent_spec is not None:
+                        databricks_profile = _resolve_uc_profile(agent_spec)
+                    if databricks_profile is None:
+                        from omnigent.runtime.workflow import _load_global_auth
+
+                        global_auth = _load_global_auth()
+                        if isinstance(global_auth, DatabricksAuth):
+                            databricks_profile = global_auth.profile or None
+
+                connection_params = resolve_configured_focused_read_connection(
+                    context_settings.focused_read.worker_model,
+                    worker_provider=context_settings.focused_read.worker_provider,
+                    databricks_profile=databricks_profile,
+                )
+                worker = ConfiguredFocusedReadWorker(
+                    connection_params=connection_params,
+                )
+            technique = FocusedReadTechnique(context_settings.focused_read, worker)
+            context_result = await technique.render(
+                ContextReadRequest(
+                    paths=tuple(cast("list[str]", raw_paths)),
+                    question=question,
+                    reader=_Reader(),
+                    requested_output_budget=max(
+                        256, context_settings.focused_read.max_excerpt_lines * 20
+                    ),
+                    session_id=conversation_id,
+                )
+            )
+            decision = ContextSaverDecision(
+                ContextSaverAction.REDIRECT,
+                "focused_read_available",
+                context_result.source_paths,
+            )
+            worker_route = context_settings.focused_read.worker_model
+            route_provider = worker_route.split("/", 1)[0]
+            record_context_saver_event(
+                decision,
+                harness=(
+                    getattr(agent_spec.executor, "harness_kind", None)
+                    if agent_spec is not None
+                    else "unknown"
+                )
+                or "unknown",
+                tool_name=tool_name,
+                outcome="failure" if context_result.failure else "success",
+                input_bytes=context_result.input_bytes,
+                output_bytes=context_result.output_bytes,
+                worker_input_tokens=context_result.worker_input_tokens,
+                worker_output_tokens=context_result.worker_output_tokens,
+                worker_route=worker_route,
+                worker_model_reported=context_result.worker_model_reported,
+                latency_ms=context_result.latency_ms,
+            )
+            result = {
+                "technique": context_result.technique,
+                "model_routing": {
+                    "primary_models": "all",
+                    "worker_route": worker_route,
+                    "worker_model_reported": context_result.worker_model_reported,
+                    "route_provider": route_provider,
+                    "non_databricks_source_sharing_allowed": (
+                        route_provider != "databricks"
+                        and context_settings.focused_read.allow_source_upload
+                    ),
+                },
+                "content": context_result.content,
+                "source_paths": list(context_result.source_paths),
+                "relevant_line_ranges": {
+                    path: [list(item) for item in ranges]
+                    for path, ranges in context_result.relevant_line_ranges.items()
+                },
+                "input_bytes": context_result.input_bytes,
+                "output_bytes": context_result.output_bytes,
+                "worker_input_tokens": context_result.worker_input_tokens,
+                "worker_output_tokens": context_result.worker_output_tokens,
+                "latency_ms": context_result.latency_ms,
+                "failure": context_result.failure,
+                "next_step": (
+                    "Use targeted direct reads for exact text before editing or verification."
+                ),
+            }
         else:
             return f"Error: {tool_name} not implemented"
     except Exception as exc:

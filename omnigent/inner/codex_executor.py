@@ -33,7 +33,7 @@ from collections.abc import (
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -46,6 +46,7 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runtime.context_saver import CONTEXT_SAVER_AVAILABLE_ENV
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
@@ -77,6 +78,9 @@ from .executor import (
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
+
+if TYPE_CHECKING:
+    from omnigent.runtime.context_saver import ContextSaverSettings
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +144,7 @@ _STREAM_READ_CHUNK_SIZE = 65536
 _CODEX_HOME_SYMLINK_FILES = ("auth.json", ".credentials.json", "memories_1.sqlite")
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
-# by default; generated as a merged regular file when subagent routing is on.
+# by default; generated as a merged regular file when Omnigent adds hooks.
 _CODEX_HOOKS_FILENAME = "hooks.json"
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
@@ -1046,6 +1050,11 @@ CODEX_ROUTER_DIR_ENV_VAR = "OMNIGENT_CODEX_SUBAGENT_ROUTER_DIR"
 # Session the spawns belong to, baked into the generated hook commands.
 CODEX_ROUTER_SESSION_ID_ENV_VAR = "OMNIGENT_CODEX_SUBAGENT_ROUTER_SESSION_ID"
 _CODEX_ROUTER_HOOK_MODULE = "omnigent.inner.hook_scripts.codex_router_hook"
+# Context Saver must gate Codex's built-in shell before ``commandExecution``;
+# the mirrored shell event arrives only after Codex has already run it.
+_CODEX_CONTEXT_SAVER_HOOK_MODULE = "omnigent.inner.hook_scripts.codex_context_saver_hook"
+_CODEX_CONTEXT_SAVER_HOOK_TIMEOUT_SECONDS = 30
+_CODEX_CONTEXT_SAVER_HOOK_MIN_VERSION = (0, 129, 0)
 # Codex flattens the spawn tool name (``collaborationspawn_agent`` on
 # 0.145.x), so the matcher is a regex suffix and never a bare literal.
 _CODEX_SPAWN_AGENT_MATCHER = r".*spawn_agent"
@@ -1059,6 +1068,82 @@ _CODEX_ROUTER_HOOK_TIMEOUT_SECONDS = int(_ROUTER_REQUEST_TIMEOUT_S + _ROUTER_HOO
 # Checked here, at the registration site, rather than as a launch floor: an
 # older codex must still launch, just without the spawn gate.
 _CODEX_ROUTING_HOOK_MIN_VERSION = (0, 145, 0)
+
+
+def codex_context_saver_hook_skip_reason(
+    codex_cli_version: tuple[int, int, int] | None,
+) -> str | None:
+    """Explain why the Context Saver pre-execution gate cannot be registered."""
+    if codex_cli_version is None or codex_cli_version >= _CODEX_CONTEXT_SAVER_HOOK_MIN_VERSION:
+        return None
+    spelled = ".".join(str(part) for part in codex_cli_version)
+    minimum = ".".join(str(part) for part in _CODEX_CONTEXT_SAVER_HOOK_MIN_VERSION)
+    return (
+        f"codex {spelled} predates trusted PreToolUse hooks (need >= {minimum}); "
+        "Context Saver enforcement degraded"
+    )
+
+
+def codex_context_saver_hooks_settings(
+    settings: ContextSaverSettings,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Build the catch-all ``PreToolUse`` gate for Codex built-in reads."""
+    if not settings.enabled:
+        return {"hooks": {}}
+    argv = [
+        python_executable or sys.executable,
+        "-I",
+        "-m",
+        _CODEX_CONTEXT_SAVER_HOOK_MODULE,
+        "--min-lines",
+        str(settings.focused_read.min_lines),
+    ]
+    if settings.focused_read.enabled:
+        argv.append("--focused-read-enabled")
+    return {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": shlex.join(argv),
+                            "timeout": _CODEX_CONTEXT_SAVER_HOOK_TIMEOUT_SECONDS,
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+
+def _effective_context_saver_settings(workspace: Path) -> ContextSaverSettings:
+    """Resolve the operator cap and user/project settings for one Codex session."""
+    from omnigent.runtime import get_caps
+    from omnigent.runtime.context_saver import (
+        ContextSaverSettings,
+        context_saver_process_available,
+        load_context_saver_settings,
+    )
+
+    if os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return ContextSaverSettings()
+    caps = get_caps()
+    if not caps.context_saver_available or not context_saver_process_available():
+        return ContextSaverSettings()
+    if caps.context_saver.enabled:
+        return caps.context_saver
+    try:
+        return load_context_saver_settings(workspace)
+    except ValueError as exc:
+        logger.warning("Context Saver configuration is invalid; enforcement disabled: %s", exc)
+        return ContextSaverSettings()
 
 
 def codex_routing_hook_skip_reason(codex_cli_version: tuple[int, int, int] | None) -> str | None:
@@ -1358,15 +1443,13 @@ def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bo
     return (source.get(CODEX_EXTENDED_CATALOG_ENV_VAR) or "").strip() == "1"
 
 
-#: Omnigent's own per-session signals for a codex launch: the subagent-router
-#: rendezvous, its session id, and the extended-catalog request. The runner sets
-#: them in the harness process env, and the executor reads them back out of
-#: ``_clean_codex_env``'s filtered copy — so they must be allowed through it or
-#: both features silently never engage on the wrapped ``codex`` harness.
+#: Omnigent per-session signals copied from the runner to Codex. They must
+#: survive ``_clean_codex_env`` so routing, catalog, and hard-disable gates work.
 _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     CODEX_EXTENDED_CATALOG_ENV_VAR,
+    CONTEXT_SAVER_AVAILABLE_ENV,
 )
 
 
@@ -2091,6 +2174,20 @@ def _dynamic_tool_specs(tools: list[ToolSpec]) -> list[CodexParams]:
     return specs
 
 
+def _without_context_saver_advertisement(
+    system_prompt: str,
+    tools: list[ToolSpec],
+) -> tuple[str, list[ToolSpec]]:
+    """Remove Context Saver guidance and its tool when its gate is degraded."""
+    from omnigent.runtime.prompt import CONTEXT_SAVER_INSTRUCTION
+
+    prompt_parts = [
+        part for part in system_prompt.split("\n\n") if part.strip() != CONTEXT_SAVER_INSTRUCTION
+    ]
+    filtered_tools = [tool for tool in tools if tool.get("name") != "sys_context_read"]
+    return "\n\n".join(prompt_parts), filtered_tools
+
+
 def _result_text(result: CodexToolResult) -> str:
     if isinstance(result, str):
         return result
@@ -2308,11 +2405,17 @@ class _CodexAppServerSession:
         # Serialize concurrent writes to the subprocess stdin so that parallel
         # tool-call responses don't interleave bytes on the pipe.
         self._stdin_lock = asyncio.Lock()
+        self._context_saver_requested = False
+        self.context_saver_enforced = False
+        self.context_saver_degraded_reason: str | None = None
 
     async def start(self) -> None:
         if self._started:
             return
         self._loop = asyncio.get_running_loop()
+        self._context_saver_requested = False
+        self.context_saver_enforced = False
+        self.context_saver_degraded_reason = None
         codex_home_root = Path(tempfile.gettempdir())
         if self._cwd and self._cwd != "/":
             try:
@@ -2346,22 +2449,40 @@ class _CodexAppServerSession:
         # created temp dir has neither, causing 401 Unauthorized errors
         # for subscription-authenticated users.
         config_source = _codex_home_config_source_from_env()
-        # When the runner advertises a subagent-routing endpoint, the user's
-        # hooks.json is merged into a generated file registering the routing
-        # hooks instead of being symlinked in untouched. Only an auto-harness
-        # Smart Routing session gets that endpoint, so a plain or pinned session
-        # keeps the symlink — and with it mid-session edits to the user's file.
+        # Generated gates replace the user's hooks symlink with one merged file;
+        # disabled sessions keep the live symlink and its mid-session edits.
+        context_saver_settings = _effective_context_saver_settings(Path(self._cwd or os.getcwd()))
+        self._context_saver_requested = context_saver_settings.enabled
         router_bridge_dir = codex_router_bridge_dir(self._env)
-        if router_bridge_dir is not None:
-            # Probed only on the routing path so a plain session never pays the
-            # subprocess. A CLI too old for the spawn gate drops the hooks and
-            # keeps the symlinked home, so routing no-ops instead of blocking.
-            skip_reason = codex_routing_hook_skip_reason(
-                await _codex_cli_version(self._codex_path)
-            )
+        codex_cli_version = None
+        if self._context_saver_requested or router_bridge_dir is not None:
+            codex_cli_version = await _codex_cli_version(self._codex_path)
+
+        context_saver_hooks_registered = self._context_saver_requested
+        if context_saver_hooks_registered:
+            skip_reason = codex_context_saver_hook_skip_reason(codex_cli_version)
             if skip_reason is not None:
                 logger.warning("%s", skip_reason)
+                self.context_saver_degraded_reason = skip_reason
+                context_saver_hooks_registered = False
+        if router_bridge_dir is not None:
+            routing_skip_reason = codex_routing_hook_skip_reason(codex_cli_version)
+            if routing_skip_reason is not None:
+                logger.warning("%s", routing_skip_reason)
                 router_bridge_dir = None
+
+        generated_hook_payloads: list[Mapping[str, Any]] = []
+        if context_saver_hooks_registered:
+            generated_hook_payloads.append(
+                codex_context_saver_hooks_settings(context_saver_settings)
+            )
+        if router_bridge_dir is not None:
+            generated_hook_payloads.append(
+                codex_router_hooks_settings(
+                    router_bridge_dir,
+                    session_id=codex_router_session_id(self._env),
+                )
+            )
         # Off the loop: this copies/symlinks a home AND (on the routing path)
         # shells out to ``codex debug models`` with a 10s timeout. Run inline it
         # stalled every other session sharing this event loop for that long.
@@ -2369,7 +2490,7 @@ class _CodexAppServerSession:
             _populate_codex_home_config,
             self._codex_home_dir,
             config_source,
-            inject_hooks=router_bridge_dir is not None,
+            inject_hooks=bool(generated_hook_payloads),
             extend_model_catalog=codex_extended_catalog_requested(self._env),
         )
         self._codex_config_overrides = materialize_codex_provider_config(
@@ -2377,11 +2498,10 @@ class _CodexAppServerSession:
             self._codex_config_overrides,
             retry_policy=self._retry_policy,
         )
-        if router_bridge_dir is not None:
-            write_codex_router_hooks_file(
+        if generated_hook_payloads:
+            write_codex_hooks_file(
                 self._codex_home_dir,
-                router_bridge_dir,
-                session_id=codex_router_session_id(self._env),
+                generated_hook_payloads,
                 user_hooks_source=config_source / _CODEX_HOOKS_FILENAME,
             )
         # Override CODEX_HOME so Codex stores its data (including conversation
@@ -2416,6 +2536,26 @@ class _CodexAppServerSession:
                 },
             )
             self._started = True
+            if context_saver_hooks_registered:
+                from omnigent.harnesses.codex_native.app_server import (
+                    trust_codex_context_saver_hooks,
+                )
+
+                try:
+                    await trust_codex_context_saver_hooks(
+                        self._request,
+                        cwd=self._cwd or os.getcwd(),
+                    )
+                except Exception as exc:  # noqa: BLE001 - degrade without blocking Codex
+                    reason = describe_exception(exc)
+                    self.context_saver_degraded_reason = reason
+                    logger.warning(
+                        "Context Saver enforcement degraded for codex: %s",
+                        reason,
+                        exc_info=True,
+                    )
+                else:
+                    self.context_saver_enforced = True
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
                 # routing hooks need the trust handshake to be enforced.
@@ -2592,6 +2732,9 @@ class _CodexAppServerSession:
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
+
+        if self._context_saver_requested and not self.context_saver_enforced:
+            system_prompt, tools = _without_context_saver_advertisement(system_prompt, tools)
 
         # Fresh turn: forget any prior turn's gateway-error signals and clear
         # the shared watchdog slot so a resolved earlier failure can't be

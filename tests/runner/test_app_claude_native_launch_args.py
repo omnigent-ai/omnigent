@@ -281,6 +281,17 @@ def test_build_native_claude_terminal_env_rejects_raw_key_on_helper_path() -> No
         build_native_claude_terminal_env(leaking)
 
 
+def test_claude_terminal_env_includes_context_saver_hard_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server hard-disable reaches Claude and its hook subprocesses."""
+    from omnigent.runtime.context_saver import CONTEXT_SAVER_AVAILABLE_ENV
+
+    monkeypatch.setenv(CONTEXT_SAVER_AVAILABLE_ENV, "0")
+
+    assert build_native_claude_terminal_env(None)[CONTEXT_SAVER_AVAILABLE_ENV] == "0"
+
+
 def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
     """The Databricks ucode/profile gateway session, end to end through the env seams.
 

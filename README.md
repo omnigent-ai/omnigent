@@ -387,6 +387,98 @@ Server operators can set the same key in the YAML passed to
 
 </details>
 
+<details>
+<summary>Reduce large-file context with Context Saver</summary>
+
+Context Saver is off by default. Enable it for the current project, or add
+`--global` to make it your user default:
+
+```bash
+omnigent config set context_saver=true
+```
+
+When enabled, broad reads of text files at least 350 lines long are redirected
+to `sys_context_read`. Focused Read asks a configured cheaper worker model a
+specific question and returns only its answer, verified source ranges, and
+short excerpts. Explicit line-range reads continue to return exact text.
+
+Focused Read uses one worker route independently of the primary model:
+
+| Primary session model | Focused Read worker route |
+| --- | --- |
+| Claude | `focused_read.worker_model` |
+| GPT / Codex | `focused_read.worker_model` |
+| GLM | `focused_read.worker_model` |
+| Gemini | `focused_read.worker_model` |
+| Any other model | `focused_read.worker_model` |
+
+The default route is `databricks/context-saver-cheap`. It is a Databricks AI
+Gateway route, so its backing model can change without an Omnigent release.
+Run `omnigent config list` to see the configured route. Each Context Saver
+result card also shows that route and, when available, the model identifier
+reported by the provider for that Focused Read. This is not primary-model
+failover: if the worker fails, the primary model stays unchanged and Context
+Saver requests targeted reads instead.
+
+Advanced settings live in `.omnigent/config.yaml` (project) or
+`~/.omnigent/config.yaml` (user). Because this example selects a worker model,
+put it in the user-level file:
+
+```yaml
+context_saver:
+  enabled: true
+  techniques:
+    focused_read:
+      enabled: true
+      min_lines: 350
+      worker_model: databricks/context-saver-cheap
+      max_excerpt_lines: 80
+      request_timeout_seconds: 30
+```
+
+The worker model must include an explicit provider prefix. To use a cheaper
+model outside Databricks, configure it in the user-level file and explicitly
+consent to sending source through that provider:
+
+```yaml
+context_saver:
+  enabled: true
+  techniques:
+    focused_read:
+      worker_model: openai/gpt-4o-mini
+      worker_provider: openai
+      allow_source_upload: true
+```
+
+`worker_provider` names an existing entry under the user-level `providers:`
+configuration and supplies its credentials and base URL. It may be omitted
+when the entry name matches the model prefix (for example, `openai`) or when
+the provider uses ambient credentials, such as local Ollama.
+
+Project configuration may tune thresholds, but it cannot set `worker_model`,
+`worker_provider`, or `allow_source_upload`. This prevents a checked-in project
+from silently redirecting source code to a different provider.
+
+Databricks workers use the session's authorized profile and do not require
+`allow_source_upload`. Other providers use the credentials configured by
+`omnigent setup` and require the explicit consent above. Start a new session
+after changing this setting; restart the local server when changing a
+user-level setting. In managed deployments, a server-provided worker runs
+through the authenticated session connection; its credentials are never sent
+to the runner. An explicit
+`context_saver.enabled: false` in a dedicated server configuration is a
+deployment hard gate and cannot be overridden by user or project settings.
+
+Wrapped `codex` sessions require Codex CLI 0.129 or newer so Omnigent can trust
+the pre-tool hook that gates built-in shell reads. If that hook cannot be
+verified, the session continues in degraded mode and does not advertise
+Context Saver; the runner log explains why.
+
+Cursor and Copilot sessions do not advertise Context Saver because their
+built-in file and shell tools do not yet have a verified pre-read gate.
+
+</details>
+
 ### 3. Choose & switch models
 
 ```bash

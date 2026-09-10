@@ -18,6 +18,7 @@ from omnigent.inner.codex_executor import (
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     _CodexAppServerSession,
     _populate_codex_home_config,
+    codex_context_saver_hooks_settings,
     codex_extended_catalog_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
@@ -26,6 +27,7 @@ from omnigent.inner.codex_executor import (
     write_codex_router_hooks_file,
 )
 from omnigent.inner.hook_scripts.subagent_router import REQUEST_TIMEOUT_S
+from omnigent.runtime.context_saver import ContextSaverSettings, FocusedReadSettings
 
 _USER_HOOKS = {
     "hooks": {
@@ -219,7 +221,7 @@ class _HomeSnapshot:
 
 
 class _FakeVersionProc:
-    """Answers the routing gate's ``codex --version`` probe."""
+    """Answers the generated-hook ``codex --version`` probe."""
 
     def __init__(self, version: str) -> None:
         self._stdout = f"codex-cli {version}\n".encode()
@@ -235,6 +237,7 @@ def _start_app_server(
     env: dict[str, str],
     probes: list[str] | None = None,
     codex_version: str = "0.145.0",
+    context_saver_settings: ContextSaverSettings | None = None,
 ) -> tuple[tuple[str, ...], _HomeSnapshot]:
     source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
     workspace = tmp_path / "work"
@@ -265,6 +268,11 @@ def _start_app_server(
     monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
     monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
     monkeypatch.setattr(codex_executor, "_probe_codex_model_catalog", fake_probe)
+    monkeypatch.setattr(
+        codex_executor,
+        "_effective_context_saver_settings",
+        lambda _workspace: context_saver_settings or ContextSaverSettings(),
+    )
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(workspace),
@@ -307,6 +315,67 @@ def test_app_server_keeps_symlinked_hooks_when_routing_off(
 
     assert argv[:2] == ("/bin/echo", "app-server")
     assert hooks.is_symlink
+
+
+def test_context_saver_registers_a_pretooluse_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = ContextSaverSettings(
+        enabled=True,
+        techniques={"focused_read": FocusedReadSettings(min_lines=123)},
+    )
+
+    _argv, home = _start_app_server(
+        tmp_path,
+        monkeypatch,
+        env={},
+        context_saver_settings=settings,
+    )
+
+    assert not home.is_symlink
+    assert home.payload is not None
+    context_hook = home.payload["hooks"]["PreToolUse"][0]["hooks"][0]
+    assert "omnigent.inner.hook_scripts.codex_context_saver_hook" in context_hook["command"]
+    assert "--min-lines 123" in context_hook["command"]
+    assert shlex.split(context_hook["command"])[1:3] == ["-I", "-m"]
+
+
+def test_disabled_context_saver_keeps_user_hooks_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _argv, home = _start_app_server(
+        tmp_path,
+        monkeypatch,
+        env={},
+        context_saver_settings=ContextSaverSettings(),
+    )
+
+    assert home.is_symlink
+    assert home.payload == _USER_HOOKS
+
+
+def test_old_codex_reports_context_saver_as_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = ContextSaverSettings(enabled=True)
+
+    with caplog.at_level("WARNING"):
+        _argv, home = _start_app_server(
+            tmp_path,
+            monkeypatch,
+            env={},
+            codex_version="0.128.0",
+            context_saver_settings=settings,
+        )
+
+    assert home.is_symlink
+    assert "Context Saver enforcement degraded" in caplog.text
+
+
+def test_context_saver_hook_settings_are_empty_when_disabled() -> None:
+    assert codex_context_saver_hooks_settings(ContextSaverSettings()) == {"hooks": {}}
 
 
 # ── The three codex session classes (SDK arm) ───────────────────────

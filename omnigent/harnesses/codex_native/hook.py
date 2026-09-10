@@ -126,6 +126,45 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     session_id = state.session_id
 
     hook_event = payload.get("hook_event_name", "")
+    if hook_event == "PreToolUse":
+        from omnigent.runtime.context_saver import (
+            ContextSaverAction,
+            classify_native_tool_call,
+            context_saver_process_available,
+            load_context_saver_settings,
+            native_redirect_hook_output,
+            record_context_saver_event,
+        )
+
+        context_settings = None
+        if context_saver_process_available():
+            try:
+                context_settings = load_context_saver_settings(Path.cwd())
+            except ValueError:
+                context_settings = None
+        if context_settings is not None and context_settings.enabled:
+            decision = classify_native_tool_call(
+                payload.get("tool_name"),
+                payload.get("tool_input"),
+                workspace=Path.cwd(),
+                settings=context_settings,
+            )
+            if decision.action is ContextSaverAction.REDIRECT:
+                record_context_saver_event(
+                    decision,
+                    harness="codex-native",
+                    tool_name=str(payload.get("tool_name", "")),
+                    outcome="redirect",
+                )
+                sys.stdout.write(json.dumps(native_redirect_hook_output(decision)))
+                return 0
+            if decision.action is ContextSaverAction.UNKNOWN:
+                record_context_saver_event(
+                    decision,
+                    harness="codex-native",
+                    tool_name=str(payload.get("tool_name", "")),
+                    outcome="unknown",
+                )
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
     if eval_request is None:
         # Unrecognized hook event or an mcp__omnigent__* tool (relay-enforced).

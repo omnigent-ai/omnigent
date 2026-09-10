@@ -17,9 +17,16 @@ if TYPE_CHECKING:
 class RunnerSessionInitializer:
     """Share initialization readiness within one runner tunnel generation."""
 
-    def __init__(self, registry: TunnelRegistry, *, server_version: str) -> None:
+    def __init__(
+        self,
+        registry: TunnelRegistry,
+        *,
+        server_version: str,
+        context_saver_available: bool,
+    ) -> None:
         self._registry = registry
         self._server_version = server_version
+        self._context_saver_available = context_saver_available
         self._tasks: dict[
             tuple[str, int, str, str, str | None],
             asyncio.Task[httpx.Response],
@@ -58,6 +65,7 @@ class RunnerSessionInitializer:
                     json=build_runner_session_init_payload(
                         conversation,
                         server_version=self._server_version,
+                        context_saver_available=self._context_saver_available,
                         suppress_recovery_turn=suppress_recovery_turn,
                     ),
                     timeout=timeout,

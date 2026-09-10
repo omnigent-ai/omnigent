@@ -56,6 +56,10 @@ class _FakeOSEnvironment(OSEnvironment):
         del path, offset, limit
         return {}
 
+    async def read_metadata(self, path: str) -> OpResult:
+        del path
+        return {}
+
     async def write(self, path: str, content: str) -> OpResult:
         del path, content
         return {}

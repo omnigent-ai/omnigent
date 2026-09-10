@@ -15,6 +15,7 @@ def test_runtime_caps_default_value() -> None:
     # Default execution_timeout is 7200s per the dataclass definition.
     # Failure means the default was changed without updating dependents.
     assert caps.execution_timeout == 7200
+    assert caps.context_saver_available is True
 
 
 def test_runtime_caps_custom_value() -> None:

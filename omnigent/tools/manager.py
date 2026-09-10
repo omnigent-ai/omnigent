@@ -28,6 +28,7 @@ from omnigent.tools.builtins import (
     SysAgentListTool,
     SysCallAsyncTool,
     SysCancelAsyncTool,
+    SysContextReadTool,
     SysListModelsTool,
     SysReadInboxTool,
     SysScheduledTaskCreateTool,
@@ -115,6 +116,7 @@ class ToolManager:
         workdir: Path | None = None,
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
+        context_saver_enabled: bool | None = None,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -141,11 +143,14 @@ class ToolManager:
             tools use this shared instance instead of creating their
             own. ``None`` falls back to per-call creation via
             ``create_os_environment()``.
+        :param context_saver_enabled: Per-runner workspace override for Context
+            Saver tool registration. ``None`` uses :class:`RuntimeCaps`.
         """
         self._spec = spec
         self._workdir = workdir
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
+        self._context_saver_enabled = context_saver_enabled
         self._started = False
         self._tools: dict[str, Tool] = {}
         self._srt_available = is_srt_available()
@@ -160,6 +165,7 @@ class ToolManager:
         self._register_session_tools()
         self._register_agent_mgmt_tools()
         self._register_os_env_tools()
+        self._register_context_saver_tools()
         self._register_terminal_tools()
         self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
@@ -196,6 +202,24 @@ class ToolManager:
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
         self._register_browser_tools()
+
+    def _register_context_saver_tools(self) -> None:
+        """Expose Context Saver when the agent has authorized filesystem access."""
+        from omnigent.runtime.context_saver import context_saver_has_filesystem_access
+
+        caps = get_caps()
+        enabled = self._context_saver_enabled
+        if enabled is None:
+            enabled = bool(getattr(getattr(caps, "context_saver", None), "enabled", False))
+        if (
+            bool(getattr(caps, "context_saver_available", False))
+            and enabled
+            and context_saver_has_filesystem_access(
+                harness=self._spec.executor.harness_kind,
+                os_env_available=self._os_env is not None,
+            )
+        ):
+            self._tools[SysContextReadTool.name()] = SysContextReadTool()
 
     def _register_policy_tools(self) -> None:
         """

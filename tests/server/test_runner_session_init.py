@@ -66,6 +66,7 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
         registry,
         server_version="0.6.0.dev0",
+        context_saver_available=False,
     )
     conversation = _conversation()
 
@@ -79,6 +80,7 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     assert first_response is second_response
     assert len(client.calls) == 1
     assert client.calls[0]["session_init"]["snapshot"]["workspace"] == "/tmp/workspace"
+    assert client.calls[0]["session_init"]["context_saver_available"] is False
 
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert cached is first_response
@@ -98,6 +100,7 @@ async def test_initializer_evicts_rejected_result_for_retry() -> None:
     initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
         registry,
         server_version="0.6.0.dev0",
+        context_saver_available=True,
     )
     conversation = _conversation()
 
@@ -193,7 +196,11 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
     bound = conversation_store.list_conversations_by_runner_id("runner_fork")
     assert [c.id for c in bound] == [fork.id]
 
-    payload = build_runner_session_init_payload(bound[0], server_version="0.6.0.dev0")
+    payload = build_runner_session_init_payload(
+        bound[0],
+        server_version="0.6.0.dev0",
+        context_saver_available=True,
+    )
     envelope = parse_runner_session_init_envelope(payload)
     assert envelope is not None
 

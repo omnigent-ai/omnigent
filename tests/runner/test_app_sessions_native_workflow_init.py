@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -43,6 +44,111 @@ from tests.runner.conftest import (
     _sse,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.asyncio
+async def test_session_init_applies_server_context_saver_hard_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trusted server envelope tightens runner and child-process gates."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.app import _tighten_runner_context_saver_availability
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from omnigent.runtime import _globals
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.runtime.context_saver import CONTEXT_SAVER_AVAILABLE_ENV
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps(context_saver_available=True))
+    monkeypatch.delenv(CONTEXT_SAVER_AVAILABLE_ENV, raising=False)
+    app, _pm, _harness = _build_lifecycle_app()
+    session_id = "context_saver_hard_disable"
+    payload = build_runner_session_init_payload(
+        Conversation(
+            id=session_id,
+            agent_id="agent_context_saver",
+            runner_id="runner_context_saver",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id=session_id,
+        ),
+        server_version="0.6.0.dev0",
+        context_saver_available=False,
+        suppress_recovery_turn=True,
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+
+    _tighten_runner_context_saver_availability(True)
+    assert response.status_code == 201
+    assert _globals._caps.context_saver_available is False
+    assert os.environ[CONTEXT_SAVER_AVAILABLE_ENV] == "0"
+
+
+@pytest.mark.asyncio
+async def test_legacy_session_init_applies_server_context_saver_hard_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback init body tightens the gate before harness launch."""
+    from omnigent.runtime import _globals
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.runtime.context_saver import CONTEXT_SAVER_AVAILABLE_ENV
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps(context_saver_available=True))
+    monkeypatch.delenv(CONTEXT_SAVER_AVAILABLE_ENV, raising=False)
+    app, _pm, _harness = _build_lifecycle_app()
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "context_saver_legacy_hard_disable",
+                "agent_id": "agent_context_saver",
+                "context_saver_available": False,
+            },
+        )
+
+    assert response.status_code == 201
+    assert _globals._caps.context_saver_available is False
+    assert os.environ[CONTEXT_SAVER_AVAILABLE_ENV] == "0"
+
+
+@pytest.mark.asyncio
+async def test_forwarded_turn_applies_server_context_saver_hard_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn tightens the gate before the runner launches its harness."""
+    from omnigent.runtime import _globals
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.runtime.context_saver import CONTEXT_SAVER_AVAILABLE_ENV
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps(context_saver_available=True))
+    monkeypatch.delenv(CONTEXT_SAVER_AVAILABLE_ENV, raising=False)
+    app, pm, harness_client = _build_lifecycle_app()
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/context_saver_turn/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent_context_saver",
+                "model": "context-saver-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+                "context_saver_available": False,
+            },
+        )
+        assert response.status_code == 202
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await asyncio.sleep(0.05)
+
+    assert pm.cleared_in_flight
+    assert harness_client.posted_bodies
+    assert _globals._caps.context_saver_available is False
+    assert os.environ[CONTEXT_SAVER_AVAILABLE_ENV] == "0"
 
 
 @pytest.mark.asyncio

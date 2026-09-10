@@ -44,6 +44,17 @@ def test_ask_on_os_tools_asks_for_sys_os_tools(tool: str) -> None:
     assert tool in result["reason"]
 
 
+def test_ask_on_os_tools_asks_for_every_context_read_path() -> None:
+    """Context Saver reads require approval with every path visible."""
+    paths = ["src/auth.py", "src/session.py"]
+
+    result = ask_on_os_tools(tc("sys_context_read", {"paths": paths, "question": "Where?"}))
+
+    assert result["result"] == "ASK"
+    assert "sys_context_read" in result["reason"]
+    assert all(path in result["reason"] for path in paths)
+
+
 # ── ask_on_os_tools: Claude Code / Codex native tools ─────────────────────
 
 

@@ -5387,6 +5387,46 @@ def _tool_relay_handler_factory(
 
             raw_event = payload.get("hook_event_name")
             hook_event = raw_event if isinstance(raw_event, str) else ""
+            if hook_event == "PreToolUse":
+                from omnigent.runtime.context_saver import (
+                    ContextSaverAction,
+                    classify_native_tool_call,
+                    context_saver_process_available,
+                    load_context_saver_settings,
+                    native_redirect_hook_output,
+                    record_context_saver_event,
+                )
+
+                workspace = Path(os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd())))
+                context_settings = None
+                if context_saver_process_available():
+                    try:
+                        context_settings = load_context_saver_settings(workspace)
+                    except ValueError:
+                        context_settings = None
+                if context_settings is not None and context_settings.enabled:
+                    decision = classify_native_tool_call(
+                        payload.get("tool_name"),
+                        payload.get("tool_input"),
+                        workspace=workspace,
+                        settings=context_settings,
+                    )
+                    if decision.action is ContextSaverAction.REDIRECT:
+                        record_context_saver_event(
+                            decision,
+                            harness="claude-native",
+                            tool_name=str(payload.get("tool_name", "")),
+                            outcome="redirect",
+                        )
+                        self._respond_hook_output(native_redirect_hook_output(decision))
+                        return
+                    if decision.action is ContextSaverAction.UNKNOWN:
+                        record_context_saver_event(
+                            decision,
+                            harness="claude-native",
+                            tool_name=str(payload.get("tool_name", "")),
+                            outcome="unknown",
+                        )
             if policy_client is None or session_id is None:
                 self._respond_hook_output(None)
                 return

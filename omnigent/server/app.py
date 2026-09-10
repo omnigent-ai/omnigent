@@ -53,6 +53,7 @@ from omnigent.harness_plugins import (
 )
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
+    get_caps,
     get_terminal_registry,
     pending_elicitations,
     set_harness_process_manager,
@@ -1285,6 +1286,7 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        context_saver_available=get_caps().context_saver_available,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,

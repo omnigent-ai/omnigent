@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from omnigent.runtime.context_saver import ContextSaverSettings, FocusedReadWorker
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -42,6 +44,14 @@ class RuntimeCaps:
         invoked via subprocess — it is validated to a fixed
         allowlist (``"docker"`` | ``"podman"``) at both the
         dataclass and parser layers.
+    :param context_saver_available: Operator-controlled hard gate for
+        Context Saver. User and project settings may enable the feature
+        only while this is ``True``. Deployments set it to ``False`` to
+        prevent mutable workspace configuration from enabling file reads
+        through a worker model.
+    :param context_saver_worker: Optional server-owned Focused Read worker.
+        Out-of-process runners invoke it through the authenticated session
+        proxy instead of receiving its credentials or client object.
     :param default_policies: Server-wide policies appended after
         per-agent policies on every session. Loaded from the
         ``policies:`` key in the server ``--config`` YAML
@@ -111,3 +121,11 @@ class RuntimeCaps:
     # Always present so consumers read one value object instead of re-parsing
     # config; the defaults describe an unconfigured deployment.
     routing_settings: RoutingSettings = field(default_factory=_default_routing_settings)
+    # Operator-controlled hard ceiling. User/project configuration is
+    # considered only while this remains enabled.
+    context_saver_available: bool = True
+    # User/project Context Saver settings. Disabled by default.
+    context_saver: ContextSaverSettings = field(default_factory=ContextSaverSettings)
+    # Managed deployments may inject a caller-authenticated server worker;
+    # out-of-process runners reach it through the session proxy route.
+    context_saver_worker: FocusedReadWorker | None = None

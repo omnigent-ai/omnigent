@@ -57,12 +57,13 @@ from .sandbox import (
     run_launcher as _run_launcher,
 )
 
-# Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` and the
-# corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/total_lines
-# for read; bytes_written/created for write; stdout/stderr/exit_code for shell;
-# error/ok markers for all of them) and values mix str/int/bool, so we expose
-# an opaque JSON-shaped dict at this boundary rather than enumerating every
-# shape as a TypedDict tree.
+# Result dict returned by ``read`` / ``read_metadata`` / ``write`` / ``edit`` /
+# ``shell`` and the corresponding ``_*_impl`` helpers. Keys vary by op
+# (content/offset/total_lines for read; total_lines/total_bytes for metadata;
+# bytes_written/created for write; stdout/stderr/exit_code for shell; error/ok
+# markers for all of them) and values mix str/int/bool, so we expose an opaque
+# JSON-shaped dict at this boundary rather than enumerating every shape as a
+# TypedDict tree.
 OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # JSON-RPC payload exchanged between the parent ``_HelperProcessClient`` and
@@ -314,7 +315,12 @@ class OSEnvironment(ABC):
         offset: int = 1,
         limit: int | None = None,
         max_binary_bytes: int | None = None,
+        max_text_bytes: int | None = None,
     ) -> OpResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def read_metadata(self, path: str) -> OpResult:
         raise NotImplementedError
 
     @abstractmethod
@@ -849,6 +855,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         offset: int = 1,
         limit: int | None = None,
         max_binary_bytes: int | None = None,
+        max_text_bytes: int | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -862,6 +869,17 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "offset": offset,
                 "limit": limit,
                 "max_binary_bytes": max_binary_bytes,
+                "max_text_bytes": max_text_bytes,
+            },
+        )
+        return cast(OpResult, result)
+
+    async def read_metadata(self, path: str) -> OpResult:
+        result = await run_sync_on_thread(
+            self._helper.request,
+            {
+                "op": "read_metadata",
+                "path": path,
             },
         )
         return cast(OpResult, result)
@@ -990,7 +1008,7 @@ def _handle_helper_request(
     sandbox: SandboxPolicy,
 ) -> OpResult:
     op = request.get("op")
-    if op == "read":
+    if op in {"read", "read_metadata"}:
         raw_path = request.get("path")
         if not isinstance(raw_path, str) or not raw_path.strip():
             return {"error": "path must be a non-empty string"}
@@ -1000,15 +1018,20 @@ def _handle_helper_request(
             _assert_read_allowed(sandbox, path, cwd)
         except PermissionError as exc:
             return {"error": str(exc)}
+        if op == "read_metadata":
+            return _read_metadata_impl(path)
         offset_raw = request.get("offset", 1)
         offset = offset_raw if isinstance(offset_raw, int) else 1
         max_binary_raw = request.get("max_binary_bytes")
         max_binary_bytes = max_binary_raw if isinstance(max_binary_raw, int) else None
+        max_text_raw = request.get("max_text_bytes")
+        max_text_bytes = max_text_raw if isinstance(max_text_raw, int) else None
         return _read_impl(
             path,
             offset,
             request.get("limit"),
             max_binary_bytes=max_binary_bytes,
+            max_text_bytes=max_text_bytes,
         )
 
     if op == "write":
@@ -1212,6 +1235,25 @@ def _assert_write_allowed(policy: SandboxPolicy, path: Path) -> None:
 # out it is not text.
 _BINARY_SNIFF_BYTES = 8192
 
+# Metadata reads decode incrementally and discard each chunk after counting its
+# line separators. This bounds memory independently of the file size.
+_METADATA_READ_CHUNK_BYTES = 64 * 1024
+
+# Python's ``str.splitlines`` recognizes these separators in addition to CRLF,
+# which is counted as one separator rather than two.
+_SPLITLINES_SINGLE_SEPARATORS = (
+    "\n",
+    "\r",
+    "\v",
+    "\f",
+    "\x1c",
+    "\x1d",
+    "\x1e",
+    "\x85",
+    "\u2028",
+    "\u2029",
+)
+
 
 def _is_binary_file(path: Path) -> bool:
     """Classify *path* as binary by inspecting only its first chunk.
@@ -1279,11 +1321,72 @@ def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
     }
 
 
+def _read_metadata_impl(path: Path) -> OpResult:
+    """Return exact UTF-8 file metadata without retaining file content."""
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    separator_count = 0
+    previous_chunk_ended_with_cr = False
+    saw_text = False
+    last_character = ""
+    sniff_bytes_remaining = _BINARY_SNIFF_BYTES
+
+    with path.open("rb") as file_handle:
+        total_bytes = os.fstat(file_handle.fileno()).st_size
+        while chunk := file_handle.read(_METADATA_READ_CHUNK_BYTES):
+            if sniff_bytes_remaining:
+                sniff = chunk[:sniff_bytes_remaining]
+                if b"\x00" in sniff:
+                    return {
+                        "path": str(path),
+                        "encoding": "base64",
+                        "total_bytes": total_bytes,
+                    }
+                sniff_bytes_remaining -= len(sniff)
+            try:
+                decoded = decoder.decode(chunk, final=False)
+            except UnicodeDecodeError:
+                return {
+                    "path": str(path),
+                    "encoding": "base64",
+                    "total_bytes": total_bytes,
+                }
+            if not decoded:
+                continue
+            chunk_separators = sum(
+                decoded.count(separator) for separator in _SPLITLINES_SINGLE_SEPARATORS
+            )
+            chunk_separators -= decoded.count("\r\n")
+            if previous_chunk_ended_with_cr and decoded.startswith("\n"):
+                chunk_separators -= 1
+            separator_count += chunk_separators
+            previous_chunk_ended_with_cr = decoded.endswith("\r")
+            saw_text = True
+            last_character = decoded[-1]
+
+        try:
+            decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            return {
+                "path": str(path),
+                "encoding": "base64",
+                "total_bytes": total_bytes,
+            }
+
+    has_unterminated_line = saw_text and last_character not in _SPLITLINES_SINGLE_SEPARATORS
+    return {
+        "path": str(path),
+        "encoding": "utf-8",
+        "total_lines": separator_count + int(has_unterminated_line),
+        "total_bytes": total_bytes,
+    }
+
+
 def _read_impl(
     path: Path,
     offset: int,
     limit: JsonValue,
     max_binary_bytes: int | None = None,
+    max_text_bytes: int | None = None,
 ) -> OpResult:
     """
     Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
@@ -1312,9 +1415,13 @@ def _read_impl(
         :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
     :param max_binary_bytes: Byte cap for binary files (see above). ``None``
         returns a descriptor only.
+    :param max_text_bytes: Optional hard cap for a text read. At most one byte
+        beyond this limit is read before returning an error, so callers can
+        enforce an upload limit without first materializing an oversized file.
     :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
         ``content``, ``offset``, ``limit``, ``returned_lines``, and
-        ``total_lines``.  For binary, ``encoding="base64"``, ``total_bytes``,
+        ``total_lines``. When ``max_text_bytes`` is set, ``total_bytes`` is
+        also returned. For binary, ``encoding="base64"``, ``total_bytes``,
         ``truncated`` and either ``content`` (the base64 string, byte-capped
         callers) or a ``note`` (descriptor-only callers).
     """
@@ -1325,12 +1432,23 @@ def _read_impl(
             return {"error": "limit must be >= 1"}
     if max_binary_bytes is not None and max_binary_bytes < 1:
         return {"error": "max_binary_bytes must be >= 1"}
+    if max_text_bytes is not None and max_text_bytes < 0:
+        return {"error": "max_text_bytes must be >= 0"}
 
     if _is_binary_file(path):
         return _read_binary_impl(path, max_binary_bytes)
 
+    total_bytes: int | None = None
     try:
-        text = path.read_text(encoding="utf-8", errors="strict")
+        if max_text_bytes is None:
+            text = path.read_text(encoding="utf-8", errors="strict")
+        else:
+            with path.open("rb") as file_handle:
+                payload = file_handle.read(max_text_bytes + 1)
+            if len(payload) > max_text_bytes:
+                return {"error": f"text file exceeds the {max_text_bytes}-byte read limit"}
+            text = payload.decode("utf-8", errors="strict")
+            total_bytes = len(payload)
     except UnicodeDecodeError:
         # The sniffed prefix decoded cleanly but bytes further in did not (a
         # file that is text up front and binary later). Fall back to the binary
@@ -1342,7 +1460,7 @@ def _read_impl(
     effective_limit = len(lines) if limit is None else limit
     resolved_limit = min(len(lines), start + effective_limit)
     content = "".join(lines[start:resolved_limit])
-    return {
+    result: OpResult = {
         "path": str(path),
         "content": content,
         "encoding": "utf-8",
@@ -1351,6 +1469,9 @@ def _read_impl(
         "returned_lines": max(0, resolved_limit - start),
         "total_lines": len(lines),
     }
+    if total_bytes is not None:
+        result["total_bytes"] = total_bytes
+    return result
 
 
 def _write_impl(path: Path, content: str) -> OpResult:

@@ -1127,6 +1127,21 @@ class _SessionInitContext:
         )
 
 
+def _tighten_runner_context_saver_availability(available: bool) -> None:
+    """Apply a trusted server hard-disable without allowing later re-enablement."""
+    from omnigent.runtime import get_caps
+    from omnigent.runtime.context_saver import (
+        CONTEXT_SAVER_AVAILABLE_ENV,
+        context_saver_process_available,
+    )
+
+    caps = get_caps()
+    if available and caps.context_saver_available and context_saver_process_available():
+        return
+    caps.context_saver_available = False
+    os.environ[CONTEXT_SAVER_AVAILABLE_ENV] = "0"
+
+
 # Language constant the omnigent YAML translator stamps on callable-backed
 # tools (omnigent/spec/omnigent.py:OMNIGENT_TOOL_LANGUAGE). Duplicated rather
 # than imported to avoid pulling the heavy translator module in for one
@@ -3469,6 +3484,8 @@ def create_runner_app(
         if envelope.session_id != session_id or envelope.agent_id != agent_id:
             raise ValueError("session initialization envelope identity mismatch")
 
+        _tighten_runner_context_saver_availability(envelope.context_saver_available)
+
         global _server_version
         _server_version = envelope.server_version
         snapshot = envelope.snapshot
@@ -3508,6 +3525,9 @@ def create_runner_app(
     ) -> _SessionInitContext:
         envelope = parse_runner_session_init_envelope(body)
         if envelope is None:
+            context_saver_available = body.get("context_saver_available")
+            if isinstance(context_saver_available, bool):
+                _tighten_runner_context_saver_availability(context_saver_available)
             return await _load_legacy_session_init_context()
         body_sub_agent = body.get("sub_agent_name")
         if envelope.sub_agent_name != (
@@ -7346,6 +7366,9 @@ def create_runner_app(
         msg_body: _JsonObject,
         conv: str,
     ) -> None:
+        server_context_saver_available = msg_body.get("context_saver_available")
+        if isinstance(server_context_saver_available, bool):
+            _tighten_runner_context_saver_availability(server_context_saver_available)
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         _prior_agent_id = _session_agent_ids.get(conv)
         if (
@@ -7574,13 +7597,30 @@ def create_runner_app(
             all_tools: list[_JsonObject] = []
             if cached_spec is not None:
                 try:
+                    from omnigent.runtime import get_caps
+                    from omnigent.runtime.context_saver import (
+                        load_context_saver_settings,
+                    )
                     from omnigent.tools.manager import (
                         ToolManager,
                     )
 
+                    _runtime_caps = get_caps()
+                    context_saver_enabled = False
+                    if _runtime_caps.context_saver_available:
+                        context_saver_enabled = _runtime_caps.context_saver.enabled
+                        if not context_saver_enabled:
+                            try:
+                                context_saver_enabled = load_context_saver_settings(
+                                    runner_workspace
+                                ).enabled
+                            except ValueError:
+                                context_saver_enabled = False
+
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
+                        context_saver_enabled=context_saver_enabled,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (

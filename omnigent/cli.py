@@ -625,6 +625,7 @@ _LOCAL_CONFIG_RELPATH: Path = Path(".omnigent") / "config.yaml"
 # User-facing keys that ``omnigent config`` accepts. Most mirror ``run``
 # options; session-title guidance configures server-owned metadata generation.
 _AUTO_OPEN_CONVERSATION_CONFIG_KEY = "auto_open_conversation"
+_CONTEXT_SAVER_CONFIG_KEY = "context_saver"
 _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "default_agent",
@@ -636,10 +637,13 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "server",
         "session_title_instructions",
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
+        _CONTEXT_SAVER_CONFIG_KEY,
     }
 )
 _USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"session_title_instructions"})
-_BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
+_BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset(
+    {_AUTO_OPEN_CONVERSATION_CONFIG_KEY, _CONTEXT_SAVER_CONFIG_KEY}
+)
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
 _ConfigValue: TypeAlias = (
@@ -4278,6 +4282,10 @@ def server(
     from omnigent.runtime import init as init_runtime
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.runtime.context_saver import (
+        load_context_saver_settings,
+        parse_context_saver_settings,
+    )
 
     agent_cache = AgentCache(
         artifact_store=artifact_store,
@@ -4294,6 +4302,23 @@ def server(
     routing_settings = parse_routing_settings(cfg.get("routing"))
     routing_backends = _build_routing_backends(cfg, server_llm, routing_settings)
 
+    # The managed local server receives the user config via --config, but that
+    # must not turn it into a deployment override that masks project settings.
+    user_config_path = _effective_global_config_path().resolve()
+    explicit_server_context_saver = (
+        "context_saver" in cfg
+        and config_path is not None
+        and Path(config_path).resolve() != user_config_path
+    )
+    try:
+        context_saver_settings = (
+            parse_context_saver_settings(cfg.get("context_saver"))
+            if explicit_server_context_saver
+            else load_context_saver_settings(Path.cwd())
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
@@ -4303,6 +4328,15 @@ def server(
         routing_client=routing_backends.any(),
         routing_backends=routing_backends,
         routing_settings=routing_settings,
+        # A dedicated server config is operator-controlled: an explicit
+        # ``enabled: false`` is therefore a hard ceiling that project config
+        # cannot reverse. The managed local server reads user/project config,
+        # so capability availability remains true there and ``enabled`` stays
+        # the user's independent opt-in.
+        context_saver_available=(
+            context_saver_settings.enabled if explicit_server_context_saver else True
+        ),
+        context_saver=context_saver_settings,
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -10387,7 +10421,10 @@ def _parse_config_settings(
         ):
             value = str(Path(value).resolve())
         if key in _BOOLEAN_CONFIG_KEYS:
-            parsed[key] = _parse_config_bool(key, value)
+            parsed_value = _parse_config_bool(key, value)
+            parsed[key] = (
+                {"enabled": parsed_value} if key == _CONTEXT_SAVER_CONFIG_KEY else parsed_value
+            )
         else:
             parsed[key] = value
     return parsed
@@ -10396,7 +10433,7 @@ def _parse_config_settings(
 def _harness_deep_merge_keys(
     parsed: dict[str, object],
 ) -> tuple[str, ...]:
-    """Rewrite a ``harness=<id>`` setting for deep-merge into the harness mapping.
+    """Prepare structured CLI settings for safe deep-merging.
 
     ``config set harness=claude-sdk`` should set the default without dropping
     any existing per-harness overrides (``harness.codex.command``, etc.). So
@@ -10407,15 +10444,20 @@ def _harness_deep_merge_keys(
 
     :param parsed: The ``KEY=VALUE`` mapping from :func:`_parse_config_settings`,
         mutated in place when it contains a scalar ``harness`` value.
-    :returns: ``("harness",)`` when *parsed* has a ``harness`` entry, else
-        ``()`` so no deep-merge is requested.
+    Context Saver is also deep-merged so toggling ``enabled`` preserves custom
+    technique thresholds and model aliases.
+
+    :returns: Structured keys that must be merged rather than replaced.
     """
     value = parsed.get("harness")
     if isinstance(value, str):
         parsed["harness"] = {"default": value}
+    deep_merge_keys: list[str] = []
     if "harness" in parsed:
-        return ("harness",)
-    return ()
+        deep_merge_keys.append("harness")
+    if _CONTEXT_SAVER_CONFIG_KEY in parsed:
+        deep_merge_keys.append(_CONTEXT_SAVER_CONFIG_KEY)
+    return tuple(deep_merge_keys)
 
 
 def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: bool) -> None:
@@ -10512,8 +10554,52 @@ def _print_config_default_rows(
             click.echo(f"  harness={default}")
             if overrides:
                 click.echo(f"    # per-harness overrides: {', '.join(sorted(overrides))}")
+        elif k == _CONTEXT_SAVER_CONFIG_KEY and isinstance(v, Mapping):
+            click.echo(f"  context_saver={bool(v.get('enabled', False))}")
         else:
             click.echo(f"  {k}={v}")
+
+
+def _print_effective_context_saver_route(
+    global_cfg: Mapping[str, object],
+    project_cfg: Mapping[str, object],
+) -> None:
+    """Show the effective Focused Read route without exposing credentials."""
+    if (
+        _CONTEXT_SAVER_CONFIG_KEY not in global_cfg
+        and _CONTEXT_SAVER_CONFIG_KEY not in project_cfg
+    ):
+        return
+
+    from omnigent.runtime.context_saver import (
+        DEFAULT_FOCUSED_READ_MODEL,
+        resolve_context_saver_settings,
+    )
+
+    try:
+        settings = resolve_context_saver_settings(
+            global_cfg.get(_CONTEXT_SAVER_CONFIG_KEY),
+            project_cfg.get(_CONTEXT_SAVER_CONFIG_KEY),
+        )
+    except ValueError as exc:
+        click.echo(f"  # Context Saver model route unavailable: {exc}")
+        return
+
+    state = (
+        "enabled in config"
+        if settings.enabled and settings.focused_read.enabled
+        else "disabled in config"
+    )
+    route = settings.focused_read.worker_model
+    click.echo(f"  # Focused Read worker route ({state}): all primary models -> {route}")
+    if route == DEFAULT_FOCUSED_READ_MODEL:
+        click.echo("  # Backing model is managed by Databricks AI Gateway and may vary.")
+    elif not route.startswith("databricks/"):
+        provider = route.split("/", 1)[0]
+        click.echo(
+            "  # Non-Databricks source sharing is allowed for this worker route "
+            f"({provider} route provider)."
+        )
 
 
 def _print_config_defaults() -> None:
@@ -10565,6 +10651,10 @@ def _print_config_defaults() -> None:
             "  # ignored user-level-only setting(s): "
             f"{', '.join(ignored_local_keys)} (set with --global)"
         )
+    _print_effective_context_saver_route(
+        global_cfg,
+        {} if local_is_global else local_cfg,
+    )
 
 
 class _ConfigGroup(click.Group):
@@ -10815,8 +10905,8 @@ def slack_logs(follow: bool) -> None:
 def config_grp() -> None:
     """Get, set, and view Omnigent defaults and credentials.
 
-    Defaults (auto_open_conversation, default_agent, harness, model,
-    server) are used by ``omnigent run``. Project-level config
+    Defaults (auto_open_conversation, context_saver, default_agent, harness,
+    model, server) are used by ``omnigent run``. Project-level config
     (``.omnigent/config.yaml`` in the cwd, like ``.git/config``) overrides
     user-level config (``~/.omnigent/config.yaml``, like ``~/.gitconfig``).
 
@@ -10862,7 +10952,7 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     ``--global`` to ``~/.omnigent/config.yaml`` (user-level, like
     ``~/.gitconfig``). Project values take precedence.
 
-    Supported keys: auto_open_conversation, default_agent, harness,
+    Supported keys: auto_open_conversation, context_saver, default_agent, harness,
     model, server, session_title_instructions. Session title instructions
     configure the shared local server and require ``--global``.
 
@@ -10874,6 +10964,7 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     \b
     Examples:
       omnigent config set default_agent=examples/hello_world.yaml
+      omnigent config set context_saver=true
       omnigent config set --global server=https://<app>.databricksapps.com
     """
     parsed = _parse_config_settings(settings, resolve_paths=is_global)

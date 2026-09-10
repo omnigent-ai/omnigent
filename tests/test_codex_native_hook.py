@@ -229,6 +229,115 @@ def test_pre_tool_use_converts_posts_and_returns_deny(
     assert captured.err == ""
 
 
+def test_context_saver_denies_broad_read_before_policy_round_trip(
+    bridge_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The native pre-tool hook blocks a broad large-file read locally."""
+    from omnigent.runtime import context_saver
+
+    settings = context_saver.parse_context_saver_settings(
+        {"enabled": True, "techniques": {"focused_read": {"min_lines": 5}}}
+    )
+    monkeypatch.setenv(context_saver.CONTEXT_SAVER_AVAILABLE_ENV, "1")
+    monkeypatch.setattr(context_saver, "load_context_saver_settings", lambda _path: settings)
+    # Pytest's log capture may write INFO records to stdout, which is reserved
+    # for the hook's JSON protocol.
+    monkeypatch.setattr(context_saver, "record_context_saver_event", lambda *_a, **_kw: None)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "large.py").write_text("\n".join(f"line {i}" for i in range(10)))
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "cat large.py"},
+        },
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert exit_code == 0
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "sys_context_read" in result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_context_saver_denies_unbounded_read_outside_workspace(
+    bridge_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The native pre-tool hook blocks external reads it cannot inspect."""
+    from omnigent.runtime import context_saver
+
+    settings = context_saver.parse_context_saver_settings(
+        {"enabled": True, "techniques": {"focused_read": {"min_lines": 5}}}
+    )
+    monkeypatch.setenv(context_saver.CONTEXT_SAVER_AVAILABLE_ENV, "1")
+    monkeypatch.setattr(context_saver, "load_context_saver_settings", lambda _path: settings)
+    monkeypatch.setattr(context_saver, "record_context_saver_event", lambda *_a, **_kw: None)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    outside = tmp_path / "outside.py"
+    outside.write_text("value = 1\n")
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(outside)},
+        },
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert exit_code == 0
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "explicit line range" in reason
+    assert "sys_context_read" not in reason
+
+
+def test_server_hard_disable_skips_native_context_saver(
+    bridge_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A deployment hard-disable outranks native workspace settings."""
+    from omnigent.runtime import context_saver
+
+    settings = context_saver.parse_context_saver_settings(
+        {"enabled": True, "techniques": {"focused_read": {"min_lines": 5}}}
+    )
+    monkeypatch.setattr(context_saver, "load_context_saver_settings", lambda _path: settings)
+    monkeypatch.setenv(context_saver.CONTEXT_SAVER_AVAILABLE_ENV, "0")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "large.py").write_text("\n".join(f"line {i}" for i in range(10)))
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "cat large.py"},
+        },
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""
+
+
 def test_user_prompt_submit_converts_posts_and_blocks(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

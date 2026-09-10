@@ -54,6 +54,12 @@ EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
     "attached) or for non-interactive bulk fetching."
 )
 
+CONTEXT_SAVER_INSTRUCTION = (
+    "Context Saver is enabled. For broad understanding of large files, call "
+    "sys_context_read with a specific question. Use direct reads with explicit line "
+    "ranges when exact text is needed, especially before editing or verifying code."
+)
+
 
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
@@ -77,6 +83,20 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     if spec.tools.agents or spec.spawn or dispatches_web_researcher:
         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
     instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
+    from omnigent.runtime import get_caps
+    from omnigent.runtime.context_saver import context_saver_has_filesystem_access
+
+    harness = getattr(getattr(spec, "executor", None), "harness_kind", None)
+    caps = get_caps()
+    if (
+        caps.context_saver_available
+        and caps.context_saver.enabled
+        and context_saver_has_filesystem_access(
+            harness=harness,
+            os_env_available=getattr(spec, "os_env", None) is not None,
+        )
+    ):
+        instructions.append(CONTEXT_SAVER_INSTRUCTION)
     return instructions
 
 

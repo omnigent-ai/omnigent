@@ -23,7 +23,9 @@ from omnigent.policies.schema import (
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
-_SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"})
+_SYS_OS_TOOLS = frozenset(
+    {"sys_context_read", "sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"}
+)
 
 # Claude Code / Codex native tools that MUTATE a file, surfaced via the
 # PreToolUse hook contract. Single source of truth: the write policies in
@@ -240,8 +242,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
 
     Covers six tool-name families:
 
-    - **Omnigent built-in OS tools** (``sys_os_read``,
-      ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
+    - **Omnigent built-in OS tools** (``sys_context_read``,
+      ``sys_os_read``, ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
     - **Claude Code native tools** (``Bash``, ``Read``, ``Write``,
       ``Edit``, ``MultiEdit``, ``NotebookEdit``, ``Glob``, ``Grep``) —
       surfaced via the ``PreToolUse`` hook contract.
@@ -302,6 +304,9 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
             preview = args.get("command", "") if isinstance(args, dict) else ""
         elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
+        elif tool == "sys_context_read":
+            paths = args.get("paths") if isinstance(args, dict) else None
+            preview = paths if isinstance(paths, list) else []
         elif tool == "execute_code":
             code = args.get("code") if isinstance(args, dict) else None
             preview = code[:80] if isinstance(code, str) else ""
@@ -774,7 +779,8 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "callable",
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
-        "covers Omnigent sys_os_* tools, Claude Code and Codex native tools "
+        "covers Omnigent sys_os_* and sys_context_read tools, Claude Code and Codex "
+        "native tools "
         "(Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep), "
         "Cursor native tools (Shell), Pi native tools (read, bash, write, edit), "
         "opencode native tools (bash, edit, read, grep, glob), "

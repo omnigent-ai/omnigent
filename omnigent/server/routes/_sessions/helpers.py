@@ -6752,6 +6752,7 @@ async def _dispatch_skill_slash_command_to_runner(
         "content": meta_content,
         "agent_id": conv.agent_id,
         "model": agent.name,
+        "context_saver_available": get_caps().context_saver_available,
         "has_mcp_servers": has_mcp_servers,
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
         # the turn when no renderer is subscribed to the session stream.
