@@ -23,8 +23,10 @@ from pathlib import Path
 import pytest
 
 from omnigent.terminals.control_bridge import (
+    _PASTE_MAX_BYTES,
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
+    _decode_paste_message,
     _hex_send_keys_commands,
     _read_tmux_buffer,
     bridge_tmux_control_to_websocket,
@@ -846,3 +848,133 @@ async def test_control_bridge_read_only_drops_input() -> None:
     assert ws.sent_text == []
 
     await _kill_and_join(sock, task)
+
+
+def test_paste_message_decodes_only_bounded_base64() -> None:
+    """Only valid, bounded ``paste`` frames decode to raw bytes."""
+    payload = base64.b64encode(b"alpha\nbeta").decode("ascii")
+    assert _decode_paste_message({"type": "paste", "encoding": "base64", "data": payload}) == (
+        b"alpha\nbeta"
+    )
+    # Anything not the strict schema is rejected.
+    assert _decode_paste_message("not-a-dict") is None
+    assert _decode_paste_message({"type": "resize", "cols": 1, "rows": 1}) is None
+    assert _decode_paste_message({"type": "paste", "encoding": "utf-8", "data": "x"}) is None
+    assert _decode_paste_message({"type": "paste", "encoding": "base64", "data": 7}) is None
+    assert _decode_paste_message({"type": "paste", "encoding": "base64", "data": "%%%"}) is None
+    assert _decode_paste_message({"type": "paste", "encoding": "base64", "data": ""}) is None
+    oversized = base64.b64encode(b"x" * (_PASTE_MAX_BYTES + 1)).decode("ascii")
+    assert (
+        _decode_paste_message({"type": "paste", "encoding": "base64", "data": oversized}) is None
+    )
+    exact = base64.b64encode(b"\n" * _PASTE_MAX_BYTES).decode("ascii")
+    decoded = _decode_paste_message({"type": "paste", "encoding": "base64", "data": exact})
+    assert decoded is not None and len(decoded) == _PASTE_MAX_BYTES
+
+
+def test_clipboard_buffer_name_rejects_paste_transport_buffers() -> None:
+    """A paste transport buffer changing is not a user copy to forward."""
+    assert _clipboard_buffer_name(b"%paste-buffer-changed omnigent-paste-abc123") is None
+    assert _clipboard_buffer_name(b"%paste-buffer-changed buffer0") == "buffer0"
+
+
+def _paste_frame(text: bytes) -> dict[str, object]:
+    """Build the browser paste websocket frame for *text*."""
+    return {
+        "type": "websocket.receive",
+        "text": json.dumps(
+            {
+                "type": "paste",
+                "encoding": "base64",
+                "data": base64.b64encode(text).decode("ascii"),
+            }
+        ),
+    }
+
+
+async def _wait_file_bytes(path: Path, expected: bytes, timeout_s: float = 8.0) -> bytes:
+    """Poll *path* until it holds *expected* (or the deadline passes)."""
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    data = b""
+    while asyncio.get_running_loop().time() < deadline:
+        if path.exists():
+            data = path.read_bytes()
+            if data == expected:
+                return data
+        await asyncio.sleep(0.2)
+    return data
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_paste_frame_brackets_for_requesting_pane(tmp_path: Path) -> None:
+    """A multi-line paste reaches a bracketed-paste pane as one wrapped block.
+
+    The pane program enabled ``?2004h`` BEFORE the client attached — the case
+    where the browser xterm cannot know the mode on tmux < 3.7 and a raw-key
+    delivery would submit the first line on its carriage return. The tmux
+    server must wrap the block in ESC[200~/201~ itself, and the transport
+    buffer's ``%paste-buffer-changed`` must not leak a clipboard frame.
+    """
+    sink = tmp_path / "sink"
+    sock, target = await _new_private_tmux(
+        f"stty raw -echo; printf '\\033[?2004h'; exec cat > {sink}"
+    )
+    await asyncio.sleep(0.5)
+
+    ws = _FakeWebSocket(inbound=[_paste_frame(b"alpha\nbeta")])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        expected = b"\x1b[200~alpha\rbeta\x1b[201~"
+        got = await _wait_file_bytes(sink, expected)
+        assert got == expected, f"pane received {got!r}, not one bracketed block"
+        assert ws.sent_text == [], "paste transport buffer leaked a clipboard frame"
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_paste_frame_plain_for_non_requesting_pane(tmp_path: Path) -> None:
+    """Without bracketed paste requested, a paste stays a plain CR-joined block."""
+    sink = tmp_path / "sink"
+    sock, target = await _new_private_tmux(f"stty raw -echo; exec cat > {sink}")
+    await asyncio.sleep(0.5)
+
+    ws = _FakeWebSocket(inbound=[_paste_frame(b"alpha\nbeta")])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        expected = b"alpha\rbeta"
+        got = await _wait_file_bytes(sink, expected)
+        assert got == expected, f"pane received {got!r}, not a plain CR-joined paste"
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_read_only_drops_paste_frames(tmp_path: Path) -> None:
+    """read_only=True must not paste browser text into the pane."""
+    sink = tmp_path / "sink"
+    sock, target = await _new_private_tmux(f"stty raw -echo; exec cat > {sink}")
+    await asyncio.sleep(0.5)
+
+    ws = _FakeWebSocket(inbound=[_paste_frame(b"should\nnot-appear")])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=True
+        )
+    )
+    try:
+        await asyncio.sleep(1.0)
+        assert not sink.exists() or sink.read_bytes() == b""
+    finally:
+        await _kill_and_join(sock, task)

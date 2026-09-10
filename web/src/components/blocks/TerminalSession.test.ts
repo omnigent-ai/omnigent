@@ -20,6 +20,8 @@ import {
   openTerminalLink,
   parseTerminalClipboardMessage,
   sgrWheelReports,
+  TERMINAL_PASTE_MAX_BYTES,
+  terminalPasteMessage,
   terminalTheme,
   terminalKeyEventPayload,
   type ConnectionState,
@@ -155,6 +157,40 @@ describe("tmux clipboard parsing", () => {
     expect(hadRecentTerminalInput(0, 100)).toBe(false);
     expect(hadRecentTerminalInput(1000, 10_000)).toBe(false);
     expect(hadRecentTerminalInput(2000, 1000)).toBe(false);
+  });
+});
+
+describe("terminalPasteMessage", () => {
+  function decodeFrame(frame: string): { type: string; text: string } {
+    const parsed = JSON.parse(frame) as { type: string; encoding: string; data: string };
+    const bytes = Uint8Array.from(atob(parsed.data), (c) => c.charCodeAt(0));
+    return { type: parsed.type, text: new TextDecoder().decode(bytes) };
+  }
+
+  it("routes a multi-line paste through the server paste frame", () => {
+    const frame = terminalPasteMessage("line one\nline two");
+    expect(frame).not.toBeNull();
+    expect(decodeFrame(frame as string)).toEqual({ type: "paste", text: "line one\nline two" });
+  });
+
+  it("treats a lone carriage return as multi-line too", () => {
+    const frame = terminalPasteMessage("one\rtwo");
+    expect(frame).not.toBeNull();
+    expect(decodeFrame(frame as string).text).toBe("one\rtwo");
+  });
+
+  it("round-trips non-ASCII text", () => {
+    const frame = terminalPasteMessage("café λ\nsecond");
+    expect(decodeFrame(frame as string).text).toBe("café λ\nsecond");
+  });
+
+  it("leaves single-line and empty pastes on xterm's native path", () => {
+    expect(terminalPasteMessage("just one line")).toBeNull();
+    expect(terminalPasteMessage("")).toBeNull();
+  });
+
+  it("leaves an oversized paste on xterm's native path", () => {
+    expect(terminalPasteMessage("\n".repeat(TERMINAL_PASTE_MAX_BYTES + 1))).toBeNull();
   });
 });
 

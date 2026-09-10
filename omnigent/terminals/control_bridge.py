@@ -25,6 +25,10 @@ Design notes learned from the protocol (see ``control_bridge`` spike):
   a ``send-keys -l`` command line corrupts the line-based command parser and
   the client exits; the hex channel is byte-exact for ESC sequences, control
   chars, and UTF-8 multibyte alike.
+- Multi-line browser pastes arrive as ``{"type": "paste"}`` text frames and are
+  delivered via ``load-buffer`` + ``paste-buffer -p`` so the tmux server itself
+  brackets the block iff the pane program requested bracketed paste — pane
+  state the browser xterm cannot see for modes enabled before it attached.
 
 The browser-facing stream uses binary frames for raw pane bytes, text JSON
 frames for resize controls, and binary frames for input. A typed text JSON
@@ -45,6 +49,7 @@ import json
 import logging
 import re
 import shutil
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
@@ -116,6 +121,16 @@ _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # Correlating the notification with this client's recent input prevents one
 # attached browser from overwriting every other viewer's local clipboard.
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
+
+# Multi-line browser pastes are delivered through tmux's own paste pipeline
+# (``load-buffer`` + ``paste-buffer -p``): only the tmux server reliably knows
+# whether the pane program requested bracketed paste (``#{bracket_paste_flag}``
+# needs tmux >= 3.7), so it — not the browser xterm — decides whether to wrap
+# the block in ESC[200~/201~. Transport buffers carry this name prefix so the
+# resulting ``%paste-buffer-changed`` is never mistaken for a user copy.
+_PASTE_MAX_BYTES: Final[int] = 1024 * 1024
+_PASTE_BUFFER_PREFIX: Final = "omnigent-paste-"
+_PASTE_DELIVER_TIMEOUT_S: Final[float] = 5.0
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -206,7 +221,101 @@ def _clipboard_buffer_name(line: bytes) -> str | None:
     raw_name = line[len(_CLIPBOARD_BUFFER_CHANGED_PREFIX) :]
     if _CLIPBOARD_BUFFER_NAME_RE.fullmatch(raw_name) is None:
         return None
-    return raw_name.decode("ascii")
+    name = raw_name.decode("ascii")
+    # Loading a paste transport buffer fires this notification too; it is not
+    # a user copy and must never round-trip into anyone's clipboard.
+    if name.startswith(_PASTE_BUFFER_PREFIX):
+        return None
+    return name
+
+
+def _decode_paste_message(ctl: object) -> bytes | None:
+    """Decode one browser ``paste`` control frame to raw pasted bytes.
+
+    :param ctl: The parsed JSON value from a browser text frame.
+    :returns: The pasted bytes, or ``None`` when the value is not a valid,
+        bounded ``{"type": "paste", "encoding": "base64", "data": ...}`` frame.
+    """
+    if not isinstance(ctl, dict) or ctl.get("type") != "paste":
+        return None
+    if ctl.get("encoding") != "base64":
+        return None
+    encoded = ctl.get("data")
+    # Reject an oversized payload on its base64 length, before decoding.
+    if not isinstance(encoded, str) or len(encoded) > -(-_PASTE_MAX_BYTES // 3) * 4:
+        return None
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        return None
+    if not raw or len(raw) > _PASTE_MAX_BYTES:
+        return None
+    return raw
+
+
+async def _paste_via_tmux_buffer(
+    tmux: str,
+    socket_path: str,
+    tmux_target: str,
+    buffer_name: str,
+    data: bytes,
+) -> bool:
+    """Deliver pasted bytes to the pane through tmux's own paste pipeline.
+
+    ``paste-buffer -p`` wraps the block in bracketed-paste markers exactly when
+    the pane program requested the mode, and otherwise pastes plainly with
+    newlines replaced by carriage returns — the same normalization a native
+    terminal paste applies. This keeps a multi-line paste from being executed
+    line by line when the browser xterm could not know the pane's mode (modes
+    enabled before attach are only queryable via ``#{bracket_paste_flag}`` on
+    tmux >= 3.7). ``-d`` deletes the transport buffer after the paste.
+
+    :param tmux: Absolute tmux executable path.
+    :param socket_path: Private tmux server socket.
+    :param tmux_target: The ``-t`` target, e.g. ``"main"``.
+    :param buffer_name: Transport buffer name (``omnigent-paste-*``).
+    :param data: Raw pasted bytes from the browser.
+    :returns: ``True`` when tmux accepted the paste, ``False`` on any failure.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            socket_path,
+            "load-buffer",
+            "-b",
+            buffer_name,
+            "-",
+            ";",
+            "paste-buffer",
+            "-p",
+            "-d",
+            "-b",
+            buffer_name,
+            "-t",
+            tmux_target,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):
+        return False
+
+    async def _kill_and_reap() -> None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=_PASTE_DELIVER_TIMEOUT_S)
+
+    try:
+        await asyncio.wait_for(proc.communicate(data), timeout=_PASTE_DELIVER_TIMEOUT_S)
+    except asyncio.CancelledError:
+        await _kill_and_reap()
+        raise
+    except (asyncio.TimeoutError, OSError, ValueError):
+        await _kill_and_reap()
+        return False
+    return proc.returncode == 0
 
 
 def _hex_send_keys_commands(target: str, data: bytes) -> list[bytes]:
@@ -380,8 +489,10 @@ def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
       claude) leaves the browser xterm unaware, so a multi-line paste is
       sent as raw newlines and readline executes each line on arrival
       instead of inserting the block. ``#{bracket_paste_flag}`` needs
-      tmux >= 3.7; older tmux expands it empty, degrading to no replay
-      (the pre-replay behavior).
+      tmux >= 3.7; older tmux expands it empty, degrading to no replay.
+      Multi-line browser pastes do not depend on this replay — they are
+      delivered through tmux's own paste pipeline (see
+      :func:`_paste_via_tmux_buffer`), which brackets authoritatively.
 
     Only enables are emitted: every attach starts a fresh xterm whose modes
     default off, so disables would be no-ops.
@@ -718,6 +829,10 @@ async def bridge_tmux_control_to_websocket(
             if eof_seen:
                 return
 
+    # Per-connection transport buffer for browser pastes; reused so a failed
+    # paste can leak at most one buffer on this tmux server.
+    paste_buffer_name = _PASTE_BUFFER_PREFIX + uuid.uuid4().hex[:12]
+
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
         nonlocal last_client_input_at
@@ -742,6 +857,18 @@ async def bridge_tmux_control_to_websocket(
                         except (KeyError, TypeError, ValueError):
                             continue
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
+                        continue
+                    paste = _decode_paste_message(ctl)
+                    if paste is not None and not read_only:
+                        last_client_input_at = _monotonic()
+                        if not await _paste_via_tmux_buffer(
+                            tmux, socket_path, tmux_target, paste_buffer_name, paste
+                        ):
+                            # Degrade to raw keys with xterm's LF->CR paste
+                            # normalization rather than dropping the paste.
+                            raw = paste.replace(b"\r\n", b"\r").replace(b"\n", b"\r")
+                            for cmd in _hex_send_keys_commands(tmux_target, raw):
+                                await _send_command(cmd)
                 elif data is not None and not read_only:
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.

@@ -350,6 +350,36 @@ export function parseTerminalClipboardMessage(message: string): string | null {
   return decodeTerminalClipboardBase64((value as { data: string }).data);
 }
 
+/** Largest pasted block forwarded through the server's tmux paste pipeline. */
+export const TERMINAL_PASTE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Build the browser→server ``paste`` control frame for pasted text, or
+ * ``null`` when the paste should stay on xterm's native path.
+ *
+ * The browser xterm cannot know whether the pane program enabled bracketed
+ * paste before this client attached (tmux exposes that flag only since 3.7),
+ * so its native path can send a multi-line paste as raw carriage returns that
+ * a TUI submits line by line. Routing the paste through the server lets the
+ * tmux server bracket it authoritatively (``paste-buffer -p``). Single-line
+ * pastes cannot self-submit and keep the native path — so do oversized ones,
+ * which the server would reject.
+ *
+ * :param text: The ``text/plain`` clipboard payload of the paste event.
+ * :returns: The JSON text frame to send, or ``null`` to fall through.
+ */
+export function terminalPasteMessage(text: string): string | null {
+  if (!/[\r\n]/.test(text)) return null;
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length === 0 || bytes.length > TERMINAL_PASTE_MAX_BYTES) return null;
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return JSON.stringify({ type: "paste", encoding: "base64", data: btoa(binary) });
+}
+
 /** Whether a clipboard event is attributable to recent input on this attach. */
 export function hadRecentTerminalInput(lastInputAt: number, now: number): boolean {
   return (
@@ -615,6 +645,25 @@ export class TerminalSession {
       // getSelection() returns "" when nothing is selected, which
       // applyTerminalCopy treats as a no-op — no hasSelection() guard needed.
       (e) => applyTerminalCopy(e, this.term.getSelection()),
+      { capture: true, signal },
+    );
+
+    // Send multi-line pastes through the server's tmux paste pipeline instead
+    // of xterm's native path (capture phase preempts xterm's own textarea
+    // paste handler). See terminalPasteMessage for why xterm cannot bracket
+    // these itself; single-line pastes fall through unchanged.
+    container.addEventListener(
+      "paste",
+      (e) => {
+        const message = terminalPasteMessage(e.clipboardData?.getData("text/plain") ?? "");
+        if (message === null) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onInput?.();
+        this.lastUserInputAt = performance.now();
+        if (this.ws.readyState !== WebSocket.OPEN) return;
+        this.ws.send(message);
+      },
       { capture: true, signal },
     );
 
