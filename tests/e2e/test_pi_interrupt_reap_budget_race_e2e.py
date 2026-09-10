@@ -165,6 +165,7 @@ async def test_rpc_prompt_command_sets_streaming_behavior() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         captured["proc"] = proc

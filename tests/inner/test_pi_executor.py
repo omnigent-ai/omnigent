@@ -1965,6 +1965,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2026,6 +2027,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2163,6 +2165,7 @@ class TestRunTurn(unittest.TestCase):
                         }
                     ),
                     json.dumps({"type": "agent_end", "messages": []}),
+                    json.dumps({"type": "agent_settled"}),
                 ):
                     fake_rpc._line_queue.put_nowait(line)
 
@@ -2240,8 +2243,10 @@ class TestRunTurn(unittest.TestCase):
 
         _run(_test())
 
-    def test_agent_end_extracts_response_from_messages(self):
-        """When no text deltas were streamed, response is extracted from agent_end messages."""
+    def test_agent_settled_extracts_response_from_agent_end_messages(self):
+        """When no text deltas were streamed, the response is extracted at
+        ``agent_settled`` from the messages the preceding ``agent_end`` carried.
+        """
 
         async def _test():
             executor = self._make_executor()
@@ -2266,6 +2271,7 @@ class TestRunTurn(unittest.TestCase):
                         ],
                     }
                 ),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2312,6 +2318,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2357,8 +2364,10 @@ class TestRunTurn(unittest.TestCase):
             lines = [
                 json.dumps({"type": "response", "success": True}),
                 json.dumps({"type": "message_end", "message": errored}),
-                # Pi's agent loop always emits agent_end after an errored call.
+                # Pi's agent loop always emits agent_end then agent_settled
+                # after an errored call.
                 json.dumps({"type": "agent_end", "messages": [errored]}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2384,9 +2393,10 @@ class TestRunTurn(unittest.TestCase):
         _run(_test())
 
     def test_message_end_error_with_stream_eof_fails_with_real_error(self):
-        """If pi dies after reporting the errored message (no agent_end ever
-        arrives), the turn still fails with pi's error message rather than
-        the generic ended-without-response fallback.
+        """If pi dies after reporting the errored message (no terminal
+        ``agent_end``/``agent_settled`` ever arrives), the turn still fails
+        with pi's error message rather than the generic
+        ended-without-response fallback.
         """
 
         async def _test():
@@ -2413,7 +2423,7 @@ class TestRunTurn(unittest.TestCase):
                 del timeout
                 if lines:
                     return lines.pop(0)
-                return None  # EOF: process died without agent_end.
+                return None  # EOF: process died without a terminal event.
 
             fake_rpc.read_line = fake_read_line
 
@@ -2437,11 +2447,12 @@ class TestRunTurn(unittest.TestCase):
 
         _run(_test())
 
-    def test_post_tool_error_drains_agent_end_before_failing(self):
+    def test_post_tool_error_drains_terminal_events_before_failing(self):
         """A message_end error after a successful tool call fails the turn
         with pi's error message, but only after consuming the trailing
-        ``agent_end`` — leaving it queued would make the next turn on the
-        same RPC session read the stale terminal event as its own end.
+        ``agent_end``/``agent_settled`` — leaving them queued would make the
+        next turn on the same RPC session read a stale terminal event as its
+        own end.
         """
 
         async def _test():
@@ -2478,8 +2489,10 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 # Pi always emits agent_end after the errored LLM call ends
-                # the agent loop; it carries the errored message.
+                # the agent loop (it carries the errored message), then
+                # agent_settled once no retry remains.
                 json.dumps({"type": "agent_end", "messages": [errored_assistant]}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2507,8 +2520,8 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual([e.message for e in errors], [parse_error])
             self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
             self.assertFalse(any(isinstance(e, TextChunk) for e in events))
-            # The trailing agent_end was consumed: nothing stale is left for
-            # the next turn on this RPC session.
+            # The trailing agent_end/agent_settled were consumed: nothing
+            # stale is left for the next turn on this RPC session.
             self.assertTrue(fake_rpc._line_queue.empty())
 
         _run(_test())
@@ -2622,6 +2635,7 @@ def test_pi_thinking_deltas_stream_as_reasoning_chunks() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -2686,6 +2700,7 @@ def test_pi_thinking_and_text_delta_ordering_preserved() -> None:
                 _update({"type": "thinking_delta", "contentIndex": 2, "delta": "revise"}),
                 _update({"type": "text_delta", "contentIndex": 3, "delta": " step two"}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -2921,6 +2936,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -2943,6 +2959,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -2964,6 +2981,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -2989,6 +3007,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -3010,6 +3029,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -3915,6 +3935,7 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             stderr_lines=[],
         )
@@ -3987,6 +4008,7 @@ def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             stderr_lines=[],
         )
@@ -4046,6 +4068,7 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
             stdout_lines=[
                 json.dumps({"type": "response", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             stderr_lines=[],
         )
@@ -4177,6 +4200,7 @@ def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> Non
             stdout_lines=[
                 json.dumps({"type": "response", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             stderr_lines=[],
         )
@@ -4293,6 +4317,7 @@ def test_pi_usage_captured_from_message_end() -> None:
                 ),
                 json.dumps({"type": "message_end", "message": _pi_assistant_message_with_usage()}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -4327,8 +4352,9 @@ def test_pi_usage_captured_from_message_end() -> None:
 
 def test_pi_usage_fallback_from_agent_end() -> None:
     """
-    When no ``message_end`` carried usage, the ``agent_end`` handler falls
-    back to the last assistant message in ``event["messages"]``. Asserts
+    When no ``message_end`` carried usage, the ``agent_settled`` handler
+    falls back to the last assistant message in the ``messages`` the
+    preceding ``agent_end`` carried. Asserts
     the mapped numbers so the fallback path is proven to map, not just to
     set a non-None dict.
     """
@@ -4337,7 +4363,8 @@ def test_pi_usage_fallback_from_agent_end() -> None:
         executor = _executor_with_scripted_rpc(
             [
                 json.dumps({"type": "response", "success": True}),
-                # No message_end frame — usage must come from agent_end.
+                # No message_end frame — usage must come from the
+                # agent_end messages.
                 json.dumps(
                     {
                         "type": "agent_end",
@@ -4354,6 +4381,7 @@ def test_pi_usage_fallback_from_agent_end() -> None:
                         ],
                     }
                 ),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -4384,6 +4412,78 @@ def test_pi_usage_fallback_from_agent_end() -> None:
     _run(_test())
 
 
+def test_pi_turn_completes_at_agent_settled_not_at_a_retried_agent_end() -> None:
+    """
+    A turn ends at ``agent_settled``, not at the first ``agent_end``.
+
+    Pi documents ``agent_end`` as "one low-level agent run completes (may
+    still be followed by retry, compaction, or queued continuations)" and
+    ``agent_settled`` as "agent run is fully settled; no automatic retry,
+    compaction retry, or queued continuation remains" (``docs/rpc.md``).
+    Ending the turn on the first ``agent_end`` therefore truncates a run pi
+    is still working on, and — because ``agent_end`` carries no error — the
+    truncated turn is reported as a normal completion.
+
+    Scripts a retried run: an ``agent_end`` with ``willRetry`` set carrying
+    only partial text, the retry's ``agent_end`` carrying the real answer,
+    then ``agent_settled``. Exactly one ``TurnComplete`` must be emitted and
+    it must carry the retry's answer; treating the first ``agent_end`` as
+    terminal yields ``"Partial"`` instead.
+    """
+
+    async def _test() -> None:
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                # First low-level run ends mid-work; pi will retry it.
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "Partial"}],
+                            },
+                        ],
+                        "willRetry": True,
+                    }
+                ),
+                # The retry is a second agent run with its own agent_end.
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "Final answer"}],
+                            },
+                        ],
+                    }
+                ),
+                # Only now is the run fully settled.
+                json.dumps({"type": "agent_settled"}),
+            ]
+        )
+
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hello"}],
+                [],
+                "system",
+            )
+        ]
+
+        turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_complete) == 1, "turn must complete once, at agent_settled"
+        assert turn_complete[0].response == "Final answer"
+        # The turn must not fail, and must not end before the retry ran.
+        assert not [e for e in events if isinstance(e, ExecutorError)]
+        assert isinstance(events[-1], TurnComplete)
+
+    _run(_test())
+
+
 def test_pi_usage_model_falls_back_to_configured_model() -> None:
     """
     When the assistant message omits ``model``, the usage ``model`` falls
@@ -4402,6 +4502,7 @@ def test_pi_usage_model_falls_back_to_configured_model() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             model="databricks-claude-sonnet-4-6",
         )
@@ -4472,6 +4573,7 @@ def test_pi_usage_sums_across_multiple_message_end() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -4520,9 +4622,11 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
                         "assistantMessageEvent": {"type": "text_delta", "delta": "Hi there"},
                     }
                 ),
-                # message_end with no usage object, then a usage-less agent_end.
+                # message_end with no usage object, then a usage-less
+                # agent_end/agent_settled pair.
                 json.dumps({"type": "message_end", "message": {"stopReason": "stop"}}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -4621,6 +4725,7 @@ def test_run_turn_spawns_pi_with_thinking_flag(monkeypatch) -> None:
                 _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
                 json.dumps({"type": "response", "command": "prompt", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -4656,6 +4761,7 @@ def test_midsession_effort_change_sets_thinking_level_before_prompt() -> None:
             _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
+            json.dumps({"type": "agent_settled"}),
         ],
         applied_thinking="low",
     )
@@ -4690,6 +4796,7 @@ def test_unsupported_thinking_level_clamps_with_warning(caplog) -> None:
             _levels_response(["off", "low", "high"]),
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
+            json.dumps({"type": "agent_settled"}),
         ],
         applied_thinking=None,
     )
@@ -4724,6 +4831,7 @@ def test_midsession_effort_clear_leaves_level_untouched() -> None:
         [
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
+            json.dumps({"type": "agent_settled"}),
         ],
         applied_thinking="high",
     )
@@ -4796,6 +4904,7 @@ def test_run_turn_prompt_command_includes_streaming_behavior():
             }
         ),
         json.dumps({"type": "agent_end", "messages": []}),
+        json.dumps({"type": "agent_settled"}),
     ]:
         fake_rpc._line_queue.put_nowait(line)
 

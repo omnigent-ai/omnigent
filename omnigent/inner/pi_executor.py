@@ -646,9 +646,9 @@ _RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
 # EOF does. Module-level so tests can patch it.
 _TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
 
-# Post-error drain budget: after an errored message the only line left to
-# consume is the already-emitted ``agent_end``. Module-level so tests can
-# patch it.
+# Post-error drain budget: after an errored message the only lines left to
+# consume are the already-emitted ``agent_end``/``agent_settled``. Applies to
+# each such read. Module-level so tests can patch it.
 _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 10.0
 
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
@@ -2487,22 +2487,29 @@ class PiExecutor(Executor):
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
 
-        # Read events until agent_end.
+        # Read events until agent_settled.
         response_text = ""
         streamed_any = False
         # Per-LLM-call token usage captured from each assistant message pi
-        # forwards (``message_end`` is the capture site; ``agent_end`` is a
-        # fallback). Summed into a turn-level usage dict at completion so a
-        # multi-step (tool-loop) turn bills for every call, not just the
-        # last. Empty when pi reports no usage — cost tracking is skipped.
+        # forwards (``message_end`` is the capture site; ``agent_settled``
+        # is a fallback). Summed into a turn-level usage dict at completion
+        # so a multi-step (tool-loop) turn bills for every call, not just
+        # the last. Empty when pi reports no usage — cost tracking is skipped.
         message_usages: list[_PiMessageUsage] = []
         # Error reported by a ``message_end`` (stopReason=error); surfaced at
-        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        # ``agent_settled`` so the terminal event is consumed off the RPC
+        # stream.
         pending_error: str | None = None
+        # Messages from the most recent ``agent_end``. A turn may contain
+        # several low-level agent runs (retry, compaction, queued
+        # continuation), so this is overwritten each time and read once at
+        # ``agent_settled``.
+        end_messages: list[Any] = []
 
         while True:
             # After an errored message the only thing left to drain is the
-            # already-emitted agent_end, so don't wait the full idle budget.
+            # already-emitted agent_end/agent_settled, so don't wait the full
+            # idle budget.
             line = await rpc.read_line(
                 timeout=_TURN_STDOUT_IDLE_TIMEOUT_S
                 if pending_error is None
@@ -2653,12 +2660,27 @@ class PiExecutor(Executor):
                 )
                 continue
 
-            # Agent ended — the turn is complete.
+            # One low-level agent run ended — NOT necessarily the turn. Pi
+            # may still auto-retry, compact, or drain queued continuations
+            # after this, each emitting its own ``agent_end``: the event is
+            # documented as "may still be followed by retry, compaction, or
+            # queued continuations" (pi ``docs/rpc.md``). Capture this run's
+            # messages and keep reading — ``agent_settled`` is the real
+            # terminator.
             if event_type == "agent_end":
+                raw_end_messages = event.get("messages", [])
+                if isinstance(raw_end_messages, list):
+                    end_messages = raw_end_messages
+                continue
+
+            # The agent run is fully settled: "no automatic retry, compaction
+            # retry, or queued continuation remains" (pi ``docs/rpc.md``), so
+            # the turn is complete. Pi's own RPC client waits for this event
+            # rather than ``agent_end`` (``dist/modes/rpc/rpc-client.js``).
+            if event_type == "agent_settled":
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                end_messages = event.get("messages", [])
                 if not response_text:
                     for m in reversed(end_messages):
                         if m.get("role") == "assistant":
@@ -2679,7 +2701,7 @@ class PiExecutor(Executor):
                 # usage, pull it from the last assistant message in
                 # ``messages`` (only the last — ``messages`` may hold the
                 # whole conversation, so summing it would overcount).
-                if not message_usages and isinstance(end_messages, list):
+                if not message_usages:
                     for m in reversed(end_messages):
                         captured = _extract_pi_turn_usage(m, model)
                         if captured is not None:
@@ -2709,11 +2731,11 @@ class PiExecutor(Executor):
                         yield ExecutorError(message=str(err))
                         return
                     if stop == "error":
-                        # Pi emits the turn-terminal ``agent_end`` after an
-                        # errored LLM call; returning here would leave it
+                        # Pi emits the turn-terminal ``agent_settled`` after
+                        # an errored LLM call; returning here would leave it
                         # queued, so the next turn on this RPC session reads
                         # the stale event as its own end. Record the error
-                        # and keep draining until ``agent_end``.
+                        # and keep draining until ``agent_settled``.
                         pending_error = str(msg.get("errorMessage", stop))
                 continue
 
