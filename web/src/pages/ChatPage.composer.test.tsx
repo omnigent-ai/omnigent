@@ -1489,6 +1489,96 @@ describe("Composer model/effort label", () => {
   });
 });
 
+describe("Composer dropped-pick notice", () => {
+  // A managed-gateway catalog with NO fable row: the session's saved pick can
+  // reference a model the deployment does not serve (e.g. picked from the
+  // sandbox's static fallback before launch, or made under another provider).
+  const MANAGED_CATALOG = [
+    { id: "opus", model: "system.ai.claude-opus-4-8", displayName: "Opus 4.8", isDefault: true },
+    { id: "sonnet", model: "system.ai.claude-sonnet-5", displayName: "Sonnet 5" },
+    { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
+  ];
+
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      sessionModelOverride: null,
+      codexModelOptions: [],
+      nativeVendorOwnsModel: false,
+      sessionHarness: null,
+      subAgentName: null,
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  function renderClaudeComposer(options: typeof MANAGED_CATALOG | [] = MANAGED_CATALOG) {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: options,
+        })}
+      />,
+    );
+  }
+
+  it("surfaces a pick the catalog does not serve while a served model runs", () => {
+    // The launch gate substituted the default for an unservable pick and the
+    // only server-side trace is a log line — the composer must say so.
+    useChatStore.setState({
+      sessionModelOverride: "fable",
+      llmModel: "system.ai.claude-opus-4-8",
+    });
+    renderClaudeComposer();
+    const notice = screen.getByTestId("composer-model-pick-dropped");
+    expect(notice).toHaveTextContent("Fable unavailable");
+    expect(notice).toHaveTextContent("running Opus 4.8");
+  });
+
+  it("stays hidden when the catalog serves the pick", () => {
+    // A served-pick divergence is a normal switch in flight (or a failed one,
+    // which publishes model_change_not_applied) — not a dropped pick.
+    useChatStore.setState({
+      sessionModelOverride: "sonnet",
+      llmModel: "system.ai.claude-opus-4-8",
+    });
+    renderClaudeComposer();
+    expect(screen.queryByTestId("composer-model-pick-dropped")).toBeNull();
+  });
+
+  it("stays hidden while no catalog has resolved", () => {
+    // The pre-catalog window can't tell a dropped pick from a pick the launch
+    // is about to honor; an empty option list must not claim a substitution.
+    useChatStore.setState({
+      sessionModelOverride: "fable",
+      llmModel: "system.ai.claude-opus-4-8",
+    });
+    renderClaudeComposer([]);
+    expect(screen.queryByTestId("composer-model-pick-dropped")).toBeNull();
+  });
+
+  it("stays hidden when the reported model is off-catalog too", () => {
+    // An off-catalog report means the pane may genuinely be running the pick
+    // under a spelling the catalog doesn't list — not a substitution.
+    useChatStore.setState({
+      sessionModelOverride: "fable",
+      llmModel: "databricks-claude-fable-4",
+    });
+    renderClaudeComposer();
+    expect(screen.queryByTestId("composer-model-pick-dropped")).toBeNull();
+  });
+});
+
 describe("Composer effort slash-command visibility", () => {
   beforeEach(() => {
     useChatStore.setState({ conversationId: "conv_test", skills: [] });

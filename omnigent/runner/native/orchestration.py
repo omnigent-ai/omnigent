@@ -2355,6 +2355,54 @@ async def _post_pi_native_credential_warning(
         )
 
 
+async def _post_claude_model_pick_not_served_notice(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    notice: str,
+) -> None:
+    """Surface a launch-time model substitution into the session.
+
+    The launch gate launches the provider default when the session's saved
+    pick is not served, and the pane then comes up healthy — so nothing else
+    tells the user their pick was dropped (the mid-session switch path
+    publishes ``model_change_not_applied``; the launch path only logged).
+    Posts an ``error`` item via ``external_conversation_item`` so the web UI
+    renders a visible pill, persists it across reload, and — because
+    ``error`` is a non-content item type — keeps it out of the next turn's
+    model context. Best-effort: a failed post only loses the notice.
+
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client (``None`` in tests).
+    :param notice: The user-facing substitution text to surface.
+    """
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "execution",
+                        "code": "model_pick_not_served",
+                        "message": notice,
+                    },
+                },
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "claude-native: failed to surface the dropped model pick for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
 _CODEX_THREAD_RESET_NOTICE = (
     "Codex reported an internal error while loading this session's saved transcript, "
     "so Omnigent started a fresh Codex thread instead of failing the turn. The chat "
@@ -7011,6 +7059,14 @@ async def _auto_create_claude_terminal(
     # A pick the provider cannot serve is dropped only once the fallback
     # terminal is actually up, so a failed launch never loses it.
     reset_pick_after_launch = False
+    # A pick this launch could not honor, kept so the substitution can be
+    # surfaced into the session — but only after the fallback terminal is
+    # actually up (like the pick reset), so a failed launch never posts a
+    # wrong claim. The notice text is composed post-launch, when the final
+    # launch model (e.g. the catalog default) is known.
+    dropped_pick: str | None = None
+    dropped_pick_was_reset = False
+    dropped_pick_endpoint = ""
     # Explicit launches (model-flows design §4): consult the shared catalog
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
@@ -7128,6 +7184,9 @@ async def _auto_create_claude_terminal(
                         extra={"session_id": session_id},
                     )
                     launch_model = unpinned_launch_model
+                    dropped_pick = pick
+                    dropped_pick_was_reset = bool(fresh_rows)
+                    dropped_pick_endpoint = claude_launch_endpoint_label(claude_config)
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
@@ -7357,6 +7416,25 @@ async def _auto_create_claude_terminal(
         raise
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
+    if dropped_pick is not None:
+        # Without this the substitution's only trace is a runner log line —
+        # unlike the mid-session switch path, whose failure publishes
+        # ``model_change_not_applied``. Posted after the reset so the picker
+        # and the notice agree by the time the user looks.
+        await _post_claude_model_pick_not_served_notice(
+            session_id=session_id,
+            server_client=server_client,
+            notice=(
+                f"The model pick '{dropped_pick}' is not served by "
+                f"{dropped_pick_endpoint}, so this session is running "
+                f"{launch_model or 'its default model'} instead."
+                + (
+                    " The model pick was reset to Default."
+                    if dropped_pick_was_reset
+                    else " The pick is kept and retried on the next relaunch."
+                )
+            ),
+        )
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal
     # launch helper registers the resource and starts the activity watcher but

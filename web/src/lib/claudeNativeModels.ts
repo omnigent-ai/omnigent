@@ -10,7 +10,10 @@
  */
 export const CLAUDE_NATIVE_MODELS = [
   // Ordered by capability tier, most powerful first.
-  { id: "fable", label: "Fable" },
+  // Fable is a workspace opt-in on managed gateways (model discovery drops
+  // it unless the workspace enabled it), so surfaces with no live catalog
+  // to check against must not offer it — see SANDBOX_CLAUDE_NATIVE_MODELS.
+  { id: "fable", label: "Fable", workspaceOptIn: true },
   { id: "opus", label: "Opus" },
   // Version-agnostic on purpose: which Sonnet the alias lands on is the
   // harness's call, and the live catalog's display name supersedes this
@@ -24,3 +27,14 @@ export const CLAUDE_NATIVE_MODELS = [
   { id: "sonnet_5", label: "Sonnet 5" },
   { id: "haiku", label: "Haiku" },
 ] as const;
+
+/**
+ * The aliases the managed-sandbox picker may offer. The sandbox has no
+ * connected host, so there is no live catalog to verify a row against —
+ * offering a workspace-opt-in model (Fable) there produces a pick the
+ * gateway silently substitutes at launch. Only the universally served
+ * aliases are offered.
+ */
+export const SANDBOX_CLAUDE_NATIVE_MODELS = CLAUDE_NATIVE_MODELS.filter(
+  (model) => !("workspaceOptIn" in model && model.workspaceOptIn),
+);

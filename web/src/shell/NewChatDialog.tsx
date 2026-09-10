@@ -153,7 +153,7 @@ import {
   smartRoutingUnavailableReason,
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { SANDBOX_CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isAcpHarnessAgent,
   partitionAgentsByKind,
@@ -2563,7 +2563,11 @@ export function NewChatLandingScreen() {
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
-        ? CLAUDE_NATIVE_MODELS.map((model) => ({
+        ? // No connected host means no live catalog to check a row against, so
+          // the sandbox offers only the aliases every managed gateway serves —
+          // a workspace-opt-in row (Fable) would be silently substituted at
+          // launch wherever the workspace hasn't enabled it.
+          SANDBOX_CLAUDE_NATIVE_MODELS.map((model) => ({
             id: model.id,
             displayName: model.label,
           }))

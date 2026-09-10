@@ -23,6 +23,7 @@ import {
   SettingsIcon,
   SquareIcon,
   SquareTerminalIcon,
+  TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -3816,6 +3817,10 @@ function ComposerImpl({
               />
             )}
             <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
+              <ComposerDroppedPickNotice
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+              />
               <ComposerModelSource
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
@@ -5097,6 +5102,22 @@ function useResolvedComposerModel(
     isReportedModelPicker && sessionModelOverride
       ? (findNativeModelOption(codexModelOptions, sessionModelOverride)?.id ?? sessionModelOverride)
       : null;
+  // A saved pick the session's resolved catalog does not serve, while the
+  // harness reports running a model the catalog DOES serve, is a dropped
+  // pick: the launch gate substituted the default and the only other trace
+  // is a runner-side log line. The mid-session switch path surfaces its
+  // failures loudly (``model_change_not_applied``); this makes the launch
+  // path's substitution equally visible. Gated on a non-empty catalog and a
+  // catalog-served report so the pre-catalog window and an honestly-running
+  // off-catalog model never claim a substitution that didn't happen.
+  const droppedModelPick =
+    isReportedModelPicker &&
+    sessionModelOverride !== null &&
+    codexModelOptions.length > 0 &&
+    findNativeModelOption(codexModelOptions, sessionModelOverride) === null &&
+    findNativeModelOption(codexModelOptions, llmModel) !== null
+      ? sessionModelOverride
+      : null;
   // cursor mirrors its live TUI model into ``model_override``; kiro sets it
   // on a web pick (which also drives a live ``/model`` switch); opencode/pi
   // mirror both ways into ``model_override``. Those wrappers keep their
@@ -5124,7 +5145,47 @@ function useResolvedComposerModel(
     pickerSelectedModel,
     effectiveModel,
     modelLabel,
+    droppedModelPick,
   };
+}
+
+/**
+ * Visible marker for a dropped model pick: the session's saved pick isn't
+ * served by its catalog while the harness reports running a served model,
+ * so the pick was silently substituted at launch. Renders next to the model
+ * label, naming the pick and what the session actually runs; hides itself
+ * the moment the divergence resolves (the pick is reset, honored, or
+ * re-picked onto a served row).
+ */
+function ComposerDroppedPickNotice({
+  modelPickerKind,
+  codexModelOptions,
+}: {
+  modelPickerKind: NativeModelPickerKind | null;
+  codexModelOptions: readonly NativeModelOption[];
+}) {
+  const { droppedModelPick, modelLabel } = useResolvedComposerModel(
+    modelPickerKind,
+    codexModelOptions,
+  );
+  if (droppedModelPick === null) return null;
+  const pickLabel = formatStatusModelLabel(droppedModelPick, codexModelOptions) ?? droppedModelPick;
+  const detail = `${pickLabel} isn't available on this deployment, so this session is running ${
+    modelLabel ?? "its default model"
+  } instead.`;
+  return (
+    <span
+      data-testid="composer-model-pick-dropped"
+      role="status"
+      title={detail}
+      className="flex min-w-0 shrink items-center gap-1 truncate pl-2.5 pr-1 text-sm text-warning"
+    >
+      <TriangleAlertIcon className="size-3.5 shrink-0" aria-hidden />
+      <span className="min-w-0 truncate">
+        {pickLabel} unavailable{modelLabel ? ` — running ${modelLabel}` : ""}
+      </span>
+    </span>
+  );
 }
 
 /** Compact, inspectable provenance beside the composer's model label. */

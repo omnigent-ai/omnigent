@@ -2598,6 +2598,24 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
   });
 
+  it("offers only gateway-served static Claude models for the sandbox (no Fable)", async () => {
+    // The sandbox has no live host catalog to check a row against, and
+    // managed gateways serve Fable only where the workspace opted in —
+    // offering it yields a pick the launch gate silently substitutes.
+    renderLanding({ managed_sandboxes_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
+    );
+    openAgentConfig("a1");
+    openSelect("new-chat-landing-config-model");
+    // The universally served aliases are offered…
+    expect(screen.getByRole("option", { name: "Opus" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Sonnet" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Haiku" })).toBeTruthy();
+    // …but never the workspace-opt-in row the gateway may not serve.
+    expect(screen.queryByRole("option", { name: "Fable" })).toBeNull();
+  });
+
   it("labels the sandbox option with the server's provider name", async () => {
     // sandbox_provider drives the per-provider label. "modal" must read
     // "Modal Sandbox" on both the chip and the dropdown option — if the

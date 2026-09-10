@@ -3881,6 +3881,136 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["reset", "kept"])
+async def test_auto_create_claude_terminal_unserved_pick_surfaces_a_session_notice(
+    outcome: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch that cannot honor the pick tells the session, not just the log.
+
+    The gate substitutes the launch model when no catalog row serves the
+    persisted pick. That substitution used to leave only a runner-side
+    warning, so the session silently ran a different model than the user
+    picked — unlike the mid-session switch path, whose failure publishes
+    ``model_change_not_applied``. The launch must post a visible ``error``
+    item naming the pick, what the session runs instead, and whether the
+    pick was reset (fresh catalog) or kept for the next relaunch (failed
+    re-probe of a stale catalog).
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    catalog = [
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+        {
+            "id": "claude-opus-4-8[1m]",
+            "model": "claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        },
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        del config
+        return catalog
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr(
+        "omnigent.claude_native.claude_launch_catalog_is_stale",
+        lambda config: outcome == "kept",
+    )
+
+    async def _failed_reprobe(config: object) -> list[dict[str, object]]:
+        del config
+        return []
+
+    if outcome == "kept":
+        monkeypatch.setattr(
+            "omnigent.claude_native.claude_reprobed_launch_catalog", _failed_reprobe
+        )
+
+    class _FakeResourceRegistry:
+        """Launches a healthy fake terminal."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Return a terminal resource view the way a live launch does."""
+            del terminal_name, session_key, spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    event_posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            event_posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": "gpt-5.4", "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    await _auto_create_claude_terminal(
+        "5e6f7a8b9c0d41e2f3a4b5c6d7e8f9a0",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+
+    notices = [
+        post
+        for post in event_posts
+        if post.get("type") == "external_conversation_item"
+        and post.get("data", {}).get("item_type") == "error"
+    ]
+    assert len(notices) == 1
+    item_data = notices[0]["data"]["item_data"]
+    assert item_data["code"] == "model_pick_not_served"
+    message = item_data["message"]
+    assert "'gpt-5.4'" in message
+    if outcome == "reset":
+        # A fresh catalog resolves the Default launch, and the pick resets.
+        assert "running claude-opus-4-8[1m] instead" in message
+        assert "reset to Default" in message
+    else:
+        # A stale catalog whose re-probe failed launches bare and keeps the pick.
+        assert "running its default model instead" in message
+        assert "kept and retried on the next relaunch" in message
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fails_to_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3889,7 +4019,9 @@ async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fail
     A pick is reset only once the fallback terminal is up.
 
     The reset would otherwise outlive a launch that failed after the gate, so
-    a tmux or bridge failure must leave the persisted pick untouched.
+    a tmux or bridge failure must leave the persisted pick untouched — and
+    post no substitution notice, which would claim a session state that never
+    came up.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3919,10 +4051,13 @@ async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fail
             raise RuntimeError("tmux exited")
 
     patches: list[dict[str, Any]] = []
+    event_posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            event_posts.append(json.loads(request.content))
         return httpx.Response(200, json={"model_override": "gpt-5.4", "labels": {}})
 
     fake_client = httpx.AsyncClient(
@@ -3942,6 +4077,7 @@ async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fail
             resolve_launch_config=_resolve,
         )
     assert [body for body in patches if "model_override" in body] == []
+    assert event_posts == []
 
     await fake_client.aclose()
 
