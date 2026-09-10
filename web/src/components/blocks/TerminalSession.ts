@@ -16,6 +16,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { createDbcertLoginWatcher } from "@/lib/dbcertLogin";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -361,6 +362,12 @@ export function hadRecentTerminalInput(lastInputAt: number, now: number): boolea
 export type TerminalClipboardListener = (text: string) => void;
 
 /**
+ * Listener for a dbcert SSO login URL found in pane output. Called once per
+ * distinct URL; see lib/dbcertLogin.ts for why the UI opens it.
+ */
+export type TerminalDbcertLoginListener = (url: string) => void;
+
+/**
  * Ceiling on synthesized wheel reports for a single DOM wheel event, so a
  * page-mode or pathological delta can't flood the input channel.
  */
@@ -539,6 +546,8 @@ export class TerminalSession {
    * :param clipboardEnabled: Whether tmux copies may write the local clipboard.
    * :param onClipboardRequest: Receives validated tmux copy-mode text.
    * :param focusOnConnect: Whether to grab keyboard focus on WS-open.
+   * :param onDbcertLogin: Receives a dbcert SSO login URL printed into the
+   *     pane. Omit to skip the scan entirely.
    */
   constructor(
     container: HTMLElement,
@@ -550,6 +559,7 @@ export class TerminalSession {
     clipboardEnabled = true,
     onClipboardRequest?: TerminalClipboardListener,
     focusOnConnect = true,
+    onDbcertLogin?: TerminalDbcertLoginListener,
   ) {
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -631,6 +641,11 @@ export class TerminalSession {
       { signal },
     );
 
+    // dbcert login detection over the pane's own bytes, set up only when a
+    // listener was supplied so a surface that doesn't care pays nothing.
+    const dbcertDecoder = onDbcertLogin ? new TextDecoder() : null;
+    const watchDbcertLogin = onDbcertLogin ? createDbcertLoginWatcher(onDbcertLogin) : null;
+
     // Throttle activity notifications so rapid output (e.g. `yes`, large
     // `cat`) doesn't re-arm the 1.5 s idle timer on every WS frame.
     let lastActivityTs = 0;
@@ -640,6 +655,12 @@ export class TerminalSession {
         if (ev.data instanceof ArrayBuffer) {
           const bytes = new Uint8Array(ev.data);
           this.term.write(bytes);
+          // Decode a second time only when someone is listening. `stream: true`
+          // carries a multi-byte character split across frames, so the scan sees
+          // the same text the terminal renders.
+          if (watchDbcertLogin && dbcertDecoder) {
+            watchDbcertLogin(dbcertDecoder.decode(bytes, { stream: true }));
+          }
           const now = performance.now();
           if (now - lastActivityTs > 300) {
             lastActivityTs = now;

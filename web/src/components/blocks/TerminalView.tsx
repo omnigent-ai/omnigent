@@ -14,6 +14,7 @@ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
+import { openDbcertLogin } from "@/lib/dbcertLogin";
 import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
@@ -331,6 +332,33 @@ export function TerminalView({
     [copyTerminalText],
   );
 
+  // A dbcert login the agent's launcher printed into the pane. Opening it is the
+  // whole point (its own opener can't reach this browser — see lib/dbcertLogin),
+  // but terminal output carries no user gesture, so a popup blocker may refuse
+  // the tab. A refusal becomes a toast whose click supplies the gesture.
+  const notifyDbcertLogin = useCallback((url: string) => {
+    if (openDbcertLogin(url)) return;
+    toast("Finish signing in to dbcert", {
+      id: "dbcert-login",
+      description: (
+        <div className="flex flex-col gap-2">
+          <div>The agent is waiting on a dbcert login. Your browser blocked the tab.</div>
+          <div className="flex flex-wrap gap-2 pt-1">
+            <Button
+              type="button"
+              size="xs"
+              onClick={() => openDbcertLogin(url)}
+              componentId="diagnostics.terminal.dbcert_login"
+            >
+              Open dbcert login
+            </Button>
+          </div>
+        </div>
+      ),
+      duration: Infinity,
+    });
+  }, []);
+
   const notifyClipboardRequest = useCallback(
     (text: string) => {
       if (
@@ -584,6 +612,7 @@ export function TerminalView({
           !readOnly && activeRef.current,
           notifyClipboardRequest,
           focusOnConnectRef.current,
+          notifyDbcertLogin,
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the
@@ -616,6 +645,7 @@ export function TerminalView({
       notifyActivity,
       notifyInput,
       notifyClipboardRequest,
+      notifyDbcertLogin,
       disposeActiveSession,
     ],
   );

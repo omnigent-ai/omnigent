@@ -520,6 +520,7 @@ describe("TerminalSession", () => {
     clipboardEnabled = true,
     onClipboardRequest?: (text: string) => void,
     focusOnConnect = true,
+    onDbcertLogin?: (url: string) => void,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -534,8 +535,21 @@ describe("TerminalSession", () => {
       clipboardEnabled,
       onClipboardRequest,
       focusOnConnect,
+      onDbcertLogin,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
+  }
+
+  /**
+   * Emit `text` as a binary pane frame, building the buffer from the global
+   * ArrayBuffer the source's `instanceof` check sees (see the binary-frame test
+   * below for why a TextEncoder's buffer fails that check under jsdom).
+   */
+  function emitPaneText(socket: FakeWebSocket, text: string): void {
+    const encoded = new TextEncoder().encode(text);
+    const data = new ArrayBuffer(encoded.byteLength);
+    new Uint8Array(data).set(encoded);
+    socket.emit("message", { data });
   }
 
   it("reports 'connected' and sends an initial resize on socket open", () => {
@@ -635,6 +649,50 @@ describe("TerminalSession", () => {
 
     socket.emit("message", { data: "text frame" });
     expect(onActivity).toHaveBeenCalledTimes(1); // unchanged — text ignored
+    session.dispose();
+  });
+
+  it("reports a dbcert login URL printed into the pane", () => {
+    // WHY: isaac's startup dbcert refresh prints an SSO URL whose own opener
+    // can't reach this browser, so the pane bytes are the only place the UI can
+    // learn about it.
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onDbcertLogin = vi.fn();
+    const { socket, session } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      onDbcertLogin,
+    );
+    const url =
+      "https://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&code_challenge=E9Me" +
+      "&code_challenge_method=S256&nonce=nQ3p" +
+      "&redirect_uri=http%3A%2F%2Flocalhost%3A4281%2Fv1%2Fdbcert%2Fcallback" +
+      "&response_type=code&scope=openid&state=hKFo";
+
+    emitPaneText(socket, `please open the following URL:\r\n\r\n\t${url}\r\n\r\n`);
+
+    expect(onDbcertLogin.mock.calls).toEqual([[url]]);
+    session.dispose();
+  });
+
+  it("stays silent on pane output with no dbcert login in it", () => {
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onDbcertLogin = vi.fn();
+    const { socket, session } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      onDbcertLogin,
+    );
+
+    emitPaneText(socket, "$ ls -la\r\nhttps://github.com/omnigent-ai/omnigent \r\n");
+
+    expect(onDbcertLogin).not.toHaveBeenCalled();
     session.dispose();
   });
 
