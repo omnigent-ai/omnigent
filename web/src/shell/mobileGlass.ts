@@ -18,9 +18,9 @@ export const MOBILE_GLASS_SURFACE =
  * The exception is the Chat/Terminal track (ViewModeToggle): it paints its
  * own background out to its edge, so with no padding it collides with the
  * pill's border while an icon-only neighbour still clears it by the slack
- * inside its 40px box. Inset the leading edge by that slack — only when the
- * track is present — so ink sits 12px from either end. Assumes the track is
- * the cluster's leading child on mobile; a control added ahead of it would
- * take the inset instead.
+ * inside its 40px box. Inset both ends by that slack when the track is present,
+ * so the track and an expanded trailing control keep the same glass rim.
+ * Assumes the track is the cluster's leading child on mobile; a control added
+ * ahead of it would take the inset instead.
  */
-export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:has-data-[slot=view-mode-toggle]:pl-1.5`;
+export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:has-data-[slot=view-mode-toggle]:px-1.5`;

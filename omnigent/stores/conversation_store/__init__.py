@@ -467,14 +467,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def find_imported_conversation(
+    def find_conversation_by_external_session_id(
         self,
-        source: str,
         external_session_id: str,
     ) -> Conversation | None:
-        """Find the original session imported from one external transcript.
+        """Find an existing conversation wrapping one external (harness) session id.
 
-        :param source: Import source key, e.g. ``"claude"``.
+        Both an imported transcript and a natively-run session record the
+        external id, so import dedup resolves against either through this one
+        lookup. When several rows share the id, the earliest-created wins.
+
         :param external_session_id: Source harness session id.
         :returns: The matching conversation, or ``None``.
         """

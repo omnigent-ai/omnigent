@@ -192,6 +192,13 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
+      /**
+       * The user spoke while this response was already producing assistant
+       * items. Start the continuation's fold expanded: it can contain a direct
+       * answer to that interjection followed by resumed background work, and
+       * the ordinary trailing-text heuristic cannot distinguish the two.
+       */
+      defaultExpanded?: boolean;
       /** Freshest epoch stamp in the group (latest activity) —
        *  server-stamped from history, client-stamped while live.
        *  Display-only. */
@@ -765,6 +772,7 @@ function walkBubbles(
   let lastBubbleStart = bubbles.length > 0 ? 0 : -1;
   let lastBubbleCount = 1;
   let i = startIndex;
+  let expandNextAssistantResponseId: string | null = null;
 
   while (i < blocks.length) {
     const b = blocks[i]!;
@@ -772,11 +780,20 @@ function walkBubbles(
     // Lifecycle markers don't render — they exist for the streaming
     // reducer and the eager URL update, not the renderer.
     if (isNonRenderingBlock(b)) {
+      // A new lifecycle edge means the next assistant group is a distinct
+      // response, even if a harness happens to reuse the same response id.
+      expandNextAssistantResponseId = null;
       i += 1;
       continue;
     }
 
     if (b.type === "user_message") {
+      // A native harness can accept a steering message without ending the
+      // response already in progress. In persisted history that user message
+      // has the same response id as assistant work immediately before it.
+      // The answer and the resumed work then share one assistant bubble; do
+      // not hide the answer merely because more work followed it.
+      expandNextAssistantResponseId = midResponseUserMessageId(blocks, i);
       const chipIndexes = deferred.byMessage.get(i);
       const firstChip = chipIndexes?.[0];
       // The pair's region starts at whichever block came first, so an
@@ -1029,7 +1046,12 @@ function walkBubbles(
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
       ...(groupCreatedAtS !== undefined ? { createdAtS: groupCreatedAtS } : {}),
+      ...(expandNextAssistantResponseId !== null &&
+      groupBlocks.some((block) => block.ctx.responseId === expandNextAssistantResponseId)
+        ? { defaultExpanded: true }
+        : {}),
     });
+    expandNextAssistantResponseId = null;
   }
 
   return { bubbles, lastBubbleStart, lastBubbleCount };
@@ -1350,6 +1372,36 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
     // FileBlock is currently deferred from rendering; skip silently.
     b.type !== "file"
   );
+}
+
+/**
+ * Whether a user message interrupted assistant work in the same response.
+ *
+ * Native harnesses persist a steered message with the active response id. A
+ * normal next-turn message has a new response id, so comparing it with the
+ * preceding assistant work distinguishes the two without inspecting message
+ * wording. Runtime system messages may record an interruption in between and are
+ * skipped; lifecycle markers remain hard boundaries. Empty ids are provisional
+ * live-stream values, not durable turn identity, and are deliberately ignored.
+ */
+function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | null {
+  const user = blocks[index];
+  if (
+    user?.type !== "user_message" ||
+    isAnonymousRid(user.ctx.responseId) ||
+    isSystemUserContent(user.content)
+  ) {
+    return null;
+  }
+  for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
+    const previous = blocks[previousIndex]!;
+    if (isNonRenderingBlock(previous)) return null;
+    if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
+    return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
+      ? user.ctx.responseId
+      : null;
+  }
+  return null;
 }
 
 /** Return true when persisted text marks the assistant turn interrupted. */
@@ -1714,7 +1766,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       // the user branch's `createdAtS` comparison below.
       a.createdAtS !== b.createdAtS ||
       // Flips when a later bubble continues this turn — the fold depends on it.
-      Boolean(a.continued) !== Boolean(b.continued)
+      Boolean(a.continued) !== Boolean(b.continued) ||
+      // Opens an interjected response's process fold on first render.
+      Boolean(a.defaultExpanded) !== Boolean(b.defaultExpanded)
     ) {
       return false;
     }

@@ -3672,6 +3672,44 @@ def test_set_external_session_id_same_value_is_idempotent(
     assert fetched.external_session_id == "sid-1"
 
 
+def test_find_conversation_by_external_session_id_matches_column_without_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The lookup keys off the metadata column, so a native run (no import
+    labels) is found — this is what lets an import dedupe against it."""
+    conv = conversation_store.create_conversation(title="native run")
+    conversation_store.set_external_session_id(conv.id, "sid-native")
+
+    found = conversation_store.find_conversation_by_external_session_id("sid-native")
+    assert found is not None
+    assert found.id == conv.id
+    assert conversation_store.find_conversation_by_external_session_id("sid-absent") is None
+
+
+def test_find_conversation_by_external_session_id_returns_earliest(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When duplicates already exist for one id, the earliest-created wins.
+
+    ``created_at`` is integer seconds, so the two rows would otherwise tie and
+    fall back to the (random) id order; pin distinct stamps to assert the
+    created_at ordering itself.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    first = conversation_store.create_conversation(title="first")
+    conversation_store.set_external_session_id(first.id, "sid-dupe")
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    second = conversation_store.create_conversation(title="second")
+    conversation_store.set_external_session_id(second.id, "sid-dupe")
+
+    found = conversation_store.find_conversation_by_external_session_id("sid-dupe")
+    assert found is not None
+    assert found.id == first.id
+
+
 def test_set_external_session_id_rejects_overwrite_with_different_value(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -31,10 +31,13 @@ from omnigent.entities.conversation import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
-    HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.host.frames import (
-    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
+    classify_launch_refusal as _classify_launch_refusal,
+)
+from omnigent.host.frames import (
+    workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
@@ -1851,48 +1854,30 @@ def register_events_routes(
                         _host_reg,
                         _host_conn,
                     )
-                    if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
-                        # The host refused: the agent's harness isn't
-                        # configured there. This message was the real
-                        # runner-start attempt, so consume it and record a
-                        # transcript error (the host's message names the
-                        # fix, `omnigent setup`) the web renders as a
-                        # banner — instead of timing out into a generic
-                        # RUNNER_UNAVAILABLE. The binding stays so a later
-                        # message relaunches once setup is done.
+                    host_error_code = _classify_launch_refusal(
+                        launch_attempt.error_code,
+                        launch_attempt.error,
+                        conv.workspace,
+                    )
+                    host_error: str | None = launch_attempt.error
+                    if host_error_code == _WORKSPACE_MISSING_ERROR_CODE:
+                        # Rebuild from the authorized session row instead
+                        # of reflecting arbitrary host-provided text.
+                        host_error = _workspace_missing_message(conv.workspace)
+                    if host_error_code is not None:
+                        # No runner can connect after either safe categorical
+                        # refusal. Consume the message and record the actionable
+                        # reason instead of waiting into a generic unavailable
+                        # response. The binding stays for a later retry.
                         item_id = await _persist_host_launch_failure_turn(
                             session_id,
                             conv,
                             body,
                             conversation_store,
-                            launch_attempt.error,
+                            host_error,
                             runner_router,
                             created_by=created_by,
-                        )
-                        return {"queued": True, "item_id": item_id}
-                    if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE:
-                        # The host refused: the workspace directory no longer
-                        # exists (e.g. the worktree was deleted). Consume the
-                        # message and persist an actionable error banner so the
-                        # user knows to start a new session with a valid
-                        # workspace — instead of timing out into a generic
-                        # RUNNER_UNAVAILABLE.
-                        item_id = await _persist_native_terminal_failure(
-                            session_id,
-                            conv,
-                            body,
-                            conversation_store,
-                            ErrorData(
-                                source="execution",
-                                code=ErrorCode.WORKSPACE_MISSING,
-                                message=(
-                                    launch_attempt.error
-                                    or "The session workspace no longer exists on the host. "
-                                    "Start a new session with a valid workspace."
-                                ),
-                            ),
-                            runner_router,
-                            created_by=created_by,
+                            host_error_code=host_error_code,
                         )
                         return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id
@@ -2085,7 +2070,7 @@ def register_events_routes(
                 created_by=created_by,
             )
             if pending_background_title is not None:
-                pending_background_title.schedule()
+                pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
@@ -2106,7 +2091,7 @@ def register_events_routes(
             host_store=getattr(request.app.state, "host_store", None),
         )
         if pending_background_title is not None:
-            pending_background_title.schedule()
+            pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True}
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id

@@ -94,6 +94,7 @@ _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 _STATE_FILE = "state.json"
 _HOOKS_FILE = "hooks.jsonl"
+OBSERVER_HOOK_STDERR_FILE = "observer_hook.stderr"
 _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
 _FORKED_FROM_LINE_LIMIT = 200
@@ -160,7 +161,18 @@ _COMPOSER_MODE_GLYPHS = (_CLAUDE_PROMPT_GLYPH, _SHELL_MODE_GLYPH)
 # rule on screen is where the footer begins (see
 # :func:`_permission_mode_from_pane`). Corner glyphs are included because
 # Claude Code has framed the input box both ways across versions.
-_BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
+_BOX_RULE_GLYPHS = "─━╭╮╰╯│┃╌╍"
+_BOX_RULE_CHARS = frozenset(_BOX_RULE_GLYPHS)
+# Glyphs that may frame a *labelled* rule. Verticals are excluded because they
+# bound table cells and ``tree`` rows, which are otherwise the same shape as a
+# labelled rule (see :func:`_is_box_rule`).
+_VERTICAL_RULE_GLYPHS = "│┃"
+_TITLED_RULE_EDGE_GLYPHS = "".join(
+    glyph for glyph in _BOX_RULE_GLYPHS if glyph not in _VERTICAL_RULE_GLYPHS
+)
+# Narrowest a labelled rule may be: the composer's rule spans the pane, so a
+# short run of glyphs around a word is decoration, not the box.
+_MIN_TITLED_RULE_WIDTH = 20
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
@@ -1189,6 +1201,7 @@ def prepare_bridge_dir(
         _SERVER_FILE,
         _STATE_FILE,
         _HOOKS_FILE,
+        OBSERVER_HOOK_STDERR_FILE,
         _TOOL_RELAY_FILE,
         _TMUX_FILE,
     ):
@@ -1538,6 +1551,7 @@ def build_hook_settings(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    model_overrides: Mapping[str, str] | None = None,
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
     launch_bypass_permissions: bool = False,
@@ -1563,6 +1577,11 @@ def build_hook_settings(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param model_overrides: Canonical-to-served model id rewrites for
+        Claude Code's ``modelOverrides`` setting, e.g.
+        ``{"claude-opus-4-8": "databricks-claude-opus-4-8"}``. Empty or
+        ``None`` writes no ``modelOverrides`` (the endpoint already
+        speaks canonical ids, or the catalog was not enumerated).
     :param launch_model: Effective launch model from ``--model``. Mirrored
         into the invocation-local settings sidecar so a wrapped Claude Code
         re-exec that preserves ``--settings`` but rebuilds argv cannot fall
@@ -1603,7 +1622,10 @@ def build_hook_settings(
         "--bridge-dir",
         str(bridge_dir),
     ]
-    command = shlex.join(command_parts)
+    # Claude owns command-hook stderr, so it does not reach the runner logs.
+    # Persist it for the forwarder to relay with the Omnigent session id.
+    observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
+    command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
     session_start_hook = {
         "type": "command",
@@ -1840,6 +1862,8 @@ def build_hook_settings(
         settings["effortLevel"] = launch_effort
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
+    if model_overrides:
+        settings["modelOverrides"] = dict(model_overrides)
     # Override Claude Code's statusLine so we receive its stdin (the
     # only place ``context_window`` surfaces). A /bin/sh shim captures
     # the raw payload atomically (no interpreter spawn on Claude's
@@ -1929,6 +1953,7 @@ def augment_claude_args(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    model_overrides: Mapping[str, str] | None = None,
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
@@ -1958,6 +1983,10 @@ def augment_claude_args(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param model_overrides: Canonical-to-served model id rewrites
+        threaded to :func:`build_hook_settings` so the sidecar carries
+        Claude Code's ``modelOverrides`` map. ``None`` or empty omits
+        the key.
     :param bundle_dir: Materialized agent-bundle root, when the
         session's agent ships a ``skills/`` directory. Triggers
         ``--plugin-dir <bundle>`` so Claude Code discovers bundled
@@ -1993,6 +2022,7 @@ def augment_claude_args(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=api_key_helper,
+        model_overrides=model_overrides,
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
@@ -2443,12 +2473,14 @@ def read_transcript_items_since(
     Read Claude transcript records as Omnigent conversation items.
 
     Claude Code writes append-only JSONL records whose ``message``
-    payloads include user prompts, assistant text, native tool calls,
-    and native tool results. This parser intentionally renders no
-    conversation item for metadata records (title, file-history,
-    permission mode, system bookkeeping) or raw ``thinking`` blocks,
+    payloads include user prompts, assistant text, ``thinking``
+    blocks, native tool calls, and native tool results. This parser
+    intentionally renders no conversation item for metadata records
+    (title, file-history, permission mode, system bookkeeping),
     while translating the user-visible semantic records into Omnigent
-    item types the web UI already understands. Some metadata is still
+    item types the web UI already understands — ``thinking`` blocks
+    become ``reasoning`` items so the chat surfaces the same
+    reasoning context the TUI shows. Some metadata is still
     read for out-of-band mirroring rather than dropped outright — a
     ``custom-title`` record surfaces on
     :attr:`TranscriptReadResult.latest_custom_title`.
@@ -4123,7 +4155,13 @@ def post_tools_changed(
     :raises RuntimeError: If the bridge server is not ready, cannot
         be reached, or rejects the notification.
     """
-    server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+    try:
+        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+    except OSError as exc:
+        # Reading the advertisement can fail for reasons other than the file
+        # being absent — fd exhaustion is the one seen in the wild. Callers
+        # treat this notification as best-effort and only expect RuntimeError.
+        raise RuntimeError(f"failed to read the Claude native bridge server info: {exc}") from exc
     token = server.get("token")
     url = server.get("url")
     if not isinstance(token, str) or not isinstance(url, str):
@@ -4443,11 +4481,43 @@ def _is_box_rule(line: str) -> bool:
     the rule directly above the composer, so it is the position that
     identifies the box, not the corners.
 
-    :param line: A single pane line, e.g. ``"──────────"``.
+    A rule may also carry a **label**: Claude Code breaks the box's
+    opening rule with the session's title (``"──── my session ─"``). The
+    frame still marks the box, so a labelled rule counts as one. Demanding
+    every glyph be a rule glyph instead anchors :func:`_composer_row` on
+    the *closing* rule, which reports "no input box" with ``❯`` plainly on
+    screen and times the turn out with the message undelivered. A label is
+    accepted between a leading and a trailing run of
+    :data:`_TITLED_RULE_EDGE_GLYPHS` when it is spaced off from both,
+    carries no rule glyph itself, and the whole rule is at least
+    :data:`_MIN_TITLED_RULE_WIDTH` wide. Those conditions are what keep
+    ordinary output from passing as a rule: a pasted ``tree``/table line of
+    nested ``│`` glyphs and spaces, and a ``│ cell │`` of any width, must
+    stay content, or :func:`_composer_row` collects it as an interior rule
+    and misses the real opening rule the same way. Excluding the vertical
+    glyphs is what draws that line, since a table cell and a labelled rule
+    are otherwise the same shape. The length of the leading run cannot draw
+    it: Claude Code right-aligns the label, so that run shrinks to a single
+    glyph once the title nears the pane width, and the pane is only as wide
+    as the person's browser terminal.
+
+    :param line: A single pane line, e.g. ``"──────────"`` or
+        ``"──────── my session ─"``.
     :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
-    return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
+    if len(stripped) < 3:
+        return False
+    if all(ch in _BOX_RULE_CHARS for ch in stripped):
+        return True
+    lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
+    trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
+    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
+        return False
+    label = stripped[lead : len(stripped) - trail]
+    if any(ch in _BOX_RULE_CHARS for ch in label):
+        return False
+    return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
 
 
 def _submit_needle(content: str) -> str:
@@ -6990,6 +7060,25 @@ def _assistant_transcript_items_from_entry(
                         response_id=response_id,
                         text=text,
                         is_api_error=is_api_error,
+                    )
+                )
+            continue
+        if block_type == "thinking":
+            # Mirror the thought as a reasoning item so the chat offers the
+            # same expandable reasoning context the TUI renders. Redacted
+            # thinking carries no readable text anywhere, so it stays dropped.
+            thinking = block.get("thinking")
+            if isinstance(thinking, str) and thinking.strip():
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, item_index, "reasoning"),
+                        item_type="reasoning",
+                        data={
+                            "agent": agent_name,
+                            "summary": [],
+                            "content": [{"type": "reasoning_text", "text": thinking}],
+                        },
+                        response_id=response_id,
                     )
                 )
             continue

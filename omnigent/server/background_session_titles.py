@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
-    synthesize_conversation_title,
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
@@ -390,14 +389,15 @@ class PendingBackgroundSessionTitle:
 
     coordinator: BackgroundSessionTitleCoordinator
     request: BackgroundTitleRequest
-    expected_seed_title: str
 
-    def schedule(self) -> None:
-        """Start the prepared title attempt without blocking the caller."""
+    def schedule(self, *, expected_seed_title: str | None) -> None:
+        """Start the attempt using the title persisted by the active store."""
+        if expected_seed_title is None:
+            return
         self.coordinator.schedule(
             session_id=self.request.session_id,
             prompt=self.request.prompt,
-            expected_seed_title=self.expected_seed_title,
+            expected_seed_title=expected_seed_title,
             agent_id=self.request.agent_id,
             harness_override=self.request.harness_override,
             model_override=self.request.model_override,
@@ -426,9 +426,6 @@ def prepare_background_session_title(
     if not prompt:
         return None
 
-    expected_seed_title = synthesize_conversation_title([{"type": "input_text", "text": prompt}])
-    if expected_seed_title is None:
-        return None
     return PendingBackgroundSessionTitle(
         coordinator=coordinator,
         request=BackgroundTitleRequest(
@@ -439,7 +436,6 @@ def prepare_background_session_title(
             model_override=conversation.model_override,
             sub_agent_name=conversation.sub_agent_name,
         ),
-        expected_seed_title=expected_seed_title,
     )
 
 

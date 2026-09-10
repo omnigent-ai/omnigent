@@ -119,10 +119,9 @@ async def test_prepare_background_title_from_message(db_uri: str) -> None:
         prompt="please investigate the authentication timeout",
         agent_id=agent_id,
     )
-    assert pending.expected_seed_title == "please investigate the authentication timeout"
 
 
-async def test_prepare_background_title_from_slash_command(db_uri: str) -> None:
+async def test_slash_command_background_title_uses_persisted_seed(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conversation = store.create_conversation(kind="default")
 
@@ -140,7 +139,12 @@ async def test_prepare_background_title_from_slash_command(db_uri: str) -> None:
 
     assert pending is not None
     assert pending.request.prompt == "/grill-me review this plan"
-    assert pending.expected_seed_title == "/grill-me review this plan"
+    persisted = store.update_conversation(conversation.id, title="grill-me review this plan")
+    assert persisted is not None
+    pending.schedule(expected_seed_title=persisted.title)
+    await pending.coordinator.wait_for_idle()
+
+    assert store.get_conversation(conversation.id).title == "Review migration plan"
 
 
 @pytest.mark.parametrize("excluded_session", ["titled", "child"])

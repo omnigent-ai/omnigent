@@ -32,6 +32,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _claude_prompt_rendered,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
+    _is_box_rule,
     _JsonlRecord,
     _occupying_surface,
     augment_claude_args,
@@ -822,7 +823,7 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
                         "message": {
                             "role": "assistant",
                             "content": [
-                                {"type": "thinking", "thinking": "redacted"},
+                                {"type": "thinking", "thinking": "check the todo file first"},
                                 {
                                     "type": "tool_use",
                                     "id": "toolu_read_1",
@@ -887,6 +888,7 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
     assert cursor == 6, "cursor should include metadata records even when they emit no items"
     assert [item.item_type for item in items] == [
         "message",
+        "reasoning",
         "function_call",
         "function_call_output",
         "message",
@@ -895,19 +897,115 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
         "role": "user",
         "content": [{"type": "input_text", "text": "please inspect TODO.md"}],
     }
-    tool_call = items[1]
+    reasoning = items[1]
+    assert reasoning.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "check the todo file first"}],
+    }
+    tool_call = items[2]
     assert tool_call.data["name"] == "Read"
     assert json.loads(tool_call.data["arguments"]) == {"file_path": "TODO.md"}
     assert tool_call.data["call_id"] == "toolu_read_1"
-    assert items[2].response_id == tool_call.response_id
-    assert items[2].data == {"call_id": "toolu_read_1", "output": "TODO contents"}
+    assert reasoning.response_id == tool_call.response_id
     assert items[3].response_id == tool_call.response_id
-    assert items[3].data == {
+    assert items[3].data == {"call_id": "toolu_read_1", "output": "TODO contents"}
+    assert items[4].response_id == tool_call.response_id
+    assert items[4].data == {
         "role": "assistant",
         "agent": "claude-native-ui",
         "content": [{"type": "output_text", "text": "Done."}],
     }
     assert current_response_id == tool_call.response_id
+
+
+def test_read_transcript_items_since_mirrors_thinking_as_reasoning(tmp_path: Path) -> None:
+    """
+    A ``thinking`` block becomes a ``reasoning`` item in the mirrored turn.
+
+    Claude Code renders the thought in the TUI and persists it to the
+    transcript, so the chat mirror must surface the same reasoning
+    context: a ``reasoning`` item sharing the turn's response id,
+    ordered before the answer text it precedes.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "the user wants the token verbatim",
+                            "signature": "sig",
+                        },
+                        {"type": "text", "text": "TOKEN"},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["reasoning", "message"]
+    reasoning, answer = items
+    assert reasoning.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "the user wants the token verbatim"}],
+    }
+    assert reasoning.source_id.endswith(":0:reasoning"), (
+        "reasoning items need a stable per-block source id so forwarder retries dedup"
+    )
+    assert reasoning.response_id == answer.response_id
+    assert current_response_id == answer.response_id
+
+
+def test_read_transcript_items_since_skips_unreadable_thinking(tmp_path: Path) -> None:
+    """
+    Thinking with no readable text mirrors nothing.
+
+    A whitespace-only ``thinking`` block and a ``redacted_thinking``
+    block (encrypted payload, no text anywhere — the TUI shows nothing
+    either) must not produce a dead, empty reasoning section in chat.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "   "},
+                        {"type": "redacted_thinking", "data": "opaque-bytes"},
+                        {"type": "text", "text": "Done."},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
 
 
 def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
@@ -3016,6 +3114,31 @@ def test_augment_claude_args_materializes_api_key_helper(
     assert settings_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_augment_claude_args_threads_model_overrides_into_settings(tmp_path: Path) -> None:
+    """``model_overrides`` is written into the invocation-local sidecar."""
+    overrides = {
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-opus-5": "databricks-claude-opus-5",
+    }
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        api_key_helper="printf tok",
+        model_overrides=overrides,
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings["apiKeyHelper"] == "printf tok"
+    assert settings["modelOverrides"] == overrides
+
+
+def test_augment_claude_args_omits_model_overrides_when_unsupplied(tmp_path: Path) -> None:
+    """Existing call sites that omit ``model_overrides`` write no such key."""
+    settings = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    assert "modelOverrides" not in settings
+
+
 def test_augment_claude_args_mirrors_launch_overrides_into_settings(
     tmp_path: Path,
 ) -> None:
@@ -5094,6 +5217,26 @@ def test_post_tools_changed_normalizes_transport_errors(
         post_tools_changed(tmp_path)
 
     assert caught.value.__cause__ is transport_error
+
+
+def test_post_tools_changed_normalizes_server_info_read_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Reading the bridge advertisement can fail for reasons other than the file
+    being absent — a runner that has exhausted its file descriptors raises
+    ``OSError`` (EMFILE) on the read. That must arrive as the documented
+    ``RuntimeError`` so the fire-and-forget caller can swallow it instead of
+    leaving an unretrieved task exception behind.
+    """
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(side_effect=OSError(24, "Too many open files")),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to read the Claude native bridge server info"):
+        post_tools_changed(tmp_path)
 
 
 def test_post_tools_changed_preserves_programming_errors(
@@ -7468,6 +7611,134 @@ def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
             "❯ 2. buy milk",
             "────────────────────────────────────────",
             "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_under_labelled_rule() -> None:
+    """
+    A label on the box's opening rule does not hide the input box.
+
+    Claude Code breaks the opening rule with the session's title
+    (``"──── 01007290 ─"``). Requiring every glyph on the rule to be a
+    rule glyph made ``_composer_row`` anchor on the *closing* rule
+    instead, pick the footer row below it, and report "no input box" with
+    ``❯`` plainly on screen. The turn then waited out
+    ``_CLAUDE_PROMPT_TIMEOUT_S`` and the person's message was never
+    delivered. Pane shape is taken from a session that hit this.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            "● 2 background agents launched (↓ to manage)",
+            "  ⎿  Interrupted · What should Claude do instead?",
+            f"{rule} 01007290 ─",  # opening rule, labelled with the session title
+            "❯ ",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "  ◯ support-agent:enrichment-ru…  Connecting     40s · ↓ 66.3k tokens",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
+    """
+    A label that fills the rule still does not hide the input box.
+
+    Claude Code right-aligns the title, so the run of glyphs left of it
+    shrinks as the title grows and is a single glyph once the title nears
+    the pane width. The pane is only as wide as the person's browser
+    terminal (``window-size latest`` plus the web client's own
+    ``refresh-client -C``), so an ordinary title on a narrow terminal
+    reaches that shape — and requiring a longer leading run left the
+    labelled-rule turn timing out there exactly as it did before. Pane
+    shape is taken from a 50-column session.
+    """
+    rule = "─" * 50
+    pane = "\n".join(
+        [
+            "  ⎿  Session renamed to:",
+            "     fix-the-billing-webhook-retry-backoff-path-now",
+            "─ fix-the-billing-webhook-retry-backoff-path-now ─",  # 1-glyph lead
+            "❯ ",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ high │ 0/1M $0.00",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "─" * 40,  # plain rule
+        "───",  # shortest plain rule
+        "╭" + "─" * 10 + "╮",  # cornered rule
+        "─" * 40 + " 01007290 ─",  # labelled with a session title
+        "─" * 40 + " design doc work ─",  # label carrying spaces
+        # Claude Code right-aligns the label, so the leading run shrinks to a
+        # single glyph once the title nears the pane width. Both of these come
+        # off a real pane: a 75-char title at 80 columns, and an ordinary
+        # 46-char title on a browser terminal only 50 columns wide.
+        "── " + "t" * 75 + " ─",
+        "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+    ],
+)
+def test_is_box_rule_accepts_rules(line: str) -> None:
+    """Plain, cornered and labelled rules all frame the input box."""
+    assert _is_box_rule(line) is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "❯ 2. No (recommended)",  # a menu row, not a rule
+        "│ cell │",  # vertical glyphs bound a table cell, not a rule
+        "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",  # footer row
+        "output line 1",
+        "─ x ─",  # narrower than _MIN_TITLED_RULE_WIDTH
+        # Wide enough to clear the width floor, so only the vertical frame
+        # glyphs keep these off the rule list.
+        "│ a longer table cell │",
+        "│ a very wide pasted table cell indeed │",
+        "──",  # shorter than the minimum rule
+        "│   │",  # nested pipes + spaces: pasted table indentation, not a rule
+        "│   │   │",  # deeper nesting, same shape
+        "│   ├── src",  # a ``tree`` row
+        "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+    ],
+)
+def test_is_box_rule_rejects_non_rules(line: str) -> None:
+    """Ordinary rows must not pass as a rule now that labels are allowed."""
+    assert _is_box_rule(line) is False
+
+
+def test_claude_prompt_rendered_sees_prompt_over_pasted_tree_output() -> None:
+    """
+    Box glyphs inside a multi-line draft do not hide the input box.
+
+    Admitting any run of rule glyphs and spaces as a rule would make a
+    pasted ``tree``/table line (``"│   │"``) an *interior* rule.
+    ``_composer_row`` takes the row under the last two rules, so that
+    false rule and the closing rule would be the pair it checks — skipping
+    the real opening rule where ``❯`` lives and reporting "no input box"
+    for the very reason this labelled-rule fix exists.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            f"{rule} 01007290 ─",  # opening rule, labelled
+            "❯ here is the layout I meant:",
+            "  src",
+            "  │   ├── app.py",
+            "  │   │",  # pasted tree indentation — content, not a rule
+            "  │   └── util.py",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
         ]
     )
     assert _claude_prompt_rendered(pane) is True

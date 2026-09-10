@@ -1233,6 +1233,38 @@ args = []
     }
 
 
+async def test_start_pins_reasoning_effort_in_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Startup seeds ``model_reasoning_effort`` from the session's persisted effort.
+
+    The private config is a copy of the user's shared one, whose effort line is
+    whatever the user last ran. Both the app-server and the ``--remote`` TUI
+    read it at thread creation, so a session created or forked at ``ultra``
+    otherwise starts (and reports in the TUI footer) that stale level.
+    """
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    original = 'model_reasoning_effort = "medium"\n'
+    (real_codex_home / "config.toml").write_text(original, encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.pinned_effort = "ultra"
+    await server.start()
+    await server.close()
+
+    rendered = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert tomllib.loads(rendered)["model_reasoning_effort"] == "ultra"
+    assert rendered.count("model_reasoning_effort") == 1
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
 async def test_start_writes_fresh_mcp_config_without_leading_blanks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2151,6 +2183,80 @@ class TestPinCodexConfigModel:
         assert read_codex_config_model(bridge_dir) == "databricks-gpt-5-4-mini"
 
 
+class TestPinCodexConfigEffort:
+    """_pin_codex_config_effort seeds the per-session config.toml effort."""
+
+    def test_replaces_top_level_effort_only(self, tmp_path: Path) -> None:
+        """The copied effort line is replaced; model and table-scoped keys survive."""
+        from omnigent.harnesses.codex_native.app_server import _pin_codex_config_effort
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            'model = "gpt-5.5"\n'
+            'model_reasoning_effort = "medium"\n'
+            "[profiles.default]\n"
+            'model_reasoning_effort = "table-scoped-stays"\n',
+            encoding="utf-8",
+        )
+        _pin_codex_config_effort(tmp_path, "ultra", "gpt-5.5")
+        lines = config.read_text(encoding="utf-8").splitlines()
+        assert lines[:2] == ['model = "gpt-5.5"', 'model_reasoning_effort = "ultra"']
+        assert 'model_reasoning_effort = "table-scoped-stays"' in lines
+        assert "medium" not in "\n".join(lines)
+
+    @pytest.mark.parametrize(
+        ("existing", "expected"),
+        [
+            (
+                '  model_reasoning_effort = "medium"  # user default',
+                '  model_reasoning_effort = "ultra"  # user default',
+            ),
+            ("model_reasoning_effort = 'medium'", 'model_reasoning_effort = "ultra"'),
+        ],
+        ids=["indented-with-comment", "single-quoted"],
+    )
+    def test_rewrites_the_existing_line_in_place(
+        self, tmp_path: Path, existing: str, expected: str
+    ) -> None:
+        """An indented key keeps its indent and comment; an unparsable value is replaced whole.
+
+        Missing the indented spelling would insert a second top-level key, which
+        codex rejects as invalid TOML — the same regex the model pin uses to clamp
+        this line already tolerates it.
+        """
+        from omnigent.harnesses.codex_native.app_server import _pin_codex_config_effort
+
+        config = tmp_path / "config.toml"
+        config.write_text(f"{existing}\n[profiles.default]\nx = 1\n", encoding="utf-8")
+        _pin_codex_config_effort(tmp_path, "ultra", "gpt-5.6-sol")
+        lines = config.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == expected
+        assert sum("model_reasoning_effort" in line for line in lines) == 1
+        assert (
+            tomllib.loads(config.read_text(encoding="utf-8"))["model_reasoning_effort"] == "ultra"
+        )
+
+    def test_inserts_effort_when_absent(self, tmp_path: Path) -> None:
+        """A config with no top-level effort gains one before the first table."""
+        from omnigent.harnesses.codex_native.app_server import _pin_codex_config_effort
+
+        config = tmp_path / "config.toml"
+        config.write_text("[profiles.default]\nx = 1\n", encoding="utf-8")
+        _pin_codex_config_effort(tmp_path, "high", None)
+        lines = config.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == 'model_reasoning_effort = "high"'
+        assert "[profiles.default]" in lines
+
+    def test_clamps_to_the_pinned_models_ladder(self, tmp_path: Path) -> None:
+        """A level the pinned model rejects is coerced so the first turn cannot 400."""
+        from omnigent.harnesses.codex_native.app_server import _pin_codex_config_effort
+
+        _pin_codex_config_effort(tmp_path, "ultra", "glm-5-2")
+        assert (tmp_path / "config.toml").read_text(encoding="utf-8") == (
+            'model_reasoning_effort = "medium"\n'
+        )
+
+
 # --- Subagent-routing hook trust ---------------------------------------
 #
 # Empirically (codex-cli 0.145.0) ``--dangerously-bypass-hook-trust`` does
@@ -2474,6 +2580,83 @@ async def test_codex_native_launch_config_reads_the_auto_harness_flag(
         config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
 
     assert config.auto_harness is expected
+
+
+@pytest.mark.parametrize(
+    ("persisted", "expected"),
+    [("ultra", "ultra"), ("bogus", None), (None, None)],
+    ids=["ultra", "unsupported", "unset"],
+)
+async def test_codex_native_launch_config_reads_reasoning_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persisted: str | None,
+    expected: str | None,
+) -> None:
+    """The persisted effort reaches the launch; an unsupported one is dropped, not fatal."""
+    import httpx
+
+    from omnigent.runner.native.orchestration import _codex_native_launch_config
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:9999")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"workspace": str(tmp_path), "labels": {}, "reasoning_effort": persisted},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
+
+    assert config.reasoning_effort == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_effort"),
+    [("gpt-5.6-sol", "ultra"), (None, "ultra"), ("glm-5-2", "medium")],
+    ids=["sol", "no-model", "clamped"],
+)
+async def test_apply_codex_thread_effort_updates_the_loaded_thread(
+    monkeypatch: pytest.MonkeyPatch, model: str | None, expected_effort: str
+) -> None:
+    """
+    The persisted effort reaches a resumed thread via ``thread/settings/update``.
+
+    A resumed thread runs the rollout's recorded effort — none after a runner
+    restart rebuilt the rollout, the source's on a forked clone — so the launch
+    re-applies the session's effort (clamped to the model's ladder) once the
+    thread has started, instead of leaving the TUI at ``default`` until a web
+    turn happens to send one.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    class _FakeClient:
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            assert ws_url == "ws://127.0.0.1:9876"
+            assert client_name == "omnigent-codex-native-effort"
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            requests.append((method, params))
+            return {"result": {}}
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+    await codex_native_app_server.apply_codex_thread_effort(
+        "ws://127.0.0.1:9876", "thread_abc", "ultra", model=model
+    )
+    assert requests == [
+        ("thread/settings/update", {"threadId": "thread_abc", "effort": expected_effort})
+    ]
 
 
 async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
