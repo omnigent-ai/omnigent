@@ -43,13 +43,14 @@ import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, ClassVar, TypeVar
+from typing import TYPE_CHECKING, ClassVar, TypeVar, cast
 
 import click
 
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
+    SandboxGoneError,
     SandboxLauncher,
     foreground_kill_command,
     foreground_pidfile,
@@ -318,10 +319,12 @@ class _OpenShellClient:
         self._guard(
             f"Could not resume OpenShell sandbox '{name}'",
             lambda: start(name, workspace=ws),
+            gone_on_not_found=True,
         )
         ready = self._guard(
             f"OpenShell sandbox '{name}' did not become ready after resume",
             lambda: self._client.wait_ready(name, workspace=ws, timeout_seconds=_READY_TIMEOUT_S),
+            gone_on_not_found=True,
         )
         # The resumed instance may carry a fresh opaque id; recache it so
         # subsequent execs reach the live instance.
@@ -371,7 +374,13 @@ class _OpenShellClient:
             self._ids[name] = cached
         return cached
 
-    def _guard(self, message: str, call: Callable[[], _T]) -> _T:
+    def _guard(
+        self,
+        message: str,
+        call: Callable[[], _T],
+        *,
+        gone_on_not_found: bool = False,
+    ) -> _T:
         """Run an SDK *call*, surfacing gRPC / SandboxError as ClickException."""
         import grpc
         from openshell import SandboxError
@@ -379,6 +388,13 @@ class _OpenShellClient:
         try:
             return call()
         except (grpc.RpcError, SandboxError) as exc:
+            not_found = (
+                isinstance(exc, grpc.Call) and exc.code() == grpc.StatusCode.NOT_FOUND
+            ) or (isinstance(exc, SandboxError) and "not found" in str(exc).lower())
+            if gone_on_not_found and not_found:
+                raise SandboxGoneError(f"{message}: sandbox no longer exists") from cast(
+                    BaseException, exc
+                )
             raise click.ClickException(f"{message}: {exc}") from exc
 
 

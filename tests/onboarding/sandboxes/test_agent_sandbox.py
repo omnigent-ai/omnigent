@@ -35,6 +35,7 @@ from omnigent.onboarding.sandboxes.agent_sandbox import (
     resolve_shutdown_window_s,
     resolve_workspace_volume,
 )
+from omnigent.onboarding.sandboxes.base import SandboxGoneError
 
 _SANDBOX_ID = "omnigent-managed-abc-1a2b3c"
 _MANIFEST_KW = {
@@ -105,9 +106,19 @@ class _FakeCustom:
         self.created: list[dict[str, object]] = []
         self.patches: list[tuple[str, dict[str, object]]] = []
         self.deleted: list[str] = []
+        self.get_error: Exception | None = None
         self.create_error: Exception | None = None
         self.patch_error: Exception | None = None
         self.delete_error: Exception | None = None
+
+    def get_namespaced_custom_object(
+        self, group, version, namespace, plural, name, _request_timeout=None
+    ):
+        self.calls.append("get")
+        assert (group, version, plural) == (API_GROUP, API_VERSION, SANDBOX_PLURAL)
+        if self.get_error is not None:
+            raise self.get_error
+        return {"metadata": {"name": name}}
 
     def create_namespaced_custom_object(
         self, group, version, namespace, plural, body, _request_timeout=None
@@ -533,6 +544,20 @@ def test_resume_tolerates_a_sandbox_that_never_had_a_pod(
     core.delete_namespaced_pod = _gone  # type: ignore[method-assign]
     _launcher().resume(_SANDBOX_ID)  # must not raise
     assert "warning" not in capsys.readouterr().err
+
+
+def test_resume_missing_sandbox_raises_gone(
+    fake_clients: tuple[_FakeCore, _FakeCustom],
+) -> None:
+    """A missing Sandbox CR means its managed workspace cannot be resumed."""
+    core, custom = fake_clients
+    custom.get_error = _FakeApiException(status=404, reason="NotFound")
+
+    with pytest.raises(SandboxGoneError, match=_SANDBOX_ID):
+        _launcher().resume(_SANDBOX_ID)
+
+    assert core.deleted_secrets == []
+    assert core.deleted_pods == []
 
 
 def test_terminating_pod_counts_as_absent(

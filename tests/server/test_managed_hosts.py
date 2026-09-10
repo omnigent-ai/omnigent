@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import (
+    SandboxGoneError,
     SandboxHostLauncher,
     render_host_config_write_command,
 )
@@ -41,9 +42,11 @@ from omnigent.server.managed_hosts import (
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_HOME_SIZE_LIMIT_DEFAULT,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
+    MANAGED_REPO_LABEL_KEY,
     MICROSANDBOX_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
+    ManagedHostLaunch,
     ManagedLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
@@ -3349,6 +3352,40 @@ async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_u
     )
 
 
+async def test_resume_managed_host_propagates_gone_and_preserves_existing_row(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Definitive sandbox loss is delegated without deleting the host identity."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="f359cf76dbd54c8e97568b436688292b",
+        name="managed-resume-gone",
+        user_id=_OWNER,
+        token="tok-resume-gone",
+        provider="islo",
+        sandbox_id="sb-resume-gone",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.set_offline(host.host_id)
+    fake = _IsloFakeLauncher(can_resume=True)
+
+    def _gone(_sandbox_id: str) -> None:
+        raise SandboxGoneError("sandbox no longer exists")
+
+    monkeypatch.setattr(fake, "resume", _gone)
+
+    with pytest.raises(SandboxGoneError, match="no longer exists"):
+        await resume_managed_host(host.host_id, host_store, _injected_config(fake))
+
+    preserved = host_store.get_host(host.host_id)
+    assert preserved is not None
+    assert preserved.status == "offline"
+    assert preserved.sandbox_id == "sb-resume-gone"
+    assert host_store.resolve_launch_token(host.host_id, "tok-resume-gone") is not None
+    assert fake.host_starts == []
+
+
 async def test_resume_managed_host_does_not_resume_detached_generation(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -4572,6 +4609,132 @@ async def test_run_managed_wake_omits_the_classifier_for_a_session_scoped_impost
         agent_id=impostor.id,
     )
     assert captured["agent_name"] is None
+
+
+async def test_run_managed_wake_recreates_a_definitively_gone_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gone wake reuses the host identity and create-time session metadata."""
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _resume(*args: object, **kwargs: object) -> None:
+        raise SandboxGoneError("sandbox no longer exists")
+
+    captured: dict[str, object] = {}
+
+    async def _launch(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume)
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _launch)
+
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+    agent_store = _StubAgentStore({builtin.id: builtin})
+    host = SimpleNamespace(host_id="host_1", user_id=_OWNER)
+    host_store = SimpleNamespace(get_host=lambda _host_id: host)
+    sandbox_config = SimpleNamespace()
+    conversation_store = SimpleNamespace()
+    host_registry = SimpleNamespace()
+    tunnel_registry = SimpleNamespace()
+    conv = SimpleNamespace(
+        labels={MANAGED_REPO_LABEL_KEY: "https://github.com/omnigent-ai/omnigent#main"},
+        host_id=host.host_id,
+        agent_id=builtin.id,
+    )
+
+    await orchestration._run_managed_wake(
+        session_id="conv_1",
+        conv=conv,
+        sandbox_config=sandbox_config,
+        tracker=ManagedLaunchTracker(),
+        conversation_store=conversation_store,
+        host_store=host_store,
+        host_registry=host_registry,
+        tunnel_registry=tunnel_registry,
+        agent_store=agent_store,
+        agent_id=builtin.id,
+    )
+
+    assert captured["session_id"] == "conv_1"
+    assert captured["owner"] == _OWNER
+    assert captured["sandbox_config"] is sandbox_config
+    assert captured["conversation_store"] is conversation_store
+    assert captured["host_store"] is host_store
+    assert captured["host_registry"] is host_registry
+    assert captured["tunnel_registry"] is tunnel_registry
+    assert captured["relaunch_host"] is host
+    assert captured["agent_store"] is agent_store
+    assert captured["agent_id"] == builtin.id
+    repo = captured["repo"]
+    assert isinstance(repo, RepoWorkspace)
+    assert repo.url == "https://github.com/omnigent-ai/omnigent"
+    assert repo.branch == "main"
+    assert repo.repo_name == "omnigent"
+
+
+async def test_recreated_sandbox_records_and_publishes_workspace_reset_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each fresh generation records and publishes one visible reset notice."""
+    from omnigent.server.routes._sessions import orchestration
+
+    appended: list[object] = []
+    surfaced: list[object] = []
+
+    class _ConversationStore:
+        def set_host_id(self, session_id: str, host_id: str, workspace: str) -> object:
+            assert session_id == "conv_1"
+            assert host_id == "host_1"
+            assert workspace == "/root/workspace/omnigent"
+            return SimpleNamespace(id=session_id, host_id=host_id, workspace=workspace)
+
+        def append(self, session_id: str, items: list[object]) -> list[object]:
+            assert session_id == "conv_1"
+            appended.extend(items)
+            return items
+
+    published: list[tuple[str, str, str | None]] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_publish_sandbox_status",
+        lambda session_id, stage, detail=None: published.append((session_id, stage, detail)),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_publish_external_conversation_item",
+        lambda session_id, item: surfaced.append(item),
+    )
+    tracker = ManagedLaunchTracker()
+    tracker.begin("conv_1")
+
+    await orchestration._bind_and_launch_managed_runner(
+        session_id="conv_1",
+        managed=ManagedHostLaunch(
+            host_id="host_1",
+            workspace="/root/workspace/omnigent",
+        ),
+        sandbox_config=SimpleNamespace(),
+        tracker=tracker,
+        conversation_store=_ConversationStore(),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+        relaunch_host=SimpleNamespace(host_id="host_1"),
+    )
+
+    assert tracker.get("conv_1") is None
+    assert [item.type for item in appended] == ["error"]
+    [visible] = appended
+    assert visible.data.code == "managed_sandbox_workspace_reset"
+    assert visible.data.level == "info"
+    assert surfaced == [visible]
+    assert published[-1] == ("conv_1", "ready", None)
 
 
 async def test_concurrent_relaunch_messages_kick_a_single_launch(

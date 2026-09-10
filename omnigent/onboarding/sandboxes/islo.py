@@ -42,6 +42,7 @@ from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
     RemoteProcess,
+    SandboxGoneError,
     SandboxLauncher,
     host_image_wheel_install_command,
 )
@@ -70,7 +71,8 @@ _REQUEST_TIMEOUT_S = 30.0
 _STREAM_TIMEOUT_S = None
 _RUNNING_STATUSES = frozenset({"running", "ready"})
 _RESUMABLE_STATUSES = frozenset({"paused", "stopped"})
-_NON_RESUMABLE_STATUSES = frozenset({"deleted", "deleting", "failed", "error"})
+_GONE_STATUSES = frozenset({"deleted", "deleting"})
+_NON_RESUMABLE_STATUSES = frozenset({"failed", "error"})
 _INSTALL_HINT = (
     "The Islo sandbox provider requires the optional Islo SDK. Install it with "
     "`pip install 'omnigent[islo]'` or `uv tool install 'omnigent[islo]'`."
@@ -152,6 +154,10 @@ class _IsloAPIError(RuntimeError):
     """Provider-boundary error with a user-facing message."""
 
 
+class _IsloSandboxGoneError(_IsloAPIError):
+    """The Islo API definitively reports that the sandbox is absent."""
+
+
 @dataclass(frozen=True)
 class _IsloSDK:
     """Lazy-loaded SDK symbols used by the launcher."""
@@ -227,6 +233,8 @@ class _IsloClient:
         try:
             sandbox = self._client.sandboxes.get_sandbox(name)
         except Exception as exc:
+            if self._is_not_found(exc):
+                raise _IsloSandboxGoneError(f"Islo sandbox '{name}' no longer exists") from exc
             raise self._sdk_error(f"get sandbox '{name}'", exc) from exc
         return _object_dict(sandbox)
 
@@ -244,6 +252,8 @@ class _IsloClient:
         try:
             sandbox = self._client.sandboxes.resume_sandbox(name)
         except Exception as exc:
+            if self._is_not_found(exc):
+                raise _IsloSandboxGoneError(f"Islo sandbox '{name}' no longer exists") from exc
             raise self._sdk_error(f"resume sandbox '{name}'", exc) from exc
         return _object_dict(sandbox)
 
@@ -588,6 +598,8 @@ class IsloSandboxLauncher(SandboxLauncher):
         click.echo(f"▸ Resuming Islo sandbox '{sandbox_id}'")
         try:
             sandbox = self._islo().get_sandbox(sandbox_id)
+        except _IsloSandboxGoneError as exc:
+            raise SandboxGoneError(str(exc)) from exc
         except _IsloAPIError as exc:
             raise click.ClickException(
                 f"Could not resume Islo sandbox '{sandbox_id}': {exc}"
@@ -599,12 +611,16 @@ class IsloSandboxLauncher(SandboxLauncher):
         if status in _RESUMABLE_STATUSES:
             try:
                 self._islo().resume_sandbox(sandbox_id)
+            except _IsloSandboxGoneError as exc:
+                raise SandboxGoneError(str(exc)) from exc
             except _IsloAPIError as exc:
                 raise click.ClickException(
                     f"Could not resume Islo sandbox '{sandbox_id}': {exc}"
                 ) from exc
             click.echo(f"  → resumed {sandbox_id}")
             return
+        if status in _GONE_STATUSES:
+            raise SandboxGoneError(f"Islo sandbox '{sandbox_id}' is {status}")
         if status in _NON_RESUMABLE_STATUSES:
             raise click.ClickException(
                 f"Islo sandbox '{sandbox_id}' is {status}; it cannot be resumed in place."
@@ -618,6 +634,8 @@ class IsloSandboxLauncher(SandboxLauncher):
         """Return whether Islo currently reports the sandbox as running."""
         try:
             sandbox = self._islo().get_sandbox(sandbox_id)
+        except _IsloSandboxGoneError:
+            return False
         except _IsloAPIError as exc:
             raise click.ClickException(
                 f"Could not inspect Islo sandbox '{sandbox_id}': {exc}"
@@ -625,7 +643,9 @@ class IsloSandboxLauncher(SandboxLauncher):
         status = str(sandbox.get("status") or "").lower()
         if status in _RUNNING_STATUSES:
             return True
-        if status in _RESUMABLE_STATUSES or status in _NON_RESUMABLE_STATUSES:
+        if status in _RESUMABLE_STATUSES or status in _GONE_STATUSES:
+            return False
+        if status in _NON_RESUMABLE_STATUSES:
             return False
         return None
 

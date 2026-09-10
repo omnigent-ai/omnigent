@@ -3125,6 +3125,8 @@ async def _bind_and_launch_managed_runner(
             session_id, "failed", "session was deleted while its sandbox was provisioning"
         )
         return
+    if relaunch_host is not None:
+        await _note_workspace_reset_on_recreate(session_id, conversation_store)
     # Host bound; what remains is launching the runner and waiting
     # for its tunnel.
     _publish_sandbox_status(session_id, "connecting")
@@ -3577,6 +3579,71 @@ async def ensure_runner_connected(
     return runner_client, conv
 
 
+def _managed_relaunch_repo(conv: Conversation, session_id: str) -> RepoWorkspace | None:
+    """Recover a managed session's create-time repository workspace."""
+    from omnigent.server.managed_hosts import (
+        MANAGED_REPO_LABEL_KEY,
+        parse_repo_workspace,
+    )
+
+    raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
+    if raw_repo is None:
+        return None
+    try:
+        return parse_repo_workspace(raw_repo)
+    except ValueError:
+        _logger.warning(
+            "Session %s has an unparseable %s label (%r); relaunching with an empty workspace",
+            session_id,
+            MANAGED_REPO_LABEL_KEY,
+            raw_repo,
+            extra={"session_id": session_id},
+        )
+        return None
+
+
+_WORKSPACE_RESET_ERROR_CODE = "managed_sandbox_workspace_reset"
+_WORKSPACE_RESET_NOTICE = (
+    "The sandbox backing this session no longer exists. A fresh sandbox is being "
+    "created. Local files that were not committed and pushed are gone. If the "
+    "session started from a repository, that repository has been cloned again."
+)
+
+
+async def _note_workspace_reset_on_recreate(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist and publish the user-facing notice that the workspace reset."""
+    response_id = f"turn_{uuid.uuid4().hex}"
+    visible_item = NewConversationItem(
+        type="error",
+        response_id=response_id,
+        data=ErrorData(
+            source="execution",
+            code=_WORKSPACE_RESET_ERROR_CODE,
+            message=_WORKSPACE_RESET_NOTICE,
+            level="info",
+        ),
+    )
+    try:
+        persisted = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [visible_item],
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to persist workspace-reset notice for session %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if persisted:
+        _publish_external_conversation_item(session_id, persisted[0])
+
+
 def _kick_managed_relaunch(
     *,
     session_id: str,
@@ -3612,30 +3679,7 @@ def _kick_managed_relaunch(
     :param app_state: ``request.app.state`` — supplies the registries and the
         agent store the classifier is re-derived from.
     """
-    from omnigent.server.managed_hosts import (
-        MANAGED_REPO_LABEL_KEY,
-        parse_repo_workspace,
-    )
-
-    # Re-clone the repository the session was created with so the
-    # fresh generation's workspace matches the create-time state.
-    # The label holds the raw create-time value, already validated
-    # by the create's parse — a parse failure here means the label
-    # was tampered with, and the relaunch proceeds with an empty
-    # workspace rather than dying.
-    repo = None
-    raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
-    if raw_repo is not None:
-        try:
-            repo = parse_repo_workspace(raw_repo)
-        except ValueError:
-            _logger.warning(
-                "Session %s has an unparseable %s label (%r); relaunching with an empty workspace",
-                session_id,
-                MANAGED_REPO_LABEL_KEY,
-                raw_repo,
-                extra={"session_id": session_id},
-            )
+    repo = _managed_relaunch_repo(conv, session_id)
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
@@ -3812,6 +3856,7 @@ async def _run_managed_wake(
         built-in gate into the woken runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
     """
+    from omnigent.onboarding.sandboxes.base import SandboxGoneError
     from omnigent.server.managed_hosts import (
         resolve_managed_agent_label,
         resume_managed_host,
@@ -3851,14 +3896,43 @@ async def _run_managed_wake(
                 agent_id,
                 session_id=session_id,
             )
-        await resume_managed_host(
-            host_id,
-            host_store,
-            sandbox_config,
-            force=True,
-            on_stage=_on_stage,
-            agent_name=agent_name,
-        )
+        try:
+            await resume_managed_host(
+                host_id,
+                host_store,
+                sandbox_config,
+                force=True,
+                on_stage=_on_stage,
+                agent_name=agent_name,
+            )
+        except SandboxGoneError:
+            _logger.info(
+                "Managed host %s (session %s) sandbox is gone; recreating a fresh generation",
+                host_id,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            host = await asyncio.to_thread(host_store.get_host, host_id)
+            if host is None:
+                reason = "managed host not found after sandbox loss"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
+            await _run_managed_launch(
+                session_id=session_id,
+                owner=host.user_id,
+                sandbox_config=sandbox_config,
+                repo=_managed_relaunch_repo(conv, session_id),
+                tracker=tracker,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                tunnel_registry=tunnel_registry,
+                relaunch_host=host,
+                agent_store=agent_store,
+                agent_id=agent_id,
+            )
+            return
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:

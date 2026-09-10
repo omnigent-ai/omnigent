@@ -14,6 +14,7 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
     SandboxCapabilityError,
+    SandboxGoneError,
     SandboxHostLauncher,
     SandboxLauncher,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "SandboxCommandError",
     "SandboxConfigError",
     "SandboxError",
+    "SandboxGoneError",
     "SandboxHostLauncher",
     "SandboxInfo",
     "SandboxLauncher",

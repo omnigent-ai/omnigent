@@ -306,6 +306,15 @@ class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
     """
 
 
+class SandboxGoneError(click.ClickException, _sandbox_types.SandboxError):
+    """Raised when a sandbox generation definitively no longer exists.
+
+    Resumable providers use this only for a definitive absence, never for a
+    timeout, connectivity failure, or unknown state. The managed-host wake path
+    catches it and provisions a fresh sandbox generation instead.
+    """
+
+
 @dataclass
 class RemoteCommandResult:
     """
@@ -582,6 +591,8 @@ class SandboxLifecycle(ABC):
             ``"sb-a1b2c3"``.
         :raises SandboxCapabilityError: When the provider cannot resume a
             stopped sandbox (ephemeral sandboxes / no persistent volume).
+        :raises SandboxGoneError: When the sandbox generation definitively no
+            longer exists.
         :raises click.ClickException: If the resume fails.
         """
         raise self._capability_error("resume a stopped sandbox")
