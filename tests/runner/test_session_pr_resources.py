@@ -6,10 +6,14 @@ import base64
 import json
 from pathlib import Path
 
+import httpx
 import pytest
+from filelock import FileLock
 
+from omnigent.runner import create_runner_app
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.runner.helpers import NullServerClient
 
 A = "https://github.com/example/one/pull/42"
 B = "https://github.com/example/two/pull/42"
@@ -113,6 +117,123 @@ def test_context_uses_fork_head_and_merge_base(
         github.github_file_diff(
             tracked, "main", "new.py", session_id="session", pr_url=B, head_sha="stale"
         )
+
+
+@pytest.fixture
+def context_api(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[int, str, str]]:
+    responses = {
+        "pulls": (
+            0,
+            json.dumps(
+                {
+                    "head": {"sha": "head123", "repo": {"full_name": "fork/two"}},
+                    "base": {"sha": "base123"},
+                }
+            ),
+            "",
+        ),
+        "compare": (0, json.dumps({"merge_base_commit": {"sha": "merge123"}}), ""),
+        "contents": (0, json.dumps({"encoding": "base64", "content": ""}), ""),
+    }
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        endpoint = args[-1]
+        key = next(key for key in responses if f"/{key}/" in endpoint)
+        return responses[key]
+
+    monkeypatch.setattr(github, "_gh", gh)
+    return responses
+
+
+@pytest.mark.parametrize(
+    "endpoint,payload",
+    [
+        ("pulls", "not-json"),
+        ("pulls", []),
+        ("pulls", {}),
+        ("pulls", {"head": None}),
+        ("pulls", {"head": {"sha": "head123"}, "base": {}}),
+        ("pulls", {"head": {"sha": 123}}),
+        ("pulls", {"head": {"sha": ""}}),
+        ("pulls", {"head": {"sha": "head123", "repo": {}}, "base": {"sha": "base123"}}),
+        ("compare", {}),
+        ("compare", {"merge_base_commit": None}),
+        ("compare", {"merge_base_commit": {"sha": 123}}),
+        ("contents", "not-json"),
+        ("contents", []),
+        ("contents", {"encoding": "base64"}),
+        ("contents", {"encoding": "base64", "content": None}),
+        ("contents", {"encoding": "base64", "content": []}),
+    ],
+)
+def test_context_rejects_unexpected_api_responses(
+    tracked: str,
+    context_api: dict[str, tuple[int, str, str]],
+    endpoint: str,
+    payload: object,
+) -> None:
+    context_api[endpoint] = (0, payload if isinstance(payload, str) else json.dumps(payload), "")
+    message = (
+        "Expanded context is unavailable" if endpoint == "contents" else "unexpected file response"
+    )
+    with pytest.raises(ValueError, match=message):
+        github.github_file_diff(tracked, "main", "new.py", session_id="session", pr_url=B)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_context_preserves_empty_and_missing_files(
+    tracked: str, context_api: dict[str, tuple[int, str, str]], missing: bool
+) -> None:
+    if missing:
+        context_api["contents"] = (1, "", "HTTP 404: Not Found")
+    result = github.github_file_diff(tracked, "main", "new.py", session_id="session", pr_url=B)
+    assert result["before"] == result["after"] == (None if missing else "")
+
+
+def test_context_reports_deleted_fork(
+    tracked: str, context_api: dict[str, tuple[int, str, str]]
+) -> None:
+    context_api["pulls"] = (
+        0,
+        json.dumps(
+            {
+                "head": {"sha": "head123", "repo": None},
+                "base": {"sha": "base123"},
+            }
+        ),
+        "",
+    )
+    with pytest.raises(ValueError, match="head repository is no longer available"):
+        github.github_file_diff(tracked, "main", "new.py", session_id="session", pr_url=B)
+
+
+@pytest.mark.parametrize("action", ["attach", "remove"])
+async def test_pr_update_reports_lock_contention_and_allows_retry(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    monkeypatch.setattr(github, "_gh", lambda *_a, **_kw: (0, '{"number": 42}', ""))
+    registry = SessionPrRegistry("session")
+    before = registry.path.read_bytes()
+    url = A.replace("42", "99") if action == "attach" else A
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        with FileLock(str(registry.path) + ".lock"):
+            response = await client.post(
+                "/v1/sessions/session/resources/github/prs", json={"url": url, "action": action}
+            )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "PR tracking is busy; try again."
+        assert registry.path.read_bytes() == before
+        response = await client.post(
+            "/v1/sessions/session/resources/github/prs", json={"url": url, "action": action}
+        )
+    assert response.status_code == 200, response.text
+    assert (url in {entry.url for entry in registry.list()}) == (action == "attach")
 
 
 def test_manual_attach_and_exclusion(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:

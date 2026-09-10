@@ -57,6 +57,8 @@ import time
 from typing import Any
 from urllib.parse import quote
 
+from filelock import Timeout as FileLockTimeout
+
 from omnigent import config as _config
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
@@ -773,14 +775,17 @@ def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict
     """Attach a verified PR or persist an explicit exclusion."""
     reference = PullRequestRef.from_url(url)
     registry = SessionPrRegistry(session_id)
-    if action == "attach":
-        if _pr_json(root, reference, "number,url") is None:
-            raise ValueError("Cannot access this pull request using gh on the host")
-        registry.record([reference], relationship="attached", source="user")
-        return github_info(root, session_id=session_id, pr_url=reference.url)
-    if action == "remove":
-        registry.remove(reference.url)
-        return github_info(root, session_id=session_id)
+    try:
+        if action == "attach":
+            if _pr_json(root, reference, "number,url") is None:
+                raise ValueError("Cannot access this pull request using gh on the host")
+            registry.record([reference], relationship="attached", source="user")
+            return github_info(root, session_id=session_id, pr_url=reference.url)
+        if action == "remove":
+            registry.remove(reference.url)
+            return github_info(root, session_id=session_id)
+    except FileLockTimeout as exc:
+        raise ValueError("PR tracking is busy; try again.") from exc
     raise ValueError("Expected attach or remove")
 
 
@@ -1054,10 +1059,24 @@ def _pr_api(root: str, reference: PullRequestRef, endpoint: str) -> dict[str, An
     )
     if rc != 0:
         raise ValueError("GitHub could not load the selected PR's file content")
-    result = json.loads(out)
+    try:
+        result = json.loads(out)
+    except ValueError as exc:
+        raise ValueError("GitHub returned an unexpected file response") from exc
     if not isinstance(result, dict):
         raise ValueError("GitHub returned an unexpected file response")
     return result
+
+
+def _api_string(value: object, *keys: str) -> str:
+    """Read a required nonempty string from a GitHub API response."""
+    for key in keys:
+        if not isinstance(value, dict):
+            raise ValueError("GitHub returned an unexpected file response")
+        value = value.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError("GitHub returned an unexpected file response")
+    return value
 
 
 def _pr_file_contents(
@@ -1073,18 +1092,20 @@ def _pr_file_contents(
         if candidate.startswith("/") or any(p in {"", ".."} for p in candidate.split("/")):
             raise ValueError("Invalid repository-relative path")
     pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
-    head, base = pr["head"], pr["base"]
-    if (head_sha and head_sha != head["sha"]) or (base_sha and base_sha != base["sha"]):
+    current_head = _api_string(pr, "head", "sha")
+    current_base = _api_string(pr, "base", "sha")
+    if (head_sha and head_sha != current_head) or (base_sha and base_sha != current_base):
         raise ValueError("The pull request changed; refresh before expanding context")
+    head_repo = pr["head"].get("repo")
+    if not isinstance(head_repo, dict):
+        raise ValueError("The pull request's head repository is no longer available")
+    head_repository = _api_string(head_repo, "full_name")
     comparison = _pr_api(
         root,
         reference,
-        f"repos/{reference.repository}/compare/{base['sha']}...{head['sha']}",
+        f"repos/{reference.repository}/compare/{current_base}...{current_head}",
     )
-    merge_base = comparison["merge_base_commit"]["sha"]
-    head_repo = head.get("repo")
-    if not isinstance(head_repo, dict):
-        raise ValueError("The pull request's head repository is no longer available")
+    merge_base = _api_string(comparison, "merge_base_commit", "sha")
 
     def contents(repository: str, ref: str, filename: str) -> str | None:
         # A missing side is expected for additions/deletions. Other failures stay visible.
@@ -1098,10 +1119,14 @@ def _pr_file_contents(
             if "HTTP 404" in err:
                 return None
             raise ValueError("GitHub could not load the selected file revision")
-        value = json.loads(out)
-        if not isinstance(value, dict) or value.get("encoding") != "base64":
-            raise ValueError("Expanded context is unavailable for this file")
         try:
+            value = json.loads(out)
+            if (
+                not isinstance(value, dict)
+                or value.get("encoding") != "base64"
+                or not isinstance(value.get("content"), str)
+            ):
+                raise ValueError("Unexpected file content")
             text = base64.b64decode(value["content"]).decode("utf-8")
             if "\x00" in text:
                 raise ValueError("Binary content")
@@ -1113,5 +1138,5 @@ def _pr_file_contents(
         "object": "session.github.file_diff",
         "path": path,
         "before": contents(reference.repository, merge_base, previous_path or path),
-        "after": contents(head_repo["full_name"], head["sha"], path),
+        "after": contents(head_repository, current_head, path),
     }
