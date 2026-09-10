@@ -6,6 +6,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -259,6 +260,10 @@ class TestConfigureJcodeForSandbox:
             "omnigent.host.jcode_databricks.shutil.which",
             Mock(return_value="/usr/bin/jcode"),
         )
+        monkeypatch.setattr(
+            "omnigent.models.model_catalog.resolve_catalog_model",
+            lambda *a, **k: SimpleNamespace(model_id="databricks-claude-from-catalog"),
+        )
         original_build = jd.build_jcode_configure_command
 
         def capture_build(*args, **kwargs):
@@ -310,17 +315,21 @@ class TestConfigureJcodeForSandbox:
         # capture is populated by the time configure_jcode_for_sandbox returns.
         assert capture_build.last_model == "system.ai.claude-opus-4-6"
 
-    def test_env_override_ignored_when_not_system_ai(
+    def test_falls_back_to_catalog_default_without_override(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A non-``system.ai.*`` gateway-model override (e.g. a ``databricks-*``
-        serving-endpoint id for opencode) is ignored — jcode's openai path serves the
-        ``system.ai`` namespace, so the served default is used instead."""
+        """With no OMNIGENT_DATABRICKS_GATEWAY_MODEL, the default is resolved from the
+        model catalog (not hardcoded), mirroring claude-native."""
         _write_profile_and_sidecar(tmp_path)
-        monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+        monkeypatch.delenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", raising=False)
         monkeypatch.setattr(
             "omnigent.host.jcode_databricks.shutil.which",
             Mock(return_value="/usr/bin/jcode"),
+        )
+        # Stub the catalog so the test doesn't depend on the bundled default id.
+        monkeypatch.setattr(
+            "omnigent.models.model_catalog.resolve_catalog_model",
+            lambda *a, **k: SimpleNamespace(model_id="databricks-claude-from-catalog"),
         )
         original_build = jd.build_jcode_configure_command
 
@@ -337,4 +346,4 @@ class TestConfigureJcodeForSandbox:
 
         jd.configure_jcode_for_sandbox()
 
-        assert capture_build.last_model == jd._JCODE_DATABRICKS_DEFAULT_MODEL
+        assert capture_build.last_model == "databricks-claude-from-catalog"

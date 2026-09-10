@@ -46,11 +46,25 @@ _JCODE_PROVIDER_ID = "dbx"
 _JCODE_BEARER_ENV = "JCODE_DBX_TOKEN"
 _JCODE_RUNTIME_DIR_ENV = "JCODE_RUNTIME_DIR"
 
-# Default served model when not overridden by env or config.
-_JCODE_DATABRICKS_DEFAULT_MODEL = "system.ai.claude-sonnet-4-6"
-
-# Environment variable for model override (mirrors claude-native and opencode).
+# Environment variable for the model override (mirrors claude-native and opencode).
 _JCODE_DATABRICKS_GATEWAY_MODEL_ENV = "OMNIGENT_DATABRICKS_GATEWAY_MODEL"
+
+
+def _jcode_default_model() -> str:
+    """The served model jcode's gateway provider defaults to.
+
+    The deployment override ``OMNIGENT_DATABRICKS_GATEWAY_MODEL`` if set, else the
+    bundled Databricks Claude catalog default — resolved from the catalog rather
+    than hardcoded, mirroring claude-native's ``_connect_broker_default_model``.
+    Both ``databricks-*`` and ``system.ai.*`` ids route on the gateway's openai path.
+    """
+    pinned = os.environ.get(_JCODE_DATABRICKS_GATEWAY_MODEL_ENV, "").strip()
+    if pinned:
+        return pinned
+    from omnigent.models import model_catalog
+
+    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+
 
 # Base dir under which each session gets its own jcode daemon runtime dir. A unique
 # JCODE_RUNTIME_DIR per session gives that session its own jcode daemon (which reads
@@ -150,12 +164,11 @@ def configure_jcode_for_sandbox() -> None:
         _logger.debug("jcode: binary not found on PATH")
         return
 
-    # Resolve the served model. Honor OMNIGENT_DATABRICKS_GATEWAY_MODEL only when it
-    # names a ``system.ai.*`` model: jcode's openai-compatible path serves the
-    # ``system.ai`` namespace, whereas that env may carry a ``databricks-*``
-    # serving-endpoint id (opencode's /serving-endpoints style) that this path rejects.
-    override = os.environ.get(_JCODE_DATABRICKS_GATEWAY_MODEL_ENV, "").strip()
-    model = override if override.startswith("system.ai.") else _JCODE_DATABRICKS_DEFAULT_MODEL
+    try:
+        model = _jcode_default_model()
+    except Exception as exc:  # noqa: BLE001 - best-effort; catalog unavailable ⇒ skip configure.
+        _logger.info("jcode: could not resolve a default model, skipping configure: %r", exc)
+        return
 
     argv = build_jcode_configure_command([jcode_bin], host=workspace, model=model)
 
