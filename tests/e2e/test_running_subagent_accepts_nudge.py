@@ -259,15 +259,24 @@ def test_parent_nudge_lands_on_child_with_stuck_running_turn(
 
         # THE regression assertion. Pre-fix the runner refused the nudge
         # because the child "already has a launching or running turn",
-        # leaving the parent no lever but cancel. The fix delivers it as a
-        # tracked continuation instead, so the refusal must be absent. (This
-        # does not assert the message is consumed mid-turn — a turn wedged
-        # inside a single never-returning LLM call only drains it on yield.)
+        # leaving the parent no lever but cancel. The fix steers the nudge
+        # into the child's in-flight turn instead, so the refusal must be
+        # absent and the tool returns a "running" steer handle. (This does not
+        # assert the message is consumed mid-turn — a turn wedged inside a
+        # single never-returning LLM call only drains it on yield.)
         assert _REFUSAL_MARKER not in nudge_output, (
             "parent nudge was refused while the child's turn was in-flight: "
-            f"{nudge_output!r}. A send to a running child must be accepted as a "
-            "tracked continuation, not bounced with the launching/running-turn "
+            f"{nudge_output!r}. A send to a running child must be steered into "
+            "its in-flight turn, not bounced with the launching/running-turn "
             "refusal that leaves sys_cancel_task as the only lever."
+        )
+        try:
+            nudge_handle = json.loads(nudge_output)
+        except json.JSONDecodeError:
+            nudge_handle = None
+        assert nudge_handle is not None and nudge_handle.get("status") == "running", (
+            "the accepted nudge must return a 'running' steer handle for the "
+            f"in-flight turn, got {nudge_output!r}."
         )
     finally:
         # Unblock the child so fixtures tear down cleanly even on failure.

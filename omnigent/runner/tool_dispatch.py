@@ -1476,6 +1476,130 @@ async def _post_child_message_event(
     )
 
 
+async def _send_to_in_flight_child(
+    child_session_id: str,
+    message: str,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    agent: str,
+    title: str,
+    child_display_title: str,
+    reuse_work_id: str | None,
+    wrapper_label: str | None,
+    created_by: str | None = None,
+) -> str:
+    """Post a message into a sub-agent's already in-flight turn.
+
+    An in-flight turn has exactly one eventual completion, so it must be
+    tracked by exactly one work entry that is never replaced or re-stamped
+    mid-flight — replacing it would orphan the running turn's completion under
+    a stale dispatch id (misattributed or silently lost). Two cases:
+
+    * ``reuse_work_id`` is set — the runner already tracks this turn. Reuse
+      that entry verbatim: no re-stamp, no re-register. The server injects the
+      message into the active turn (the web-composer steering path), and the
+      turn's single result still delivers under the existing dispatch id.
+    * ``reuse_work_id`` is ``None`` — the child is in-flight per the server
+      snapshot but untracked locally (e.g. after a runner restart). Adopt the
+      turn by registering one entry directly in ``running`` (not
+      ``launching``, so the launch-timeout reaper leaves it alone) with a
+      freshly stamped dispatch id, so the turn's one completion delivers under
+      it.
+
+    On a post failure we never tear the child down: a reused turn stays tracked
+    and alive, and an adopted registration is rolled back to the prior untracked
+    state. This is what keeps a spiraling, never-yielding child interruptible
+    without the completion-race, post-failure, and false-reap hazards a
+    re-stamping continuation would introduce.
+
+    :param child_session_id: The in-flight child session id.
+    :param message: Steering message text to inject.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The parent session id.
+    :param agent: Sub-agent name, echoed in the handle.
+    :param title: Sub-agent instance title, echoed in the handle.
+    :param child_display_title: Display title for the fan-out registration.
+    :param reuse_work_id: Dispatch id of the existing work entry to reuse, or
+        ``None`` to adopt an untracked in-flight turn.
+    :param wrapper_label: Optional child ``omnigent.wrapper`` label.
+    :param created_by: Human actor that sent the nudge, if known.
+    :returns: A JSON handle on success; a descriptive error string otherwise.
+    """
+    from omnigent.runner import app as _runner_app
+
+    registered_here = False
+    if reuse_work_id is not None:
+        work_id = reuse_work_id
+    else:
+        work_id = _runner_app.new_subagent_work_id()
+        stamp_error = await _patch_subagent_label(
+            server_client, child_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        )
+        if stamp_error is not None:
+            return f"Error: failed to record sub-agent dispatch: {stamp_error}"
+        _runner_app.register_child_session(
+            child_session_id,
+            parent_session_id=conversation_id,
+            title=child_display_title,
+            tool=agent,
+            session_name=title,
+        )
+        adopted = _runner_app.register_subagent_work(
+            parent_session_id=conversation_id,
+            child_session_id=child_session_id,
+            agent=agent,
+            title=title,
+            wrapper_label=wrapper_label,
+            created_by=created_by,
+            work_id=work_id,
+        )
+        # Adopt the running turn directly, skipping the "launching" state so the
+        # launch-timeout reaper (which only fails launching work) can't reap it
+        # while a buffered nudge waits for the turn to yield.
+        adopted.status = "running"
+        registered_here = True
+
+    try:
+        msg_resp = await _post_child_message_event(
+            server_client,
+            child_session_id,
+            content=[{"type": "input_text", "text": message}],
+            created_by=created_by,
+        )
+    except httpx.HTTPError as exc:
+        if registered_here:
+            _runner_app.unregister_subagent_work(child_session_id)
+        return (
+            f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if msg_resp.status_code >= 400:
+        if registered_here:
+            _runner_app.unregister_subagent_work(child_session_id)
+        return (
+            f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
+            f"{msg_resp.status_code} {msg_resp.text[:200]}"
+        )
+    return json.dumps(
+        {
+            "task_id": child_session_id,
+            "handle_id": child_session_id,
+            "conversation_id": child_session_id,
+            "kind": "sub_agent",
+            "agent": agent,
+            "title": title,
+            "status": "running",
+            "message": (
+                f"Steered the in-flight turn of sub-agent {agent!r} title {title!r}: the "
+                "message was injected into the running turn, which picks it up as it yields. "
+                "The turn's single result still arrives via sys_read_inbox — don't resend to "
+                "await it."
+            ),
+        }
+    )
+
+
 def _subagent_model_from_args(args: _JsonObject) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
@@ -2329,16 +2453,31 @@ async def _execute_subagent_tool(
                 "is still starting its turn; retry the send in a moment, or use "
                 "a distinct task-based title for independent parallel work."
             )
-        # A running/waiting/busy child is no longer refused: fall through to the
-        # normal continuation below. It stamps a fresh dispatch id and registers
-        # the work before posting, so the turn's result is always tracked and
-        # delivered to the parent inbox. The server injects the message into the
-        # child's active turn when one is in flight (the web-composer steering
-        # path) and starts a fresh turn otherwise. We deliberately do NOT post
-        # on an untracked path here: if the child went idle between the status
-        # read and the post — a completion race, or a stale/lagged work entry
-        # that still reads "running" — an untracked post would spawn a turn
-        # whose result is lost or misattributed to the previous dispatch.
+        # A running/waiting child, or one the server reports busy, is steered
+        # into its in-flight turn rather than refused — but on the in-flight
+        # path so its single existing work entry is reused (or, if untracked
+        # after a restart, adopted) instead of replaced. Re-stamping/replacing
+        # the entry before the post is accepted is what would orphan the running
+        # turn's completion (misattributed or lost). The fresh-continuation path
+        # below (register launching, stamp, post) is only for a genuinely idle
+        # child, where the post starts a new turn that emits its own running
+        # edge.
+        _named_in_flight = (
+            existing_work is not None and existing_work.status in ("running", "waiting")
+        ) or existing.get("busy") is True
+        if _named_in_flight:
+            return await _send_to_in_flight_child(
+                child_session_id,
+                message,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                agent=str(sub_agent_name),
+                title=str(session_name),
+                child_display_title=f"{sub_agent_name}:{session_name}",
+                reuse_work_id=existing_work.work_id if existing_work is not None else None,
+                wrapper_label=child_wrapper_label,
+                created_by=dispatch_created_by,
+            )
     else:
         _auto_ordinal = False
         if not session_name:
@@ -2852,13 +2991,27 @@ async def _send_to_existing_session(
             f"Error: session {target_session_id!r} is still starting its turn; "
             "retry the send in a moment"
         )
-    # A running/waiting/busy child is no longer refused: fall through to the
-    # tracked continuation below, which stamps a fresh dispatch id and registers
-    # the work before posting. The server injects the message into the active
-    # turn when one is in flight and starts a fresh turn otherwise; either way
-    # the result is tracked and delivered. We do NOT post on an untracked path
-    # for a running/busy child: a completion race or stale work entry would
-    # otherwise spawn a turn whose result is lost or misattributed.
+    # A running/waiting child, or one the server reports busy, is steered into
+    # its in-flight turn on the in-flight path — reusing (or adopting) the one
+    # work entry instead of replacing it, so the running turn's single
+    # completion is never orphaned. The fresh continuation below is only for a
+    # genuinely idle child, where the post starts a new turn.
+    _by_id_in_flight = (
+        existing_work is not None and existing_work.status in ("running", "waiting")
+    ) or snap_data.get("busy") is True
+    if _by_id_in_flight:
+        return await _send_to_in_flight_child(
+            target_session_id,
+            message,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            agent=agent_label,
+            title=instance_title,
+            child_display_title=display_title or "",
+            reuse_work_id=existing_work.work_id if existing_work is not None else None,
+            wrapper_label=_session_wrapper_label(snap_data),
+            created_by=created_by,
+        )
     work_id = _runner_app.new_subagent_work_id()
     stamp_error = await _patch_subagent_label(
         server_client, target_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id

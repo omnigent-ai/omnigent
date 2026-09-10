@@ -11319,17 +11319,25 @@ def test_response_failed_event_llm_source_is_preserved() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Continuing an in-flight sub-agent turn instead of bouncing the send.
+# Steering an in-flight sub-agent turn instead of bouncing the send.
 #
 # A sub-agent whose turn is still running used to make the parent's same-title /
 # same-session send bounce with "already has a launching or running turn",
-# leaving cancellation as the only lever. The runner now continues the child
-# instead of refusing: it stamps a fresh dispatch id and registers the work
-# before posting, so the server injects the message into the active turn (or
-# starts a fresh one) and the turn's result is always tracked and delivered to
-# the parent inbox -- never an untracked orphan (Polly review issues #1/#2).
-# Only a child that has not started streaming yet ("launching") is deferred
-# with a transient retry, since a post then could race a parallel start.
+# leaving cancellation as the only lever. The runner now steers the child's
+# in-flight turn instead of refusing, on a path that keeps the turn's SINGLE
+# work entry rather than replacing it:
+#   * a locally-tracked running/waiting turn reuses its existing entry verbatim
+#     (no re-stamp, no re-register), so the one completion always maps to it;
+#   * a server-busy-but-untracked turn (e.g. after a runner restart) is adopted
+#     by registering one entry directly in "running" (not "launching", so the
+#     launch-timeout reaper leaves it alone) with a freshly stamped id.
+# On a post failure the child is never torn down: a reused turn stays tracked
+# and alive; an adopted registration is rolled back to the prior untracked
+# state. Only a child that has not started streaming yet ("launching") is
+# deferred with a transient retry. Together these close the completion-race,
+# post-failure, and false-reap hazards of a re-stamping continuation (Polly
+# review issues #1/#2/#3); the fresh register+stamp continuation path is used
+# only for a genuinely idle child.
 # ---------------------------------------------------------------------------
 
 
@@ -11341,13 +11349,18 @@ def _running_child_server_handler(
     event_posts: list[dict[str, Any]],
     create_posts: list[int],
     child_busy: bool = False,
+    delete_posts: list[int] | None = None,
+    events_status: int = 200,
 ) -> Any:
-    """Build a MockTransport handler for a named-mode continuation test.
+    """Build a MockTransport handler for a named-mode in-flight-send test.
 
     Serves the parent turn-actor label and a single matching child (busy flag
     per ``child_busy``), records the stamped dispatch id on PATCH and the posted
     message on the child's /events, and 500s any duplicate-create POST so an
-    accidental untracked create is caught.
+    accidental untracked create is caught. ``events_status`` forces the child's
+    /events response code (e.g. 500 to exercise a post failure), and any DELETE
+    of the child is recorded in ``delete_posts`` so a test can assert a still-live
+    turn is never torn down.
     """
     from omnigent.runner import app as runner_app
 
@@ -11378,9 +11391,13 @@ def _running_child_server_handler(
             labels = json.loads(request.content)["labels"]
             stamped.append(labels[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY])
             return httpx.Response(200, json={"ok": True})
+        if request.method == "DELETE" and path == f"/v1/sessions/{child_id}":
+            if delete_posts is not None:
+                delete_posts.append(1)
+            return httpx.Response(204)
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             event_posts.append(json.loads(request.content))
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(events_status, json={"ok": events_status < 400})
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
@@ -11413,18 +11430,19 @@ async def _run_named_continuation(parent_id: str, handler: Any) -> str:
 
 @pytest.mark.parametrize("work_status", ["running", "waiting"])
 @pytest.mark.asyncio
-async def test_named_send_continues_in_flight_child_as_tracked_work(
+async def test_named_send_reuses_tracked_in_flight_entry_without_restamp(
     monkeypatch: pytest.MonkeyPatch,
     work_status: str,
 ) -> None:
-    """A same-title send to a running/waiting child is a tracked continuation.
+    """A same-title send to a locally-tracked running/waiting child reuses its entry.
 
     Pre-PR this bounced with "already has a launching or running turn". The fix
-    must deliver the message AND track it: stamp a fresh dispatch id and register
-    work under that id before posting, so the turn's result reaches the parent
-    inbox rather than being silently orphaned or misattributed (review issue #1).
-    ``waiting`` (own turn ended, descendants active) must be handled the same way
-    rather than treated as an un-injectable state (review issue #2).
+    must deliver the message while keeping the turn's SINGLE existing work entry:
+    no fresh dispatch id is stamped and no new entry is registered, so the one
+    in-flight completion always maps back to the original entry rather than being
+    orphaned under a replacement id (review issue #1). ``waiting`` (own turn
+    ended, descendants active) is steered the same way, not refused (review
+    issue #2).
     """
     from omnigent.runner import app as runner_app
 
@@ -11440,6 +11458,7 @@ async def test_named_send_continues_in_flight_child_as_tracked_work(
         parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
     )
     entry.status = work_status
+    original_work_id = entry.work_id
 
     handler = _running_child_server_handler(
         parent_id, child_id, stamped=stamped, event_posts=event_posts, create_posts=create_posts
@@ -11453,30 +11472,87 @@ async def test_named_send_continues_in_flight_child_as_tracked_work(
 
     assert "already has a launching or running turn" not in output
     payload = json.loads(output)
-    assert payload["status"] == "launching"
+    # A steered in-flight turn reports "running" (it continues the live turn),
+    # not "launching" (which would arm the launch-timeout reaper).
+    assert payload["status"] == "running"
     assert payload["conversation_id"] == child_id
-    assert create_posts == [], "continuation must not create a duplicate child session"
-    # Tracked: exactly one fresh dispatch id stamped, and the registered work
-    # carries that same id -- the invariant that keeps the result deliverable.
-    assert len(stamped) == 1, "the continuation must stamp a fresh dispatch id"
-    assert work is not None and work.work_id == stamped[0]
+    assert create_posts == [], "steering must not create a duplicate child session"
+    # The load-bearing invariant against misattribution: no re-stamp, and the
+    # entry is the same one (same work_id) that already tracks the in-flight turn.
+    assert stamped == [], "reusing a tracked in-flight turn must not re-stamp a new id"
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == work_status
     assert len(event_posts) == 1
     assert event_posts[0]["created_by"] == "alice@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "stop and report where the merge stands"
 
 
 @pytest.mark.asyncio
-async def test_named_send_continues_busy_child_with_no_local_work_entry(
+async def test_named_send_reused_in_flight_post_failure_keeps_tracking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server-busy child with no local work entry is still tracked, not orphaned.
+    """A failed post to a reused in-flight turn must not destroy its tracking.
+
+    The original turn is still alive, so a post failure must leave its work entry
+    intact (and never delete the child) -- otherwise the running turn's eventual
+    result becomes untracked and undeliverable, a regression that was impossible
+    while such sends were refused (review issue #2).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_postfail", "conv_child_postfail"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+    delete_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    entry.status = "running"
+    original_work_id = entry.work_id
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        delete_posts=delete_posts,
+        events_status=500,
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert output.startswith("Error: failed to steer in-flight sub-agent")
+    # The still-running turn stays tracked under its original entry, and the
+    # child session is not deleted.
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == "running"
+    assert delete_posts == [], "a reused, still-live turn must never be torn down"
+    assert create_posts == []
+
+
+@pytest.mark.asyncio
+async def test_named_send_adopts_busy_child_as_running_not_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-busy child with no local work entry is adopted as a running turn.
 
     After a runner restart the in-flight turn's local bookkeeping is gone, but the
     server still reports the child busy. Pre-PR this was refused ("is already
-    running"); the fix must continue it as tracked work -- stamp a dispatch id and
-    register work -- so its result is delivered rather than lost (review issue #1).
-    A server ``busy`` that is really the ``waiting`` (subtree-active) state is
-    handled by the same tracked path (review issue #2).
+    running"); the fix adopts it -- stamping a dispatch id and registering one
+    entry so its result is delivered (review issue #1) -- and registers that entry
+    directly in ``running`` (not ``launching``), so the launch-timeout reaper
+    cannot fail a long-running steered turn whose buffered nudge is waiting for it
+    to yield (review issue #3).
     """
     from omnigent.runner import app as runner_app
 
@@ -11506,11 +11582,14 @@ async def test_named_send_continues_busy_child_with_no_local_work_entry(
     assert "already has a launching or running turn" not in output
     assert "is already running" not in output
     payload = json.loads(output)
-    assert payload["status"] == "launching"
+    assert payload["status"] == "running"
     assert payload["conversation_id"] == child_id
     assert create_posts == []
-    assert len(stamped) == 1, "a server-busy child must still be stamped/tracked"
+    assert len(stamped) == 1, "an untracked server-busy turn must be adopted with one stamp"
+    # Adopted directly as running (not launching) so it is safe from the reaper,
+    # and the entry carries the freshly stamped id so its completion delivers.
     assert work is not None and work.work_id == stamped[0]
+    assert work.status == "running"
     assert len(event_posts) == 1
 
 
@@ -11598,12 +11677,14 @@ async def test_named_send_defers_when_child_turn_still_launching(
 
 
 @pytest.mark.asyncio
-async def test_send_by_session_id_continues_running_child_as_tracked_work() -> None:
-    """By-session-id send continues a running direct child as tracked work.
+async def test_send_by_session_id_reuses_running_child_without_restamp() -> None:
+    """By-session-id send steers a running direct child reusing its one entry.
 
-    The by-id path shares the fix: a running child is continued (stamped +
-    registered + posted) rather than bounced with "already has a launching or
-    running turn", so the result is delivered and never orphaned (review issue #1).
+    The by-id path shares the fix: a locally-tracked running child is steered
+    into its in-flight turn without a re-stamp or a new entry, rather than bounced
+    with "already has a launching or running turn". Keeping the single existing
+    entry is what keeps the turn's one completion deliverable and correctly
+    attributed (review issue #1).
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
@@ -11643,6 +11724,7 @@ async def test_send_by_session_id_continues_running_child_as_tracked_work() -> N
         title="merge-task",
     )
     entry.status = "running"
+    original_work_id = entry.work_id
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
@@ -11666,10 +11748,11 @@ async def test_send_by_session_id_continues_running_child_as_tracked_work() -> N
 
     assert "already has a launching or running turn" not in output
     payload = json.loads(output)
-    assert payload["status"] == "launching"
+    assert payload["status"] == "running"
     assert payload["conversation_id"] == "conv_byid_coder"
-    assert len(stamped) == 1, "the by-id continuation must stamp a fresh dispatch id"
-    assert work is not None and work.work_id == stamped[0]
+    assert stamped == [], "reusing a tracked in-flight turn must not re-stamp a new id"
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == "running"
     assert len(event_posts) == 1
     assert event_posts[0]["created_by"] == "alice@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
