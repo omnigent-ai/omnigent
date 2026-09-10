@@ -99,7 +99,12 @@ def _enable_crdb_ddl_autocommit(connection: Any, version: Version) -> None:
 
 
 def _prepare_crdb_schema_transaction(connection: Any, version: Version) -> None:
-    """Begin a SERIALIZABLE transaction suitable for CRDB schema changes."""
+    """Begin a SERIALIZABLE transaction suitable for CRDB schema changes.
+
+    ``SET TRANSACTION`` must be the first statement of the transaction, so the
+    autocommit helper above commits before it runs and callers must not execute
+    any other statement on *connection* before calling this function.
+    """
     _enable_crdb_ddl_autocommit(connection, version)
     connection.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
 

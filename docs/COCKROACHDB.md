@@ -44,7 +44,10 @@ An empty CRDB database is required for the first startup. Omnigent creates the
 current schema directly and stamps the current Alembic revision. It does not
 run the historical PostgreSQL migration chain. A database left at a partial
 revision by an earlier migration attempt is unsupported and must be replaced
-with a new empty database.
+with a new empty database. A first bootstrap interrupted mid-run is repaired
+automatically when the same Omnigent version restarts; if Omnigent is upgraded
+before that repair completes, startup fails and the database must be replaced
+with a new empty one.
 
 Existing CRDB databases created by a supported Omnigent release use normal
 Alembic upgrades for subsequent migrations.
