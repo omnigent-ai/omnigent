@@ -144,22 +144,143 @@ def test_community_harness_rejects_community_collision(
     assert hp.harness_modules()["foo"] == "omnigent.community.harness.foo.inner.foo_harness"
 
 
-def test_community_harness_rejects_native_terminal_metadata(
+_FOO_NATIVE_MODULE = "omnigent.community.harness.foo"
+
+
+def _foo_native_agent() -> hp.NativeCodingAgent:
+    return hp.NativeCodingAgent(
+        key="foo",
+        display_name="Foo",
+        agent_name="foo-native-ui",
+        harness="foo-native",
+        wrapper_label="foo-native-ui",
+        terminal_name="foo",
+    )
+
+
+def _foo_native_provider(**overrides: object) -> hp.NativeHarnessProvider:
+    fields: dict[str, object] = {
+        "key": "foo",
+        "run_native": f"{_FOO_NATIVE_MODULE}.foo_native:run_foo_native",
+        "auto_create_terminal": f"{_FOO_NATIVE_MODULE}.runner:_launch_foo",
+        "spawn_env_builder": f"{_FOO_NATIVE_MODULE}.foo_native_bridge:build_foo_native_spawn_env",
+    }
+    fields.update(overrides)
+    return hp.NativeHarnessProvider(**fields)  # type: ignore[arg-type]
+
+
+def _foo_native_contribution(
+    *,
+    agents: tuple[hp.NativeCodingAgent, ...] | None = None,
+    providers: tuple[hp.NativeHarnessProvider, ...] | None = None,
+) -> hp.HarnessContribution:
+    return hp.HarnessContribution(
+        name="omnigent-foo",
+        valid_harnesses=frozenset({"foo-native"}),
+        harness_modules={"foo-native": f"{_FOO_NATIVE_MODULE}.inner.foo_native_harness"},
+        native_harnesses=frozenset({"foo-native"}),
+        native_agents=(_foo_native_agent(),) if agents is None else agents,
+        native_providers=(_foo_native_provider(),) if providers is None else providers,
+    )
+
+
+def test_community_harness_accepts_native_terminal_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _contribution() -> hp.HarnessContribution:
-        return hp.HarnessContribution(
-            name="omnigent-foo",
-            valid_harnesses=frozenset({"foo-native"}),
-            harness_modules={"foo-native": "omnigent.community.harness.foo.inner.foo_harness"},
-            native_harnesses=frozenset({"foo-native"}),
-        )
+    """A consistent community native harness is accepted and merged (PR 2.1 flip).
 
-    _install_entry_points(monkeypatch, _EntryPoint("foo", _contribution))
+    Native terminal harnesses ARE supported now that the runner runs every
+    native harness through the provider seam; a plugin whose agent/provider rows
+    are internally consistent and community-prefixed must load, not be rejected.
+    """
+    _install_entry_points(monkeypatch, _EntryPoint("foo", _foo_native_contribution))
+
+    state = hp.plugin_state()
+    assert "foo" not in state.load_errors, state.load_errors
+    assert "foo-native" in hp.valid_harnesses()
+    # The native agent + provider are both visible through the registry.
+    assert any(a.key == "foo" for a in hp.native_agents())
+    provider = hp.native_provider_for_key("foo")
+    assert provider is not None
+    assert provider.run_native == f"{_FOO_NATIVE_MODULE}.foo_native:run_foo_native"
+
+
+def test_community_native_rejects_non_community_provider_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native provider hook outside the community prefix is rejected."""
+    contribution = _foo_native_contribution(
+        providers=(_foo_native_provider(run_native="omnigent.claude_native:run_claude_native"),),
+    )
+    _install_entry_points(monkeypatch, _EntryPoint("foo", lambda: contribution))
 
     state = hp.plugin_state()
     assert "foo" in state.load_errors
+    assert hp.native_provider_for_key("foo") is None
+
+
+def test_community_native_rejects_agent_without_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native agent with no matching provider row is rejected."""
+    contribution = _foo_native_contribution(providers=())
+    _install_entry_points(monkeypatch, _EntryPoint("foo", lambda: contribution))
+
+    state = hp.plugin_state()
+    assert "foo" in state.load_errors
+    assert "matching provider row" in state.load_errors["foo"]
     assert "foo-native" not in hp.valid_harnesses()
+
+
+def test_community_native_rejects_provider_without_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native provider with no matching agent row is rejected."""
+    contribution = _foo_native_contribution(agents=())
+    _install_entry_points(monkeypatch, _EntryPoint("foo", lambda: contribution))
+
+    state = hp.plugin_state()
+    assert "foo" in state.load_errors
+    assert "matching agent row" in state.load_errors["foo"]
+
+
+def test_community_native_rejects_missing_required_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native provider missing a required launch hook is rejected."""
+    contribution = _foo_native_contribution(
+        providers=(_foo_native_provider(auto_create_terminal=""),),
+    )
+    _install_entry_points(monkeypatch, _EntryPoint("foo", lambda: contribution))
+
+    state = hp.plugin_state()
+    assert "foo" in state.load_errors
+    assert "auto_create_terminal" in state.load_errors["foo"]
+
+
+def test_community_native_rejects_agent_identity_collision_with_builtin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native agent whose identity collides with a built-in is rejected.
+
+    The shared identity-collision guard (`_native_agent_identity_values`) must
+    still fire for native contributions after the accept flip — a plugin can't
+    claim ``claude``'s key / agent_name / wrapper_label / terminal_name.
+    """
+    colliding_agent = hp.NativeCodingAgent(
+        key="foo",
+        display_name="Foo",
+        agent_name="claude-native-ui",  # collides with the built-in claude agent
+        harness="foo-native",
+        wrapper_label="foo-native-ui",
+        terminal_name="foo",
+    )
+    contribution = _foo_native_contribution(agents=(colliding_agent,))
+    _install_entry_points(monkeypatch, _EntryPoint("foo", lambda: contribution))
+
+    state = hp.plugin_state()
+    assert "foo" in state.load_errors
+    assert "native-agent keys" in state.load_errors["foo"]
 
 
 def test_community_harness_readiness_uses_install_metadata(
