@@ -786,6 +786,49 @@ def test_refresh_404_on_remote_warns_without_relogin_advice(
     assert not any("omnigent login" in m for m in warnings)
 
 
+def test_safe_log_url_strips_userinfo_and_query() -> None:
+    """The log sanitizer drops credential-bearing URL parts, keeps identity."""
+    from omnigent.cli_auth import _safe_log_url
+
+    # Userinfo and query (both can carry secrets) are removed; scheme, host,
+    # port, and path (the useful, non-secret identity) are kept.
+    assert (
+        _safe_log_url("https://user:s3cr3t@ws.example.com/api/2.0/omnigent?access_token=leak")
+        == "https://ws.example.com/api/2.0/omnigent"
+    )
+    assert _safe_log_url("http://127.0.0.1:6767") == "http://127.0.0.1:6767"
+    # Unparseable input degrades to a placeholder rather than leaking.
+    assert _safe_log_url("not a url") == "<server>"
+
+
+def test_refresh_refusal_log_redacts_url_credentials(token_dir, monkeypatch, caplog) -> None:
+    """A refusal must log the sanitized URL, never embedded credentials."""
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    url = "https://user:s3cr3t@omni.example.com/api?access_token=leak"
+    store_token(
+        url,
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(u, *, data=None, timeout=None):
+        return httpx.Response(403, json={"error": "denied"}, request=httpx.Request("POST", u))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert refresh_stored_token(url) is None
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "s3cr3t" not in messages and "leak" not in messages
+    assert "omni.example.com" in messages
+
+
 def test_refresh_stored_token_skips_when_already_fresh(token_dir, monkeypatch) -> None:
     """A concurrent refresher already renewed → return the valid token
     without a network call (the lock-then-recheck path)."""
