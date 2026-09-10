@@ -11,11 +11,14 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Iterable
+from unittest.mock import Mock
 
 import pytest
 from omnigent_client import child_summary_busy
 from omnigent_ui_sdk.terminal._formatter import StreamingText
 from omnigent_ui_sdk.terminal._host import TerminalHost
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.document import Document
 from prompt_toolkit.output import DummyOutput
 from rich.text import Text
 
@@ -30,6 +33,21 @@ def _formatted_text_plain(fragments: Iterable[tuple[str, str]]) -> str:
     :returns: Concatenated text payload without style names.
     """
     return "".join(text for _style, text in fragments)
+
+
+def test_deleting_input_restarts_available_completions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deleting a command prefix must reopen matching completions."""
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host.create_output", DummyOutput)
+    host = TerminalHost(model_name="test", completer=WordCompleter(["/help", "/history"]))
+    buffer = host._prompt.default_buffer
+    buffer.validator = None
+    buffer.set_document(Document("/hel", cursor_position=4))
+    start_completion = Mock()
+    buffer.start_completion = start_completion
+
+    buffer.delete_before_cursor(count=2)
+
+    start_completion.assert_called_once_with()
 
 
 @pytest.mark.asyncio
