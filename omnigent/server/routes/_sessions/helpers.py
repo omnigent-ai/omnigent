@@ -385,6 +385,10 @@ def _allow_auto_mode_eligible(tool_name: str, permission_mode: str | None) -> bo
     """
     Whether a regular Claude permission prompt may offer a session-scoped auto-mode switch.
 
+    Reuses the remember-ineligible set on purpose: those are exactly the
+    bespoke-card tools (ExitPlanMode, AskUserQuestion) with their own
+    approval flows, where a generic auto-mode button never belongs.
+
     :param tool_name: The gated tool from Claude's PermissionRequest payload.
     :param permission_mode: Claude's current permission mode, or None when absent.
     :returns: True for tool approvals outside planning and already-automatic modes.

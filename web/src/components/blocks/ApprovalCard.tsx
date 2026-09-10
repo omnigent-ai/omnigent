@@ -143,7 +143,7 @@ interface ApprovalCardProps {
   } | null;
   /**
    * Claude-native edit-tool prompts only: when true, the binary
-   * approve/reject card grows a third "Accept & allow all edits"
+   * approve/reject card also offers an "Accept & allow all edits"
    * button. Accepting through it asks the server to switch the
    * session into Claude Code's ``acceptEdits`` mode (the web
    * equivalent of the native shift+tab toggle). Absent/false for
@@ -151,10 +151,16 @@ interface ApprovalCardProps {
    * mode switch would be a no-op.
    */
   allowAllEdits?: boolean;
+  /**
+   * Eligible Claude-native tool prompts: when true, the card offers an
+   * "Approve & switch to auto mode" button — accept plus a session-scoped
+   * ``setMode(auto)``, so Claude reviews this session's later permissions
+   * automatically. Absent/false where the switch was never offered.
+   */
   allowAutoMode?: boolean;
   /**
    * Claude-native non-edit tool prompts only: when set, the binary
-   * approve/reject card grows a third "Approve & don't ask again for
+   * approve/reject card also offers an "Approve & don't ask again for
    * <host|tool>" button. Accepting through it asks the server to
    * install a session-scoped allow rule for the tool (scoped to
    * ``host`` for WebFetch, tool-wide otherwise) — the web equivalent
