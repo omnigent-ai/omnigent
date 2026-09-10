@@ -450,10 +450,17 @@ class StoreHarnessCredentialRequest(BaseModel):
 
 
 class HostModelOptionsResponse(BaseModel):
-    """Pre-launch model choices resolved by a host harness."""
+    """Pre-launch model choices resolved by a host harness.
+
+    ``error`` carries the host's reason for an empty catalog — a probe that
+    failed on the host is not a transport failure, so the request still
+    succeeds and the picker can say WHY it is empty instead of a generic
+    "Models unavailable".
+    """
 
     models: list[dict[str, Any]]
     routable_models: list[str]
+    error: str | None = None
 
 
 class LaunchRunnerRequest(BaseModel):
@@ -706,6 +713,7 @@ def create_hosts_router(
             )
         models = result.get("models")
         routable = result.get("routable_models")
+        error = result.get("error")
         return HostModelOptionsResponse(
             models=(
                 [model for model in models if isinstance(model, dict)]
@@ -717,6 +725,7 @@ def create_hosts_router(
             routable_models=(
                 [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
             ),
+            error=error if isinstance(error, str) and error else None,
         )
 
     @router.post("/hosts/{host_id}/runners")

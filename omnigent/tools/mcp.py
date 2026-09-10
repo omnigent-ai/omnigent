@@ -619,6 +619,18 @@ class McpServerConnection:
                 arguments=arguments,
             )
 
+        if session_id:
+            from omnigent.runner.pr_observer import observe_tool_completion
+
+            await asyncio.to_thread(
+                observe_tool_completion,
+                session_id,
+                tool_name=f"{self.config.name}__{name}",
+                arguments=arguments,
+                result=result.model_dump(),
+                successful=not result.isError,
+                source="managed_mcp",
+            )
         return _format_call_result(result)
 
     async def call_tool_with_elicitation(

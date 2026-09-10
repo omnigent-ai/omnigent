@@ -430,6 +430,18 @@ class OmnigentClient:
         self._logger.info("Created Omnigent session session_id=%s", session_id)
         return session_id
 
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session, e.g. one stranded by a failed runner launch.
+
+        A 404 is benign — the session is already gone, which is the goal.
+        """
+        self._logger.info("Deleting Omnigent session session_id=%s", session_id)
+        response = await self._request("DELETE", f"/v1/sessions/{session_id}")
+        if response.status_code == 404:
+            return
+        await _raise_for_status(response)
+        self._logger.info("Deleted Omnigent session session_id=%s", session_id)
+
     async def submit_message(self, session_id: str, text: str) -> None:
         self._logger.info(
             "Submitting Slack message to Omnigent session_id=%s chars=%s",

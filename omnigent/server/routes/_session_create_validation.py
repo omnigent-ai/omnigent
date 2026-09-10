@@ -10,11 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import ntpath
 import os
-import posixpath
 from dataclasses import dataclass
-from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 from pydantic import ValidationError
@@ -51,19 +48,6 @@ def _strict_project_create_enabled() -> bool:
         "yes",
         "on",
     }
-
-
-def _workspace_within(candidate: str, root: str) -> bool:
-    """Return whether normalized *candidate* is lexically inside *root*."""
-    try:
-        windows = "\\" in candidate or "\\" in root
-        path_module = ntpath if windows else posixpath
-        path_type = PureWindowsPath if windows else PurePosixPath
-        candidate_path = path_type(path_module.normpath(candidate))
-        root_path = path_type(path_module.normpath(root))
-        return candidate_path.is_relative_to(root_path)
-    except (TypeError, ValueError):
-        return False
 
 
 async def resolve_project_session_create(
@@ -137,20 +121,6 @@ async def resolve_project_session_create(
             {
                 "code": "project_agent_mismatch",
                 "message": "Explicit agent_id differs from the project's pinned agent",
-            }
-        )
-
-    explicit_workspace = getattr(body, "workspace", None) if "workspace" in fields_set else None
-    configured_workspace = config.get("workspace")
-    if (
-        isinstance(explicit_workspace, str)
-        and isinstance(configured_workspace, str)
-        and not _workspace_within(explicit_workspace, configured_workspace)
-    ):
-        warnings.append(
-            {
-                "code": "project_workspace_mismatch",
-                "message": "Explicit workspace is outside the project's configured workspace root",
             }
         )
 

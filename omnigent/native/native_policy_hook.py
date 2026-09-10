@@ -2,7 +2,7 @@
 
 Both Claude Code and Codex expose a command-hook system whose
 ``PreToolUse`` / ``PostToolUse`` payloads use the same field names
-(``hook_event_name``, ``tool_name``, ``tool_input``, ``tool_output``)
+(``hook_event_name``, ``tool_name``, ``tool_input``, ``tool_response``)
 and whose ``UserPromptSubmit`` payload carries the user prompt under
 ``prompt``. This module owns the harness-neutral translation between
 that hook shape and the server's proto-compatible ``EvaluationRequest``
@@ -332,7 +332,7 @@ def hook_payload_to_evaluation_request(
             },
         }
     if hook_event == _POST_TOOL_USE:
-        tool_output = payload.get("tool_output", "")
+        tool_output = payload.get("tool_response", payload.get("tool_output", ""))
         return {
             "event": {
                 "type": "PHASE_TOOL_RESULT",

@@ -3028,16 +3028,21 @@ class HostProcess:
                 limit=_coerce_int(params.get("limit", 500)),
             )
         if op == "github_info":
-            return r.github_info()
+            return r.github_info(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_changes":
-            return r.github_changes()
+            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
                 str(params.get("path", "")),
+                session_id=session_id,
+                pr_url=cast("str | None", params.get("pr_url")),
+                previous_path=cast("str | None", params.get("previous_path")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff()
+            return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
@@ -3070,7 +3075,9 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
         try:
-            payload = self._dispatch_fs_write_op(expanded, frame.op, frame.params or {})
+            payload = self._dispatch_fs_write_op(
+                expanded, frame.op, {**(frame.params or {}), "session_id": frame.session_id}
+            )
         except ValueError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3110,6 +3117,15 @@ class HostProcess:
                 workspace,
                 account=cast("str | None", params.get("account")),
                 remote=cast("str | None", params.get("remote")),
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+            )
+        if op == "github_prs_update":
+            return github_resource.update_session_pr(
+                workspace,
+                str(params["session_id"]),
+                str(params["url"]),
+                str(params.get("action", "attach")),
             )
         raise ValueError(f"unknown fs write op: {op!r}")
 
