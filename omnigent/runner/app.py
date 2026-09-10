@@ -5368,7 +5368,16 @@ def create_runner_app(
             client_name="omnigent-codex-native-runner",
         )
         try:
-            await codex_client.connect()
+            try:
+                await codex_client.connect()
+            except (ConnectionError, FileNotFoundError) as exc:
+                # Bridge state is published before the app server binds its
+                # socket, so a refused connect means "not up yet", the same
+                # condition as missing state above — not a failure worth a
+                # warning and a stack trace on every poll.
+                raise _CodexNativeModelOptionsNotReady(
+                    "Codex-native app server is not accepting connections yet."
+                ) from exc
             rows = await list_codex_model_options(codex_client)
         finally:
             with contextlib.suppress(Exception):
@@ -10548,12 +10557,12 @@ def create_runner_app(
                 status_code=200,
                 content={"models": _with_model_configuration_source(session_id, models)},
             )
-        except _CodexNativeModelOptionsNotReady:
+        except _CodexNativeModelOptionsNotReady as exc:
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "codex_native_model_options_failed",
-                    "detail": "Codex-native model options are not ready yet.",
+                    "detail": str(exc),
                 },
             )
         except Exception as exc:  # noqa: BLE001 - surface Codex app-server failures to AP.

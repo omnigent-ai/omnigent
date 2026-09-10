@@ -1024,6 +1024,118 @@ async def test_codex_native_model_options_query_model_list(
 
 
 @pytest.mark.asyncio
+async def test_codex_native_model_options_refused_connect_reads_as_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refused connect to the Codex app server is startup, not a failure.
+
+    Bridge state is published before the app server binds its socket, so the
+    picker's poll lands in that gap and the connect is refused. Reporting it
+    through the generic handler logged a warning with a stack trace on every
+    poll, for the same "not up yet" condition the missing-state branch already
+    reports quietly.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "68ba0a62ebe928d26adf37c8974ce1ebc"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    async def _fake_auto_create_codex(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        """Stand in for the codex launch, leaving the seeded bridge dir alone."""
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_codex_main",
+            type="terminal",
+            session_id=session_id,
+            name="codex:main",
+            metadata={"terminal_name": "codex", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _fake_auto_create_codex,
+    )
+
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43211",
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+            active_turn_id=None,
+        ),
+    )
+
+    class _RefusingClient:
+        """App-server client whose connect is refused, as during startup."""
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def connect(self) -> None:
+            raise ConnectionRefusedError("Connect call failed ('127.0.0.1', 43211)")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    refusing = _RefusingClient()
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        lambda transport, *, client_name="omnigent": refusing,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    with caplog.at_level("WARNING", logger="omnigent.runner.app"):
+        async with _runner_client(app) as client:
+            create_resp = await client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+            )
+            assert create_resp.status_code == 201, create_resp.text
+
+            resp = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+
+    # Still a retryable 503 so the picker polls again, but named for what it is.
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {
+        "error": "codex_native_model_options_failed",
+        "detail": "Codex-native app server is not accepting connections yet.",
+    }
+    assert not [r for r in caplog.records if "model/list failed" in r.getMessage()]
+    # The client is still closed on the way out, so the refused attempt leaks nothing.
+    assert refusing.closed
+
+
+@pytest.mark.asyncio
 async def test_claude_native_model_options_use_session_launch_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
