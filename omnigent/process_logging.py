@@ -477,36 +477,59 @@ def configure_process_logging(
     root: bool = True,
     force: bool = False,
     debug_log_send: Callable[[list[dict[str, object]]], None] | None = None,
-) -> Path:
+) -> Path | None:
     """Configure Python logging for one process destination.
 
-    The returned file always receives logs. Stderr receives logs only when
-    requested and an interactive terminal stream is available. When provided,
-    ``debug_log_send`` receives prepared debug-log batches on a daemon thread;
-    otherwise the environment-gated ZeroBus sender remains the default.
+    File logging is best-effort: if the log directory cannot be created or the
+    log file cannot be opened (e.g. a read-only filesystem), the process
+    continues with stderr-only logging rather than crashing. The return value
+    is ``None`` in that case.
+
+    Stderr receives logs only when requested and an interactive terminal stream
+    is available. When provided, ``debug_log_send`` receives prepared debug-log
+    batches on a daemon thread; otherwise the environment-gated ZeroBus sender
+    remains the default.
     """
     global _current_process_log_path
 
     resolved_level = effective_log_level() if level is None else level
-    path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
-    if path is None:
-        path = create_process_log_path(destination)
-        # A process that dies before its first record would leave this
-        # freshly created file empty forever (crash-at-birth hosts littered
-        # dozens a day); sweep it on exit. Self-allocated paths only — a
-        # parent-published or explicit path is the caller's to manage.
-        atexit.register(_unlink_if_empty, path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _current_process_log_path = path
+    resolved_path = (
+        Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
+    )
+    path: Path | None = resolved_path
+    try:
+        if path is None:
+            path = create_process_log_path(destination)
+            # A process that dies before its first record would leave this
+            # freshly created file empty forever (crash-at-birth hosts littered
+            # dozens a day); sweep it on exit. Self-allocated paths only — a
+            # parent-published or explicit path is the caller's to manage.
+            atexit.register(_unlink_if_empty, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _current_process_log_path = path
+    except OSError as exc:
+        sys.stderr.write(
+            f"omnigent: warning: could not create log file for {destination!r}"
+            f" ({exc}); continuing without file logging\n"
+        )
+        path = None
 
     formatter = RedactingLogFormatter(use_colors=False)
     handlers: list[logging.Handler] = []
 
-    file_handler = _ProcessLogFileHandler(path, encoding="utf-8")
-    file_handler.setLevel(resolved_level)
-    file_handler.setFormatter(formatter)
-    file_handler._omnigent_process_log_path = str(path)
-    handlers.append(file_handler)
+    if path is not None:
+        try:
+            file_handler = _ProcessLogFileHandler(path, encoding="utf-8")
+            file_handler.setLevel(resolved_level)
+            file_handler.setFormatter(formatter)
+            file_handler._omnigent_process_log_path = str(path)
+            handlers.append(file_handler)
+        except OSError as exc:
+            sys.stderr.write(
+                f"omnigent: warning: could not open log file {path}"
+                f" ({exc}); continuing without file logging\n"
+            )
+            path = None
 
     mirror = should_log_to_stderr() if log_to_stderr is None else log_to_stderr
     if mirror:
@@ -552,7 +575,7 @@ def configure_process_logging(
     )
 
     logging.captureWarnings(True)
-    return path
+    return path  # None when file logging could not be set up
 
 
 def _debug_sink_target_loggers(logger_names: Sequence[str], *, root: bool) -> list[logging.Logger]:

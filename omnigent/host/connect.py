@@ -4251,7 +4251,10 @@ def run_host_process(
     # file is printed when each runner launches). The host process's
     # own diagnostics go to the host destination.
     print(f"Session logs: {display_log_path(_runner_log_dir())}/")
-    print(f"This host's log: {display_log_path(host_log_path)}")
+    host_log_display = (
+        display_log_path(host_log_path) if host_log_path is not None else "(unavailable)"
+    )
+    print(f"This host's log: {host_log_display}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()

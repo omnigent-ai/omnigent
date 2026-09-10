@@ -4470,7 +4470,10 @@ def server(
     click.echo(f"Starting omnigent server on {host}:{port}")
     click.echo(f"  database:  {_display_db_uri(db_uri)}")
     click.echo(f"  artifacts: {art_loc}")
-    click.echo(f"  log:       {_display_path(server_log_path)}")
+    log_display = (
+        _display_path(server_log_path) if server_log_path is not None else "(unavailable)"
+    )
+    click.echo(f"  log:       {log_display}")
 
     # Warn loudly when the SPA bundle is absent: the server still boots
     # but serves an API-only JSON landing at "/", so the operator hits
