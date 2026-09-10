@@ -124,6 +124,10 @@ _CODEX_ELICITATION_CONNECT_TIMEOUT_SECONDS = 30.0
 # idle long-polls); later retries back off.
 _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
 _CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS = 30.0
+# A POST held at least this long before failing was severed by the gateway at
+# its request cap, not refused by a sick server, so its retry must not back off
+# — see the backoff reset in :func:`_post_codex_elicitation_request`.
+_CODEX_ELICITATION_HELD_POLL_FLOOR_SECONDS = 10.0
 _CODEX_MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request"
 # Per-server MCP startup progress (issue #2058). Codex runs an MCP
 # startup round when a thread starts, but delivers the per-server
@@ -3940,6 +3944,7 @@ async def _post_codex_elicitation_request(
     backoff_s = _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
     while True:
         response: httpx.Response | None = None
+        attempt_started = loop.time()
         try:
             response = await client.post(url, json=event, timeout=timeout)
         except httpx.HTTPError:
@@ -3948,6 +3953,7 @@ async def _post_codex_elicitation_request(
                 event.get("method"),
                 exc_info=True,
             )
+        held_s = loop.time() - attempt_started
         if response is not None and response.status_code < 500:
             return response
         if response is not None:
@@ -3965,7 +3971,14 @@ async def _post_codex_elicitation_request(
             )
             return None
         await _elicitation_retry_sleep(backoff_s)
-        backoff_s = min(backoff_s * 2, _CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS)
+        if held_s >= _CODEX_ELICITATION_HELD_POLL_FLOOR_SECONDS:
+            # The gateway severed a held poll rather than a sick server refusing
+            # it: re-POST inside the server's re-park grace so the approval card
+            # survives the gap instead of clearing between polls. Growth is kept
+            # for fast failures, which are the ones worth backing off from.
+            backoff_s = _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
+        else:
+            backoff_s = min(backoff_s * 2, _CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS)
 
 
 def _note_native_plan_implementation_prompt(

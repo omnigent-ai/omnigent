@@ -16,6 +16,8 @@ from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     OBSERVER_HOOK_STDERR_FILE,
     ClaudeNativeHookInterpreterMismatchError,
+    approval_wait_is_fresh,
+    approval_wait_marker_path,
     build_hook_settings,
     prepare_bridge_dir,
     read_transcript_path,
@@ -2524,6 +2526,66 @@ def test_reattach_held_poll_sever_resets_backoff(monkeypatch: pytest.MonkeyPatch
     initial = claude_native_hook._PERMISSION_RETRY_INITIAL_BACKOFF_S
     # Three hard failures double the wait; each held-poll sever resets it.
     assert sleeps == [initial, initial * 2, initial * 4, initial, initial]
+
+
+def test_reattach_holds_the_approval_wait_marker_until_the_wait_ends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked hook keeps its approval-wait marker fresh on every attempt.
+
+    A pane parked on a permission prompt emits nothing and reports no active
+    turn, so the idle pane reaper reads it as abandoned and kills the prompt.
+    This marker is the pane's only evidence of the wait, so it must be fresh
+    for every re-POST across a severed poll — and gone once the wait ends, so
+    the pane returns to normal idle accounting instead of lingering.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT", tmp_path / "approval-waits"
+    )
+    session_id = "conv_marked"
+    marker = approval_wait_marker_path(session_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    fresh_per_attempt: list[bool] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+
+    class _ObservingClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _ObservingClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            fresh_per_attempt.append(approval_wait_is_fresh(session_id))
+            req = httpx.Request("POST", url)
+            if len(fresh_per_attempt) <= 2:
+                clock["t"] += held
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ObservingClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_marked/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        wait_marker=marker,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert fresh_per_attempt == [True, True, True], (
+        "the marker must read fresh on every attempt, including after a sever"
+    )
+    assert not approval_wait_marker_path(session_id).exists()
 
 
 def test_reattach_fast_flapping_connection_is_hard_failure(

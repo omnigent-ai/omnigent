@@ -10217,3 +10217,49 @@ def test_http_ingress_all_interfaces_opt_in_advertises_routable_host(
     finally:
         httpd.shutdown()
         httpd.server_close()
+def test_approval_wait_marker_tracks_a_parked_permission_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A touched marker reads fresh, a stale one does not, and clearing removes it.
+
+    The idle pane reaper spares a native pane only while this marker is fresh,
+    so a marker that reads stale mid-wait reproduces the wedge where a reaped
+    pane strands its approval card unanswerable.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT_PARENT", tmp_path / "omnigent-test"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT",
+        tmp_path / "omnigent-test" / "approval-parent" / "approval-waits",
+    )
+
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_wait")
+
+    marker = claude_native_bridge.approval_wait_marker_path("conv_wait")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
+    assert marker.exists()
+    assert claude_native_bridge.approval_wait_is_fresh("conv_wait")
+    # One session's parked prompt must not spare another session's pane.
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_other")
+
+    stale = time.time() - claude_native_bridge.APPROVAL_WAIT_MARKER_TTL_S - 1
+    os.utime(marker, (stale, stale))
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_wait")
+
+    claude_native_bridge.clear_approval_wait_marker(marker)
+    assert not marker.exists()
+    # The hook clears in a finally, so a second clear must not raise.
+    claude_native_bridge.clear_approval_wait_marker(marker)
+
+    # A hook subprocess derives the root from the bridge dir it was handed,
+    # which must land on the same path the runner-side reaper checks.
+    bridge_dir = tmp_path / "omnigent-test" / "approval-parent" / "abc123"
+    assert (
+        claude_native_bridge.approval_wait_marker_path("conv_wait", bridge_dir=bridge_dir)
+        == marker
+    )

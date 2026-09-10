@@ -109,6 +109,19 @@ DEFAULT_BRIDGE_PORT_POOL: tuple[int, ...] = tuple(range(28700, 28716))
 _TRUSTED_PARENT = Path(tempfile.gettempdir())
 _BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
+# Markers for permission hooks parked on a verdict, keyed by SESSION id: the
+# idle pane reaper's busy check holds a pane's conversation id, and resolving
+# that to a bridge id needs a session-label fetch no per-scan check can afford.
+# Inside the bridge root so it inherits the same owner-only validation; it
+# carries no ``owner.pid``, which is exactly what makes the orphan pruner skip
+# it (see ``native_bridge_common.prune_orphaned_dirs``).
+_APPROVAL_WAIT_DIR_NAME = "approval-waits"
+_APPROVAL_WAIT_ROOT = _BRIDGE_ROOT / _APPROVAL_WAIT_DIR_NAME
+# A marker touched more recently than this means a hook is still waiting.
+# Above one full long-poll (the Databricks front door caps a request at 300s)
+# plus a retry backoff, so a marker refreshed once per POST attempt never
+# reads stale while the hook is alive.
+APPROVAL_WAIT_MARKER_TTL_S = 420.0
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 _STATE_FILE = "state.json"
@@ -1194,6 +1207,83 @@ def bridge_dir_for_conversation_id(conversation_id: str) -> Path:
     return bridge_dir_for_bridge_id(conversation_id)
 
 
+def approval_wait_marker_path(session_id: str, *, bridge_dir: Path | None = None) -> Path:
+    """
+    Return the marker path a parked permission hook keeps fresh.
+
+    :param session_id: Omnigent session id whose verdict a hook is waiting
+        on, e.g. ``"conv_abc123"``.
+    :param bridge_dir: The caller's own bridge directory, e.g.
+        ``/tmp/omnigent-501/claude-native/<digest>``. When given, the marker
+        root is derived from it instead of from this process's own temp root: a
+        hook subprocess is *told* its bridge dir, so deriving from it cannot
+        disagree with the runner about ``$TMPDIR`` the way an independently
+        computed root could — and a marker written where the reaper never looks
+        would fail silently. ``None`` uses this process's own root, which is
+        the runner side including the pane reaper.
+    :returns: Absolute marker path under ``<temp root>/approval-waits``.
+    """
+    root = (
+        bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME
+        if bridge_dir is not None
+        else _APPROVAL_WAIT_ROOT
+    )
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    return root / f"{digest}.wait"
+
+
+def touch_approval_wait_marker(marker: Path) -> None:
+    """
+    Stamp an approval-wait marker with the current time.
+
+    Refreshed once per hook POST attempt so the idle pane reaper can tell a
+    pane parked on a permission prompt — which emits no output and reports no
+    active turn — from an abandoned one. The root is created and validated by
+    :func:`prepare_bridge_dir` in the runner, so this only writes inside an
+    already-trusted directory. Best-effort: a marker that cannot be written
+    only costs the pre-existing reap behavior.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: None.
+    """
+    try:
+        marker.touch()
+    except OSError:
+        _logger.debug("Could not touch approval-wait marker", exc_info=True)
+
+
+def clear_approval_wait_marker(marker: Path) -> None:
+    """
+    Remove an approval-wait marker.
+
+    Called when the hook stops waiting (verdict, rejection, give-up, or a
+    signal that kills it mid-wait) so the pane returns to normal idle
+    accounting at once rather than after :data:`APPROVAL_WAIT_MARKER_TTL_S`.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: None.
+    """
+    with contextlib.suppress(OSError):
+        marker.unlink(missing_ok=True)
+
+
+def approval_wait_is_fresh(session_id: str) -> bool:
+    """
+    Whether a permission hook is parked on this session's verdict right now.
+
+    :param session_id: Omnigent session id to check, e.g.
+        ``"conv_abc123"``.
+    :returns: ``True`` when the marker was touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when it is missing,
+        stale, or unreadable.
+    """
+    try:
+        touched_at = approval_wait_marker_path(session_id).stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - touched_at < APPROVAL_WAIT_MARKER_TTL_S
+
+
 def build_claude_native_spawn_env(
     conversation_id: str,
     *,
@@ -1282,6 +1372,11 @@ def prepare_bridge_dir(
     resolved_bridge_id = bridge_id or conversation_id
     bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
     _ensure_secure_dir(bridge_dir)
+    # A parked permission hook only touches files in this root, so the runner
+    # owns creating and validating it before any hook can fire. Derived from the
+    # bridge dir just validated rather than read from the module global, so it
+    # lands in the same tree the caller asked for.
+    _ensure_secure_dir(bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME)
     config = _read_json_file(bridge_dir / _CONFIG_FILE)
     token = config.get("token") if isinstance(config, dict) else None
     if not isinstance(token, str) or not token:

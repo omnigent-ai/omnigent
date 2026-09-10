@@ -11696,6 +11696,7 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
+        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
@@ -11721,6 +11722,11 @@ def create_runner_app(
             ):
                 return True
             if _native_pane_status.get(conv_id) == "running":
+                return True
+            # A pane parked on a permission prompt emits nothing and reports no
+            # active turn, so every signal above reads idle. Reaping it kills the
+            # prompt and strands its approval card unanswerable.
+            if approval_wait_is_fresh(conv_id):
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             if clients:

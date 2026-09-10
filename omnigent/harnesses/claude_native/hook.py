@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    approval_wait_marker_path,
+    clear_approval_wait_marker,
     read_active_session_id,
     read_bridge_id,
     read_claude_session_id,
@@ -22,6 +24,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_permission_hook_config,
     read_seen_claude_session_ids,
     record_hook_event,
+    touch_approval_wait_marker,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -662,6 +665,7 @@ def _post_hook_with_reattach(
     payload: dict[str, object],
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
+    wait_marker: Path | None = None,
 ) -> httpx.Response | None:
     """
     POST one permission-style hook payload, surviving severed long-polls.
@@ -732,6 +736,10 @@ def _post_hook_with_reattach(
         or returns ``401`` — i.e. the one-shot ``ap_auth_headers`` token lapsed.
         Called at most once; new headers trigger an immediate retry with them.
         ``None`` keeps the legacy behavior.
+    :param wait_marker: Approval-wait marker kept fresh for the life of the
+        wait, from :func:`approval_wait_marker_path`, so the idle pane reaper
+        spares a pane parked on this prompt. ``None`` skips the marker
+        (non-approval callers).
     :returns: The successful (2xx) response, or ``None`` when rejected
         or out of budget — callers fail-ask as before.
     """
@@ -751,94 +759,104 @@ def _post_hook_with_reattach(
     deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     reauthed = False
     consecutive_hard_failures = 0
-    while True:
-        attempt_started = time.monotonic()
-        try:
-            with httpx.Client(headers=headers, timeout=timeout) as client:
-                resp = client.post(url, json=body)
-                if (
-                    reauth is not None
-                    and not reauthed
-                    and _is_login_redirect_or_unauthorized(resp)
-                ):
-                    # One-shot ``ap_auth_headers`` token lapsed (~1h OAuth
-                    # lifetime): re-mint and retry once rather than fail-asking
-                    # into a terminal prompt no one watches. Mirrors the
-                    # evaluate-policy hook and ``_RunnerDatabricksAuth``.
-                    refreshed = reauth()
-                    if refreshed:
-                        headers = refreshed
-                        reauthed = True
-                        print(
-                            f"omnigent {hook_label} hook: Omnigent auth expired "
-                            "(login redirect/401); re-minted token and retrying",
-                            file=sys.stderr,
-                        )
-                        continue
-                resp.raise_for_status()
-                return resp
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code < 500:
+    try:
+        while True:
+            attempt_started = time.monotonic()
+            if wait_marker is not None:
+                # Refreshed per attempt: a pane parked on this prompt makes no
+                # output, so without it the idle reaper kills the prompt.
+                touch_approval_wait_marker(wait_marker)
+            try:
+                with httpx.Client(headers=headers, timeout=timeout) as client:
+                    resp = client.post(url, json=body)
+                    if (
+                        reauth is not None
+                        and not reauthed
+                        and _is_login_redirect_or_unauthorized(resp)
+                    ):
+                        # One-shot ``ap_auth_headers`` token lapsed (~1h OAuth
+                        # lifetime): re-mint and retry once rather than fail-asking
+                        # into a terminal prompt no one watches. Mirrors the
+                        # evaluate-policy hook and ``_RunnerDatabricksAuth``.
+                        refreshed = reauth()
+                        if refreshed:
+                            headers = refreshed
+                            reauthed = True
+                            print(
+                                f"omnigent {hook_label} hook: Omnigent auth expired "
+                                "(login redirect/401); re-minted token and retrying",
+                                file=sys.stderr,
+                            )
+                            continue
+                    resp.raise_for_status()
+                    return resp
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500:
+                    print(
+                        f"omnigent {hook_label} hook: Omnigent request rejected: {exc}",
+                        file=sys.stderr,
+                    )
+                    return None
+                # A fast 5xx is a sick server (the spin). One that arrives only
+                # after the poll was held past the floor is a gateway timing out
+                # an idle long-poll (a 504 at 300s) — a held-poll sever.
+                held_s = time.monotonic() - attempt_started
+                is_hard_failure = held_s < _PERMISSION_HELD_POLL_FLOOR_S
+                kind = "sick" if is_hard_failure else "held-poll severed by gateway"
                 print(
-                    f"omnigent {hook_label} hook: Omnigent request rejected: {exc}",
+                    f"omnigent {hook_label} hook: Omnigent request failed "
+                    f"({kind}); retrying: {exc}",
+                    file=sys.stderr,
+                )
+            except httpx.HTTPError as exc:
+                # Classify by HOW it failed, not by elapsed time (a proxy severs a
+                # legitimately-held poll in seconds-to-minutes, so wall-clock can't
+                # tell it from a down server — #1782 Polly review).
+                never_connected = isinstance(exc, _never_connected_errors())
+                held_s = time.monotonic() - attempt_started
+                # Hard failure iff the server was never reached, OR an established
+                # connection dropped so fast it's a flap rather than a parked poll.
+                is_hard_failure = never_connected or held_s < _PERMISSION_HELD_POLL_FLOOR_S
+                kind = (
+                    "unreachable"
+                    if never_connected
+                    else ("flapping" if is_hard_failure else "held-poll severed")
+                )
+                print(
+                    f"omnigent {hook_label} hook: Omnigent request failed "
+                    f"({kind}); retrying: {exc}",
+                    file=sys.stderr,
+                )
+            if is_hard_failure:
+                consecutive_hard_failures += 1
+            else:
+                # A proxy severed a genuinely-held poll — the re-park mechanism
+                # working as intended. Reset so a slow human is never capped, and
+                # re-POST promptly so the same id re-parks inside the server's
+                # re-park grace instead of letting the card clear between polls.
+                consecutive_hard_failures = 0
+                backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
+            if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
+                print(
+                    f"omnigent {hook_label} hook: giving up after "
+                    f"{consecutive_hard_failures} consecutive hard failures "
+                    "(server unreachable/sick) — failing ask",
                     file=sys.stderr,
                 )
                 return None
-            # A fast 5xx is a sick server (the spin). One that arrives only
-            # after the poll was held past the floor is a gateway timing out
-            # an idle long-poll (a 504 at 300s) — a held-poll sever.
-            held_s = time.monotonic() - attempt_started
-            is_hard_failure = held_s < _PERMISSION_HELD_POLL_FLOOR_S
-            kind = "sick" if is_hard_failure else "held-poll severed by gateway"
-            print(
-                f"omnigent {hook_label} hook: Omnigent request failed ({kind}); retrying: {exc}",
-                file=sys.stderr,
-            )
-        except httpx.HTTPError as exc:
-            # Classify by HOW it failed, not by elapsed time (a proxy severs a
-            # legitimately-held poll in seconds-to-minutes, so wall-clock can't
-            # tell it from a down server — #1782 Polly review).
-            never_connected = isinstance(exc, _never_connected_errors())
-            held_s = time.monotonic() - attempt_started
-            # Hard failure iff the server was never reached, OR an established
-            # connection dropped so fast it's a flap rather than a parked poll.
-            is_hard_failure = never_connected or held_s < _PERMISSION_HELD_POLL_FLOOR_S
-            kind = (
-                "unreachable"
-                if never_connected
-                else ("flapping" if is_hard_failure else "held-poll severed")
-            )
-            print(
-                f"omnigent {hook_label} hook: Omnigent request failed ({kind}); retrying: {exc}",
-                file=sys.stderr,
-            )
-        if is_hard_failure:
-            consecutive_hard_failures += 1
-        else:
-            # A proxy severed a genuinely-held poll — the re-park mechanism
-            # working as intended. Reset so a slow human is never capped, and
-            # re-POST promptly so the same id re-parks inside the server's
-            # re-park grace instead of letting the card clear between polls.
-            consecutive_hard_failures = 0
-            backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
-        if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
-            print(
-                f"omnigent {hook_label} hook: giving up after "
-                f"{consecutive_hard_failures} consecutive hard failures "
-                "(server unreachable/sick) — failing ask",
-                file=sys.stderr,
-            )
-            return None
-        # Two-line backoff; not worth a retry lib in this dependency-light hook.
-        time.sleep(backoff_s)
-        backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
-        if time.monotonic() >= deadline:
-            print(
-                f"omnigent {hook_label} hook: retry budget exhausted "
-                f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
-                file=sys.stderr,
-            )
-            return None
+            # Two-line backoff; not worth a retry lib in this dependency-light hook.
+            time.sleep(backoff_s)
+            backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
+            if time.monotonic() >= deadline:
+                print(
+                    f"omnigent {hook_label} hook: retry budget exhausted "
+                    f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
+                    file=sys.stderr,
+                )
+                return None
+    finally:
+        if wait_marker is not None:
+            clear_approval_wait_marker(wait_marker)
 
 
 def _main_permission_request(argv: list[str]) -> int:
@@ -895,6 +913,7 @@ def _main_permission_request(argv: list[str]) -> int:
         payload,
         "claude permission",
         reauth=policy_hook_reauth(ap_server_url, headers),
+        wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
     )
     if resp is None:
         return 0
@@ -975,6 +994,7 @@ def _main_ask_user_question(argv: list[str]) -> int:
         payload,
         "ask-user-question",
         reauth=policy_hook_reauth(ap_server_url, headers),
+        wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
     )
     if resp is None or not resp.content:
         return 0
