@@ -121,11 +121,13 @@ class TestConnectJcodeGatewayEnv:
         assert result is not None
         assert result["JCODE_DBX_TOKEN"] == "fresh-bearer-token"
         assert "JCODE_RUNTIME_DIR" in result
-        # Runtime dir exists, sits under the harness tmp parent, and is keyed by session.
+        # Runtime dir exists and sits under the harness tmp parent's run-dir root
+        # (the leaf is a hash of the session id, not the raw id — no path traversal).
         runtime_dir = result["JCODE_RUNTIME_DIR"]
         assert Path(runtime_dir).exists()
         assert str(tmp_path) in runtime_dir
-        assert runtime_dir.endswith("omnigent-jcode-run/sess-abc")
+        assert "/omnigent-jcode-run/" in runtime_dir
+        assert "sess-abc" not in runtime_dir  # raw id never appears in the path
 
     def test_same_session_reuses_dir_new_session_differs_and_always_mints(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

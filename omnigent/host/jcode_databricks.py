@@ -17,6 +17,7 @@ and model are loaded at startup and never persisted.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -78,15 +79,21 @@ def _session_runtime_dir(session_id: str | None) -> str:
     """Return this session's jcode runtime dir, created 0700 and idempotently.
 
     Rooted under ``OMNIGENT_HARNESS_TMP_PARENT`` when set (the harness tmp parent),
-    else the OS temp dir, and keyed by *session_id* so repeated spawns within one
-    session reuse a single dir (its own daemon) instead of leaking a new dir per
-    turn. A missing session id falls back to a per-process key.
+    else the OS temp dir. The dir *name* is a hash of *session_id*, so repeated
+    spawns within one session reuse a single dir (its own daemon) without leaking a
+    new dir per turn, and — since a hex digest carries no path separators — the
+    (untrusted) session id can't escape the run-dir root. A missing id falls back to
+    a per-process key.
     """
     base = os.environ.get("OMNIGENT_HARNESS_TMP_PARENT") or tempfile.gettempdir()
-    key = "".join(c for c in (session_id or "") if c.isalnum() or c in "-_")
-    if not key:
-        key = f"proc-{os.getpid()}"
-    path = os.path.join(base, _JCODE_RUN_DIR_BASE, key)
+    root = os.path.join(base, _JCODE_RUN_DIR_BASE)
+    raw = session_id or f"proc-{os.getpid()}"
+    name = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    path = os.path.join(root, name)
+    # Defense-in-depth: the resolved dir must stay within the run-dir root.
+    root_real = os.path.realpath(root)
+    if os.path.commonpath([root_real, os.path.realpath(path)]) != root_real:
+        raise OSError(f"jcode runtime dir escaped its root: {path!r}")
     os.makedirs(path, mode=0o700, exist_ok=True)
     os.chmod(path, 0o700)  # enforce 0700 even if the dir pre-existed or umask trimmed it
     return path
