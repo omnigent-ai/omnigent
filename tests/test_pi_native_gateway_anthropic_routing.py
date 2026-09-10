@@ -31,6 +31,14 @@ _DBX_GATEWAY_ANTHROPIC_URL = "https://myws.ai-gateway.cloud.databricks.com/anthr
 # A workspace-hosted AI Gateway (shape 2: ``/ai-gateway/`` path prefix).
 _DBX_WORKSPACE_CODEX_URL = "https://myws.cloud.databricks.com/ai-gateway/codex/v1"
 _DBX_WORKSPACE_ANTHROPIC_URL = "https://myws.cloud.databricks.com/ai-gateway/anthropic"
+# Databricks gateway HOSTS but NON-Codex paths: `is_databricks_ai_gateway_url`
+# accepts them, yet `_gateway_anthropic_base_url` can't rewrite them — so they
+# must fall through, never derive a bogus `.../anthropic` that 404s silently.
+_DBX_GATEWAY_NONCODEX_URL = "https://myws.ai-gateway.cloud.databricks.com/openai/v1"
+_DBX_WORKSPACE_MLFLOW_URL = "https://myws.cloud.databricks.com/ai-gateway/mlflow/v1"
+# A distinct base URL for an explicitly configured anthropic family, so a test
+# can tell "used the configured family" apart from "derived from openai".
+_DBX_CONFIGURED_ANTHROPIC_URL = "https://anthropic.corp.example/v1"
 
 _CLAUDE_MODEL = "claude-fable-5-1"
 _GPT_MODEL = "gpt-5-4"
@@ -73,8 +81,8 @@ def _dbx_gateway_two_family_config() -> dict[str, object]:
                 "kind": "gateway",
                 "default": ["pi"],
                 "anthropic": {
-                    "base_url": _DBX_GATEWAY_ANTHROPIC_URL,
-                    "api_key": "test-gateway-key",
+                    "base_url": _DBX_CONFIGURED_ANTHROPIC_URL,
+                    "api_key": "configured-anthropic-key",
                     "models": {"default": _CLAUDE_MODEL},
                 },
                 "openai": {
@@ -105,6 +113,10 @@ def test_derivation_helper_only_fires_for_claude_on_databricks_openai_family() -
     # Generic (non-Databricks) gateway -> not derivable.
     assert surface("openai", "https://gw.example.com/openai/v1", _CLAUDE_MODEL) is None
     assert surface("openai", "http://127.0.0.1:9099/openai/v1", _CLAUDE_MODEL) is None
+    # Databricks gateway HOST but a non-Codex path -> not derivable: blindly
+    # appending /anthropic would 404 silently, so these must fall through.
+    assert surface("openai", _DBX_GATEWAY_NONCODEX_URL, _CLAUDE_MODEL) is None
+    assert surface("openai", _DBX_WORKSPACE_MLFLOW_URL, _CLAUDE_MODEL) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -164,7 +176,8 @@ def test_databricks_gateway_openai_only_gpt_stays_on_openai() -> None:
         config_loader=_dbx_gateway_openai_only_config(),
     )
     assert provider is not None
-    assert provider.api != "anthropic-messages"
+    # wire_api: chat -> openai-completions on the configured openai base URL.
+    assert provider.api == "openai-completions"
     assert provider.base_url == _DBX_GATEWAY_CODEX_URL
     assert provider.model == _GPT_MODEL
 
@@ -182,4 +195,26 @@ def test_configured_anthropic_family_used_directly_not_derived() -> None:
     )
     assert provider is not None
     assert provider.api == "anthropic-messages"
-    assert provider.base_url == _DBX_GATEWAY_ANTHROPIC_URL
+    # The *configured* anthropic base URL (deliberately distinct from the URL
+    # that would be derived from openai) — proves the family won, not derivation.
+    assert provider.base_url == _DBX_CONFIGURED_ANTHROPIC_URL
+
+
+def test_databricks_gateway_noncodex_path_falls_through_to_warning() -> None:
+    """A Databricks gateway host on a non-Codex path is NOT silently rerouted.
+
+    `_gateway_anthropic_base_url` can only rewrite a `.../codex/v1` URL; a
+    gateway host on `/openai/v1` (etc.) must fall through to the advisory
+    warning, never derive a bogus `/openai/v1/anthropic` that launches with no
+    warning and 404s on every turn — the precise failure this PR removes.
+    """
+    provider = creds.resolve_pi_native_provider(
+        config_loader=_dbx_gateway_openai_only_config(base_url=_DBX_GATEWAY_NONCODEX_URL),
+    )
+    assert provider is not None
+    assert provider.api == "openai-completions"  # stayed on the openai wire
+    assert provider.base_url == _DBX_GATEWAY_NONCODEX_URL  # NOT rewritten
+    assert provider.credential_warning is not None, (
+        "a non-Codex Databricks gateway path must surface the advisory warning, "
+        "not launch as a bogus silent anthropic reroute"
+    )

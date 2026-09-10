@@ -1070,24 +1070,34 @@ def _databricks_gateway_anthropic_surface(
     family is routed to the derived Anthropic surface for real, instead of
     404-ing on ``/chat/completions``.
 
-    Fires only for a recognized Databricks AI Gateway base URL (host allowlist
-    + path shape, via :func:`is_databricks_ai_gateway_url`); a generic gateway's
-    Messages URL is not derivable, so those keep the advisory-warning
-    fallthrough (declare an ``anthropic`` family with the Messages base URL to
-    route natively there). The model id is left verbatim — the user named it for
-    this gateway, and we only change which surface it is sent to.
+    Fires only for a recognized Databricks AI Gateway host (allowlist, via
+    :func:`is_databricks_ai_gateway_url`) whose base URL is Codex-shaped
+    (``.../codex/v1``) — the one form :func:`_gateway_anthropic_base_url` can
+    rewrite to the gateway's real Messages surface. A gateway host on any other
+    path (``/openai/v1``, ``/ai-gateway/mlflow/v1``, …) would only get
+    ``/anthropic`` blindly appended, yielding a bogus URL that 404s silently, so
+    those — and every generic (non-Databricks) gateway — keep the
+    advisory-warning fallthrough (declare an ``anthropic`` family with the
+    Messages base URL to route natively there). The model id is left verbatim —
+    the user named it for this gateway, and we only change which surface it is
+    sent to.
 
     :param family_name: The family being resolved; only ``"openai"`` derives.
     :param base_url: That family's configured base URL.
     :param model_id: The resolved model id.
     :returns: The ``/anthropic`` base URL when this is a Claude id on a
-        Databricks-AI-Gateway OpenAI family, else ``None``.
+        Codex-shaped Databricks-AI-Gateway OpenAI family, else ``None``.
     """
     if family_name != "openai":
         return None
     if model_catalog.model_family_token(model_id) != "claude":
         return None
     if not _is_databricks_ai_gateway_url(base_url):
+        return None
+    # _gateway_anthropic_base_url only rewrites a Codex-shaped URL to the real
+    # Messages surface; on any other recognized gateway path it would just
+    # append /anthropic and 404 silently. Restrict derivation to that case.
+    if not base_url.rstrip("/").endswith(_DATABRICKS_GATEWAY_CODEX_SUFFIX):
         return None
     return _gateway_anthropic_base_url(base_url)
 
