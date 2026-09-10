@@ -15,6 +15,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { TerminalImeInput } from "./TerminalImeInput";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 
 // Card background colors derived from the app's CSS palette.
@@ -522,6 +523,7 @@ export class TerminalSession {
   private lastSentSize: { cols: number; rows: number } | null = null;
   /** Fractional wheel lines carried across events (see {@link wheelReportPayload}). */
   private wheelPartialLines = 0;
+  private readonly imeInput: TerminalImeInput;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -670,16 +672,22 @@ export class TerminalSession {
       { signal },
     );
 
-    this.dataDispose = this.term.onData((d) => {
+    const sendInput = (d: string) => {
       onInput?.();
       // Stamp before the readyState guard so clipboard trust still reflects
       // local input during a momentary WebSocket hiccup.
       this.lastUserInputAt = performance.now();
       if (this.ws.readyState !== WebSocket.OPEN) return;
       this.ws.send(INPUT_ENCODER.encode(d));
+    };
+    this.imeInput = new TerminalImeInput(this.term);
+    this.dataDispose = this.term.onData((d) => {
+      if (!this.imeInput.consumeData(d)) sendInput(d);
     });
 
     this.term.attachCustomKeyEventHandler((e) => {
+      if (!this.imeInput.handleKeyEvent(e)) return false;
+      if (this.imeInput.isComposing) return true;
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
       // xterm invokes this handler for keydown, keypress, and keyup.
@@ -687,6 +695,7 @@ export class TerminalSession {
       // the CSI-u sequence once, on keydown.
       if (e.type === "keydown") {
         e.preventDefault();
+        if (!this.imeInput.beforeSoftKey()) return false;
         onInput?.();
         this.lastUserInputAt = performance.now();
         if (this.ws.readyState === WebSocket.OPEN) {
@@ -777,6 +786,7 @@ export class TerminalSession {
     this.disposed = true;
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
+    this.imeInput.dispose();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
     try {

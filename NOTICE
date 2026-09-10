@@ -61,6 +61,9 @@ ________________
 
 This Software contains code from the following open source projects, licensed under the MIT license (https://opensource.org/license/mit):
 
+Dinotty - https://github.com/xichan96/dinotty
+Copyright (c) 2026 ChenXi.
+
 pyyaml - https://pypi.org/project/pyyaml/
 Copyright (c) 2017-2021 Ingy döt Net. Copyright (c) 2006-2016 Kirill Simonov.
 
