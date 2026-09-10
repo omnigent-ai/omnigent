@@ -13,22 +13,23 @@ the escape bytes are silently consumed without disrupting the
 visible output. This is the standard "graceful degradation"
 behavior every modern terminal honors per the OSC 8 spec.
 
-Why this lives here, not as a Rich highlighter or markup
-transformation: Rich's ``Console`` only auto-applies a
-``highlighter`` to plain-string args of ``Console.print`` —
-pre-built ``Text``/``Panel``/``Group`` renderables (which is
-what ``TerminalHost.output`` mostly receives) bypass the
-highlighter pass entirely. Rather than walk every Rich
-renderable type to find ``Text`` leaves and stylize them,
-we post-process the rendered ANSI string. One byte-level pass
-applies uniformly to every render path (streaming text,
-non-streaming Rich, mid-paragraph rewrites) without entangling
-us with Rich's renderable internals.
+``LinkifyingConsole`` attaches destinations to Rich text before
+line wrapping, including text inside panels, tables, and Markdown.
+Each wrapped fragment retains the complete URL. ``linkify_ansi``
+is a fallback for renderables that emit ANSI or segments directly;
+already-linked fragments pass through unchanged.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+
+from rich.console import Console, ConsoleOptions, RenderableType
+from rich.protocol import rich_cast
+from rich.segment import Segment
+from rich.style import Style
+from rich.text import Text
 
 # Match ``http://`` / ``https://`` URLs, stopping at:
 #   - whitespace
@@ -49,6 +50,7 @@ import re
 # https://example.com." should fire OSC 8 over the URL but leave
 # the period after the close-OSC8.
 _URL = r"https?://[^\s\)\]\>\"'<\x00-\x1f\x7f]+"
+_URL_RE = re.compile(_URL)
 
 # Match a complete pre-existing OSC 8 hyperlink block so we don't
 # re-wrap a URL that was already linkified (some agent paths emit
@@ -84,6 +86,30 @@ _TRAILING_PUNCT = ".,;:!?"
 # OSC 8 escape components.
 _OSC_OPEN = "\x1b]8;;"
 _OSC_CLOSE = "\x1b\\"
+
+
+class LinkifyingConsole(Console):
+    """Attach URL destinations before Rich splits text into terminal rows."""
+
+    def render(
+        self, renderable: RenderableType, options: ConsoleOptions | None = None
+    ) -> Iterable[Segment]:
+        renderable = rich_cast(renderable)
+        render_options = options or self.options
+        if isinstance(renderable, str):
+            renderable = self.render_str(
+                renderable, highlight=render_options.highlight, markup=render_options.markup
+            )
+        if isinstance(renderable, Text) and not self.get_style(renderable.style).link:
+            matches = list(_URL_RE.finditer(renderable.plain))
+            if matches:
+                renderable = renderable.copy()
+                for match in matches:
+                    url = match.group().rstrip(_TRAILING_PUNCT)
+                    renderable.stylize_before(
+                        Style(link=url), match.start(), match.start() + len(url)
+                    )
+        yield from super().render(renderable, options)
 
 
 def linkify_ansi(text: str) -> str:
