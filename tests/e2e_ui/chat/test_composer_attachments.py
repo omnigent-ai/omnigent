@@ -33,6 +33,7 @@ at all — both of which jsdom approximates rather than implements.
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -128,6 +129,61 @@ def test_attach_json_file(page: Page, seeded_session: tuple[str, str], tmp_path:
     remove_button = page.get_by_role("button", name=f"Remove {_JSON_NAME}")
     expect(remove_button).to_be_visible(timeout=10_000)
     expect(page.get_by_text(_JSON_NAME, exact=True)).to_be_visible()
+
+
+# A real 64x64 HEIC still (macOS ``sips -s format heic``), base64 so the suite
+# needs no binary fixture. Chromium cannot decode HEIC natively, so attaching it
+# drives the wasm fallback in ``lib/imageCompression.ts`` end to end.
+_HEIC_NAME = "photo.heic"
+_HEIC_B64 = (
+    "AAAAJGZ0eXBoZWljAAAAAG1pZjFNaVBybWlhZk1pSEJoZWljAAABhW1ldGEAAAAAAAAAIWhkbHIA"
+    "AAAAAAAAAHBpY3QAAAAAAAAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAA"
+    "AAABAAAADnBpdG0AAAAAAAEAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAAAOVp"
+    "cHJwAAAAxGlwY28AAAATY29scm5jbHgAAgACAAaAAAAADGNsbGkAywBAAAAAFGlzcGUAAAAAAAAA"
+    "QAAAAEAAAAAJaXJvdAAAAAAQcGl4aQAAAAADCAgIAAAAcGh2Y0MBA3AAAACwAAAAAAAe8AD8/fj4"
+    "AAALA6AAAQAXQAEMAf//A3AAAAMAsAAAAwAAAwAecCShAAEAIkIBAQNwAAADALAAAAMAAAMAHqAU"
+    "IEHBj4h7kWVTcCAgYAiiAAEACUQBwGFyyERTZAAAABlpcG1hAAAAAAAAAAEAAQaBAgMFhoQAAAAe"
+    "aWxvYwAAAABEAAABAAEAAAABAAABuQAAADAAAAABbWRhdAAAAAAAAABAAAAALCgBr6L6RoF8//0X"
+    "D//wr+y+27M+w2tE9pwD7zgv/93WT+n/0D5uBwmam1R+"
+)
+
+
+def test_attach_heic_converts_to_jpeg(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A HEIC photo attaches as a JPEG chip instead of bouncing or failing later.
+
+    Phone photos are HEIC by default. The server accepts any ``image/*``
+    upload, but the model APIs reject the format, so without conversion the
+    turn failed after the message was already sent. ``addFiles`` now runs
+    images through ``prepareImageAttachment`` first; the chip carries the
+    converted name, proving the file in composer state is the JPEG.
+
+    Two things are asserted:
+
+    1. The hidden input lists ``.heic`` in ``accept`` so the OS picker admits
+       the photo at all (``set_input_files`` bypasses that filter).
+    2. The chip that lands is ``photo.jpg`` and no ``photo.heic`` chip exists.
+    """
+    base_url, session_id = seeded_session
+    sample = tmp_path / _HEIC_NAME
+    sample.write_bytes(base64.b64decode(_HEIC_B64))
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    file_input = page.locator('input[type="file"][accept*="image/"]')
+    accept = file_input.get_attribute("accept")
+    assert accept is not None and ".heic" in accept, (
+        f"composer file input should accept .heic; got {accept!r}"
+    )
+
+    file_input.set_input_files(str(sample))
+
+    # The wasm decoder loads on first use, so allow more than the usual chip wait.
+    expect(page.get_by_role("button", name="Remove photo.jpg")).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("button", name=f"Remove {_HEIC_NAME}")).to_have_count(0)
+    expect(page.get_by_text("couldn't be read", exact=False)).to_have_count(0)
 
 
 def test_reject_unsupported_type(
