@@ -1923,6 +1923,41 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
+  it("resets the native text input when the Send button moves focus first", () => {
+    const props = composerProps({ status: "streaming", isWorking: true });
+    render(<Composer {...props} />);
+    const ta = textarea();
+
+    ta.focus();
+    fireEvent.change(ta, { target: { value: "disabled" } });
+    fireEvent.blur(ta);
+    const focusSpy = vi.spyOn(ta, "focus");
+    const blurSpy = vi.spyOn(ta, "blur");
+    fireEvent.submit(ta.closest("form")!);
+
+    expect(props.onSend).toHaveBeenCalledWith("disabled", undefined);
+    expect(focusSpy).toHaveBeenCalledOnce();
+    expect(blurSpy).toHaveBeenCalledOnce();
+    expect(ta).toHaveValue("");
+    expect(ta).not.toHaveFocus();
+    expect(ta.placeholder).toMatch(/send a follow-up/i);
+  });
+
+  it("keeps the native input focused after a keyboard send", () => {
+    const props = composerProps({ status: "streaming", isWorking: true });
+    render(<Composer {...props} />);
+    const ta = textarea();
+
+    ta.focus();
+    fireEvent.change(ta, { target: { value: "disabled" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledWith("disabled", undefined);
+    expect(ta).toHaveValue("");
+    expect(ta).toHaveFocus();
+    expect(ta.placeholder).toMatch(/send a follow-up/i);
+  });
+
   it("unreachable (host offline / local-stranded): composer is blocked", () => {
     // A message can't wake it, so the textarea is disabled and the banner
     // below is the only affordance.

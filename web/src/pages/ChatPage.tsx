@@ -3158,7 +3158,21 @@ function ComposerImpl({
     dirtyRef.current = true;
   };
 
-  const submit = () => {
+  const clearComposerAfterSend = (resetNativeInputSession: boolean) => {
+    const textarea = textareaRef.current;
+    if (resetNativeInputSession && textarea !== null) {
+      // End the emptied text-input session so native keyboards drop predictions.
+      textarea.focus({ preventScroll: true });
+      textarea.value = "";
+      textarea.setSelectionRange(0, 0);
+      textarea.blur();
+    }
+    setValue("");
+  };
+
+  const submit = ({
+    resetNativeInputSession = false,
+  }: { resetNativeInputSession?: boolean } = {}) => {
     const trimmed = value.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
@@ -3258,7 +3272,7 @@ function ComposerImpl({
     if (trimmed) appendEntry(trimmed);
     onSend(messageText, files.length > 0 ? files : undefined);
     dirtyRef.current = true;
-    setValue("");
+    clearComposerAfterSend(resetNativeInputSession);
     setFiles([]);
     setAttachmentError(null);
     setMentionedItems([]);
@@ -3272,7 +3286,7 @@ function ComposerImpl({
       onStop();
       return;
     }
-    submit();
+    submit({ resetNativeInputSession: true });
   };
 
   const applyRecall = (ta: HTMLTextAreaElement, recalled: string) => {
