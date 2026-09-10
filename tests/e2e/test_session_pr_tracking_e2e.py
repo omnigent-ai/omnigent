@@ -44,6 +44,10 @@ async def test_native_session_tracks_prs_across_repositories(
         "args[args.index('-R') + 1].removeprefix('github.com/'))\n"
         "url = f'https://github.com/{repo}/pull/42'\n"
         "if args[:2] == ['pr', 'create'] or args[0] == 'api': print(url)\n"
+        "elif args[:2] == ['pr', 'view'] and '--comments' in args:\n"
+        "    print('Supersedes https://github.com/unrelated/repo/pull/7')\n"
+        "    print('https://github.com/unrelated/repo/pull/7')\n"
+        "    print('View this pull request on GitHub: ' + url)\n"
         "elif args[:2] == ['pr', 'view']: "
         "print(json.dumps({'number': 42, 'url': url, 'title': repo, 'state': 'OPEN'}))\n"
         "elif args[:2] == ['pr', 'diff']: print('patch for ' + repo)\n"
@@ -88,6 +92,10 @@ async def test_native_session_tracks_prs_across_repositories(
         )
         mixed_output = subprocess.check_output(
             ["/bin/sh", "-c", mixed_command], text=True, cwd=workspace
+        )
+        view_command = "gh pr view 42 -R example/one --comments"
+        view_output = subprocess.check_output(
+            ["/bin/sh", "-c", view_command], text=True, cwd=workspace
         )
         payloads = [
             {
@@ -135,6 +143,11 @@ async def test_native_session_tracks_prs_across_repositories(
                         "Next steps:\n  • Assign reviewers\n  • Monitor CI checks\n"
                     }
                 ),
+            },
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": view_command},
+                "tool_response": {"stdout": view_output, "exit_code": 0},
             },
             {
                 "tool_name": "Bash",

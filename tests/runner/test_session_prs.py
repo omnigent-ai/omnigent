@@ -631,7 +631,7 @@ def test_combined_operations_keep_prs_without_misattributing_creation(
         ({"html_url": A + "#issuecomment-123", "body": B}, [A]),
         ({"stdout": json.dumps({"html_url": A + "#issuecomment-123", "body": B})}, [A]),
         (A + "#issuecomment-123", [A]),
-        (f"Comment posted: [view]({A}#issuecomment-123)", [A]),
+        (f"Comment posted: [view]({A}#issuecomment-123)", []),
         ({"body": B}, []),
         ({"html_url": A.replace("/pull/", "/issues/") + "#issuecomment-123"}, []),
         ({"stdout": A, "exit_code": 1}, []),
@@ -664,19 +664,102 @@ def test_pr_reads_use_structured_identity(command: str) -> None:
 @pytest.mark.parametrize(
     "result,urls",
     [
-        # Rendered output naming several PRs (a body linking another PR plus the
-        # view footer) cannot say which one the call was about.
         (f"Fix typo\n\nSupersedes {B}.\nView this pull request on GitHub: {A}", []),
-        # A single embedded URL is unambiguous, as in comment confirmations.
-        (f"posted: [view]({A}#issuecomment-9)", [A]),
-        # A standalone result line stays authoritative over embedded prose links.
+        (f"posted: [view]({A}#issuecomment-9)", []),
         (f"See {B} for background\n{A}", [A]),
     ],
 )
-def test_embedded_urls_associate_only_when_unambiguous(result: str, urls: list[str]) -> None:
+def test_rendered_output_requires_complete_url_line(result: str, urls: list[str]) -> None:
     refs, created = extract_prs("Bash", {"command": "gh pr view 42"}, result)
     assert [ref.url for ref in refs] == urls
     assert not created
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 42 -R example/one",
+        f"gh pr view {A} --comments",
+        "gh auth status; gh pr view --comments -R example/one 42; gh config set pager cat",
+        "gh pr view --json body -q .body 42 -R example/one",
+        "gh pr diff --color never 42 -R example/one",
+        "gh api repos/example/one/pulls/42 --jq .body",
+        "gh api repos/example/one/pulls/42/reviews",
+    ],
+)
+def test_known_target_excludes_prs_mentioned_in_output(command: str) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": command},
+        {"stdout": f"Supersedes {B}\n{B}\nView this pull request on GitHub: {A}"},
+    )
+    assert [ref.url for ref in refs] == [A]
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr diff",
+        "gh pr diff 42",
+        "gh api repos/example/one/pulls -X POST --jq .body",
+        "gh api repos/example/one/pulls --jq '.[].body'",
+        "gh api repos/example/one/issues/42/comments --jq .body",
+        "gh pr view 42 --json body --jq .body",
+        "gh pr list --json body --jq '.[] | .body'",
+    ],
+)
+@pytest.mark.parametrize("output", [B, json.dumps({"url": B})])
+def test_content_only_output_does_not_supply_pr_identity(command: str, output: str) -> None:
+    refs, _ = extract_prs("Bash", {"command": command}, {"stdout": output})
+    assert refs == []
+
+
+def test_single_operation_prefers_structured_identity_over_text() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr create"},
+        {"structuredContent": {"html_url": A}, "stdout": B},
+    )
+    assert [ref.url for ref in refs] == [A]
+    assert created
+
+
+def test_plain_text_fallback_accepts_only_complete_url_lines() -> None:
+    refs, _ = extract_prs(
+        "Bash",
+        {"command": "gh pr view 42; gh pr create"},
+        {
+            "stdout": (
+                f"Supersedes {A}\n+{A}\n[view]({A})\n"
+                f'42{A}\n"{A}" is mentioned\n{A}#comment is mentioned\n{B}\n'
+            )
+        },
+    )
+    assert [ref.url for ref in refs] == [B]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("second_json", [False, True])
+def test_compound_output_preserves_json_identities_and_url_lines(
+    reverse: bool, second_json: bool
+) -> None:
+    other = "https://github.com/unrelated/repo/pull/7"
+    commands = ["gh api repos/example/one/pulls -X POST", "gh pr create -R example/two"]
+    outputs = [json.dumps({"html_url": A, "body": other}, indent=2), B]
+    if second_json:
+        commands[1] = "gh api repos/example/two/pulls -X POST"
+        outputs[1] = json.dumps({"html_url": B, "body": other})
+    if reverse:
+        commands.reverse()
+        outputs.reverse()
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "; ".join(commands)},
+        {"stdout": "Preparing PRs\n" + "\n".join(outputs) + "\nShell cwd was reset"},
+    )
+    assert {ref.url for ref in refs} == {A, B}
+    assert created
 
 
 @pytest.mark.parametrize("envelope", [False, True])
@@ -711,7 +794,12 @@ def test_rest_create_with_jq_and_multiline_shell(envelope: bool) -> None:
         ("gh api /repos/example/one/pulls/42 --jq .html_url", A, [A], False),
         ("gh api /repos/example/one/pulls -X GET -f title=test --jq .html_url", A, [A], False),
         ("gh api /repos/example/one/pulls --jq '.[].html_url'", A + "\n" + B, [A, B], False),
-        ("gh api /repos/example/one/pulls/99 -X PATCH --jq .html_url", A, [A], False),
+        (
+            "gh api /repos/example/one/pulls/99 -X PATCH --jq .body",
+            A,
+            [A.replace("/42", "/99")],
+            False,
+        ),
         (
             "gh api --input /repos/example/one/pulls -X POST "
             "/repos/example/one/issues --jq .html_url",

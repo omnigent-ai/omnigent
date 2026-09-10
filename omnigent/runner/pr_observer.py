@@ -42,10 +42,33 @@ def _result_parts(result: object, depth: int = 0) -> list[dict[str, object] | st
     if depth > 6:
         return []
     if isinstance(result, str):
-        try:
-            return _result_parts(json.loads(result), depth + 1)
-        except ValueError:
-            return [result]
+        # Compound shell output can interleave JSON responses, URL lines, and logs.
+        parts: list[dict[str, object] | str] = []
+        decoder = json.JSONDecoder()
+        index = 0
+        while index < len(result):
+            if result[index].isspace():
+                index += 1
+                continue
+            position = index
+            if result[index] in '{["':
+                try:
+                    value, position = decoder.raw_decode(result, index)
+                except ValueError as error:
+                    # Keep incomplete JSON together instead of re-parsing its nested lines.
+                    position = error.pos if isinstance(error, json.JSONDecodeError) else index
+                else:
+                    line_end = result.find("\n", position)
+                    if not result[position : line_end if line_end != -1 else len(result)].strip():
+                        parts.extend(_result_parts(value, depth + 1))
+                        index = position
+                        continue
+            end = result.find("\n", position)
+            if end == -1:
+                end = len(result)
+            parts.append(result[index:end])
+            index = end
+        return parts
     if isinstance(result, list):
         return [part for item in result[:100] for part in _result_parts(item, depth + 1)]
     if not isinstance(result, dict):
@@ -258,6 +281,11 @@ def _positional_target(tokens: list[str]) -> str | None:
         "--match-head-commit",
         "--branch",
         "--reason",
+        "--json",
+        "--jq",
+        "-q",
+        "--template",
+        "--color",
     }
     switches = {
         "--approve",
@@ -286,6 +314,9 @@ def _positional_target(tokens: list[str]) -> str | None:
         "--yes",
         "--web",
         "-w",
+        "--comments",
+        "--patch",
+        "--name-only",
     }
     index = 0
     while index < len(tokens):
@@ -311,6 +342,34 @@ def _target(repository: object, number: object, host: str = "github.com") -> Pul
             host, repository = parts[0], "/".join(parts[1:])
         return _reference(f"https://{host}/{repository}/pull/{number}")
     return None
+
+
+def _command_target(tokens: list[str]) -> PullRequestRef | None:
+    host = _flag(tokens, "--hostname") or "github.com"
+    if tokens[0] == "api":
+        endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
+        match = re.match(r"/?repos/([^/]+/[^/]+)/pulls/([1-9][0-9]*)(?:/|$)", endpoint)
+        return _target(match[1], match[2], host) if match else None
+    if tokens[0] == "pr" and len(tokens) > 1 and tokens[1] != "create":
+        target = _positional_target(tokens[2:])
+        if ref := _reference(target):
+            return ref
+        if target and target.isdigit():
+            return _target(_flag(tokens, "--repo", "-R"), target, host)
+    return None
+
+
+def _content_only(tokens: list[str]) -> bool:
+    fields = _flag(tokens, "--json")
+    return (
+        tokens[:2] == ["pr", "diff"]
+        or _flag(tokens, "--jq", "-q") in {".body", ".[].body"}
+        or (
+            tokens[0] == "pr"
+            and fields is not None
+            and set(fields.split(",")) <= {"body", "title"}
+        )
+    )
 
 
 def _mcp_prs(
@@ -373,34 +432,16 @@ def extract_prs(
             return [], False
         # Mixed reads/writes still associate PRs, but cannot establish creation.
         created = all(_creates_pr(tokens) for tokens in commands)
-        for tokens in commands:
-            if tokens[0] == "pr" and len(tokens) > 1 and tokens[1] != "create":
-                target = _positional_target(tokens[2:])
-                ref = _reference(target)
-                if ref is None and target and target.isdigit():
-                    ref = _target(
-                        _flag(tokens, "--repo", "-R"),
-                        target,
-                        _flag(tokens, "--hostname") or "github.com",
-                    )
-                if ref:
+        references = [ref for tokens in commands if (ref := _command_target(tokens))]
+        if len(commands) > 1 or not _content_only(commands[0]):
+            for obj in _objects(result):
+                if ref := _reference(obj.get("html_url", obj.get("url"))):
                     references.append(ref)
-        for obj in _objects(result):
-            if ref := _reference(obj.get("html_url", obj.get("url"))):
-                references.append(ref)
-        # Standalone URL lines are gh's own operation results. URLs embedded in
-        # rendered bodies/diffs (pr view, pr diff) can name unrelated PRs, so
-        # they count only when the output is otherwise unattributed and names
-        # exactly one PR.
-        references.extend(ref for line in text.splitlines() if (ref := _reference(line.strip())))
-        if not references:
-            embedded = {
-                ref.url: ref
-                for url in re.findall(r"https://[^\s<>\"'`]+", text)
-                if (ref := _reference(url))
-            }
-            if len(embedded) == 1:
-                references.extend(embedded.values())
+            # A single operation's known identity makes rendered body links redundant.
+            if len(commands) > 1 or not references:
+                for line in text.splitlines():
+                    if len(line.split()) == 1 and (ref := _reference(line.strip())):
+                        references.append(ref)
     else:
         name = tool_name.rsplit("__", 1)[-1].removeprefix("github_")
         if name == "write_api_call":
