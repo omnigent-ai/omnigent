@@ -122,8 +122,8 @@ def test_reference_accepts_dns_hostname(host: str) -> None:
         ("Bash", {"command": "gh pr create"}, {"stdout": A, "exit_code": 1}, []),
         ("Bash", {"command": "gh pr create"}, A + "\n[exit code: 1]", []),
         ("Bash", {"command": f"echo '{A}'"}, A, []),
-        ("Bash", {"command": "gh pr list"}, A + "\n" + B, []),
-        ("Bash", {"command": "gh pr view 42"}, A, []),
+        ("Bash", {"command": "gh pr list"}, A + "\n" + B, [A, B]),
+        ("Bash", {"command": "gh pr view 42"}, A, [A]),
         (
             "mcp__custom__create_pull_request",
             {"owner": "example", "repo": "one"},
@@ -317,12 +317,12 @@ EOF
             True,
         ),
         ("gh auth status", A, [], False),
-        ("gh auth switch --user example-user; gh pr list", A, [], False),
-        ("gh auth switch --user example-user; gh pr view; gh pr create", A, [], False),
+        ("gh auth switch --user example-user; gh pr list", A, [A], False),
+        ("gh auth switch --user example-user; gh pr view; gh pr create", A, [A], False),
         (
             "gh auth switch --user example-user; gh api repos/example/one/pulls/42; gh pr create",
             A,
-            [],
+            [A],
             False,
         ),
         ("gh auth switch --user example-user; gh pr create || true", A, [], False),
@@ -595,13 +595,70 @@ def test_background_or_interrupted_shell_does_not_attach_target(result: dict) ->
     assert refs == []
 
 
-def test_read_api_output_is_not_attributed_to_later_create() -> None:
-    refs, _ = extract_prs(
+@pytest.mark.parametrize(
+    "commands,created",
+    [
+        (["gh api repos/example/one/pulls/42 --jq .html_url", "gh pr create"], False),
+        (["gh pr view 42 --repo example/one", "gh pr create"], False),
+        (["gh api repos/example/one/pulls -X POST", "gh pr edit 42"], False),
+        (
+            ["gh api repos/example/one/pulls -X POST", "gh api repos/example/two/pulls/42"],
+            False,
+        ),
+        (
+            ["gh api repos/example/one/pulls -X POST", "gh api repos/example/two/pulls -X POST"],
+            True,
+        ),
+        (["gh api repos/example/one/pulls -X POST", "gh pr create"], True),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_combined_operations_keep_prs_without_misattributing_creation(
+    commands: list[str], created: bool, reverse: bool
+) -> None:
+    refs, was_created = extract_prs(
         "Bash",
-        {"command": "gh api repos/example/one/pulls/42 --jq .html_url; gh pr create"},
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
         A + "\n" + B,
     )
-    assert refs == []
+    assert {ref.url for ref in refs} == {A, B}
+    assert was_created is created
+
+
+@pytest.mark.parametrize(
+    "result,urls",
+    [
+        ({"html_url": A + "#issuecomment-123", "body": B}, [A]),
+        ({"stdout": json.dumps({"html_url": A + "#issuecomment-123", "body": B})}, [A]),
+        (A + "#issuecomment-123", [A]),
+        (f"Comment posted: [view]({A}#issuecomment-123)", [A]),
+        ({"body": B}, []),
+        ({"html_url": A.replace("/pull/", "/issues/") + "#issuecomment-123"}, []),
+        ({"stdout": A, "exit_code": 1}, []),
+        ({"stdout": A, "interrupted": True}, []),
+        ({"stdout": A, "backgroundTaskId": "pending"}, []),
+    ],
+)
+def test_rest_comment_tracks_pr_identity(result: object, urls: list[str]) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"gh api repos/example/one/issues/42/comments -f body='{B}'"},
+        result,
+    )
+    assert [ref.url for ref in refs] == urls
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["gh pr view 42 --json url,body", "gh api repos/example/one/pulls/42"],
+)
+def test_pr_reads_use_structured_identity(command: str) -> None:
+    refs, created = extract_prs(
+        "Bash", {"command": command}, {"stdout": json.dumps({"url": A, "body": B})}
+    )
+    assert [ref.url for ref in refs] == [A]
+    assert not created
 
 
 @pytest.mark.parametrize("envelope", [False, True])
@@ -633,16 +690,15 @@ def test_rest_create_with_jq_and_multiline_shell(envelope: bool) -> None:
             True,
         ),
         ("gh api /repos/example/one/pulls/42 -X PATCH --jq .html_url", A, [A], False),
-        ("gh api /repos/example/one/pulls/42 --jq .html_url", A, [], False),
-        ("gh api /repos/example/one/pulls -X GET -f title=test --jq .html_url", A, [], False),
-        ("gh api /repos/example/one/pulls -X POST --jq .body", B, [], False),
-        ("gh api /repos/example/one/pulls -X POST --jq .html_url", B, [], False),
-        ("gh api /repos/example/one/pulls/99 -X PATCH --jq .html_url", A, [], False),
+        ("gh api /repos/example/one/pulls/42 --jq .html_url", A, [A], False),
+        ("gh api /repos/example/one/pulls -X GET -f title=test --jq .html_url", A, [A], False),
+        ("gh api /repos/example/one/pulls --jq '.[].html_url'", A + "\n" + B, [A, B], False),
+        ("gh api /repos/example/one/pulls/99 -X PATCH --jq .html_url", A, [A], False),
         (
             "gh api --input /repos/example/one/pulls -X POST "
             "/repos/example/one/issues --jq .html_url",
             A,
-            [],
+            [A],
             False,
         ),
         (
@@ -660,8 +716,9 @@ def test_rest_url_projection(command: str, result: object, urls: list[str], crea
         assert was_created is created
 
 
-@pytest.mark.parametrize("quote,urls", [('"', [A]), ("'", [])])
-def test_shell_continuation_respects_quoting(quote: str, urls: list[str]) -> None:
+@pytest.mark.parametrize("quote,created", [('"', True), ("'", False)])
+def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
     command = f"gh api {quote}/repos/example/one/pul\\\nls{quote} -X POST --jq .html_url"
-    refs, _ = extract_prs("Bash", {"command": command}, A)
-    assert [pr.url for pr in refs] == urls
+    refs, was_created = extract_prs("Bash", {"command": command}, A)
+    assert [pr.url for pr in refs] == [A]
+    assert was_created is created

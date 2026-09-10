@@ -39,7 +39,7 @@ async def test_native_session_tracks_prs_across_repositories(
         "import json, sys\n"
         "args = sys.argv[1:]\n"
         "if args[0] not in {'pr', 'api'}: sys.exit(0)\n"
-        "repo = (args[1].strip('/').removeprefix('repos/').removesuffix('/pulls')\n"
+        "repo = ('/'.join(args[1].strip('/').split('/')[1:3])\n"
         "        if args[0] == 'api' else "
         "args[args.index('-R') + 1].removeprefix('github.com/'))\n"
         "url = f'https://github.com/{repo}/pull/42'\n"
@@ -81,6 +81,13 @@ async def test_native_session_tracks_prs_across_repositories(
         )
         rest_output = subprocess.check_output(
             ["/bin/sh", "-c", rest_command], text=True, cwd=workspace
+        )
+        mixed_command = (
+            "gh api /repos/example/five/issues/42/comments -f body=fixture; "
+            "gh pr view 42 -R example/one --json url"
+        )
+        mixed_output = subprocess.check_output(
+            ["/bin/sh", "-c", mixed_command], text=True, cwd=workspace
         )
         payloads = [
             {
@@ -129,6 +136,11 @@ async def test_native_session_tracks_prs_across_repositories(
                     }
                 ),
             },
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": mixed_command},
+                "tool_response": {"stdout": mixed_output, "exit_code": 0},
+            },
         ]
         for index, payload in enumerate(payloads):
             payload.update(
@@ -147,6 +159,29 @@ async def test_native_session_tracks_prs_across_repositories(
                 )
                 assert completed.returncode == 0, completed.stderr
                 assert completed.stdout == ""
+        registry = SessionPrRegistry("conv_owned")
+        entries = registry.list()
+        assert len(entries) == 5
+        assert {entry.repository: entry.relationship for entry in entries} == {
+            "example/one": "created",
+            "example/two": "created",
+            "example/three": "created",
+            "example/four": "created",
+            "example/five": "worked_on",
+        }
+        registry.remove("https://github.com/example/five/pull/42")
+        # A new observation, as well as hook replay, must respect explicit unlinking.
+        for call_id in (payloads[-1]["tool_use_id"], "new-comment"):
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                command,
+                input=json.dumps({**payloads[-1], "tool_use_id": call_id}),
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            assert completed.returncode == 0, completed.stderr
+            assert completed.stdout == ""
         info = json.loads((bridge_dir / "tool_relay.json").read_text())
         async with httpx.AsyncClient() as client:
             denied = await client.post(info["url"] + "/hook/observe-tool", json=payloads[0])
