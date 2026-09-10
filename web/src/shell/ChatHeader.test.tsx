@@ -184,6 +184,7 @@ describe("ChatHeader — pending session presentation", () => {
       pending: true,
     });
 
+    expect(screen.getByRole("button", { name: "Add to project" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Agent tools and policies" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Chat view" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Terminal view" })).toBeDisabled();

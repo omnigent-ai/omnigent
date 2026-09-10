@@ -2,6 +2,7 @@ import {
   BotIcon,
   EllipsisVerticalIcon,
   FileIcon,
+  FolderPlusIcon,
   GitCompareIcon,
   GitForkIcon,
   InfoIcon,
@@ -496,7 +497,22 @@ export function ChatHeader({
   // the title keeps its back-to-parent role. `null` falls back to the static
   // folder icon in the breadcrumb.
   const projectTag =
-    !pending && !isMobile && actionConversation && !isChildSession ? (
+    pending && !isMobile && !projectName ? (
+      <div className="hidden min-w-0 shrink-0 items-center gap-1.5 text-ui md:flex">
+        <button
+          type="button"
+          aria-label="Add to project"
+          title={PENDING_ACTION_TITLE}
+          disabled
+          className="breadcrumb-folder flex shrink-0 items-center text-muted-foreground opacity-30"
+        >
+          <FolderPlusIcon className="size-4" />
+        </button>
+        <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">
+          /
+        </span>
+      </div>
+    ) : !pending && !isMobile && actionConversation && !isChildSession ? (
       <HeaderProjectTag
         conversationId={actionConversation.id}
         projectName={projectName}

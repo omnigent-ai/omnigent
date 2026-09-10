@@ -734,6 +734,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             ).to_be_visible()
             header = page.locator("header.chat-header")
             for action_name in (
+                "Add to project",
                 "Agent tools and policies",
                 "Chat view",
                 "Terminal view",
