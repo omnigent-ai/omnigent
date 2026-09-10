@@ -23,7 +23,7 @@
  * accidentally caching secrets in a list endpoint.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -439,18 +439,38 @@ export function MembersPage() {
  */
 function CopyableValue({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
   const onCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(value);
+    let success = false;
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        success = true;
+      } catch {
+        // Fall through to execCommand path.
+      }
+    }
+    if (!success && inputRef.current) {
+      // execCommand must run while focus is on an element inside the dialog —
+      // appending a temporary node to document.body fails because Radix
+      // Dialog's focus trap prevents it from receiving focus.
+      inputRef.current.focus();
+      inputRef.current.select();
+      try {
+        success = document.execCommand("copy");
+      } catch {
+        // Input text is selected; user can copy manually.
+      }
+    }
+    if (success) {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // No clipboard permission — the input is still selectable.
     }
   };
   return (
     <div className="flex items-center gap-2">
       <Input
+        ref={inputRef}
         value={value}
         readOnly
         className="font-mono text-sm"
