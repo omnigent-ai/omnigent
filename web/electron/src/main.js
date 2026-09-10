@@ -66,6 +66,7 @@ const arca = require("./arca");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
+const { ensureDatabricksSession, databricksOAuthConfigured } = require("./databricks-session");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
   SETTINGS_PATH,
@@ -559,7 +560,21 @@ function registerSessionExpiryAccess() {
       const last = lastExpiryReloadAt.get(win) ?? 0;
       if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
       lastExpiryReloadAt.set(win, now);
-      win.webContents.reload();
+      // For a Databricks workspace, silently refresh the OAuth token and re-mint
+      // the DBAUTH cookie before reloading (interactive:false — never pops a
+      // browser here). If there's nothing to refresh, the reload still triggers
+      // the ordinary SSO re-challenge.
+      if (databricksOAuthConfigured() && isDatabricksManagedServerUrl(origin)) {
+        void ensureDatabricksSession(session.defaultSession, origin, { interactive: false })
+          .catch((err) =>
+            console.warn("[omnigent] databricks session refresh on expiry failed:", err.message),
+          )
+          .finally(() => {
+            if (!win.isDestroyed()) win.webContents.reload();
+          });
+      } else {
+        win.webContents.reload();
+      }
     }
   });
 }
@@ -2535,6 +2550,21 @@ function registerIpc() {
       void fetchServerManifest(target).then((manifest) => {
         if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
       });
+      // Databricks-managed workspace: authenticate in the system browser and
+      // pre-seed the DBAUTH cookie before the SPA loads, so the window never
+      // runs the (now locked-down) login page itself. Best-effort — on any
+      // failure fall through to a plain load and let the SSO gate handle it.
+      if (databricksOAuthConfigured() && isDatabricksManagedServerUrl(target)) {
+        console.log(`[omnigent] databricks pre-auth: signing in to ${new URL(target).origin} before load`);
+        try {
+          await ensureDatabricksSession(session.defaultSession, new URL(target).origin);
+        } catch (err) {
+          console.warn(
+            "[omnigent] databricks pre-auth failed; loading without a pre-seeded session:",
+            err.message,
+          );
+        }
+      }
       win
         .loadURL(target)
         .then(() => {
