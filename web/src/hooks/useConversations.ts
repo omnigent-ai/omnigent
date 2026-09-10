@@ -28,6 +28,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
+  insertNewRowsIntoPages,
   markRecentlyCreated,
   mergeItemsIntoPages,
   overlayArchivedIntoCaches,
@@ -1308,10 +1309,28 @@ export async function undoArchiveConversations(
   // Un-hide any rows still in the list cache (flag flip). Rows a refetch already
   // evicted aren't here to flip — the keep-alive below covers those.
   await paintConversationsArchived(queryClient, ids, false);
-  for (const conv of conversations) markRecentlyCreated({ ...conv, archived: false });
-  // Refetch the sidebar list so `withRecentlyCreated` re-injects the kept-alive
-  // rows into page 0 at once, instead of waiting for the periodic reconcile.
-  // The keep-alive holds them there until the search index reflects the
+  const restored = conversations.map((conv) => ({ ...conv, archived: false }));
+  for (const conv of restored) markRecentlyCreated(conv);
+  // Optimistically write the evicted rows straight back into the cached lists
+  // so Undo's result is visible on the next frame — the flag flip above only
+  // covers rows a refetch hasn't evicted yet, and waiting on the refetch below
+  // leaves a visible gap where the user wonders whether Undo worked. Same
+  // filter-aware insertion the WS `session_added` path uses, so search lists
+  // and non-member variants are untouched.
+  const candidates = new Map(restored.map((conv) => [conv.id, conv]));
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    if (!data) continue;
+    const { data: next } = insertNewRowsIntoPages(
+      data,
+      candidates,
+      filtersFromConversationQueryKey(key),
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  // Refetch the sidebar list to reconcile with the server. The keep-alive
+  // armed above holds the rows in page 0 until the search index reflects the
   // unarchive, so a lagging refetch can't drop them.
   void queryClient.invalidateQueries({ queryKey: ["conversations"] });
   try {

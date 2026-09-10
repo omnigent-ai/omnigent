@@ -53,7 +53,7 @@ function ArchiveUndoToast({ count }: { count: number }) {
           type="button"
           data-testid="archive-undo-button"
           onClick={runUndo}
-          className="font-bold underline underline-offset-2 hover:text-primary"
+          className="cursor-pointer font-bold underline underline-offset-2 hover:text-primary"
         >
           Undo
         </button>
