@@ -23,6 +23,8 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "host-tok")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    # Route per-session jcode runtime dirs under tmp_path (not the real /tmp).
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(tmp_path))
 
 
 def _write_profile_and_sidecar(tmp_path: Path) -> None:
@@ -114,14 +116,35 @@ class TestConnectJcodeGatewayEnv:
             Mock(return_value=("https://ws.example", "fresh-bearer-token")),
         )
 
-        result = jd.connect_jcode_gateway_env()
+        result = jd.connect_jcode_gateway_env(session_id="sess-abc")
         assert result is not None
         assert result["JCODE_DBX_TOKEN"] == "fresh-bearer-token"
         assert "JCODE_RUNTIME_DIR" in result
-        # Runtime dir exists and has the prefix in its name.
+        # Runtime dir exists, sits under the harness tmp parent, and is keyed by session.
         runtime_dir = result["JCODE_RUNTIME_DIR"]
         assert Path(runtime_dir).exists()
-        assert "omnigent-jcode-run-" in runtime_dir
+        assert str(tmp_path) in runtime_dir
+        assert runtime_dir.endswith("omnigent-jcode-run/sess-abc")
+
+    def test_same_session_reuses_dir_new_session_differs_and_always_mints(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A session reuses one runtime dir across spawns (no per-turn leak); a
+        different session gets its own dir; and the bearer is minted on every call
+        (so a re-spawn after the jcode daemon idle-exits re-authenticates)."""
+        _write_profile_and_sidecar(tmp_path)
+        fetch = Mock(return_value=("https://ws.example", "bearer"))
+        monkeypatch.setattr("omnigent.host.jcode_databricks.fetch_broker_bearer", fetch)
+
+        a1 = jd.connect_jcode_gateway_env(session_id="A")
+        a2 = jd.connect_jcode_gateway_env(session_id="A")
+        b1 = jd.connect_jcode_gateway_env(session_id="B")
+        assert a1 is not None and a2 is not None and b1 is not None
+        # Same session → same dir (idempotent, no accumulation); different session differs.
+        assert a1["JCODE_RUNTIME_DIR"] == a2["JCODE_RUNTIME_DIR"]
+        assert b1["JCODE_RUNTIME_DIR"] != a1["JCODE_RUNTIME_DIR"]
+        # The broker is called on every spawn — refresh stays correct for re-spawns.
+        assert fetch.call_count == 3
 
     def test_runtime_dir_has_0700_permissions(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -173,13 +196,13 @@ class TestConnectJcodeGatewayEnv:
             "omnigent.host.jcode_databricks.fetch_broker_bearer",
             Mock(return_value=("https://ws.example", "bearer")),
         )
-        # Monkeypatch tempfile.mkdtemp to raise an error.
+        # Monkeypatch os.makedirs (used by _session_runtime_dir) to raise.
         monkeypatch.setattr(
-            "omnigent.host.jcode_databricks.tempfile.mkdtemp",
+            "omnigent.host.jcode_databricks.os.makedirs",
             Mock(side_effect=OSError("permission denied")),
         )
 
-        result = jd.connect_jcode_gateway_env()
+        result = jd.connect_jcode_gateway_env(session_id="sess-x")
         assert result is None
 
     def test_returns_none_on_workspace_mismatch(
@@ -203,45 +226,57 @@ class TestConfigureJcodeForSandbox:
     def test_noop_without_managed_connect_signals(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Returns immediately when no managed-connect sidecar/profile is present."""
+        """No sidecar/profile → the gate fails before building or running anything."""
         # No sidecar written, so the gate is not satisfied.
+        build_spy = Mock()
+        monkeypatch.setattr(
+            "omnigent.host.jcode_databricks.build_jcode_configure_command", build_spy
+        )
         jd.configure_jcode_for_sandbox()
-        # The function should return without spawning anything.
-        # Since it's async/threaded, just verify no exception is raised.
+        build_spy.assert_not_called()
 
     def test_noop_when_jcode_not_found(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Returns immediately when jcode binary is not on PATH."""
+        """jcode binary absent → no configure command is built or run."""
         _write_profile_and_sidecar(tmp_path)
         monkeypatch.setattr("omnigent.host.jcode_databricks.shutil.which", Mock(return_value=None))
+        build_spy = Mock()
+        monkeypatch.setattr(
+            "omnigent.host.jcode_databricks.build_jcode_configure_command", build_spy
+        )
 
         jd.configure_jcode_for_sandbox()
-        # Should no-op gracefully; no exception raised.
+        build_spy.assert_not_called()
 
     def test_spawns_configure_thread_when_ready(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Spawns a daemon thread to run the configure command when all gates are satisfied."""
-        _write_profile_and_sidecar(tmp_path)
-
-        # Mock shutil.which and subprocess.run.
+        """With all gates satisfied, the configure command is built for the connected
+        workspace's openai gateway (resolved synchronously, before the daemon thread)."""
+        _write_profile_and_sidecar(tmp_path)  # workspace https://ws.example
         monkeypatch.setattr(
             "omnigent.host.jcode_databricks.shutil.which",
             Mock(return_value="/usr/bin/jcode"),
         )
-        subprocess_mock = Mock()
-        subprocess_mock.return_value.returncode = 0
+        original_build = jd.build_jcode_configure_command
+
+        def capture_build(*args, **kwargs):
+            capture_build.argv = original_build(*args, **kwargs)
+            return capture_build.argv
+
+        monkeypatch.setattr(
+            "omnigent.host.jcode_databricks.build_jcode_configure_command", capture_build
+        )
         monkeypatch.setattr(
             "omnigent.host.jcode_databricks.subprocess.run",
-            subprocess_mock,
+            Mock(return_value=Mock(return_value=Mock(returncode=0))),
         )
 
         jd.configure_jcode_for_sandbox()
 
-        # The configure command should have been invoked in a thread.
-        # We can't easily wait for the thread here, but the test will pass
-        # if no exception is raised.
+        assert "provider" in capture_build.argv and "add" in capture_build.argv
+        assert "https://ws.example/ai-gateway/openai/v1" in capture_build.argv
 
     def test_uses_env_override_for_model(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -265,7 +300,9 @@ class TestConfigureJcodeForSandbox:
         monkeypatch.setattr(
             "omnigent.host.jcode_databricks.build_jcode_configure_command", capture_build
         )
-        monkeypatch.setattr("omnigent.host.jcode_databricks.subprocess.run", Mock(returncode=0))
+        monkeypatch.setattr(
+            "omnigent.host.jcode_databricks.subprocess.run", Mock(return_value=Mock(returncode=0))
+        )
 
         jd.configure_jcode_for_sandbox()
 
@@ -294,7 +331,9 @@ class TestConfigureJcodeForSandbox:
         monkeypatch.setattr(
             "omnigent.host.jcode_databricks.build_jcode_configure_command", capture_build
         )
-        monkeypatch.setattr("omnigent.host.jcode_databricks.subprocess.run", Mock(returncode=0))
+        monkeypatch.setattr(
+            "omnigent.host.jcode_databricks.subprocess.run", Mock(return_value=Mock(returncode=0))
+        )
 
         jd.configure_jcode_for_sandbox()
 

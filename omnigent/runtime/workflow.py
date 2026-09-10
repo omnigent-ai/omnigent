@@ -1529,6 +1529,7 @@ def _build_acp_cli_spawn_env(
     harness: str,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
 
@@ -1592,7 +1593,7 @@ def _build_acp_cli_spawn_env(
             connect_jcode_gateway_env,
         )
 
-        gateway_env = connect_jcode_gateway_env()
+        gateway_env = connect_jcode_gateway_env(session_id=session_id)
         if gateway_env is not None:
             env.update(gateway_env)
             # Extend HARNESS_ACP_ENV_PASSTHROUGH to include the bearer and runtime dir names.

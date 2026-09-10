@@ -52,6 +52,31 @@ _JCODE_DATABRICKS_DEFAULT_MODEL = "system.ai.claude-sonnet-4-6"
 # Environment variable for model override (mirrors claude-native and opencode).
 _JCODE_DATABRICKS_GATEWAY_MODEL_ENV = "OMNIGENT_DATABRICKS_GATEWAY_MODEL"
 
+# Base dir under which each session gets its own jcode daemon runtime dir. A unique
+# JCODE_RUNTIME_DIR per session gives that session its own jcode daemon (which reads
+# the fresh bearer at spawn). Keying it by session id — rather than a fresh mkdtemp
+# per call — keeps the builder idempotent across the many times it runs per session,
+# so run dirs don't accumulate one-per-message on a long-lived connect pod.
+_JCODE_RUN_DIR_BASE = "omnigent-jcode-run"
+
+
+def _session_runtime_dir(session_id: str | None) -> str:
+    """Return this session's jcode runtime dir, created 0700 and idempotently.
+
+    Rooted under ``OMNIGENT_HARNESS_TMP_PARENT`` when set (the harness tmp parent),
+    else the OS temp dir, and keyed by *session_id* so repeated spawns within one
+    session reuse a single dir (its own daemon) instead of leaking a new dir per
+    turn. A missing session id falls back to a per-process key.
+    """
+    base = os.environ.get("OMNIGENT_HARNESS_TMP_PARENT") or tempfile.gettempdir()
+    key = "".join(c for c in (session_id or "") if c.isalnum() or c in "-_")
+    if not key:
+        key = f"proc-{os.getpid()}"
+    path = os.path.join(base, _JCODE_RUN_DIR_BASE, key)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)  # enforce 0700 even if the dir pre-existed or umask trimmed it
+    return path
+
 
 def build_jcode_configure_command(
     jcode_command: list[str],
@@ -160,28 +185,34 @@ def configure_jcode_for_sandbox() -> None:
     threading.Thread(target=_run, name="jcode-configure", daemon=True).start()
 
 
-def connect_jcode_gateway_env() -> dict[str, str] | None:
-    """Mint a fresh Databricks bearer and runtime dir for a jcode spawn.
+def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str] | None:
+    """Mint a fresh Databricks bearer + this session's runtime dir for a jcode spawn.
 
-    Called at spawn time (not host boot) to inject per-session jcode gateway
-    configuration. Reads the managed-connect sidecar; if present and valid, fetches
-    a fresh bearer via the broker and returns the two env vars jcode needs
-    (``JCODE_DBX_TOKEN``, ``JCODE_RUNTIME_DIR``).
+    Called while building the jcode spawn env. Reads the managed-connect sidecar;
+    if present and valid, fetches a **fresh** bearer via the broker and returns the
+    two env vars jcode needs (``JCODE_DBX_TOKEN``, ``JCODE_RUNTIME_DIR``).
 
-    The runtime dir is created with 0700 permissions to isolate the session's daemon
-    and config; it's temporary and cleaned up when the runner exits.
+    **Refresh:** the bearer is minted on every call. The spawn-env builder runs per
+    message, and the harness process manager only applies the env when it actually
+    (re)spawns the jcode subprocess — but a jcode daemon idle-exits after a few
+    minutes, so a later turn can re-spawn it, and minting every time guarantees that
+    re-spawn re-authenticates with a current token rather than a stale one. (On a
+    turn that reuses a live daemon the mint is unused; that is a small per-turn broker
+    call, the tradeoff for keeping re-spawns fresh without a jcode-side token command.)
 
-    Returns ``None`` when:
-    - The sidecar is absent (not a managed-connect host), or
-    - The broker is unreachable or declines, or
-    - Any error occurs reading the sidecar.
+    **Runtime dir:** keyed by *session_id* (see :func:`_session_runtime_dir`) and
+    created idempotently, so the session reuses one dir (its own daemon) across turns
+    rather than leaking a new dir per message. It is reclaimed when the ephemeral
+    managed-connect pod is torn down.
 
-    Best-effort: a ``None`` return makes the spawn a complete no-op (jcode uses its
-    existing config), so non-connect launches are untouched. Errors are logged but
-    never raised.
+    Returns ``None`` (a complete no-op — jcode keeps its ambient config) when the
+    sidecar is absent (not a managed-connect host), the broker is unreachable or
+    declines, or the broker's workspace no longer matches the sidecar pin. Best-effort:
+    errors are logged, never raised.
 
-    :returns: A dict with keys ``JCODE_DBX_TOKEN`` and ``JCODE_RUNTIME_DIR``, or
-        ``None`` when the managed-connect gate is not satisfied.
+    :param session_id: The session/conversation id, used to scope the runtime dir.
+    :returns: ``{JCODE_DBX_TOKEN, JCODE_RUNTIME_DIR}``, or ``None`` off the managed
+        connect path.
     """
     coords = _read_sidecar(_sidecar_path())
     if coords is None:
@@ -205,10 +236,8 @@ def connect_jcode_gateway_env() -> dict[str, str] | None:
     if workspace_host.rstrip("/") != coords["workspace_host"].rstrip("/"):
         return None
 
-    # Create a unique runtime dir for this spawn (0700 isolation).
     try:
-        runtime_dir = tempfile.mkdtemp(prefix="omnigent-jcode-run-")
-        os.chmod(runtime_dir, 0o700)
+        runtime_dir = _session_runtime_dir(session_id)
     except OSError as exc:
         _logger.warning("jcode: could not create runtime dir: %r", exc)
         return None

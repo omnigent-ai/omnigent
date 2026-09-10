@@ -118,9 +118,9 @@ def test_jcode_connect_injects_gateway_env_and_passthrough(
     since the ACP wrap forwards only passthrough-named vars to the jcode subprocess."""
     monkeypatch.setattr(
         "omnigent.host.jcode_databricks.connect_jcode_gateway_env",
-        lambda: {"JCODE_DBX_TOKEN": "fresh-bearer", "JCODE_RUNTIME_DIR": "/tmp/jc-run-xyz"},
+        lambda **_kw: {"JCODE_DBX_TOKEN": "fresh-bearer", "JCODE_RUNTIME_DIR": "/tmp/jc-run-xyz"},
     )
-    env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode")
+    env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
     assert env["JCODE_DBX_TOKEN"] == "fresh-bearer"
     assert env["JCODE_RUNTIME_DIR"] == "/tmp/jc-run-xyz"
     names = set(env["HARNESS_ACP_ENV_PASSTHROUGH"].split(","))
@@ -132,9 +132,9 @@ def test_jcode_no_connect_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     spawn env carries no JCODE_* vars and no passthrough — laptop/non-connect untouched."""
     monkeypatch.setattr(
         "omnigent.host.jcode_databricks.connect_jcode_gateway_env",
-        lambda: None,
+        lambda **_kw: None,
     )
-    env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode")
+    env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
     assert "JCODE_DBX_TOKEN" not in env
     assert "JCODE_RUNTIME_DIR" not in env
     assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
