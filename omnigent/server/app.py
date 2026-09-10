@@ -2290,6 +2290,7 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            docloop_notebook_enabled=app.state.feature_flags.enabled(Feature.DOCLOOP_NOTEBOOK),
         ),
         prefix="/v1",
         tags=["sessions"],

@@ -2276,6 +2276,7 @@ def create_runner_app(
     mcp_manager: RunnerMcpManager | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    docloop_notebook_enabled: bool | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -2315,6 +2316,15 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+
+    from omnigent.server.feature_flags import Feature, resolve_feature_flags
+
+    if docloop_notebook_enabled is None:
+        docloop_notebook_enabled = resolve_feature_flags().enabled(Feature.DOCLOOP_NOTEBOOK)
+    if docloop_notebook_enabled:
+        from omnigent.runner.docloop import runner_notebook_router
+
+        app.include_router(runner_notebook_router(process_manager))
 
     from omnigent.runtime import telemetry
 

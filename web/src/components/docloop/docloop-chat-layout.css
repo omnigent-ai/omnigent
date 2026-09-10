@@ -1,0 +1,95 @@
+.docloop-chat-container {
+  container: docloop / inline-size;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+  padding-top: 48px;
+}
+@media (max-width: 767px) {
+  .docloop-chat-container {
+    padding-top: 56px;
+  }
+}
+.docloop-chat-layout {
+  display: grid;
+  grid-template: "views" auto "chat" minmax(0, 1fr) / minmax(0, 1fr);
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  box-sizing: border-box;
+  background: var(--background);
+  color: var(--foreground);
+}
+.docloop-chat-layout.docloop-open {
+  grid-template: "views views" auto "chat notebook" minmax(0, 1fr) / minmax(0, 1.2fr) minmax(
+      300px,
+      1fr
+    );
+}
+.docloop-native-chat {
+  grid-area: chat;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.docloop-pane-toggle {
+  grid-area: views;
+  display: flex;
+  gap: 4px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border, #8884);
+  background: var(--card, transparent);
+}
+.docloop-pane-toggle button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--muted-foreground, #666);
+  background: transparent;
+  cursor: pointer;
+}
+.docloop-pane-toggle button[aria-pressed="true"] {
+  color: var(--foreground);
+  background: var(--accent, #8882);
+  border-color: var(--border, #8884);
+}
+.docloop-pane-toggle button:focus-visible {
+  outline: 2px solid var(--ring, #6c7ad7);
+  outline-offset: 2px;
+}
+.docloop-pane-toggle button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+#docloop-notebook-pane {
+  grid-area: notebook;
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--border, #8884);
+  overflow: hidden;
+}
+#docloop-notebook-pane[hidden] {
+  display: none;
+}
+@container docloop (max-width: 760px) {
+  .docloop-chat-layout.docloop-open {
+    grid-template: "views" auto "notebook" minmax(0, 1fr) / minmax(0, 1fr);
+  }
+  .docloop-open .docloop-native-chat {
+    display: none;
+  }
+  #docloop-notebook-pane {
+    border-left: 0;
+  }
+}

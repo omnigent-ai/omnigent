@@ -795,6 +795,7 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    docloop_notebook_enabled: bool = False,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -866,6 +867,19 @@ def create_sessions_router(
         ``/sessions`` endpoints.
     """
     router = APIRouter()
+
+    if docloop_notebook_enabled:
+        from omnigent.docloop_gateway import register_docloop_forwarding
+        from omnigent.runner.docloop import AssignedRunnerNotebookTransport
+
+        register_docloop_forwarding(
+            router,
+            enabled=True,
+            transport=AssignedRunnerNotebookTransport(runner_router),
+            conversation_store=conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
 
     from omnigent.server.routes.sessions.routes_agent import register_agent_routes
     from omnigent.server.routes.sessions.routes_browser import register_browser_routes

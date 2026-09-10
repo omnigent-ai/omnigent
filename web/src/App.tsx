@@ -6,6 +6,7 @@ import { useOmnigentPageView } from "@/lib/analytics";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { DocloopChatLayout } from "@/components/docloop/DocloopChatLayout";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
 // beside the component, keeps the route table clean and means no route ships
@@ -26,7 +27,15 @@ function withPageView<P extends object>(id: string, Component: ComponentType<P>)
 // so a non-accounts (header / OIDC) deploy doesn't ship them in the main chunk —
 // their routes aren't registered there, so the chunk never downloads. (Members /
 // Policies are lazy inside SettingsPage now that they're settings sub-categories.)
-const ChatPage = withPageView("chat", ChatPageImpl);
+function ChatWithNotebook() {
+  return (
+    <DocloopChatLayout>
+      <ChatPageImpl />
+    </DocloopChatLayout>
+  );
+}
+
+const ChatPage = withPageView("chat", ChatWithNotebook);
 const NotFoundPage = withPageView("not_found", NotFoundPageImpl);
 const LoginPage = withPageView(
   "login",
