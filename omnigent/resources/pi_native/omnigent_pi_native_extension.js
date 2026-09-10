@@ -972,6 +972,30 @@ async function postModelChangeError(config, message) {
   });
 }
 
+function writeModelChangeAck(config, ackId, ok, error) {
+  if (!config || !config.bridgeDir || typeof ackId !== "string" || !ackId) return;
+  const ackDir = path.join(config.bridgeDir, "acks");
+  const ackPath = path.join(ackDir, `${ackId}.json`);
+  const tmpPath = `${ackPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.mkdirSync(ackDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      tmpPath,
+      JSON.stringify({
+        id: ackId,
+        ok: ok === true,
+        ...(typeof error === "string" && error ? { error } : {}),
+      }),
+      "utf8",
+    );
+    fs.renameSync(tmpPath, ackPath);
+  } catch (_err) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch (_cleanupErr) {}
+  }
+}
+
 function modelReference(model) {
   const modelId = model && typeof model.id === "string" ? model.id : "";
   if (!modelId) return "";
@@ -1162,9 +1186,26 @@ function startInboxPoller(
         // handleModelChange owns its visible-error item and posts nothing on
         // success — the paired model_select handler mirrors the applied model
         // back — so the returned promise is intentionally discarded.
-        handleModelChange(
-          typeof payload.model === "string" ? payload.model : undefined,
-        );
+        Promise.resolve(
+          handleModelChange(
+            typeof payload.model === "string" ? payload.model : undefined,
+          ),
+        )
+          .then((ok) => {
+            if (typeof payload.ack_id === "string") {
+              writeModelChangeAck(config, payload.ack_id, ok === true);
+            }
+          })
+          .catch((err) => {
+            if (typeof payload.ack_id === "string") {
+              writeModelChangeAck(
+                config,
+                payload.ack_id,
+                false,
+                err && err.message ? String(err.message) : "model change failed",
+              );
+            }
+          });
       }
       if (payload.type === "thinking_level_change") {
         // Point-in-time: one delivery attempt, then always consume the file.

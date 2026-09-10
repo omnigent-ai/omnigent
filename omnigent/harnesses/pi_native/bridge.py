@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import itertools
@@ -31,6 +32,7 @@ _CONFIG_FILE = "config.json"
 _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
 _INBOX_DIR = "inbox"
+_ACK_DIR = "acks"
 _SESSIONS_DIR = "sessions"
 
 
@@ -61,6 +63,7 @@ def prepare_bridge_dir(session_id: str) -> Path:
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(bridge_dir, 0o700)
     (bridge_dir / _INBOX_DIR).mkdir(mode=0o700, exist_ok=True)
+    (bridge_dir / _ACK_DIR).mkdir(mode=0o700, exist_ok=True)
     (bridge_dir / _SESSIONS_DIR).mkdir(mode=0o700, exist_ok=True)
     # Owner-pid marker for the periodic dead-owner prune; refreshed every
     # turn so it always names the current runner. See native_bridge_common.
@@ -237,7 +240,12 @@ def enqueue_thinking_level_change(bridge_dir: Path, level: str) -> str:
     return change_id
 
 
-def enqueue_model_change(bridge_dir: Path, model: str) -> str:
+def enqueue_model_change(
+    bridge_dir: Path,
+    model: str,
+    *,
+    wait_for_ack: bool = False,
+) -> str:
     """
     Queue a UI-originated model switch for the resident Pi extension.
 
@@ -251,6 +259,9 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     :param bridge_dir: Native Pi bridge directory.
     :param model: Model id to switch to, e.g.
         ``"databricks-claude-sonnet-4-6"``.
+    :param wait_for_ack: Ask the resident extension to write an acknowledgement
+        after Pi has accepted or rejected the model. Used during startup replay;
+        ordinary mid-session changes remain fire-and-forget.
     :returns: Opaque model-change id.
     """
     model_change_id = f"model_change_{uuid.uuid4().hex}"
@@ -260,8 +271,42 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
         "model": model,
         "created_at": time.time(),
     }
+    if wait_for_ack:
+        payload["ack_id"] = model_change_id
     _enqueue_payload(bridge_dir, model_change_id, payload)
     return model_change_id
+
+
+async def wait_for_model_change_ack(
+    bridge_dir: Path,
+    change_id: str,
+    *,
+    timeout: float = 15.0,
+) -> bool:
+    """Wait for Pi to accept or reject an acknowledged model change.
+
+    The extension writes the acknowledgement only after ``setModel`` resolves,
+    so a successful return proves the new Pi process actually applied the
+    persisted web selection rather than merely consuming the inbox file.
+
+    :returns: ``True`` when Pi accepted the model; ``False`` on rejection,
+        timeout, malformed acknowledgement, or bridge I/O failure.
+    """
+    ack_path = bridge_dir / _ACK_DIR / f"{change_id}.json"
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            payload = json.loads(await asyncio.to_thread(ack_path.read_text, encoding="utf-8"))
+            if isinstance(payload, dict) and payload.get("id") == change_id:
+                with contextlib.suppress(FileNotFoundError):
+                    ack_path.unlink()
+                return payload.get("ok") is True
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            return False
+        await asyncio.sleep(0.1)
+    return False
 
 
 def _enqueue_payload(bridge_dir: Path, item_id: str, payload: _JsonObject) -> None:
