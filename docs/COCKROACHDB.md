@@ -34,7 +34,11 @@ actionable error instead of silently running v23.2 transactions as
 
 The engine uses `READ COMMITTED`. Omnigent preserves explicit row locks and
 can replay database-only transaction callbacks after SQLSTATE `40001` errors.
-It never retries constraint failures or external side effects.
+It never retries constraint failures or external side effects. Operations
+that span the conversation database and the Omnigent metadata database run as
+two independent transactions (as on every backend), so each database stays
+internally consistent but a retry exhaustion between the two phases can leave
+the first commit in place without the second.
 
 An empty CRDB database is required for the first startup. Omnigent creates the
 current schema directly and stamps the current Alembic revision. It does not
