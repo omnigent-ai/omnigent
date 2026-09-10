@@ -2542,3 +2542,23 @@ def test_is_connection_error_mcp_real_invalid_request_not_connection() -> None:
         )
     )
     assert _is_connection_error(exc) is False
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_managed_mcp_records_pr_before_result_formatting(
+    tmp_path, monkeypatch, failed
+) -> None:
+    from omnigent.runner.session_prs import SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    url = "https://github.com/example/managed/pull/42"
+    response = CallToolResult.model_validate(
+        {"content": [{"type": "text", "text": json.dumps({"html_url": url})}], "isError": failed}
+    )
+    with _mock_mcp_transport() as session:
+        session.call_tool.return_value = response
+        connection = McpServerConnection(config=_make_http_config(name="custom-github"))
+        await connection.connect()
+        result = await connection._invoke_tool("create_pull_request", {}, session_id="conv_mcp")
+        assert url in result
+    assert [pr.url for pr in SessionPrRegistry("conv_mcp").list()] == ([] if failed else [url])

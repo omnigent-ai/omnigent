@@ -776,3 +776,17 @@ def test_policy_hook_reauth_returns_none_without_factory(
         "http://127.0.0.1:6767", {"Content-Type": "application/json"}
     )
     assert reauth() is None
+
+
+def test_documented_tool_response_takes_precedence() -> None:
+    result = hook_payload_to_evaluation_request(
+        "PostToolUse",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": "actual result",
+            "tool_output": "legacy",
+        },
+    )
+    assert result is not None
+    assert result["event"]["data"]["result"] == "actual result"

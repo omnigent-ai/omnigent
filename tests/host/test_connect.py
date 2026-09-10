@@ -5929,7 +5929,7 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
 
     seen: dict[str, object] = {}
 
-    def fake_set(root, *, account=None, remote=None):
+    def fake_set(root, *, account=None, remote=None, session_id=None, pr_url=None):
         seen.update({"root": root, "account": account, "remote": remote})
         return {"object": "session.github.info", "ok": True}
 

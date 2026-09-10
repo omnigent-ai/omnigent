@@ -10054,82 +10054,73 @@ def create_runner_app(
             )
         return root
 
-    @app.get("/v1/sessions/{session_id}/resources/github")
-    async def read_github_info(session_id: str) -> JSONResponse:
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import github_info
+    async def _github_call(session_id: str, operation: str, **kwargs: Any) -> JSONResponse:
+        from omnigent.runner import github_resource
 
         root = await _github_workspace_root(session_id)
-        info = await _asyncio.to_thread(github_info, root)
-        return JSONResponse(status_code=200, content=info)
+        function = getattr(github_resource, operation)
+        try:
+            result = await asyncio.to_thread(function, root, session_id=session_id, **kwargs)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github")
+    async def read_github_info(session_id: str, pr_url: str | None = None) -> JSONResponse:
+        return await _github_call(session_id, "github_info", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
-    async def read_github_changes(session_id: str) -> JSONResponse:
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import github_changed_files
-
-        root = await _github_workspace_root(session_id)
-        result = await _asyncio.to_thread(github_changed_files, root)
-        return JSONResponse(status_code=200, content=result)
+    async def read_github_changes(session_id: str, pr_url: str | None = None) -> JSONResponse:
+        return await _github_call(session_id, "github_changed_files", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
-    async def read_github_pr_diff(session_id: str) -> JSONResponse:
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import github_pr_diff
-
-        root = await _github_workspace_root(session_id)
-        result = await _asyncio.to_thread(github_pr_diff, root)
-        return JSONResponse(status_code=200, content=result)
+    async def read_github_pr_diff(session_id: str, pr_url: str | None = None) -> JSONResponse:
+        return await _github_call(session_id, "github_pr_diff", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
         session_id: str,
         relative_path: str,
-        base: str | None = Query(default=None),
+        base: str | None = None,
+        pr_url: str | None = None,
+        previous_path: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import github_file_diff, resolve_base_ref
-
-        # Repo-root-relative paths only; reject traversal even though ``git show``
-        # reads from the object store (not disk) and rejects out-of-tree paths.
         if relative_path.startswith("/") or any(
             seg in ("", "..") for seg in relative_path.split("/")
         ):
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"code": "invalid_path", "message": "Invalid path"}},
-            )
-        root = await _github_workspace_root(session_id)
-        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
-        result = await _asyncio.to_thread(
-            github_file_diff, root, resolved_base or "", relative_path
+            raise HTTPException(status_code=400, detail="Invalid path")
+        return await _github_call(
+            session_id,
+            "github_file_diff",
+            base=base or "",
+            path=relative_path,
+            pr_url=pr_url,
+            previous_path=previous_path,
+            head_sha=head_sha,
+            base_sha=base_sha,
         )
-        return JSONResponse(status_code=200, content=result)
+
+    @app.post("/v1/sessions/{session_id}/resources/github/prs")
+    async def update_github_pr_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id, "update_session_pr", url=body["url"], action=body.get("action", "attach")
+        )
 
     @app.post("/v1/sessions/{session_id}/resources/github/preferences")
-    async def set_github_preference_route(
-        session_id: str,
-        request: Request,
-    ) -> JSONResponse:
-        # Apply the panel's account / remote selection (gh repo set-default +
-        # a per-repo account preference), then return the refreshed info payload.
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import set_github_preference
-
+    async def set_github_preference_route(session_id: str, request: Request) -> JSONResponse:
         body = await request.json()
-        root = await _github_workspace_root(session_id)
-        info = await _asyncio.to_thread(
-            set_github_preference,
-            root,
+        return await _github_call(
+            session_id,
+            "set_github_preference",
             account=body.get("account"),
             remote=body.get("remote"),
+            pr_url=body.get("pr_url"),
         )
-        return JSONResponse(status_code=200, content=info)
 
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"

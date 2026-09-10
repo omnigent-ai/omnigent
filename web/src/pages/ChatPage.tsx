@@ -2221,8 +2221,10 @@ function ComposerStatusLine({
   // cache with the GitHub panel, so opening the tab is instant.
   const github = useGithubInfo(sessionId ?? undefined);
   const openGithubTab = useOpenGithubTab();
-  const prNumber = github.data?.pr?.number ?? null;
-  const showPr = !!conversationId && !isSubAgentSession && prNumber !== null && !!openGithubTab;
+  const prs = github.data?.prs;
+  const prNumber = prs?.[0]?.number ?? github.data?.pr?.number ?? null;
+  const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
+  const showPr = !!conversationId && !isSubAgentSession && prCount > 0 && !!openGithubTab;
 
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
@@ -2273,11 +2275,15 @@ function ComposerStatusLine({
             type="button"
             data-testid="composer-pr-link"
             onClick={() => openGithubTab?.()}
-            title="View this PR in the GitHub tab"
+            title={
+              prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"
+            }
             className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             <GithubMono size={14} aria-hidden />
-            <span className="tabular-nums underline underline-offset-2">#{prNumber}</span>
+            <span className="tabular-nums whitespace-nowrap underline underline-offset-2">
+              {prCount > 1 ? `${prCount} PRs` : `#${prNumber}`}
+            </span>
           </button>
         )}
       </div>

@@ -1691,6 +1691,11 @@ def build_hook_settings(
         # publish live token deltas to the web UI.
         "MessageDisplay": [{"hooks": [message_display_hook]}],
     }
+    from omnigent.native.tool_observer_hook import hook_settings
+
+    hooks["PostToolUse"].append(
+        {"hooks": [hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")]}
+    )
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
@@ -5040,6 +5045,7 @@ def _tool_relay_handler_factory(
                 "/tool",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
+                "/hook/observe-tool",
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -5049,6 +5055,13 @@ def _tool_relay_handler_factory(
             payload = self._read_json_body()
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if self.path == "/hook/observe-tool":
+                from omnigent.runner.pr_observer import observe_hook
+
+                if session_id is not None:
+                    observe_hook(session_id, payload)
+                self._send_json({})
                 return
             if self.path == "/hook/claude/evaluate-policy":
                 self._handle_hook_evaluate(payload)
@@ -5241,6 +5254,8 @@ def _tool_relay_handler_factory(
             try:
                 length = int(length_raw)
             except ValueError:
+                return None
+            if self.path == "/hook/observe-tool" and not 0 <= length <= 1_048_576:
                 return None
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
