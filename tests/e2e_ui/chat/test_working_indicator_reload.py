@@ -868,8 +868,10 @@ _TASK_NOTIFICATION = "\n".join(
         "<tool-use-id>toolu_bdrk_01Xy7Q2PfLm8RkVn3Ws4Tz9A</tool-use-id>",
         "<output-file>/tmp/claude/tasks/b3f9a2c1d.output</output-file>",
         "<status>completed</status>",
-        '<summary>Background command "air run -f cases/latency_launch_hello_world/run.yml" '
-        "completed (exit code 0)</summary>",
+        (
+            '<summary>Background command "air run -f cases/latency_launch_hello_world/run.yml" '
+            + "completed (exit code 0)</summary>"
+        ),
         "</task-notification>",
     ]
 )
