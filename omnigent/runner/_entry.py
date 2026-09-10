@@ -1262,6 +1262,9 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404.
     """
+    import shutil
+    import tempfile
+
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
@@ -1304,9 +1307,19 @@ async def _resolve_agent_spec_from_server(
     # unsupported sub-agent and launch the parent with what this runner
     # *does* support, rather than failing every dispatch of the agent.
     # See omnigent.spec.load.
-    if not dest.exists():
-        dest.mkdir(parents=True)
-        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    if not (dest / "config.yaml").is_file():
+        spec_cache_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=spec_cache_root, prefix=".agent-bundle-") as staging:
+            staging_dir = Path(staging)
+            load(
+                resp.content,
+                dest=staging_dir,
+                expand_env=expand_env,
+                prune_invalid_sub_agents=True,
+            )
+            if dest.exists():
+                shutil.rmtree(dest)
+            staging_dir.rename(dest)
     spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     return ResolvedSpec(spec=spec, workdir=dest)
 

@@ -2391,6 +2391,65 @@ async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cache_state", ["incomplete-directory", "failed-load"])
+async def test_resolve_agent_spec_from_server_recovers_incomplete_cache(
+    tmp_path: Path,
+    cache_state: str,
+) -> None:
+    """A failed bundle load must not turn later valid responses into cache hits."""
+    config_bytes = (
+        b"spec_version: 1\nname: recovered-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundles: dict[str, bytes] = {}
+    for entry_name, content in [("config.yaml", config_bytes), ("partial.txt", b"partial")]:
+        bundle_buffer = io.BytesIO()
+        with tarfile.open(fileobj=bundle_buffer, mode="w:gz") as archive:
+            entry = tarfile.TarInfo(name=entry_name)
+            entry.size = len(content)
+            archive.addfile(entry, io.BytesIO(content))
+        bundles[entry_name] = bundle_buffer.getvalue()
+
+    cache_dir = tmp_path / "ag_recover-v7"
+    if cache_state == "incomplete-directory":
+        cache_dir.mkdir()
+        (cache_dir / "partial.txt").write_text("partial")
+
+    response_contents = [bundles["config.yaml"]]
+    if cache_state == "failed-load":
+        response_contents.insert(0, bundles["partial.txt"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=response_contents.pop(0),
+            headers={"X-Agent-Version": "7"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server.test",
+    ) as client:
+        if cache_state == "failed-load":
+            with pytest.raises(FileNotFoundError, match=r"config\.yaml not found"):
+                await _resolve_agent_spec_from_server(
+                    client, tmp_path, "ag_recover", session_id="conv_test"
+                )
+            assert not cache_dir.exists()
+
+        recovered = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_recover", session_id="conv_test"
+        )
+
+    assert recovered is not None
+    assert recovered.name == "recovered-agent"
+    assert recovered.workdir == cache_dir
+    assert (cache_dir / "config.yaml").read_bytes() == config_bytes
+    assert not (cache_dir / "partial.txt").exists()
+    assert list(tmp_path.iterdir()) == [cache_dir]
+    assert response_contents == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [401, 403, 500, 502])
 async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     tmp_path: Path,
