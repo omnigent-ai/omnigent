@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -164,7 +165,6 @@ async def fs_setup(
     conn = registry.get(_HOST_ID)
     assert conn is not None
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
         """Drain outbound WS frames from the communicator and reply.
@@ -177,14 +177,10 @@ async def fs_setup(
         ``websocket.receive`` event — which the route's receive
         loop turns into a resolved future.
 
-        :returns: None when ``stop_drain`` is set or no events
-            arrive within the per-iteration timeout.
+        Runs until fixture teardown cancels the task.
         """
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -238,14 +234,36 @@ async def fs_setup(
     try:
         yield app, registry, comm, replies, drain_task
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
+
+
+async def test_list_filesystem_survives_idle_mock_host(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An idle mock host stays connected until fixture teardown."""
+    app, registry, comm, replies, _drain = fs_setup
+    replies["~"] = {"entries": []}
+    await asyncio.sleep(0.75)
+    assert not comm.future.done()
+    assert registry.get(_HOST_ID) is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem")
+    assert response.status_code == 200, response.text
 
 
 async def test_host_model_options_returns_prelaunch_catalog(
@@ -353,6 +371,60 @@ async def test_host_model_options_reports_probe_error_without_500(
         "routable_models": [],
         "error": "the codex model probe failed — see the host log",
     }
+
+
+async def test_list_filesystem_returns_paginated_entries(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """
+    Verify the endpoint returns the runner-compatible response shape:
+    ``{"object": "list", "data": [...], "has_more": bool}``.
+
+    Without this match, the Web UI's existing
+    ``fetchWorkspaceDirectory`` hook would fail to parse the
+    response (different field names) and the picker would render
+    no entries.
+    """
+    from omnigent.host.frames import HostListDirEntry
+
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["/Users/corey/projects"] = {
+        "entries": [
+            HostListDirEntry(
+                name="src",
+                path="/Users/corey/projects/src",
+                type="directory",
+                bytes=None,
+                modified_at=1779980000,
+            ),
+            HostListDirEntry(
+                name="README.md",
+                path="/Users/corey/projects/README.md",
+                type="file",
+                bytes=42,
+                modified_at=1779980100,
+            ),
+        ],
+        "has_more": False,
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/Users/corey/projects")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["object"] == "list"
+    assert payload["has_more"] is False
+    names = [entry["name"] for entry in payload["data"]]
+    assert names == ["src", "README.md"]
+    # Type field present and correct so the Web UI can pick the
+    # right icon.
+    types = [entry["type"] for entry in payload["data"]]
+    assert types == ["directory", "file"]
 
 
 async def test_list_filesystem_root_forwards_tilde(

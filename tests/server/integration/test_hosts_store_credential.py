@@ -309,6 +309,102 @@ async def test_adopt_forwards_env_var_without_secret(
     assert received[0].secret_value is None
 
 
+async def test_concurrent_writes_to_one_host_are_serialized(
+    cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two overlapping credential writes to one host don't interleave.
+
+    The daemon's write is a non-atomic read-modify-write of config.yaml, so the
+    route serializes writes per host (credential_write_lock). This drives a host
+    that HOLDS its first reply until both requests are in flight, then asserts
+    the second frame only reaches the host after the first completes — i.e. the
+    lock kept them from overlapping.
+    """
+    app, registry, _hs, _cs = cred_app
+    comm = await _connect_mock_host(app, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+
+    arrivals: asyncio.Queue[HostStoreSecretFrame] = asyncio.Queue()
+    second_write_waiting = asyncio.Event()
+    original_acquire = conn.credential_write_lock.acquire
+
+    async def observe_acquire() -> bool:
+        if conn.credential_write_lock.locked():
+            second_write_waiting.set()
+        return await original_acquire()
+
+    monkeypatch.setattr(conn.credential_write_lock, "acquire", observe_acquire)
+
+    async def _drain() -> None:
+        while True:
+            output = await comm.receive_output(timeout=None)
+            if output.get("type") != "websocket.send":
+                continue
+            text = output.get("text")
+            if not isinstance(text, str):
+                continue
+            frame = decode_host_frame(text)
+            if not isinstance(frame, HostStoreSecretFrame):
+                continue
+            arrivals.put_nowait(frame)
+
+    async def reply(frame: HostStoreSecretFrame) -> None:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostStoreSecretResultFrame(
+                        request_id=frame.request_id,
+                        status="ok",
+                        configured_harnesses={frame.harness: True},
+                    )
+                ),
+            }
+        )
+
+    try:
+        async with (
+            AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
+            asyncio.TaskGroup() as tasks,
+        ):
+            drain_task = tasks.create_task(_drain())
+            first = tasks.create_task(
+                client.post(
+                    f"/v1/hosts/{_HOST_ID}/harnesses/codex/credential",
+                    json={"kind": "key", "secret": "sk-1"},
+                )
+            )
+            first_frame = await asyncio.wait_for(arrivals.get(), timeout=5.0)
+            assert first_frame.kind == "key"
+            second = tasks.create_task(
+                client.post(
+                    f"/v1/hosts/{_HOST_ID}/harnesses/codex/credential",
+                    json={"kind": "gateway", "secret": "sk-2", "base_url": "https://gw/v1"},
+                )
+            )
+            await asyncio.wait_for(second_write_waiting.wait(), timeout=5.0)
+            assert not first.done()
+            assert not second.done()
+            assert set(conn.pending_secret_writes) == {first_frame.request_id}
+            assert arrivals.empty()
+            await reply(first_frame)
+            second_frame = await asyncio.wait_for(arrivals.get(), timeout=5.0)
+            assert second_frame.kind == "gateway"
+            await reply(second_frame)
+            first_response, second_response = await asyncio.wait_for(
+                asyncio.gather(first, second), timeout=5.0
+            )
+            assert first_response.status_code == 200
+            assert second_response.status_code == 200
+            assert arrivals.empty()
+            drain_task.cancel()
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=5.0)
+
+
 # ── Validation / gating ─────────────────────────────────
 
 

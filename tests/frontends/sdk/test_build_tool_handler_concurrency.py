@@ -17,6 +17,9 @@ concurrently via ``asyncio.gather`` and asserts that the
 total wall-clock is close to the single-body duration, not
 N-times it. Fast (~sleep duration) and deterministic.
 
+The re-homed D6 parallel fan-out coverage
+(``tests/integration/test_d6_parallel_fan_out_round_trip.py``) exercises
+the sessions-layer fan-out round trip.
 """
 
 from __future__ import annotations

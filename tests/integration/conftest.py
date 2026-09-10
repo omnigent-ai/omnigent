@@ -94,7 +94,7 @@ def _reset_mock_llm_between_tests(
     and ``resolve_queue`` falls back to the ``"default"`` queue on a key
     miss, so a queue left non-empty (or keyed for another agent) by one
     test leaks scripted responses into its siblings — the recurring
-    cause of ``test_smoke`` / ``test_multi_turn``
+    cause of ``test_smoke`` / ``test_multi_turn`` / ``test_sharing``
     breaking when run alongside the scripted round-trip tests.
 
     Resetting before *and* after each test makes every integration test

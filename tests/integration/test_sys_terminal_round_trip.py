@@ -7,8 +7,9 @@ drove the **removed** ``POST /v1/responses`` route (plus
 longer exists under ``omnigent/server/routes/``; the cited
 "500 / runner availability" reason on issue 532 was a stale
 misdiagnosis. These replacements drive the current runner-bound
-sessions API in mock-LLM mode instead — the same path
-``test_d6_async_cancel_round_trip`` uses.
+sessions API in mock-LLM mode instead — the same path the merged D6
+re-homes (``test_d6_async_cancel_round_trip``,
+``test_d6_parallel_fan_out_round_trip``) use.
 
 Why this faithfully exercises the same surface
 -----------------------------------------------
@@ -34,7 +35,8 @@ tool execution is harness-agnostic (it is a runner-side registry
 lookup + tmux spawn), so the on-disk ``sys-terminal-test`` claude-sdk
 agent is not usable in mock mode; instead each test registers a minimal
 inline ``openai-agents`` agent carrying the same ``terminals:`` block
-via ``register_inline_agent(extra_config=...)``.
+via ``register_inline_agent(extra_config=...)``. This mirrors
+``test_d6_parallel_fan_out_round_trip.py::terminal_mock_agent``.
 
 Coverage deltas vs. the old e2e (honest notes)
 ----------------------------------------------

@@ -1,9 +1,42 @@
-"""Mock-LLM integration coverage for cancellation of a parked client-tool call.
+"""Mock-LLM integration coverage for the D6 server->client round-trip.
 
-Drives the real server, runner, and harness over the sessions stream/events
-surface. Interrupting the parked call must emit ``session.interrupted``,
-settle the session to idle, and persist cancellation history with a synthetic
-``function_call_output`` for the dangling call.
+Re-homes the suppressed D6 e2e coverage (which targeted the removed
+``POST /v1/responses`` route and a real LLM) at the mock-LLM
+sessions-API integration layer. Drives the real ``omnigent server``
++ runner + harness over the sessions stream/events surface — the
+same path :mod:`tests.integration.test_client_tools` proves works in
+mock mode.
+
+Two surfaces this file pins, neither covered before (only the SSE
+*parser* was unit-tested):
+
+1. ``test_client_tool_round_trip`` — a client-side (action_required)
+   tool call is dispatched on the stream, the test posts the
+   ``function_call_output``, the model emits a final answer, and the
+   turn reaches a clean ``response.completed`` terminal. The full
+   server->client round-trip.
+
+2. ``test_direct_cancel_parks_then_interrupts_cleanly`` — a direct
+   cancel (``interrupt`` event) issued while a client-tool call is
+   parked must drive the turn to a clean, idle terminal: the stream
+   emits ``session.interrupted``, the session settles to ``idle``
+   (NOT ``failed``), and the runner persists the cancellation marker
+   + synthetic ``function_call_output`` for the dangling call.
+
+   This is the sessions-layer cancel contract. The scaffold's own
+   ``_build_terminal_event`` builds ``response.cancelled`` correctly
+   (proven by ``tests/runtime/harnesses/test_scaffold.py``); on the
+   sessions surface that terminal is not relayed — the runner
+   synthesizes the idle terminal + cancellation history instead, the
+   shape ``session.interrupted`` and ``GET /v1/sessions/{id}`` expose
+   to clients (see ``tests/e2e/test_cancel_history.py``).
+
+The mock LLM is scripted with a fixed tool-call sequence, so the
+agent prompt is irrelevant — the queued responses drive the turn.
+
+Runs in the default suite in mock mode (no ``--llm-api-key``); the
+``tests/integration`` package gate is lifted in mock mode by
+``tests/integration/conftest.py``.
 """
 
 from __future__ import annotations
@@ -88,6 +121,118 @@ def _list_session_items(client: httpx.Client, session_id: str) -> list[dict[str,
         after = page.get("last_id")
         if after is None:
             raise AssertionError(f"items page had has_more without last_id: {page}")
+
+
+def test_client_tool_round_trip(
+    live_server: str,
+    journey_session: JourneySession,
+    mock_llm_server_url: str | None,
+) -> None:
+    """A client-tool call round-trips and the turn completes cleanly.
+
+    Turn script (mock LLM queue):
+      1. ``compute`` tool call (the server publishes it as an
+         ``action_required`` function_call on the live stream).
+      2. The test posts a ``function_call_output`` with a marker.
+      3. The model emits the marker as its final answer.
+
+    Asserts the turn terminal is ``response.completed`` — the
+    full server->client round-trip the SSE-parser unit tests
+    never reach.
+    """
+    marker = f"D6-ROUND-TRIP-{uuid.uuid4().hex[:8]}"
+    call_id = f"call_{uuid.uuid4().hex[:8]}"
+    sid = journey_session.session_id
+
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": call_id,
+                        "name": "compute",
+                        "arguments": json.dumps({"value": marker}),
+                    }
+                ]
+            },
+            {"text": f"ANSWER:{marker}"},
+        ],
+    )
+
+    errors: list[Exception] = []
+    text_chunks: list[str] = []
+    status: str | None = None
+
+    def _post_message() -> None:
+        try:
+            with httpx.Client(base_url=live_server, timeout=30) as poster:
+                send_user_message_to_session(
+                    poster,
+                    session_id=sid,
+                    content="Run compute and answer with the value.",
+                    tools=[_COMPUTE_TOOL],
+                )
+        except Exception as exc:  # thread boundary; re-raised below
+            errors.append(exc)
+
+    def _post_output(cid: str) -> None:
+        try:
+            with httpx.Client(base_url=live_server, timeout=30) as poster:
+                resp = poster.post(
+                    f"/v1/sessions/{sid}/events",
+                    json={
+                        "type": "function_call_output",
+                        "data": {"call_id": cid, "output": marker},
+                    },
+                )
+                assert resp.status_code in (200, 202), (
+                    f"function_call_output POST failed: {resp.status_code} {resp.text[:300]}"
+                )
+        except Exception as exc:  # thread boundary; re-raised below
+            errors.append(exc)
+
+    with httpx.Client(base_url=live_server, timeout=90) as streamer:
+        with streamer.stream("GET", f"/v1/sessions/{sid}/stream") as response:
+            response.raise_for_status()
+            posted = False
+            answered = False
+            for event in _iter_sse(response):
+                if not posted:
+                    threading.Thread(target=_post_message, daemon=True).start()
+                    posted = True
+                etype = event.get("type")
+                if etype == "response.output_item.done":
+                    item = event.get("item") or {}
+                    if (
+                        item.get("type") == "function_call"
+                        and item.get("name") == "compute"
+                        and item.get("status") == "action_required"
+                        and not answered
+                    ):
+                        answered = True
+                        threading.Thread(
+                            target=_post_output, args=(item["call_id"],), daemon=True
+                        ).start()
+                elif etype == "response.output_text.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str):
+                        text_chunks.append(delta)
+                elif etype in ("response.completed", "response.failed", "response.cancelled"):
+                    status = etype
+                    break
+
+    if errors:
+        raise errors[0]
+    assert status == "response.completed", (
+        f"D6 round-trip should complete cleanly; turn ended {status!r} "
+        f"with text {''.join(text_chunks)!r}"
+    )
+    final_text = "".join(text_chunks)
+    assert marker in final_text, (
+        f"D6 round-trip final answer should echo the tool-output marker; "
+        f"expected {marker!r} in reply text {final_text!r}"
+    )
 
 
 def test_direct_cancel_parks_then_interrupts_cleanly(
