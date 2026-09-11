@@ -270,7 +270,7 @@ function selectAgent(agentId: string): void {
  * The knobs (model / effort / permission / approval / cursor mode / brain
  * harness) live in this modal, not the picker dropdown.
  */
-function openAgentConfig(agentId: string): void {
+function openAgentModels(agentId: string): void {
   const picker = screen.getByTestId("new-chat-landing-agent-select");
   fireEvent.pointerDown(picker, { button: 0 });
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
@@ -284,6 +284,10 @@ function openAgentConfig(agentId: string): void {
     }
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+}
+
+function openAgentConfig(agentId: string): void {
+  openAgentModels(agentId);
   fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
 }
 
@@ -1560,10 +1564,10 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     // Model, effort and permission mode share Claude Code's one config modal;
     // both can be set in one visit and commit together on Save.
-    openAgentConfig("ag_native");
-    pickSelectOption("new-chat-landing-config-model", "Opus");
-    pickSelectOption("new-chat-landing-config-effort", "High");
-    saveConfig();
+    openAgentModels("ag_native");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1605,20 +1609,19 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_pi");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
+    openAgentModels("ag_pi");
     const fullNameRow = document.querySelector(
-      '[data-model-id="omnigent-openai/system.ai.gpt-5-6-sol"]',
+      '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
     expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
-    fireEvent.change(screen.getByTestId("new-chat-landing-config-model-search"), {
+    fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
       target: { value: "gpt sol" },
     });
     expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
     expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
     fireEvent.click(screen.getByText("GPT 5.6 Sol"));
-    saveConfig();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1674,9 +1677,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_native");
-    pickSelectOption("new-chat-landing-config-model", "Opus");
-    saveConfig();
+    openAgentModels("ag_native");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));

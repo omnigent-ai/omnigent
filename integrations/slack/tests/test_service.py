@@ -13,11 +13,14 @@ from omnigent_slack.omnigent import (
     HostType,
     HostUnavailableError,
     OmnigentError,
+    RunnerUnavailableError,
     ServerUnreachableError,
     StreamInterruptedError,
 )
 from omnigent_slack.service import (
     _ACK_TEXT,
+    _MANAGED_SANDBOX_NOT_READY_TEXT,
+    _RUNNER_UNAVAILABLE_TEXT,
     _SERVER_UNREACHABLE_TEXT,
     _STREAM_INTERRUPTED_TEXT,
     SlackOmnigentService,
@@ -2385,6 +2388,92 @@ async def test_harness_not_configured_412_surfaces_server_message(tmp_path: Path
     text = slack.posts[-1]["text"]
     assert "omnigent setup" in text
     assert "status 412" not in text  # not the generic fallback
+
+
+class RunnerUnavailableTurnClient(FakeOmnigentClient):
+    """run_turn reports no runner serving the session (503 runner_unavailable).
+
+    Raising from run_turn models the client boundary after its own recovery is
+    exhausted: on a managed session the client re-raises immediately (the server
+    owns the sandbox relaunch); on an external host it has already relaunched
+    and retried once.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: str = "external",
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        self.turn_host_types.append(host_type)
+        raise RunnerUnavailableError("Omnigent runner is unavailable.")
+        yield  # pragma: no cover -- makes this an async generator
+
+
+async def test_managed_sandbox_not_ready_asks_for_a_retry(tmp_path: Path) -> None:
+    # A managed sandbox that isn't ready fails the turn with a 503
+    # runner_unavailable, which the client re-raises rather than relaunching
+    # (the server owns the sandbox). The same code covers both a sandbox that is
+    # still provisioning and one whose launch failed, so the user must see the
+    # cause-neutral not-ready notice — not the generic "something went wrong",
+    # and not a promise that the sandbox is merely "still starting".
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = RunnerUnavailableTurnClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", workspace="", host_type="managed")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_ack_deleted(slack)
+    await service.shutdown()
+
+    assert omnigent.turn_host_types == ["managed"]
+    # A possibly-recoverable wait must not read as a broken turn.
+    assert all("went wrong" not in stream.text for stream in slack.streams)
+    # The notice is a public post naming the not-ready sandbox, and it does not
+    # echo the raw exception wording.
+    text = slack.posts[-1]["text"]
+    assert text == _MANAGED_SANDBOX_NOT_READY_TEXT
+    assert "unavailable" not in text.lower()
+    # Cause-neutral: the same 503 also covers a failed sandbox launch, so the
+    # notice must not assert the sandbox is merely starting.
+    assert "still starting" not in text.lower()
+    assert slack.ephemerals == []
+
+
+async def test_external_runner_unavailable_asks_for_a_retry(tmp_path: Path) -> None:
+    # Same 503 on an external host: the client's relaunch-and-retry already ran
+    # and didn't recover a runner. Still a wait, not a failure — but it must not
+    # claim a managed sandbox is starting on the user's own host.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = RunnerUnavailableTurnClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_ack_deleted(slack)
+    await service.shutdown()
+
+    assert omnigent.turn_host_types == ["external"]
+    assert all("went wrong" not in stream.text for stream in slack.streams)
+    text = slack.posts[-1]["text"]
+    assert text == _RUNNER_UNAVAILABLE_TEXT
+    assert "sandbox" not in text.lower()
 
 
 # ── Tool-approval (elicitation) flow ─────────────────────────────────

@@ -28,6 +28,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_mcp_startup,
     update_active_turn_id,
+    write_codex_config_effort,
     write_codex_config_model,
 )
 from omnigent.inner.codex_goal_command import (
@@ -93,6 +94,19 @@ async def _start_codex_turn(
                 _logger.warning(
                     "Failed to mirror codex model switch into config.toml: model=%s",
                     switched_model,
+                )
+        # Mirror an applied effort the same way (after the model write, whose
+        # clamp may have rewritten the stale effort line): the forwarder's
+        # effort mirror treats config.toml as the source of truth, and a fresh
+        # forwarder state (thread resume / reconnect) re-reads it — without
+        # this write it would revert a composer-picked effort to the stale
+        # launch value.
+        switched_effort = settings_overrides.get("effort")
+        if isinstance(switched_effort, str) and switched_effort:
+            if not write_codex_config_effort(bridge_dir, switched_effort):
+                _logger.warning(
+                    "Failed to mirror codex effort switch into config.toml: effort=%s",
+                    switched_effort,
                 )
     response = await client.request(
         "turn/start",

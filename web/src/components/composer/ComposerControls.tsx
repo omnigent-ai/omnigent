@@ -120,13 +120,13 @@ export function ComposerPermissionPicker({
           data-testid={`${testIdPrefix}-permission-chip`}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span className="max-w-20 truncate text-ui font-normal">{value}</span>
+          <span className="whitespace-nowrap text-ui font-normal">{value}</span>
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="start"
-        className="w-[13.75rem] min-w-0"
+        className="w-max min-w-[13.75rem] max-w-[calc(100vw-2rem)]"
         data-testid={`${testIdPrefix}-permission-menu`}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
@@ -135,6 +135,7 @@ export function ComposerPermissionPicker({
             key={option.value}
             onSelect={() => onSelect(option.value)}
             data-testid={`${testIdPrefix}-permission-option-${option.value}`}
+            className="whitespace-normal break-words"
           >
             {option.label}
           </DropdownMenuItem>
@@ -197,7 +198,7 @@ export const ComposerHarnessTrigger = forwardRef<
       size="sm"
       aria-label={label}
       className={cn(
-        "h-8 min-w-0 w-full max-w-[7.25rem] gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0 md:h-7 md:w-auto md:max-w-40",
+        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0 md:min-h-7",
         className,
       )}
       {...props}
@@ -211,12 +212,12 @@ export const ComposerHarnessTrigger = forwardRef<
         />
       )}
       <span
-        className={cn("inline-flex min-w-0 items-baseline gap-1", labelClassName)}
+        className={cn("inline-flex min-w-0 flex-wrap items-baseline gap-1", labelClassName)}
         data-testid={`${testIdPrefix}-agent-config-value`}
       >
         {model && (
           <span
-            className="min-w-0 truncate text-ui font-medium text-foreground"
+            className="min-w-0 whitespace-normal break-words text-left text-ui font-medium text-foreground"
             data-testid={`${testIdPrefix}-agent-model-value`}
           >
             {model}
@@ -224,7 +225,7 @@ export const ComposerHarnessTrigger = forwardRef<
         )}
         {effort && (
           <span
-            className="hidden shrink-0 text-ui font-normal text-muted-foreground md:inline"
+            className="shrink-0 text-ui font-normal text-muted-foreground"
             data-testid={`${testIdPrefix}-agent-effort-value`}
           >
             {effort}

@@ -379,9 +379,8 @@ class PreparedCodexTerminal:
         the app-server directly.
     :param app_server: Running app-server process when this wrapper
         invocation owns it. ``None`` for reattached live terminals.
-    :param event_client: App-server client already listening for the
-        Codex thread. Fresh sessions keep this listener open after it
-        observes the TUI-created ``thread/started`` event.
+    :param event_client: App-server client connected before thread creation
+        or resume, retained by the forwarder to preserve startup events.
     :param reattached: ``True`` when an existing terminal was reused.
     """
 
@@ -1260,13 +1259,13 @@ async def _prepare_codex_terminal(
         launched_terminal: LaunchedCodexTerminal | None = None
         try:
             await app_server.start()
-            if thread_id is None:
-                event_client = client_for_transport(
-                    codex_ws_url,
-                    client_name="omnigent-codex-native",
-                )
-                await event_client.connect()
-            else:
+            event_client = client_for_transport(
+                codex_ws_url,
+                client_name="omnigent-codex-native",
+            )
+            # Buffer startup events before either the TUI or preload loads the thread.
+            await event_client.connect()
+            if thread_id is not None:
                 await preload_codex_thread_for_resume(
                     codex_ws_url,
                     thread_id,

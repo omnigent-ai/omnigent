@@ -28,7 +28,7 @@ def test_chat_width_scales_while_prose_remains_readable(
     expected_frame_width: float,
     expected_prose_width: float,
 ) -> None:
-    """The chat frame scales on wide screens while ordinary prose stays capped."""
+    """The chat and composer scale together while ordinary prose stays capped."""
     base_url, session_id = seeded_session
     seed_committed_turn(
         session_id,
@@ -60,6 +60,10 @@ def test_chat_width_scales_while_prose_remains_readable(
     widths = page.evaluate(
         """({ proseMarker, tableMarker }) => {
           const frame = document.querySelector('.chat-conversation-content');
+          const composer = document.querySelector('[data-composer-card]');
+          const workspace = document.querySelector(
+            '[data-testid="composer-workspace-controls"]'
+          ).parentElement;
           const bubbles = [...document.querySelectorAll(
             '[data-testid="message-bubble"][data-role="assistant"]'
           )];
@@ -74,6 +78,10 @@ def test_chat_width_scales_while_prose_remains_readable(
               parseFloat(frameStyle.paddingRight),
             prose: prose.getBoundingClientRect().width,
             table: table.getBoundingClientRect().width,
+            composer: composer.getBoundingClientRect().width,
+            workspace: workspace.getBoundingClientRect().width,
+            composerLeft: composer.getBoundingClientRect().left,
+            frameLeft: frame.getBoundingClientRect().left,
           };
         }""",
         {"proseMarker": _PROSE_MARKER, "tableMarker": _TABLE_MARKER},
@@ -82,3 +90,47 @@ def test_chat_width_scales_while_prose_remains_readable(
     assert widths["frame"] == pytest.approx(expected_frame_width, abs=1)
     assert widths["prose"] == pytest.approx(expected_prose_width, abs=1)
     assert widths["table"] == pytest.approx(widths["frameInner"], abs=1)
+    assert widths["composer"] == pytest.approx(expected_frame_width, abs=1)
+    assert widths["workspace"] == pytest.approx(expected_frame_width, abs=1)
+    assert widths["composerLeft"] == pytest.approx(widths["frameLeft"], abs=1)
+
+
+def test_composer_fits_available_space_when_resizing(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The composer follows the chat width without overflowing smaller viewports."""
+    base_url, session_id = seeded_session
+    seed_committed_turn(session_id, prompt="Hello", reply="Resize this conversation.")
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.locator("[data-composer-card]")).to_be_visible(timeout=30_000)
+
+    for viewport_width in (3200, 1920, 1024, 390, 2400):
+        page.set_viewport_size({"width": viewport_width, "height": 1080})
+        dimensions = page.evaluate(
+            """() => {
+              const frame = document.querySelector('.chat-conversation-content');
+              const composer = document.querySelector('[data-composer-card]');
+              const form = composer.closest('form');
+              const formStyle = getComputedStyle(form);
+              const card = composer.getBoundingClientRect();
+              return {
+                frame: frame.getBoundingClientRect().width,
+                available:
+                  form.clientWidth -
+                  parseFloat(formStyle.paddingLeft) -
+                  parseFloat(formStyle.paddingRight),
+                composer: card.width,
+                left: card.left,
+                right: card.right,
+                viewport: window.innerWidth,
+                documentWidth: document.documentElement.scrollWidth,
+              };
+            }"""
+        )
+        assert dimensions["composer"] == pytest.approx(
+            min(dimensions["frame"], dimensions["available"]), abs=1
+        )
+        assert dimensions["left"] >= 0
+        assert dimensions["right"] <= dimensions["viewport"]
+        assert dimensions["documentWidth"] <= dimensions["viewport"]
