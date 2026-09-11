@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import tarfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -493,3 +495,97 @@ def test_replace_swaps_spec(
     # Subsequent load() returns the new spec from memory cache
     loaded_again = agent_cache.load("agent-5", loc_v2)
     assert loaded_again.spec is loaded_v2.spec
+
+
+@pytest.mark.parametrize("operation", ["miss", "replace", "evict"])
+def test_same_agent_waits_while_other_agent_progresses(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """A cache call cannot observe another call's incomplete disk work."""
+    import shutil
+
+    location = "agent-1/v1"
+    bundle = _store_bundle(artifact_store, location)
+    _store_bundle(artifact_store, "agent-2/v1")
+    if operation != "miss":
+        agent_cache.load("agent-1", location)
+    started, release = threading.Event(), threading.Event()
+    reader_started, reader_done = threading.Event(), threading.Event()
+    downloads = 0
+    original_get = artifact_store.get
+    original_rename = Path.rename
+    original_rmtree = shutil.rmtree
+
+    def pause() -> None:
+        started.set()
+        assert release.wait(5), "test did not release cache operation"
+
+    def get(key: str) -> bytes:
+        nonlocal downloads
+        if key == location:
+            downloads += 1
+            if operation == "miss":
+                pause()
+        return original_get(key)
+
+    def rename(source: Path, target: Path) -> Path:
+        if source == cache_dir / "agent-1_staging":
+            pause()
+        return original_rename(source, target)
+
+    def rmtree(path: Path) -> None:
+        if path == cache_dir / "agent-1":
+            pause()
+        original_rmtree(path)
+
+    def read():  # type: ignore[no-untyped-def]
+        reader_started.set()
+        try:
+            return agent_cache.load("agent-1", location)
+        finally:
+            reader_done.set()
+
+    monkeypatch.setattr(artifact_store, "get", get)
+    if operation == "replace":
+        monkeypatch.setattr(Path, "rename", rename)
+    elif operation == "evict":
+        monkeypatch.setattr(shutil, "rmtree", rmtree)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        if operation == "miss":
+            writing = pool.submit(agent_cache.load, "agent-1", location)
+        elif operation == "replace":
+            writing = pool.submit(agent_cache.replace, "agent-1", location, bundle)
+        else:
+            writing = pool.submit(agent_cache.evict, "agent-1")
+        try:
+            assert started.wait(5)
+            reading = pool.submit(read)
+            assert reader_started.wait(5)
+            other = pool.submit(agent_cache.load, "agent-2", "agent-2/v1").result(5)
+            assert (other.workdir / "config.yaml").is_file()
+            assert not reader_done.wait(0.1)
+        finally:
+            release.set()
+        writing.result(5)
+        loaded = reading.result(5)
+    assert (loaded.workdir / "config.yaml").is_file()
+    assert loaded.spec is agent_cache.load("agent-1", location).spec
+    if operation == "miss":
+        assert downloads == 1
+
+
+def test_cache_lock_released_after_error(
+    agent_cache: AgentCache, artifact_store: LocalArtifactStore
+) -> None:
+    with pytest.raises(KeyError):
+        agent_cache.load("agent-1", "agent-1/missing")
+    _store_bundle(artifact_store, "agent-1/v1")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        loaded = pool.submit(agent_cache.load, "agent-1", "agent-1/v1").result(5)
+    assert (loaded.workdir / "config.yaml").is_file()
+    assert not agent_cache._locks

@@ -5,7 +5,12 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import weakref
+from _thread import LockType
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 
 from omnigent.entities import LoadedAgent
 from omnigent.spec import AgentSpec
@@ -47,6 +52,20 @@ class AgentCache:
         self._artifact_store = artifact_store
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
+
+        self._locks_guard = Lock()
+        self._locks: weakref.WeakValueDictionary[str, LockType] = weakref.WeakValueDictionary()
+
+    @contextmanager
+    def _lock(self, agent_id: str) -> Iterator[None]:
+        """Serialize one agent's cache operations without retaining idle locks."""
+        with self._locks_guard:
+            lock = self._locks.get(agent_id)
+            if lock is None:
+                lock = Lock()
+                self._locks[agent_id] = lock
+        with lock:
+            yield
 
     def _cache_path(self, agent_id: str, *, suffix: str = "") -> Path:
         """Return a direct child of the cache root for an agent id."""
@@ -99,6 +118,12 @@ class AgentCache:
         :returns: A LoadedAgent with the parsed spec and the
             on-disk working directory.
         """
+        with self._lock(agent_id):
+            return self._load_locked(agent_id, bundle_location, expand_env=expand_env)
+
+    def _load_locked(
+        self, agent_id: str, bundle_location: str, *, expand_env: bool
+    ) -> LoadedAgent:
         workdir = self._cache_path(agent_id)
 
         # Tier 1: in-memory spec. The cached spec was parsed with the
@@ -130,10 +155,9 @@ class AgentCache:
         """
         Warm-swap an agent's cached spec and disk directory.
 
-        Extracts the new bundle to a temp directory, swaps the
-        in-memory spec entry, renames into the cache location, and
-        cleans up the old directory. Concurrent readers see either
-        the old spec or the new spec, never an empty cache.
+        Extracts the new bundle, replaces the disk directory, then publishes
+        the matching spec. Same-agent cache calls wait for the swap;
+        previously returned workdirs are not immutable snapshots.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
@@ -150,6 +174,14 @@ class AgentCache:
         :returns: A LoadedAgent with the new spec and working
             directory.
         """
+        with self._lock(agent_id):
+            return self._replace_locked(
+                agent_id, bundle_location, bundle_bytes, expand_env=expand_env
+            )
+
+    def _replace_locked(
+        self, agent_id: str, bundle_location: str, bundle_bytes: bytes, *, expand_env: bool
+    ) -> LoadedAgent:
         workdir = self._cache_path(agent_id)
         staging_dir = self._cache_path(agent_id, suffix="_staging")
 
@@ -168,13 +200,11 @@ class AgentCache:
         finally:
             tmp_path.unlink()
 
-        # Swap in-memory entry (atomic dict assignment)
-        self._specs[agent_id] = spec
-
         # Replace disk directory: remove old, rename staging into place
         if workdir.is_dir():
             shutil.rmtree(workdir)
         staging_dir.rename(workdir)
+        self._specs[agent_id] = spec
 
         return LoadedAgent(spec=spec, workdir=workdir)
 
@@ -186,6 +216,10 @@ class AgentCache:
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
         """
+        with self._lock(agent_id):
+            return self._evict_locked(agent_id)
+
+    def _evict_locked(self, agent_id: str) -> None:
         workdir = self._cache_path(agent_id)
         self._specs.pop(agent_id, None)
         if workdir.is_dir():
