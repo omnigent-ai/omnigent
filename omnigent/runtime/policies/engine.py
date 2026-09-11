@@ -570,7 +570,17 @@ class PolicyEngine:
             # INCREMENT, and APPEND all leave it present in ``merged``); a
             # future action that also removes keys must join this set.
             deleted_keys = {op.key for op in session_ops if op.action == StateUpdateAction.DELETE}
-            merged = self._store.mutate_session_state(self._conversation_id, _merge)
+            try:
+                merged = self._store.mutate_session_state(self._conversation_id, _merge)
+            except ConversationNotFoundError:
+                # The conversation was deleted while this turn was in flight:
+                # there is no row to merge into and nothing left to persist.
+                # Apply the ops to the in-memory view only, so guardrails
+                # keep counting for the rest of the turn instead of the hot
+                # evaluate() path failing the turn over a session that is
+                # gone (the deferred write paths suppress this the same way).
+                merged = dict(self._session_state)
+                _merge(merged)
             # Hot cache: persisted truth (``merged``) is authoritative for
             # every key it holds. For a key it DOESN'T hold, though, absence
             # is ambiguous — a blanket union with the old cache

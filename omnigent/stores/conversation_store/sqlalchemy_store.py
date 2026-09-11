@@ -1598,8 +1598,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ConversationNotFoundError: When the conversation has no
             metadata row.
         """
-        import json
-
         q = select(SqlConversationMetadata).where(
             SqlConversationMetadata.workspace_id == current_workspace_id(),
             SqlConversationMetadata.id == conversation_id,

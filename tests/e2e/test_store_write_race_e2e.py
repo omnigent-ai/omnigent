@@ -296,3 +296,37 @@ async def test_label_seeding_absent_row_leaves_no_orphans(
         f"{deleted_id!r}, which no longer exists — no FK, no existence "
         f"check in the same transaction as the write (facet 4: orphan label rows)."
     )
+
+
+@pytest.mark.asyncio
+async def test_state_updates_on_deleted_conversation_do_not_fail_the_turn(
+    store: SqlAlchemyConversationStore,
+    seeded_spec: AgentSpec,
+) -> None:
+    """
+    Applying state updates for a conversation deleted mid-turn must not
+    raise out of the hot ``evaluate()`` path.
+
+    The store's locked merge refuses to report a write it cannot persist
+    (``ConversationNotFoundError``), but a policy incrementing a counter
+    on a session the user just deleted is not an error an in-flight turn
+    should die on: nothing can be persisted (the row is gone), and the
+    engine's in-memory view keeps counting so guardrails stay coherent
+    for the remainder of the turn.
+    """
+    conv = store.create_conversation()
+    engine = build_policy_engine(
+        spec=seeded_spec, conversation_id=conv.id, conversation_store=store
+    )
+    assert await store.delete_conversation(conv.id)
+
+    increment = [StateUpdate(key="calls", action=StateUpdateAction.INCREMENT, value=1)]
+    engine.apply_state_updates(increment)
+    engine.apply_state_updates(increment)
+
+    assert engine.session_state.get("calls") == 2, (
+        f"the engine's in-memory state stopped counting once the conversation "
+        f"row was gone: expected calls == 2, got "
+        f"{engine.session_state.get('calls')!r}"
+    )
+    assert store.get_conversation(conv.id) is None

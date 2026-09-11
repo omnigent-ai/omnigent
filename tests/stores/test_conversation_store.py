@@ -6745,7 +6745,7 @@ def test_two_real_writers_race_on_one_metadata_row(
 
         try:
             conversation_store.mutate_session_state(conv.id, _mutate)
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=_increment) for _ in range(2)]
