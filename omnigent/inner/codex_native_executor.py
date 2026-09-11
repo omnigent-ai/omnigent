@@ -71,6 +71,18 @@ def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
     )
 
 
+_SUPERSEDED_TURN_ERROR_PREFIX = "expected active turn id "
+
+
+def _is_recorded_turn_superseded(error: CodexAppServerResponseError) -> bool:
+    """Return whether Codex rejected a request because the recorded turn is no longer active."""
+    return (
+        error.code == _NO_ACTIVE_TURN_ERROR_CODE
+        and error.message is not None
+        and error.message.strip().casefold().startswith(_SUPERSEDED_TURN_ERROR_PREFIX)
+    )
+
+
 async def _start_codex_turn(
     client: CodexAppServerClient,
     *,
@@ -334,13 +346,28 @@ class CodexNativeExecutor(Executor):
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
-                await client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
-                )
+                try:
+                    await client.request(
+                        "turn/interrupt",
+                        {
+                            "threadId": state.thread_id,
+                            "turnId": state.active_turn_id,
+                        },
+                    )
+                except CodexAppServerResponseError as error:
+                    if not _is_recorded_turn_superseded(error):
+                        raise
+                    # Codex moved past the recorded turn (e.g. a TUI-driven
+                    # follow-on turn), so that turn is over and there is
+                    # nothing left to interrupt — an expected upstream
+                    # condition, not a failure. Drop the stale record unless
+                    # a newer turn/started already replaced it.
+                    clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
+                    _logger.info(
+                        "Codex native interrupt skipped: recorded turn %s already superseded (%s)",
+                        state.active_turn_id,
+                        error.message,
+                    )
         finally:
             await client.close()
         return True
