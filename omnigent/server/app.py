@@ -2044,6 +2044,70 @@ def create_app(
             },
         )
 
+    try:
+        # Optional dependency: only deployments whose store backends speak
+        # gRPC (e.g. a workspace hierarchy service) can raise RpcError, and
+        # those environments always ship grpcio.
+        import grpc
+    except ImportError:  # pragma: no cover - exercised only without grpcio
+        grpc = None  # type: ignore[assignment]
+
+    if grpc is not None:
+
+        @app.exception_handler(grpc.RpcError)
+        async def _handle_grpc_error(
+            request: Request,
+            exc: Exception,
+        ) -> JSONResponse:
+            """
+            Map a backend gRPC access denial to a handled 403/401.
+
+            A store backend reached over gRPC can answer ``PERMISSION_DENIED``
+            or ``UNAUTHENTICATED``. Those are access outcomes, not server
+            faults: answer a handled 403/401 naming the resource instead of
+            collapsing to an unhandled 500 that logs a full traceback on every
+            client retry. Any other gRPC status keeps the unhandled-500 path.
+
+            :param request: The incoming request; its path names the denied
+                resource in the response message and the audit log.
+            :param exc: The gRPC error raised by the backend call.
+            :returns: A 403/401 JSON response for access denials, otherwise
+                the standard 500 from the catch-all.
+            """
+            code_of = getattr(exc, "code", None)
+            status = code_of() if callable(code_of) else None
+            mapped: tuple[str, int] | None = {
+                grpc.StatusCode.PERMISSION_DENIED: (ErrorCode.FORBIDDEN, 403),
+                grpc.StatusCode.UNAUTHENTICATED: (ErrorCode.UNAUTHORIZED, 401),
+            }.get(status)
+            if mapped is None:
+                return await _handle_unhandled_exception(request, exc)
+            error_code, http_status = mapped
+            details_of = getattr(exc, "details", None)
+            details = details_of() if callable(details_of) else None
+            # Warning without a stack: the denial is the whole story, and the
+            # 500 arm's per-retry tracebacks buried real errors in the log.
+            _logger.warning(
+                "gRPC %s from a backend service on %s: %s",
+                status.name,
+                request.url.path,
+                details,
+                extra=_error_audit_extra(
+                    request,
+                    phase="denied",
+                    code=str(error_code),
+                    http_status=str(http_status),
+                ),
+            )
+            if error_code == ErrorCode.FORBIDDEN:
+                message = f"Access to {request.url.path} was denied by a backing service."
+            else:
+                message = f"A backing service rejected the credentials for {request.url.path}."
+            return JSONResponse(
+                status_code=http_status,
+                content={"error": {"code": error_code, "message": message}},
+            )
+
     def _host_is_online(host_id: str) -> bool:
         """
         Return whether ``host_id`` is currently online, cross-replica.
