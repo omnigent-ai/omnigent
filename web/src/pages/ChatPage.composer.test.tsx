@@ -871,6 +871,10 @@ describe("Composer slash-command submit routing", () => {
     expect(gearTooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
       gearTooltip.textContent?.indexOf("Effort:") ?? -1,
     );
+    // Bold keys separate each row's label from its value.
+    for (const key of within(gearTooltip).getAllByText(/^(Harness|Model|Effort|Connection):$/)) {
+      expect(key).toHaveClass("font-semibold");
+    }
     // The pill owns exactly one tooltip surface — a second wrapper surface
     // (the old model-source tooltip) stacked over it is the reported bug.
     expect(screen.queryByTestId("composer-model-source-tooltip")).toBeNull();

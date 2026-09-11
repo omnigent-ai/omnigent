@@ -40,6 +40,7 @@ import {
   ComposerWorkspaceTrigger,
   ComposerPermissionPicker,
   ComposerHarnessTrigger,
+  ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -4974,11 +4975,7 @@ function SessionHarnessPicker({
               className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
               data-testid="composer-config-gear-tooltip"
             >
-              {summary.map((row) => (
-                <span key={row.label}>
-                  {row.label}: {row.value}
-                </span>
-              ))}
+              <ComposerConfigTooltipRows rows={summary} />
             </TooltipContent>
           </Tooltip>
         </TooltipProvider>

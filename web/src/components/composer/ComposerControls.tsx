@@ -144,6 +144,26 @@ export function ComposerPermissionPicker({
   );
 }
 
+/**
+ * Label/value rows for a composer trigger's config tooltip. The bold key
+ * separates each row's label from its value.
+ */
+export function ComposerConfigTooltipRows({
+  rows,
+}: {
+  rows: readonly { label: string; value: string }[];
+}) {
+  return (
+    <>
+      {rows.map((row) => (
+        <span key={row.label}>
+          <span className="font-semibold">{row.label}:</span> {row.value}
+        </span>
+      ))}
+    </>
+  );
+}
+
 export const ComposerHarnessTrigger = forwardRef<
   HTMLButtonElement,
   Omit<ComponentPropsWithoutRef<typeof Button>, "children"> & {
