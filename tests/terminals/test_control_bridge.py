@@ -21,6 +21,8 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from starlette.websockets import WebSocket, WebSocketState
+from uvicorn.protocols.utils import ClientDisconnected
 
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
@@ -896,3 +898,56 @@ async def test_control_attach_pins_client_term_over_inherited_dumb(
         )
     finally:
         await _kill_and_join(sock, task)
+
+
+def _dead_transport_websocket() -> WebSocket:
+    """A real starlette WebSocket whose client transport is already gone.
+
+    Every outbound frame fails with uvicorn's ``ClientDisconnected`` (an
+    ``OSError``), which starlette re-raises as ``WebSocketDisconnect(1006)`` --
+    exactly what ``close()`` hits after the browser dropped abruptly.
+    """
+
+    async def receive() -> dict[str, object]:
+        return {"type": "websocket.disconnect", "code": 1006}
+
+    async def send(message: dict[str, object]) -> None:
+        raise ClientDisconnected
+
+    ws = WebSocket(
+        {"type": "websocket", "headers": [], "query_string": b""},
+        receive=receive,
+        send=send,
+    )
+    # The attach handshake already completed: both sides CONNECTED.
+    ws.application_state = WebSocketState.CONNECTED
+    ws.client_state = WebSocketState.CONNECTED
+    return ws
+
+
+async def test_missing_tmux_error_close_swallows_dead_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tmux-not-found error close() must not leak WebSocketDisconnect."""
+    monkeypatch.setattr(shutil, "which", lambda _cmd: None)
+    await bridge_tmux_control_to_websocket(
+        _dead_transport_websocket(),
+        socket_path="/nonexistent/tmux.sock",
+        tmux_target="main",
+        read_only=False,
+    )
+
+
+async def test_spawn_failure_error_close_swallows_dead_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attach-spawn-failure error close() must not leak WebSocketDisconnect."""
+    # A tmux "binary" that cannot be executed makes the control-attach spawn
+    # raise OSError; the seed capture degrades to None on the same error.
+    monkeypatch.setattr(shutil, "which", lambda _cmd: os.devnull + "/tmux")
+    await bridge_tmux_control_to_websocket(
+        _dead_transport_websocket(),
+        socket_path="/nonexistent/tmux.sock",
+        tmux_target="main",
+        read_only=False,
+    )
