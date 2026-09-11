@@ -521,6 +521,14 @@ class McpServerConnection:
     # ``_call_lock`` so only one call is active at a time.
     _active_session_id: str | None = field(default=None, init=False, repr=False)
     _session: ClientSession | None = field(default=None, init=False, repr=False)
+    # True once connect() has established a live session at least
+    # once. Distinguishes "never connected" (genuine caller misuse
+    # — call_tool before connect) from "the session died and needs
+    # rebuilding" (a transient transport fault that cleared, e.g. a
+    # steady-state 401 from an expired bearer that has since
+    # refreshed). Only the former is a hard error; the latter must
+    # reconnect on the next call instead of wedging forever.
+    _connected: bool = field(default=False, init=False, repr=False)
     # Most recent network-level transport failure, recorded by
     # ``_TransportErrorRecordingTransport``. The MCP SDK can swallow
     # a mid-response network error entirely (leaving ``_session``
@@ -627,11 +635,18 @@ class McpServerConnection:
             context. ``None`` when no session is available.
         :returns: The tool result as a string. For multi-content
             results, text blocks are joined with newlines.
-        :raises RuntimeError: If ``connect()`` has not been called.
+        :raises RuntimeError: If ``connect()`` has never been called.
         :raises McpServerDisabledError: If the circuit breaker is
             tripped.
         """
-        if self._session is None:
+        # A None session with no prior successful connect is caller
+        # misuse (call_tool before connect) — hard error. A None
+        # session *after* a successful connect means the lifecycle
+        # task died on a transient transport fault (e.g. a
+        # steady-state 401 that has since cleared); don't wedge here,
+        # let _call_tool_with_reconnect rebuild the session so a
+        # recovered server keeps working.
+        if self._session is None and not self._connected:
             raise RuntimeError(
                 f"MCP server {self.config.name!r} has no live "
                 f"session — call connect() before call_tool()"
@@ -877,6 +892,7 @@ class McpServerConnection:
                 # signal recorded on the previous connection.
                 self._transport_error = None
                 discovered = await self._discover_or_use_cache()
+                self._connected = True
                 ready.set_result(discovered)
                 # Hold transport + session open until close() signals.
                 # All call_tool() invocations during this window run
@@ -1657,7 +1673,11 @@ async def _call_tool_with_reconnect(
     """
     last_exc: Exception | None = None
     total_tries = retry.max_retries + 1
-    needs_reconnect = False
+    # A session that died before the call (lifecycle task torn down
+    # by an earlier fault) must be rebuilt before the first attempt,
+    # not only after an in-call failure — otherwise a cleared 401
+    # never gets a live session to run against.
+    needs_reconnect = conn._session is None
 
     for attempt in range(total_tries):
         try:

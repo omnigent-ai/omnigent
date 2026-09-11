@@ -427,6 +427,91 @@ async def test_call_tool_raises_without_connect() -> None:
         await conn.call_tool("test_tool", {"query": "hi"})
 
 
+@pytest.mark.asyncio()
+async def test_call_tool_reconnects_when_session_died_after_connect() -> None:
+    """
+    A session lost *after* a successful connect must reconnect, not
+    wedge.
+
+    When a transport fault (e.g. a steady-state 401 from an expired
+    bearer) crashes the lifecycle task, its ``finally`` nulls
+    ``_session``. On the next call the connection has already
+    connected once, so ``call_tool`` must rebuild the session via
+    the reconnect path and let the call round-trip — rather than
+    short-circuiting on the None-session guard and raising
+    ``has no live session`` forever (the steady-state-401 wedge).
+    This fails on the unfixed tree, where the guard raises before
+    ``_reconnect`` is ever attempted.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        assert conn._connected is True
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        mock_session.call_tool.return_value = ok_result
+
+        # Simulate the lifecycle task's death clearing the session
+        # (exactly what _run_lifecycle's finally does on a
+        # steady-state transport fault).
+        conn._session = None
+
+        async def _restore_session() -> None:
+            conn._session = mock_session
+
+        with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        # The reconnect happened before the first invocation, driven
+        # purely by the None session rather than an in-call failure.
+        mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnect_failure_after_session_death_propagates() -> None:
+    """
+    A cleared session still surfaces the real error when auth is
+    genuinely still down.
+
+    Recovering the None-session case must not swallow a persistent
+    fault: if the reconnect keeps failing (the 401 has not cleared),
+    the underlying connection error propagates after the retries are
+    exhausted instead of the generic ``has no live session`` guard.
+    """
+    config = MCPServerConfig(
+        name="still-401",
+        url="http://localhost:9000/mcp",
+        retry=RetryPolicy(max_retries=1, backoff_base_s=0.01, backoff_max_s=0.01, jitter=False),
+    )
+
+    with _mock_mcp_transport():
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        # Session died and reconnect keeps failing with a connection
+        # error (auth still down).
+        conn._session = None
+        boom = httpx.ReadError("connection refused")
+
+        with patch.object(conn, "_reconnect", side_effect=boom) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                with pytest.raises(httpx.ReadError, match="connection refused"):
+                    await conn.call_tool("test_tool", {"query": "hi"})
+
+        # Retried rather than raising the None-session guard once.
+        assert mock_reconnect.await_count >= 2
+
+    await conn.close()
+
+
 # ── McpServerConnection.close ────────────────────────────
 
 
