@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -2242,6 +2243,34 @@ def _subagent_parents_by_tool_use(
     for tool_use_id in ambiguous:
         owners.pop(tool_use_id, None)
     return owners
+
+
+def _parse_record_timestamp(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 record timestamp into an aware UTC datetime.
+
+    Raw strings are never compared: precisions vary, so this
+    normalizes to UTC first. ``None`` when unparsable.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _record_timestamp_is_newer(candidate: str | None, baseline: str | None) -> bool:
+    """Return True only when both timestamps parse and candidate is later."""
+    if candidate is None or baseline is None:
+        return False
+    parsed = (_parse_record_timestamp(candidate), _parse_record_timestamp(baseline))
+    return parsed[0] is not None and parsed[1] is not None and parsed[0] > parsed[1]
 
 
 async def _forward_available_subagents(

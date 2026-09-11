@@ -10323,3 +10323,15 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+def test_record_timestamp_ordering() -> None:
+    """Record timestamps order by instant, never by raw string."""
+    newer = "2026-09-10T13:23:13.274Z"
+    older = "2026-09-10T13:22:05.710Z"
+    assert forwarder._record_timestamp_is_newer(newer, older)
+    assert not forwarder._record_timestamp_is_newer(older, newer)
+    assert not forwarder._record_timestamp_is_newer("2026-09-10T13:22:05.710000Z", older)
+    assert not forwarder._record_timestamp_is_newer(older, "2026-09-10T13:22:05.710000Z")
+    assert not forwarder._record_timestamp_is_newer("not-a-timestamp", older)
+    assert not forwarder._record_timestamp_is_newer(None, older)

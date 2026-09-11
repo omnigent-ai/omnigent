@@ -10390,6 +10390,67 @@ def test_offset_reader_parses_task_notification_envelopes(tmp_path: Path, envelo
         assert result.items[0].data.get("is_meta") is True
 
 
+def _tool_result_entry(tool_use_result: Any) -> dict[str, Any]:
+    """Build a user tool_result record with a top-level toolUseResult."""
+    return {
+        "type": "user",
+        "uuid": "agent-result-1",
+        "timestamp": _TASK_NOTIFICATION_TS,
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_agent_1",
+                    "content": "Final agent output",
+                }
+            ],
+        },
+        "toolUseResult": tool_use_result,
+    }
+
+
+@pytest.mark.parametrize(
+    ("tool_use_result", "task_id"),
+    [
+        ({"status": "completed", "agentId": "a15bfb83"}, "a15bfb83"),
+        ({"status": "completed"}, None),
+    ],
+)
+def test_offset_reader_parses_terminal_agent_tool_result(
+    tmp_path: Path, tool_use_result: Any, task_id: str | None
+) -> None:
+    """A foreground Agent result with terminal toolUseResult is evidence."""
+    result = _read_notifications(tmp_path, [_tool_result_entry(tool_use_result)])
+
+    assert len(result.task_notifications) == 1
+    notification = result.task_notifications[0]
+    assert notification.task_id == task_id
+    assert notification.tool_use_id == "toolu_agent_1"
+    assert notification.status == "completed"
+    assert notification.result == "Final agent output"
+    assert notification.timestamp == _TASK_NOTIFICATION_TS
+    assert [item.item_type for item in result.items] == ["function_call_output"]
+
+
+@pytest.mark.parametrize(
+    "tool_use_result",
+    [
+        {"status": "async_launched", "agentId": "a15bfb83"},
+        {"status": "running"},
+        {"stdout": "ok", "stderr": "", "interrupted": False},
+        "Error: Exit code 1",
+    ],
+)
+def test_offset_reader_ignores_nonterminal_tool_result(
+    tmp_path: Path, tool_use_result: Any
+) -> None:
+    """Launch, running, and non-Agent tool results are not lifecycle edges."""
+    result = _read_notifications(tmp_path, [_tool_result_entry(tool_use_result)])
+
+    assert result.task_notifications == ()
+
+
 def test_offset_reader_dedupes_and_ignores_noise(tmp_path: Path) -> None:
     """Repeats collapse; id-less markup and queue bookkeeping drop."""
     entry = _notification_entry(_TASK_NOTIFICATION_TEXT)
@@ -10461,3 +10522,25 @@ def test_line_reader_parses_task_notifications(tmp_path: Path) -> None:
     assert len(result.task_notifications) == 1
     assert result.task_notifications[0].task_id == "a815d"
     assert result.task_notifications[0].timestamp == _TASK_NOTIFICATION_TS
+
+
+def test_offset_reader_surfaces_coordinator_resume(tmp_path: Path) -> None:
+    """A coordinator resume record surfaces as one flagged user message."""
+    entry = {
+        "type": "user",
+        "isMeta": True,
+        "uuid": "resume-1",
+        "timestamp": _TASK_NOTIFICATION_TS,
+        "origin": {"kind": "coordinator"},
+        "message": {"role": "user", "content": "The coordinator sent a message: Keep going."},
+    }
+    result = _read_notifications(tmp_path, [entry])
+
+    assert len(result.items) == 1
+    item = result.items[0]
+    assert item.is_coordinator_resume is True
+    assert item.data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "The coordinator sent a message: Keep going."}],
+    }
+    assert result.record_items[0].timestamp == _TASK_NOTIFICATION_TS
