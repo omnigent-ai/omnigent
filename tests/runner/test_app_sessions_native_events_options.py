@@ -3435,3 +3435,82 @@ async def test_events_compact_on_claude_sdk_publishes_failed_when_no_compaction(
         f"stranded spinner; got {events!r}"
     )
     assert completed == [], f"No completed should appear when nothing compacted; got {events!r}"
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_clears_flag_on_pre_stream_failure() -> None:
+    """A `/compact` turn that fails before streaming still clears the spinner.
+
+    The up-front `response.compaction.in_progress` and the in-progress flag are
+    set before the turn task runs, but the loop that clears them runs only once
+    streaming starts. A setup-phase failure (here: no live harness) ends the turn
+    before that loop, so cleanup cannot live only inside the stream loop:
+    `_on_proxy_stream_end` — reached on every turn-end path — must publish
+    `failed` and discard the flag. Otherwise the spinner is stranded and the
+    stale flag corrupts the NEXT turn's compaction signalling (a real
+    `in_progress` is swallowed, or an unrelated turn emits a spurious `failed`).
+    """
+
+    class _FailingProcessManager(_FakeProcessManager):
+        """Process manager that fails to hand out a client once armed."""
+
+        def __init__(self, client: _ScriptedHarnessClient) -> None:
+            super().__init__(client)
+            self.fail_get_client = False
+
+        async def get_client(
+            self, conversation_id: str, harness: str, env: Any = None
+        ) -> _ScriptedHarnessClient:
+            if self.fail_get_client:
+                raise RuntimeError("no live harness")
+            return await super().get_client(conversation_id, harness, env)
+
+    hc = _ScriptedHarnessClient([])
+    pm = _FailingProcessManager(hc)
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    sid = "a6c3d4e5f60718293a4b5c6d7e8f9012"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        # Arm the setup-phase failure, then dispatch /compact. The handler still
+        # returns 200 (the turn runs in the background); the failure lands inside
+        # the turn task, before any streaming.
+        pm.fail_get_client = True
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "compact"})
+        assert resp.status_code == 200, resp.text
+
+        events = await _accumulate_session_events(sid, until_types={"response.compaction.failed"})
+
+    failed = [e for e in events if e.get("type") == "response.compaction.failed"]
+    assert failed, (
+        f"A /compact turn that fails during setup (before streaming) must still publish "
+        f"failed to clear the up-front spinner; got {events!r}"
+    )
+    # The flag must not leak past the turn: a stale entry would swallow the next
+    # turn's real in_progress or make an unrelated turn emit a spurious failed.
+    assert sid not in app.state.sdk_compact_inprogress, (
+        "the in-progress flag must be cleared on the setup-failure path; a leaked "
+        "entry corrupts later compaction signalling for this conversation."
+    )

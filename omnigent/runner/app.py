@@ -2899,9 +2899,12 @@ def create_runner_app(
     # Conversations whose claude-sdk `/compact` published an up-front
     # `response.compaction.in_progress`. Used to (a) swallow the executor's own
     # later `in_progress` so the web shows a single spinner, and (b) publish a
-    # `failed` at stream end if the turn produced no compaction, so the spinner
-    # is never stranded. Cleared on `response.compaction.completed`.
+    # `failed` if the turn produced no compaction, so the spinner is never
+    # stranded. Discarded on `response.compaction.completed` (real compaction),
+    # else cleared by `_on_proxy_stream_end` — the single turn-end convergence
+    # point reached on every exit path (clean end, setup error, cancel).
     _sdk_compact_inprogress: set[str] = set()
+    app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
     # Detached watchers answering a /model confirm dialog that pops after
@@ -6421,52 +6424,75 @@ def create_runner_app(
             "content": [{"type": "input_text", "text": "/compact"}],
             "conversation_id": conv_id,
         }
-        # A turn is already running: buffer so /compact runs as the next turn
-        # rather than racing the live one; the buffer drains via
-        # _check_and_start_next_turn once the active turn ends. The buffered
-        # compact's own in_progress comes from the executor when it later runs
-        # — publishing an up-front spinner here would show "Compacting…" while
-        # the prior turn is still working, so only the idle path does that.
-        if conv_id in _active_turns:
-            _session_message_buffers.setdefault(conv_id, []).append(compact_body)
-            return Response(status_code=200)
-
-        # Publish the compaction spinner up front so the UI shows "Compacting
-        # conversation…" immediately, like the native handlers — the executor's
-        # own in_progress fires only once the SDK PreCompact hook hits (mid-turn),
-        # by which point the generic running status has shown "Working…". The
-        # relay swallows the executor's later duplicate; `completed` (or the
-        # stream-end `failed` fallback) clears the spinner.
-        _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
-        _sdk_compact_inprogress.add(conv_id)
+        # Serialize the active-turn check + slot bind through the same ingest
+        # gate the message path uses. Without it, the idle branch's check and
+        # its `_active_turns` bind straddle an `await` (history load), so a
+        # message arriving in that window also sees the session idle and binds
+        # the slot — the two turns then clobber each other's `_active_turns`
+        # entry and race the single live SDK client. Under the gate one reaches
+        # its bind before the other's check, so the loser buffers instead.
+        _seq = _ingest_next_seq.get(conv_id, 0)
+        _ingest_next_seq[conv_id] = _seq + 1
+        _cond = _ingest_cond.get(conv_id)
+        if _cond is None:
+            _cond = asyncio.Condition()
+            _ingest_cond[conv_id] = _cond
+        async with _cond:
+            while _ingest_now_serving.get(conv_id, 0) != _seq:
+                await _cond.wait()
         try:
-            new_item: _JsonObject = {
-                "type": "message",
-                "role": "user",
-                "content": compact_body["content"],
-            }
-            if conv_id in _session_histories:
-                _session_histories[conv_id].append(new_item)
-            else:
-                loaded = await _load_history_as_input(conv_id)
-                loaded.append(new_item)
-                _session_histories[conv_id] = loaded
+            # A turn is already running: buffer so /compact runs as the next turn
+            # rather than racing the live one; the buffer drains via
+            # _check_and_start_next_turn once the active turn ends. The buffered
+            # compact's own in_progress comes from the executor when it later runs
+            # — publishing an up-front spinner here would show "Compacting…" while
+            # the prior turn is still working, so only the idle path does that.
+            if conv_id in _active_turns:
+                _session_message_buffers.setdefault(conv_id, []).append(compact_body)
+                return Response(status_code=200)
 
-            _begin_turn_slot(conv_id)
-            _publish_turn_status(conv_id, "running")
-            _turn_task = asyncio.create_task(
-                _run_turn_bg(compact_body, conv_id),
-                name=f"compact-{conv_id}",
+            # Publish the compaction spinner up front so the UI shows "Compacting
+            # conversation…" immediately, like the native handlers — the executor's
+            # own in_progress fires only once the SDK PreCompact hook hits (mid-turn),
+            # by which point the generic running status has shown "Working…". The
+            # relay swallows the executor's later duplicate; `completed` (or the
+            # turn-end `failed` fallback in _on_proxy_stream_end) clears the spinner.
+            _publish_event(
+                conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id}
             )
-            _active_turns[conv_id] = _turn_task
-            _turn_task.add_done_callback(_background_tasks.discard)
-            _background_tasks.add(_turn_task)
-        except Exception:
-            # Never strand the spinner if the turn fails to start.
-            _sdk_compact_inprogress.discard(conv_id)
-            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
-            raise
-        return Response(status_code=200)
+            _sdk_compact_inprogress.add(conv_id)
+            try:
+                new_item: _JsonObject = {
+                    "type": "message",
+                    "role": "user",
+                    "content": compact_body["content"],
+                }
+                if conv_id in _session_histories:
+                    _session_histories[conv_id].append(new_item)
+                else:
+                    loaded = await _load_history_as_input(conv_id)
+                    loaded.append(new_item)
+                    _session_histories[conv_id] = loaded
+
+                _begin_turn_slot(conv_id)
+                _publish_turn_status(conv_id, "running")
+                _turn_task = asyncio.create_task(
+                    _run_turn_bg(compact_body, conv_id),
+                    name=f"compact-{conv_id}",
+                )
+                _active_turns[conv_id] = _turn_task
+                _turn_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_turn_task)
+            except Exception:
+                # Never strand the spinner if the turn fails to start.
+                _sdk_compact_inprogress.discard(conv_id)
+                _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
+                raise
+            return Response(status_code=200)
+        finally:
+            async with _cond:
+                _ingest_now_serving[conv_id] = _seq + 1
+                _cond.notify_all()
 
     async def _handle_claude_native_cost_popup(
         conv_id: str,
@@ -6739,6 +6765,17 @@ def create_runner_app(
 
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
+        # A claude-sdk `/compact` turn that ended without emitting
+        # `response.compaction.completed` produced no compaction (nothing to
+        # compact, or the turn failed before/without streaming). Clear the
+        # up-front spinner with `failed` here — the single turn-end convergence
+        # point, reached on every exit path (clean end, setup error, cancel) — so
+        # no path strands the spinner or leaks the flag into a later turn's
+        # compaction signalling. A successful compaction already discarded the
+        # flag on `response.compaction.completed`, making this a no-op then.
+        if conv_id in _sdk_compact_inprogress:
+            _sdk_compact_inprogress.discard(conv_id)
+            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
         # Transport-loss ending desyncs harness from runner; flag for clean rebind.
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
@@ -8685,17 +8722,9 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
-                    # A claude-sdk `/compact` turn that ended without a
-                    # `completed` event produced no compaction (e.g. nothing to
-                    # compact). Clear the up-front spinner with `failed` so it is
-                    # not stranded.
-                    if conv_id in _sdk_compact_inprogress:
-                        _sdk_compact_inprogress.discard(conv_id)
-                        _publish_event(
-                            conv_id,
-                            {"type": "response.compaction.failed", "task_id": conv_id},
-                        )
-
+                    # _on_proxy_stream_end clears any claude-sdk `/compact`
+                    # spinner (publishing `failed` when no compaction landed);
+                    # it is the single convergence point for every turn-end path.
                     _on_proxy_stream_end(
                         conv_id, error=_stream_failed_error, owner_response_id=_response_id
                     )
