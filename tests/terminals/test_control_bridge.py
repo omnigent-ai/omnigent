@@ -28,6 +28,7 @@ from omnigent.terminals.control_bridge import (
     _hex_send_keys_commands,
     _read_tmux_buffer,
     bridge_tmux_control_to_websocket,
+    parse_terminal_palette,
     unescape_control_output,
 )
 
@@ -894,5 +895,216 @@ async def test_control_attach_pins_client_term_over_inherited_dumb(
             f"attached control client reported TERM {termname!r}; a leaked "
             "'dumb' makes a pane TUI (Codex) refuse to start"
         )
+    finally:
+        await _kill_and_join(sock, task)
+
+
+# ── palette reporting: pane OSC 10/11 probes see the client's colors ──
+
+
+def test_parse_terminal_palette_validates_hex_colors() -> None:
+    """Only a pair of six-digit hex colors survives; junk yields None."""
+    assert parse_terminal_palette("#18181b", "#ffffff") == ("#18181b", "#ffffff")
+    assert parse_terminal_palette(None, "#ffffff") is None
+    assert parse_terminal_palette("#18181b", None) is None
+    assert parse_terminal_palette(123, {"bg": "#ffffff"}) is None
+    assert parse_terminal_palette("#fff", "#ffffff") is None
+    assert parse_terminal_palette("18181b", "ffffff") is None
+    # The value is spliced into a tmux command line: anything that could
+    # smuggle another word or command must be rejected outright.
+    assert parse_terminal_palette("#18181b", "#ffffff; kill-server") is None
+    assert parse_terminal_palette("#18181b", "#ffffff\nkill-server") is None
+    assert parse_terminal_palette("#18181b bold", "#ffffff") is None
+
+
+async def _window_style_option(sock: Path) -> str:
+    """The server's global ``window-style`` option value ("" when unset)."""
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "show-options",
+        "-g",
+        "window-style",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return out.decode().strip()
+
+
+# Reads the pane's tty until quiet, mirroring the OSC 11 background probe a
+# TUI (Codex among them) performs during startup before caching its palette.
+_STARTUP_PROBE = """\
+out="$1"
+exec </dev/tty
+printf '\\033]11;?\\033\\\\' >/dev/tty
+reply=""
+for _ in $(seq 1 64); do
+  IFS= read -r -t 2 -n 1 ch || break
+  reply+="$ch"
+done
+printf '%s' "$reply" >"$out"
+"""
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_palette_reaches_start_on_attach_startup_probe(tmp_path: Path) -> None:
+    """A start-on-attach TUI's startup palette probe sees the attach's colors.
+
+    Replicates terminal.py's ``tmux_start_on_attach`` launch: the pane blocks
+    on a wait-for channel that a client-attached hook signals, then probes the
+    terminal background exactly like a TUI booting on first attach. The bridge
+    must have reported the palette BEFORE its control client attaches, or the
+    probe races it and caches black/no answer — the reported bug.
+    """
+    tmux = shutil.which("tmux")
+    assert tmux
+    tmpdir = Path(tempfile.mkdtemp(prefix="cc-test-"))
+    sock = tmpdir / "tmux.sock"
+    probe = tmp_path / "probe.sh"
+    probe.write_text(_STARTUP_PROBE, encoding="utf-8")
+    reply_path = tmp_path / "reply.bin"
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "-f",
+        os.devnull,
+        "set-hook",
+        "-g",
+        "client-attached",
+        "wait-for -S omnigent-start-on-attach",
+        ";",
+        "new-session",
+        "-d",
+        "-s",
+        "main",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        f"tmux wait-for omnigent-start-on-attach; bash {probe} {reply_path}; sleep 30",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
+
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws,
+            socket_path=str(sock),
+            tmux_target="main",
+            read_only=False,
+            palette=("#18181b", "#ffffff"),
+        )
+    )
+    try:
+        for _ in range(100):
+            if reply_path.exists() and reply_path.stat().st_size > 0:
+                break
+            await asyncio.sleep(0.1)
+        reply = reply_path.read_bytes() if reply_path.exists() else b""
+        assert b"]11;rgb:ffff/ffff/ffff" in reply, (
+            "the startup probe of a start-on-attach pane did not see the "
+            f"attach's background (raw reply: {reply!r})"
+        )
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_theme_frame_restyles_live_attach() -> None:
+    """A ``{"type": "theme"}`` frame re-reports the palette mid-attach."""
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(
+        inbound=[
+            {
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "theme", "fg": "#e4e4e7", "bg": "#131517"}),
+            }
+        ]
+    )
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws,
+            socket_path=str(sock),
+            tmux_target=target,
+            read_only=False,
+            palette=("#18181b", "#ffffff"),
+        )
+    )
+    try:
+        style = ""
+        for _ in range(100):
+            style = await _window_style_option(sock)
+            if "fg=#e4e4e7,bg=#131517" in style:
+                break
+            await asyncio.sleep(0.1)
+        assert "fg=#e4e4e7,bg=#131517" in style, (
+            f"live theme switch never reached tmux (window-style: {style!r})"
+        )
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_read_only_attach_ignores_theme_frames() -> None:
+    """A read-only viewer's theme frame must not restyle the owner's pane."""
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(
+        inbound=[
+            {
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "theme", "fg": "#e4e4e7", "bg": "#131517"}),
+            },
+            # A resize afterwards proves the theme frame was already consumed
+            # (frames are handled in order) before we assert on the option.
+            {
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "resize", "cols": 100, "rows": 30}),
+            },
+        ]
+    )
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=True
+        )
+    )
+    try:
+        tmux = shutil.which("tmux")
+        assert tmux
+        # Wait for the ordered resize to land, then check the style stayed unset.
+        size = ""
+        for _ in range(100):
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                str(sock),
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{window_width}x#{window_height}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            size = out.decode().strip()
+            if size == "100x30":
+                break
+            await asyncio.sleep(0.1)
+        assert size == "100x30"
+        # tmux reports the unset option as its default; any ``fg=`` means the
+        # viewer's colors landed.
+        style = await _window_style_option(sock)
+        assert "fg=" not in style, f"a read-only attach restyled the pane: {style!r}"
     finally:
         await _kill_and_join(sock, task)

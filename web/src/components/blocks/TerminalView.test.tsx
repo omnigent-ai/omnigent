@@ -123,6 +123,24 @@ describe("buildAttachPath", () => {
     expect(path.includes("omnigent_slice_key")).toBe(false);
   });
 
+  it("reports the rendered palette as url-encoded fg/bg params", () => {
+    // WHY: tmux answers pane palette probes (OSC 10/11) from these values;
+    // without them a TUI started in the pane caches a dark palette on a
+    // light terminal. The '#' must be %23-encoded to survive the query.
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, {
+      fg: "#18181b",
+      bg: "#ffffff",
+    });
+    expect(path).toContain("fg=%2318181b");
+    expect(path).toContain("bg=%23ffffff");
+  });
+
+  it("omits fg/bg params when no palette is reported", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", false);
+    expect(path.includes("fg=")).toBe(false);
+    expect(path.includes("bg=")).toBe(false);
+  });
+
   it("url-encodes the session and terminal ids", () => {
     const path = buildAttachPath("conv with space", "terminal/odd:id", false);
     expect(path).toContain("/v1/sessions/conv%20with%20space/");

@@ -74,9 +74,10 @@ def _patch_control_attach(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        palette: tuple[str, str] | None = None,
         on_client_interaction: object = None,
     ) -> None:
-        del websocket, on_client_interaction
+        del websocket, palette, on_client_interaction
         on_attach(socket_path, tmux_target, read_only)
         raise RuntimeError("bridge stopped")
 
@@ -131,6 +132,53 @@ def test_runner_resource_attach_passes_read_only_to_control_bridge(
             pass
 
     assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]
+
+
+def test_runner_resource_attach_forwards_validated_palette_to_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``?fg=/&bg=`` reach the bridge validated; junk and read-only don't.
+
+    The palette is what tmux answers pane OSC 10/11 probes with, so the
+    route must hand a vetted pair to the bridge — and never let a
+    read-only viewer's colors restyle the owner's pane.
+    """
+    registry = TerminalRegistry()
+    _seed_registry(registry, "conv_abc", _make_running_instance("bash", "s1", tmp_path))
+    app = create_runner_app(
+        terminal_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    palettes: list[tuple[str, str] | None] = []
+
+    async def fake_control(
+        websocket: object,
+        *,
+        socket_path: str,
+        tmux_target: str,
+        read_only: bool,
+        palette: tuple[str, str] | None = None,
+        on_client_interaction: object = None,
+    ) -> None:
+        del websocket, socket_path, tmux_target, read_only, on_client_interaction
+        palettes.append(palette)
+        raise RuntimeError("bridge stopped")
+
+    monkeypatch.setattr("omnigent.runner.app.bridge_tmux_control_to_websocket", fake_control)
+
+    for query in (
+        "?fg=%2318181b&bg=%23ffffff",
+        "?fg=junk&bg=%23ffffff",
+        "?read_only=true&fg=%2318181b&bg=%23ffffff",
+    ):
+        with pytest.raises(RuntimeError, match="bridge stopped"):
+            with TestClient(app).websocket_connect(
+                f"/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach{query}"
+            ):
+                pass
+
+    assert palettes == [("#18181b", "#ffffff"), None, None]
 
 
 def test_runner_resource_attach_unknown_terminal_closes_4404(tmp_path: Path) -> None:
@@ -547,7 +595,7 @@ def test_runner_resource_attach_without_registry_closes_4404() -> None:
 
 
 def _make_direct_app(
-    events: list[tuple[str, str, bool]],
+    events: list[tuple[str, str, bool, str | None, str | None]],
 ) -> FastAPI:
     """A direct-attach app whose attach handler records its arguments.
 
@@ -561,8 +609,10 @@ def _make_direct_app(
         session_id: str,
         terminal_id: str,
         read_only: bool = False,
+        fg: str | None = None,
+        bg: str | None = None,
     ) -> None:
-        events.append((session_id, terminal_id, read_only))
+        events.append((session_id, terminal_id, read_only, fg, bg))
         await websocket.accept()  # type: ignore[attr-defined]
         await websocket.close()  # type: ignore[attr-defined]
 
@@ -652,8 +702,8 @@ def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -
 
 
 def test_direct_attach_forwards_attach_params_to_handler() -> None:
-    """The attach wrapper hands session/terminal/read-only through unchanged."""
-    events: list[tuple[str, str, bool]] = []
+    """The attach wrapper hands session/terminal/read-only/palette through unchanged."""
+    events: list[tuple[str, str, bool, str | None, str | None]] = []
     app = _make_direct_app(events)
     with contextlib.suppress(WebSocketDisconnect):
         with TestClient(app).websocket_connect(
@@ -662,7 +712,19 @@ def test_direct_attach_forwards_attach_params_to_handler() -> None:
             headers={"origin": "https://app.example"},
         ):
             pass
-    assert events == [("conv1", "terminal_bash_s1", True)]
+    with contextlib.suppress(WebSocketDisconnect):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv1/resources/terminals/terminal_bash_s1/attach"
+            "?token=sekret-token&fg=%2318181b&bg=%23ffffff",
+            headers={"origin": "https://app.example"},
+        ):
+            pass
+    assert events == [
+        ("conv1", "terminal_bash_s1", True, None, None),
+        # The direct path must report the palette like the relay path does,
+        # or a TUI probing on a loopback attach still caches the wrong colors.
+        ("conv1", "terminal_bash_s1", False, "#18181b", "#ffffff"),
+    ]
 
 
 def test_allowed_origin_for_server_strips_path_and_keeps_port() -> None:

@@ -1,3 +1,5 @@
+import type { TerminalPalette } from "@/components/blocks/TerminalSession";
+
 /** UI-facing terminal record returned by the session resources API. */
 export interface TerminalInfo {
   /** Opaque, stable resource id used for addressing and tab keys. */
@@ -38,9 +40,17 @@ export function parseDirectAttachUrl(value: unknown): string | undefined {
  * params join with ``&``. Mirrors ``buildAttachPath``'s param policy:
  * only emit what is set.
  */
-export function withAttachParams(directAttachUrl: string, readOnly: boolean): string {
+export function withAttachParams(
+  directAttachUrl: string,
+  readOnly: boolean,
+  palette?: TerminalPalette,
+): string {
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
+  if (palette) {
+    params.set("fg", palette.fg);
+    params.set("bg", palette.bg);
+  }
   const qs = params.toString();
   return qs ? `${directAttachUrl}&${qs}` : directAttachUrl;
 }

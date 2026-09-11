@@ -27,9 +27,17 @@ Design notes learned from the protocol (see ``control_bridge`` spike):
   chars, and UTF-8 multibyte alike.
 
 The browser-facing stream uses binary frames for raw pane bytes, text JSON
-frames for resize controls, and binary frames for input. A typed text JSON
-frame carries tmux clipboard updates because outer-client OSC 52 is absent from
-``%output``.
+frames for resize and theme controls, and binary frames for input. A typed text
+JSON frame carries tmux clipboard updates because outer-client OSC 52 is absent
+from ``%output``.
+
+A control client reports its size but has no tty for tmux to learn default
+colors from, so tmux answers pane palette probes (``OSC 10;?`` / ``OSC 11;?``)
+with nothing (detached) or black. TUIs cache that answer at startup and render
+dark surfaces on a light browser canvas. The attach therefore carries the
+browser's rendered default colors, applied as the server's ``window-style``
+BEFORE the control client attaches — ``tmux_start_on_attach`` panes exec their
+TUI on first attach, and its startup probe must already see the real palette.
 
 Tmux's own overlays (``display-popup``, copy-mode, status line) are not delivered
 to control clients. The native cost-approval popup remains available to users
@@ -67,6 +75,7 @@ _logger = logging.getLogger(__name__)
 
 __all__ = [
     "bridge_tmux_control_to_websocket",
+    "parse_terminal_palette",
     "unescape_control_output",
 ]
 
@@ -124,6 +133,66 @@ _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # Correlating the notification with this client's recent input prevents one
 # attached browser from overwriting every other viewer's local clipboard.
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
+
+
+# A client-reported default color. Strict six-digit hex only: the value is
+# spliced into a tmux command line (query param → ``set-option``), so the
+# validation doubles as command-injection containment.
+_PALETTE_COLOR_RE: Final = re.compile(r"#[0-9a-fA-F]{6}\Z")
+
+
+def parse_terminal_palette(fg: object, bg: object) -> tuple[str, str] | None:
+    """Validate a client-reported terminal palette.
+
+    Accepts arbitrary objects so both query-param strings and untrusted JSON
+    values can be passed straight through.
+
+    :param fg: Default foreground as ``#rrggbb``, e.g. ``"#18181b"``.
+    :param bg: Default background as ``#rrggbb``, e.g. ``"#ffffff"``.
+    :returns: ``(fg, bg)`` when both are valid six-digit hex colors, else
+        ``None`` (the attach proceeds without palette reporting).
+    """
+    if not isinstance(fg, str) or not isinstance(bg, str):
+        return None
+    if _PALETTE_COLOR_RE.fullmatch(fg) is None or _PALETTE_COLOR_RE.fullmatch(bg) is None:
+        return None
+    return fg, bg
+
+
+def _window_style_value(palette: tuple[str, str]) -> str:
+    """The ``window-style`` option value for a validated *palette*."""
+    fg, bg = palette
+    return f"fg={fg},bg={bg}"
+
+
+async def _apply_palette_to_server(tmux: str, socket_path: str, palette: tuple[str, str]) -> None:
+    """Set the server's default pane colors to the client's palette.
+
+    ``window-style`` is what tmux resolves a pane's default fg/bg from when it
+    answers ``OSC 10;?`` / ``OSC 11;?`` queries — for attached AND detached
+    panes — so this one option makes palette probes see the colors the browser
+    actually renders. It does not alter ``%output`` or ``capture-pane`` bytes.
+    Best-effort: a failure costs only palette fidelity, never the attach.
+
+    :param tmux: Absolute tmux executable path.
+    :param socket_path: Private tmux server socket.
+    :param palette: Validated ``(fg, bg)`` hex colors.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            socket_path,
+            "set-option",
+            "-g",
+            "window-style",
+            _window_style_value(palette),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+    except (OSError, ValueError):
+        _logger.warning("failed to apply terminal palette on %s", socket_path)
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -502,6 +571,7 @@ async def bridge_tmux_control_to_websocket(
     socket_path: str,
     tmux_target: str,
     read_only: bool,
+    palette: tuple[str, str] | None = None,
     on_client_interaction: Callable[[], None] | None = None,
     reader_done: asyncio.Event | None = None,
     forward_done: asyncio.Event | None = None,
@@ -517,6 +587,11 @@ async def bridge_tmux_control_to_websocket(
     :param tmux_target: The ``-t`` target string identifying the session.
     :param read_only: When ``True``, attach with ``-r`` *and* drop inbound
         binary input frames at the application layer (defense in depth).
+    :param palette: Validated ``(fg, bg)`` default colors of the attaching
+        client's renderer (see :func:`parse_terminal_palette`), or ``None``
+        to leave the server's palette untouched. Applied before the control
+        client attaches so a ``tmux_start_on_attach`` TUI's startup palette
+        probe already sees it; later ``{"type": "theme"}`` frames update it.
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
@@ -539,6 +614,12 @@ async def bridge_tmux_control_to_websocket(
         with contextlib.suppress(RuntimeError):
             await websocket.close(code=WS_CLOSE_INTERNAL_ERROR, reason="tmux not found")
         return
+
+    # Report the client's palette to tmux BEFORE attaching: attaching can exec
+    # a start-on-attach TUI, whose startup OSC 10/11 probe must already get
+    # the real colors (a race here is the dark-palette-on-light-terminal bug).
+    if palette is not None:
+        await _apply_palette_to_server(tmux, socket_path, palette)
 
     # Seed the browser terminal with the current screen BEFORE attaching so no
     # pre-attach content is missing. Failure is non-fatal — a live pane redraw
@@ -754,6 +835,17 @@ async def bridge_tmux_control_to_websocket(
                         except (KeyError, TypeError, ValueError):
                             continue
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
+                    elif isinstance(ctl, dict) and ctl.get("type") == "theme" and not read_only:
+                        # A live theme switch re-reports the client's palette
+                        # so later pane probes see the new colors. Validation
+                        # keeps untrusted JSON out of the tmux command line;
+                        # read-only viewers cannot restyle the owner's pane.
+                        new_palette = parse_terminal_palette(ctl.get("fg"), ctl.get("bg"))
+                        if new_palette is not None:
+                            await _send_command(
+                                f"set-option -g window-style "
+                                f"{_window_style_value(new_palette)}\n".encode()
+                            )
                 elif data is not None and not read_only:
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.

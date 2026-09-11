@@ -38,8 +38,22 @@ Wire protocol on the WebSocket
   follow a tmux copy-mode selection.
 - **Client → server**:
     - **Text frames** are JSON control messages such as
-      ``{"type": "resize", "cols": N, "rows": M}``. Unknown shapes are
-      ignored for forward compatibility.
+      ``{"type": "resize", "cols": N, "rows": M}`` and
+      ``{"type": "theme", "fg": "#rrggbb", "bg": "#rrggbb"}`` (a live
+      theme switch re-reporting the browser terminal's default colors).
+      Unknown shapes are ignored for forward compatibility.
+
+Palette reporting
+-----------------
+
+A tmux control client reports its size but has no tty tmux could learn
+default colors from, so pane palette probes (``OSC 10;?`` / ``OSC 11;?``)
+are answered with black or nothing — TUIs then cache a dark palette on a
+light browser canvas. The attach URL therefore carries the browser
+terminal's rendered default colors as ``?fg=%23rrggbb&bg=%23rrggbb``,
+applied to the pane's tmux server before the control client attaches (see
+``omnigent/terminals/control_bridge.py``). Read-only attaches never apply
+a palette: viewers must not restyle the owner's pane.
     - **Binary frames** are raw input bytes forwarded to tmux. xterm.js's
       ``onData`` callback emits these for keystrokes, pasted text, and mouse
       reports.
@@ -86,7 +100,10 @@ from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.control_bridge import (
+    bridge_tmux_control_to_websocket,
+    parse_terminal_palette,
+)
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -133,6 +150,8 @@ def create_terminal_attach_router(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        fg: str | None = Query(default=None),
+        bg: str | None = Query(default=None),
     ) -> None:
         """
         Attach to a terminal by resource id via WebSocket.
@@ -146,6 +165,10 @@ def create_terminal_attach_router(
         :param terminal_id: Opaque terminal resource id,
             e.g. ``"terminal_bash_s1"``.
         :param read_only: Prevent terminal input when ``True``.
+        :param fg: The browser terminal's default foreground as
+            ``#rrggbb``, or ``None`` when unreported.
+        :param bg: The browser terminal's default background as
+            ``#rrggbb``, or ``None`` when unreported.
         """
         from omnigent.entities.session_resources import (
             resolve_terminal_entry_by_resource_id,
@@ -173,11 +196,18 @@ def create_terminal_attach_router(
             ),
         )
 
+        # Validate the palette once here; both the proxied query string and
+        # the in-process bridge below receive only vetted values.
+        palette = None if read_only else parse_terminal_palette(fg, bg)
+
         ws_factory = get_runner_ws_factory()
         if ws_factory is not None:
             from urllib.parse import urlencode
 
-            qs = urlencode({"read_only": "true" if read_only else "false"})
+            params = {"read_only": "true" if read_only else "false"}
+            if palette is not None:
+                params["fg"], params["bg"] = palette
+            qs = urlencode(params)
             runner_path = (
                 f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
             )
@@ -270,6 +300,7 @@ def create_terminal_attach_router(
                 socket_path=str(entry.instance.socket_path),
                 tmux_target=entry.instance.tmux_target,
                 read_only=read_only,
+                palette=palette,
             )
 
     return router
