@@ -889,11 +889,15 @@ def _build_profile(
     # ----------------------------------------------------------------
     # Extra read roots
     # ----------------------------------------------------------------
+    # Canonicalise like the scratch tmpdir (L2): subpath rules match the
+    # kernel's canonical path, so a symlinked spelling (/tmp → /private/tmp
+    # on macOS) would emit a rule the kernel never sees.
     if policy.read_roots:
         lines.append("")
         lines.append(";; Spec-supplied extra read roots")
         for root in policy.read_roots:
-            lines.append(f"(allow file-read* (subpath {_quote(str(root))}))")
+            canonical_root = str(root.resolve(strict=False))
+            lines.append(f"(allow file-read* (subpath {_quote(canonical_root)}))")
 
     # ----------------------------------------------------------------
     # Extra write roots (excluding cwd which was handled above and
@@ -908,8 +912,9 @@ def _build_profile(
         lines.append("")
         lines.append(";; Spec-supplied extra write roots")
         for root in extra_write_roots:
-            lines.append(f"(allow file-read* (subpath {_quote(str(root))}))")
-            lines.append(f"(allow file-write* (subpath {_quote(str(root))}))")
+            canonical_root = str(root.resolve(strict=False))
+            lines.append(f"(allow file-read* (subpath {_quote(canonical_root)}))")
+            lines.append(f"(allow file-write* (subpath {_quote(canonical_root)}))")
 
     # ----------------------------------------------------------------
     # Per-file write grants (bwrap does similar via --bind-try)
