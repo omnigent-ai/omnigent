@@ -10315,3 +10315,149 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+_TASK_NOTIFICATION_TEXT = (
+    "<task-notification>\n"
+    "<task-id>a815d</task-id>\n"
+    "<tool-use-id>toolu_worker_1</tool-use-id>\n"
+    "<output-file>/private/tmp/worker.out</output-file>\n"
+    "<status>completed</status>\n"
+    '<summary>Agent "Explore spec" finished</summary>\n'
+    "<result>Final verified report.</result>\n"
+    "</task-notification>"
+)
+_TASK_NOTIFICATION_TS = "2026-09-10T13:23:13.274Z"
+
+
+def _notification_entry(
+    content: Any, *, uuid: str = "task-notification-1", queued: bool = False
+) -> dict[str, Any]:
+    """Build one transcript record carrying notification markup."""
+    if queued:
+        return {
+            "type": "attachment",
+            "uuid": uuid,
+            "timestamp": _TASK_NOTIFICATION_TS,
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": "task-notification",
+                "prompt": content,
+            },
+        }
+    return {
+        "type": "user",
+        "uuid": uuid,
+        "timestamp": _TASK_NOTIFICATION_TS,
+        "message": {"role": "user", "content": content},
+    }
+
+
+def _read_notifications(tmp_path: Path, rows: list[dict[str, Any]]) -> Any:
+    """Write rows to JSONL and read them back through the offset reader."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+
+@pytest.mark.parametrize("envelope", ["string", "blocks", "queued"])
+def test_offset_reader_parses_task_notification_envelopes(tmp_path: Path, envelope: str) -> None:
+    """String, list-block, and queued-command envelopes parse identically."""
+    content: Any = (
+        [{"type": "text", "text": _TASK_NOTIFICATION_TEXT}]
+        if envelope == "blocks"
+        else _TASK_NOTIFICATION_TEXT
+    )
+    result = _read_notifications(
+        tmp_path, [_notification_entry(content, queued=envelope == "queued")]
+    )
+
+    assert len(result.task_notifications) == 1
+    notification = result.task_notifications[0]
+    assert notification.task_id == "a815d"
+    assert notification.tool_use_id == "toolu_worker_1"
+    assert notification.status == "completed"
+    assert notification.result == "Final verified report."
+    assert notification.timestamp == _TASK_NOTIFICATION_TS
+    # Parsing leaves conversation items untouched: user records stay a
+    # hidden meta bubble, queued deliveries stay item-less.
+    if envelope == "queued":
+        assert result.items == []
+    else:
+        assert [item.item_type for item in result.items] == ["message"]
+        assert result.items[0].data.get("is_meta") is True
+
+
+def test_offset_reader_dedupes_and_ignores_noise(tmp_path: Path) -> None:
+    """Repeats collapse; id-less markup and queue bookkeeping drop."""
+    entry = _notification_entry(_TASK_NOTIFICATION_TEXT)
+    no_ids = (
+        "<task-notification>\n<status>completed</status>\n"
+        "<result>Done</result>\n</task-notification>"
+    )
+    no_tool_use_id = {
+        "type": "user",
+        "uuid": "agent-result-noid",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "content": "output"}],
+        },
+        "toolUseResult": {"status": "completed"},
+    }
+    bookkeeping = {
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "timestamp": _TASK_NOTIFICATION_TS,
+        "content": _TASK_NOTIFICATION_TEXT,
+    }
+    result = _read_notifications(
+        tmp_path, [entry, entry, _notification_entry(no_ids), no_tool_use_id, bookkeeping]
+    )
+
+    assert len(result.task_notifications) == 1
+
+
+def test_offset_reader_notification_result_falls_back_and_caps(
+    tmp_path: Path,
+) -> None:
+    """A failed stop keeps its summary; an oversized result is capped."""
+    failed = (
+        "<task-notification>\n<task-id>a815d</task-id>\n"
+        "<tool-use-id>toolu_worker_1</tool-use-id>\n"
+        "<status>failed</status>\n"
+        '<summary>Agent "Explore spec" finished</summary>\n'
+        "</task-notification>"
+    )
+    huge = (
+        "<task-notification>\n<task-id>a815d</task-id>\n"
+        "<tool-use-id>toolu_worker_2</tool-use-id>\n"
+        "<status>completed</status>\n"
+        f"<result>{'r' * 5000}</result>\n"
+        "</task-notification>"
+    )
+    rows = [
+        _notification_entry(text, uuid=f"task-notification-{index}")
+        for index, text in enumerate([failed, huge])
+    ]
+    result = _read_notifications(tmp_path, rows)
+
+    assert len(result.task_notifications) == 2
+    assert result.task_notifications[0].result == 'Agent "Explore spec" finished'
+    assert result.task_notifications[1].result == "r" * 4000
+
+
+def test_line_reader_parses_task_notifications(tmp_path: Path) -> None:
+    """The legacy line reader surfaces the same lifecycle records."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(_notification_entry(_TASK_NOTIFICATION_TEXT)) + "\n", encoding="utf-8"
+    )
+    result = claude_native_bridge.read_transcript_items_since_with_position(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert len(result.task_notifications) == 1
+    assert result.task_notifications[0].task_id == "a815d"
+    assert result.task_notifications[0].timestamp == _TASK_NOTIFICATION_TS
