@@ -131,8 +131,9 @@ def test_upload_large_image_is_compressed_under_budget(
     assert resp.status_code in (200, 201), resp.text
     body = resp.json()
     assert body["metadata"]["bytes"] <= IMAGE_MODEL_BUDGET_BYTES
-    # Opaque image re-encodes to JPEG, so the stored name is realigned.
-    assert body["name"] == "screenshot.jpg"
+    # Opaque image re-encodes (WebP preferred, JPEG fallback), so the stored
+    # name is realigned to match the new type.
+    assert body["name"] in ("screenshot.webp", "screenshot.jpg")
 
 
 def test_upload_csv_mislabeled_as_excel_is_accepted(

@@ -1032,7 +1032,7 @@ def test_compress_image_leaves_small_image_untouched() -> None:
 
 
 def test_compress_image_shrinks_opaque_png_under_budget() -> None:
-    """A large opaque PNG is re-encoded (to JPEG) under the budget."""
+    """A large opaque PNG is re-encoded (WebP or JPEG) under the budget."""
     from omnigent.runtime.content_resolver import (
         IMAGE_MODEL_BUDGET_BYTES,
         compress_image_attachment,
@@ -1041,7 +1041,7 @@ def test_compress_image_shrinks_opaque_png_under_budget() -> None:
     result, content_type = compress_image_attachment(_png_bytes_over_budget(), "image/png")
 
     assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
-    assert content_type == "image/jpeg"
+    assert content_type in ("image/webp", "image/jpeg")
     # The stored blob is base64-inlined every turn; the encoded payload must
     # stay under the provider's ~5 MB per-image ceiling.
     assert len(base64.b64encode(result)) < 5 * 1024 * 1024
@@ -1149,6 +1149,35 @@ def test_compress_image_rejects_format_mismatch() -> None:
 
     with pytest.raises(ImageCompressionError):
         compress_image_attachment(bmp, "image/png")
+
+
+def test_compress_image_flattens_mpo_to_primary_frame() -> None:
+    """A multi-picture JPEG (MPO) over budget is compressed, not rejected."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        compress_image_attachment,
+    )
+
+    # High-entropy frames so the MPO's JPEG-compressed frames still exceed the
+    # budget and actually enter compression.
+    side = 2400
+    frames = [Image.frombytes("RGB", (side, side), os.urandom(side * side * 3)) for _ in range(2)]
+    buffer = BytesIO()
+    frames[0].save(buffer, format="MPO", save_all=True, append_images=frames[1:])
+    mpo = buffer.getvalue()
+    assert len(mpo) > IMAGE_MODEL_BUDGET_BYTES
+
+    # Declared image/jpeg (as browsers/OS label MPO photos); should compress the
+    # primary frame rather than 413 as "animated".
+    result, content_type = compress_image_attachment(mpo, "image/jpeg")
+
+    assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
+    assert content_type in ("image/webp", "image/jpeg")
 
 
 def test_compress_image_rejects_oversized_animated(monkeypatch: pytest.MonkeyPatch) -> None:

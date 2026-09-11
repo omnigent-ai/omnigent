@@ -133,13 +133,12 @@ _COMPRESSIBLE_IMAGE_MIMES: frozenset[str] = frozenset(
 
 # Pillow format names that legitimately back each compressible MIME. Used to
 # reject a spoofed extension (e.g. a TIFF/BMP labeled image/png) before we hand
-# 50 MB of untrusted bytes to an unintended decoder. Multi-picture JPEG (MPO)
-# is deliberately excluded: it reports n_frames >= 2, so admitting it would only
-# route it to the animation rejection with a confusing message — asking for a
-# plain JPEG here is clearer.
+# 50 MB of untrusted bytes to an unintended decoder. MPO (multi-picture JPEG,
+# common from phone/stereo cameras) is admitted for image/jpeg and flattened to
+# its primary frame — see the animation gate in compress_image_attachment.
 _ALLOWED_PIL_FORMATS: dict[str, frozenset[str]] = {
     "image/png": frozenset({"PNG"}),
-    "image/jpeg": frozenset({"JPEG"}),
+    "image/jpeg": frozenset({"JPEG", "MPO"}),
     "image/webp": frozenset({"WEBP"}),
     "image/gif": frozenset({"GIF"}),
 }
@@ -294,11 +293,12 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
 
     Already-small images (``<=`` budget) and non-raster types we don't compress
     (SVG, …) are returned unchanged. For still images we search largest-first:
-    alpha images try lossy then lossless WebP then PNG; opaque images try
-    descending-quality JPEG, downscaling the canvas when quality alone isn't
-    enough. An **animated** image over the budget is rejected: we can't
-    re-encode animation, and storing it uncompressed would just fail at the
-    provider at turn time.
+    alpha images try lossy then lossless WebP then PNG; opaque images try WebP
+    (crisper on text than JPEG) then fall back to JPEG, downscaling the canvas
+    when quality alone isn't enough. A multi-picture JPEG (MPO) is flattened to
+    its primary frame. A truly **animated** image over the budget is rejected:
+    we can't re-encode animation, and storing it uncompressed would just fail at
+    the provider at turn time.
 
     :param content: Raw uploaded image bytes.
     :param content_type: The resolved image MIME (``image/*``).
@@ -333,10 +333,13 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
             # ~89 MP warning), so no warnings.catch_warnings() is needed.
             if probe.width * probe.height > IMAGE_MAX_DECODED_PIXELS:
                 raise ImageCompressionError("the image's dimensions are too large to process")
+            probe_format = probe.format
             n_frames = int(getattr(probe, "n_frames", 1))
-        # Animation can't be re-encoded here, and it's over budget, so it
-        # would be rejected by the provider at turn time — reject cleanly now.
-        if n_frames != 1:
+        # True animation can't be re-encoded here and would be rejected by the
+        # provider at turn time — reject cleanly now. MPO is multi-frame but not
+        # animation (its extra frames are alternate stills), so we keep its
+        # primary frame (Image.open positions at frame 0) and compress that.
+        if n_frames != 1 and probe_format != "MPO":
             raise ImageCompressionError(
                 "this animated image is too large to attach; upload a smaller "
                 "or static image instead"
@@ -374,9 +377,13 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
             )
         else:
             base = image.convert("RGB")
-            _encodings = tuple(
-                ("JPEG", "image/jpeg", {"quality": q, "optimize": True, "progressive": True})
-                for q in (85, 70, 55)
+            # WebP first: at a comparable budget it keeps fine text/UI detail
+            # crisper than JPEG (which rings on screenshots), and providers
+            # accept WebP. JPEG is the final fallback.
+            _encodings = (
+                ("WEBP", "image/webp", {"quality": 82, "method": 4}),
+                ("WEBP", "image/webp", {"quality": 68, "method": 4}),
+                ("JPEG", "image/jpeg", {"quality": 75, "optimize": True, "progressive": True}),
             )
 
         # Pre-shrink an oversized canvas to the edge cap before the quality search.
