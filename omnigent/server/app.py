@@ -39,7 +39,14 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    is_cancelled_rpc_error,
+)
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
     ResolvedBundle,
@@ -2016,6 +2023,31 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
+        if is_cancelled_rpc_error(exc):
+            # A peer-cancelled backing call (upstream teardown/restart) is an
+            # expected, retryable condition, not a fault: attribute it as
+            # transient upstream at WARNING — keeping the ERROR stream for real
+            # 500s — and answer with the coded 499 via the standard handler.
+            cancelled = OmnigentError(
+                "The backing service cancelled the call; please retry.",
+                code=ErrorCode.UPSTREAM_CANCELLED,
+            )
+            _logger.warning(
+                "Upstream call cancelled by its peer: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="cancelled",
+                    code=str(cancelled.code),
+                    http_status=str(cancelled.http_status),
+                    error_category=cancelled.category.value,
+                    error_impact=cancelled.impact.value,
+                    error_phase=cancelled.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, cancelled)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real
