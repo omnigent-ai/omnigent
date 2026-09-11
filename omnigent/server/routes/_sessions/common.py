@@ -842,10 +842,8 @@ def host_interactive_shells_for_request(
     runner_router: RunnerRouter | None,
 ) -> list[str]:
     """Return this replica's host shells or signal a misrouted request."""
-    reported = host_registry.interactive_shells(host_id)
     if (
-        reported is None
-        and host_registry.get(host_id) is None
+        host_registry.get(host_id) is None
         and runner_router is not None
         and runner_router.host_is_on_another_replica(host_id)
     ):
@@ -853,7 +851,7 @@ def host_interactive_shells_for_request(
             "host shell inventory is on another replica",
             code=ErrorCode.WRONG_REPLICA,
         )
-    return normalize_interactive_shells(reported)
+    return normalize_interactive_shells(host_registry.interactive_shells(host_id))
 
 
 def set_server_host_registry(host_registry: HostRegistry | None) -> None:

@@ -3250,24 +3250,11 @@ async def test_session_agent_terminals_follow_selected_host(
     app: Any,
     db_uri: str,
 ) -> None:
-    """Native shell choices come from the host; custom choices stay authored."""
+    """Fresh projections use the host for both old and new native sessions."""
     host_id = "6b9c07bfb42f687d53af44f018adebee"
-    HostStore(db_uri).upsert_on_connect(host_id, "bash-only-host", "owner@example.com")
-    app.state.host_registry.register(
-        host_id,
-        AsyncMock(),
-        HostHelloFrame(
-            version="0.1.0-test",
-            frame_protocol_version=1,
-            name="bash-only-host",
-            interactive_shells=["bash"],
-        ),
-        owner="owner@example.com",
-    )
-
     terminal_spec = {
-        "zsh": {
-            "command": "zsh",
+        "bash": {
+            "command": "bash",
             "os_env": {"type": "caller_process", "cwd": "."},
         }
     }
@@ -3281,9 +3268,30 @@ async def test_session_agent_terminals_follow_selected_host(
         native_session["id"], host_id=host_id, workspace="/tmp/native"
     )
 
+    HostStore(db_uri).upsert_on_connect(host_id, "zsh-host", "owner@example.com")
+    app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="zsh-host",
+            interactive_shells=["zsh", "bash"],
+        ),
+        owner="owner@example.com",
+    )
+
     native_response = await client.get(f"/v1/sessions/{native_session['id']}/agent")
     assert native_response.status_code == 200, native_response.text
-    assert native_response.json()["terminals"] == ["bash"]
+    assert native_response.json()["terminals"] == ["zsh", "bash"]
+
+    new_native_session = await _create_session(client, native_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        new_native_session["id"], host_id=host_id, workspace="/tmp/new-native"
+    )
+    new_native_response = await client.get(f"/v1/sessions/{new_native_session['id']}/agent")
+    assert new_native_response.status_code == 200, new_native_response.text
+    assert new_native_response.json()["terminals"] == ["zsh", "bash"]
 
     custom_agent = await create_test_agent(
         client,
@@ -3297,15 +3305,17 @@ async def test_session_agent_terminals_follow_selected_host(
 
     custom_response = await client.get(f"/v1/sessions/{custom_session['id']}/agent")
     assert custom_response.status_code == 200, custom_response.text
-    assert custom_response.json()["terminals"] == ["zsh"]
+    assert custom_response.json()["terminals"] == ["bash"]
 
 
+@pytest.mark.parametrize("cached_inventory", [False, True])
 async def test_host_shell_inventory_miss_returns_wrong_replica(
     client: httpx.AsyncClient,
     app: Any,
     db_uri: str,
+    cached_inventory: bool,
 ) -> None:
-    """Replica-local shell metadata must not fall back before re-addressing."""
+    """Missing or stale replica-local metadata must trigger re-addressing."""
     host_id = "7b9c07bfb42f687d53af44f018adebee"
     HostStore(db_uri).upsert_on_connect(host_id, "remote-host", "owner@example.com")
     native_agent = await create_test_agent(
@@ -3322,6 +3332,19 @@ async def test_host_shell_inventory_miss_returns_wrong_replica(
     SqlAlchemyConversationStore(db_uri).set_host_id(
         session["id"], host_id=host_id, workspace="/tmp/native"
     )
+    if cached_inventory:
+        app.state.host_registry.register(
+            host_id,
+            AsyncMock(),
+            HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="former-local-host",
+                interactive_shells=["bash"],
+            ),
+            owner="owner@example.com",
+        )
+        app.state.host_registry.deregister(host_id)
 
     agent_response = await client.get(f"/v1/sessions/{session['id']}/agent")
     terminal_response = await client.post(

@@ -324,6 +324,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           return;
         case "hosts_changed":
           void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+          void queryClient.invalidateQueries({ queryKey: ["session-agent"] });
           return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
