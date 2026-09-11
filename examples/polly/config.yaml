@@ -317,10 +317,10 @@ os_env:
 # Generic shell terminals for long-running processes (dev servers, watchers, log
 # tails) and ad-hoc shell when sys_os_shell's blocking model doesn't fit. NOT
 # for launching coding agents / sub-agents — those go through sys_session_send.
-# bash and zsh are both offered; the "+ New shell" affordance picks between them.
+# "shell" declares no command, so it runs the host user's login shell ($SHELL);
+# zsh is an explicit alternative. The "+ New shell" affordance picks between them.
 terminals:
   shell:
-    command: bash
     allow_cwd_override: true
     os_env:
       type: caller_process

@@ -106,6 +106,18 @@ class TestLoadFromDict(unittest.TestCase):
                 }
             )
 
+    def test_terminal_without_command_stays_unpinned(self):
+        # A generic terminal that declares no command must not be pinned to
+        # bash at parse time: launch resolves the host user's login shell.
+        a = load_agent_def(
+            {"name": "t", "prompt": "hi", "terminals": {"shell": {"allow_cwd_override": True}}}
+        )
+        self.assertIsNone(a.terminals["shell"].command)
+
+    def test_terminal_string_form_pins_its_command(self):
+        a = load_agent_def({"name": "t", "prompt": "hi", "terminals": {"zsh": "zsh"}})
+        self.assertEqual(a.terminals["zsh"].command, "zsh")
+
     def test_tools_function(self):
         a = load_agent_def(
             {"name": "t", "tools": {"f": {"type": "function", "catalog_path": "a.b.c"}}}

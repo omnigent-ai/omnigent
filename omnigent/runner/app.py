@@ -9588,7 +9588,8 @@ def create_runner_app(
                     cwd=spec_cwd,
                     sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
                 ),
-                command=spec.get("command", "bash"),
+                # No default: an unset command launches the host's login shell.
+                command=spec.get("command"),
                 args=spec.get("args", []),
                 env=spec.get("env", {}),
                 scrollback=spec.get("scrollback", 10000),

@@ -732,7 +732,9 @@ def _parse_terminal_env_spec(data: YamlData | str | bool | None) -> TerminalEnvS
     env = {str(k): str(v) for k, v in env_val.items()}
 
     return TerminalEnvSpec(
-        command=data.get("command", "bash"),
+        # No parse-time default: an absent command resolves to the host's
+        # login shell at launch (create_terminal_instance).
+        command=data.get("command"),
         args=list(data.get("args", [])),
         env=env,
         os_env=os_env,

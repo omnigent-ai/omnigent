@@ -1074,6 +1074,62 @@ def test_create_terminal_instance_propagates_keep_alive_after_exit(
         shutil.rmtree(result.instance.private_dir, ignore_errors=True)
 
 
+@pytest.mark.parametrize(
+    ("login_shell", "expected"),
+    [
+        ("/bin/sh", "sh"),  # known, installed -> honored
+        ("/opt/weird/mycustomsh", "bash"),  # unknown shell -> bash fallback
+        ("", "bash"),  # unset/empty -> bash fallback
+    ],
+)
+def test_create_terminal_instance_unpinned_command_runs_login_shell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    login_shell: str,
+    expected: str,
+) -> None:
+    """
+    A spec with no pinned ``command`` launches the host user's login shell.
+
+    Guards the launch-time default that makes a generic ``shell`` terminal
+    follow ``$SHELL`` instead of always starting bash.
+
+    :param tmp_path: Temporary directory used as the terminal cwd.
+    :param login_shell: Value of ``$SHELL`` in the launching process.
+    :param expected: Shell basename the instance must run.
+    """
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setenv("SHELL", login_shell)
+    spec = TerminalEnvSpec(os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)))
+    result = create_terminal_instance(name="shell", session_key="s1", spec=spec)
+    try:
+        assert result.instance.command == expected
+    finally:
+        shutil.rmtree(result.instance.private_dir, ignore_errors=True)
+
+
+def test_create_terminal_instance_pinned_command_ignores_login_shell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An explicitly pinned ``command`` wins over the user's login shell.
+
+    :param tmp_path: Temporary directory used as the terminal cwd.
+    """
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    spec = TerminalEnvSpec(
+        command="bash",
+        os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)),
+    )
+    result = create_terminal_instance(name="shell", session_key="s1", spec=spec)
+    try:
+        assert result.instance.command == "bash"
+    finally:
+        shutil.rmtree(result.instance.private_dir, ignore_errors=True)
+
+
 @pytest.mark.asyncio
 async def test_launch_keeps_server_alive_when_opted_in(
     tmp_path: Path,

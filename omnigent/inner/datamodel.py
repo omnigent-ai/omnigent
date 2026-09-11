@@ -764,7 +764,9 @@ class TerminalEnvSpec:
     """
     Configuration for a terminal environment.
 
-    :param command: Program to run in the terminal, e.g. ``"bash"``.
+    :param command: Program to run in the terminal, e.g. ``"bash"``. Unset
+        (``None``) launches the host user's login shell (``$SHELL``),
+        falling back to bash.
     :param args: Command arguments, e.g. ``["-lc", "echo hi"]``.
     :param env: Extra environment variables for the terminal process,
         e.g. ``{"CODEX_HOME": "/tmp/codex-home"}``.
