@@ -808,8 +808,9 @@ class SandboxHostLauncher(SandboxLifecycle):
     Every managed-host provider — exec-model or entrypoint-as-host — implements
     this. :meth:`start_host` is abstract here; the exec-model default lives on
     :class:`ExecModelHostLauncher`. Entrypoint-as-host providers (e.g.
-    Kubernetes) inherit this class directly and override :meth:`start_host`
-    without needing any exec transport.
+    Kubernetes) and provider-native host launchers (e.g. Gensee) inherit this
+    class directly and override :meth:`start_host` without needing any exec
+    transport.
     """
 
     def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
@@ -861,7 +862,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
     managed-host bootstrap. A provider that only needs to change how the
     repository is obtained overrides :meth:`materialize_workspace` alone.
 
-    Entrypoint-as-host providers (e.g. Kubernetes) inherit
+    Entrypoint-as-host and provider-native host launchers inherit
     :class:`SandboxHostLauncher` directly and do NOT need ``run()`` or any
     exec transport.
     """
