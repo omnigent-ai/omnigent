@@ -44,23 +44,35 @@ function mintSessionCookie(ses, origin, accessToken, nextPath) {
     request.setHeader("Authorization", `Bearer ${accessToken}`);
     let captured = false;
 
-    function applyFrom(status, setCookies) {
+    // Resolve if a DBAUTH cookie is present — either parsed from the response's
+    // Set-Cookie, or (Electron can strip Set-Cookie from exposed headers while
+    // still storing it) already in the session jar. Otherwise throw, including
+    // the redirect target so a bounce to /login/sso is obvious.
+    async function finish(status, setCookies, locationNote) {
       const dbauth = setCookies.map(parseSetCookie).find((c) => c && c.name === "DBAUTH");
-      if (!dbauth) {
-        reject(new Error(`${SESSION_CREATE_PATH} ${status} but no DBAUTH cookie in the response`));
+      if (dbauth) {
+        await applyCookie(ses, origin, dbauth);
+        console.log(`[omnigent] databricks session: DBAUTH cookie set for ${origin} (via HTTP ${status})`);
         return;
       }
-      applyCookie(ses, origin, dbauth).then(() => {
-        console.log(`[omnigent] databricks session: DBAUTH cookie set for ${origin} (via HTTP ${status})`);
-        resolve();
-      }, reject);
+      const jar = await ses.cookies.get({ url: origin, name: "DBAUTH" });
+      if (jar.length > 0) {
+        console.log(`[omnigent] databricks session: DBAUTH already in session jar (HTTP ${status})`);
+        return;
+      }
+      throw new Error(`${SESSION_CREATE_PATH} HTTP ${status}${locationNote} — no DBAUTH cookie set`);
     }
 
-    // The success case is a 302 to next_url; manual mode surfaces it here.
-    request.on("redirect", (statusCode, _method, _redirectUrl, responseHeaders) => {
+    request.on("redirect", (statusCode, _method, redirectUrl, responseHeaders) => {
       captured = true;
       request.abort(); // we only want the Set-Cookie, not the redirect target
-      applyFrom(statusCode, headerValues(responseHeaders, "set-cookie"));
+      console.log(
+        `[omnigent] databricks session: ${SESSION_CREATE_PATH} -> HTTP ${statusCode}, Location=${redirectUrl}`,
+      );
+      finish(statusCode, headerValues(responseHeaders, "set-cookie"), ` (Location=${redirectUrl})`).then(
+        resolve,
+        reject,
+      );
     });
 
     // A 200 (no redirect) carries the Set-Cookie on the response itself.
@@ -69,11 +81,7 @@ function mintSessionCookie(ses, origin, accessToken, nextPath) {
       const setCookies = headerValues(response.headers, "set-cookie");
       response.on("data", () => {});
       response.on("end", () => {
-        if (status !== 200) {
-          reject(new Error(`${SESSION_CREATE_PATH} returned ${status}`));
-          return;
-        }
-        applyFrom(status, setCookies);
+        finish(status, setCookies, "").then(resolve, reject);
       });
     });
 
