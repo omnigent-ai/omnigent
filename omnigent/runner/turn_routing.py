@@ -437,24 +437,12 @@ def _allow(reason: str, *, terminal: bool = False) -> TurnRouteDecision:
 def already_routed(conv: Any) -> bool:
     """Report whether this session has ever had a routing decision.
 
-    The authoritative "route once" gate, and deliberately NOT
-    ``model_override``: on codex-native the forwarder mirrors
-    ``config.toml``'s model into ``model_override`` at the first
-    ``turn/started``, which lands about a second into the turn — racing,
-    and usually beating, this hook's round trip. Measured on a bare launch,
-    that mirrored value was not even the model the thread was running (the
-    stale-config trap), so neither "is it set?" nor "does it match the live
-    model?" separates a real pin from the mirror. The decision label is
-    written by every routing trigger (create-time, the composer turn gate,
-    and this one) and by nothing else, so it is the honest signal.
-
-    Residual gap: a session that carries a manual ``--model`` / picker pin
-    AND leaves Smart Routing on gets routed once by this hook, where the
-    composer gate would have declined. Closing it needs provenance on
-    ``model_override`` — either the pin sites labelling their writes, or
-    the forwarder no longer posting the launch model as if the user had
-    switched to it. Both are changes to shipping paths that this addition
-    deliberately leaves alone.
+    The authoritative "route once" gate. The decision label is written by
+    every routing trigger (create-time, the composer turn gate, and this
+    one) and by nothing else, so it is the honest signal for "routed
+    before". ``model_override`` is not: a present override may equally be
+    a pin the user made without ever routing, which is
+    :func:`user_pinned_model`'s separate gate.
 
     :param conv: Conversation row for the session.
     :returns: ``True`` when something already routed this session.
@@ -463,6 +451,38 @@ def already_routed(conv: Any) -> bool:
 
     labels = getattr(conv, "labels", None) or {}
     return bool(labels.get(ROUTING_DECISION_LABEL_KEY))
+
+
+def user_pinned_model(conv: Any) -> bool:
+    """Report whether this session's ``model_override`` is its user's own pin.
+
+    ``model_override`` carries REQUESTS only — the picker PATCH, a create's
+    explicit model, a scheduled task's configured model — since harness-side
+    model REPORTS (launch defaults, in-pane ``/model`` switches) land in
+    ``reported_model``. (The codex forwarder once mirrored the launch model
+    into ``model_override`` about a second into the first turn, which is why
+    this hook historically could not read the field at all; the mirror now
+    posts reports.) Routing's own pins are told apart by their labels: a
+    routed turn stamps the decision label :func:`already_routed` reads
+    first, and a Smart Routing create records the routed prompt's
+    fingerprint instead — awaiting a first-prompt claim, or a fresh route
+    for an edited prompt — so that fingerprint marks the override as
+    routing's, not the user's.
+
+    Children are exempt: a routed parent deliberately routes its spawns past
+    an orchestrator-supplied model, the same choice the composer gate makes.
+
+    :param conv: Conversation row for the session.
+    :returns: ``True`` when the session must keep its model unrouted.
+    """
+    from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+
+    if getattr(conv, "model_override", None) is None:
+        return False
+    if getattr(conv, "parent_conversation_id", None) is not None:
+        return False
+    labels = getattr(conv, "labels", None) or {}
+    return not labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY)
 
 
 def out_of_parent_family(
@@ -650,6 +670,23 @@ async def resolve_turn_route(
             session_id,
         )
         return _allow("this session was routed at create on this prompt", terminal=True)
+    if user_pinned_model(conv):
+        # The user chose this session's model themselves (picker PATCH, an
+        # explicit create model, a scheduled task's configured model) and left
+        # Smart Routing on. A pin wins over the router — the same answer the
+        # composer gate and the create path give — so a resumed pane's fresh
+        # hook must not re-pick and switch the session off it. Terminal for
+        # the same reason as "routing is off": pinned is this session's
+        # steady state, so a non-terminal answer would charge every remaining
+        # prompt a full round trip to be told the same thing. The narrow cost
+        # mirrors that gate's — a pin cleared mid-pane routes again only from
+        # the next launch; the composer gate and create-time path are
+        # unaffected.
+        _logger.info(
+            "route-turn: session=%s keeps its user-pinned model; allowing unrouted",
+            session_id,
+        )
+        return _allow("the user pinned this session's model", terminal=True)
 
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])
