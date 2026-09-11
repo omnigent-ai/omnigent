@@ -4,7 +4,7 @@ import type { useFileContent } from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
-import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_CHARS } from "./codeViewerHelpers";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -256,6 +256,28 @@ describe("CodeViewer editor routing", () => {
     renderViewer("# heading", true, "notes.md");
     // Markdown source must NOT route to Monaco — it stays on the Shiki render
     // (TipTap handles markdown editing; Monaco is for non-markdown files).
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+});
+
+describe("CodeViewer oversized markdown fallback", () => {
+  // The markdown block lexer overflows the call stack on multi-MiB buffers,
+  // so oversized markdown must skip the rich editor/preview entirely and
+  // render as Monaco-backed source — like every other large file type.
+  const bigMarkdown = "y".repeat(MAX_RICH_MARKDOWN_CHARS + 1);
+
+  it("routes oversized markdown in editor mode to Monaco, not TipTap", async () => {
+    renderViewer(bigMarkdown, true, "big.md", { viewMode: "editor", truncated: true });
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+  });
+
+  it("routes oversized markdown in preview mode to Monaco, not the rendered preview", async () => {
+    renderViewer(bigMarkdown, true, "big.md", { viewMode: "preview", truncated: true });
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+  });
+
+  it("keeps markdown at the cap on the rich editor path", () => {
+    renderViewer("y".repeat(64), true, "small.md", { viewMode: "editor" });
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
   });
 });
