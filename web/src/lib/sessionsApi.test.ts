@@ -138,6 +138,7 @@ describe("createSession", () => {
       runnerId: undefined,
       hostId: null,
       hostResumable: false,
+      archived: false,
       status: "idle",
       createdAt: 1704067200,
       title: null,
@@ -896,6 +897,38 @@ describe("getSession", () => {
     );
     const session = await getSession("conv_abc");
     expect(session.permissionLevel).toBeNull();
+  });
+
+  it("maps archived from the wire onto the snapshot", async () => {
+    // The snapshot is the only archived-flag carrier for a session opened
+    // directly by URL (the default sidebar list excludes archived rows).
+    // Dropping it at the parse boundary made the header kebab offer
+    // "Archive" on an already-archived session.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+        archived: true,
+      }),
+    );
+    const session = await getSession("conv_abc");
+    expect(session.archived).toBe(true);
+  });
+
+  it("treats a missing archived flag as false", async () => {
+    // Older servers / recorded fixtures omit the field; absent means active.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+      }),
+    );
+    const session = await getSession("conv_abc");
+    expect(session.archived).toBe(false);
   });
 
   it("maps parent_session_id from the wire to parentSessionId", async () => {

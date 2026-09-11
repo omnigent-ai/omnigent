@@ -205,6 +205,22 @@ describe("HeaderConversationMenu", () => {
     });
   });
 
+  it("offers Unarchive on an archived session and unarchives in place", () => {
+    // An archived session reopened by URL must not be re-offered the action
+    // that was already taken; the item flips like the sidebar row's menu.
+    renderMenu({ conversation: { ...CONVERSATION, archived: true } });
+
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+    const item = screen.getByRole("menuitem", { name: "Unarchive" });
+    expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
+
+    fireEvent.click(item);
+    // Just the flag flip: unarchiving keeps the user on the session, so no
+    // redirect home and no Undo toast.
+    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: false });
+  });
+
   it("labels project actions for filed and unfiled sessions", () => {
     // Move to project is mobile-only in this menu now (desktop moved it to the
     // breadcrumb folder tag).
