@@ -970,6 +970,14 @@ class TerminalInstance:
     # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
     # until the process exits or when tmux reports no numeric status.
     _last_exit_status: int | None = field(default=None, repr=False)
+    # Diagnostics for the "tmux unavailable" exit path: the stderr of the last
+    # failed capture-pane probe, and of the has-session probe that then
+    # confirmed the session gone. The has-session stderr is what separates a
+    # whole-server death ("no server running on <socket>" — machine slept, tmux
+    # killed, socket dir reaped) from a single-session kill ("can't find
+    # session"). ``None`` until such a probe fails.
+    _last_capture_probe_error: str | None = field(default=None, repr=False)
+    _last_session_probe_error: str | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1013,6 +1021,37 @@ class TerminalInstance:
     def _remember_pane_snapshot(self, snapshot: str) -> None:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
+
+    def _tmux_gone_diagnostics(self) -> str:
+        """Summarize why tmux vanished, for the "tmux unavailable" exit log.
+
+        The bare exit message can't tell an expected teardown (user quit, the
+        web client just detached, the pane already exited cleanly) from a real
+        fault (a crash frame left in the pane, a whole-server death). This
+        gathers the signals that do: the last capture-pane and has-session
+        stderr, how long since a web client last touched the terminal, any
+        recorded pane exit status, and the tail of the last captured pane.
+
+        :returns: A single-line, ``; ``-joined diagnostic summary.
+        """
+        parts: list[str] = []
+        if self._last_capture_probe_error:
+            parts.append(f"last capture error: {self._last_capture_probe_error}")
+        if self._last_session_probe_error:
+            parts.append(f"has-session said: {self._last_session_probe_error}")
+        if self._last_exit_status is not None:
+            parts.append(f"pane exit status: {self._last_exit_status}")
+        last_interaction = self._last_client_interaction_at
+        if last_interaction == float("-inf"):
+            parts.append("no web client interaction observed")
+        else:
+            idle_s = time.monotonic() - last_interaction
+            parts.append(f"{idle_s:.0f}s since web client interaction")
+        # The bottom of the pane is the most telling: a shell prompt or
+        # "[Process exited]" reads as clean teardown; a traceback as a fault.
+        tail = self.last_pane_text()
+        parts.append(f"last pane tail: {tail[-240:]!r}" if tail else "last pane: <none captured>")
+        return "; ".join(parts)
 
     def last_exit_status(self) -> int | None:
         """Return the inner process's exit code, if the pane has died.
@@ -1488,6 +1527,7 @@ class TerminalInstance:
                 await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
                 continue
             except RuntimeError as exc:
+                self._last_capture_probe_error = str(exc)
                 logger.warning(
                     "tmux capture-pane probe failed for terminal %s:%s: %s",
                     self.name,
@@ -1504,10 +1544,11 @@ class TerminalInstance:
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
                 logger.error(
-                    "tmux unavailable after %d consecutive probes for terminal %s:%s",
+                    "tmux unavailable after %d consecutive probes for terminal %s:%s (%s)",
                     consecutive_capture_failures,
                     self.name,
                     self.session_key,
+                    self._tmux_gone_diagnostics(),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1709,10 +1750,11 @@ class TerminalInstance:
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
                 logger.error(
-                    "tmux unavailable after %d consecutive probes for terminal %s:%s",
+                    "tmux unavailable after %d consecutive probes for terminal %s:%s (%s)",
                     consecutive_capture_failures,
                     self.name,
                     self.session_key,
+                    self._tmux_gone_diagnostics(),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1785,6 +1827,7 @@ class TerminalInstance:
         except _TmuxProcessStartError:
             raise
         except RuntimeError as exc:
+            self._last_capture_probe_error = str(exc)
             logger.warning(
                 "tmux capture-pane probe failed for terminal %s:%s: %s",
                 self.name,
@@ -1806,7 +1849,8 @@ class TerminalInstance:
                 exc,
             )
             return None
-        except RuntimeError:
+        except RuntimeError as exc:
+            self._last_session_probe_error = str(exc)
             return False
         return True
 
@@ -2017,7 +2061,8 @@ class TerminalInstance:
                 exc,
             )
             return None
-        except RuntimeError:
+        except RuntimeError as exc:
+            self._last_session_probe_error = str(exc)
             return False
         return True
 

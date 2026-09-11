@@ -119,6 +119,76 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> N
     assert instance.last_pane_text() == "startup failed\ntry config"
 
 
+def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> None:
+    """The exit-diagnostics summary folds in every signal it has."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    # With nothing recorded yet it still states the baseline both ways.
+    baseline = instance._tmux_gone_diagnostics()
+    assert "no web client interaction observed" in baseline
+    assert "last pane: <none captured>" in baseline
+
+    instance._last_capture_probe_error = "tmux command failed (rc=1): no server running on /tmp/x"
+    instance._last_session_probe_error = "tmux command failed (rc=1): no server running on /tmp/x"
+    instance._last_exit_status = 137
+    instance._remember_pane_snapshot("\x1b[31mSegmentation fault\x1b[0m")
+    instance.note_client_interaction()
+
+    summary = instance._tmux_gone_diagnostics()
+    assert "last capture error: tmux command failed (rc=1): no server running" in summary
+    assert "has-session said: tmux command failed (rc=1): no server running" in summary
+    assert "pane exit status: 137" in summary
+    assert "since web client interaction" in summary
+    assert "last pane tail:" in summary and "Segmentation fault" in summary
+
+
+def test_tmux_unavailable_error_log_carries_the_cause(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The 'tmux unavailable' exit ERROR names why: probe stderr + pane tail.
+
+    Drives the real capture/has-session helpers (both failing) so the log
+    proves the probe errors are recorded and surfaced, not just formattable.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    def _fail(*_args: str) -> str:
+        # The has-session stderr distinguishing a whole-server death.
+        raise RuntimeError("tmux command failed (rc=1): no server running on /tmp/x/default")
+
+    instance._tmux_output_sync = _fail  # type: ignore[method-assign]
+    instance._remember_pane_snapshot("running build...\nTraceback (most recent call last): boom")
+    instance.note_client_interaction()
+    exited = threading.Event()
+
+    with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+        assert exited.wait(timeout=2.0)
+
+    unavailable = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR and "tmux unavailable after" in record.getMessage()
+    ]
+    assert unavailable, "expected a 'tmux unavailable' ERROR"
+    message = unavailable[0]
+    assert "no server running" in message  # has-session stderr → whole-server death
+    assert "since web client interaction" in message
+    assert "Traceback" in message  # last pane tail carried into the exit log
+
+
 def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path) -> None:
     """Successful pane captures reset the consecutive-failure threshold."""
     instance = TerminalInstance(
