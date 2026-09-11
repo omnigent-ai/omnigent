@@ -239,6 +239,10 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
+// The session scrollbar auto-hides this long after the last scroll event, so
+// its thumb only shows while the list is actively being scrolled.
+const SCROLLBAR_HIDE_DELAY_MS = 700;
+
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
@@ -714,9 +718,28 @@ function SidebarImpl({
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);
   const [hasScrolled, setHasScrolled] = useState(false);
+  // Reveal the session scrollbar only while the list is actively scrolling,
+  // fading it back out once scrolling settles.
+  const [isScrolling, setIsScrolling] = useState(false);
+  const scrollIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const markScrolling = useCallback(() => {
+    setIsScrolling(true);
+    if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
+    scrollIdleTimer.current = setTimeout(() => setIsScrolling(false), SCROLLBAR_HIDE_DELAY_MS);
+  }, []);
+  useEffect(
+    () => () => {
+      if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
+    },
+    [],
+  );
   const setScrollContainer = useCallback((node: HTMLElement | null) => {
     scrollContainerRef.current = node;
     setHasScrolled((node?.scrollTop ?? 0) > 0);
+    // A freshly (re)mounted list — e.g. returning from Settings — starts with
+    // the scrollbar hidden.
+    if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
+    setIsScrolling(false);
   }, []);
 
   // Inbox badge — total approval prompts across loaded rows. We read from both
@@ -1225,12 +1248,23 @@ function SidebarImpl({
               />
               <nav
                 ref={setScrollContainer}
-                onScroll={(event) => setHasScrolled(event.currentTarget.scrollTop > 0)}
-                // max-md:pb-14 is the floating Settings chip's clearance: the
+                onScroll={(event) => {
+                  setHasScrolled(event.currentTarget.scrollTop > 0);
+                  markScrolling();
+                }}
+                // max-md:pb-16 is the floating Settings chip's clearance: the
                 // chip is a non-scrolling sibling pinned bottom-right, so
                 // without a gutter the last row's always-visible kebab parks
                 // underneath it and can't be tapped.
-                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-color:var(--muted-foreground)_transparent] [scrollbar-width:thin] max-md:pb-16 md:mr-1 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground [&::-webkit-scrollbar-track]:bg-transparent"
+                className={cn(
+                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16 md:mr-1",
+                  // Reserve a thin gutter on both engines so toggling the thumb
+                  // never reflows the list; only its color changes on scroll.
+                  "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
+                  isScrolling
+                    ? "[scrollbar-color:var(--muted-foreground)_transparent] [&::-webkit-scrollbar-thumb]:bg-muted-foreground"
+                    : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
+                )}
               >
                 <ConversationList
                   conversationsQuery={displayQuery}
