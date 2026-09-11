@@ -155,6 +155,9 @@ class HostHelloFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host, or a startup probe
         that failed) — never treat it as "nothing is gateway-backed".
+    :param interactive_shells: Ordered interactive shells installed on this
+        machine, with its login shell first. ``None`` means an older host did
+        not report an inventory.
     """
 
     version: str
@@ -163,6 +166,7 @@ class HostHelloFrame:
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     gateway_inference: dict[str, bool] | None = None
+    interactive_shells: list[str] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
 
@@ -1122,6 +1126,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
+                "interactive_shells": frame.interactive_shells,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
             }
@@ -1644,6 +1649,11 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        interactive_shells=(
+            _optional_str_list(msg, "interactive_shells")
+            if msg.get("interactive_shells") is not None
+            else None
+        ),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )

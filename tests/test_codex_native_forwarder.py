@@ -226,6 +226,69 @@ def test_refresh_launch_race_ends_on_routed_model(tmp_path: Path) -> None:
     assert state.model == "databricks-gpt-5-6-luna"
 
 
+def test_refresh_effort_from_config_adopts_changed_value(tmp_path: Path) -> None:
+    """``config.toml``'s effort lands on the forwarder state for mirroring.
+
+    This is the path the ``turn/started`` handler uses to learn an in-TUI
+    ``/model`` effort change (which rewrites config.toml with no
+    notification): read config.toml (via the shared ``read_codex_config_effort``)
+    → set ``forwarder_state.effort`` → ``_sync_reasoning_effort_change``
+    mirrors it so the chat composer's effort control updates.
+    """
+    _write_codex_config(tmp_path, 'model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_effort_from_config(tmp_path, state)
+    assert state.effort == "medium"
+
+    # The user picks a new effort in the TUI: /model rewrites config.toml.
+    _write_codex_config(tmp_path, 'model = "gpt-5.5"\nmodel_reasoning_effort = "high"\n')
+
+    fwd._refresh_effort_from_config(tmp_path, state)
+
+    assert state.effort == "high"
+    assert state.last_config_effort == "high"
+
+
+def test_refresh_effort_prefers_pushed_settings_effort_over_stale_config(
+    tmp_path: Path,
+) -> None:
+    """An unchanged config.toml must not roll back a live thread-settings effort.
+
+    An Omnigent-initiated effort change lands thread-level (notified as
+    ``thread/settings/updated``) without rewriting config.toml; the next
+    ``turn/started`` re-read of the unchanged file must keep the pushed
+    effort rather than reverting it one turn after it applied.
+    """
+    _write_codex_config(tmp_path, 'model_reasoning_effort = "medium"\n')
+    state = fwd._CodexForwarderState()
+    # Subscription/turn-time read adopts the pinned launch effort (baseline).
+    fwd._refresh_effort_from_config(tmp_path, state)
+    assert state.effort == "medium"
+    # Omnigent pushes a new effort thread-level; the live notification wins.
+    state.note_thread_settings_updated({"threadSettings": {"effort": "low"}})
+
+    # turn/started re-read: config.toml is UNCHANGED — the pushed effort holds.
+    fwd._refresh_effort_from_config(tmp_path, state)
+
+    assert state.effort == "low"
+
+
+def test_refresh_effort_noop_when_config_has_no_effort(tmp_path: Path) -> None:
+    """A config.toml without an effort key preserves the prior value.
+
+    Absence (or an unreadable file) is not a signal to clear or invent an
+    effort — the forwarder keeps whatever it last learned.
+    """
+    _write_codex_config(tmp_path, 'model = "gpt-5.5"\n')
+    state = fwd._CodexForwarderState()
+    state.effort = "medium"
+
+    fwd._refresh_effort_from_config(tmp_path, state)
+
+    assert state.effort == "medium"
+    assert state.last_config_effort is None
+
+
 def test_note_resume_response_records_model_without_seeding_baseline() -> None:
     """The startup/resume model is recorded but the baseline stays unset.
 
@@ -773,6 +836,91 @@ async def test_elicitation_post_reposts_after_transport_cut_with_same_envelope(
     # Identical (url, envelope) on the retry is the re-park contract.
     assert client.posts[0] == client.posts[1]
     assert client.posts[0][0] == "/v1/sessions/conv_x/hooks/codex-elicitation-request"
+
+
+@pytest.mark.asyncio
+async def test_elicitation_post_resets_backoff_after_a_gateway_severed_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A gateway-severed HELD poll resets the retry backoff; fast failures grow it.
+
+    The front door caps a request at 300s and answers with 504, so a parked
+    approval is severed every five minutes. A backoff that kept doubling
+    pushed the re-POST past the server's re-park grace, which cleared the
+    approval card to "Resolved elsewhere" between polls. Growth belongs to
+    fast failures (a sick or unreachable server), not to a poll the gateway
+    held for its full budget.
+    """
+    loop = asyncio.get_running_loop()
+    clock = {"t": 0.0}
+    monkeypatch.setattr(loop, "time", lambda: clock["t"])
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        """
+        Record the backoff instead of waiting it out.
+
+        :param seconds: Backoff the loop asked for.
+        :returns: None.
+        """
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(fwd, "_elicitation_retry_sleep", _record_sleep)
+    held = fwd._CODEX_ELICITATION_HELD_POLL_FLOOR_SECONDS + 290.0
+    # (held_s, outcome) per attempt: a gateway sever holds the poll for its
+    # full budget, a refused connection fails instantly.
+    script = [
+        (held, "5xx"),
+        (held, "5xx"),
+        (0.0, "cut"),
+        (0.0, "cut"),
+        (held, "5xx"),
+        (0.0, "ok"),
+    ]
+
+    class _ScriptedElicitationClient:
+        """Stub client whose POSTs follow *script*, advancing the fake clock."""
+
+        def __init__(self) -> None:
+            self.posts: list[tuple[str, dict]] = []
+
+        async def post(self, url: str, *, json: dict, timeout: httpx.Timeout) -> httpx.Response:
+            """
+            Fail or succeed per the script, charging the attempt's hold time.
+
+            :param url: Request URL.
+            :param json: Codex JSON-RPC request envelope.
+            :param timeout: Per-attempt budget (ignored by the stub).
+            :returns: 504 for a gateway sever, 200 once the script says so.
+            :raises httpx.ReadError: For an instantly refused connection.
+            """
+            del timeout
+            self.posts.append((url, json))
+            held_s, outcome = script[len(self.posts) - 1]
+            clock["t"] += held_s
+            request = httpx.Request("POST", url)
+            if outcome == "cut":
+                raise httpx.ReadError("connection refused", request=request)
+            if outcome == "5xx":
+                return httpx.Response(504, request=request)
+            return httpx.Response(200, json={"action": "accept"}, request=request)
+
+    client = _ScriptedElicitationClient()
+
+    response = await fwd._post_codex_elicitation_request(
+        client,  # type: ignore[arg-type]  # stub implements the one used method
+        "conv_x",
+        event=_ELICITATION_EVENT,
+    )
+
+    assert response is not None
+    assert response.status_code == 200
+    initial = fwd._CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
+    assert sleeps == [initial, initial, initial, initial * 2, initial * 4], (
+        "a gateway-severed held poll must reset the backoff so the re-POST lands "
+        "inside the server's re-park grace; only fast failures may back off"
+    )
 
 
 @pytest.mark.asyncio

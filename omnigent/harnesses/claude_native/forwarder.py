@@ -4349,37 +4349,13 @@ async def _forward_available_items(
                 )
                 await _write_forward_state_async(bridge_dir, updated)
                 continue
-            if post_may_have_been_delivered(exc):
-                # Ambiguous failure: the server may have committed this
-                # item before the response was lost. External items aren't
-                # deduped, so a retry would duplicate the bubble —
-                # skip it. At worst one item is lost on a flaky POST.
-                _logger.warning(
-                    "Skipping Claude transcript item after an ambiguous POST failure "
-                    "(may already be committed); not retrying to avoid a duplicate; "
-                    "session=%s source_id=%s item_type=%s http_status=%s",
-                    session_id,
-                    item.source_id,
-                    item.item_type,
-                    _http_status_for_log(exc),
-                    exc_info=True,
-                    extra={"session_id": session_id},
-                )
-                retry_tracker.clear(retry_key)
-                seen.add(item.source_id)
-                seen_source_ids.append(item.source_id)
-                updated = TranscriptForwardState(
-                    transcript_path=state.transcript_path,
-                    line_cursor=state.line_cursor,
-                    byte_offset=state.byte_offset,
-                    current_response_id=current_response_id,
-                    seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                    cursor_fingerprint=state.cursor_fingerprint,
-                    settled_response_id=dedupe.settled_response_id,
-                    pending_settled_response_id=dedupe.pending_settled_response_id,
-                )
-                await _write_forward_state_async(bridge_dir, updated)
-                continue
+            # Ambiguous transport failures (request sent, no response seen)
+            # retry like any other transient failure: the POST carries a
+            # ``source_id`` idempotency key and the server dedupes a re-post
+            # of an already-committed item, so a retry can never duplicate
+            # the bubble — while skipping would silently lose the message
+            # from the conversation store whenever the server had NOT
+            # committed it.
             _logger.warning(
                 "Failed to forward Claude transcript item; session=%s source_id=%s "
                 "item_type=%s attempt=%s permanent=%s "

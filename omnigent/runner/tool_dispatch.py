@@ -1480,6 +1480,157 @@ async def _post_child_message_event(
     )
 
 
+async def _send_to_in_flight_child(
+    child_session_id: str,
+    message: str,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    agent: str,
+    title: str,
+    child_display_title: str,
+    wrapper_label: str | None,
+    created_by: str | None = None,
+) -> str:
+    """Steer a message into a sub-agent whose turn is already in flight.
+
+    The message is **posted first**; work tracking is decided only *after* the
+    post succeeds, from the child's post-settled work state, under a per-child
+    lock. Live completion delivery is keyed by child id (the dispatch-id label
+    is read only on restart recovery), so the classify/register step is what
+    governs delivery:
+
+    * post fails — nothing was registered or stamped, so the still-running
+      turn's tracking is untouched and there is nothing to roll back (the child
+      is never torn down);
+    * post succeeds and the child's tracked turn is **still active** — the
+      message was buffered into it, so its single existing work entry is reused
+      verbatim (no re-stamp) and that one completion delivers under it;
+    * post succeeds and no tracked turn is active — the old turn already ended
+      and the server started a new one, or the child was in-flight but untracked
+      locally (e.g. after a runner restart). Either way a fresh entry is
+      registered in ``running`` (not ``launching``, so the launch-timeout reaper
+      leaves it alone) so the new/pre-existing turn's completion is delivered
+      rather than dropped against a drained entry.
+
+    Why the post→classify order is loss-safe: the completion path
+    ``_on_proxy_stream_end`` is synchronous — it frees the turn slot and marks
+    the work entry terminal in one run, with no ``await`` between. On the single
+    event loop the runner shares with its sub-agent turns, that makes those two
+    inseparable, so a turn that had ended by the time we classify is already
+    terminal in the registry — we register fresh for the new turn and never
+    reuse a drained entry. The one residual is benign: if a *buffered* turn
+    completes during the post's response round-trip, we register a fresh
+    ``running`` entry that no turn will complete — a harmless phantom (the real
+    result already delivered under the original entry) that is cleaned up with
+    the rest of the child's work on teardown. Eliminating even that would take
+    the server surfacing its own buffered-vs-accepted disposition back through
+    the message response; delivery is already loss-safe without it.
+
+    Concurrent sends to one child are serialized by the per-child lock so they
+    can't install divergent entries; the lock is cleaned up with the child's
+    work registry (see ``in_flight_send_lock`` /
+    ``unregister_subagent_work_for_session``).
+
+    :param child_session_id: The in-flight child session id.
+    :param message: Steering message text to inject.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The parent session id.
+    :param agent: Sub-agent name, echoed in the handle.
+    :param title: Sub-agent instance title, echoed in the handle.
+    :param child_display_title: Display title for the fan-out registration.
+    :param wrapper_label: Optional child ``omnigent.wrapper`` label.
+    :param created_by: Human actor that sent the nudge, if known.
+    :returns: A JSON handle on success; a descriptive error string otherwise.
+    """
+    from omnigent.runner import app as _runner_app
+
+    # Post first — before any register/stamp — so a failure leaves the live
+    # turn's tracking untouched (nothing to roll back, never a teardown).
+    try:
+        msg_resp = await _post_child_message_event(
+            server_client,
+            child_session_id,
+            content=[{"type": "input_text", "text": message}],
+            created_by=created_by,
+        )
+    except httpx.HTTPError as exc:
+        return (
+            f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if msg_resp.status_code >= 400:
+        return (
+            f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
+            f"{msg_resp.status_code} {msg_resp.text[:200]}"
+        )
+
+    async with _runner_app.in_flight_send_lock(child_session_id):
+        entry = _runner_app.get_subagent_work(child_session_id)
+        if entry is not None and entry.status in ("running", "waiting"):
+            # The tracked turn is still active, so the post was buffered into it.
+            # Reuse the one entry so its single completion delivers under it;
+            # re-stamping/replacing here is what would orphan that completion.
+            work_id = entry.work_id
+        else:
+            # No active tracked turn: the old turn ended and a fresh one started,
+            # or the in-flight turn was untracked locally (post-restart). Track
+            # it freshly so the completion is delivered, directly as "running"
+            # (never "launching") to stay clear of the launch-timeout reaper.
+            work_id = _runner_app.new_subagent_work_id()
+            _runner_app.register_child_session(
+                child_session_id,
+                parent_session_id=conversation_id,
+                title=child_display_title,
+                tool=agent,
+                session_name=title,
+            )
+            fresh = _runner_app.register_subagent_work(
+                parent_session_id=conversation_id,
+                child_session_id=child_session_id,
+                agent=agent,
+                title=title,
+                wrapper_label=wrapper_label,
+                created_by=created_by,
+                work_id=work_id,
+            )
+            fresh.status = "running"
+            # Best-effort dispatch-id stamp for restart recovery only; the
+            # in-memory entry above already makes the completion deliverable, so
+            # a stamp failure degrades recovery but never live delivery.
+            stamp_error = await _patch_subagent_label(
+                server_client,
+                child_session_id,
+                _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY,
+                work_id,
+            )
+            if stamp_error is not None:
+                _logger.warning(
+                    "steered sub-agent %s: dispatch-id stamp failed (%s); live "
+                    "delivery is unaffected, restart recovery for this turn is degraded",
+                    child_session_id,
+                    stamp_error,
+                )
+
+    return json.dumps(
+        {
+            "task_id": child_session_id,
+            "handle_id": child_session_id,
+            "conversation_id": child_session_id,
+            "kind": "sub_agent",
+            "agent": agent,
+            "title": title,
+            "status": "running",
+            "message": (
+                f"Steered the in-flight turn of sub-agent {agent!r} title {title!r}: the "
+                "message was injected into the running turn, which picks it up as it yields. "
+                "The turn's single result still arrives via sys_read_inbox — don't resend to "
+                "await it."
+            ),
+        }
+    )
+
+
 def _subagent_model_from_args(args: _JsonObject) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
@@ -2323,23 +2474,39 @@ async def _execute_subagent_tool(
             )
         child_wrapper_label = _session_wrapper_label(existing)
         existing_work = _runner_app.get_subagent_work(child_session_id)
-        if existing_work is not None and existing_work.status in (
-            "launching",
-            "running",
-            "waiting",
-        ):
+        if existing_work is not None and existing_work.status == "launching":
+            # The child's turn hasn't started streaming yet, so there is no
+            # active turn to inject into and a send now could race a parallel
+            # start. Ask the caller to retry once it is running (a matter of a
+            # beat) rather than post into that gap.
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "already has a launching or running turn. Use a distinct task-based title "
-                "for independent parallel work; reuse this title only to continue the same "
-                "conversation after completion."
+                "is still starting its turn; retry the send in a moment, or use "
+                "a distinct task-based title for independent parallel work."
             )
-        if existing.get("busy") is True:
-            return (
-                f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "is already running. Use a distinct task-based title for independent "
-                "parallel work; reuse this title only to continue the same conversation "
-                "after completion."
+        # A running/waiting child, or one the server reports busy, is steered
+        # into its in-flight turn rather than refused — but on the in-flight
+        # path so its single existing work entry is reused (or, if untracked
+        # after a restart, adopted) instead of replaced. Re-stamping/replacing
+        # the entry before the post is accepted is what would orphan the running
+        # turn's completion (misattributed or lost). The fresh-continuation path
+        # below (register launching, stamp, post) is only for a genuinely idle
+        # child, where the post starts a new turn that emits its own running
+        # edge.
+        _named_in_flight = (
+            existing_work is not None and existing_work.status in ("running", "waiting")
+        ) or existing.get("busy") is True
+        if _named_in_flight:
+            return await _send_to_in_flight_child(
+                child_session_id,
+                message,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                agent=str(sub_agent_name),
+                title=str(session_name),
+                child_display_title=f"{sub_agent_name}:{session_name}",
+                wrapper_label=child_wrapper_label,
+                created_by=dispatch_created_by,
             )
     else:
         _auto_ordinal = False
@@ -2847,15 +3014,32 @@ async def _send_to_existing_session(
     )
     instance_title = parsed.title if parsed.title is not None else (display_title or "")
     existing_work = _runner_app.get_subagent_work(target_session_id)
-    if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
+    if existing_work is not None and existing_work.status == "launching":
+        # No active turn to inject into yet; a send now could race a parallel
+        # start. Ask the caller to retry once it is running.
         return (
-            f"Error: session {target_session_id!r} already has a launching or running turn; "
-            "wait for completion before sending again"
+            f"Error: session {target_session_id!r} is still starting its turn; "
+            "retry the send in a moment"
         )
-    if snap_data.get("busy") is True:
-        return (
-            f"Error: session {target_session_id!r} is already running; "
-            "wait for completion before sending again"
+    # A running/waiting child, or one the server reports busy, is steered into
+    # its in-flight turn on the in-flight path — reusing (or adopting) the one
+    # work entry instead of replacing it, so the running turn's single
+    # completion is never orphaned. The fresh continuation below is only for a
+    # genuinely idle child, where the post starts a new turn.
+    _by_id_in_flight = (
+        existing_work is not None and existing_work.status in ("running", "waiting")
+    ) or snap_data.get("busy") is True
+    if _by_id_in_flight:
+        return await _send_to_in_flight_child(
+            target_session_id,
+            message,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            agent=agent_label,
+            title=instance_title,
+            child_display_title=display_title or "",
+            wrapper_label=_session_wrapper_label(snap_data),
+            created_by=created_by,
         )
     work_id = _runner_app.new_subagent_work_id()
     stamp_error = await _patch_subagent_label(
@@ -6247,6 +6431,18 @@ async def execute_tool(
         )
         output = f"Error: {type(exc).__name__}: {exc}"
 
+    if conversation_id and tool_name == "sys_os_shell":
+        from omnigent.runner.pr_observer import observe_tool_completion
+
+        await asyncio.to_thread(
+            observe_tool_completion,
+            conversation_id,
+            tool_name=tool_name,
+            arguments=args,
+            result=output,
+            successful=not output.startswith("Error:"),
+            source="runner_shell",
+        )
     return output
 
 

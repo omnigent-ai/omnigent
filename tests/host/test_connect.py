@@ -66,6 +66,7 @@ from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -2009,7 +2010,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         workspace="/ws",
         parent_pid=42,
         initial_auth_token="host-bootstrap-bearer",
+        interactive_shells=["zsh", "bash"],
     )
+
+    assert env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] == '["zsh", "bash"]'
 
     # Process essentials + the locale family pass through.
     assert env["PATH"] == "/usr/bin:/bin"
@@ -5929,7 +5933,7 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
 
     seen: dict[str, object] = {}
 
-    def fake_set(root, *, account=None, remote=None):
+    def fake_set(root, *, account=None, remote=None, session_id=None, pr_url=None):
         seen.update({"root": root, "account": account, "remote": remote})
         return {"object": "session.github.info", "ok": True}
 
@@ -5947,3 +5951,43 @@ async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
     """An unknown write op fails loud rather than silently no-op'ing."""
     with pytest.raises(ValueError, match="unknown fs write op"):
         HostProcess._dispatch_fs_write_op("/ws", "bogus", {})
+
+
+@pytest.mark.parametrize("action", ["attach", "remove"])
+async def test_github_pr_update_reports_lock_contention_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    from filelock import FileLock
+
+    from omnigent.host.frames import HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_json", lambda *_a, **_kw: {"number": 42})
+    monkeypatch.setattr(github_resource, "_reference_info", lambda *_a: {"pr": {"number": 42}})
+    url = "https://github.com/example/one/pull/42"
+    registry = SessionPrRegistry("session")
+    registry.record(
+        [PullRequestRef.from_url(url), PullRequestRef.from_url(url.replace("42", "99"))],
+        relationship="created",
+        source="test",
+    )
+    before = registry.path.read_bytes()
+    target = url.replace("42", "100") if action == "attach" else url
+    frame = HostFsWriteFrame(
+        request_id="pr-update",
+        op="github_prs_update",
+        workspace=str(tmp_path),
+        session_id="session",
+        params={"url": target, "action": action},
+    )
+    host = _make_host_process()
+    with FileLock(str(registry.path) + ".lock"):
+        result = host._handle_fs_write(frame)
+    assert result.status == "error"
+    assert result.error_status == 400
+    assert result.error == "PR tracking is busy; try again."
+    assert registry.path.read_bytes() == before
+    assert host._handle_fs_write(frame).status == "ok"
+    assert (target in {entry.url for entry in registry.list()}) == (action == "attach")

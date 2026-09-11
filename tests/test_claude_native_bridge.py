@@ -10355,3 +10355,101 @@ def test_http_ingress_all_interfaces_opt_in_advertises_routable_host(
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_approval_wait_marker_tracks_a_parked_permission_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A touched marker reads fresh, a stale one does not, and clearing removes it.
+
+    The idle pane reaper spares a native pane only while this marker is fresh,
+    so a marker that reads stale mid-wait reproduces the wedge where a reaped
+    pane strands its approval card unanswerable.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT_PARENT", tmp_path / "omnigent-test"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT",
+        tmp_path / "omnigent-test" / "approval-parent" / "approval-waits",
+    )
+
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_wait")
+
+    marker = claude_native_bridge.approval_wait_marker_path("conv_wait")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
+    assert marker.exists()
+    assert claude_native_bridge.approval_wait_is_fresh("conv_wait")
+    # One session's parked prompt must not spare another session's pane.
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_other")
+
+    # Each hook owns its own marker, so one finishing (an AskUserQuestion beside
+    # a permission request, or parallel tool calls) leaves the other's evidence.
+    sibling = marker.with_name(marker.name.replace(f".{os.getpid()}.", f".{os.getpid() + 1}."))
+    assert sibling != marker
+    claude_native_bridge.touch_approval_wait_marker(sibling)
+    claude_native_bridge.clear_approval_wait_marker(marker)
+    assert not marker.exists()
+    assert claude_native_bridge.approval_wait_is_fresh("conv_wait")
+
+    # A stale marker (a hook killed mid-wait) reads idle and is pruned.
+    stale = time.time() - claude_native_bridge.APPROVAL_WAIT_MARKER_TTL_S - 1
+    os.utime(sibling, (stale, stale))
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_wait")
+    assert not sibling.exists()
+
+    # The hook clears on exit, so clearing an absent marker must not raise.
+    claude_native_bridge.clear_approval_wait_marker(marker)
+
+    # A hook subprocess derives the root from the bridge dir it was handed,
+    # which must land on the same path the runner-side reaper checks.
+    bridge_dir = tmp_path / "omnigent-test" / "approval-parent" / "abc123"
+    assert (
+        claude_native_bridge.approval_wait_marker_path("conv_wait", bridge_dir=bridge_dir)
+        == marker
+    )
+
+
+def test_hold_approval_wait_marker_refreshes_until_released(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The held marker is re-touched on a timer and gone once the block exits.
+
+    A direct server holds one POST for the whole wait, so a marker touched
+    only at the start of the attempt read stale after the TTL and the reaper
+    killed the parked pane an hour later.
+    """
+    monkeypatch.setattr(claude_native_bridge, "APPROVAL_WAIT_MARKER_REFRESH_S", 0.02)
+    touches: list[Path] = []
+    real_touch = claude_native_bridge.touch_approval_wait_marker
+
+    def _counting_touch(marker: Path) -> None:
+        """
+        Record a touch, then perform it.
+
+        :param marker: Marker path being touched.
+        :returns: None.
+        """
+        touches.append(marker)
+        real_touch(marker)
+
+    monkeypatch.setattr(claude_native_bridge, "touch_approval_wait_marker", _counting_touch)
+    marker = tmp_path / "approval-waits" / "digest.1234.wait"
+    marker.parent.mkdir()
+
+    with claude_native_bridge.hold_approval_wait_marker(marker):
+        assert marker.exists(), "touched before the block starts"
+        deadline = time.monotonic() + 5.0
+        while len(touches) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(touches) >= 3, "the refresher must keep touching while the block runs"
+    assert not marker.exists()
+    settled = len(touches)
+    time.sleep(0.1)
+    assert len(touches) == settled, "the refresher must stop when the block exits"

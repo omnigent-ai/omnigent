@@ -113,7 +113,7 @@ def test_queued_row_action_icon_geometry_matches_composer(
         expect(strip).to_contain_text(_MSG2)
 
         queued = {label: _measure_icon(page, label) for label in _QUEUED_ACTION_LABELS}
-        reference = _measure_icon(page, "Attach files")
+        reference = _measure_icon(page, "Add")
 
         # Linger briefly so the queued row -- the state under test -- is
         # plainly visible in journey recordings before assertions run.

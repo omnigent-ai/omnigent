@@ -14,6 +14,7 @@ from omnigent.host import connect
 from omnigent.host.connect import HostProcess
 from omnigent.host.daemon_lifecycle import (
     DaemonLifecycleLock,
+    HostDaemonRecord,
     daemon_record_path,
     normalize_daemon_target,
     record_flock_is_held,
@@ -27,10 +28,92 @@ def _write_record(path: Path, pid: int) -> None:
     path.write_text(json.dumps({"pid": pid, "target": "local", "mode": "local"}))
 
 
-def test_normalize_daemon_target() -> None:
-    assert normalize_daemon_target(None) == "local"
-    assert normalize_daemon_target("") == "local"
-    assert normalize_daemon_target("https://x.example.com/") == "https://x.example.com"
+@pytest.mark.parametrize(
+    ("server_url", "expected"),
+    [
+        (None, "local"),
+        ("", "local"),
+        ("https://x.example.com/", "https://x.example.com"),
+        ("HTTPS://X.Example.COM:443/api/", "https://x.example.com/api"),
+        ("http://X.Example.COM:80/", "http://x.example.com"),
+        ("http://X.Example.COM:8080/Path/", "http://x.example.com:8080/Path"),
+        (
+            "https://X.Example.COM/api/?next=/",
+            "https://x.example.com/api?next=/",
+        ),
+        ("https://X.Example.COM/api/#/", "https://x.example.com/api#/"),
+        ("https://[2001:DB8::1]:443/", "https://[2001:db8::1]"),
+        ("unix:///tmp/omnigent.sock/", "unix:///tmp/omnigent.sock"),
+    ],
+)
+def test_normalize_daemon_target(server_url: str | None, expected: str) -> None:
+    assert normalize_daemon_target(server_url) == expected
+
+
+def test_equivalent_server_urls_share_record_path(tmp_path: Path) -> None:
+    canonical = normalize_daemon_target("https://x.example.com/api")
+    equivalent = normalize_daemon_target("HTTPS://X.EXAMPLE.COM:443/api/")
+
+    assert canonical == equivalent
+    assert daemon_record_path(canonical, base_dir=tmp_path) == daemon_record_path(
+        equivalent, base_dir=tmp_path
+    )
+
+
+def test_find_daemon_record_reuses_legacy_url_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent import cli
+
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    legacy_target = "https://X.Example.COM:443/api"
+    legacy_record = cli._HostDaemonRecord(
+        pid=4242,
+        target=legacy_target,
+        mode="server",
+        server_url=legacy_target,
+        log_path="daemon.log",
+        started_at=100,
+    )
+    cli._write_daemon_record(legacy_record)
+
+    canonical_target = normalize_daemon_target("https://x.example.com/api")
+    found = cli._find_daemon_record(canonical_target)
+
+    assert found == legacy_record
+
+
+def test_reuse_legacy_record_probes_its_original_lock_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent import cli
+
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    legacy_target = "https://X.Example.COM:443/api"
+    cli._write_daemon_record(
+        cli._HostDaemonRecord(
+            pid=4242,
+            target=legacy_target,
+            mode="server",
+            server_url=legacy_target,
+            log_path="daemon.log",
+            started_at=100,
+        )
+    )
+    probed_paths: list[Path] = []
+    monkeypatch.setattr(
+        cli,
+        "_record_flock_is_held",
+        lambda path: probed_paths.append(path) or True,
+    )
+    monkeypatch.setattr(cli, "_daemon_host_identity_changed", lambda record: False)
+
+    decision = cli._reuse_existing_daemon_record(
+        normalize_daemon_target("https://x.example.com/api")
+    )
+
+    assert decision.reuse is True
+    assert probed_paths == [cli._daemon_record_path(legacy_target)]
 
 
 def test_record_path_uses_digest(tmp_path: Path) -> None:
@@ -199,7 +282,7 @@ def test_background_daemon_loser_exits_before_connecting(
         owner.release()
 
 
-def _record(target: str, pid: int) -> object:
+def _record(target: str, pid: int) -> HostDaemonRecord:
     from omnigent import cli
 
     return cli._HostDaemonRecord(
@@ -226,18 +309,18 @@ def test_daemon_owner_is_live_flock_then_pid(
     lock = DaemonLifecycleLock.for_target(target, base_dir=tmp_path, pid=999)
     assert lock.acquire() is True
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: False)
-    assert cli._daemon_owner_is_live(_record(target, 999), target) is True
+    assert cli._daemon_owner_is_live(_record(target, 999)) is True
     lock.release()
 
     # Free lock → fall back to pid identity: a pid that is still the
     # recorded daemon (e.g. mid-startup, lock not yet grabbed) → alive.
     monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: True)
-    assert cli._daemon_owner_is_live(_record(target, 999), target) is True
+    assert cli._daemon_owner_is_live(_record(target, 999)) is True
 
     # Free lock + a pid that is no longer the recorded daemon (dead, or
     # recycled to an unrelated process after a reboot) → dead (reapable).
     monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: False)
-    assert cli._daemon_owner_is_live(_record(target, 999), target) is False
+    assert cli._daemon_owner_is_live(_record(target, 999)) is False
 
 
 def test_live_daemon_conflict_uses_flock_then_pid(
@@ -260,6 +343,30 @@ def test_live_daemon_conflict_uses_flock_then_pid(
     # Free lock + dead PID → the owner is gone, so not a conflict.
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: False)
     assert cli._live_daemon_conflict(claimer) is None
+
+
+def test_live_daemon_conflict_probes_legacy_record_lock_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent import cli
+
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    legacy_target = "https://X.Example.COM:443/api"
+    existing = _record(legacy_target, 222)
+    cli._write_daemon_record(existing)
+    probed_paths: list[Path] = []
+    monkeypatch.setattr(
+        cli,
+        "_record_flock_is_held",
+        lambda path: probed_paths.append(path) or True,
+    )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: False)
+
+    canonical_target = normalize_daemon_target("https://x.example.com/api")
+    conflict = cli._live_daemon_conflict(_record(canonical_target, 111))
+
+    assert conflict == existing
+    assert probed_paths == [cli._daemon_record_path(legacy_target)]
 
 
 def _host_with_lock(lock: DaemonLifecycleLock) -> HostProcess:

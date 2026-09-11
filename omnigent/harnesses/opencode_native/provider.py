@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from typing import TYPE_CHECKING
 from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
+    from databricks.sdk.core import Config
+
     from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
@@ -41,6 +44,11 @@ DATABRICKS_GATEWAY_PROVIDER_ID = "databricks-gateway"
 DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
+# Optional deployment default: a ``databricks-*`` serving-endpoint id used when a
+# session pins no compatible model. Unset falls back to the Databricks Claude
+# catalog. Set it in the runner env to steer every session at one endpoint
+# (e.g. ``databricks-kimi-k3``).
+DATABRICKS_GATEWAY_DEFAULT_MODEL_ENV_VAR = "OMNIGENT_DATABRICKS_GATEWAY_MODEL"
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,9 @@ class OpenCodeGatewayResolution:
         ``"https://ws.cloud.databricks.com/serving-endpoints"``.
     :param api_key: Bearer token / API key for the gateway.
     :param model_id: The endpoint/model id, e.g. ``"databricks-claude-sonnet-4-6"``.
+    :param model_ids: Every serving-endpoint the gateway can route to, so opencode's
+        in-session model picker lists them all. ``model_id`` stays the pinned launch
+        default. Empty falls back to just ``model_id``.
     :param provider_id: opencode provider id, e.g. ``"databricks-gateway"``.
     :param provider_name: Human label for the opencode provider block.
     """
@@ -58,6 +69,7 @@ class OpenCodeGatewayResolution:
     base_url: str
     api_key: str
     model_id: str
+    model_ids: tuple[str, ...] = ()
     provider_id: str = DATABRICKS_GATEWAY_PROVIDER_ID
     provider_name: str = DATABRICKS_GATEWAY_PROVIDER_NAME
 
@@ -102,7 +114,9 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
                     "baseURL": resolution.base_url,
                     "apiKey": resolution.api_key,
                 },
-                "models": {resolution.model_id: {"name": resolution.model_id}},
+                "models": {
+                    mid: {"name": mid} for mid in (resolution.model_ids or (resolution.model_id,))
+                },
             }
         },
     }
@@ -314,14 +328,54 @@ def resolve_databricks_gateway(
 
     resolved_model = _gateway_endpoint_for_model(model_id)
     if resolved_model is None:
+        resolved_model = _gateway_endpoint_for_model(
+            os.environ.get(DATABRICKS_GATEWAY_DEFAULT_MODEL_ENV_VAR)
+        )
+    if resolved_model is None:
         resolved_model = model_catalog.resolve_catalog_model(
             "databricks", family="claude"
         ).model_id
+    # List every chat serving-endpoint so opencode's picker offers them all,
+    # with the pinned default first. Best-effort: a failure leaves just the
+    # default (dict.fromkeys de-dupes if the default is also discovered).
+    model_ids = tuple(dict.fromkeys((resolved_model, *_list_gateway_models(config))))
     return OpenCodeGatewayResolution(
         base_url=f"{host}/{_SERVING_ENDPOINTS_PATH}",
         api_key=token,
         model_id=resolved_model,
+        model_ids=model_ids,
     )
+
+
+def _list_gateway_models(config: Config) -> tuple[str, ...]:
+    """
+    List the workspace's chat-capable ``databricks-*`` serving endpoints.
+
+    Reuses the already-authenticated SDK *config* so it shares the gateway's
+    auth. Best-effort: any failure (SDK absent, list denied) returns ``()`` and
+    the caller falls back to the single pinned model. Embedding/rerank endpoints
+    are dropped so the model picker only lists chat models.
+
+    :param config: A ``databricks.sdk.core.Config`` for the gateway workspace.
+    :returns: Endpoint names, e.g. ``("databricks-kimi-k3", ...)``.
+    """
+    try:
+        from databricks.sdk import WorkspaceClient
+
+        client = WorkspaceClient(config=config)
+        ids: list[str] = []
+        for endpoint in client.serving_endpoints.list():
+            name = getattr(endpoint, "name", "") or ""
+            if not name.startswith("databricks-"):
+                continue
+            task = (getattr(endpoint, "task", "") or "").lower()
+            if "embed" in task or "rerank" in task:
+                continue
+            ids.append(name)
+        return tuple(ids)
+    except Exception as exc:  # noqa: BLE001 - SDK absent / list denied / bad shape.
+        _logger.info("opencode Databricks gateway model list failed: %r", exc)
+        return ()
 
 
 def _gateway_endpoint_for_model(model_id: str | None) -> str | None:
@@ -567,3 +621,151 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     result.setdefault("$schema", "https://opencode.ai/config.json")
 
     return result
+
+
+def _configure_opencode_on_demand() -> None:
+    """Run ``ucode configure --agents opencode`` for the connect profile, minting
+    via the broker. Used when the background boot configure has not yet written
+    opencode's config at launch time. Best-effort and quiet."""
+    from omnigent.host.databricks_credential import HOST_DATABRICKS_PROFILE, broker_token_command
+    from omnigent.inner.databricks_executor import _read_databrickscfg_host
+    from omnigent.onboarding.ucode_setup import (
+        build_ucode_configure_command_for_profile,
+        find_ucode_command,
+        ucode_configure_lock,
+    )
+
+    host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+    bearer_command = broker_token_command(host.rstrip("/")) if host else None
+    if not bearer_command:
+        return
+    ucode_config = Path.home() / ".ucode" / "opencode-xdg" / "opencode" / "opencode.json"
+    try:
+        with ucode_configure_lock():
+            # The boot-time all-agent configure may have written opencode's config
+            # while we waited for the lock — skip a redundant run if so.
+            if ucode_config.exists():
+                return
+            argv = build_ucode_configure_command_for_profile(
+                find_ucode_command(), profile=HOST_DATABRICKS_PROFILE, agents=["opencode"]
+            )
+            configure_env = {
+                **os.environ,
+                "DATABRICKS_BEARER_COMMAND": bearer_command,
+                "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,
+            }
+            # ucode has no use for the host's launch token; don't hand it over.
+            configure_env.pop("OMNIGENT_HOST_TOKEN", None)
+            subprocess.run(argv, capture_output=True, timeout=120, env=configure_env)
+    except Exception:  # noqa: BLE001 - best-effort; the caller declines if config is still absent.
+        _logger.info("opencode on-demand ucode configure failed", exc_info=True)
+
+
+def _provider_base_urls_match_host(config: Mapping[str, object], workspace_host: str) -> bool:
+    """True when every opencode provider base URL is HTTPS and shares
+    *workspace_host*'s network location.
+
+    Guards the managed-connect path: a broker bearer is forwarded to whatever
+    ``provider.<id>.options.baseURL`` the on-disk config names, so a stale/other
+    origin must not be trusted. Requires at least one base URL (a provider block
+    with none is not a usable gateway target).
+    """
+    from omnigent.host.databricks_credential import https_url_on_workspace_host
+
+    providers = config.get("provider")
+    if not isinstance(providers, Mapping):
+        return False
+    saw_url = False
+    for provider in providers.values():
+        options = provider.get("options") if isinstance(provider, Mapping) else None
+        base_url = options.get("baseURL") if isinstance(options, Mapping) else None
+        if not isinstance(base_url, str) or not base_url:
+            continue
+        saw_url = True
+        if not https_url_on_workspace_host(base_url, workspace_host):
+            return False
+    return saw_url
+
+
+def managed_connect_opencode_config(xdg_config_home: Path) -> dict[str, object] | None:
+    """Consume ucode's generated opencode config on a managed connect host.
+
+    The opencode counterpart to Claude reading ``read_ucode_state``: on a managed
+    connect host, ``ucode configure --agents opencode`` (run at host boot) writes
+    ``~/.config/opencode/opencode.json`` (provider block + served-model selectors)
+    and a ``plugin/ucode-auth.js`` that mints a fresh Databricks token per request
+    via ``ucode auth-token`` (→ the broker). omnigent isolates opencode to a
+    per-session ``XDG_CONFIG_HOME``, so this reuses ucode's output: it returns
+    ucode's config (to seed the session ``opencode.json``) after copying the auth
+    plugin into the session plugin dir and pointing ``plugin`` at the copy.
+
+    Reuse over reinvention — the same ucode artifact serves OSS connect sandboxes
+    here, lakebox (via ``ucode opencode``), and ucode's own users; refresh comes
+    from ucode's plugin, not a static omnigent-minted token.
+
+    Returns ``None`` off a managed connect host (no broker sidecar) or when ucode
+    did not generate an opencode config — so laptop and non-connect launches are
+    untouched. The caller must also forward ``DATABRICKS_BEARER_COMMAND`` into the
+    opencode process env so the plugin's ``ucode auth-token`` can mint.
+    """
+    from omnigent.host.databricks_credential import _read_sidecar, _sidecar_path
+
+    sidecar = _read_sidecar(_sidecar_path())
+    if sidecar is None:
+        return None  # not a managed connect host
+    workspace_host = sidecar["workspace_host"].rstrip("/")
+
+    # ucode writes opencode's config into its own XDG root, not ~/.config/opencode.
+    ucode_config_dir = Path.home() / ".ucode" / "opencode-xdg" / "opencode"
+    ucode_config = ucode_config_dir / "opencode.json"
+    if not ucode_config.exists():
+        # The boot-time configure_ucode_for_sandbox runs in the background and may
+        # not have written opencode's config yet when this launch resolves. Unlike
+        # claude/codex/pi, opencode has no working hand-built fallback on the
+        # connect path, so configure it on demand here (a few seconds, off the
+        # runner's dial-back path). Best-effort; a failure just declines below.
+        _configure_opencode_on_demand()
+    try:
+        config = json.loads(ucode_config.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        _logger.info("opencode managed config: unreadable ucode config %s: %r", ucode_config, exc)
+        return None
+    if not isinstance(config, dict) or "provider" not in config:
+        _logger.info(
+            "opencode managed config: ucode did not configure opencode (no provider block in %s); "
+            "opencode falls back to its own login.",
+            ucode_config,
+        )
+        return None  # ucode did not configure opencode (e.g. not in --agents)
+    # Security: the config on disk carries the provider base URL, and we forward a
+    # freshly-minted broker bearer to it. A stale config (left from a previous
+    # workspace connection) or a locally-modified file could aim that bearer at a
+    # different origin. Only trust it when every provider base URL is HTTPS and
+    # targets the sidecar's current workspace host.
+    if not _provider_base_urls_match_host(config, workspace_host):
+        _logger.warning(
+            "opencode managed config: provider base URL is not HTTPS on the connected "
+            "workspace host %r — declining so the broker bearer is not forwarded to an "
+            "unverified origin.",
+            workspace_host,
+        )
+        return None
+
+    ucode_plugin = ucode_config_dir / "plugin" / "ucode-auth.js"
+    try:
+        plugin_src = ucode_plugin.read_text(encoding="utf-8")
+    except OSError as exc:
+        _logger.info(
+            "opencode managed config: provider block present but the refresh plugin %s is "
+            "unreadable (%r); declining so no static bearer is used.",
+            ucode_plugin,
+            exc,
+        )
+        return None  # provider block without the refresh plugin is not usable
+    session_plugin_dir = xdg_config_home / "opencode" / "plugin"
+    session_plugin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    session_plugin = session_plugin_dir / "ucode-auth.js"
+    session_plugin.write_text(plugin_src, encoding="utf-8")
+    # Point at the session copy; the caller appends its own policy plugin.
+    config["plugin"] = [str(session_plugin)]
+    return config

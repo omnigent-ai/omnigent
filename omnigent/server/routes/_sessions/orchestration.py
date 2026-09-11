@@ -129,12 +129,14 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
+    MANAGED_REPO_LABEL_KEY,
     ManagedHostLaunch,
     ManagedLaunchTracker,
     ManagedSandboxDeployment,
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
+    read_managed_repo_workspaces,
 )
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -590,7 +592,9 @@ def _schedule_deferred_elicitation_clear(
     blocked in the native terminal; clearing immediately wiped the only
     surface a headless sub-agent's user can answer from. A hook that
     died for real never re-parks, so the clear still fires after the
-    grace and badges don't stick.
+    grace and badges don't stick. That clear carries
+    ``reason="unanswered"``: nobody decided anything, so the card can say
+    the prompt expired instead of implying someone resolved it elsewhere.
 
     :param session_id: Session that owns the elicitation, e.g.
         ``"conv_abc123"``.
@@ -614,13 +618,14 @@ def _schedule_deferred_elicitation_clear(
         if elicitation_id in _harness_elicitation_registry:
             # Re-parked — the new wait owns the eventual clear.
             return
-        _publish_elicitation_resolved(session_id, elicitation_id)
+        _publish_elicitation_resolved(session_id, elicitation_id, reason="unanswered")
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_resolved_to_ancestors,
                 conversation_store,
                 session_id,
                 elicitation_id,
+                reason="unanswered",
             )
 
     task = asyncio.create_task(_clear_after_grace())
@@ -794,31 +799,41 @@ def _spawn_archive_stop(
 
 def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
     """
-    Collapse per-user pin keys to the canonical pin label for one viewer.
+    Collapse the dynamic-suffix label families to their canonical bare keys.
 
-    Pins are stored per-user as ``omnigent.pinned.<user>`` (see
-    :func:`pinned_label_key`). On the wire we present a single canonical
-    ``omnigent.pinned`` key — set iff THIS viewer pinned the session — and drop
-    every ``omnigent.pinned.*`` key. That keeps the per-user dimension server-
-    side (a viewer never sees who else pinned a shared session, and the client
-    reads the same bare key it writes) and stops other users' pin keys from
-    bloating the payload.
+    Two families are stored under indexed/per-user keys but presented on the
+    wire as one bare key, so the client reads the same key it writes:
+
+    - Pins are stored per-user as ``omnigent.pinned.<user>`` (see
+      :func:`pinned_label_key`); we present a single ``omnigent.pinned`` set iff
+      THIS viewer pinned the session, and drop every ``omnigent.pinned.*`` key.
+      That keeps the per-user dimension server-side and stops other users' pins
+      from bloating the payload.
+    - Sandbox repos are stored one per repo as ``omnigent.sandbox.repo.<index>``
+      (avoiding the 256-char label-value cap); we present the canonical
+      ``omnigent.sandbox.repo`` as the space-joined list so clients that read
+      the bare key (e.g. the fork dialog) see every repo.
 
     :param labels: The stored conversation labels.
     :param user_id: The requesting viewer, or ``None`` in single-user mode.
-    :returns: A copy with all ``omnigent.pinned.*`` keys removed and the
-        canonical ``omnigent.pinned`` key added when the viewer's own pin
-        is present.
+    :returns: A copy with the pin and sandbox-repo families collapsed to their
+        canonical bare keys.
     """
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
+    repos = read_managed_repo_workspaces(labels)
     cleaned = {
         k: v
         for k, v in labels.items()
-        if k != PINNED_LABEL_KEY and not k.startswith(f"{PINNED_LABEL_KEY}.")
+        if k != PINNED_LABEL_KEY
+        and not k.startswith(f"{PINNED_LABEL_KEY}.")
+        and k != MANAGED_REPO_LABEL_KEY
+        and not k.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
     }
     if my_pin is not None:
         cleaned[PINNED_LABEL_KEY] = my_pin
+    if repos:
+        cleaned[MANAGED_REPO_LABEL_KEY] = " ".join(repos)
     return cleaned
 
 
@@ -2941,7 +2956,7 @@ async def _run_managed_launch(
     session_id: str,
     owner: str,
     sandbox_config: ManagedSandboxDeployment,
-    repo: RepoWorkspace | None,
+    repos: Sequence[RepoWorkspace],
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3030,7 +3045,7 @@ async def _run_managed_launch(
         session_id=session_id,
         owner=owner,
         sandbox_config=sandbox_config,
-        repo=repo,
+        repos=repos,
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
@@ -3613,29 +3628,29 @@ def _kick_managed_relaunch(
         agent store the classifier is re-derived from.
     """
     from omnigent.server.managed_hosts import (
-        MANAGED_REPO_LABEL_KEY,
         parse_repo_workspace,
+        read_managed_repo_workspaces,
     )
 
-    # Re-clone the repository the session was created with so the
-    # fresh generation's workspace matches the create-time state.
-    # The label holds the raw create-time value, already validated
-    # by the create's parse — a parse failure here means the label
-    # was tampered with, and the relaunch proceeds with an empty
-    # workspace rather than dying.
-    repo = None
-    raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
-    if raw_repo is not None:
+    # Re-clone the repositories the session was created with so the fresh
+    # generation's workspace matches the create-time state. The per-repo labels
+    # hold the raw create-time values, already validated by the create's parse —
+    # a parse failure here means a label was tampered with, and the relaunch
+    # proceeds with an empty workspace rather than dying.
+    repos: list[RepoWorkspace] = []
+    raw_workspaces = read_managed_repo_workspaces(conv.labels)
+    if raw_workspaces:
         try:
-            repo = parse_repo_workspace(raw_repo)
+            repos = [parse_repo_workspace(w) for w in raw_workspaces]
         except ValueError:
             _logger.warning(
-                "Session %s has an unparseable %s label (%r); relaunching with an empty workspace",
+                "Session %s has an unparseable sandbox repo label (%r); "
+                "relaunching with an empty workspace",
                 session_id,
-                MANAGED_REPO_LABEL_KEY,
-                raw_repo,
+                raw_workspaces,
                 extra={"session_id": session_id},
             )
+            repos = []
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
@@ -3658,7 +3673,7 @@ def _kick_managed_relaunch(
             session_id=session_id,
             owner=host.user_id,
             sandbox_config=sandbox_config,
-            repo=repo,
+            repos=repos,
             tracker=tracker,
             conversation_store=conversation_store,
             host_store=host_store,
@@ -6872,6 +6887,7 @@ async def _relay_runner_stream_once(
                                 session_id,
                                 elicitation_id,
                                 event.get("action"),
+                                reason=event.get("reason"),
                             )
                         continue
                     session_stream.publish(session_id, event)
@@ -7059,6 +7075,11 @@ async def _ensure_runner_relay_ready_impl(
             "Timed out waiting for runner stream relay to subscribe",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
+    # The runner just acknowledged this session's stream. A session bound after
+    # the tunnel connected has no ``runner_last_seen`` until the next ping; stamp
+    # it here so a server recycle in that window cannot read it as orphaned.
+    if runner_id is not None:
+        session_live_state.touch_runner_liveness([runner_id])
     return handle
 
 

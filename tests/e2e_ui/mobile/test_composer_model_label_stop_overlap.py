@@ -23,8 +23,7 @@ Harness notes:
   is patched into a claude-native session on a Databricks workspace model at
   ``xhigh`` effort — the exact shape the reporter's session has — the same
   route-patch approach as ``chat/test_claude_model_picker.py``. The catalog
-  rows carry a ``databricks`` ``source`` so the label renders inside the
-  ``composer-model-source`` tooltip wrapper, exactly as on a real Databricks
+  rows carry a ``databricks`` ``source``, exactly as on a real Databricks
   workspace session.
 - The turn is held open with the mock LLM's ``block`` gate (released in the
   ``finally``), so the Stop button is genuinely showing while the geometry
@@ -262,7 +261,7 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
 
         # The reporter's label must actually be on screen, or the geometry
         # assertions below would vacuously pass.
-        label = page.get_by_test_id("composer-model-effort-label")
+        label = page.get_by_test_id("composer-agent-config-value")
         expect(label).to_be_visible(timeout=15_000)
         expect(label).to_contain_text(_MODEL_ID)
 
@@ -310,48 +309,30 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         reset_mock_llm(mock_llm_server_url)
 
 
-def test_composer_compacts_plan_and_goal_labels_when_action_row_is_narrow(
+def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Narrow composer rows preserve model space without dropping the gear.
-
-    :param page: Playwright page fixture (fresh context per test).
-    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
-    :returns: None.
-    """
+    """Keep Goal and Plan reachable in the shared Add menu at both widths."""
     base_url, session_id = seeded_session
-
     page.set_viewport_size(_IPHONE_VIEWPORT)
     _patch_session_as_databricks_codex_native(page, session_id)
-
     try:
         page.goto(f"{base_url}/c/{session_id}")
-
-        plan = page.get_by_role("button", name="Enter Plan mode")
-        goal = page.get_by_role("button", name="Set Codex goal")
-        gear = page.get_by_role("button", name="Configure session")
-        expect(plan).to_be_visible(timeout=15_000)
-        expect(goal).to_be_visible(timeout=15_000)
-        expect(gear).to_be_visible(timeout=15_000)
-
-        plan_text = plan.locator("span", has_text="Plan")
-        goal_text = goal.locator("span", has_text="Goal")
-        expect(plan_text).to_be_hidden()
-        expect(goal_text).to_be_hidden()
-
-        page.set_viewport_size({"width": 1200, "height": _IPHONE_VIEWPORT["height"]})
-        action_row = page.get_by_test_id("composer-action-row")
-        action_row.evaluate(
-            "element => { element.style.width = '31rem'; element.style.alignSelf = 'center'; }"
-        )
-        expect(plan_text).to_be_hidden()
-        expect(goal_text).to_be_hidden()
-        expect(gear).to_be_visible()
-
-        action_row.evaluate("element => { element.style.width = '34rem'; }")
-        expect(plan_text).to_be_visible()
-        expect(goal_text).to_be_visible()
-        expect(gear).to_be_visible()
+        for viewport in [_IPHONE_VIEWPORT, {"width": 1200, "height": 852}]:
+            page.set_viewport_size(viewport)
+            trigger = page.get_by_test_id("composer-attach")
+            expect(trigger).to_be_visible()
+            expect(page.get_by_test_id("composer-config-gear")).to_be_visible()
+            trigger.click()
+            for action_id in ["composer-plan-action", "composer-goal-action"]:
+                action = page.get_by_test_id(action_id)
+                expect(action).to_be_visible()
+                expect(action).to_be_enabled()
+                bounds = _box(action)
+                assert bounds["x"] >= 0
+                assert bounds["x"] + bounds["width"] <= viewport["width"]
+            page.keyboard.press("Escape")
+            expect(trigger).to_be_focused()
     finally:
         page.unroute_all(behavior="ignoreErrors")

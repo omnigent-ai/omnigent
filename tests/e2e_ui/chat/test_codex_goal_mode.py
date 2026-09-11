@@ -83,9 +83,10 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     assert requests[0]["body"]["model"] == "mock-model"
     assert "Bootstrap the mocked goal-mode e2e thread." in str(requests[0]["body"]["input"])
 
-    goal_toggle = page.get_by_test_id("goal-toggle")
+    page.get_by_test_id("composer-attach").click()
+    goal_toggle = page.get_by_test_id("composer-goal-action")
     expect(goal_toggle).to_be_visible(timeout=30_000)
-    expect(goal_toggle).to_have_attribute("aria-label", "Set Codex goal")
+    expect(goal_toggle).to_contain_text("Goal")
 
     with page.expect_response(_goal_response(session.session_id, "GET")):
         goal_toggle.click()
@@ -129,4 +130,6 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
         page.get_by_test_id("goal-clear").click()
     expect(page.get_by_test_id("goal-empty")).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("composer-goal-mode")).to_have_count(0)
-    expect(goal_toggle).to_have_attribute("aria-label", "Set Codex goal")
+    page.keyboard.press("Escape")
+    page.get_by_test_id("composer-attach").click()
+    expect(goal_toggle).to_contain_text("Goal")

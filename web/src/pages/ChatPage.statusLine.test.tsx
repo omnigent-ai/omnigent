@@ -3,8 +3,9 @@ import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
@@ -25,7 +26,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
 vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => ({ data: undefined }),
+  useGithubInfo: () => useGithubInfoMock(),
+}));
+vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileViewerContextModule>()),
+  useOpenGithubTab: () => openGithubTabMock,
 }));
 
 // HostBadge now lives in the status-line tray (left of the worktree branch).
@@ -33,10 +38,18 @@ vi.mock("@/hooks/useGithub", () => ({
 // renders deterministically without a QueryClient / RunnerHealth provider. The
 // default is "not host-bound", so the badge self-hides and the existing branch/
 // ring/harness assertions are unchanged; host-aware tests override per case.
-const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(() => ({
+const {
+  useSessionMock,
+  useHostsMock,
+  useSessionHostOnlineMock,
+  useGithubInfoMock,
+  openGithubTabMock,
+} = vi.hoisted(() => ({
   useSessionMock: vi.fn(),
   useHostsMock: vi.fn(),
   useSessionHostOnlineMock: vi.fn(),
+  useGithubInfoMock: vi.fn(),
+  openGithubTabMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
@@ -135,6 +148,8 @@ describe("Composer status line (branch + context ring)", () => {
     });
     useHostsMock.mockReset().mockReturnValue({ data: [] });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
+    useGithubInfoMock.mockReset().mockReturnValue({ data: undefined });
+    openGithubTabMock.mockReset();
     useChatStore.setState({
       conversationId: "conv_test",
       skills: [],
@@ -173,6 +188,42 @@ describe("Composer status line (branch + context ring)", () => {
     useChatStore.setState({ sessionCostUsd: 0.5 });
     renderComposer();
     expect(statusLine()).toBeNull();
+  });
+
+  it.each([
+    {
+      scenario: "a single PR from an older host",
+      data: { pr: { number: 42 } },
+      label: "#42",
+    },
+    {
+      scenario: "one tracked PR without fetched metadata",
+      data: { prs: [{ number: 42 }], pr: null },
+      label: "#42",
+    },
+    {
+      scenario: "multiple PRs with a selected PR",
+      data: { prs: [{ number: 42 }, { number: 42 }], pr: { number: 42 } },
+      label: "2 PRs",
+    },
+    {
+      scenario: "multiple PRs without fetched metadata",
+      data: { prs: [{ number: 42 }, { number: 43 }, { number: 44 }], pr: null },
+      label: "3 PRs",
+    },
+  ])("links $scenario to the GitHub panel", ({ data, label }) => {
+    useGithubInfoMock.mockReturnValue({ data });
+    renderComposer();
+    const indicator = screen.getByRole("button", { name: label });
+    expect(indicator).toHaveTextContent(label);
+    fireEvent.click(indicator);
+    expect(openGithubTabMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the PR indicator when the tracked list is empty", () => {
+    useGithubInfoMock.mockReturnValue({ data: { prs: [], pr: null } });
+    renderComposer();
+    expect(screen.queryByTestId("composer-pr-link")).not.toBeInTheDocument();
   });
 
   it("shows the context ring with the correct used percentage", () => {
@@ -260,23 +311,24 @@ describe("Composer status line (branch + context ring)", () => {
     expect(branch).toHaveTextContent("feature/a-very-long-worktree-branch-name-that-would-wrap");
     // `truncate` (overflow-hidden + ellipsis + nowrap) is the guard that
     // keeps a long branch from wrapping the tray onto a second line.
-    expect(branch).toHaveClass("truncate");
+    expect(branch.querySelector(".truncate")).toBeTruthy();
+    expect(branch.closest('[data-testid="composer-workspace-controls"]')).toBeTruthy();
   });
 
-  it("renders the tray with a branch even when the ring is absent", () => {
+  it("keeps the branch in the shared top bar without an empty footer", () => {
     // The branch alone is enough to surface the tray — the visibility
     // guard must not key off the ring only.
     useChatStore.setState({ gitBranch: "main" });
     renderComposer();
-    expect(statusLine()).not.toBeNull();
+    expect(statusLine()).toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("main");
   });
 
-  it("shows no branch when the session uses no worktree", () => {
+  it("shows an honest placeholder before a branch is reported", () => {
     useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000, gitBranch: null });
     renderComposer();
     expect(statusLine()).not.toBeNull();
-    expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("No branch reported");
   });
 
   it("shows a persistent Plan mode badge when Codex Plan mode is active", () => {
@@ -298,7 +350,7 @@ describe("Composer status line (branch + context ring)", () => {
     );
   });
 
-  it("renders the tray for a host-bound session with no branch or ring", () => {
+  it("keeps a bound host visible in the shared toolbar without an empty footer", () => {
     // Regression: removing the harness label from the tray must not take the
     // host badge + context footer with it. A host-bound session (e.g. a codex
     // session with no worktree branch, before the ring populates) still shows
@@ -307,26 +359,28 @@ describe("Composer status line (branch + context ring)", () => {
     useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
     renderComposer();
 
-    expect(statusLine()).not.toBeNull();
-    expect(screen.getByTestId("host-badge")).toHaveTextContent("mac-laptop");
+    expect(statusLine()).toBeNull();
+    expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName(
+      "Host mac-laptop, online",
+    );
   });
 
-  it("shows the host badge to the left of the worktree branch", () => {
+  it("places the host in the action row below the shared workspace bar", () => {
     // The host indicator moved out of the chat header into this tray; it
     // sits immediately left of the worktree branch.
     bindHost("mac-laptop");
     useChatStore.setState({ gitBranch: "geist" });
     renderComposer();
 
-    const host = screen.getByTestId("host-badge");
+    const host = screen.getByTestId("composer-host-select");
     const branch = screen.getByTestId("composer-git-branch");
-    expect(host).toHaveTextContent("mac-laptop");
-    expect(host.compareDocumentPosition(branch) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+    expect(host).toHaveAccessibleName("Host mac-laptop, online");
+    expect(branch.compareDocumentPosition(host) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
   });
 
-  it("turns the host badge into a clickable reconnect prompt for an offline host", () => {
+  it("keeps reconnect help available from the shared host menu", () => {
     // An offline host surfaces the reconnect affordance in the host badge (in
     // place of the old banner below the composer) while keeping the host name:
     // the tray shows even with no branch/ring, and clicking opens the help.
@@ -336,11 +390,12 @@ describe("Composer status line (branch + context ring)", () => {
     const onShowReconnectHelp = vi.fn();
     renderComposer({ onShowReconnectHelp });
 
-    expect(statusLine()).not.toBeNull();
-    const badge = screen.getByTestId("host-badge");
+    expect(statusLine()).toBeNull();
+    const badge = screen.getByTestId("composer-host-select");
     expect(badge.tagName).toBe("BUTTON");
-    expect(badge).toHaveTextContent("mac-laptop");
-    badge.click();
+    expect(badge).toHaveAccessibleName("Host mac-laptop, offline");
+    fireEvent.keyDown(badge, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
   });
 
@@ -363,7 +418,7 @@ describe("Composer status line (branch + context ring)", () => {
     useChatStore.setState({ gitBranch: "geist" });
     renderComposer({ subAgentLabel: "check-eligibility" });
 
-    expect(screen.queryByTestId("host-badge")).toBeNull();
+    expect(screen.queryByTestId("composer-host-select")).toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
   });
 });
@@ -431,7 +486,7 @@ describe("formatModelEffortStatusLabel", () => {
           isDefault: true,
         },
       ]),
-    ).toBe("codex says GPT-5.5 xhigh");
+    ).toBe("codex says GPT-5.5 xHigh");
   });
 
   it("leaves unknown model ids raw", () => {
@@ -446,7 +501,7 @@ describe("formatModelEffortStatusLabel", () => {
       formatModelEffortStatusLabel("sonnet[1m]", "high", [
         { id: "sonnet[1m]", model: "claude-sonnet-5[1m]", displayName: "Sonnet 5 (1M context)" },
       ]),
-    ).toBe("Sonnet 5 (1M context) high");
+    ).toBe("Sonnet 5 (1M context) High");
   });
 
   it("renders a catalog-less Claude [1m] alias friendly without claiming a version", () => {

@@ -579,6 +579,12 @@ export interface ElicitationBlock {
    */
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
+    /**
+     * Refines `auto_resolved`: `"unanswered"` means the server cleared
+     * the prompt because the hook stopped waiting before anyone
+     * answered, so the card says the prompt expired and how to resume.
+     */
+    reason?: "unanswered";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   } | null;
@@ -617,6 +623,12 @@ export interface ElicitationBlock {
    * switch is a no-op.
    */
   allowAllEdits?: boolean;
+  /**
+   * Eligible Claude-native tool prompts: when true, the card offers an
+   * "Approve & switch to auto mode" button (accept + session-scoped
+   * ``setMode(auto)``). Absent/false for all other elicitations.
+   */
+  allowAutoMode?: boolean;
   /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button

@@ -21,7 +21,6 @@ import os
 import pathlib
 import shlex
 import sys
-import textwrap
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -47,10 +46,11 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
 from rich.console import Console
 from rich.console import RenderableType as _RichRenderable
+from rich.text import Text
 from wcwidth import wcswidth
 
 from ._formatter import FormattedItem, StreamingText, StreamLive, StreamReplace
-from ._linkify import linkify_ansi
+from ._linkify import LinkifyingConsole, linkify_ansi
 from ._theme import LIGHT_THEME, TerminalTheme, get_theme
 
 _log = logging.getLogger(__name__)
@@ -2835,7 +2835,9 @@ class TerminalHost:
             while _display_width(self._text_buffer) >= available:
                 wrap_at = self._text_buffer.rfind(" ", 0, available)
                 if wrap_at <= 0:
-                    wrap_at = available
+                    wrap_at = self._text_buffer.find(" ", available)
+                    if wrap_at < 0:
+                        break
                 line = self._text_buffer[:wrap_at]
                 self._text_buffer = self._text_buffer[wrap_at:].lstrip()
                 # Gated by the same viewport-ceiling rule as
@@ -2844,8 +2846,7 @@ class TerminalHost:
                 # scrollback-duplicate-render bug.
                 if not self._should_stream_more():
                     continue
-                print(linkify_ansi(f"{self.text_indent}{line}"), flush=True)
-                self._streamed_line_count += 1
+                self._print_text_line(line)
             self._last_was_streaming = True
             return
         # Flush any remaining streaming text buffer (partial line).
@@ -2853,8 +2854,7 @@ class TerminalHost:
             buf = self._text_buffer
             self._text_buffer = ""
             if buf.strip():
-                print(linkify_ansi(f"{self.text_indent}{buf}"), flush=True)
-                self._streamed_line_count += 1
+                self._print_text_line(buf)
             else:
                 print(flush=True)
                 self._streamed_line_count += 1
@@ -2866,7 +2866,7 @@ class TerminalHost:
         self._live_line_count = 0
         # Render Rich content to ANSI string, print through proxy.
         buf = io.StringIO()
-        temp = Console(
+        temp = LinkifyingConsole(
             file=buf,
             force_terminal=True,
             width=_term_width(),
@@ -2898,14 +2898,18 @@ class TerminalHost:
         width = _term_width()
         indent = self.text_indent
         available = max(20, width - _display_width(indent))
-        wrapped = textwrap.fill(
-            text,
+        buf = io.StringIO()
+        temp = LinkifyingConsole(
+            file=buf,
+            force_terminal=True,
             width=available,
-            initial_indent=indent,
-            subsequent_indent=indent,
+            highlight=False,
+            theme=self.theme.rich_theme,
         )
-        self._streamed_line_count += wrapped.count("\n") + 1
-        print(linkify_ansi(wrapped), flush=True)
+        temp.print(Text.from_ansi(text))
+        lines = buf.getvalue().splitlines()
+        self._streamed_line_count += len(lines)
+        print("\n".join(f"{indent}{line}" for line in lines), flush=True)
 
     def _should_stream_more(self) -> bool:
         """
@@ -3026,7 +3030,7 @@ class TerminalHost:
         if total_clear > 0:
             parts.append("\033[A\033[2K" * total_clear)
         ansi_buf = io.StringIO()
-        temp = Console(
+        temp = LinkifyingConsole(
             file=ansi_buf,
             force_terminal=True,
             width=_term_width(),

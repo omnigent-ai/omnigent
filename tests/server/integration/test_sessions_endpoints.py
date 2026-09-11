@@ -30,7 +30,9 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
 )
+from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
@@ -2085,18 +2087,19 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
     assert "malformed skill resolution" in resp.json()["error"]["message"]
 
 
-async def test_external_meta_user_message_persists_without_live_input_event(
+async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    External bridge meta messages are durable but hidden from live UI.
+    External bridge meta messages are durable and reach live subscribers flagged.
 
     Codex-native mirrors ``<skill>`` wrappers via
     ``external_conversation_item``. The server must store those
-    messages so resume has the context, while suppressing
-    ``session.input.consumed`` so subscribers do not render raw skill
-    text.
+    messages so resume has the context, and publish
+    ``session.input.consumed`` with ``is_meta`` set so subscribers can
+    hide raw skill text yet still see a Claude background-task wake as a
+    turn boundary; it must not seed a title from the hidden text.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -2131,6 +2134,55 @@ async def test_external_meta_user_message_persists_without_live_input_event(
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.status_code == 200
     assert snap.json()["title"] is None
+    assert [(sid, ev["type"]) for sid, ev in published] == [
+        (session["id"], "session.input.consumed")
+    ]
+    consumed = published[0][1]["data"]
+    assert consumed["item_id"] == meta["id"]
+    assert consumed["data"]["is_meta"] is True
+    assert consumed["cleared_pending_id"] is None
+
+
+async def test_external_meta_assistant_message_persists_without_live_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A meta message that is not a user message stays off the live stream.
+
+    ``response.output_item.done`` has no ``is_meta`` filter on the web
+    live path, so hidden context on an assistant item must be persisted
+    for history yet never published.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "<hidden>context</hidden>"}],
+                    "is_meta": True,
+                },
+                "response_id": "resp_meta_assistant",
+                "source_id": "meta-assistant",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert [item["is_meta"] for item in items if item["type"] == "message"] == [True]
     assert published == []
 
 
@@ -3241,6 +3293,137 @@ async def test_list_sessions_includes_external_session_id(
 
 
 # ── claude-native session discovery (list + snapshot) ────────────
+
+
+async def test_session_agent_terminals_follow_selected_host(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+) -> None:
+    """Fresh projections use the host for both old and new native sessions."""
+    host_id = "6b9c07bfb42f687d53af44f018adebee"
+    terminal_spec = {
+        "bash": {
+            "command": "bash",
+            "os_env": {"type": "caller_process", "cwd": "."},
+        }
+    }
+    native_agent = await create_test_agent(
+        client,
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals=terminal_spec,
+    )
+    native_session = await _create_session(client, native_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        native_session["id"], host_id=host_id, workspace="/tmp/native"
+    )
+
+    HostStore(db_uri).upsert_on_connect(host_id, "zsh-host", "owner@example.com")
+    app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="zsh-host",
+            interactive_shells=["zsh", "bash"],
+        ),
+        owner="owner@example.com",
+    )
+
+    native_response = await client.get(f"/v1/sessions/{native_session['id']}/agent")
+    assert native_response.status_code == 200, native_response.text
+    assert native_response.json()["terminals"] == ["zsh", "bash"]
+
+    new_native_session = await _create_session(client, native_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        new_native_session["id"], host_id=host_id, workspace="/tmp/new-native"
+    )
+    new_native_response = await client.get(f"/v1/sessions/{new_native_session['id']}/agent")
+    assert new_native_response.status_code == 200, new_native_response.text
+    assert new_native_response.json()["terminals"] == ["zsh", "bash"]
+
+    custom_agent = await create_test_agent(
+        client,
+        name="custom-shell-agent",
+        terminals=terminal_spec,
+    )
+    custom_session = await _create_session(client, custom_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        custom_session["id"], host_id=host_id, workspace="/tmp/custom"
+    )
+
+    custom_response = await client.get(f"/v1/sessions/{custom_session['id']}/agent")
+    assert custom_response.status_code == 200, custom_response.text
+    assert custom_response.json()["terminals"] == ["bash"]
+
+
+@pytest.mark.parametrize("cached_inventory", [False, True])
+async def test_host_shell_inventory_miss_returns_wrong_replica(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    cached_inventory: bool,
+) -> None:
+    """Missing or stale replica-local metadata must trigger re-addressing."""
+    host_id = "7b9c07bfb42f687d53af44f018adebee"
+    HostStore(db_uri).upsert_on_connect(host_id, "remote-host", "owner@example.com")
+    native_agent = await create_test_agent(
+        client,
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals={
+            "zsh": {
+                "command": "zsh",
+                "os_env": {"type": "caller_process", "cwd": "."},
+            }
+        },
+    )
+    session = await _create_session(client, native_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        session["id"], host_id=host_id, workspace="/tmp/native"
+    )
+    if cached_inventory:
+        app.state.host_registry.register(
+            host_id,
+            AsyncMock(),
+            HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="former-local-host",
+                interactive_shells=["bash"],
+            ),
+            owner="owner@example.com",
+        )
+        app.state.host_registry.deregister(host_id)
+
+    agent_response = await client.get(f"/v1/sessions/{session['id']}/agent")
+    terminal_response = await client.post(
+        f"/v1/sessions/{session['id']}/resources/terminals",
+        json={"terminal": "zsh", "session_key": "shell-1"},
+    )
+
+    assert agent_response.status_code == 400
+    assert agent_response.json()["error"]["code"] == "wrong_replica"
+    assert terminal_response.status_code == 400
+    assert terminal_response.json()["error"]["code"] == "wrong_replica"
+
+    custom_agent = await create_test_agent(
+        client,
+        name="custom-remote-agent",
+        terminals={
+            "zsh": {
+                "command": "zsh",
+                "os_env": {"type": "caller_process", "cwd": "."},
+            }
+        },
+    )
+    custom_session = await _create_session(client, custom_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        custom_session["id"], host_id=host_id, workspace="/tmp/custom"
+    )
+    custom_response = await client.get(f"/v1/sessions/{custom_session['id']}/agent")
+    assert custom_response.status_code == 200
+    assert custom_response.json()["terminals"] == ["zsh"]
 
 
 async def test_claude_native_session_discoverable_with_terminal_metadata(
