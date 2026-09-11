@@ -72,21 +72,39 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
-import { checkHostDirectory } from "@/hooks/useHostFilesystem";
+import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
+import {
+  WorkspacePicker,
+  isNavigablePath,
+  resolveWorkspacePath,
+  useResolvedHostHome,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
-  isValidWorkspace,
+  SANDBOX_REPO_LABEL_KEY,
+  composeSandboxWorkspace,
+  deriveRepoName,
+  isValidSandboxRepoUrl,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
+  splitSandboxWorkspace,
 } from "./NewChatDialog";
 
 // Select sentinel for "keep the source's agent" (Radix Select needs a
 // non-empty value). When chosen, the fork omits agent_id and the server
 // clones the source's agent.
 const SAME_AS_SOURCE = "__same__";
+
+// This dialog's pickers use the compact `text-sm` font (matching the Agent
+// field), on both the trigger value and the open dropdown's options. Items set
+// their own `text-ui`, so the option font is shrunk via a descendant selector
+// on the dropdown content rather than plain inheritance.
+const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 
 /**
  * Compact host label for the Select item — mirrors NewChatDialog's
@@ -455,6 +473,8 @@ function ForkRunConfig({
             testId="fork-session-config-model"
             models={modelSelectOptions}
             defaultLabel={defaultModelLabel(modelOptions)}
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
             componentId="fork_session.config.model"
           >
             {modelsLoading && (
@@ -479,13 +499,13 @@ function ForkRunConfig({
               valueHasNoPii
             >
               <SelectTrigger
-                className="w-full cursor-pointer"
+                className="w-full cursor-pointer text-sm"
                 data-testid="fork-session-config-effort"
                 aria-label="Reasoning effort"
               >
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
+              <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
                 <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                 {CLAUDE_NATIVE_EFFORTS.map((e) => (
                   <SelectItem key={e.value} value={e.value}>
@@ -503,6 +523,8 @@ function ForkRunConfig({
               options={CLAUDE_NATIVE_PERMISSION_MODES}
               testId="fork-session-config-permission"
               ariaLabel="Permissions"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
@@ -526,6 +548,8 @@ function ForkRunConfig({
               }
               testId="fork-session-config-approval"
               ariaLabel="Approval"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.approval"
             />
           </ForkConfigRow>
@@ -553,6 +577,8 @@ function ForkRunConfig({
             options={CURSOR_NATIVE_EXEC_MODES}
             testId="fork-session-config-cursor-mode"
             ariaLabel="Mode"
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
             componentId="fork_session.config.cursor_mode"
           />
         </ForkConfigRow>
@@ -567,6 +593,8 @@ function ForkRunConfig({
               options={AGY_NATIVE_SKIP_MODES}
               testId="fork-session-config-agy-skip"
               ariaLabel="Permissions"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
@@ -600,16 +628,28 @@ function ForkRunConfig({
  * (the server deep-copies the transcript and clones the agent into a fresh
  * session owned by the caller; comments and permissions are NOT copied and
  * future messages don't mutate the source). For a *coding* source (one with
- * a working directory), the form also picks a host + directory + optional
- * git worktree and binds the fork to a runner via ``launchRunner``
- * (``POST /v1/hosts/{id}/runners``). For a non-coding source there is no
- * directory to pick, so it forks with just name + agent.
+ * a working directory), the form also picks where the clone runs. Two
+ * targets:
  *
- * Before creating anything, a coding fork pre-flights the picked directory
+ *  • A connected **host** — pick a directory and optional git worktree; the
+ *    form binds the fork to a runner via ``launchRunner``
+ *    (``POST /v1/hosts/{id}/runners``) after the fork call returns.
+ *  • A server-provisioned **sandbox**, offered when ``/v1/info`` reports
+ *    ``managed_sandboxes_enabled`` — the fork itself carries
+ *    ``host_type: "managed"`` and the server provisions the host in the
+ *    background, so no ``launchRunner`` follows. Its workspace is a
+ *    repository the server clones into the sandbox, prefilled from the
+ *    source's own when the source was a sandbox session.
+ *
+ * For a non-coding source there is no directory to pick, so it forks with
+ * just name + agent.
+ *
+ * Before creating anything, a host fork pre-flights the picked directory
  * against the host (it must exist and be listable) — the launch below is
  * detached, so a bad path would otherwise produce a clone that silently
- * never starts. After that, the fork call is the only thing the form
- * awaits: on success it closes and
+ * never starts. A sandbox fork has nothing to pre-flight; the server
+ * creates the workspace. After that, the fork call is the only thing the
+ * form awaits: on success it closes and
  * navigates into the clone IMMEDIATELY, and (for a coding source) fires the
  * runner launch in the background. Holding the dialog through the launch
  * blocks for as long as a worktree create takes (up to minutes) and hangs
@@ -681,6 +721,9 @@ export function ForkSessionForm({
   // warning + branch field aren't hidden. A ref (not state in the effect dep)
   // keeps it one-shot — the user can re-collapse it without it springing back.
   const autoExpandedRef = useRef(false);
+  // Same one-shot guard for the sandbox repository prefill, so clearing the
+  // field (an empty sandbox) sticks.
+  const sandboxRepoSeededRef = useRef(false);
 
   // A coding source ran in a working directory; only then does the fork
   // need a host + directory to start. A non-coding source forks with just
@@ -693,6 +736,16 @@ export function ForkSessionForm({
   const [branchName, setBranchName] = useState("");
   const [browsing, setBrowsing] = useState(false);
   const [browseNonce, setBrowseNonce] = useState(0);
+  // True when the user picked a server-provisioned sandbox instead of a
+  // connected host — the fork then carries host_type "managed" and the
+  // server provisions its compute, so no launchRunner call follows.
+  const [sandboxSelected, setSandboxSelected] = useState(false);
+  // Provider the sandbox pick launches on; null for a server that names none.
+  const [sandboxProvider, setSandboxProvider] = useState<string | null>(null);
+  // Repository cloned into the sandbox, split across two inputs and
+  // recomposed into the request's `<url>[#<branch>]` workspace.
+  const [sandboxRepoUrl, setSandboxRepoUrl] = useState("");
+  const [sandboxRepoBranch, setSandboxRepoBranch] = useState("");
   // Whether the "connect another host" CLI hint is expanded (only shown when
   // at least one host is online; otherwise the instructions render directly).
   const [showConnect, setShowConnect] = useState(false);
@@ -713,15 +766,36 @@ export function ForkSessionForm({
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
   const serverUrl = getCliServerUrl();
 
+  // Gates the sandbox rows in the host picker: only servers whose sandbox
+  // config can actually serve a managed launch advertise it. "loading"
+  // fails closed (rows hidden) until the boot probe resolves. Same gate
+  // NewChatDialog uses for its own sandbox option.
+  const info = useServerInfo();
+  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  // One picker row per configured provider; a single-provider server
+  // yields exactly one.
+  const sandboxProviderRows = useMemo(
+    () => (info !== "loading" ? sandboxProviderOptions(info) : []),
+    [info],
+  );
+
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
   // Whether the picked host is the SAME machine the source ran on. Only then
   // does "reuse the source's working directory" make sense — on a different
   // host that path is on someone else's machine. Drives the dir prefill, the
-  // reuse-dir indicator, and whether Advanced starts collapsed.
-  const onSourceHost = isCodingSource && selectedHostId !== null && selectedHostId === sourceHostId;
+  // reuse-dir indicator, and whether Advanced starts collapsed. A sandbox
+  // pick is neither: its filesystem doesn't exist until the server makes it.
+  const onSourceHost =
+    isCodingSource &&
+    !sandboxSelected &&
+    selectedHostId !== null &&
+    selectedHostId === sourceHostId;
   const onDifferentHost =
-    isCodingSource && selectedHostId !== null && selectedHostId !== sourceHostId;
+    isCodingSource &&
+    !sandboxSelected &&
+    selectedHostId !== null &&
+    selectedHostId !== sourceHostId;
 
   const sourceWorkspaceNorm = sourceWorkspace ? normalizeWorkspacePath(sourceWorkspace) : null;
   // Source ran in a server-created git worktree (its workspace IS the
@@ -843,15 +917,32 @@ export function ForkSessionForm({
 
   // Default the host = source host (when online) else the first online
   // host, once hosts have loaded. Only fills an empty slot so an explicit
-  // pick is never overridden.
+  // pick is never overridden. A clone defaults to reproducing the source,
+  // so a sandbox is not the default while any host is online — it costs a
+  // fresh provision, and the user asks for it explicitly. But with no host
+  // online a sandbox-only deployment has nothing to reproduce the source
+  // on, so default to the sandbox rather than strand the picker empty and
+  // unsubmittable.
   useEffect(() => {
-    if (!isCodingSource || selectedHostId !== null) return;
+    if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
     if (sourceHostId && sourceHostOnline) {
       setSelectedHostId(sourceHostId);
     } else if (onlineHosts.length > 0) {
       setSelectedHostId(onlineHosts[0].host_id);
+    } else if (managedSandboxesEnabled && sandboxProviderRows.length > 0) {
+      setSandboxSelected(true);
+      setSandboxProvider(sandboxProviderRows[0]);
     }
-  }, [isCodingSource, selectedHostId, sourceHostId, sourceHostOnline, onlineHosts]);
+  }, [
+    isCodingSource,
+    sandboxSelected,
+    selectedHostId,
+    sourceHostId,
+    sourceHostOnline,
+    onlineHosts,
+    managedSandboxesEnabled,
+    sandboxProviderRows,
+  ]);
 
   // Prefill the directory with the source's workspace — but only when staying
   // on the source host. On a different host that path is a different machine,
@@ -868,8 +959,40 @@ export function ForkSessionForm({
     }
   }, [onSourceHost, workspace, sourceWorkspace, sourceRepo, sourceBranch]);
 
-  const workspaceTrimmed = normalizeWorkspacePath(workspace) ?? "";
-  const workspaceValid = isValidWorkspace(workspace);
+  // Repository the SOURCE ran in, when it was itself a sandbox session.
+  // Recorded by the server on the managed create and copied onto the fork.
+  const sourceSandboxRepo = sourceSession?.labels?.[SANDBOX_REPO_LABEL_KEY] ?? null;
+  // The source's repo label is space-joined when it had several repos. The
+  // single URL/branch fields below can't represent more than one, so a
+  // multi-repo source inherits ALL of them wholesale (the fork omits its own
+  // workspace, and the server re-clones every repo the source recorded).
+  const sourceSandboxRepos = (sourceSandboxRepo ?? "").split(/\s+/).filter(Boolean);
+  const multiRepoSource = sourceSandboxRepos.length > 1;
+
+  // Prefill the sandbox repository from the source's, so cloning a sandbox
+  // session onto a fresh sandbox lands in the same checkout. A ref keeps it
+  // ONE-SHOT: clearing the field is how the user asks for an empty sandbox,
+  // and a slot-empty guard would spring the prefill straight back.
+  useEffect(() => {
+    if (!sandboxSelected || sandboxRepoSeededRef.current || sourceSandboxRepo === null) return;
+    sandboxRepoSeededRef.current = true;
+    // A multi-repo source can't be edited through the single URL/branch pair,
+    // so leave them blank and inherit every repo (see the submit below);
+    // splitting the space-joined label here would seed an invalid URL.
+    if (multiRepoSource) return;
+    const { url, branch } = splitSandboxWorkspace(sourceSandboxRepo);
+    setSandboxRepoUrl(url);
+    setSandboxRepoBranch(branch);
+  }, [sandboxSelected, sourceSandboxRepo, multiRepoSource]);
+
+  // Resolve a typed "~/…" path to its absolute form against the host's home,
+  // so it's directly submittable without opening the tree browser (the server
+  // never expands ~). Already-absolute values pass through normalized; a
+  // tilde path stays unresolved (null) until the home listing arrives.
+  const resolvedHome = useResolvedHostHome(selectedHostId);
+  const resolvedWorkspace = resolveWorkspacePath(workspace, resolvedHome);
+  const workspaceTrimmed = resolvedWorkspace ?? normalizeWorkspacePath(workspace) ?? "";
+  const workspaceValid = resolvedWorkspace !== null;
   // The prefilled repo + source-branch pair left untouched: that branch
   // already exists (with a live worktree), so instead of asking the server
   // to create it — which would fail — the clone binds straight to the
@@ -890,22 +1013,51 @@ export function ForkSessionForm({
   // that would just fail server-side) until a live host is chosen.
   const selectedHostOnline =
     selectedHostId !== null && onlineHosts.some((h) => h.host_id === selectedHostId);
-  // A coding source can only start once a live host + valid directory are picked.
-  const canSubmit = !isCodingSource || (selectedHostOnline && workspaceValid);
+  // A blank repository is legal — the clone then gets an empty sandbox —
+  // but a branch without one, or a malformed URL, greys the button instead
+  // of surfacing as a 422. Mirrors NewChatDialog's sandbox validity rule.
+  // The destination provider the fork launches on (server default when none is
+  // picked yet) and whether it clones several repos.
+  const forkEffectiveProvider =
+    sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const forkProviderMultiRepo =
+    info !== "loading" &&
+    forkEffectiveProvider !== null &&
+    info.sandbox_provider_capabilities?.[forkEffectiveProvider]?.multi_repo === true;
+  // A multi-repo source inherits every repo, so it needs a multi-repo
+  // destination; onto a single-repo provider it would be rejected server-side
+  // after the fork is created and announced, so block submit here instead.
+  const sandboxRepoValid = multiRepoSource
+    ? forkProviderMultiRepo
+    : sandboxRepoUrl.trim() === ""
+      ? sandboxRepoBranch.trim() === ""
+      : isValidSandboxRepoUrl(sandboxRepoUrl);
+  // Short "repo" / "repo#branch" form for the sandbox hint — the same name
+  // the clone directory takes inside the sandbox.
+  const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
+  const sandboxRepoLabel =
+    sandboxRepoName !== null && sandboxRepoBranch.trim() !== ""
+      ? `${sandboxRepoName}#${sandboxRepoBranch.trim()}`
+      : (sandboxRepoName ?? sandboxRepoUrl.trim());
+  // A coding source can only start once a live host + valid directory are
+  // picked; a sandbox clone needs neither — the server provisions both.
+  const canSubmit = sandboxSelected
+    ? sandboxRepoValid
+    : !isCodingSource || (selectedHostOnline && workspaceValid);
 
   // Conflict hint: other *connected* sessions already working in the picked
   // directory on this host (same wiring as NewChatDialog).
   const { data: directorySessions } = useDirectorySessions(
-    isCodingSource && Boolean(selectedHostId),
+    isCodingSource && !sandboxSelected && Boolean(selectedHostId),
   );
   const conflictCandidates = useMemo(
     () =>
-      isCodingSource
+      isCodingSource && !sandboxSelected
         ? (directorySessions ?? []).filter(
             (s) => s.host_id === selectedHostId && s.workspace != null,
           )
         : [],
-    [isCodingSource, directorySessions, selectedHostId],
+    [isCodingSource, sandboxSelected, directorySessions, selectedHostId],
   );
   const runnerHealth = useRunnerHealthRegistration(conflictCandidates);
   const conflictingSessions = useMemo(
@@ -944,6 +1096,7 @@ export function ForkSessionForm({
     sourceHostId != null && selectedHostId !== null && selectedHostId !== sourceHostId;
   const showMismatchWarning =
     isCodingSource &&
+    !sandboxSelected &&
     ((hostMismatch && workspaceTrimmed !== "") ||
       (sourceWorkspaceNorm !== null &&
         workspaceTrimmed !== "" &&
@@ -964,6 +1117,31 @@ export function ForkSessionForm({
     setBrowseNonce((n) => n + 1);
   }
 
+  /** Target the clone at a connected host, dropping any sandbox pick. */
+  function selectHost(hostId: string): void {
+    setSandboxSelected(false);
+    setSelectedHostId(hostId);
+    // Workspace and the worktree branch are host-specific: the directory
+    // path and the prefilled source branch only make sense on the source
+    // machine. Clear both on a host change. (The source-host prefill effect
+    // re-seeds them if the user switches back.)
+    setWorkspace("");
+    setBranchName("");
+    setBrowsing(false);
+  }
+
+  /** Target the clone at a server-provisioned sandbox on `provider`. */
+  function selectSandbox(provider: string | null): void {
+    setSandboxSelected(true);
+    setSandboxProvider(provider);
+    // A host directory can't describe a sandbox that doesn't exist yet;
+    // the repository fields take over. Also close the tree browser, whose
+    // host-backed listing has nothing left to browse.
+    setWorkspace("");
+    setBranchName("");
+    setBrowsing(false);
+  }
+
   async function handleFork(): Promise<void> {
     if (!canSubmit) return;
     setSubmitting(true);
@@ -972,25 +1150,61 @@ export function ForkSessionForm({
       // Pre-flight the directory BEFORE creating anything: the runner
       // launch below is detached and its failure is swallowed, so a
       // nonexistent path would otherwise leave a clone that silently
-      // never starts.
-      if (isCodingSource && selectedHostId) {
+      // never starts. A sandbox clone has no directory to pre-flight —
+      // the server creates the workspace inside the sandbox.
+      let recreateSourceWorktree = false;
+      if (isCodingSource && !sandboxSelected && selectedHostId) {
         const problem = await checkHostDirectory(selectedHostId, effectiveWorkspace);
         if (problem !== null) {
-          setError(problem);
-          return;
+          // Deleted source worktree + untouched name: recreate the worktree
+          // at the same path/branch instead of erroring — the host's
+          // create-worktree handles an already-existing branch (no -b).
+          // Only this exact case falls back; every other problem (offline
+          // host, unlistable path, network) still aborts the fork.
+          if (
+            usingSourceWorktree &&
+            (await hostDirectoryMissing(selectedHostId, effectiveWorkspace))
+          ) {
+            // The recreate launches from the repo path, so pre-flight THAT
+            // path too — a missing repo can't recreate anything, and the
+            // detached launch below swallows its failure.
+            const repoProblem = await checkHostDirectory(selectedHostId, workspaceTrimmed);
+            if (repoProblem !== null) {
+              setError(repoProblem);
+              return;
+            }
+            recreateSourceWorktree = true;
+          } else {
+            setError(problem);
+            return;
+          }
         }
       }
       const trimmed = title.trim();
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
       // value; an empty object (non-native target) sends no run overrides.
-      const fork = await forkSession(
-        sourceSessionId,
-        trimmed === "" ? undefined : trimmed,
-        switching ? agentChoice : undefined,
-        upToResponseId ?? undefined,
-        runConfig,
-      );
+      const fork = await forkSession(sourceSessionId, {
+        title: trimmed === "" ? undefined : trimmed,
+        agentId: switching ? agentChoice : undefined,
+        upToResponseId: upToResponseId ?? undefined,
+        config: runConfig,
+        // Sandbox clone: the server provisions the host, so the fork call
+        // carries the compute request itself and no launchRunner follows.
+        // The workspace is always explicit — the dialog's repository field
+        // is the user's answer, including "blank" for an empty sandbox.
+        sandbox: sandboxSelected
+          ? {
+              provider: sandboxProvider,
+              // Omit the workspace for a multi-repo source so the server
+              // inherits ALL of the source's repositories; otherwise send the
+              // single repo the fields resolve to (blank → empty sandbox).
+              workspace: multiRepoSource
+                ? undefined
+                : (composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null),
+            }
+          : undefined,
+      });
       // Coding fork: launch the runner in the BACKGROUND, then navigate
       // into the (already-created, unbound) clone immediately — awaiting the
       // launch would block the modal for a worktree create (up to minutes)
@@ -998,7 +1212,7 @@ export function ForkSessionForm({
       // unbound; ChatPage's existing unbound-fork path lets the user retry
       // the bind via the directory picker. (A follow-up will surface the
       // failure proactively + show "Connecting…" for the whole launch.)
-      if (isCodingSource && selectedHostId) {
+      if (isCodingSource && !sandboxSelected && selectedHostId) {
         const trimmedBranch = branchName.trim();
         addRecent(workspaceTrimmed);
         // Reusing the source's worktree binds its directory directly (no
@@ -1013,12 +1227,20 @@ export function ForkSessionForm({
         void launchRunner(
           selectedHostId,
           fork.id,
-          effectiveWorkspace,
-          trimmedBranch !== "" && !usingSourceWorktree
-            ? {
-                branchName: trimmedBranch,
-                baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
-              }
+          // Recreating a deleted source worktree launches from the REPO
+          // path (the server derives the worktree directory from the
+          // branch), exactly like the renamed-branch path.
+          recreateSourceWorktree ? workspaceTrimmed : effectiveWorkspace,
+          trimmedBranch !== "" && (!usingSourceWorktree || recreateSourceWorktree)
+            ? recreateSourceWorktree
+              ? // The branch survives its deleted directory — recreate the
+                // worktree by checking the existing branch back out (no base:
+                // nothing new is forked).
+                { branchName: trimmedBranch, existingBranch: true }
+              : {
+                  branchName: trimmedBranch,
+                  baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
+                }
             : undefined,
         ).catch((e) => {
           // Swallow: recovery is the unbound-fork picker on the session
@@ -1050,11 +1272,11 @@ export function ForkSessionForm({
   return (
     <>
       <div className="-mr-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-4 [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
-        {/* Host first: with no online host there is nothing to run the
-              clone on, so the user learns up front whether they can proceed.
-              Mirrors NewChatDialog: a picker when hosts are online (with a
-              collapsible "connect another" CLI hint), or the connect
-              instructions directly when none are. */}
+        {/* Host first: with nothing to run the clone on, the user learns up
+              front whether they can proceed. Mirrors NewChatDialog: a picker
+              when a target is available (sandbox rows pinned above the
+              connected hosts, with a collapsible "connect another" CLI hint),
+              or the connect instructions directly when none is. */}
         {isCodingSource && (
           <div className="flex flex-col gap-2">
             <span className="text-sm font-medium text-muted-foreground">Host</span>
@@ -1062,10 +1284,11 @@ export function ForkSessionForm({
               <p className="text-sm text-muted-foreground" data-testid="fork-session-no-hosts">
                 Loading hosts…
               </p>
-            ) : onlineHosts.length === 0 ? (
-              // Nothing usable (no hosts, or all offline) — show the connect
-              // command directly so the user can unblock. The submit button
-              // stays greyed until a host is online.
+            ) : onlineHosts.length === 0 && !managedSandboxesEnabled ? (
+              // Nothing usable (no hosts, or all offline) and no sandbox to
+              // fall back on — show the connect command directly so the user
+              // can unblock. The submit button stays greyed until a host is
+              // online.
               <ConnectHostInstructions
                 serverUrl={serverUrl}
                 label={
@@ -1077,24 +1300,50 @@ export function ForkSessionForm({
             ) : (
               <>
                 <Select
-                  value={selectedHostId ?? ""}
+                  value={
+                    sandboxSelected ? sandboxHostChoice(sandboxProvider) : (selectedHostId ?? "")
+                  }
                   componentId="fork_session.host"
                   onValueChange={(v) => {
-                    setSelectedHostId(v);
-                    // Workspace and the worktree branch are host-specific:
-                    // the directory path and the prefilled source branch only
-                    // make sense on the source machine. Clear both on a host
-                    // change. (The source-host prefill effect re-seeds them
-                    // if the user switches back.)
-                    setWorkspace("");
-                    setBranchName("");
-                    setBrowsing(false);
+                    const provider = sandboxHostChoiceProvider(v);
+                    if (provider !== undefined) {
+                      selectSandbox(provider);
+                      return;
+                    }
+                    selectHost(v);
                   }}
                 >
                   <SelectTrigger className="w-full text-sm" data-testid="fork-session-host-select">
-                    <SelectValue placeholder="Select a host" />
+                    <SelectValue
+                      placeholder={
+                        managedSandboxesEnabled ? "Select a host or sandbox" : "Select a host"
+                      }
+                    />
                   </SelectTrigger>
                   <SelectContent>
+                    {/* Server-provisioned sandbox — only advertised when
+                        /v1/info reports managed_sandboxes_enabled. Pinned
+                        first, above the connected-host list. */}
+                    {managedSandboxesEnabled &&
+                      sandboxProviderRows.map((provider, index) => (
+                        <SelectItem
+                          key={provider ?? "default"}
+                          value={sandboxHostChoice(provider)}
+                          // First row keeps the unscoped testid; later rows
+                          // get a per-provider one.
+                          data-testid={
+                            index === 0
+                              ? "fork-session-sandbox-option"
+                              : `fork-session-sandbox-option-${provider}`
+                          }
+                        >
+                          <span className="flex items-center gap-2">
+                            <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                            <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    {managedSandboxesEnabled && allHosts.length > 0 && <SelectSeparator />}
                     {onlineHosts.map((host) => (
                       <SelectItem
                         key={host.host_id}
@@ -1116,20 +1365,27 @@ export function ForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
-                <button
-                  type="button"
-                  onClick={() => setShowConnect((v) => !v)}
-                  className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
-                  data-testid="fork-session-connect-host-toggle"
-                >
-                  {showConnect ? (
-                    <ChevronUpIcon className="size-3.5" />
-                  ) : (
-                    <ChevronDownIcon className="size-3.5" />
-                  )}
-                  Connect another host from your terminal
-                </button>
-                {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
+                {/* A sandbox is a usable target, so no dead-end even with no
+                    host online: offer connecting one as a collapsed, optional
+                    step rather than an alarming "no hosts connected" banner. */}
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setShowConnect((v) => !v)}
+                    className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
+                    data-testid="fork-session-connect-host-toggle"
+                  >
+                    {showConnect ? (
+                      <ChevronUpIcon className="size-3.5" />
+                    ) : (
+                      <ChevronDownIcon className="size-3.5" />
+                    )}
+                    {onlineHosts.length === 0
+                      ? "Connect a host from your terminal"
+                      : "Connect another host from your terminal"}
+                  </button>
+                  {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
+                </>
               </>
             )}
           </div>
@@ -1217,6 +1473,19 @@ export function ForkSessionForm({
             selectedHostId={isCodingSource ? selectedHostId : (sourceHostId ?? null)}
             onChange={setRunConfig}
           />
+        )}
+
+        {/* Sandbox counterpart of the reuse-dir indicator: the clone gets a
+              fresh sandbox, so say what lands in it and where to change that.
+              The repository fields themselves live under Advanced. */}
+        {sandboxSelected && (
+          <p className="text-sm text-muted-foreground" data-testid="fork-session-sandbox-hint">
+            {multiRepoSource
+              ? `The clone starts in a fresh sandbox with all ${sourceSandboxRepos.length} of the source's repositories cloned into it.`
+              : sandboxRepoUrl.trim() === ""
+                ? "The clone starts in a fresh, empty sandbox. Name a repository under Advanced settings to clone one into it."
+                : `The clone starts in a fresh sandbox with ${sandboxRepoLabel} cloned into it. Open Advanced settings to change it.`}
+          </p>
         )}
 
         {/* Indicator: by default the clone reuses the source's working
@@ -1308,7 +1577,93 @@ export function ForkSessionForm({
                 />
               </div>
 
-              {isCodingSource && (
+              {/* Sandbox repository — the sandbox counterpart of the working
+                  directory. The sandbox doesn't exist yet, so there is no
+                  path to browse: the workspace is specified as a repository
+                  the server clones into it. */}
+              {isCodingSource && sandboxSelected && multiRepoSource && (
+                <div
+                  className="flex flex-col gap-1"
+                  data-testid="fork-session-sandbox-repos-readonly"
+                >
+                  <span className="text-sm font-medium text-muted-foreground">Repositories</span>
+                  <ul className="flex flex-col gap-1 rounded-md border border-input bg-background px-3 py-2">
+                    {sourceSandboxRepos.map((w) => {
+                      const { url, branch } = splitSandboxWorkspace(w);
+                      const name = deriveRepoName(url) ?? url;
+                      return (
+                        <li key={w} className="truncate font-mono text-sm" title={w}>
+                          {branch.trim() !== "" ? `${name}#${branch}` : name}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {forkProviderMultiRepo ? (
+                    <p className="text-sm text-muted-foreground">
+                      All of the source's repositories are cloned into the fork's sandbox as
+                      siblings; the agent starts in the parent directory that holds them.
+                    </p>
+                  ) : (
+                    <p
+                      className="text-sm text-warning"
+                      data-testid="fork-session-repos-unsupported"
+                    >
+                      This provider clones only one repository, but the source has{" "}
+                      {sourceSandboxRepos.length}. Choose a provider that supports several to fork
+                      with all of them.
+                    </p>
+                  )}
+                </div>
+              )}
+              {isCodingSource && sandboxSelected && !multiRepoSource && (
+                <>
+                  <div className="flex flex-col gap-1">
+                    <label
+                      htmlFor="fork-session-sandbox-repo"
+                      className="text-sm font-medium text-muted-foreground"
+                    >
+                      Repository (optional)
+                    </label>
+                    <input
+                      id="fork-session-sandbox-repo"
+                      type="text"
+                      value={sandboxRepoUrl}
+                      onChange={(e) => setSandboxRepoUrl(e.target.value)}
+                      placeholder="https://github.com/org/repo"
+                      data-testid="fork-session-sandbox-repo-input"
+                      className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
+                    />
+                    <p className="text-sm text-muted-foreground">
+                      Cloned into the sandbox as the clone's working directory. Leave blank to start
+                      in an empty sandbox.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-col gap-1">
+                    <label
+                      htmlFor="fork-session-sandbox-branch"
+                      className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
+                    >
+                      <GitBranchIcon className="size-3.5" />
+                      Branch (optional)
+                    </label>
+                    <input
+                      id="fork-session-sandbox-branch"
+                      type="text"
+                      value={sandboxRepoBranch}
+                      onChange={(e) => setSandboxRepoBranch(e.target.value)}
+                      placeholder="main"
+                      data-testid="fork-session-sandbox-branch-input"
+                      className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
+                    />
+                    <p className="text-sm text-muted-foreground">
+                      Leave blank to clone the repository's default branch.
+                    </p>
+                  </div>
+                </>
+              )}
+
+              {isCodingSource && !sandboxSelected && (
                 <>
                   <div className="flex flex-col gap-2">
                     <span className="text-sm font-medium text-muted-foreground">

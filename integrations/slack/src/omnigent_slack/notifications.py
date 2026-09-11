@@ -226,7 +226,7 @@ class SlackNotifier:
         # mount answers JSON, not the UI. Map the path and keep any ``?o=<org>``
         # workspace selector from the configured URL so multi-workspace (SPOG)
         # hosts open in the right workspace. (This bot is standalone — it can't
-        # import ``omnigent.server_url`` — so the mount mapping is mirrored
+        # import ``omnigent.util.server_url`` — so the mount mapping is mirrored
         # here.)
         parts = urlsplit(self._server_url.rstrip("/"))
         if parts.path == "/api/2.0/omnigent":

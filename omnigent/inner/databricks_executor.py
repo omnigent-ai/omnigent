@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
 
-from omnigent import model_catalog
+from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
     from openai import OpenAI, Stream
@@ -271,6 +271,11 @@ def databricks_bearer_token_command(
     When the caller knows a token command that already worked (the one ucode
     recorded, say), it runs last, once the named profile has yielded nothing.
 
+    **Ambient bearer.** Prefer the configured profile because
+    ``DATABRICKS_BEARER`` may be stale. Bound and silence that mint attempt so
+    a profile without usable OAuth state quickly falls back to the bearer,
+    preserving deliberately injected credentials in mint-less environments.
+
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``, or
@@ -279,6 +284,23 @@ def databricks_bearer_token_command(
         run only when the profile above yields an empty token.
     :returns: Shell command that prints a bearer token on stdout.
     """
+    # In a managed connect sandbox the owner's workspace profile is host-only
+    # (its bearer lives in the credential broker, not on disk), so
+    # ``databricks auth token`` finds no OAuth cache and yields nothing. Default
+    # ONLY that connect profile to the broker fetch. Gate on the profile, not
+    # just the host: a *different* credential-less profile that happens to share
+    # the connected workspace host must not silently mint as the owner (distinct
+    # profiles on one host can be different users/service principals).
+    if fallback_command is None:
+        from omnigent.host.databricks_credential import HOST_DATABRICKS_PROFILE
+
+        if profile == HOST_DATABRICKS_PROFILE:
+            try:
+                from omnigent.host.databricks_credential import broker_token_command
+
+                fallback_command = broker_token_command(host)
+            except Exception as exc:  # noqa: BLE001 - best-effort; no sidecar ⇒ no fallback.
+                logger.info("databricks bearer: broker fallback lookup failed: %r", exc)
     selector = (
         f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
     )
@@ -291,9 +313,13 @@ def databricks_bearer_token_command(
         else ""
     )
     return (
-        # An injected bearer wins: the runner already resolved one.
+        # An ambient bearer may be injected or stale: prefer a bounded,
+        # quiet profile mint, and use the bearer only when it yields nothing.
         'if [ -n "${DATABRICKS_BEARER:-}" ]; then '
-        'printf "%s\\n" "$DATABRICKS_BEARER"; '
+        f"token=$({mint} --timeout 15s --output json 2>/dev/null "
+        "| jq -r '.access_token // empty'); "
+        'if [ -z "$token" ]; then token="$DATABRICKS_BEARER"; fi; '
+        'printf "%s\\n" "$token"; '
         "else token=''; "
         "if databricks auth token --help 2>&1 | grep -q force-refresh; then "
         f"token=$({mint} --force-refresh --output json 2>/dev/null "

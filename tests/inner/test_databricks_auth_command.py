@@ -179,10 +179,46 @@ def test_the_recorded_command_runs_when_the_named_profile_yields_nothing(
 
 
 @pytest.mark.posix_only
-def test_an_injected_bearer_short_circuits_both_the_profile_and_the_fallback(
+def test_a_working_profile_outranks_an_ambient_bearer(
     tmp_path: Path,
 ) -> None:
-    """The runner already resolved a token; nothing else should be consulted."""
+    """
+    A stale shell bearer must not poison auth when the profile can mint.
+
+    Ambient ``DATABRICKS_BEARER`` exports linger past their ~1h TTL, and when
+    one shadowed the configured profile every turn failed 403 and re-login
+    didn't help — the mint was never consulted. The profile is the configured
+    identity, so its token wins whenever it can produce one.
+    """
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    command = databricks_bearer_token_command(
+        "https://example.databricks.com", "agent", fallback_command=_recorded_fallback(tmp_path)
+    )
+
+    assert (
+        _run_generated_helper(
+            command,
+            tmp_path,
+            force_refresh_works=False,
+            cached_token_works=True,
+            bearer="stale-shell-export",
+        )
+        == "cached"
+    )
+    assert not (tmp_path / "fallback-ran").exists()
+
+
+@pytest.mark.posix_only
+def test_the_ambient_bearer_backstops_a_profile_that_cannot_mint(
+    tmp_path: Path,
+) -> None:
+    """An injected bearer still carries an environment with no mintable profile.
+
+    CI and runner launches export a resolved token precisely because the
+    profile there has no OAuth state; when the mint yields nothing the bearer
+    must be served, and the recorded fallback stays out of it.
+    """
     from omnigent.inner.databricks_executor import databricks_bearer_token_command
 
     command = databricks_bearer_token_command(
@@ -217,3 +253,82 @@ def test_without_a_recorded_command_an_unauthenticated_profile_stays_empty(
         )
         == ""
     )
+
+
+def _write_broker_sidecar(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workspace_host: str):
+    """Point the config file at *tmp_path* and drop a broker sidecar for *workspace_host*."""
+    from omnigent.host import databricks_credential as dc
+
+    cfg_path = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    assert dc._write_sidecar(
+        cfg_path, "https://omni.example", "host-1", "host-tok", workspace_host
+    )
+
+
+def test_the_broker_sidecar_becomes_the_fallback_for_the_connected_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In a connect sandbox, the host-only profile delegates its mint to the broker."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    command = databricks_bearer_token_command("https://example.databricks.com", "omnigent")
+    assert "python3 -m omnigent.host.databricks_credential token" in command
+
+
+def test_the_broker_sidecar_is_ignored_for_a_different_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gateway pinned to a spec's own workspace must not borrow the broker token."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://connected.databricks.com")
+    command = databricks_bearer_token_command("https://other.databricks.com", "myprofile")
+    assert "omnigent.host.databricks_credential" not in command
+
+
+def test_the_broker_is_ignored_for_a_different_profile_on_the_connected_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Identity boundary: only the host-only connect profile (HOST_DATABRICKS_PROFILE)
+    borrows the owner's broker bearer. A different, credential-less profile that
+    happens to share the connected workspace host must NOT silently mint as the
+    owner — distinct profiles on one host can be different users/service principals."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    # Same connected workspace host as the sidecar, but NOT the connect profile.
+    command = databricks_bearer_token_command("https://example.databricks.com", "someone-else")
+    assert "omnigent.host.databricks_credential" not in command
+
+
+def test_an_explicit_fallback_is_not_overridden_by_the_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A caller-supplied fallback (e.g. ucode's) wins over the broker default."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    command = databricks_bearer_token_command(
+        "https://example.databricks.com", "omnigent", fallback_command="ucode-token"
+    )
+    assert "omnigent.host.databricks_credential" not in command
+    assert "ucode-token" in command
+
+
+def test_no_sidecar_leaves_the_command_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Non-regression: with NO broker sidecar (a normal user with their own
+    Databricks profile, not a managed connect sandbox), the broker fallback adds
+    nothing — the command has no broker reference and no eval-fallback clause,
+    i.e. it is identical to the pre-change behaviour."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    cmd = databricks_bearer_token_command("https://example.databricks.com", "myprofile")
+    assert "omnigent.host.databricks_credential" not in cmd
+    # The eval-fallback clause is emitted ONLY when a fallback command is set.
+    assert "eval" not in cmd

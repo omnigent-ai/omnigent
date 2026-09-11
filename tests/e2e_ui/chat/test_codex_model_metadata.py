@@ -11,7 +11,12 @@ from playwright.sync_api import Page, Route, expect
 from tests.e2e_ui.conftest import fetch_with_retry
 
 
-def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
+def _patch_session_as_codex_native(
+    page: Page,
+    session_id: str,
+    *,
+    custom_agent: bool = False,
+) -> list[dict]:
     """Patch the browser's session snapshot into a codex-native response.
 
     The server fixture seeds a normal ``hello_world`` session so the page can
@@ -22,6 +27,8 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
+    :param custom_agent: Remove the presentation wrapper label and report the
+        resolved ``codex-native`` harness, matching a YAML custom agent.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
@@ -67,11 +74,13 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
             route.continue_()
             return
 
-        payload["labels"] = {
-            **payload.get("labels", {}),
-            "omnigent.wrapper": "codex-native-ui",
-        }
-        payload["harness"] = "codex"
+        labels = dict(payload.get("labels", {}))
+        if custom_agent:
+            labels.pop("omnigent.wrapper", None)
+        else:
+            labels["omnigent.wrapper"] = "codex-native-ui"
+        payload["labels"] = labels
+        payload["harness"] = "codex-native" if custom_agent else "codex"
         payload["llm_model"] = "gpt-5.5"
         payload["reasoning_effort"] = "xhigh"
         payload["model_options"] = [
@@ -126,31 +135,68 @@ def test_codex_native_picker_uses_raw_model_metadata(
 
     # The read-only composer label shows the resolved model + effort; the
     # harness identity moved into the config gear's hover tooltip.
-    label = page.get_by_test_id("composer-model-effort-label")
-    expect(label).to_contain_text("Codex Pretty 5.5 xhigh", timeout=15_000)
+    expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
+        "Codex Pretty 5.5", timeout=15_000
+    )
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
     page.get_by_test_id("composer-config-gear").hover()
     expect(page.get_by_test_id("composer-config-gear-tooltip")).to_contain_text("Codex")
 
     # Open the config modal; its Model dropdown renders Codex's displayName raw.
     page.get_by_test_id("composer-config-gear").click()
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
-    page.get_by_test_id("composer-config-model").click()
-    model_row = page.locator('[role="option"][data-model-id="gpt-5.5"]')
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
+
+    model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.5"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("Codex Pretty 5.5")
     # Re-select the current model to close the listbox without sending Escape
     # to the surrounding dialog.
-    model_row.click()
-    expect(model_row).to_be_hidden()
-    effort_trigger = page.get_by_test_id("composer-config-effort")
+
+    expect(model_row).to_be_visible()
+    effort_trigger = page.get_by_test_id("composer-agent-efforts")
     expect(effort_trigger).to_be_visible()
-    effort_trigger.click()
-    effort_row = page.locator('[role="option"][data-effort-level="xhigh"]')
+
+    effort_row = page.locator('[role="menuitemcheckbox"][data-effort-level="xhigh"]')
     expect(effort_row).to_be_visible()
-    expect(effort_row).to_contain_text("xhigh")
+    expect(effort_row).to_contain_text("xHigh")
     # Codex effort ids render raw (not title-cased) even in the shared Select.
     assert effort_row.evaluate("el => getComputedStyle(el).textTransform") == "none"
+
+
+def test_custom_codex_native_agent_keeps_model_and_effort_controls(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Expose Codex controls from the resolved harness without a wrapper label.
+
+    YAML custom agents do not receive the built-in ``omnigent.wrapper``
+    presentation label. The authoritative session snapshot still identifies
+    their resolved harness as ``codex-native``, which is sufficient evidence
+    that model and reasoning-effort overrides are supported.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser snapshot is patched to a custom codex-native agent.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _patch_session_as_codex_native(page, session_id, custom_agent=True)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
+        "Codex Pretty 5.5", timeout=15_000
+    )
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible()
+    gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-models")).to_be_visible()
+    expect(page.get_by_test_id("composer-agent-efforts")).to_contain_text("xHigh")
 
 
 def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
@@ -174,10 +220,11 @@ def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    plan_toggle = page.get_by_test_id("codex-plan-mode-toggle")
+    page.get_by_test_id("composer-attach").click()
+    plan_toggle = page.get_by_test_id("composer-plan-action")
     expect(plan_toggle).to_be_visible(timeout=15_000)
     expect(plan_toggle).to_have_attribute("aria-label", "Enter Plan mode")
-    expect(plan_toggle).to_have_attribute("aria-pressed", "false")
+    expect(plan_toggle).not_to_have_attribute("data-active", "true")
 
     with page.expect_response(
         lambda response: (
@@ -189,8 +236,10 @@ def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
         plan_toggle.click()
 
     assert patch_bodies[-1] == {"collaboration_mode": "plan"}
+    expect(plan_toggle).not_to_be_visible()
+    page.get_by_test_id("composer-attach").click()
     expect(plan_toggle).to_have_attribute("aria-label", "Exit Plan mode")
-    expect(plan_toggle).to_have_attribute("aria-pressed", "true")
+    expect(plan_toggle).to_have_attribute("data-active", "true")
     expect(page.get_by_test_id("composer-plan-mode")).to_contain_text("Plan mode")
 
     with page.expect_response(
@@ -203,8 +252,10 @@ def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
         plan_toggle.click()
 
     assert patch_bodies[-1] == {"collaboration_mode": "default"}
+    expect(plan_toggle).not_to_be_visible()
+    page.get_by_test_id("composer-attach").click()
     expect(plan_toggle).to_have_attribute("aria-label", "Enter Plan mode")
-    expect(plan_toggle).to_have_attribute("aria-pressed", "false")
+    expect(plan_toggle).not_to_have_attribute("data-active", "true")
     expect(page.get_by_test_id("composer-plan-mode")).to_have_count(0)
 
 
@@ -319,23 +370,26 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
 
     # The Effort row is present although the session catalog is still empty.
-    effort_trigger = page.get_by_test_id("composer-config-effort")
+    effort_trigger = page.get_by_test_id("composer-agent-efforts")
     expect(effort_trigger).to_be_visible(timeout=10_000)
 
     # The Model menu lists the host probe row under its display name.
-    page.get_by_test_id("composer-config-model").click()
-    model_row = page.locator('[role="option"][data-model-id="gpt-5.6-luna"]')
+
+    model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("GPT-5.6-Luna")
     # Re-select the current model to close the listbox without sending
     # Escape to the surrounding dialog.
-    model_row.click()
-    expect(model_row).to_be_hidden()
+
+    expect(model_row).to_be_visible()
 
     # The Effort menu offers exactly the host row's reasoning efforts.
-    effort_trigger.click()
+
     for level in ("low", "medium", "xhigh"):
-        expect(page.locator(f'[role="option"][data-effort-level="{level}"]')).to_be_visible()
+        expect(
+            page.locator(f'[role="menuitemcheckbox"][data-effort-level="{level}"]')
+        ).to_be_visible()

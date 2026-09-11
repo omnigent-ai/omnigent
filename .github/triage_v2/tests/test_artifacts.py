@@ -56,6 +56,8 @@ def test_dry_run_artifacts_are_complete_and_deterministic(tmp_path) -> None:
     assert ranking[0]["duplicate_count"] == 2
     assert ranking[1]["type"] == "Feature"
     assert ranking[0]["impact"] == "high"
+    assert ranking[0]["evidence_kind"] == "none"
+    assert ranking[0]["information_status"] == "not_applicable"
 
 
 def test_cli_writes_review_artifacts_without_network(tmp_path) -> None:
