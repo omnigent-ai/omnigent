@@ -693,7 +693,10 @@ async def _evaluate_policy_via_omnigent(
         verdict_body["data"] = verdict_data
 
     # Retry once on dead-channel / timeout / non-2xx; any unacknowledged verdict
-    # eventually calls on_delivery_failure to cancel the wedged turn.
+    # eventually calls on_delivery_failure to cancel the wedged turn. Track the
+    # failure mode so the wrap-up log attributes the cause instead of lumping
+    # every mode into one unattributed record.
+    failure_reason = "unexpected"
     for _attempt in range(2):
         try:
             resp = await harness_client.post(
@@ -702,6 +705,7 @@ async def _evaluate_policy_via_omnigent(
                 timeout=30.0,
             )
         except _DEAD_HARNESS_CHANNEL_ERRORS as exc:
+            failure_reason = "dead_channel"
             _logger.warning(
                 "Policy verdict %s delivery hit a dead harness channel (attempt %d/2): %s",
                 evaluation_id,
@@ -711,6 +715,7 @@ async def _evaluate_policy_via_omnigent(
             )
             continue
         except Exception:  # noqa: BLE001 — non-transport: no retry, but still signal
+            failure_reason = "unexpected"
             _logger.warning(
                 "Failed to deliver policy verdict %s to harness (unexpected error)",
                 evaluation_id,
@@ -720,6 +725,7 @@ async def _evaluate_policy_via_omnigent(
             break
         if 200 <= resp.status_code < 300:
             return
+        failure_reason = f"http_{resp.status_code}"
         _logger.warning(
             "Policy verdict %s delivery got HTTP %d — harness did not accept it (attempt %d/2)",
             evaluation_id,
@@ -728,13 +734,34 @@ async def _evaluate_policy_via_omnigent(
             extra={"session_id": conversation_id},
         )
 
-    _logger.error(
-        "Policy verdict %s delivery unacknowledged (dead channel / timeout / "
-        "non-2xx / unexpected) after retry; signaling desync for %s",
-        evaluation_id,
-        conversation_id,
-        extra={"session_id": conversation_id},
-    )
+    if failure_reason == "dead_channel":
+        # The harness channel died before the verdict could land — an upstream
+        # disconnect/teardown consequence whose primary failure (the harness
+        # death) is surfaced by stream teardown, not an Omnigent defect. Log at
+        # WARNING with a structured reason; the desync recovery still runs.
+        _logger.warning(
+            "Policy verdict %s undeliverable after retry: harness channel is dead "
+            "(upstream disconnect/teardown); signaling desync for %s",
+            evaluation_id,
+            conversation_id,
+            extra={
+                "session_id": conversation_id,
+                "delivery_failure_reason": "verdict_delivery_channel_dead",
+            },
+        )
+    else:
+        # A live harness refused the verdict (non-2xx) or delivery failed in an
+        # unforeseen way — potentially a real protocol defect, kept at ERROR.
+        _logger.error(
+            "Policy verdict %s delivery unacknowledged (%s) after retry; signaling desync for %s",
+            evaluation_id,
+            failure_reason,
+            conversation_id,
+            extra={
+                "session_id": conversation_id,
+                "delivery_failure_reason": failure_reason,
+            },
+        )
     if on_delivery_failure is not None:
         await on_delivery_failure(conversation_id)
 
