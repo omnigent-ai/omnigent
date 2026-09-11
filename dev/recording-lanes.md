@@ -82,11 +82,12 @@ fixtures **spawn their own local server + runner** (the default when no
 
 ## A live server your reproduction built is a recording target
 
-The fixture spawn is the default lane, not the only one. When the journey needs
-a stack the stock fixtures can't replicate (a real runner behind a restartable
-proxy, injected transport faults, a bespoke topology), do **not** declare the
-web lane unfilmable by citing the stock fixture's limits — attach the recorder
-to the server you already have running. Build the SPA first (next section): an
+The fixture spawn is the default lane, not the only one. Whenever your
+reproduction already stood up its own live server — for *any* reason the stock
+`tests/e2e_ui/` fixtures don't cover — that running server is itself a
+recording target. Do **not** declare the web lane unfilmable by citing the
+stock fixture's limits — attach the recorder to the server you already have
+running. Build the SPA first (next section): an
 `omnigent server` serves it from `omnigent/server/static/web-ui/`, so once the
 bundle exists the SPA is live on your stack's own URL. Then run the recorder
 against that URL:

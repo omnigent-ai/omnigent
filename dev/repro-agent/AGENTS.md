@@ -376,12 +376,12 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
 Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 
-A reproduction that stood up its **own live stack** (a real server + runner +
-fault injection the stock `tests/e2e_ui/` fixture can't replicate) has not lost
-the web lane — that stack is itself a recording target. Build the SPA and
-point the recorder at the server you already have running (`--ui-base-url`;
-see `dev/recording-lanes.md`) and film the user-visible moment there. Citing
-the stock fixture's limits is never grounds for `recording_unavailable_reason`:
+A reproduction that stood up its **own live server** — for any reason the
+stock `tests/e2e_ui/` fixture can't cover — has not lost the web lane; that
+running server is itself a recording target. Build the SPA and point the
+recorder at the server you already have running (`--ui-base-url`; see
+`dev/recording-lanes.md`) and film the user-visible moment there. Citing the
+stock fixture's limits is never grounds for `recording_unavailable_reason`:
 only an attempted attach that failed, with the command and error quoted,
 justifies the skip.
 
