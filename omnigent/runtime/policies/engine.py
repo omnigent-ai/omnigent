@@ -566,8 +566,9 @@ class PolicyEngine:
                 for op in session_ops:
                     _apply_one(state, op)
 
-            # Closed over today's two-member StateUpdateAction enum (SET, DELETE):
-            # a future third action would need its own inclusion/exclusion here.
+            # DELETE is the only StateUpdateAction that removes a key (SET,
+            # INCREMENT, and APPEND all leave it present in ``merged``); a
+            # future action that also removes keys must join this set.
             deleted_keys = {op.key for op in session_ops if op.action == StateUpdateAction.DELETE}
             merged = self._store.mutate_session_state(self._conversation_id, _merge)
             # Hot cache: persisted truth (``merged``) is authoritative for
