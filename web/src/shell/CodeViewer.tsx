@@ -431,6 +431,12 @@ export interface CodeViewerProps {
    * itself can't anchor text-selection comments).
    */
   onRequestEditMode?: () => void;
+  /**
+   * 1-based line a chat citation (`path:line`) pointed at. The Monaco surface
+   * reveals it on open instead of parking at the top; the Shiki surfaces
+   * scroll their line row into view.
+   */
+  revealLine?: number | null;
 }
 
 export function CodeViewer({
@@ -452,6 +458,7 @@ export function CodeViewer({
   tocOpen = false,
   onTocToggle,
   onRequestEditMode,
+  revealLine,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -539,6 +546,16 @@ export function CodeViewer({
     const lineNum = indexToLine(activeSelection.start_index, rawLines);
     matchLineRefs.current.get(lineNum - 1)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [activeSelection]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Land on the cited line for the Shiki (per-line DOM) surfaces. The Monaco
+  // surface handles its own reveal; this covers markdown/HTML source views.
+  // Keyed on content so a late-arriving file body still gets the scroll.
+  useEffect(() => {
+    if (showMonaco || revealLine == null || rawLines.length === 0) return;
+    matchLineRefs.current
+      .get(Math.max(1, Math.min(revealLine, rawLines.length)) - 1)
+      ?.scrollIntoView({ block: "center" });
+  }, [showMonaco, revealLine, rawLines.length]);
 
   useEffect(() => {
     setCurrentMatchIdx(0);
@@ -868,6 +885,7 @@ export function CodeViewer({
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
           onSearchHandled={handleSearchHandled}
+          revealLine={revealLine}
           comments={comments}
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}

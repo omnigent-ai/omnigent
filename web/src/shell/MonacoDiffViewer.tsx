@@ -76,6 +76,12 @@ interface MonacoDiffViewerProps {
    * widget's ✕) so the owning toggle resets and the next Cmd+F re-opens it.
    */
   onSearchHandled?: () => void;
+  /**
+   * 1-based line (in the "after" content) to reveal on the modified side — a
+   * chat citation's `path:line` target. When set it owns the landing position,
+   * so the saved scroll offset is not restored.
+   */
+  revealLine?: number | null;
 }
 
 /**
@@ -100,6 +106,7 @@ export function MonacoDiffViewer({
   pendingBodyRef,
   searchOpen,
   onSearchHandled,
+  revealLine,
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const lang = detectLang(path);
@@ -145,6 +152,10 @@ export function MonacoDiffViewer({
   // so a file's diff and its editor view don't share one offset.
   const scrollKeyRef = useRef("");
   scrollKeyRef.current = `viewer-diff:${conversationId}:${path}`;
+  // Read by handleMount (which runs once) so a citation known at mount can
+  // suppress the saved-scroll restore that would fight the reveal.
+  const revealLineRef = useRef(revealLine);
+  revealLineRef.current = revealLine;
 
   const handleMount: DiffOnMount = useCallback(
     (diffEditor, monaco) => {
@@ -169,6 +180,7 @@ export function MonacoDiffViewer({
         modified,
         () => scrollKeyRef.current,
         () => modifiedEditorRef.current === modified,
+        revealLineRef.current == null,
       );
       setMounted(true);
     },
@@ -205,6 +217,25 @@ export function MonacoDiffViewer({
     },
     [],
   );
+
+  // Land on the cited line (a chat `path:line` citation) on the modified side,
+  // centered so the change sits in context. Re-runs when a later citation
+  // targets a different line of the same open file.
+  useEffect(() => {
+    if (!mounted || revealLine == null) return;
+    const modified = modifiedEditorRef.current;
+    const model = modified?.getModel();
+    if (!modified || !model) return;
+    const line = Math.max(1, Math.min(revealLine, model.getLineCount()));
+    modified.revealLineInCenter(line);
+    modified.setPosition({ lineNumber: line, column: 1 });
+    // Monaco may still be laying out at mount (a zero-height pass clamps the
+    // scroll), so re-assert once after the first real layout.
+    const raf = requestAnimationFrame(() => {
+      if (modifiedEditorRef.current === modified) modified.revealLineInCenter(line);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [mounted, revealLine]);
 
   // Mirror the "Find in file" toggle to Monaco's native find widget on the
   // modified side. Gated on `mounted` so a Cmd+F pressed while the lazy chunk
