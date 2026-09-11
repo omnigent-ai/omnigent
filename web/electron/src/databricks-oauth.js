@@ -153,6 +153,26 @@ async function postToken(origin, body) {
   };
 }
 
+/**
+ * Decode and log a JWT access token's scope/audience (payload only — never the
+ * token itself). Diagnostic: /auth/session/create's route-level check requires
+ * the `all-apis` scope, so this shows whether the minted token actually has it.
+ */
+function logTokenScopes(accessToken) {
+  try {
+    const parts = String(accessToken).split(".");
+    if (parts.length !== 3) {
+      console.log("[omnigent] databricks oauth: token is opaque (not a JWT); cannot read scopes");
+      return;
+    }
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const scope = payload.scope ?? payload.scp ?? "(no scope claim)";
+    console.log(`[omnigent] databricks oauth: token scope="${scope}" aud="${payload.aud ?? ""}"`);
+  } catch (e) {
+    console.warn("[omnigent] databricks oauth: could not decode token scopes:", e.message);
+  }
+}
+
 async function exchangeCode(origin, code, verifier, redirectUri) {
   const { clientId, clientSecret } = config();
   const body = new URLSearchParams({
@@ -166,6 +186,7 @@ async function exchangeCode(origin, code, verifier, redirectUri) {
   const tokens = await postToken(origin, body);
   saveTokens(origin, tokens);
   console.log("[omnigent] databricks oauth: access token minted");
+  logTokenScopes(tokens.access_token);
   return tokens;
 }
 
