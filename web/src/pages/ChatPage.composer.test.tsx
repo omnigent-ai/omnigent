@@ -2912,6 +2912,25 @@ describe("Composer sub-agent tray", () => {
     expect(screen.getByText("check-account-eligibility")).toBeTruthy();
     expect(screen.getByText(/Chatting with sub-agent/)).toBeTruthy();
   });
+
+  // The tray is the rounded top of the composer stack: it must sit directly on
+  // the workspace shelf (sharing its inset) and square that shelf's top
+  // corners. Rendered outside the column — as it was before the composer
+  // redesign added the shelf — it peeks wider than the bar below it.
+  it("sits on the workspace shelf and squares its corners", () => {
+    render(<Composer {...composerProps({ subAgentLabel: "check-account-eligibility" })} />);
+    const bar = document.querySelector('[data-testid="composer-workspace-controls"]');
+    expect(bar).not.toBeNull();
+    expect(tray()?.nextElementSibling).toBe(bar);
+    expect(tray()?.parentElement).toBe(bar?.parentElement);
+    expect(bar?.className).toContain("rounded-t-none");
+  });
+
+  it("leaves the workspace shelf rounded on a top-level session", () => {
+    render(<Composer {...composerProps()} />);
+    const bar = document.querySelector('[data-testid="composer-workspace-controls"]');
+    expect(bar?.className).not.toContain("rounded-t-none");
+  });
 });
 
 describe("Composer — queued-message flush gating", () => {

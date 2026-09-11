@@ -142,16 +142,28 @@ def test_is_omnigent_side_fork_discriminates_fork_from_system_ephemeral() -> Non
 # --------------------------------------------------------------------------- #
 # register_side_fork_child — forwarder auto-surface
 # --------------------------------------------------------------------------- #
+def _ensure_stub(child_session_id: str | None) -> AsyncMock:
+    """Stand in for ``_ensure_child_session``, mapping the child like the real one."""
+
+    async def _ensure(_client, **kwargs: Any) -> None:
+        if child_session_id is not None:
+            kwargs["forwarder_state"].note_child_thread(
+                kwargs["child_thread_id"], child_session_id
+            )
+
+    return AsyncMock(side_effect=_ensure)
+
+
 @pytest.mark.asyncio
 async def test_register_side_fork_child_registers_matching_fork(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    register = AsyncMock(return_value="conv_side")
-    monkeypatch.setattr(fwd, "_register_child_session", register)
+    ensure = _ensure_stub("conv_side")
+    monkeypatch.setattr(fwd, "_ensure_child_session", ensure)
     state = fwd._CodexForwarderState()
 
     child_session = await side_chat.register_side_fork_child(
-        object(),  # ap_client unused: registration mocked
+        object(),  # ap_client unused: the pipeline is stubbed
         forwarder_state=state,
         parent_session_id="conv_parent",
         parent_thread_id="thread_parent",
@@ -160,18 +172,46 @@ async def test_register_side_fork_child_registers_matching_fork(
 
     assert child_session == "conv_side"
     assert state.session_for_child_thread("thread_side") == "conv_side"
-    kwargs = register.await_args.kwargs
+    kwargs = ensure.await_args.kwargs
     assert kwargs["parent_session_id"] == "conv_parent"
     assert kwargs["child_thread_id"] == "thread_side"
-    assert kwargs["item"]["sub_agent_name"] == side_chat.SIDE_CHAT_SUBAGENT_NAME
+    # a display name, so the rail/composer tray never shows the raw thread id
+    assert kwargs["item"]["agent_nickname"] == side_chat.SIDE_CHAT_DISPLAY_NAME
+
+
+@pytest.mark.asyncio
+async def test_register_side_fork_child_backfills_via_the_full_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The side fork must go through ``_ensure_child_session``.
+
+    Registering the child alone leaves the side chat an empty session: only the
+    pipeline's backfill replays the forked thread, so a bare
+    ``_register_child_session`` call is the bug this guards.
+    """
+    ensure = _ensure_stub("conv_side")
+    register = AsyncMock(return_value="conv_side")
+    monkeypatch.setattr(fwd, "_ensure_child_session", ensure)
+    monkeypatch.setattr(fwd, "_register_child_session", register)
+
+    await side_chat.register_side_fork_child(
+        object(),
+        forwarder_state=fwd._CodexForwarderState(),
+        parent_session_id="conv_parent",
+        parent_thread_id="thread_parent",
+        event=_fork_started(thread_id="thread_side", forked_from="thread_parent"),
+    )
+
+    ensure.assert_awaited_once()
+    register.assert_not_awaited()  # never bypass the pipeline
 
 
 @pytest.mark.asyncio
 async def test_register_side_fork_child_ignores_system_ephemeral_and_wrong_parent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    register = AsyncMock(return_value="conv_side")
-    monkeypatch.setattr(fwd, "_register_child_session", register)
+    ensure = _ensure_stub("conv_side")
+    monkeypatch.setattr(fwd, "_ensure_child_session", ensure)
     state = fwd._CodexForwarderState()
 
     # system ephemeral (no forkedFromId) -> ignored
@@ -196,13 +236,13 @@ async def test_register_side_fork_child_ignores_system_ephemeral_and_wrong_paren
         )
         is None
     )
-    register.assert_not_awaited()
+    ensure.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_register_side_fork_child_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
-    register = AsyncMock(return_value="conv_side")
-    monkeypatch.setattr(fwd, "_register_child_session", register)
+    ensure = _ensure_stub("conv_side")
+    monkeypatch.setattr(fwd, "_ensure_child_session", ensure)
     state = fwd._CodexForwarderState()
     state.note_child_thread("thread_side", "conv_side")  # already known
 
@@ -215,7 +255,41 @@ async def test_register_side_fork_child_is_idempotent(monkeypatch: pytest.Monkey
     )
 
     assert result == "conv_side"
-    register.assert_not_awaited()  # no duplicate registration
+    ensure.assert_not_awaited()  # no duplicate registration
+
+
+@pytest.mark.asyncio
+async def test_register_child_session_forwards_the_display_nickname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``agent_nickname`` must reach the server, else the child keeps a UUID title."""
+    posted: dict[str, Any] = {}
+
+    async def _post(_client, session_id: str, *, event_type: str, data: _JsonObject):
+        posted.update({"session_id": session_id, "event_type": event_type, "data": data})
+
+        class _R:
+            status_code = 200
+
+            @staticmethod
+            def json() -> dict[str, str]:
+                return {"child_session_id": "conv_side"}
+
+        return _R()
+
+    monkeypatch.setattr(fwd, "_post_session_event", _post)
+
+    child = await fwd._register_child_session(
+        object(),
+        parent_session_id="conv_parent",
+        parent_thread_id="thread_parent",
+        child_thread_id="thread_side",
+        item={"agent_nickname": "Side chat"},
+    )
+
+    assert child == "conv_side"
+    assert posted["data"]["agent_nickname"] == "Side chat"
+    assert posted["data"]["thread_id"] == "thread_side"
 
 
 # --------------------------------------------------------------------------- #

@@ -1296,12 +1296,23 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    // /btw is gated off by default (claude-native only), so it's excluded here.
+    // /btw (claude-native) and /side (codex-native) are gated off by default,
+    // so both are excluded here.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /side only when showSide is true (codex-native)", () => {
+    // Off by default and when explicitly false — /side is a codex-native
+    // built-in, so it must not leak into other harnesses' menus.
+    expect(buildSlashCommandMap([], true, true)["/side"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false)["/side"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, true)["/side"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/side"],
+    );
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
@@ -1361,9 +1372,9 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills. /btw is gated off by default.
+    // surfaces built-ins above user skills. /btw and /side are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
       "/triage-issues",
       "/mlflow-bug",
     ]);

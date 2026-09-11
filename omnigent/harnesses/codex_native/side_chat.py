@@ -51,7 +51,7 @@ SIDE_REFERENCE_ONLY_INSTRUCTIONS = (
 
 # Display name stamped on a side-chat child so the web can tell it apart from a
 # Codex-spawned sub-agent (drives the "this is a side chat" banner).
-SIDE_CHAT_SUBAGENT_NAME = "side-chat"
+SIDE_CHAT_DISPLAY_NAME = "Side chat"
 
 _SIDE_PREFIX = "/side "
 _JsonObject = dict[str, Any]
@@ -231,19 +231,18 @@ async def register_side_fork_child(
     if existing is not None:
         return existing
 
-    # ponytail: reuse the proven sub-agent registration pipeline
-    # (_register_child_session POSTs external_codex_subagent_start; note_child_thread
-    # makes _resolve_event_session route the fork's events to the child session).
+    # Reuse the whole sub-agent pipeline: it registers the child, maps the
+    # thread so _resolve_event_session routes its events to the child session,
+    # AND backfills the thread via thread/resume. Skipping the backfill leaves
+    # the side chat an empty session that never shows its answer.
     from omnigent.harnesses.codex_native import forwarder as _fwd
 
-    child_session_id = await _fwd._register_child_session(
+    await _fwd._ensure_child_session(
         ap_client,
         parent_session_id=parent_session_id,
         parent_thread_id=parent_thread_id,
         child_thread_id=child_thread_id,
-        item={"sub_agent_name": SIDE_CHAT_SUBAGENT_NAME},
+        item={"agent_nickname": SIDE_CHAT_DISPLAY_NAME},
+        forwarder_state=forwarder_state,
     )
-    if child_session_id is None:
-        return None
-    forwarder_state.note_child_thread(child_thread_id, child_session_id)
-    return child_session_id
+    return forwarder_state.session_for_child_thread(child_thread_id)

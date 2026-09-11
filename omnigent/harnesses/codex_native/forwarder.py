@@ -5311,6 +5311,12 @@ async def _register_child_session(
     tool_call_id = item.get("id")
     if isinstance(tool_call_id, str) and tool_call_id:
         data["tool_call_id"] = tool_call_id
+    # Display name for the child. Without it the server stamps its fixed
+    # fallback and the title keeps the raw thread id, which surfaces as a UUID
+    # in the sub-agent rail and the composer tray.
+    nickname = item.get("agent_nickname")
+    if isinstance(nickname, str) and nickname:
+        data["agent_nickname"] = nickname
     response = await _post_session_event(
         client,
         parent_session_id,
