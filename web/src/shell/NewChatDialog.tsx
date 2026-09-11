@@ -3581,7 +3581,12 @@ export function NewChatLandingScreen() {
     : supportsPermissionMode
       ? CLAUDE_NATIVE_PERMISSION_MODES
       : supportsApprovalMode
-        ? CODEX_NATIVE_APPROVAL_MODES
+        ? // Codex offers the DANGEROUS full-bypass as a 4th option, exactly as
+          // the Advanced settings select does; other approval harnesses
+          // (OpenCode) list only the three presets.
+          selectedNativeHarness === "codex-native"
+          ? [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
+          : CODEX_NATIVE_APPROVAL_MODES
         : supportsCursorMode
           ? CURSOR_NATIVE_EXEC_MODES
           : supportsAgySkipPermissions
@@ -3591,8 +3596,14 @@ export function NewChatLandingScreen() {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
     else if (supportsApprovalMode) {
-      setApprovalMode(mode);
-      setBypassSandbox(false);
+      if (mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
+        // Bypass rides a LABEL, not launch args: arm the toggle and keep the
+        // underlying preset, mirroring the Advanced settings select.
+        setBypassSandbox(true);
+      } else {
+        setApprovalMode(mode);
+        setBypassSandbox(false);
+      }
     } else if (supportsCursorMode) setCursorExecMode(mode);
     else if (supportsAgySkipPermissions) setAgySkipMode(mode);
     writeHarnessOption(selectedNativeHarness, { mode });

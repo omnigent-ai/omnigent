@@ -3124,6 +3124,57 @@ describe("NewChatLandingScreen", () => {
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
+  it("offers codex bypass in the quick Approval dropdown and arms the label on create", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    // The quick pill lists the same four modes as Advanced settings' select.
+    const chip = screen.getByTestId("new-chat-landing-permission-chip");
+    fireEvent.pointerDown(chip, { button: 0 });
+    const menu = screen.getByTestId("new-chat-landing-permission-menu");
+    for (const label of ["Default", "Full access", "Read only", "Bypass approvals & sandbox"]) {
+      expect(menu).toHaveTextContent(label);
+    }
+    // Picking bypass reads back on the pill (like the modal path does)...
+    fireEvent.click(screen.getByTestId("new-chat-landing-permission-option-bypass"));
+    expect(chip).toHaveTextContent("Bypass approvals & sandbox");
+    // ...and rides create as the label, with no preset flag pair alongside.
+    const { body } = await submitAndReadBody();
+    const labels = body.labels as Record<string, string>;
+    expect(labels["omnigent.codex_native.bypass_sandbox"]).toBe("1");
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("disarms a quick-menu bypass when a preset is picked from the same menu", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const chip = screen.getByTestId("new-chat-landing-permission-chip");
+    fireEvent.pointerDown(chip, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-permission-option-bypass"));
+    expect(chip).toHaveTextContent("Bypass approvals & sandbox");
+    // Re-picking a preset stands the bypass down: the pill tracks the preset
+    // and the create carries the preset's flags with no bypass label.
+    fireEvent.pointerDown(chip, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-permission-option-full-access"));
+    expect(chip).toHaveTextContent("Full access");
+    const { body } = await submitAndReadBody();
+    const labels = body.labels as Record<string, string>;
+    expect(labels["omnigent.codex_native.bypass_sandbox"]).toBeUndefined();
+    expect(body.terminal_launch_args).toEqual([
+      "--sandbox",
+      "danger-full-access",
+      "--ask-for-approval",
+      "never",
+    ]);
+  });
+
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
     // A live session in the seeded workspace ("/Users/corey/repo") on the
     // auto-selected host occupies the directory the picker opens at.
