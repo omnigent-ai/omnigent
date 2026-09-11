@@ -144,10 +144,12 @@ export const ComposerTextarea = forwardRef<
 });
 
 export function ComposerActionRow({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+  // Single flex line: the groups shrink (labels wrap/truncate) rather than wrap,
+  // so the trailing cluster never drops below the leading one at narrow widths.
   return (
     <div
       className={cn(
-        "@container/composer-actions flex min-w-0 flex-wrap items-center justify-between gap-2 px-2 pt-1 pb-2",
+        "@container/composer-actions flex min-w-0 items-center justify-between gap-2 px-2 pt-1 pb-2",
         className,
       )}
       {...props}
@@ -163,8 +165,11 @@ export function ComposerActionGroup({
   return (
     <div
       className={cn(
-        "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-auto overflow-visible" : "ml-auto max-w-full shrink-0",
+        "flex items-center gap-1",
+        // The leading group keeps min-width:auto so it never shrinks below its
+        // rigid controls (which would overflow into the trailing cluster); the
+        // trailing group is the one that shrinks, wrapping its pill labels.
+        side === "left" ? "flex-auto overflow-visible" : "ml-auto min-w-0 max-w-full",
         className,
       )}
       {...props}

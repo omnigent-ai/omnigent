@@ -4814,6 +4814,10 @@ function SessionHarnessPicker({
                     label="Configure session"
                     model={label}
                     effort={effortLabel ?? undefined}
+                    // One line under squeeze: the toolbar row never wraps, so a
+                    // narrow column ellipsizes the label instead of growing the
+                    // pill tall; the tooltip carries the full configuration.
+                    truncateLabel
                     icon={<ComposerAgentIcon agent={iconAgent} />}
                     disabled={busy || !configurable}
                     aria-disabled={disabled || busy || !configurable}

@@ -1751,12 +1751,15 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
     expect(Array.from(actions.children)).toEqual([leftControls, rightControls]);
-    expect(actions).toHaveClass("flex-wrap");
-    expect(leftControls).toHaveClass("min-w-0", "flex-auto", "gap-1", "overflow-visible");
-    expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "absolute");
-    expect(rightControls).toHaveClass("flex", "shrink-0", "items-center", "gap-1");
-    expect(rightControls).toHaveClass("ml-auto", "max-w-full");
-    expect(rightControls).not.toHaveClass("flex-1");
+    // The action row keeps both clusters on one flex line: the trailing
+    // cluster shrinks (labels wrap/truncate) instead of dropping below the
+    // leading controls when the composer narrows.
+    expect(actions).not.toHaveClass("flex-wrap");
+    expect(leftControls).toHaveClass("flex-auto", "gap-1", "overflow-visible");
+    expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "min-w-0", "absolute");
+    expect(rightControls).toHaveClass("flex", "items-center", "gap-1");
+    expect(rightControls).toHaveClass("ml-auto", "min-w-0", "max-w-full");
+    expect(rightControls).not.toHaveClass("flex-1", "shrink-0");
     for (const control of [attach, hostChip, permission]) {
       expect(leftControls).toContainElement(control);
     }

@@ -58,6 +58,35 @@ describe("ChatComposer", () => {
     );
   });
 
+  it("keeps both action clusters on one flex line at narrow widths", () => {
+    render(
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Message" }}
+        actions={{
+          leading: <span>Left cluster</span>,
+          trailing: <span>Right cluster</span>,
+          testId: "action-row",
+        }}
+      />,
+    );
+    // The row must never wrap: a wrapped row drops the model/mic/send cluster
+    // onto a second line below the left-hand controls when the column narrows.
+    const row = screen.getByTestId("action-row");
+    expect(row).toHaveClass("flex", "items-center", "justify-between");
+    expect(row).not.toHaveClass("flex-wrap");
+    // The trailing group absorbs the squeeze by shrinking (its pill labels
+    // wrap or truncate) instead of holding its width and forcing a wrap.
+    const trailing = screen.getByText("Right cluster").parentElement;
+    expect(trailing).toHaveClass("min-w-0", "max-w-full", "ml-auto");
+    expect(trailing).not.toHaveClass("shrink-0");
+    // The leading group floors at its content width (min-width:auto), so its
+    // rigid controls never overflow underneath the trailing cluster.
+    const leading = screen.getByText("Left cluster").parentElement;
+    expect(leading).toHaveClass("flex-auto");
+    expect(leading).not.toHaveClass("min-w-0");
+  });
+
   it("places context, overlays, attachments and controls around the same input", () => {
     const cardRef = createRef<HTMLDivElement>();
     render(
