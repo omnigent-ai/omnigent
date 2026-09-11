@@ -12,6 +12,7 @@ import { useChatStore } from "@/store/chatStore";
 import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -264,6 +265,17 @@ describe("Composer growth layout", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it("shares the responsive chat width with its workspace controls", () => {
+    render(<Composer {...composerProps()} />);
+
+    const card = textarea().closest("[data-composer-card]");
+    const workspace = screen.getByTestId("composer-workspace-controls").parentElement;
+    for (const element of [card, workspace]) {
+      expect(element).toHaveClass("w-full", ...CHAT_COLUMN_WIDTH.split(" "));
+      expect(element).not.toHaveClass("max-w-[720px]");
+    }
   });
 
   it("keeps multiline growth in layout instead of offsetting the form over the transcript", () => {
