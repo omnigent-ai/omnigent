@@ -21,9 +21,11 @@ from omnigent.inner.codex_executor import (
     _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
+    _CodexRequestError,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
+    _input_too_large_error,
     _parse_codex_gateway_error,
     _prompt_for_turn,
     _provider_codex_config_overrides,
@@ -742,6 +744,124 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertNotIn("-32600", message)
             methods = [call.args[0] for call in session._request.await_args_list]
             self.assertNotIn("thread/goal/set", methods)
+
+        _run(_t())
+
+    def test_input_too_large_error_translates_counts(self):
+        message = _input_too_large_error(
+            {
+                "code": -32602,
+                "data": {
+                    "input_error_code": "input_too_large",
+                    "max_chars": 1048576,
+                    "actual_chars": 1450257,
+                },
+                "message": "Input exceeds the maximum length of 1048576 characters.",
+            }
+        )
+        self.assertIsNotNone(message)
+        self.assertIn("1450257", message)
+        self.assertIn("1048576", message)
+        self.assertIn("Shorten", message)
+        self.assertNotIn("-32602", message)
+        self.assertNotIn("input_error_code", message)
+
+    def test_input_too_large_error_without_counts_is_still_actionable(self):
+        message = _input_too_large_error(
+            {"code": -32602, "data": {"input_error_code": "input_too_large"}}
+        )
+        self.assertIsNotNone(message)
+        self.assertIn("Shorten", message)
+
+    def test_input_too_large_error_ignores_other_errors(self):
+        self.assertIsNone(_input_too_large_error({"code": -32000, "message": "boom"}))
+        self.assertIsNone(
+            _input_too_large_error({"code": -32602, "data": {"input_error_code": "other"}})
+        )
+        self.assertIsNone(_input_too_large_error("not a dict"))
+        self.assertIsNone(_input_too_large_error(None))
+
+    def test_app_server_oversized_turn_input_fails_clearly(self):
+        """An app-server input_too_large rejection surfaces a readable reason."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            rejection = _CodexRequestError(
+                {
+                    "code": -32602,
+                    "data": {
+                        "input_error_code": "input_too_large",
+                        "max_chars": 1048576,
+                        "actual_chars": 1450257,
+                    },
+                    "message": "Input exceeds the maximum length of 1048576 characters.",
+                }
+            )
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    rejection,
+                ]
+            )
+
+            events = []
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "oversized paste"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                events.append(event)
+
+            self.assertEqual([type(event) for event in events], [ExecutorError])
+            message = events[0].message
+            # A readable size/limit reason, not the raw JSON-RPC payload.
+            self.assertIn("1450257", message)
+            self.assertIn("1048576", message)
+            self.assertIn("Shorten", message)
+            self.assertNotIn("-32602", message)
+            self.assertNotIn("input_error_code", message)
+
+        _run(_t())
+
+    def test_app_server_turn_start_unrelated_rejection_still_raises(self):
+        """Only input_too_large is translated; other rejections propagate."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    _CodexRequestError({"code": -32000, "message": "boom"}),
+                ]
+            )
+
+            with self.assertRaises(_CodexRequestError):
+                async for _event in session.run_turn(
+                    messages=[{"role": "user", "content": "hello"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                ):
+                    pass
 
         _run(_t())
 
