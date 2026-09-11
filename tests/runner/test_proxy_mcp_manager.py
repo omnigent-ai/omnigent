@@ -24,6 +24,7 @@ import pytest
 
 from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
 from omnigent.runner import pending_approvals
+from omnigent.runner import proxy_mcp_manager as proxy_mcp_manager_mod
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
@@ -653,6 +654,86 @@ async def test_call_tool_network_error_raises() -> None:
     error_msg = str(exc_info.value)
     assert "github__search" in error_msg, "Tool name must appear in the error message"
     assert "conv_test" in error_msg, "Session id must appear in the error message"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_transient_500_retries_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient 500 from the proxy is retried and the call succeeds.
+
+    The retry must re-post under the same operation id (so the server
+    reattaches work already started instead of replaying it) with a fresh
+    JSON-RPC id.
+
+    Failure means one server blip (restart, LB error, momentary overload)
+    permanently fails the agent's tool call.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0, raising=False)
+    rpc_ok = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"content": [{"type": "text", "text": "recovered"}], "isError": False},
+        }
+    )
+    transport = _StubTransport([httpx.Response(500, text="Internal Server Error"), rpc_ok])
+    manager = _make_manager(transport)
+
+    output = await manager.call_tool(_make_spec("github"), "github__search", {"query": "x"})
+
+    assert output == "recovered"
+    assert len(transport.calls) == 2, "Exactly one retry must follow the transient 500"
+    first, second = transport.calls
+    assert (
+        first.body["params"][MCP_OPERATION_ID_PARAM]
+        == second.body["params"][MCP_OPERATION_ID_PARAM]
+    ), "The retry must reuse the runner-owned operation id (replay guard)"
+    assert first.body["id"] != second.body["id"], "Each attempt needs a distinct JSON-RPC id"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_persistent_500_raises_after_bounded_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 500 that never clears raises RuntimeError after the bounded retry budget.
+
+    Failure means either the error is swallowed or the proxy retries without
+    bound against a persistently failing server.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0, raising=False)
+    transport = _StubTransport([httpx.Response(500, text="Internal Server Error")] * 3)
+    manager = _make_manager(transport)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await manager.call_tool(_make_spec("github"), "github__search", {})
+
+    error_msg = str(exc_info.value)
+    assert "github__search" in error_msg
+    assert "conv_test" in error_msg
+    assert "500" in error_msg
+    # Initial post plus two retries, then give up.
+    assert len(transport.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_call_tool_client_error_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-transient status (404) fails immediately, without any retry.
+
+    Failure means deterministic request errors burn retries and delay the
+    tool result for no benefit.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0, raising=False)
+    transport = _StubTransport([httpx.Response(404, text="not found")])
+    manager = _make_manager(transport)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await manager.call_tool(_make_spec("github"), "github__search", {})
+
+    assert "404" in str(exc_info.value)
+    assert len(transport.calls) == 1, "Client errors must not be retried"
 
 
 # ── dispatch timeout nesting ────────────────────────────────────────────────
