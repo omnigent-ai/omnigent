@@ -240,6 +240,10 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
+// The session scrollbar auto-hides this long after the last scroll event, so
+// its thumb only shows while the list is actively being scrolled.
+const SCROLLBAR_HIDE_DELAY_MS = 700;
+
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
@@ -714,6 +718,30 @@ function SidebarImpl({
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);
+  const [hasScrolled, setHasScrolled] = useState(false);
+  // Reveal the session scrollbar only while the list is actively scrolling,
+  // fading it back out once scrolling settles.
+  const [isScrolling, setIsScrolling] = useState(false);
+  const scrollIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const markScrolling = useCallback(() => {
+    setIsScrolling(true);
+    if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
+    scrollIdleTimer.current = setTimeout(() => setIsScrolling(false), SCROLLBAR_HIDE_DELAY_MS);
+  }, []);
+  useEffect(
+    () => () => {
+      if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
+    },
+    [],
+  );
+  const setScrollContainer = useCallback((node: HTMLElement | null) => {
+    scrollContainerRef.current = node;
+    setHasScrolled((node?.scrollTop ?? 0) > 0);
+    // A freshly (re)mounted list — e.g. returning from Settings — starts with
+    // the scrollbar hidden.
+    if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
+    setIsScrolling(false);
+  }, []);
 
   // Inbox badge — total approval prompts across loaded rows. We read from both
   // conversationsQuery (all-sessions, page 1 coverage) AND filteredConversationsQuery
@@ -1219,15 +1247,33 @@ function SidebarImpl({
           absolute-positioning inside the aside would place it in the native
           safe-area padding, under the home indicator. */}
             <div className="relative flex min-h-0 flex-1 flex-col">
+              <div
+                aria-hidden="true"
+                data-testid="sidebar-scroll-divider"
+                className={cn(
+                  "pointer-events-none absolute inset-x-0 top-0 z-10 h-px bg-border",
+                  hasScrolled ? "opacity-100" : "opacity-0",
+                )}
+              />
               <nav
-                ref={scrollContainerRef}
-                // Keep wheel/touch scrolling without letting classic-scrollbar
-                // platforms reserve a wide, permanently visible Sidebar gutter.
-                // max-md:pb-14 is the floating Settings chip's clearance: the
+                ref={setScrollContainer}
+                onScroll={(event) => {
+                  setHasScrolled(event.currentTarget.scrollTop > 0);
+                  markScrolling();
+                }}
+                // max-md:pb-16 is the floating Settings chip's clearance: the
                 // chip is a non-scrolling sibling pinned bottom-right, so
                 // without a gutter the last row's always-visible kebab parks
                 // underneath it and can't be tapped.
-                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-16 [&::-webkit-scrollbar]:hidden"
+                className={cn(
+                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16 md:mr-1",
+                  // Reserve a thin gutter on both engines so toggling the thumb
+                  // never reflows the list; only its color changes on scroll.
+                  "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
+                  isScrolling
+                    ? "[scrollbar-color:var(--muted-foreground)_transparent] [&::-webkit-scrollbar-thumb]:bg-muted-foreground"
+                    : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
+                )}
               >
                 <ConversationList
                   conversationsQuery={displayQuery}

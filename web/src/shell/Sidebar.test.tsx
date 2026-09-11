@@ -338,6 +338,46 @@ const TEST_EXTENSION: ExtensionCatalogItem = {
   },
 };
 
+describe("Sidebar scroll divider", () => {
+  it("separates fixed navigation only while sessions are scrolled", () => {
+    mockConversations([conv("session-1", "A session")]);
+    renderSidebar();
+
+    const divider = screen.getByTestId("sidebar-scroll-divider");
+    const scrollContainer = screen.getByRole("navigation");
+
+    expect(divider).toHaveClass("opacity-0", "absolute", "pointer-events-none");
+    expect(divider).toHaveAttribute("aria-hidden", "true");
+    expect(scrollContainer).not.toContainElement(divider);
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 1 } });
+    expect(divider).toHaveClass("opacity-100");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 100 } });
+    expect(divider).toHaveClass("opacity-100");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 0 } });
+    expect(divider).toHaveClass("opacity-0");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: -10 } });
+    expect(divider).toHaveClass("opacity-0");
+  });
+
+  it("resets when returning from settings to a fresh session list", () => {
+    mockConversations([conv("session-1", "A session")]);
+    renderSidebar();
+
+    fireEvent.scroll(screen.getByRole("navigation"), { target: { scrollTop: 100 } });
+    expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-100");
+
+    fireEvent.click(screen.getByTestId("sidebar-settings-float"));
+    expect(screen.queryByTestId("sidebar-scroll-divider")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("link", { name: /back/i }));
+    expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-0");
+  });
+});
+
 describe("Sidebar session list", () => {
   it.each([null, 1, 2, 3, 4])(
     "marks shared sessions regardless of permission level %s",
@@ -463,14 +503,42 @@ describe("Sidebar session list", () => {
     expect(error).not.toHaveClass("text-sm");
   });
 
-  it("keeps the session list scrollable without visible scrollbar chrome", () => {
-    mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar();
+  it("reveals a thin, theme-aware scrollbar only while scrolling", () => {
+    vi.useFakeTimers();
+    try {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      renderSidebar();
 
-    const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
-    expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
-    expect(scroller.className).not.toContain("scrollbar-gutter");
+      const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
+      // The gutter is always reserved (thin, on both engines) so toggling the
+      // thumb never reflows the list; only its color changes.
+      expect(scroller).toHaveClass("overflow-y-auto", "md:mr-1", "[scrollbar-width:thin]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar]:w-2");
+      expect(scroller).not.toHaveClass("[scrollbar-width:none]");
+      expect(scroller.className).not.toContain("[&::-webkit-scrollbar]:hidden");
+
+      // Idle: the thumb is transparent, so no scrollbar is visible.
+      expect(scroller).toHaveClass("[scrollbar-color:transparent_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-transparent");
+      expect(scroller).not.toHaveClass("[scrollbar-color:var(--muted-foreground)_transparent]");
+      expect(scroller.className).not.toContain("[&::-webkit-scrollbar-thumb]:bg-muted-foreground");
+
+      // Scrolling reveals the thumb.
+      act(() => {
+        fireEvent.scroll(scroller, { target: { scrollTop: 40 } });
+      });
+      expect(scroller).toHaveClass("[scrollbar-color:var(--muted-foreground)_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-muted-foreground");
+
+      // It hides again once scrolling settles.
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(scroller).toHaveClass("[scrollbar-color:transparent_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-transparent");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows a draft icon only beside sessions with unfinished composer content", () => {
