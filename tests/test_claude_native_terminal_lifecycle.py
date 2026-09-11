@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -186,7 +187,7 @@ async def test_two_completed_runs_survive_one_parent_read(tmp_path, tool):
     scene.assert_completed("second done")
 
 
-@pytest.mark.parametrize("legacy", [False])
+@pytest.mark.parametrize("legacy", [False, True])
 async def test_parked_terminal_retains_fallback_across_registration_and_restart(tmp_path, legacy):
     scene = _Scene(tmp_path)
     await scene.tick(_terminal(task="external-task"))
@@ -195,6 +196,75 @@ async def test_parked_terminal_retains_fallback_across_registration_and_restart(
     await scene.tick()
     scene.assert_completed("first done")
     assert not scene.state.pending_terminal_notifications
+
+
+@pytest.mark.parametrize("later_completion", [False, True])
+async def test_host_upgrade_heals_consumed_legacy_evidence_without_new_records(
+    tmp_path, later_completion
+):
+    scene = _Scene(tmp_path)
+    scene.register()
+    await scene.tick(_terminal())
+    _append(scene.child, _resume())
+    if later_completion:
+        _append(scene.parent, _terminal(timestamp=T3, output="second done"))
+    entry = scene.state.subagents["worker"]
+    # State written by the previous Host after it consumed the resume and,
+    # optionally, lost the later completion through its old dedupe rule.
+    entry = replace(
+        entry,
+        byte_offset=scene.child.stat().st_size,
+        terminal_status=None if later_completion else entry.terminal_status,
+        terminal_observed_at=None if later_completion else entry.terminal_observed_at,
+        last_status="running" if later_completion else entry.last_status,
+    )
+    scene.state = replace(
+        scene.state, subagents={"worker": entry}, parent_byte_offset=scene.parent.stat().st_size
+    )
+    f._write_subagent_forward_state(scene.bridge, scene.state)
+    scene.reload(legacy=True)
+    scene.events.clear()
+    await scene.tick()
+    if later_completion:
+        scene.assert_completed("second done")
+    else:
+        # A consumed cursor alone cannot distinguish a new prompt from an
+        # acknowledged historical replay. Preserve the settled state.
+        assert scene.events == []
+        assert scene.state.subagents["worker"].terminal_status == "completed"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_foreground_resumed_agent_completion_uses_stable_task_id(tmp_path, legacy):
+    scene = _Scene(tmp_path)
+    scene.register()
+    await scene.tick(_terminal())
+    _append(scene.child, _resume())
+    await scene.tick()
+    _append(
+        scene.parent,
+        {
+            "type": "user",
+            "uuid": "foreground-result",
+            "timestamp": T3,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool_resume", "content": "second done"}
+                ],
+            },
+            "toolUseResult": {"status": "completed", "agentId": "worker"},
+        },
+    )
+    if legacy:
+        scene.state = replace(scene.state, parent_byte_offset=scene.parent.stat().st_size)
+        f._write_subagent_forward_state(scene.bridge, scene.state)
+        scene.reload(legacy=True)
+    scene.events.clear()
+    await scene.tick()
+    scene.assert_completed("second done")
+    if legacy and scene.events[-1]["status"] == "completed":
+        assert scene.events[-1]["replayed"] is True
 
 
 @pytest.mark.parametrize("parked", [False, True])
@@ -208,3 +278,104 @@ async def test_late_old_completion_cannot_replace_newer_result(tmp_path, parked)
         scene.register()
         await scene.tick()
     scene.assert_completed("second done")
+
+
+@pytest.mark.parametrize("dropped", [False, True])
+async def test_upgrade_never_treats_an_unaccepted_prompt_as_a_resume(tmp_path, dropped):
+    scene = _Scene(tmp_path)
+    scene.register()
+    await scene.tick(_terminal())
+    _append(scene.child, _resume())
+    if dropped:
+        entry = scene.state.subagents["worker"]
+        scene.state = replace(
+            scene.state,
+            subagents={
+                "worker": replace(
+                    entry,
+                    byte_offset=scene.child.stat().st_size,
+                    delivery_error=f._SUBAGENT_DROPPED_ITEM_REASON,
+                )
+            },
+        )
+    f._write_subagent_forward_state(scene.bridge, scene.state)
+    scene.reload(legacy=True)
+    scene.events.clear()
+    await scene.tick(fail_items=True)
+    assert scene.state.subagents["worker"].terminal_status == "completed"
+    assert scene.state.subagents["worker"].resume_observed_at is None
+    assert all(event["status"] != "running" for event in scene.events)
+
+
+async def test_missing_old_peer_does_not_block_completion_recovery(tmp_path):
+    scene = _Scene(tmp_path)
+    scene.register()
+    _append(scene.child, _resume("2026-09-10T13:20:00Z"))
+    await scene.tick()
+    _append(scene.parent, _terminal(), _terminal(task="gone", tool="gone", output="gone done"))
+    gone = f.SubagentEntry(
+        subagent_id="gone", child_conversation_id="conv_gone", byte_offset=1, last_status="running"
+    )
+    scene.state = replace(
+        scene.state,
+        subagents={**scene.state.subagents, "gone": gone},
+        parent_byte_offset=scene.parent.stat().st_size,
+    )
+    f._write_subagent_forward_state(scene.bridge, scene.state)
+    scene.reload(legacy=True)
+    scene.events.clear()
+    await scene.tick()
+    scene.assert_completed("first done")
+    assert scene.state.subagents["gone"].terminal_evidence_pending
+    scene.reload()
+    (scene.child.parent / "agent-gone.jsonl").write_text("{}\n")
+    await scene.tick()
+    assert scene.state.subagents["gone"].terminal_status == "completed"
+    assert not scene.state.subagents["gone"].terminal_evidence_pending
+
+
+async def test_upgrade_retries_late_metadata_and_preserves_historical_delivery(tmp_path):
+    scene = _Scene(tmp_path)
+    scene.register()
+    _append(scene.child, _resume("2026-09-10T13:20:00Z"))
+    await scene.tick()
+    scene.child.with_suffix(".meta.json").unlink()
+    _append(scene.parent, _terminal(task="external-task"))
+    scene.state = replace(
+        scene.state,
+        subagents={"worker": replace(scene.state.subagents["worker"], tool_use_id=None)},
+        parent_byte_offset=scene.parent.stat().st_size,
+    )
+    f._write_subagent_forward_state(scene.bridge, scene.state)
+    scene.reload(legacy=True)
+    scene.events.clear()
+    await scene.tick()
+    scene.reload()
+    scene.register()
+    await scene.tick()
+    scene.assert_completed("first done")
+    if scene.events[-1]["status"] == "completed":
+        assert scene.events[-1]["replayed"] is True
+
+
+async def test_old_delivery_error_cannot_hide_a_later_accepted_resume(tmp_path):
+    scene = _Scene(tmp_path)
+    scene.register()
+    await scene.tick(_terminal())
+    scene.state = replace(
+        scene.state,
+        subagents={
+            "worker": replace(
+                scene.state.subagents["worker"], delivery_error=f._SUBAGENT_DROPPED_ITEM_REASON
+            )
+        },
+    )
+    _append(scene.child, _resume())
+    await scene.tick()
+    assert scene.events[-1]["status"] == "running"
+    scene.reload(legacy=True)
+    scene.events.clear()
+    await scene.tick()
+    assert scene.state.subagents["worker"].terminal_status is None
+    assert scene.state.subagents["worker"].last_status == "running"
+    assert scene.events == []

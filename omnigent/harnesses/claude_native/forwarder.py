@@ -2471,6 +2471,71 @@ def _observe_resume(
     return entry
 
 
+async def _repair_terminal_evidence_order(
+    state: SubagentForwardState,
+    *,
+    subagents_dir: Path,
+    transcript_path: Path,
+    bridge_dir: Path,
+    agent_name: str,
+) -> SubagentForwardState:
+    """Repair each old child independently, preserving settled replay acknowledgements."""
+    initial = state.terminal_evidence_version < 1
+    if not initial and not any(
+        entry.terminal_evidence_pending for entry in state.subagents.values()
+    ):
+        return state
+    try:
+        with transcript_path.open("rb") as stream:
+            stream.read(1)
+    except OSError:
+        return state
+    entries = dict(state.subagents)
+    for sid, entry in entries.items():
+        if not initial and not entry.terminal_evidence_pending:
+            continue
+        # A cursor includes deduplicated history. It cannot reopen an already
+        # acknowledged terminal; only new delivery can establish that intent.
+        if not entry.child_conversation_id or (
+            entry.terminal_status is not None and entry.last_status in {"idle", "failed"}
+        ):
+            entries[sid] = replace(entry, terminal_evidence_pending=False)
+            continue
+        if entry.byte_offset or entry.seen_source_ids:
+            path = subagents_dir / f"agent-{sid}.jsonl"
+            try:
+                with path.open("rb") as stream:
+                    stream.read(1)
+                result = await asyncio.to_thread(
+                    read_transcript_items_from_offset,
+                    path,
+                    0,
+                    start_line=0,
+                    agent_name=agent_name,
+                    include_sidechains=True,
+                )
+            except (OSError, ValueError):
+                entries[sid] = replace(entry, terminal_evidence_pending=True)
+                continue
+            for record in result.record_items:
+                for item in record.items:
+                    if (
+                        record.next_byte_offset <= entry.byte_offset
+                        or item.source_id in entry.seen_source_ids
+                    ):
+                        entry = _observe_resume(entry, item, record.timestamp)
+        entries[sid] = replace(entry, terminal_evidence_pending=False)
+    state = replace(
+        state,
+        subagents=entries,
+        parent_byte_offset=0 if initial else state.parent_byte_offset,
+        parent_line_cursor=0 if initial else state.parent_line_cursor,
+        terminal_evidence_version=1,
+    )
+    await _write_subagent_forward_state_async(bridge_dir, state)
+    return state
+
+
 def _is_user_resume_item(item: ClaudeTranscriptItem) -> bool:
     """Return True for a delivered user prompt that may resume a stopped child."""
     if (
@@ -2772,6 +2837,29 @@ async def _forward_available_subagents(
                 )
             break
         pending = deferred
+
+    # Upgrade older entries that predate persistent spawn identifiers.
+    for sid, entry in updated.subagents.items():
+        if entry.tool_use_id is None and (
+            entry.tool_use_id_pending or updated.terminal_evidence_version < 1
+        ):
+            meta = await asyncio.to_thread(
+                _read_subagent_meta, subagents_dir / f"agent-{sid}.meta.json"
+            )
+            if meta is not None:
+                updated = _with_entry(
+                    updated,
+                    replace(entry, tool_use_id=meta["toolUseId"], tool_use_id_pending=False),
+                )
+            elif not entry.tool_use_id_pending:
+                updated = _with_entry(updated, replace(entry, tool_use_id_pending=True))
+    updated = await _repair_terminal_evidence_order(
+        updated,
+        subagents_dir=subagents_dir,
+        transcript_path=transcript_path,
+        bridge_dir=bridge_dir,
+        agent_name=agent_name,
+    )
 
     # ── Drain parent task evidence ────────────────────────
     # Notifications apply by task id, then spawn tool-use id, else park.
