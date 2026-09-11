@@ -6810,6 +6810,20 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
 
+    async def _reconcile_desynced_harness(conv_id: str) -> None:
+        """Unwind a desynced harness's stale turn ctx before a fresh delivery.
+
+        A turn that ends in a transport drop marks the session desynced without
+        forwarding an interrupt, so a still-live harness keeps its active turn
+        ctx and answers the next fresh-turn delivery 204 (its in-band injection
+        reply) — the turn fails. Forward one interrupt to clear the ctx, then
+        drop the marker. Best-effort: a dead harness respawns ctx-free.
+        """
+        if conv_id not in _desynced_sessions:
+            return
+        await _forward_harness_interrupt(conv_id)
+        _desynced_sessions.discard(conv_id)
+
     async def _cancel_inprocess_turn(conv_id: str) -> None:
         # Distinguish "no live turn" (absent) from a stream-mode turn (present as
         # the None sentinel — driven by the AP request's consumption of
@@ -7410,10 +7424,12 @@ def create_runner_app(
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
         # A fresh turn is binding: whatever desync the previous turn ended on is
-        # resolved now. Also clear a stale publish-once token (e.g. left set by a
-        # wedged stream that never reached its own _on_proxy_stream_end) so it
-        # can't suppress this turn's legitimate terminal publish.
-        _desynced_sessions.discard(conv)
+        # resolved now — after unwinding the harness's stale turn ctx, or this
+        # delivery would be 204-rejected as an in-band injection. Also clear a
+        # stale publish-once token (e.g. left set by a wedged stream that never
+        # reached its own _on_proxy_stream_end) so it can't suppress this
+        # turn's legitimate terminal publish.
+        await _reconcile_desynced_harness(conv)
         _desync_terminalized.pop(conv, None)
         # Locate any uncoded exception logged below in the turn phase (this task's
         # context carries it for its lifetime). Coded errors keep their own phase.
@@ -7929,6 +7945,9 @@ def create_runner_app(
         dispatch: TurnDispatch | None = None,
     ) -> Response:
         manager = cast(HarnessProcessManager, process_manager)
+        # Direct-stream turns don't pass through _run_turn_bg — reconcile a
+        # desynced harness here so the fresh delivery isn't 204-rejected.
+        await _reconcile_desynced_harness(conv_id)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
