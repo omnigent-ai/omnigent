@@ -688,7 +688,7 @@ def test_set_github_preference_sets_default_and_account(
         "set_github_account_preference",
         lambda key, login, *a, **k: saved.update({"key": key, "login": login}),
     )
-    monkeypatch.setattr(github_resource, "github_info", lambda _root: {"stub": True})
+    monkeypatch.setattr(github_resource, "github_info", lambda _root, **_kwargs: {"stub": True})
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None

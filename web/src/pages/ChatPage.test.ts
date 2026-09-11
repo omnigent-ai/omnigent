@@ -1265,9 +1265,22 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    expect(Object.keys(map)).toEqual(Object.keys(BUILTIN_SLASH_COMMANDS));
+    // /btw is gated off by default (claude-native only), so it's excluded here.
+    expect(Object.keys(map)).toEqual(
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+    );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /btw only when showBtw is true (claude-native)", () => {
+    // Off by default and when explicitly false.
+    expect(buildSlashCommandMap([], true, true)["/btw"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false)["/btw"]).toBeUndefined();
+    // On when the session is claude-native.
+    expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/btw"],
+    );
   });
 
   it("omits /effort when effort controls are hidden", () => {
@@ -1317,9 +1330,9 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills.
+    // surfaces built-ins above user skills. /btw is gated off by default.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
       "/triage-issues",
       "/mlflow-bug",
     ]);

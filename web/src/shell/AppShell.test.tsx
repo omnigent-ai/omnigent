@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
@@ -554,6 +555,7 @@ beforeEach(() => {
   // choice carries across sessions. Clear it so a stored preference from one
   // test can't change another test's default scope.
   localStorage.clear();
+  clearOptimisticTitles();
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
@@ -580,12 +582,26 @@ describe("AppShell header", () => {
     expect(screen.queryByTestId("execution-logs-card")).toBeNull();
   });
 
-  it("does not expose conversation actions for a provisional temp row", () => {
+  it("shows only disabled conversation actions for a provisional temp row", () => {
     mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
     renderShell("/c/temp:12345678");
 
-    expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Share" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Share session" })).toBeDisabled();
+    expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "false");
+  });
+
+  it("shows the optimistic title when the temp row is absent from the shell list cache", () => {
+    recordOptimisticTitle("temp:12345678", "Inspect the workspace");
+    mockConversations([]);
+
+    renderShell("/c/temp:12345678");
+
+    expect(screen.getByText("Inspect the workspace")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Share session" })).toBeDisabled();
+    expect(screen.queryByTestId("agent-info-trigger")).toBeNull();
+    expect(screen.queryByTestId("session-actions-menu")).toBeNull();
     expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "false");
   });
 
@@ -2646,6 +2662,20 @@ describe("Extension pages own the header", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("mounts an expandable pending card for a temporary session", () => {
+    writeSessionWorkspaceState("temp:12345678", { open: true });
+    mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
+
+    renderShell("/c/temp:12345678");
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByText("Starting workspace…")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+  });
+
   it("reserves the visible pane width plus its two desktop margins from the header", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
