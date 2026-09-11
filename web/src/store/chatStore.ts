@@ -352,6 +352,13 @@ export function hydrateLocalConversation(
   }
 
   const store = useChatStore.getState();
+  // Same hard-navigation insurance as the server-first stash path
+  // (`setPendingInitialPrompt`): if a forced re-login wipes the heap between
+  // the create and this first send settling, ChatPage recovers the persisted
+  // copy after the reload and re-dispatches it. Marked dispatched so the
+  // fallback stays inert in THIS heap — the sends below are the dispatch.
+  persistInitialPrompt(realId, { text, skill });
+  dispatchedInitialPrompts.add(realId);
   if (skill !== null) {
     // Slash command: the server resolves the skill and emits its own receipt +
     // echo, which `sendSlashCommand` renders. Drop the plain-text placeholder
@@ -1584,10 +1591,123 @@ export interface PendingInitialPrompt {
 // module-level singleton, so it works identically standalone and embedded.
 const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
 
+// sessionStorage twin of `pendingInitialPrompts`, keyed the same way. The
+// in-memory map dies with the JS heap on a hard navigation — the forced
+// re-login after a sleep/wake 401 is one (`redirectToLogin` →
+// `window.location.href` in lib/identity.ts) — which used to silently drop a
+// first message whose send hadn't settled yet: the session existed but stayed
+// empty. Only `text` + `skill` persist (`File` attachments can't survive
+// serialization, so a recovered prompt degrades to text-only). Entries clear
+// when the send settles server-side (accepted or denied), not on consume, so
+// an interrupted send can still be recovered and re-dispatched after reload.
+const PENDING_INITIAL_PROMPTS_KEY = "omnigent.pendingInitialPrompts";
+
+// Conversations whose first message THIS page load already handed to a
+// dispatcher — by ChatPage's consume or by `hydrateLocalConversation`'s own
+// pinned send. The persisted fallback below is gated on this set so recovery
+// only fires across a heap boundary (a hard navigation wiped the page that
+// dispatched): within one heap the transport stays strictly read-once, so an
+// unsettled persisted entry can never double-dispatch alongside its original
+// in-flight send.
+const dispatchedInitialPrompts = new Set<string>();
+
+interface PersistedInitialPrompt {
+  text: string;
+  skill: { name: string; args: string } | null;
+}
+
+function loadPersistedInitialPrompts(): Record<string, PersistedInitialPrompt> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_INITIAL_PROMPTS_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const entries: Record<string, PersistedInitialPrompt> = {};
+    for (const [id, value] of Object.entries(parsed)) {
+      if (value === null || typeof value !== "object") continue;
+      const { text, skill } = value as { text?: unknown; skill?: unknown };
+      if (typeof text !== "string" || text === "") continue;
+      const candidate = skill as { name?: unknown; args?: unknown } | null | undefined;
+      const validSkill =
+        candidate != null &&
+        typeof candidate === "object" &&
+        typeof candidate.name === "string" &&
+        typeof candidate.args === "string"
+          ? { name: candidate.name, args: candidate.args }
+          : null;
+      entries[id] = { text, skill: validSkill };
+    }
+    return entries;
+  } catch {
+    return {};
+  }
+}
+
+function savePersistedInitialPrompts(entries: Record<string, PersistedInitialPrompt>): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (Object.keys(entries).length === 0) {
+      window.sessionStorage.removeItem(PENDING_INITIAL_PROMPTS_KEY);
+    } else {
+      window.sessionStorage.setItem(PENDING_INITIAL_PROMPTS_KEY, JSON.stringify(entries));
+    }
+  } catch {
+    // Storage full or unavailable — the in-memory map still covers the
+    // soft-navigation handoff; only hard-navigation recovery degrades.
+  }
+}
+
+function persistInitialPrompt(conversationId: string, prompt: PendingInitialPrompt): void {
+  const entries = loadPersistedInitialPrompts();
+  entries[conversationId] = { text: prompt.text, skill: prompt.skill };
+  savePersistedInitialPrompts(entries);
+}
+
+/**
+ * Drop the persisted (hard-navigation-surviving) copy of a conversation's
+ * pending first message. Called when the prompt is settled some other way —
+ * its send settled server-side, or ChatPage's reconcile found it already
+ * delivered in the hydrated transcript.
+ *
+ * @param conversationId The conversation whose entry to drop.
+ */
+export function clearPersistedInitialPrompt(conversationId: string): void {
+  const entries = loadPersistedInitialPrompts();
+  if (!(conversationId in entries)) return;
+  savePersistedInitialPrompts(
+    Object.fromEntries(Object.entries(entries).filter(([id]) => id !== conversationId)),
+  );
+}
+
+// Settle-time clear: once the server has settled a send (accepted or
+// policy-denied), a persisted first-message entry carrying that exact payload
+// is delivered (or terminally surfaced) and must not be re-dispatched by a
+// later reload. Matched on content, not just conversation id, so an unrelated
+// send can't discard a first message that is still awaiting recovery.
+function clearSettledInitialPrompt(conversationId: string, settledText: string): void {
+  const persisted = loadPersistedInitialPrompts()[conversationId];
+  if (persisted === undefined || persisted.skill !== null) return;
+  if (persisted.text !== settledText) return;
+  clearPersistedInitialPrompt(conversationId);
+}
+
+function clearSettledInitialSkill(conversationId: string, name: string, args: string): void {
+  const persisted = loadPersistedInitialPrompts()[conversationId];
+  if (persisted?.skill == null) return;
+  if (persisted.skill.name !== name || persisted.skill.args !== args) return;
+  clearPersistedInitialPrompt(conversationId);
+}
+
 /**
  * Stash the first message for a freshly created conversation so ChatPage
  * can auto-send it once the session is ready. Called by NewChatDialog
  * immediately before it navigates to `/c/:conversationId`.
+ *
+ * Also persisted to sessionStorage so the prompt survives a hard
+ * navigation (e.g. the forced re-login after the computer wakes from
+ * sleep) that lands before the auto-send settles; see
+ * `clearSettledInitialPrompt` for when the persisted copy is dropped.
  *
  * @param conversationId The new conversation's id, e.g. `"conv_abc123"`.
  * @param prompt The user's first message (already sanitized by the
@@ -1601,24 +1721,43 @@ export function setPendingInitialPrompt(
 ): void {
   if (!prompt.text) return;
   pendingInitialPrompts.set(conversationId, prompt);
+  persistInitialPrompt(conversationId, prompt);
 }
 
 /**
  * Read and remove the pending first message for a conversation. Read-once
- * (get + delete): the delete is what prevents a refresh/back from
- * replaying the prompt, replacing the old `navigate(..., { state: null })`
- * clear.
+ * from the in-memory map (get + delete), replacing the old
+ * `navigate(..., { state: null })` clear.
+ *
+ * When the map has no entry, falls back to the sessionStorage copy: a hard
+ * navigation (the forced re-login on wake) wiped the heap while the send
+ * hadn't settled, and the persisted copy is what lets ChatPage re-dispatch
+ * the message instead of silently losing it. The fallback is deliberately
+ * non-destructive — the persisted entry clears when the send settles
+ * server-side — and replay of an already-delivered prompt is prevented by
+ * that settle-clear plus ChatPage's transcript reconcile, not by read-once
+ * deletion.
  *
  * @param conversationId The conversation id to consume for, e.g.
  *   `"conv_abc123"`.
  * @returns The stashed prompt, or `null` when none was set (or it was
- *   already consumed).
+ *   already consumed and settled).
  */
 export function consumePendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
   const prompt = pendingInitialPrompts.get(conversationId);
-  if (prompt === undefined) return null;
-  pendingInitialPrompts.delete(conversationId);
-  return prompt;
+  if (prompt !== undefined) {
+    pendingInitialPrompts.delete(conversationId);
+    dispatchedInitialPrompts.add(conversationId);
+    return prompt;
+  }
+  // Same heap already dispatched this conversation's first message (this
+  // consume, or hydrateLocalConversation's pinned send) — the persisted
+  // copy is that send's recovery insurance, not a second prompt.
+  if (dispatchedInitialPrompts.has(conversationId)) return null;
+  const persisted = loadPersistedInitialPrompts()[conversationId];
+  if (persisted === undefined) return null;
+  dispatchedInitialPrompts.add(conversationId);
+  return { text: persisted.text, skill: persisted.skill };
 }
 
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
@@ -2099,6 +2238,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
         }));
       }
+      // The send settled server-side (accepted or policy-denied), so a
+      // persisted first-message copy of this exact text is no longer
+      // pending — drop it so a later reload can't re-dispatch it.
+      clearSettledInitialPrompt(sessionId, text);
       // Note: native-terminal messages return a `pending_id`, but the
       // optimistic bubble deliberately keeps its client temp id as its
       // stable React key — swapping it to the server id mid-send forces
@@ -2274,6 +2417,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
         }));
       }
+      // Settled server-side — see `send`'s matching clear.
+      clearSettledInitialSkill(sessionId, name, args);
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

@@ -92,6 +92,7 @@ import { retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  clearPersistedInitialPrompt,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
@@ -100,6 +101,7 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { slashCommandEchoText, type AnyBlock } from "@/lib/blocks";
 import {
   claudeNativeSubagentLabel,
   isNativeTerminalSession,
@@ -603,6 +605,29 @@ export function ChatPage() {
     // predicate already guarantees these, so this never fires at runtime.
     if (initialPrompt === null || !agentId || !urlConvId) return;
     initialPromptSentForConvRef.current = urlConvId;
+    // The prompt may be a hard-navigation recovery (the persisted copy of a
+    // send the forced re-login interrupted) whose original POST actually
+    // LANDED before the connection died — the client just never saw the
+    // response. The transcript is hydrated at this point (the
+    // `loadingConversation` gate above), so it is the authority: a prompt
+    // already present there is settled, not pending, and re-dispatching it
+    // would double-deliver.
+    if (isInitialPromptDelivered(useChatStore.getState().blocks, initialPrompt.prompt)) {
+      clearPersistedInitialPrompt(urlConvId);
+      return;
+    }
+    // A recovered prompt's interrupted send may also have parked its text as
+    // a composer draft (the failed-send restore persists across reloads).
+    // Delivering the message makes that copy stale — drop it so the composer
+    // doesn't offer to send the same text again.
+    const draft = getSessionDraft(urlConvId);
+    if (
+      draft !== undefined &&
+      draft.text === initialPrompt.prompt.text &&
+      draft.files.length === 0
+    ) {
+      setSessionDraft(urlConvId, { text: "", files: [] });
+    }
     const { send, sendSlashCommand } = useChatStore.getState();
     dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
   }, [initialPrompt, urlConvId, loadingConversation, agentId]);
@@ -3996,6 +4021,46 @@ export function shouldSendInitialPrompt(params: {
     return false;
   }
   return true;
+}
+
+/**
+ * Whether a pending first message is already present in a session's hydrated
+ * transcript — i.e. its send actually landed server-side even though the
+ * client never saw it settle (the connection was severed mid-POST, e.g. by
+ * the computer sleeping, and a forced re-login reloaded the page). Used by
+ * the auto-send effect to reconcile a persisted, recovered prompt against
+ * the loaded transcript before re-dispatching, so recovery can never
+ * double-deliver. Exported for unit testing.
+ *
+ * A plain message matches a `user_message` block carrying the exact text; a
+ * skill invocation matches its `slash_command` receipt (or the synthesized
+ * user echo both block funnels render next to it).
+ *
+ * @param blocks The hydrated transcript blocks (`chatStore.blocks`).
+ * @param prompt The pending first message to look for.
+ */
+export function isInitialPromptDelivered(
+  blocks: AnyBlock[],
+  prompt: PendingInitialPrompt,
+): boolean {
+  if (prompt.skill !== null) {
+    const { name, args } = prompt.skill;
+    const echo = slashCommandEchoText(name, args);
+    return blocks.some(
+      (block) =>
+        (block.type === "slash_command" &&
+          block.kind === "skill" &&
+          block.name === name &&
+          block.arguments === args) ||
+        (block.type === "user_message" &&
+          block.content.some((c) => c.type === "input_text" && c.text === echo)),
+    );
+  }
+  return blocks.some(
+    (block) =>
+      block.type === "user_message" &&
+      block.content.some((c) => c.type === "input_text" && c.text === prompt.text),
+  );
 }
 
 /**

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
-import type { ToolExecution } from "@/lib/blocks";
+import type { AnyBlock, ToolExecution } from "@/lib/blocks";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
@@ -21,6 +21,7 @@ import {
   containsMarkdownTable,
   dispatchInitialPrompt,
   isCostRoutingEligible,
+  isInitialPromptDelivered,
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
@@ -1484,6 +1485,95 @@ describe("dispatchInitialPrompt", () => {
     // The exact File objects picked on the landing screen reach send() —
     // an empty array here means first-message attachments silently vanish.
     expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file]);
+  });
+});
+
+describe("isInitialPromptDelivered", () => {
+  // The reconcile behind hard-navigation recovery: a first message whose
+  // send was severed mid-flight (computer sleep) may have LANDED server-side
+  // without the client ever seeing the response. After the forced-re-login
+  // reload, the recovered prompt is re-dispatched ONLY when the hydrated
+  // transcript doesn't already carry it — these cases pin both directions,
+  // since a false negative double-delivers and a false positive re-loses the
+  // message.
+  const ctx = (itemId: string) => ({
+    agent: null,
+    depth: 0,
+    turn: 0,
+    timestamp: 0,
+    responseId: "resp_1",
+    itemId,
+  });
+  const userMessage = (text: string): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx("item_user"),
+    content: [{ type: "input_text", text }],
+  });
+
+  it("finds a delivered plain message in the transcript", () => {
+    expect(
+      isInitialPromptDelivered([userMessage("read the README")], {
+        text: "read the README",
+        skill: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not match a different message or an empty transcript", () => {
+    expect(isInitialPromptDelivered([], { text: "read the README", skill: null })).toBe(false);
+    expect(
+      isInitialPromptDelivered([userMessage("some other turn")], {
+        text: "read the README",
+        skill: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not let a plain prompt match a skill receipt's echo text", () => {
+    // A plain-text prompt that happens to look like "/name args" must only
+    // match a user_message — the skill receipt branch is gated on
+    // prompt.skill, exercised below.
+    expect(
+      isInitialPromptDelivered([userMessage("unrelated")], {
+        text: "/review-pr 123",
+        skill: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("finds a delivered skill invocation by its slash_command receipt", () => {
+    const receipt: AnyBlock = {
+      type: "slash_command",
+      ctx: ctx("item_slash"),
+      kind: "skill",
+      name: "review-pr",
+      arguments: "123",
+      output: null,
+    };
+    expect(
+      isInitialPromptDelivered([receipt], {
+        text: "/review-pr 123",
+        skill: { name: "review-pr", args: "123" },
+      }),
+    ).toBe(true);
+    // A different invocation of the same skill is NOT this prompt.
+    expect(
+      isInitialPromptDelivered([receipt], {
+        text: "/review-pr 456",
+        skill: { name: "review-pr", args: "456" },
+      }),
+    ).toBe(false);
+  });
+
+  it("finds a delivered skill invocation by its synthesized user echo", () => {
+    // Some funnels render the receipt as a user bubble carrying the typed
+    // text (`slashCommandEchoText`); recovery must treat that as delivered.
+    expect(
+      isInitialPromptDelivered([userMessage("/review-pr 123")], {
+        text: "/review-pr 123",
+        skill: { name: "review-pr", args: "123" },
+      }),
+    ).toBe(true);
   });
 });
 
