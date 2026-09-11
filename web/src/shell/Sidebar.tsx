@@ -205,6 +205,13 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
+import { ComposerAgentIcon } from "./NewChatDialog";
+import {
+  WRAPPER_LABEL_KEY,
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForSubagentWrapper,
+  nativeCodingAgentForWrapper,
+} from "../lib/nativeCodingAgents";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
@@ -3629,6 +3636,14 @@ function ConversationRowImpl({
   }, [conversation.title, pendingTitle, rename.isSuccess, rename.isError]);
 
   const label = pendingTitle ?? conversationDisplayLabel(conversation);
+
+  // Which coding agent this session runs, for the leading row icon. The
+  // `omnigent.wrapper` label is authoritative (sub-agent children carry their
+  // own wrapper); `agent_name` covers rows whose label predates the stamp.
+  const rowAgent =
+    nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForSubagentWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForAgentName(conversation.agent_name);
   // Subscribed so the just-recorded optimistic label flips the row
   // immediately instead of at the next conversations poll.
   const optimisticTitle = useOptimisticTitle(conversation.id);
@@ -3922,7 +3937,17 @@ function ConversationRowImpl({
     >
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
-      <div className="flex w-full items-center">
+      <div className="flex w-full items-center gap-1.5">
+        {rowAgent && (
+          <span
+            className="flex shrink-0 items-center"
+            role="img"
+            aria-label={rowAgent.displayName}
+            title={rowAgent.displayName}
+          >
+            <ComposerAgentIcon agent={{ name: rowAgent.agentName, harness: rowAgent.harness }} />
+          </span>
+        )}
         <span
           className={cn(
             "relative min-w-0 truncate",
@@ -4412,6 +4437,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "host_id",
   "runner_id",
   "project_id",
+  "agent_name",
   "owner",
   "pending_elicitations_count",
   "provisional",

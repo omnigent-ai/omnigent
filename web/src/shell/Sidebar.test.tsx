@@ -413,6 +413,38 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("No sessions")).not.toHaveClass("text-sm");
   });
 
+  it("marks each session row with the coding agent it runs", () => {
+    // Forks inherit "Fork of <original>", so the harness is the only thing
+    // telling the two rows apart.
+    mockConversations([
+      conv("conv_cc", "Fork of login redirect", {
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+      conv("conv_cx", "Fork of login redirect", {
+        labels: { "omnigent.wrapper": "codex-native-ui" },
+      }),
+    ]);
+    renderSidebar();
+
+    expect(screen.getByRole("img", { name: "Claude Code" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Codex" })).toBeInTheDocument();
+  });
+
+  it("falls back to the bound agent name when a row carries no wrapper label", () => {
+    mockConversations([conv("conv_named", "No wrapper", { agent_name: "codex-native-ui" })]);
+    renderSidebar();
+
+    expect(screen.getByRole("img", { name: "Codex" })).toBeInTheDocument();
+  });
+
+  it("leaves a non-native session row unmarked", () => {
+    mockConversations([conv("conv_plain", "Plain session")]);
+    renderSidebar();
+
+    expect(screen.queryByRole("img", { name: "Claude Code" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "Codex" })).not.toBeInTheDocument();
+  });
+
   it("flips a just-created session's row to its provisional first-prompt label", () => {
     mockConversations([
       conv("conv_opt", "Claude Code", {
