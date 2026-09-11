@@ -2344,6 +2344,14 @@ async def _auto_create_pi_terminal(
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
+            # Keep the private tmux server alive if the `pi` CLI exits. Without
+            # this, tmux (exit-empty on, remain-on-exit off) reaps the lone-pane
+            # server the instant pi exits, the idle watcher's probes fail with
+            # "tmux unavailable", and the exit is undiagnosable. With it, the
+            # dead pane persists (last output capturable) and the watcher
+            # reports the exit deterministically via `#{pane_dead}` — parity
+            # with the claude terminal.
+            keep_alive_after_exit=True,
         ),
     )
     publish_event(
