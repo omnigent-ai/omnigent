@@ -450,6 +450,8 @@ describe(
 
           await chooseWorkspace(launched.window, fixtureRepo);
           const panel = launched.window.locator("[data-workspace-panel-content]");
+          await panel.waitFor({ state: "hidden", timeout: 20_000 });
+          await launched.window.getByRole("button", { name: "Expand right panel" }).click();
           await panel.waitFor({ state: "visible", timeout: 20_000 });
 
           await launched.window.getByRole("tab", { name: "Files" }).click();
@@ -545,6 +547,8 @@ describe(
 
           await launched.window.reload();
           await windowReady(launched.window);
+          await panel.waitFor({ state: "hidden", timeout: 20_000 });
+          await launched.window.getByRole("button", { name: "Expand right panel" }).click();
           await panel.waitFor({ state: "visible", timeout: 20_000 });
           const storageAfterReload = await captureLandingStorage(launched.window);
           fs.writeFileSync(
@@ -580,6 +584,36 @@ describe(
             { timeout: 20_000 },
           );
 
+          const browserPaneBounds = await launched.window
+            .locator(`[data-browser-pane-conversation="${browserState.viewId}"]`)
+            .evaluate((pane) => {
+              const rect = pane.lastElementChild.getBoundingClientRect();
+              return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+            });
+          const nativeViews = await launched.electronApp.evaluate(({ BrowserWindow }) => {
+            return BrowserWindow.getAllWindows().flatMap((window) =>
+              window.contentView.children
+                .filter((view) => view.webContents)
+                .map((view) => ({
+                  bounds: view.getBounds(),
+                  url: view.webContents.getURL(),
+                  windowUrl: window.webContents.getURL(),
+                })),
+            );
+          });
+          fs.writeFileSync(
+            path.join(RECORD_DIR, "browser-view-children.json"),
+            `${JSON.stringify({ expectedUrl: demoPage.url, browserPaneBounds, nativeViews }, null, 2)}\n`,
+          );
+          const nativeBrowserView = nativeViews.find((view) => view.url === demoPage.url);
+          assert.ok(nativeBrowserView, "native browser view was not attached");
+          for (const edge of ["x", "y", "width", "height"]) {
+            assert.ok(
+              Math.abs(nativeBrowserView.bounds[edge] - browserPaneBounds[edge]) <= 2,
+              `native ${edge} did not match the BrowserPane placeholder`,
+            );
+          }
+
           await launched.window.getByRole("tab", { name: /Agents 0/ }).click();
           await panel
             .getByText("No agents yet. Start a chat to add an agent.", { exact: true })
@@ -612,8 +646,37 @@ describe(
           await launched.window
             .getByTestId("new-chat-landing-input")
             .fill("Start the demo workspace");
+          const startBounds = await launched.window
+            .getByTestId("new-chat-landing-submit")
+            .boundingBox();
+          assert.ok(startBounds, "Start button did not have renderer bounds");
+          const overlapsBrowserPane = !(
+            startBounds.x + startBounds.width <= browserPaneBounds.x ||
+            browserPaneBounds.x + browserPaneBounds.width <= startBounds.x ||
+            startBounds.y + startBounds.height <= browserPaneBounds.y ||
+            browserPaneBounds.y + browserPaneBounds.height <= startBounds.y
+          );
+          assert.equal(overlapsBrowserPane, false, "native browser bounds overlapped Start");
+          const startHitTarget = await launched.window.evaluate(({ x, y, width, height }) => {
+            const target = document.elementFromPoint(x + width / 2, y + height / 2);
+            return {
+              html: target?.outerHTML.slice(0, 500) ?? null,
+              path: target
+                ? Array.from(target.closest("button") ? [target.closest("button")] : [])
+                    .map((element) => element.outerHTML.slice(0, 500))
+                    .join("\n")
+                : null,
+            };
+          }, startBounds);
+          fs.writeFileSync(
+            path.join(RECORD_DIR, "browser-view-bounds.json"),
+            `${JSON.stringify({ browserPaneBounds, nativeBrowserView, startBounds, startHitTarget }, null, 2)}\n`,
+          );
+          await launched.electronApp.evaluate(({ BrowserWindow }) => {
+            BrowserWindow.getAllWindows()[0].webContents.focus();
+          });
           startClicked = true;
-          await launched.window.getByTestId("new-chat-landing-submit").click();
+          await launched.window.getByTestId("new-chat-landing-submit").click({ timeout: 2_000 });
           await launched.window.waitForURL(/\/c\/[^/]+$/, { timeout: 45_000 });
           assert.equal(sessionCreateRequests, 1, "Start did not issue exactly one session POST");
           const sessionId = new URL(launched.window.url()).pathname

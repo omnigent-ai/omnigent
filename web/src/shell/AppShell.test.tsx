@@ -344,6 +344,23 @@ function NavProbe() {
       <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
         to-home
       </button>
+      <button
+        type="button"
+        data-testid="nav-home-replace"
+        onClick={() => navigate("/", { replace: true })}
+      >
+        replace with home
+      </button>
+      <button type="button" data-testid="nav-back" onClick={() => navigate(-1)}>
+        back
+      </button>
+      <button
+        type="button"
+        data-testid="normalize-project-query"
+        onClick={() => navigate("/?project=ready", { replace: true })}
+      >
+        normalize query
+      </button>
     </div>
   );
 }
@@ -411,6 +428,7 @@ function renderShell(path: string, info?: ServerInfo) {
                 element={
                   <>
                     <div>home</div>
+                    <NavProbe />
                     <LocationDisplay />
                   </>
                 }
@@ -4123,6 +4141,77 @@ describe("Terminal-first shells — opening a shell from the mobile drawer", () 
 });
 
 describe("new-chat workspace rail", () => {
+  it("starts collapsed despite an open saved draft and global preference, preserving draft tools", async () => {
+    const { readLandingWorkspaceState, writeLandingWorkspacePanel } =
+      await import("@/lib/landingWorkspaceState");
+    writeWorkspacePanelDefault("open");
+    writeLandingWorkspacePanel({
+      open: true,
+      rightRailTab: "subagents",
+      openFiles: ["README.md"],
+      selectedFilePath: null,
+      openBrowsers: ["saved-browser"],
+      selectedBrowserId: "saved-browser",
+      selectedTerminalKey: "terminal:saved-shell",
+    });
+    const saved = readLandingWorkspaceState();
+    mockConversations([]);
+    renderShell("/");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+    expect(readLandingWorkspaceState()).toEqual({
+      ...saved,
+      panel: { ...saved.panel, open: false },
+    });
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Agents 0" })).toBeInTheDocument();
+    expect(readLandingWorkspaceState().browserNamespace).toBe(saved.browserNamespace);
+    expect(readLandingWorkspaceState().panel.openBrowsers).toEqual(["saved-browser"]);
+  });
+
+  it("collapses when entering New Chat from an open session and on each later New Chat entry", () => {
+    writeSessionWorkspaceState("conv_open", { open: true });
+    mockConversations([{ id: "conv_open", permission_level: null }]);
+    renderShell("/c/conv_open");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+  });
+
+  it("keeps a manually opened landing rail visible while prefill normalizes search params", () => {
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("normalize-project-query"));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+  });
+
+  it("collapses for explicit New Chat, history entry, and replacement from another route", () => {
+    mockConversations([]);
+    renderShell("/?project=ready");
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-back"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    fireEvent.click(screen.getByTestId("nav-home-replace"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+  });
+
   it("opens and collapses the workspace before a session exists", async () => {
     const { writeLandingWorkspacePanel } = await import("@/lib/landingWorkspaceState");
     writeLandingWorkspacePanel({

@@ -1,7 +1,15 @@
 import { toast } from "sonner";
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Outlet, useParams, useSearchParams, useLocation } from "@/lib/routing";
+import { Outlet, useParams, useSearchParams, useLocation, useNavigationType } from "@/lib/routing";
 import {
   PROJECT_LABEL_KEY,
   type Conversation,
@@ -239,6 +247,7 @@ export function AppShell() {
   // of the raw route id so none of them fetch `/v1/sessions/temp:*` during the
   // create window (or on a stale temp reload, before ChatPage redirects).
   const location = useLocation();
+  const navigationType = useNavigationType();
   const landingRoute = location.pathname === "/";
   const landingWorkspace = useLandingWorkspaceState();
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
@@ -425,12 +434,35 @@ export function AppShell() {
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
   // the user last left it. Toggled via the header's PanelRightIcon, mirroring
-  // the sidebar collapse. The landing route restores its own panel preference.
+  // the sidebar collapse. Each New Chat entry starts collapsed.
   const [rightPanelOpen, setRightPanelOpen] = useState(() =>
     conversationId
       ? (readSessionWorkspaceState(conversationId).open ?? readDefaultWorkspacePanelOpen())
-      : (readLandingWorkspaceState().panel.open ?? readDefaultWorkspacePanelOpen()),
+      : false,
   );
+  const previousWorkspaceLocation = useRef<{
+    pathname: string;
+    search: string;
+    key: string;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const previous = previousWorkspaceLocation.current;
+    previousWorkspaceLocation.current = {
+      pathname: location.pathname,
+      search: location.search,
+      key: location.key,
+    };
+    if (!landingRoute) return;
+    // Prefill can normalize search params without starting a new landing visit.
+    if (
+      previous?.pathname === location.pathname &&
+      (navigationType === "REPLACE" ||
+        (navigationType === undefined && previous.search !== location.search))
+    )
+      return;
+    setRightPanelOpen(false);
+    writeLandingWorkspacePanel({ open: false });
+  }, [landingRoute, location.pathname, location.search, location.key, navigationType]);
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
   // Truncation point for a "fork from here" opened from a message's
@@ -1060,8 +1092,8 @@ export function AppShell() {
     pendingShellCreateRef.current = null;
     setTerminalPendingClose(null);
     if (!conversationId) {
-      // The landing workspace restores independently from every session.
-      setRightPanelOpen(readLandingWorkspaceState().panel.open ?? readDefaultWorkspacePanelOpen());
+      // Draft tools stay available when the user opens the collapsed landing rail.
+      setRightPanelOpen(false);
       setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
