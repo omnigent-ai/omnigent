@@ -198,7 +198,7 @@ export const ComposerHarnessTrigger = forwardRef<
       size="sm"
       aria-label={label}
       className={cn(
-        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0 md:min-h-7",
+        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
         className,
       )}
       {...props}
