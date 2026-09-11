@@ -127,6 +127,24 @@ _SKIP_DIRS: frozenset[str] = frozenset(
         # These are never agent-edited source files and must not appear
         # in the Files panel.
         "terminals",
+        # Omnigent's own workspace-local scratch namespace (harness runtime
+        # dirs, bootstrap markers) — runner infrastructure, never user content.
+        ".omnigent",
+    }
+)
+
+# Workspace-relative paths of cursor plumbing that Omnigent itself writes at
+# session launch: the MCP relay config, the usage/policy hooks, and the hook
+# wrapper script.  cursor-agent only discovers project config under
+# ``<workspace>/.cursor``, so these have to live in the user's workspace — but
+# they are session infrastructure, not user or agent edits, and must not show
+# up as the session's "changed files".  Only these exact paths are hidden; the
+# user's own ``.cursor`` content (rules, plans, …) keeps normal tracking.
+_CURSOR_PLUMBING_PATHS: frozenset[str] = frozenset(
+    {
+        ".cursor/hooks.json",
+        ".cursor/mcp.json",
+        ".cursor/omnigent-hook.sh",
     }
 )
 
@@ -142,6 +160,15 @@ def _is_ephemeral(path: str) -> bool:
     """
     filename = Path(path).name
     return any(fnmatch.fnmatch(filename, pat) for pat in _EPHEMERAL_PATTERNS)
+
+
+def _is_harness_plumbing(path: str) -> bool:
+    """Return ``True`` when *path* is Omnigent-written harness plumbing.
+
+    :param path: Workspace-relative path, e.g. ``".cursor/mcp.json"``.
+    :returns: ``True`` when the path is in :data:`_CURSOR_PLUMBING_PATHS`.
+    """
+    return path in _CURSOR_PLUMBING_PATHS
 
 
 def _net_operation(first: str, last: str) -> str | None:
@@ -640,7 +667,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         norm = _normalize_path(path, self._cwd)
         if norm is None:
             return
-        if _is_ephemeral(norm):
+        if _is_ephemeral(norm) or _is_harness_plumbing(norm):
             return
         bytes_: int | None = None
         modified_at: int | None = None
@@ -693,10 +720,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         last_op: dict[str, str] = {}
         by_path: dict[str, _FileEvent] = {}
         for e in events:
-            # Ephemeral artifacts are filtered here as a second line of
-            # defence, primarily for events injected without going through
-            # record_change (e.g. in tests).
-            if _is_ephemeral(e.path):
+            # Ephemeral artifacts and harness plumbing are filtered here as a
+            # second line of defence, primarily for events injected without
+            # going through record_change (e.g. in tests).
+            if _is_ephemeral(e.path) or _is_harness_plumbing(e.path):
                 continue
             # Events are appended chronologically, so the last write wins for
             # metadata (bytes, modified_at) without any timestamp comparison.
@@ -1024,7 +1051,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             rel_path = self._git_to_rel(git_path)
             if rel_path is None:
                 continue
-            if _is_ephemeral(rel_path):
+            if _is_ephemeral(rel_path) or _is_harness_plumbing(rel_path):
                 continue
             # Skip runner-internal and build directories (e.g. terminals/,
             # node_modules/).  These are never agent-edited source files.
@@ -1053,7 +1080,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         norm = _normalize_path(path, self._cwd)
         if norm is None:
             return None
-        if _is_ephemeral(norm):
+        if _is_ephemeral(norm) or _is_harness_plumbing(norm):
             return None
         try:
             cwd_prefix = self._cwd.relative_to(self._git_root)
