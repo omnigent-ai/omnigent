@@ -2318,8 +2318,9 @@ def _subagent_delivery_not_confirmed_response(
     was created as a sub-agent. For known sub-agents, Omnigent must not receive a
     2xx acknowledgement unless the terminal payload is confirmed in the
     parent's inbox — except a tracked entry whose parent is itself a
-    sub-agent, which ``post_session_events`` acknowledges before calling here
-    and retains for delivery when the parent's inbox is created.
+    sub-agent, which ``post_session_events`` acknowledges before calling here;
+    the entry is retained and delivered only if this runner ever creates that
+    parent's inbox.
 
     :param ack: Delivery acknowledgement returned by
         ``mark_subagent_work_terminal``.
@@ -4967,13 +4968,16 @@ def create_runner_app(
         """
         Return whether an undelivered result's parent is itself a sub-agent.
 
-        A sub-agent parent normally has no inbox on this runner: a mirrored
-        claude-native child is never initialized here. Retrying its children's
-        terminal status every 30 s buys nothing, so the status is acknowledged
-        and the entry kept; creating the parent's inbox later delivers it (see
-        ``_deliver_retained_subagent_results``). An unreadable parent snapshot
-        reads as a top-level parent, so the retry contract still covers a
-        parent that lives elsewhere or is re-initializing after a restart.
+        A mirrored claude-native sub-agent never runs on this runner, so its
+        inbox never exists here and retrying its children's terminal status
+        every 30 s buys nothing. The inbox record is redundant for that
+        topology: the child's result reaches the parent natively inside the
+        Claude process. The status is acknowledged and the entry kept, so a
+        sub-agent parent that does run here later still receives it when its
+        inbox is created (``_deliver_retained_subagent_results``). An unreadable
+        parent snapshot reads as a top-level parent, so the retry contract still
+        covers a parent that lives elsewhere or is re-initializing after a
+        restart.
 
         :param entry: Terminal work entry whose parent inbox was missing.
         :returns: ``True`` when the parent's snapshot names its own parent.
@@ -4985,10 +4989,13 @@ def create_runner_app(
         """
         Hand over results acknowledged while ``parent_id`` had no inbox here.
 
-        A terminal child whose parent inbox was missing is acknowledged with
-        its entry kept undelivered. Creating the parent's inbox delivers those
-        entries and wakes the parent, as the forwarder's pending retry used to
-        the moment the inbox appeared. Idempotent: delivered entries are skipped.
+        A terminal child whose sub-agent parent had no inbox here is
+        acknowledged with its entry kept undelivered. If that parent later
+        runs on this runner, creating its inbox delivers those entries and
+        wakes it, as the forwarder's pending retry used to the moment the inbox
+        appeared. A parent that never runs here keeps the entry undelivered;
+        for a claude-native mirror the result already reached it natively.
+        Idempotent: delivered entries are skipped.
 
         :param parent_id: Parent whose inbox now exists, e.g. ``"conv_parent123"``.
         :returns: None.
@@ -8783,9 +8790,9 @@ def create_runner_app(
                     and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
                     and await _parent_is_nested_subagent(delivery_ack.entry)
                 ):
-                    # Acknowledge instead of asking the forwarder to poll; the
-                    # entry stays terminal and undelivered until this runner
-                    # creates the parent's inbox and hands it over.
+                    # Acknowledge instead of asking the forwarder to poll. The
+                    # entry stays terminal and undelivered; it is handed over
+                    # only if this runner ever creates the parent's inbox.
                     return Response(status_code=204)
                 is_known = (
                     conversation_id in _session_sub_agent_names or recovered_entry is not None

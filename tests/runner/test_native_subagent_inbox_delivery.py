@@ -401,8 +401,9 @@ async def test_nested_subagent_parent_without_inbox_is_acked(
     Claude Code sub-agents can fan out further, and the forwarder mirrors the
     grandchildren under the mid-level child. That parent is never initialized
     on the runner, so its inbox never exists and a 503 only made the forwarder
-    retry every 30 s for the life of the runner. The entry stays terminal and
-    undelivered for the parent's own recovery scan.
+    retry every 30 s for the life of the runner; the result reaches the parent
+    natively inside the Claude process. The entry stays terminal and
+    undelivered so a parent that does run here later can still receive it.
     """
     http, items = await _post_native_idle(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
