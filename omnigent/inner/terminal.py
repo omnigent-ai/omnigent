@@ -970,6 +970,13 @@ class TerminalInstance:
     # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
     # until the process exits or when tmux reports no numeric status.
     _last_exit_status: int | None = field(default=None, repr=False)
+    # Detail of the most recent ``capture-pane`` probe the idle watcher saw
+    # rejected (the tmux ``rc``/stderr text). Retained so the "tmux unavailable"
+    # exit ERROR can name *why* tmux went away — its stderr distinguishes a
+    # vanished server ("no server running") from a single lost session ("can't
+    # find session") — instead of only reporting that it did. ``None`` until a
+    # probe is rejected; cleared on the next successful capture.
+    _last_idle_probe_error: str | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1504,10 +1511,13 @@ class TerminalInstance:
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
                 logger.error(
-                    "tmux unavailable after %d consecutive probes for terminal %s:%s",
+                    "tmux unavailable after %d consecutive probes for terminal %s:%s "
+                    "(keep_alive_after_exit=%s): last capture-pane error: %s",
                     consecutive_capture_failures,
                     self.name,
                     self.session_key,
+                    self.keep_alive_after_exit,
+                    exc,
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1709,10 +1719,13 @@ class TerminalInstance:
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
                 logger.error(
-                    "tmux unavailable after %d consecutive probes for terminal %s:%s",
+                    "tmux unavailable after %d consecutive probes for terminal %s:%s "
+                    "(keep_alive_after_exit=%s): %s",
                     consecutive_capture_failures,
                     self.name,
                     self.session_key,
+                    self.keep_alive_after_exit,
+                    self._diagnose_tmux_gone_sync(),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1781,10 +1794,11 @@ class TerminalInstance:
             and terminal liveness is therefore unknown.
         """
         try:
-            return self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
+            snapshot = self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
         except _TmuxProcessStartError:
             raise
         except RuntimeError as exc:
+            self._last_idle_probe_error = str(exc)
             logger.warning(
                 "tmux capture-pane probe failed for terminal %s:%s: %s",
                 self.name,
@@ -1792,6 +1806,8 @@ class TerminalInstance:
                 exc,
             )
             return None
+        self._last_idle_probe_error = None
+        return snapshot
 
     def _tmux_session_exists_sync(self) -> bool | None:
         """Confirm tmux exists, or return ``None`` when the probe cannot start."""
@@ -1809,6 +1825,36 @@ class TerminalInstance:
         except RuntimeError:
             return False
         return True
+
+    def _diagnose_tmux_gone_sync(self) -> str:
+        """Classify why tmux went away, for the idle watcher's exit ERROR.
+
+        Called once when the threaded watcher declares the terminal dead, so
+        the ERROR can say *what* failed rather than only that the terminal is
+        gone. Re-probes ``has-session`` and, when tmux reports the session
+        gone, the server-wide ``list-sessions`` — separating a vanished private
+        server (crash / OOM / external kill / socket removed) from a single
+        session that disappeared while the server stayed up, which are triaged
+        differently — and appends the last rejected ``capture-pane`` stderr. A
+        probe that cannot start leaves liveness genuinely unknown.
+
+        :returns: A compact, non-empty human-readable reason.
+        """
+        try:
+            self._tmux_output_sync("has-session", "-t", self.tmux_target)
+            state = "session reappeared on re-probe (transient probe failure)"
+        except _TmuxProcessStartError as exc:
+            state = f"tmux liveness unknown, probe could not start: {exc}"
+        except RuntimeError as has_session_exc:
+            try:
+                self._tmux_output_sync("list-sessions")
+                state = f"session gone, tmux server still alive: {has_session_exc}"
+            except _TmuxProcessStartError as exc:
+                state = f"session gone; server liveness unknown, probe could not start: {exc}"
+            except RuntimeError as server_exc:
+                state = f"tmux server not reachable: {server_exc}"
+        last = self._last_idle_probe_error
+        return f"{state}; last capture-pane error: {last}" if last else state
 
     def _pane_is_dead(self) -> bool | None:
         """

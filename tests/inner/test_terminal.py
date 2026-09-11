@@ -431,6 +431,95 @@ def test_capture_probe_logs_command_return_code_and_stderr(
     assert "fork failed: resource temporarily unavailable" in message
 
 
+@pytest.mark.parametrize(
+    ("list_sessions_rc", "expected_fragment"),
+    [
+        (1, "tmux server not reachable"),
+        (0, "session gone, tmux server still alive"),
+    ],
+)
+def test_diagnose_tmux_gone_sync_classifies_server_vs_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    list_sessions_rc: int,
+    expected_fragment: str,
+) -> None:
+    """Exit diagnosis separates a dead server from a lost session, keeping capture stderr."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._last_idle_probe_error = (
+        "tmux command failed (rc=1): tmux -S sock capture-pane -t main -p -e: no server running"
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        # ``has-session`` always fails here (the watcher only diagnoses once the
+        # session is already gone); ``list-sessions`` decides server liveness.
+        if "list-sessions" in cmd:
+            return SimpleNamespace(
+                returncode=list_sessions_rc, stdout=b"", stderr=b"no server running"
+            )
+        return SimpleNamespace(returncode=1, stdout=b"", stderr=b"can't find session: main")
+
+    monkeypatch.setattr(terminal_mod.subprocess, "run", _fake_run)
+
+    reason = instance._diagnose_tmux_gone_sync()
+
+    assert expected_fragment in reason
+    assert "last capture-pane error:" in reason
+    assert "no server running" in reason
+
+
+def test_threaded_idle_watcher_exit_error_names_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ``tmux unavailable`` exit ERROR carries why tmux went away, not just that it did."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+
+    def _capture() -> None:
+        # Simulate a swallowed capture-pane rejection: record the stderr and
+        # signal "tmux gone" to the watcher by returning None implicitly.
+        instance._last_idle_probe_error = (
+            "tmux command failed (rc=1): tmux -S sock capture-pane -t main -p -e: "
+            "no server running on /tmp/x"
+        )
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+    # The one-shot diagnosis re-probe finds the whole server unreachable.
+    monkeypatch.setattr(
+        terminal_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout=b"", stderr=b"no server running on /tmp/x"
+        ),
+    )
+
+    with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+        assert exited.wait(timeout=1.0)
+
+    message = caplog.text
+    assert "tmux unavailable after" in message
+    assert "consecutive probes" in message
+    assert "keep_alive_after_exit=False" in message
+    assert "tmux server not reachable" in message
+    assert "no server running on /tmp/x" in message
+
+
 def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
     """``on_tick`` fires every poll (not only on pane change), so the
     claude-native status-file poller runs on the watcher cadence.
