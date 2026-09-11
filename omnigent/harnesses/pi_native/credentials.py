@@ -452,16 +452,26 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
     return [options[model_id] for model_id in sorted(options)]
 
 
-def pi_own_login_model_arg(selection: str) -> str:
+def pi_own_login_model_arg(selection: str) -> str | None:
     """Return the ``--model`` value for a Pi running on its own login.
 
     A managed ``provider/model`` picker value names a provider that does not
     exist without omnigent-managed config, so only the model id survives; any
     other reference (``anthropic/claude-...`` or a bare id) passes through
     unchanged for Pi's own resolver.
+
+    A managed selection whose model id itself contains a ``/`` (e.g.
+    ``omnigent/moonshotai/kimi-k2.5``) is refused with ``None``: stripping the
+    managed prefix would leave a bare slash-bearing id whose leading segment
+    Pi's ``--model`` parser reads as a *provider*, silently mis-routing the
+    launch to an unrelated built-in provider. Such a pick is unresolvable
+    without the managed provider, so the launch falls back to Pi's own
+    default model instead.
     """
     split = _split_pi_native_model_selection(selection)
-    return split[1] if split is not None else selection
+    if split is None:
+        return selection
+    return None if "/" in split[1] else split[1]
 
 
 def pi_native_model_options() -> list[dict[str, object]]:

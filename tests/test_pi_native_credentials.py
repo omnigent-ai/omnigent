@@ -2657,6 +2657,18 @@ def test_pi_own_login_model_arg_strips_managed_prefix_only() -> None:
     assert creds.pi_own_login_model_arg("claude-sonnet-4-5") == "claude-sonnet-4-5"
 
 
+def test_pi_own_login_model_arg_refuses_slash_bearing_managed_model() -> None:
+    """A managed pick with a slash-bearing model id is refused, not mis-routed.
+
+    Stripping ``omnigent/`` from ``omnigent/moonshotai/kimi-k2.5`` would leave
+    ``moonshotai/kimi-k2.5``, whose leading segment Pi's ``--model`` parser
+    reads as a *provider* — silently routing the launch to a built-in
+    ``moonshotai`` provider. Such a pick is unresolvable without the managed
+    provider, so the own-login path must refuse it (Pi keeps its default).
+    """
+    assert creds.pi_own_login_model_arg("omnigent/moonshotai/kimi-k2.5") is None
+
+
 def test_connect_broker_managed_host_resolves_without_configured_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

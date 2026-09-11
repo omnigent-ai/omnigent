@@ -13,7 +13,7 @@ Facet 1 (empty picker, surface ``web``):
     host's usable Pi models so the pre-launch model picker in the
     Configure-Pi dialog lists them. It currently returns ``{"models": []}``
     because ``pi_native_model_options()`` early-returns ``[]`` on a ``None``
-    provider (``omnigent/pi_native_credentials.py``), so the picker shows
+    provider (``omnigent/harnesses/pi_native/credentials.py``), so the picker shows
     only "Default".
 
 Facet 2 (dropped pick, surface ``cli``):
@@ -255,6 +255,8 @@ def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 4
                     if host["host_id"] == host_id and host["status"] == "online":
                         return
         except httpx.ConnectError:
+            # Server isn't accepting connections yet (still starting up);
+            # keep polling until the deadline.
             pass
         time.sleep(POLL_INTERVAL_S)
     raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")

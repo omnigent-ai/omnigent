@@ -2315,8 +2315,12 @@ async def _auto_create_pi_terminal(
         elif spec_model:
             # No managed provider: Pi runs on its own login, but the pinned
             # model must still reach it — without this the pick is silently
-            # dropped and Pi opens its own default model.
-            pi_args.extend(["--model", pi_own_login_model_arg(spec_model)])
+            # dropped and Pi opens its own default model. A managed pick that
+            # cannot be expressed for Pi's own resolver (slash-bearing model
+            # id) is refused rather than mis-routed, so Pi keeps its default.
+            own_login_model = pi_own_login_model_arg(spec_model)
+            if own_login_model is not None:
+                pi_args.extend(["--model", own_login_model])
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
