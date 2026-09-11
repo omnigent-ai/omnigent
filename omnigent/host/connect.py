@@ -411,6 +411,12 @@ _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 # keeps retrying and never exits.
 _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 
+# Min seconds between warnings when token acquisition raises. The reconnect
+# loop calls the token factory every few seconds, so a persistent failure is
+# logged at warning at most this often (debug in between) — visible without
+# flooding the log.
+_AUTH_TOKEN_ERROR_WARN_INTERVAL_S = 60.0
+
 # Consecutive accepted-then-silent connections (upgrade completed, then the
 # socket died without one inbound frame) before the reconnect loop treats the
 # endpoint as unhealthy: it stops using the prompt "recycle" cadence and
@@ -1460,9 +1466,20 @@ class HostProcess:
         body = " ".join(raw_body.decode("utf-8", "replace").split())
         if len(body) > _UPGRADE_BODY_MAX_CHARS:
             body = body[:_UPGRADE_BODY_MAX_CHARS] + "…"
-        return self._classify_http_status(exc.response.status_code, body)
+        # Databricks' workspace edge names the refusal reason in a response
+        # header (e.g. "Source IP address: … is blocked by Databricks IP ACL
+        # for workspace: …") — far more actionable than a bare status. Surface
+        # it so an IP-ACL block isn't mislabeled as a credential problem.
+        reason = ""
+        try:
+            reason = (exc.response.headers.get("x-databricks-reason-phrase") or "").strip()
+        except Exception:  # noqa: BLE001 — header extraction is best-effort
+            reason = ""
+        return self._classify_http_status(exc.response.status_code, body, reason=reason)
 
-    def _classify_http_status(self, status: int, body: str = "") -> HostConnectError | None:
+    def _classify_http_status(
+        self, status: int, body: str = "", *, reason: str = ""
+    ) -> HostConnectError | None:
         """Map a rejected-upgrade HTTP status to a fatal error, or ``None``.
 
         :param status: HTTP status on the failed WS upgrade response, e.g.
@@ -1471,6 +1488,10 @@ class HostProcess:
             (decoded, stripped). When present it is the authoritative,
             reason-specific explanation, so it is surfaced verbatim for statuses
             without their own client-actionable guidance.
+        :param reason: The edge's reason phrase (Databricks
+            ``x-databricks-reason-phrase`` header), when present. More specific
+            than ``body`` and preferred when naming the refusal cause — notably
+            a workspace IP-ACL block.
         :returns: A :class:`HostConnectError` for a permanent 4xx, or
             ``None`` for a transient status (retryable 4xx in
             :data:`_RETRYABLE_UPGRADE_STATUSES`, a 404 on a host that has
@@ -1478,6 +1499,12 @@ class HostProcess:
             non-4xx such as a 5xx server bounce) that the reconnect loop
             should retry.
         """
+        # The reason phrase (when present) is the most specific explanation;
+        # fall back to the body. An IP-ACL block is a network-location problem,
+        # not a credential one, so it retries and self-heals once the source IP
+        # is allowed — worth naming distinctly.
+        detail = (reason or body).strip()
+        ip_acl_blocked = "ip acl" in detail.lower() or "ip access" in detail.lower()
         if status in _RETRYABLE_UPGRADE_STATUSES or not (400 <= status < 500):
             return None
         if status == 404:
@@ -1485,19 +1512,36 @@ class HostProcess:
         if status in (401, 403):
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
-            cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
+            if ip_acl_blocked:
+                cause = f"Connection refused (HTTP {status}): {detail}."
+            else:
+                cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
             should_retry = self._ever_connected or (
                 self._auth_retry_streak < _MAX_CONSECUTIVE_AUTH_ERRORS
             )
             if should_retry:
-                # A sustained streak (vs. a brief VPN blip) means the credential
-                # is very likely permanently rejected: escalate the operator
-                # signal and name re-auth, but keep retrying so a real outage
-                # self-heals.
-                if (
+                escalate = (
                     self._auth_retry_streak >= _AUTH_REJECT_ESCALATE_ATTEMPTS
                     and self._auth_retry_streak % _AUTH_REJECT_ESCALATE_ATTEMPTS == 0
-                ):
+                )
+                if ip_acl_blocked:
+                    # A network-location block, not a credential problem:
+                    # connecting from an allowed IP (the VPN) heals it on the
+                    # next dial, so name the real cause and keep retrying.
+                    msg = (
+                        f"{cause} Your machine's source IP is not on the "
+                        "workspace's allow-list — connect to the VPN / an "
+                        "allowed network; it reconnects automatically once the "
+                        "IP is permitted."
+                    )
+                    _logger.warning("%s", msg)
+                    if escalate or self._auth_retry_streak == 1:
+                        print(f"⚠ {msg}", file=sys.stderr, flush=True)
+                elif escalate:
+                    # A sustained streak (vs. a brief VPN blip) means the
+                    # credential is very likely permanently rejected: escalate
+                    # the operator signal and name re-auth, but keep retrying so
+                    # a real outage self-heals.
                     escalated = (
                         f"{cause} The server has rejected it "
                         f"{self._auth_retry_streak} times in a row — this is no "
@@ -1531,6 +1575,12 @@ class HostProcess:
                 + self._login_fix_hint()
             )
         if status == 403:
+            if ip_acl_blocked:
+                return HostConnectError(
+                    f"Connection refused (HTTP 403): {detail}. Your machine's "
+                    "source IP is not on the workspace's allow-list. Connect to "
+                    "the VPN / an allowed network and retry."
+                )
             # An expired stored login is the common way to land here: the
             # token loader yields nothing, the dial goes out
             # unauthenticated, and the server's refusal looks like an
@@ -3869,7 +3919,22 @@ class HostProcess:
             if self._auth_token_factory is not None:
                 return self._auth_token_factory()
         except Exception:  # noqa: BLE001
-            _logger.debug("Could not obtain auth token", exc_info=True)
+            # Don't stay silent: a raised token-acquisition error otherwise
+            # returns None, the tunnel dials unauthenticated, and the server's
+            # refusal looks like an opaque 403/redirect with no breadcrumb.
+            # Rate-limit so a persistent failure on the ~3s reconnect loop
+            # surfaces without flooding the log.
+            now = time.monotonic()
+            last = getattr(self, "_auth_token_error_warned_at", 0.0)
+            if now - last >= _AUTH_TOKEN_ERROR_WARN_INTERVAL_S:
+                self._auth_token_error_warned_at = now
+                _logger.warning(
+                    "Could not obtain an auth token — dialing the tunnel "
+                    "unauthenticated; the server will likely reject it.",
+                    exc_info=True,
+                )
+            else:
+                _logger.debug("Could not obtain auth token", exc_info=True)
         return None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:

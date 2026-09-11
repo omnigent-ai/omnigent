@@ -5286,6 +5286,79 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
 
 
+_IP_ACL_REASON = "Source IP address: 1.2.3.4 is blocked by Databricks IP ACL for workspace: 999"
+
+
+def test_ip_acl_403_names_reason_and_retries(capsys: pytest.CaptureFixture[str]) -> None:
+    """A 403 carrying a Databricks IP-ACL reason phrase is named, not mislabeled.
+
+    An IP-ACL block is a network-location problem — connecting from an allowed
+    IP heals it on the next dial — so it stays retryable (None) and the
+    operator message names the allow-list, not the generic "check your
+    VPN/network" credential hint.
+    """
+    host = _make_host_process()
+    host._ever_connected = True
+
+    assert host._classify_http_status(403, reason=_IP_ACL_REASON) is None
+    err = capsys.readouterr().err
+    assert "IP ACL" in err
+    assert "allow-list" in err
+    assert "network dropped" not in err  # not the generic credential message
+
+
+def test_ip_acl_403_fatal_message_names_allowlist_when_never_connected() -> None:
+    """A never-connected host that exhausts its retry budget on an IP-ACL 403
+    fails with a message naming the allow-list, not a credential/version guess.
+    """
+    from omnigent.host.connect import _MAX_CONSECUTIVE_AUTH_ERRORS, HostConnectError
+
+    host = _make_host_process()
+    host._ever_connected = False
+
+    result: HostConnectError | None = None
+    for _ in range(_MAX_CONSECUTIVE_AUTH_ERRORS):
+        result = host._classify_http_status(403, reason=_IP_ACL_REASON)
+    assert isinstance(result, HostConnectError)
+    assert "allow-list" in str(result)
+    assert "IP ACL" in str(result)
+
+
+def test_current_auth_token_warns_once_when_factory_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raised token-acquisition error must surface (not stay debug-silent),
+    rate-limited so the ~3s reconnect loop doesn't flood the log.
+
+    Silence here is what turned a wedged host into an opaque 403 loop with no
+    breadcrumb — the factory error was swallowed at debug while the daemon ran
+    at info.
+    """
+    import logging
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    host = _make_host_process()
+
+    def _boom() -> str | None:
+        raise RuntimeError("token mint failed")
+
+    host._auth_token_factory = _boom
+    host._auth_token_factory_resolved = True
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        assert host._current_auth_token() is None
+    assert any("Could not obtain an auth token" in r.getMessage() for r in caplog.records)
+
+    # Rate-limited: an immediate second failure does not emit another warning.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        assert host._current_auth_token() is None
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
 async def test_launch_harness_probe_runs_off_the_event_loop(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
