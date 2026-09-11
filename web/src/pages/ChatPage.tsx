@@ -1988,12 +1988,15 @@ export function buildSlashCommandMap(
   showEffort: boolean,
   showModel: boolean,
   showCompact = true,
+  showBtw = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
+    // /btw is a Claude Code CLI built-in — only offer it on claude-native.
+    if (name === "/btw" && !showBtw) continue;
     m[name] = description;
   }
   for (const skill of skills) {
@@ -2021,10 +2024,13 @@ export function buildSlashCommandWithArgsSet(
   skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
+  showBtw = false,
 ): Set<string> {
   const s = new Set<string>();
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
+  // Selecting /btw fills "/btw " so the user types the side question after it.
+  if (showBtw) s.add("/btw");
   for (const skill of skills) s.add(`/${skill.name}`);
   return s;
 }
@@ -2780,16 +2786,20 @@ function ComposerImpl({
   // codex-native) which inject the slash command into the terminal.
   // SDK harnesses (openai-agents-sdk, claude-sdk) don't support it yet.
   const showCompact = isNativeWrapper;
+  // /btw is a Claude Code CLI built-in (side chat), so offer it only on
+  // claude-native sessions. Selected/typed, it sends as plaintext to the
+  // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
+  const showBtw = sessionHarness === "claude-native";
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact),
-    [skills, showEffort, showModel, showCompact],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw),
+    [skills, showEffort, showModel, showCompact, showBtw],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
-    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel),
-    [skills, showEffort, showModel],
+    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw),
+    [skills, showEffort, showModel, showBtw],
   );
 
   // Suggestions menu is open while the user is still typing the command
@@ -3211,7 +3221,11 @@ function ComposerImpl({
         setPickerOpenNonce((n) => n + 1);
         return;
       }
-      if (cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
+      // /btw is a built-in for menu/autocomplete purposes only — it is NOT
+      // executed locally. It must reach the vendor TUI as plaintext so Claude
+      // Code opens its side chat and the forwarder relays the answer to the
+      // web overlay; fall through to the plaintext send path below.
+      if (cmd !== "/btw" && cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
         executeSlashCommand(cmd, arg);
         return;
       }
