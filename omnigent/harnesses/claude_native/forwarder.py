@@ -746,6 +746,8 @@ class _ForwardDedupeState:
     # single ``capture-pane`` subprocess (feeding both the permission-mode and
     # /btw signals) spawns at _PANE_POLL_INTERVAL_S, not every poll.
     pane_next_read: float = 0.0
+    pending_terminal_message_key: str | None = None
+    posted_terminal_message_key: str | None = None
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
@@ -1352,17 +1354,25 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
                         )
-                        # Footer-derived signals (permission mode, /btw overlay)
-                        # emit no event and live only in the rendered pane. One
-                        # throttled capture feeds both, so a shift+tab switch and
-                        # a settled /btw exchange both reach the web view without
-                        # spawning a capture-pane subprocess per signal.
-                        await _forward_pane_signals(
+                    else:
+                        hook_state = await _forward_available_status_events(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
+                            state=hook_state,
+                            retry_tracker=status_retries,
                             dedupe=dedupe,
+                            task_subjects=task_subjects,
+                            task_statuses=task_statuses,
+                            task_order=task_order,
                         )
+                    await _forward_pane_signals(
+                        client=client,
+                        session_id=current_session_id,
+                        bridge_dir=bridge_dir,
+                        dedupe=dedupe,
+                        response_id=state.current_response_id if state is not None else None,
+                    )
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
@@ -3491,8 +3501,8 @@ async def _forward_available_status_events(
     ``POST /v1/sessions/{id}/events`` with type ``external_session_status``
     — the authoritative turn-end edges that drive sub-agent terminal
     delivery (see :data:`_HOOK_EVENT_TO_STATUS`). ``running`` stays
-    PTY-derived (the pane-activity watcher drives the UI badge). Other hook
-    event names advance the cursor without emitting (no status meaning).
+    PTY-derived (the pane-activity watcher drives the UI badge). Notifications
+    persist as UI-only notices without changing the turn status.
 
     Also forwards native task state changes (``TaskCreated``,
     ``TaskCompleted``, ``PostToolUse``/``TaskUpdate``) and
@@ -3574,6 +3584,32 @@ async def _forward_available_status_events(
             await _write_hook_state_async(bridge_dir, durable)
             continue
         if status is None:
+            if record.notification_message is not None:
+                source_id = (
+                    f"claude-notification:{record.claude_session_id}:"
+                    f"{record.recorded_at}:{record.event_cursor}:{record.byte_offset}"
+                )
+                if retry_tracker.retry_delay_s(source_id) is not None:
+                    return durable
+                try:
+                    await _post_terminal_notice(
+                        client,
+                        session_id=session_id,
+                        message=record.notification_message,
+                        source_id=source_id,
+                    )
+                except httpx.HTTPError as exc:
+                    decision = retry_tracker.record_failure(source_id, exc)
+                    _logger.warning(
+                        "Claude notification post failed; session=%s source_id=%s exhausted=%s",
+                        session_id,
+                        source_id,
+                        decision.exhausted,
+                        exc_info=True,
+                    )
+                    if not decision.exhausted:
+                        return durable
+                retry_tracker.clear(source_id)
             # Compaction boundary (PreCompact / SessionStart source=compact)
             # → forward as a compaction-status event so the web UI brackets
             # Claude's real terminal compaction with its spinner. Best-effort:
@@ -5095,12 +5131,12 @@ async def _forward_pane_signals(
     session_id: str,
     bridge_dir: Path,
     dedupe: _ForwardDedupeState,
+    response_id: str | None = None,
 ) -> None:
     """
     Capture the Claude pane ONCE per window and relay every footer signal.
 
-    Neither the permission mode nor a ``/btw`` side-chat is observable to
-    Omnigent through the transcript, deltas, or hooks — both live only in the
+    Permission mode, ``/btw`` side-chats, and terminal dialogs live only in the
     rendered pane. Rather than each spawning its own ``tmux capture-pane``
     subprocess, this reads the pane a single time (throttled to
     :data:`_PANE_POLL_INTERVAL_S`) and hands the one snapshot to each relay,
@@ -5111,6 +5147,7 @@ async def _forward_pane_signals(
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param response_id: Active turn, or ``None`` before the transcript exists.
     """
     now = time.monotonic()
     if now < dedupe.pane_next_read:
@@ -5122,6 +5159,73 @@ async def _forward_pane_signals(
     )
     await _relay_btw_overlay(
         client, session_id=session_id, overlay=signals.btw_overlay, dedupe=dedupe
+    )
+    await _relay_terminal_message(
+        client,
+        session_id=session_id,
+        message=signals.terminal_message,
+        response_id=response_id,
+        dedupe=dedupe,
+    )
+
+
+async def _relay_terminal_message(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    message: str | None,
+    response_id: str | None,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """Persist stable dialogs once per turn; never answer a terminal prompt."""
+    if message is None:
+        dedupe.pending_terminal_message_key = None
+        return
+    key = hashlib.sha256(f"{response_id or session_id}\x00{message}".encode()).hexdigest()
+    if key == dedupe.posted_terminal_message_key:
+        return
+    if key != dedupe.pending_terminal_message_key:
+        dedupe.pending_terminal_message_key = key
+        return
+    try:
+        await _post_terminal_notice(
+            client,
+            session_id=session_id,
+            message=(
+                "Claude displayed this prompt in the terminal. "
+                "Use its approval card if available, or open the terminal to respond.\n\n"
+                f"{message}"
+            ),
+            source_id=f"claude-terminal:{key}",
+        )
+    except httpx.HTTPError:
+        _logger.debug("Claude terminal notice post failed; session=%s", session_id, exc_info=True)
+        return
+    dedupe.posted_terminal_message_key = key
+
+
+async def _post_terminal_notice(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    message: str,
+    source_id: str,
+) -> None:
+    """Use a durable UI-only notice, excluded from model context and turn status."""
+    await _post_external_conversation_item(
+        client,
+        session_id=session_id,
+        item=ClaudeTranscriptItem(
+            source_id=source_id,
+            response_id=source_id,
+            item_type="error",
+            data={
+                "source": "harness",
+                "code": "claude_terminal_notice",
+                "message": message,
+                "level": "info",
+            },
+        ),
     )
 
 

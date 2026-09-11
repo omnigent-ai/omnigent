@@ -284,6 +284,13 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+Claude-native also mirrors terminal notifications and visible numbered dialogs
+into the chat as expandable notices, including tool descriptions, hook warnings,
+and the displayed choices. These notices survive a refresh but are not sent back
+to the model. Respond using the approval card when one is available, or open the
+terminal; a notice does not approve a tool. Text hidden behind a collapsed
+description or outside the terminal viewport is not captured.
+
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 
