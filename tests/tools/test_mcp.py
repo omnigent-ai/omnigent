@@ -1004,6 +1004,73 @@ async def test_recording_stream_does_not_record_timeouts() -> None:
     assert recorded == []
 
 
+def _make_hook_response(method: str) -> httpx.Response:
+    """Build a response attached to a request with the given method."""
+    request = httpx.Request(method, "http://127.0.0.1:9/mcp")
+    return httpx.Response(
+        200,
+        request=request,
+        stream=_ExplodingByteStream(httpx.ReadError("reset")),
+    )
+
+
+@pytest.mark.asyncio()
+async def test_response_hook_wraps_post_but_not_get() -> None:
+    """
+    The response hook records only tool-call (POST) traffic. The
+    SDK's server-initiated GET stream reconnects on its own; its
+    flaps must not taint an unrelated tool call's timeout
+    classification.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+
+    post_response = _make_hook_response("POST")
+    await conn._record_response_stream(post_response)
+    assert isinstance(post_response.stream, _TransportErrorRecordingStream)
+
+    get_response = _make_hook_response("GET")
+    await conn._record_response_stream(get_response)
+    assert not isinstance(get_response.stream, _TransportErrorRecordingStream)
+
+
+@pytest.mark.asyncio()
+async def test_response_hook_records_into_connection() -> None:
+    """
+    A network failure while reading a hooked POST response body lands
+    in ``conn._transport_error`` — the end-to-end wiring of the
+    recorder.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    response = _make_hook_response("POST")
+    await conn._record_response_stream(response)
+    with pytest.raises(httpx.ReadError):
+        async for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert isinstance(conn._transport_error, httpx.ReadError)
+
+
+def test_recording_client_preserves_env_proxy_mounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Regression: installing the recorder must not disable httpx's
+    environment-proxy support. An explicit ``transport=`` argument
+    would (httpx only mounts env proxies when ``transport is None``),
+    so the recorder is a response event hook instead — with
+    ``HTTP(S)_PROXY`` set, the client must carry proxy mounts exactly
+    like the SDK's default ``create_mcp_http_client`` does.
+    """
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.delenv("ALL_PROXY", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    conn = McpServerConnection(config=_make_http_config())
+    client = conn._make_recording_httpx_client()
+    proxy_mounts = [t for t in client._mounts.values() if t is not None]
+    assert proxy_mounts, "env-proxy mounts were not created"
+    assert client._event_hooks["response"], "recording response hook is missing"
+
+
 # ── _backoff_delay ────────────────────────────────────────
 
 
@@ -1200,9 +1267,9 @@ async def test_call_tool_reconnects_on_swallowed_transport_error_timeout() -> No
 
         assert result == "recovered"
         mock_reconnect.assert_awaited_once()
-        # The successful round-trip proves the transport is healthy
-        # again, so the stale error must not linger to misclassify a
-        # future genuine tool timeout.
+        # Each attempt starts with a clean signal, so the recorded
+        # error must not linger past the successful retry to
+        # misclassify a future genuine tool timeout.
         assert conn._transport_error is None
 
     await conn.close()
