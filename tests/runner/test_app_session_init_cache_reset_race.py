@@ -338,6 +338,23 @@ async def test_session_init_does_not_reinstate_agent_binding_superseded_by_reset
             "init did not release the harness spawned from the superseded "
             f"spec after a raced reset (released: {process_manager.released})"
         )
+        assert process_manager.release_calls[-1][1] is not None, (
+            "the fence-fired release was unconditional: it must carry the "
+            "idle cutoff so a concurrent consumer of the shared entry is "
+            "never torn down mid-turn"
+        )
+
+        # The just-created session must stay readable after the fence-fired
+        # release: no subprocess is registered, but the session is live, so
+        # the runner GET serves it (idle) with the authoritative binding
+        # from the post-switch server snapshot.
+        get_resp = await client.get(f"/v1/sessions/{session_id}")
+        assert get_resp.status_code == 200, get_resp.text
+        assert get_resp.json()["agent_id"] == _NEW_AGENT_ID, (
+            "runner GET did not serve the snapshot binding after the "
+            f"fence-fired release (got {get_resp.json()['agent_id']!r})"
+        )
+        assert get_resp.json()["status"] == "idle"
 
         fallback_resp = await client.post(
             f"/v1/sessions/{session_id}/agent-cache/reset",
@@ -533,3 +550,105 @@ async def test_session_init_fences_reset_during_legacy_context_load(
     assert "marker-v1" not in names, (
         f"superseded pre-reset spec still served after reset; skills = {sorted(names)}"
     )
+
+
+class _BlockingSpawnProcessManager(_FakeProcessManager):
+    """Process-manager stub whose harness spawn blocks until released.
+
+    Init's eager ``get_client`` call runs *after* the spec-cache write, so
+    holding the spawn open exposes the window in which the spec entry is
+    already memoized when the reset lands.
+    """
+
+    def __init__(self, client: _ScriptedHarnessClient) -> None:
+        super().__init__(client)
+        self.spawn_entered = asyncio.Event()
+        self.release_spawn = asyncio.Event()
+
+    async def get_client(
+        self, conversation_id: str, harness: str, env: Any = None
+    ) -> _ScriptedHarnessClient:
+        """Block the first spawn until the test releases it.
+
+        :param conversation_id: Session/conversation id being spawned for.
+        :param harness: Harness name (forwarded to the parent).
+        :param env: Spawn environment (forwarded to the parent).
+        :returns: The scripted client, once released.
+        """
+        self.spawn_entered.set()
+        await self.release_spawn.wait()
+        return await super().get_client(conversation_id, harness, env)
+
+
+@pytest.mark.asyncio
+async def test_session_init_fences_reset_during_harness_spawn() -> None:
+    """A reset landing during init's harness spawn still loses to the fence.
+
+    Unlike the resolver- and version-probe races, here the reset lands
+    *after* init's fenced spec-cache write has executed: the reset pops that
+    entry and bumps the generation, so init must not reinstate the agent-id
+    binding afterwards, must release the harness it spawned from the
+    superseded spec, and the next spec read must re-resolve.
+    """
+    session_id = "cachespawn_4b81c9e2d63f4a07b5a2c8f1d90e6b72"
+    resolver_calls = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolver_calls
+        del agent_id, session_id
+        resolver_calls += 1
+        return _spec("v1" if resolver_calls == 1 else "v2")
+
+    server_client = _SwitchableSnapshotServerClient(session_id, _AGENT_ID)
+    process_manager = _BlockingSpawnProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+
+    async with _runner_client(app) as client:
+        init_task = asyncio.create_task(
+            client.post(
+                "/v1/sessions",
+                json={"session_id": session_id, "agent_id": _AGENT_ID},
+            )
+        )
+        await asyncio.wait_for(process_manager.spawn_entered.wait(), timeout=10)
+
+        reset_resp = await client.post(
+            f"/v1/sessions/{session_id}/agent-cache/reset",
+            json={"agent_id": _AGENT_ID},
+        )
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["reset"] is True
+
+        process_manager.release_spawn.set()
+        init_resp = await asyncio.wait_for(init_task, timeout=30)
+        assert init_resp.status_code == 201, init_resp.text
+
+        assert get_session_agent_id(session_id) is None, (
+            "init reinstated the agent-id binding retired by a reset during the harness spawn"
+        )
+        assert process_manager.released == [session_id], (
+            "init did not release the harness spawned from the superseded "
+            f"spec after a reset during the spawn "
+            f"(released: {process_manager.released})"
+        )
+
+        get_resp = await client.get(f"/v1/sessions/{session_id}")
+        assert get_resp.status_code == 200, get_resp.text
+
+        skills_resp = await client.get(f"/v1/sessions/{session_id}/skills")
+
+    assert skills_resp.status_code == 200, skills_resp.text
+    names = {skill["name"] for skill in skills_resp.json()["skills"]}
+    # The reset popped the spec entry init memoized just before the spawn:
+    # the next spec read must consult the resolver again.
+    assert resolver_calls == 2, (
+        "spec read after a reset acknowledged during the harness spawn was "
+        "served from the session spec cache "
+        f"(resolver consulted {resolver_calls} time(s), expected 2)"
+    )
+    assert "marker-v2" in names, f"post-reset spec not served; skills = {sorted(names)}"
