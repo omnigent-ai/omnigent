@@ -266,11 +266,40 @@ function removeConvRow(tempId: string): void {
  * Returns the temp id + the bubble's `pendingMsgTempId` for
  * `hydrateLocalConversation`, or `null` with no query cache (tests).
  */
+/**
+ * The model/agent identity the optimistic conversation should show while
+ * `createSession` is in flight (#7039). Derived from the SAME normalized create
+ * request the POST sends — NOT raw picker state — so the temp view matches the
+ * session that binds: a routing create pins no model, a default create sends no
+ * override, and a concrete/1M pick carries its exact id.
+ */
+export interface OptimisticSessionModel {
+  /** The `model_override` the create POSTs, or `null` when none (default/routing). */
+  modelOverride: string | null;
+  /** The agent's resolved default model id, shown when there's no override. Omit
+   *  to leave `llmModel` unset (composer reads "agent default"). */
+  llmModel?: string | null;
+  /** The `reasoning_effort` the create POSTs, or `null`. */
+  reasoningEffort?: string | null;
+  /** Normalized brain/session harness (e.g. `"claude-sdk"`), NOT the picker's
+   *  `*-native` id. Omit when unknown; the composer tolerates a null harness. */
+  harness?: string | null;
+  /** Model context window, when known up front. Omit to leave unset. */
+  contextWindow?: number | null;
+  /** Bound agent identity for the composer, when resolved. */
+  boundAgentId?: string | null;
+  boundAgentName?: string | null;
+  /** True when the create routes per turn (smart routing / pinned native route):
+   *  no concrete model is pinned so the temp view shows routing, not a model. */
+  routing?: boolean;
+}
+
 export function beginLocalConversation(
   text: string,
   files: File[] | undefined,
   provisional = newTempConversation(),
   project?: LocalConversationProject,
+  model?: OptimisticSessionModel,
 ): { tempConvId: string; pendingMsgTempId: string; createToken: string } | null {
   if (queryClient === null) return null;
   const { id: tempConvId, token: createToken } = provisional;
@@ -300,8 +329,32 @@ export function beginLocalConversation(
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
 
+  // Seed the model/agent identity so the optimistic composer shows the SELECTED
+  // model (with the caller's pending spinner) instead of the previous session's
+  // or a blank one (#7039). A routing create pins no model — leave the fields at
+  // their initial nulls so the temp view reads as routing, matching the create.
+  const modelSeed: Partial<ConversationState> =
+    model === undefined
+      ? {}
+      : {
+          boundAgentId: model.boundAgentId ?? null,
+          boundAgentName: model.boundAgentName ?? null,
+          ...(model.routing === true
+            ? {}
+            : {
+                sessionModelOverride: model.modelOverride,
+                sessionReasoningEffort: model.reasoningEffort ?? null,
+                ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
+                ...(model.harness !== undefined ? { sessionHarness: model.harness } : {}),
+                ...(model.contextWindow !== undefined
+                  ? { contextWindow: model.contextWindow }
+                  : {}),
+              }),
+        };
+
   const entry = conversationRegistry.acquire(tempConvId);
   entry.setState({
+    ...modelSeed,
     pendingUserMessages: [bubble],
     loadingConversation: false,
     status: "streaming",

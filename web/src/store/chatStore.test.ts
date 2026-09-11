@@ -13710,3 +13710,75 @@ describe("chatStore — interaction_phase analytics", () => {
     ]);
   });
 });
+
+describe("beginLocalConversation — optimistic model seed (#7039)", () => {
+  it("seeds the selected model override so the temp view isn't the previous model", () => {
+    seedConversationsCache([]);
+    // A previous session left a cross-session sticky pick; it must NOT leak into
+    // the optimistic view — the seed is authoritative.
+    useChatStore.setState({ selectedModel: "claude-sonnet-4-6" });
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: "opus[1m]",
+      reasoningEffort: "high",
+      boundAgentId: "agent_xyz",
+      boundAgentName: "Debby",
+    })!;
+    expect(isTempConvId(begun.tempConvId)).toBe(true);
+    const s = useChatStore.getState();
+    expect(s.sessionModelOverride).toBe("opus[1m]");
+    expect(s.sessionReasoningEffort).toBe("high");
+    expect(s.boundAgentId).toBe("agent_xyz");
+    expect(s.boundAgentName).toBe("Debby");
+  });
+
+  it("pins no model for a routing create", () => {
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      routing: true,
+      boundAgentId: "agent_auto",
+    })!;
+    expect(begun).not.toBeNull();
+    const s = useChatStore.getState();
+    expect(s.sessionModelOverride).toBeNull();
+    expect(s.boundAgentId).toBe("agent_auto");
+  });
+
+  it("leaves model null for a default create (no override)", () => {
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+    })!;
+    expect(begun).not.toBeNull();
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+  });
+
+  it("preserves the seeded model across the temp→real rekey", () => {
+    seedSession("conv_real");
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: "opus[1m]",
+      boundAgentId: "agent_xyz",
+    })!;
+    hydrateLocalConversation(
+      begun.tempConvId,
+      "conv_real",
+      "agent_xyz",
+      "hi",
+      undefined,
+      begun.pendingMsgTempId,
+      null,
+      () => {},
+    );
+    // The registry rekey copies entry state, so the real entry carries the seed
+    // until the server snapshot binds authoritative values.
+    expect(useChatStore.getState().sessionModelOverride).toBe("opus[1m]");
+  });
+
+  it("is backward compatible: a 4-arg call seeds no model fields", () => {
+    seedConversationsCache([]);
+    useChatStore.setState({ selectedModel: "claude-sonnet-4-6" });
+    beginLocalConversation("hi", undefined);
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+  });
+});
