@@ -1,11 +1,13 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   ComposerHostTrigger,
   ComposerWorkspaceBar,
   ComposerWorkspaceTrigger,
   ComposerHarnessTrigger,
   ComposerPermissionPicker,
+  ContextRing,
 } from "./ComposerControls";
 
 describe("shared composer controls", () => {
@@ -60,5 +62,35 @@ describe("shared composer controls", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
     expect(onSelect).toHaveBeenCalledWith("plan");
+  });
+});
+
+describe("context ring", () => {
+  it("keeps the workspace bar's neutral gray at every usage level", () => {
+    // 20% / 65% / 92% cover the bands the old treatment painted gray,
+    // yellow (>60%), and red (>80%); all must now stay the bar's gray.
+    render(
+      <TooltipProvider>
+        <ContextRing contextWindow={200_000} tokensUsed={40_000} />
+        <ContextRing contextWindow={200_000} tokensUsed={130_000} />
+        <ContextRing contextWindow={200_000} tokensUsed={184_000} />
+      </TooltipProvider>,
+    );
+    for (const pct of [20, 65, 92]) {
+      const ring = screen.getByLabelText(`${pct}% of context used`);
+      expect(ring).toHaveClass("text-muted-foreground");
+      expect(ring).not.toHaveClass("text-destructive");
+      expect(ring).not.toHaveClass("text-warning");
+    }
+  });
+
+  it("caps the fill at 100% and merges the caller's alignment classes", () => {
+    render(
+      <TooltipProvider>
+        <ContextRing contextWindow={128_000} tokensUsed={184_000} className="ml-auto" />
+      </TooltipProvider>,
+    );
+    const ring = screen.getByLabelText("100% of context used");
+    expect(ring).toHaveClass("ml-auto", "text-muted-foreground");
   });
 });

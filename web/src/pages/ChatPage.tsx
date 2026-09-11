@@ -41,6 +41,7 @@ import {
   ComposerWorkspaceTrigger,
   ComposerPermissionPicker,
   ComposerHarnessTrigger,
+  ContextRing,
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -2054,53 +2055,21 @@ export function buildSlashCommandWithArgsSet(
   return s;
 }
 
-/** Circumference of the progress ring (r=5.5). */
-const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
-
-/** Circular progress ring showing how much context window is used, with the used percentage beside it. */
-function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tokensUsed: number }) {
-  const pct = Math.min(tokensUsed / contextWindow, 1);
-  // Arc, %, label, and tooltip all encode context USED: a fresh session
-  // shows an empty ring at 0% and the ring fills as context is consumed.
-  const usedArc = pct * RING_CIRCUMFERENCE;
-  const usedPct = Math.round(pct * 100);
-
-  const color =
-    pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
-
+/**
+ * Context ring slot for the workspace bar's right side. Reads the session's
+ * context usage from the chat store and self-gates to null until both the
+ * window and the used tokens are known.
+ */
+function ComposerContextRing() {
+  const conversationId = useChatStore((s) => s.conversationId);
+  const contextWindow = useChatStore((s) => s.contextWindow);
+  const tokensUsed = useChatStore((s) => s.tokensUsed);
+  // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
+  if (!conversationId || contextWindow == null || contextWindow <= 0 || tokensUsed == null) {
+    return null;
+  }
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span
-          className={cn("flex items-center gap-1.5", color)}
-          aria-label={`${usedPct}% of context used`}
-        >
-          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
-            {/* Track */}
-            <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
-            {/* Used arc — skipped at 0, where round linecaps would still paint a dot. */}
-            {usedArc > 0 && (
-              <circle
-                cx="8"
-                cy="8"
-                r="5.5"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeDasharray={`${usedArc} ${RING_CIRCUMFERENCE}`}
-                transform="rotate(-90 8 8)"
-              />
-            )}
-          </svg>
-          <span className="text-sm tabular-nums" aria-hidden="true">
-            {usedPct}%
-          </span>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-44 text-center text-sm">
-        <p className="tabular-nums">{usedPct}% of context used.</p>
-      </TooltipContent>
-    </Tooltip>
+    <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} className="ml-auto h-6" />
   );
 }
 
@@ -2207,9 +2176,10 @@ export function composerHarnessLabel(
 }
 
 /**
- * Status tray under the composer: branch left, model/context right.
+ * Status tray under the composer: PR link left, plan mode/goal right.
  * Pulled up behind the card so a shelf peeks below; skips render when empty.
- * Session cost lives in the header agent-info popover, not here.
+ * Session cost lives in the header agent-info popover; the context ring
+ * lives in the workspace bar above the composer, not here.
  */
 function ComposerStatusLine({
   goal,
@@ -2223,8 +2193,6 @@ function ComposerStatusLine({
   // below on it so they never fetch `/v1/sessions/temp:*` during the create
   // window (mirrors ChatPage's top-level `sessionConvId`).
   const sessionId = isTempConvId(conversationId) ? null : conversationId;
-  const contextWindow = useChatStore((s) => s.contextWindow);
-  const tokensUsed = useChatStore((s) => s.tokensUsed);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
   // PR link → opens the workspace rail's GitHub tab. Shares the info query's
   // cache with the GitHub panel, so opening the tab is instant.
@@ -2237,10 +2205,7 @@ function ComposerStatusLine({
 
   const showPlanMode = !!conversationId && codexPlanMode;
   const showGoal = !!conversationId && goal != null;
-  // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
-  const showRing =
-    !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showPr && !showPlanMode && !showGoal && !showRing) return null;
+  if (!showPr && !showPlanMode && !showGoal) return null;
 
   return (
     <div
@@ -2269,7 +2234,7 @@ function ComposerStatusLine({
           </button>
         )}
       </div>
-      {/* Right: model/effort and context ring, never shrinks. */}
+      {/* Right: plan mode and goal status, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
           <span
@@ -2281,7 +2246,6 @@ function ComposerStatusLine({
           </span>
         )}
         {showGoal && goal && <GoalStatusPill goal={goal} />}
-        {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
       </div>
     </div>
   );
@@ -3524,6 +3488,8 @@ function ComposerImpl({
               </p>
             </DropdownMenuContent>
           </DropdownMenu>
+          {/* Right-aligned context usage; directory/branch stay on the left. */}
+          <ComposerContextRing />
         </ComposerWorkspaceBar>
       </div>
       <ChatComposer

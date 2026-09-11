@@ -43,9 +43,9 @@ from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configur
 _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
-# The composer status tray's context ring exposes its value via aria-label,
+# The workspace bar's context ring exposes its value via aria-label,
 # e.g. "1% of context used".
-_RING = '[data-testid="composer-status-line"] [aria-label$="of context used"]'
+_RING = '[data-testid="composer-workspace-controls"] [aria-label$="of context used"]'
 
 # Spec-declared window; percentages below derive from it.
 _CONTEXT_WINDOW = 200_000

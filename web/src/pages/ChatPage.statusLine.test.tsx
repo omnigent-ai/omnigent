@@ -79,11 +79,12 @@ import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
-// it shows the worktree branch (truncated so the tray never wraps), current
-// model/effort, and the context ring. It must not render at all when none
-// has data — no dead shelf attached to the composer. Session cost was moved
-// OUT of this tray into the header agent-info popover, so a priced cost must
-// NOT resurrect the tray or appear here.
+// it shows the PR link and the plan-mode/goal badges, and must not render at
+// all when none has data — no dead shelf attached to the composer. The
+// worktree branch and the context ring live in the shared workspace bar ABOVE
+// the composer, not here. Session cost was moved OUT of this tray into the
+// header agent-info popover, so a priced cost must NOT resurrect the tray or
+// appear here.
 
 /** Minimal ComposerProps for an interactive (writable, idle) composer. */
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
@@ -138,7 +139,7 @@ function bindHost(name: string) {
   useSessionHostOnlineMock.mockReturnValue(true);
 }
 
-describe("Composer status line (branch + context ring)", () => {
+describe("Composer status line and workspace bar", () => {
   beforeEach(() => {
     // Default: no host bound, so HostBadge renders nothing.
     useSessionMock.mockReset().mockReturnValue({
@@ -226,13 +227,18 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.queryByTestId("composer-pr-link")).not.toBeInTheDocument();
   });
 
-  it("shows the context ring with the correct used percentage", () => {
+  it("shows the context ring in the workspace bar with the correct used percentage", () => {
     useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000 });
     renderComposer();
-    expect(statusLine()).not.toBeNull();
     // 25k of 100k → 25% used; a wrong value means the ring wired the
     // wrong store fields through its props.
-    expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
+    const ring = screen.getByLabelText("25% of context used");
+    // The ring lives in the gray directory/branch bar above the composer,
+    // not in the tray below it — and ring data alone no longer surfaces
+    // that tray.
+    expect(ring.closest('[data-testid="composer-workspace-controls"]')).toBeTruthy();
+    expect(ring.closest('[data-testid="composer-status-line"]')).toBeNull();
+    expect(statusLine()).toBeNull();
   });
 
   it("no longer renders the harness label in the status tray (moved to the config gear)", () => {
@@ -327,7 +333,6 @@ describe("Composer status line (branch + context ring)", () => {
   it("shows an honest placeholder before a branch is reported", () => {
     useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000, gitBranch: null });
     renderComposer();
-    expect(statusLine()).not.toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("No branch reported");
   });
 
@@ -339,15 +344,14 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByTestId("composer-plan-mode")).toHaveTextContent("Plan mode");
   });
 
-  it("places Plan mode to the left of the context ring", () => {
+  it("keeps Plan mode in the tray while the ring sits in the workspace bar", () => {
     useChatStore.setState({ codexPlanMode: true, contextWindow: 100_000, tokensUsed: 25_000 });
     renderComposer({ modelPickerKind: "codex" });
 
     const plan = screen.getByTestId("composer-plan-mode");
     const ring = screen.getByLabelText("25% of context used");
-    expect(plan.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
+    expect(plan.closest('[data-testid="composer-status-line"]')).toBeTruthy();
+    expect(ring.closest('[data-testid="composer-workspace-controls"]')).toBeTruthy();
   });
 
   it("keeps a bound host visible in the shared toolbar without an empty footer", () => {
