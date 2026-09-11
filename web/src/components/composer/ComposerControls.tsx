@@ -15,6 +15,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
@@ -26,6 +27,65 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
       )}
       {...props}
     />
+  );
+}
+
+/** Circumference of the context ring's progress circle (r=5.5). */
+const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
+
+/**
+ * Circular progress ring showing how much context window is used, with the
+ * used percentage beside it. Sits on the right side of the workspace bar and
+ * keeps the bar's neutral gray at every usage level.
+ */
+export function ContextRing({
+  contextWindow,
+  tokensUsed,
+  className,
+}: {
+  contextWindow: number;
+  tokensUsed: number;
+  className?: string;
+}) {
+  const pct = Math.min(tokensUsed / contextWindow, 1);
+  // Arc, %, label, and tooltip all encode context USED: a fresh session
+  // shows an empty ring at 0% and the ring fills as context is consumed.
+  const usedArc = pct * RING_CIRCUMFERENCE;
+  const usedPct = Math.round(pct * 100);
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          className={cn("flex items-center gap-1.5 text-muted-foreground", className)}
+          aria-label={`${usedPct}% of context used`}
+        >
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+            {/* Track */}
+            <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
+            {/* Used arc — skipped at 0, where round linecaps would still paint a dot. */}
+            {usedArc > 0 && (
+              <circle
+                cx="8"
+                cy="8"
+                r="5.5"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeDasharray={`${usedArc} ${RING_CIRCUMFERENCE}`}
+                transform="rotate(-90 8 8)"
+              />
+            )}
+          </svg>
+          <span className="text-xs tabular-nums" aria-hidden="true">
+            {usedPct}%
+          </span>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-44 text-center text-sm">
+        <p className="tabular-nums">{usedPct}% of context used.</p>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
