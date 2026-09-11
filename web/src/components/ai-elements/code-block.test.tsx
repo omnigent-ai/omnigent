@@ -37,7 +37,7 @@ describe("CodeBlock — lazy Shiki highlighting", () => {
 
 describe("CodeBlock — soft wrap", () => {
   it("keeps white-space: pre by default so columns stay aligned", () => {
-    const { container } = render(<CodeBlock code={"a  b  c"} language="text" />);
+    const { container } = render(<CodeBlock code={"a  b  c"} language="json" />);
 
     const pre = container.querySelector("pre");
     expect(pre).toBeTruthy();
@@ -46,7 +46,7 @@ describe("CodeBlock — soft wrap", () => {
 
   it("soft-wraps long lines when wrap is set, so nothing scrolls horizontally", () => {
     const longLine = "x".repeat(2000);
-    const { container } = render(<CodeBlock code={longLine} language="text" wrap />);
+    const { container } = render(<CodeBlock code={longLine} language="json" wrap />);
 
     // whitespace-pre-wrap allows breaking at whitespace; wrap-anywhere adds a
     // break opportunity inside unbroken runs (long paths, hashes, URLs) so a
