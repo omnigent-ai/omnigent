@@ -658,8 +658,32 @@ def build_policy_engine(
         harness = (
             conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
+        # Resolve the actual named provider so sessions on non-default
+        # providers are priced at their configured rate rather than the
+        # harness default's rate. A sub-agent session runs the CHILD spec's
+        # executor, so its auth decides the provider identity.
+        from omnigent.onboarding.detected import effective_config_with_detected
+        from omnigent.spec.types import ProviderAuth
+
+        _executor = child_spec.executor if child_spec is not None else spec.executor
+        _provider_entry = None
+        if (
+            isinstance(_executor.auth, ProviderAuth)
+            and _executor.auth.name
+            and harness is not None
+        ):
+            try:
+                from omnigent.onboarding.provider_config import load_providers
+
+                _providers = load_providers(effective_config_with_detected(provider_config))
+                _provider_entry = _providers.get(_executor.auth.name)
+            except Exception:
+                pass
         token_pricing = fetch_model_pricing_with_provider(
-            initial_model, provider_config=provider_config, harness=harness
+            initial_model,
+            provider_config=provider_config,
+            harness=harness,
+            provider_entry=_provider_entry,
         )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
