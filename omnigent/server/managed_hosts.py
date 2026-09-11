@@ -315,6 +315,9 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # value). ``conversations.workspace`` is overwritten with the CLONED
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
+# Per-session state: a fork never inherits it (the store drops it, and
+# the fork's own launch re-stamps whatever repository it resolves),
+# while an in-place agent switch keeps it — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 
 

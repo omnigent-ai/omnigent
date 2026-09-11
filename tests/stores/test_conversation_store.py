@@ -86,6 +86,28 @@ def test_fork_drops_import_provenance_labels(
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_sandbox_repo_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork must not inherit the repository the source's sandbox was built
+    from: the label is what a sandbox RELAUNCH re-clones, so a clone that
+    asked for an empty sandbox would get the source's repo re-cloned into it
+    on the first relaunch. The fork's own launch re-stamps whatever it
+    resolves."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main", "kept": "yes"},
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert MANAGED_REPO_LABEL_KEY not in fork.labels
+
+
 def test_fork_drops_per_user_pin_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -4976,6 +4998,25 @@ def test_instance_scoped_label_keys_match_harness_constants() -> None:
     # miss means a rename slipped past the store's hard-coded literal.
     assert BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
     assert CODEX_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+
+
+def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:
+    """
+    The store's fork-only denylist matches the server's sandbox-repo key.
+
+    The store hard-codes the repository literal (to avoid importing the
+    server into the persistence layer). If the server renames
+    ``MANAGED_REPO_LABEL_KEY``, the literal in
+    :data:`_FORK_ONLY_DROPPED_LABEL_KEYS` would silently stop matching and
+    a fork would re-inherit the source's repository — a clone that asked
+    for an empty sandbox would get the source's repo re-cloned into it on
+    the first relaunch. Importing the real constant here makes that rename
+    fail loudly at test time.
+    """
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
+
+    assert MANAGED_REPO_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(

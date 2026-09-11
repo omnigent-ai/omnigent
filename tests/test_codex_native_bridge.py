@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -494,37 +495,193 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
     assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
 
 
-def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+def test_prune_orphaned_bridge_dirs_retains_recent_dead_owner_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
-    import os
-    import subprocess
-    import sys
-
-    from omnigent.harnesses.codex_native.bridge import prune_orphaned_bridge_dirs
-
+    """Recent dead-owner bridges remain fully intact during the grace period."""
     root = tmp_path / "codex-native"
     root.mkdir(parents=True)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
 
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
-    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    rollout = (
+        dead_dir
+        / "codex-home"
+        / "sessions"
+        / "2026"
+        / "09"
+        / "09"
+        / "rollout-2026-09-09T00-00-00-thread.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    bridge_config = dead_dir / "bridge.json"
+    bridge_config.write_text("secret", encoding="utf-8")
+    policy_config = dead_dir / "policy_hook.json"
+    policy_config.write_text("secret", encoding="utf-8")
+    ephemeral_dir = dead_dir / "mcp-runtime"
+    ephemeral_dir.mkdir()
+    runtime_token = ephemeral_dir / "token"
+    runtime_token.write_text("secret", encoding="utf-8")
+    os.utime(owner_marker, (now - 60, now - 60))
+
+    def _unexpected_walk(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("recent owner activity should skip rollout scanning")
+
+    monkeypatch.setattr(codex_native_bridge.os, "walk", _unexpected_walk)
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert owner_marker.read_text(encoding="utf-8") == "999999"
+    assert rollout.read_text(encoding="utf-8") == '{"type":"session_meta"}\n'
+    assert bridge_config.read_text(encoding="utf-8") == "secret"
+    assert policy_config.read_text(encoding="utf-8") == "secret"
+    assert runtime_token.read_text(encoding="utf-8") == "secret"
+
+
+def test_prune_orphaned_bridge_dirs_removes_expired_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead-owner bridge inactive for 7 days is removed wholesale."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+
+    dead_dir = root / "deadowner"
+    rollout = (
+        dead_dir
+        / "codex-home"
+        / "sessions"
+        / "2026"
+        / "09"
+        / "09"
+        / "rollout-2026-09-09T00-00-00-thread.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    unrelated_jsonl = rollout.parent / "metadata.jsonl"
+    unrelated_jsonl.write_text('{"recent":true}\n', encoding="utf-8")
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    (dead_dir / "bridge.json").write_text("secret", encoding="utf-8")
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS
+    for activity_path in (owner_marker, rollout):
+        os.utime(activity_path, (expired_at, expired_at))
+    os.utime(unrelated_jsonl, (now - 60, now - 60))
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 1
+    assert not dead_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_uses_latest_rollout_activity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recent rollout keeps a bridge whose launch and owner marker are old."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+
+    dead_dir = root / "deadowner"
+    rollout = (
+        dead_dir
+        / "codex-home"
+        / "sessions"
+        / "2026"
+        / "09"
+        / "09"
+        / "rollout-2026-09-09T00-00-00-thread.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    os.utime(owner_marker, (expired_at, expired_at))
+    os.utime(rollout, (now - 60, now - 60))
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert dead_dir.exists()
+    assert rollout.exists()
+
+
+def test_prune_orphaned_bridge_dirs_retains_bridge_when_rollout_scan_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incomplete rollout scan fails closed instead of deleting the bridge."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+
+    dead_dir = root / "deadowner"
+    sessions_dir = dead_dir / "codex-home" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    os.utime(owner_marker, (expired_at, expired_at))
+
+    def _failed_walk(
+        _root: Path,
+        *,
+        onerror: object,
+    ) -> list[tuple[str, list[str], list[str]]]:
+        assert callable(onerror)
+        onerror(PermissionError("rollout directory unreadable"))
+        return []
+
+    monkeypatch.setattr(codex_native_bridge.os, "walk", _failed_walk)
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert dead_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live-owner and unmarked bridges remain even when old."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda pid: pid == os.getpid())
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    dead_marker = dead_dir / "owner.pid"
+    dead_marker.write_text("999999", encoding="utf-8")
+    os.utime(dead_marker, (expired_at, expired_at))
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
-    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+    live_marker = live_dir / "owner.pid"
+    live_marker.write_text(str(os.getpid()), encoding="utf-8")
+    os.utime(live_marker, (expired_at, expired_at))
 
     unmarked_dir = root / "unmarked"
     unmarked_dir.mkdir()
 
-    pruned = prune_orphaned_bridge_dirs()
-
-    assert pruned == 1
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 1
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
