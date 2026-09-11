@@ -70,6 +70,7 @@ import {
   SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
   startStreamPump,
+  takeFailedSendDraft,
   useChatStore,
   type ConversationState,
   type FrameScheduler,
@@ -13102,5 +13103,39 @@ describe("chatStore — interaction_phase analytics", () => {
         status: "cancelled",
       },
     ]);
+  });
+});
+
+// A failed send hands its text back as the conversation's failedSendDraft,
+// but when the session itself failed to LOAD no composer ever renders to
+// drain it. takeFailedSendDraft is the load-error screen's recovery read.
+describe("takeFailedSendDraft", () => {
+  it("drains the stranded draft for the failed conversation (read-once)", () => {
+    const entry = conversationRegistry.acquire("conv_load_failed");
+    const file = new File(["x"], "notes.txt", { type: "text/plain" });
+    entry.setState({
+      failedSendDraft: {
+        conversationId: "conv_load_failed",
+        text: "prompt stranded by a failed first load",
+        files: [file],
+        stableId: "stable_1",
+      },
+      pendingRetryStableId: "stable_1",
+    });
+
+    expect(takeFailedSendDraft("conv_load_failed")).toEqual({
+      text: "prompt stranded by a failed first load",
+      files: [file],
+    });
+    // Read-once: the entry no longer holds the draft (or its retry id).
+    expect(entry.getState().failedSendDraft).toBeNull();
+    expect(entry.getState().pendingRetryStableId).toBeNull();
+    expect(takeFailedSendDraft("conv_load_failed")).toBeNull();
+  });
+
+  it("returns null when nothing is stranded or the conversation is unknown", () => {
+    conversationRegistry.acquire("conv_clean");
+    expect(takeFailedSendDraft("conv_clean")).toBeNull();
+    expect(takeFailedSendDraft("conv_never_seen")).toBeNull();
   });
 });

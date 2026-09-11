@@ -390,6 +390,29 @@ export function removeLocalConversation(tempConvId: string): boolean {
 }
 
 /**
+ * Drain the first message a failed-to-load conversation stranded.
+ *
+ * A failed send hands its text back as that conversation's
+ * `failedSendDraft`, expecting the in-session composer to drain it — but
+ * when the session's own load fails, the error screen replaces the whole
+ * page and that composer never renders, so the text would be silently
+ * lost. The load-error screen calls this to recover it for the landing
+ * composer instead. Read-once: cleared on read so it can't restore twice.
+ *
+ * @param conversationId The failed conversation's id, e.g. `"conv_abc"`.
+ * @returns The stranded text + attachments, or `null` when none.
+ */
+export function takeFailedSendDraft(
+  conversationId: string,
+): { text: string; files: File[] } | null {
+  const state = setterForState(conversationId);
+  const draft = state?.failedSendDraft ?? null;
+  if (draft === null || draft.conversationId !== conversationId) return null;
+  setterFor(conversationId)({ failedSendDraft: null, pendingRetryStableId: null });
+  return { text: draft.text, files: draft.files };
+}
+
+/**
  * A user message awaiting its `session.input.consumed` event.
  *
  * Inserted by `send` before the POST is awaited so the bubble renders
