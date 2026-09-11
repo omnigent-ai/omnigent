@@ -379,9 +379,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
         assert not (isinstance(ensure_error, dict) and ensure_error.get("code")), (
             f"ensure returned a structured error despite launch recovery: {ensure.text[:500]}"
         )
-        assert (
-            f"Codex terminal ensure failed for session={session_id}" not in _runner_log()
-        ), (
+        assert f"Codex terminal ensure failed for session={session_id}" not in _runner_log(), (
             "ensure path logged a start failure despite the launch having recovered; "
             f"runner log:\n{_runner_log()[-4000:]}"
         )
