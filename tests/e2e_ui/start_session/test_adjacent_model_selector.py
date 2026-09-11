@@ -72,6 +72,21 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
 
             edit = page.get_by_test_id("new-chat-landing-agent-config-ag_claude_e2e")
             await edit.hover()
+            await page.mouse.move(parent_box["x"] + parent_box["width"] / 2, parent_box["y"] + 2)
+            await page.wait_for_timeout(500)
+            await expect(models).to_be_visible()
+            await parent.get_by_role("menuitem", name="Other...", exact=True).hover()
+            await page.wait_for_timeout(500)
+            await expect(models).to_be_visible()
+            await edit.hover()
+            gap_x = (
+                (parent_box["x"] + parent_box["width"] + child_box["x"]) / 2
+                if width == 1600
+                else (child_box["x"] + child_box["width"] + parent_box["x"]) / 2
+            )
+            await page.mouse.move(gap_x, child_box["y"] + 20, steps=20)
+            await page.wait_for_timeout(500)
+            await expect(models).to_be_visible()
             target = models.get_by_role("menuitemcheckbox", name="Sonnet 5", exact=True)
             target_box = await target.bounding_box()
             assert target_box is not None
@@ -81,6 +96,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
                 steps=20,
             )
             await expect(target).to_be_visible()
+            await expect(target).to_have_attribute("data-highlighted", "")
             await page.mouse.click(
                 target_box["x"] + target_box["width"] / 2,
                 target_box["y"] + target_box["height"] / 2,
@@ -92,6 +108,14 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             await page.keyboard.press("Escape")
             await expect(page.get_by_role("menu")).to_have_count(0)
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_focused()
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await harness.click()
+            await expect(models).to_be_visible()
+            await parent.get_by_role("menuitem", name="Other...", exact=True).click()
+            await expect(models).not_to_be_visible()
+            await expect(page.get_by_role("menuitem", name="Create custom agent")).to_be_visible()
+            await page.mouse.click(20, 20)
+            await expect(page.get_by_role("menu")).to_have_count(0)
         finally:
             await context.close()
             await browser.close()

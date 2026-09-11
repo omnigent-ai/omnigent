@@ -1461,7 +1461,7 @@ export function AgentHarnessPicker({
           open={configAgentId === agent.id}
           onOpenChange={(next) => {
             if (next) {
-              if (!active) onSelectAgent(agent);
+              onSelectAgent(agent);
               setConfigAgentId(agent.id);
             } else {
               setConfigAgentId((current) => (current === agent.id ? null : current));
@@ -1481,6 +1481,11 @@ export function AgentHarnessPicker({
             className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] overflow-y-auto p-2"
             sideOffset={16}
             collisionPadding={12}
+            onFocusOutside={(event) => {
+              if (event.target instanceof Element && event.target.getAttribute("role") === "menu") {
+                event.preventDefault();
+              }
+            }}
           >
             {active ? selectedConfigContent : null}
           </DropdownMenuSubContent>
@@ -1643,6 +1648,11 @@ export function AgentHarnessPicker({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align={contentAlign}
+        onPointerMoveCapture={(event) => {
+          if (configAgentId !== null && event.currentTarget.contains(event.target as Node)) {
+            event.preventDefault();
+          }
+        }}
         // Keep the menu inside the viewport on short mobile screens: pad the
         // collision box so the available-height cap leaves room below the
         // status bar, and let it flip/scroll rather than run off the top.

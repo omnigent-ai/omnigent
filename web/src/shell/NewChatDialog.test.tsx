@@ -2092,6 +2092,21 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getAllByRole("menu")).toHaveLength(2);
   });
 
+  it("keeps clicked configuration open when pointer travel focuses the parent menu", () => {
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const parent = screen.getByRole("menu");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.focus(parent);
+    expect(screen.getAllByRole("menu")).toHaveLength(2);
+    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
+    expect(screen.getAllByRole("menu")).toHaveLength(2);
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      /^Claude Code/,
+    );
+  });
+
   it("does not switch harnesses on hover and opens adjacent settings from the keyboard", async () => {
     renderLanding();
     const picker = screen.getByTestId("new-chat-landing-agent-select");
