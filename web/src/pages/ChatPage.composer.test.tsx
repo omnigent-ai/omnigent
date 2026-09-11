@@ -3059,6 +3059,60 @@ describe("Composer config gear", () => {
       );
     });
   });
+
+  // The harness row shows the bound model's catalog name in a fixed-width
+  // column; a long name must ellipsize on one line instead of wrapping and
+  // stretching the row. jsdom does no layout, so pin the CSS contract that
+  // guarantees single-line rendering (`truncate`); the real geometry is
+  // covered by tests/e2e_ui/chat/test_harness_row_model_label_wrap.py.
+  describe("harness row model label", () => {
+    const LONG_LABEL = "Opus in plan mode, else Sonnet";
+    const LONG_LABEL_OPTIONS = [
+      { id: "sonnet-default", displayName: "Sonnet 5", isDefault: true },
+      { id: "opusplan", displayName: LONG_LABEL, isDefault: false },
+    ];
+
+    function renderLongLabelPicker() {
+      useChatStore.setState({ sessionHarness: "claude-native", llmModel: "opusplan" });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            showEffort: true,
+            modelPickerKind: "claude",
+            codexModelOptions: LONG_LABEL_OPTIONS,
+          })}
+        />,
+      );
+      fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+      const row = screen.getByTestId("composer-agent-edit");
+      return within(row).getByText(LONG_LABEL);
+    }
+
+    it("ellipsizes a long model name on one line in the desktop row", () => {
+      const label = renderLongLabelPicker();
+      expect(label).toHaveClass("truncate");
+      expect(label).toHaveClass("min-w-0");
+      expect(label).not.toHaveClass("whitespace-normal");
+      expect(label).not.toHaveClass("break-words");
+    });
+
+    it("ellipsizes a long model name on one line in the mobile row", () => {
+      const originalMatchMedia = window.matchMedia;
+      window.matchMedia = ((query: string) => ({
+        ...originalMatchMedia(query),
+        matches: query.includes("max-width"),
+      })) as typeof window.matchMedia;
+      try {
+        const label = renderLongLabelPicker();
+        expect(label).toHaveClass("truncate");
+        expect(label).not.toHaveClass("whitespace-normal");
+        expect(label).not.toHaveClass("break-words");
+      } finally {
+        window.matchMedia = originalMatchMedia;
+      }
+    });
+  });
 });
 
 // The gear modal's "Subagent routing" row — the only in-session routing control,
