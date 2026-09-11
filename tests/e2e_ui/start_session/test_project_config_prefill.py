@@ -337,8 +337,8 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
 
             # The host chip shows the sandbox — proof the stored sandbox default
             # was honored rather than dropped for a connected host.
-            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
-                "Sandbox", timeout=15_000
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_have_attribute(
+                "aria-label", re.compile(re.escape("Sandbox")), timeout=15_000
             )
 
             await page.get_by_test_id("new-chat-landing-input").fill("start here")

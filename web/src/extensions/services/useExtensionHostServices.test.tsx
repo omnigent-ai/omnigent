@@ -151,7 +151,7 @@ describe("useExtensionHostServices", () => {
     });
   });
 
-  it("serves the initial canvas data from the live shell caches", async () => {
+  it("exposes a cached preview separately from canonical session pages", async () => {
     queryClient.setQueryData(["conversations", "", true], {
       pages: [
         {
@@ -188,11 +188,9 @@ describe("useExtensionHostServices", () => {
       wrapper,
     });
 
-    expect(result.current.methods["sessions.listPage"]?.({}, signal())).toMatchObject({
-      sessions: [{ id: "conv_cached", title: "Cached" }],
-      nextCursor: "conv_cached",
-      hasMore: true,
-    });
+    expect(result.current.methods["sessions.getCached"]?.({}, signal())).toMatchObject([
+      { id: "conv_cached", title: "Cached" },
+    ]);
     expect(result.current.methods["projects.list"]?.({}, signal())).toEqual([
       { id: "proj_1", name: "Alpha", icon: "🅰️" },
     ]);
@@ -200,6 +198,62 @@ describe("useExtensionHostServices", () => {
 
     await result.current.methods["sessions.listPage"]?.({}, signal());
     expect(authenticatedFetchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])(
+    "paginates from the server when a cache with has_more=%s has gaps",
+    async (hasMore) => {
+      const rows = ["a", "b", "c", "d"].map((id, index) => ({
+        id,
+        title: id,
+        status: "idle",
+        created_at: 1,
+        updated_at: 4 - index,
+      }));
+      queryClient.setQueryData(["conversations", "", true], {
+        pages: [{ data: [rows[0], rows[3]], has_more: hasMore, last_id: "d" }],
+        pageParams: [undefined],
+      });
+      authenticatedFetchMock.mockImplementation(async (url: string) => {
+        const after = new URL(url, "http://localhost").searchParams.get("after");
+        const start = after ? rows.findIndex((row) => row.id === after) + 1 : 0;
+        const data = rows.slice(start, start + 2);
+        return new Response(
+          JSON.stringify({
+            data,
+            has_more: start + data.length < rows.length,
+            last_id: data.at(-1)?.id ?? null,
+          }),
+        );
+      });
+      const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+
+      expect(
+        await result.current.methods["sessions.listPage"]?.({ limit: 2 }, signal()),
+      ).toMatchObject({
+        sessions: [{ id: "a" }, { id: "b" }],
+        nextCursor: "b",
+        hasMore: true,
+      });
+      expect(
+        await result.current.methods["sessions.listPage"]?.({ after: "b", limit: 2 }, signal()),
+      ).toMatchObject({
+        sessions: [{ id: "c" }, { id: "d" }],
+        nextCursor: null,
+        hasMore: false,
+      });
+      expect(authenticatedFetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("does not read the cache after cancellation", () => {
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+    const controller = new AbortController();
+    controller.abort();
+    expect(() => result.current.methods["sessions.getCached"]?.({}, controller.signal)).toThrow(
+      "Host operation cancelled",
+    );
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 
   it("opens a project-scoped new session by resolving the project name", async () => {
@@ -345,6 +399,7 @@ describe("useExtensionHostServices", () => {
     const existing = { ...extension, permissions: ["navigation", "storage.user"] };
     const { result } = renderHook(() => useExtensionHostServices(existing), { wrapper });
 
+    expect(result.current.methods["sessions.getCached"]).toBeUndefined();
     expect(result.current.methods["sessions.listPage"]).toBeUndefined();
     expect(result.current.methods["projects.list"]).toBeUndefined();
     expect(result.current.methods["projects.create"]).toBeUndefined();

@@ -155,6 +155,15 @@ class Conversation:
         allowlisted ``args.harness`` (gated by the sub-agent spec's
         ``executor.config.allowed_harnesses``); that value is set on the
         child's own row, not inherited.
+    :param share_workspace_files: Whether the owner opted into letting
+        people with *view* (read-only) access browse the session's
+        workspace files — the Files/Changes/GitHub-diff surfaces and the
+        file contents behind them. ``False`` (the default) keeps those
+        surfaces edit-only, so a plain read grant shares the conversation
+        without exposing the workspace (which routinely holds secrets like
+        ``.env`` / key files). Set from the share dialog (manage-gated) via
+        ``PATCH /v1/sessions/{id}``; never widens absolute-path browsing,
+        which stays owner-only. See ``designs/SESSIONS_AUTH.md``.
     :param sub_agent_name: For sub-agent sessions (``kind="sub_agent"``),
         the sub-agent type name within the parent's spec tree,
         e.g. ``"summarizer"``. The runner uses this to resolve the
@@ -237,6 +246,7 @@ class Conversation:
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    share_workspace_files: bool = False
     sub_agent_name: str | None = None
     task_summary: str | None = None
     external_session_id: str | None = None
@@ -248,9 +258,13 @@ class Conversation:
     # so any replica's session list can serve them. ``live_status`` is the
     # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",
     # None = never reported); ``pending_elicitation_count`` is the
-    # outstanding approval-prompt count (None = never written).
+    # outstanding approval-prompt count (None = never written);
+    # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
+    # seconds, None = no live stamp) — carried on the row so a session list
+    # can judge runner liveness without a second connectivity query.
     live_status: str | None = None
     pending_elicitation_count: int | None = None
+    runner_last_seen: int | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
@@ -470,6 +484,10 @@ class CompactionData(BaseModel):
         e.g. ``"openai/gpt-4o"``.
     :param token_count: Approximate token count of the summary
         text, for budget tracking, e.g. ``342``.
+    :param window_id: Opaque vendor compaction-window identifier. Current
+        Codex writes a UUID string to ``payload.window_id`` on its
+        ``type == "compacted"`` rollout JSONL record; older Codex rollouts
+        used integer counters there.
     """
 
     summary: str
@@ -477,7 +495,7 @@ class CompactionData(BaseModel):
     model: str | None = None
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
-    window_id: int | None = None
+    window_id: int | str | None = None
 
     @field_validator("compacted_messages")
     @classmethod
@@ -793,6 +811,13 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
+    # Deterministic item id for idempotent appends. When set, the store uses
+    # it as the item's id and treats an already-persisted item with this id
+    # as the append's result instead of inserting a duplicate — the retry
+    # contract for at-least-once producers (a transcript forwarder cannot
+    # know whether a timed-out POST committed). Same 32-hex shape the store
+    # mints itself; ``None`` keeps the store-assigned random id.
+    stable_id: str | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -803,6 +828,8 @@ class NewConversationItem(BaseModel):
         :raises ValueError: If ``type`` does not match ``data``.
         """
         _validate_type_matches_data(self.type, self.data)
+        if self.stable_id is not None and not re.fullmatch(r"[0-9a-f]{32}", self.stable_id):
+            raise ValueError("stable_id must be a 32-char lowercase hex string")
         return self
 
 
@@ -829,6 +856,10 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    # In-process signal only (excluded from every dump / API shape): ``True``
+    # when an idempotent append found this item already persisted under its
+    # ``stable_id``, so the caller can skip a duplicate's side effects.
+    deduplicated: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:

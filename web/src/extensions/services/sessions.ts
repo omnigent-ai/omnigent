@@ -141,10 +141,10 @@ function projectSession(value: unknown): ExtensionSessionSummary {
   };
 }
 
-export function cachedInitialSessionPage(
+export function cachedSessionSummaries(
   queryClient: QueryClient,
   params: unknown,
-): ExtensionSessionPage | null {
+): ExtensionSessionSummary[] | null {
   const request = parseSessionPageRequest(params);
   if (request.after !== null) return null;
   const cached = queryClient.getQueryData<InfiniteData<ConversationsPage, string | undefined>>([
@@ -156,18 +156,15 @@ export function cachedInitialSessionPage(
   const rows = cached.pages
     .flatMap((page) => page.data)
     .filter((session) => session.archived !== true && session.parent_session_id == null);
-  const selected = rows.slice(0, request.limit);
-  const cacheHasMore = rows.length > request.limit || cached.pages.at(-1)?.has_more === true;
-  if (cacheHasMore && selected.length === 0) return null;
+  const selected = [...new Map(rows.map((row) => [row.id, row])).values()].slice(0, request.limit);
   try {
     return projectSessionPage(
       {
         data: selected,
-        has_more: cacheHasMore,
-        last_id: cacheHasMore ? selected.at(-1)?.id : null,
+        has_more: false,
       },
       request.limit,
-    );
+    ).sessions;
   } catch {
     return null;
   }

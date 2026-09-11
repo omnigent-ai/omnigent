@@ -301,6 +301,120 @@
   line-height: 20px;
 }
 
+.composer-add-menu,
+.composer-host-menu {
+  background-color: #fff;
+  background-image: none;
+}
+
+.composer-add-menu {
+  border-color: #e4e4e7;
+  box-shadow: 0 0 20px -6px rgb(0 0 0 / 12%);
+}
+
+.composer-host-menu {
+  box-shadow: 0 2px 16px rgb(0 0 0 / 12%);
+}
+
+.dark :is(.composer-add-menu, .composer-host-menu) {
+  --muted: rgb(248 248 248 / 12.7333%);
+  --muted-foreground: rgb(245 245 244 / 56%);
+  background-color: rgb(31 31 33 / 60%);
+  border-color: rgb(255 255 255 / 8%);
+  backdrop-filter: blur(24px) saturate(120%);
+}
+
+.dark .composer-add-menu {
+  box-shadow: 0 0 14px -8px rgb(0 0 0 / 90%);
+}
+
+.dark .composer-host-menu {
+  box-shadow: 0 2px 16px rgb(0 0 0 / 35%);
+}
+
+.composer-add-menu [role="menuitem"] {
+  min-height: 24px;
+  gap: 8px;
+  border-radius: 8px;
+  padding: 2px 6px;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.composer-host-menu [role="menuitem"] {
+  min-height: 28px;
+  gap: 4px;
+  border-radius: 8px;
+  padding: 4px 12px 4px 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.composer-host-menu [role="menuitem"] [class~="text-sm"] {
+  font-size: inherit;
+}
+
+:is(.composer-add-menu, .composer-host-menu) [data-active="true"] {
+  background-color: var(--muted);
+  font-weight: 500;
+}
+
+:is(.composer-add-menu, .composer-host-menu) [data-highlighted] {
+  background-color: var(--muted);
+}
+
+:is(.composer-add-menu, .composer-host-menu) [data-highlighted] svg {
+  color: var(--foreground);
+}
+
+.composer-host-menu [role="menuitem"].composer-host-connect {
+  gap: 8px;
+  padding-right: 8px;
+}
+
+.composer-host-menu [role="separator"] {
+  margin: 4px 0;
+}
+
+.composer-agent-menu :is([role="menuitem"], [role="menuitemcheckbox"]) {
+  min-height: 32px;
+  align-items: center;
+  gap: 8px;
+  border-radius: 8px;
+  padding: 4px 12px 4px 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.composer-agent-menu [role="menuitem"].composer-agent-row {
+  gap: 4px;
+  padding: 0 12px 0 0;
+}
+
+.composer-agent-menu [role="menuitemcheckbox"] {
+  padding-right: 32px;
+}
+
+.composer-agent-config-menu :is([role="menuitem"], [role="menuitemcheckbox"]) {
+  min-height: 28px;
+}
+
+.composer-agent-menu [role="menuitem"] > svg:last-child {
+  margin-left: 0;
+}
+
+.composer-reference-surface {
+  border-color: color(srgb 0.129412 0 0.0509804 / 0.1);
+  background-color: rgba(255, 255, 255, 0.8);
+  background-image: none;
+}
+
+.dark .composer-reference-surface {
+  border-width: 0.5px;
+  border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
 .ui-icon {
   box-sizing: border-box;

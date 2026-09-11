@@ -4,7 +4,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { isExtensionSessionPageWithinBudget } from "../rpc/validation";
 import { ExtensionHostServiceError } from "./errors";
 import {
-  cachedInitialSessionPage,
+  cachedSessionSummaries,
   listSessionPage,
   parseSessionPageRequest,
   SessionReadLimiter,
@@ -191,8 +191,8 @@ describe("projectSessionPage", () => {
   });
 });
 
-describe("cachedInitialSessionPage", () => {
-  it("projects a first page from the live sidebar cache", () => {
+describe("cachedSessionSummaries", () => {
+  it("projects a deduplicated preview without pagination metadata", () => {
     const queryClient = new QueryClient();
     queryClient.setQueryData(["conversations", "", true], {
       pages: [
@@ -201,6 +201,7 @@ describe("cachedInitialSessionPage", () => {
             wireRow,
             { ...wireRow, id: "archived", archived: true },
             { ...wireRow, id: "child", parent_session_id: "conv_1" },
+            wireRow,
             { ...wireRow, id: "conv_2", title: "Session two" },
           ],
           has_more: true,
@@ -210,17 +211,27 @@ describe("cachedInitialSessionPage", () => {
       pageParams: [undefined],
     });
 
-    expect(cachedInitialSessionPage(queryClient, { limit: 2 })).toMatchObject({
-      sessions: [{ id: "conv_1" }, { id: "conv_2" }],
-      nextCursor: "conv_2",
-      hasMore: true,
-    });
+    expect(cachedSessionSummaries(queryClient, { limit: 2 })).toMatchObject([
+      { id: "conv_1" },
+      { id: "conv_2" },
+    ]);
+    expect(cachedSessionSummaries(queryClient, { limit: 1 })).toHaveLength(1);
     expect(
-      cachedInitialSessionPage(queryClient, {
+      cachedSessionSummaries(queryClient, {
         after: "conv_2",
         limit: 2,
       }),
     ).toBeNull();
+  });
+
+  it("treats an absent or malformed preview as unavailable", () => {
+    const queryClient = new QueryClient();
+    expect(cachedSessionSummaries(queryClient, {})).toBeNull();
+    queryClient.setQueryData(["conversations", "", true], {
+      pages: [{ data: [{ ...wireRow, status: "invalid" }], has_more: false }],
+      pageParams: [undefined],
+    });
+    expect(cachedSessionSummaries(queryClient, {})).toBeNull();
   });
 });
 

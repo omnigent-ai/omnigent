@@ -54,7 +54,7 @@ Available V1 methods:
   such as a pull request) with the `navigation` permission;
 - `theme.getCurrent` and `theme.subscribe`;
 - `storage.user.get`, `set`, and `delete` with the `storage.user` permission;
-- `sessions.listPage`, the SDK's `sessions.listAll` helper, and
+- `sessions.getCached`, `sessions.listPage`, the SDK's `sessions.listAll` helper, and
   `sessions.pullRequest` (the PR filed from a session's branch, via the same
   GitHub lookup as the shell's GitHub tab) with the `sessions.read` permission;
 - `projects.list` with the `projects.read` permission and `projects.create`
@@ -71,6 +71,13 @@ directory, worktree branch, project ID, and created/updated timestamps. Pages de
 1,000; the host shortens unusually large pages to stay within the RPC response budget. The SDK drains at most
 200 pages or 5,000 sessions. Extensions receive neither raw
 authenticated fetch nor the internal session WebSocket.
+
+`sessions.listPage` always reads canonical server pages. For an immediate preview,
+hosts advertising the `sessions.getCached` capability return an optional array of
+cached summaries (or `null` when unavailable), with the same `limit` bounds.
+The preview may be incomplete, stale, or out of order and has no pagination cursor.
+Display it while loading, start `listPage` with no `after` cursor, and merge fetched
+rows by ID. Once pagination completes, discard preview-only rows.
 
 The projects API returns the current user's projects as ID, name, and icon.
 `projects.create` makes an empty project from a trimmed name of at most 100

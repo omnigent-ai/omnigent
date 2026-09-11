@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.claude_model_vocabulary import (
+from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     claude_model_command_arg,
     model_vocabulary_env,
     normalized_model_id,
+    prefix_folded_model_id,
     served_alias_pins,
     served_canonical_overrides,
 )
@@ -153,9 +154,17 @@ def test_normalized_model_id_strips_prefix_and_context_suffix() -> None:
     assert normalized_model_id("Claude-Opus-4-8[1M]") == "claude-opus-4-8"
 
 
+def test_prefix_fold_strips_the_namespace_but_keeps_the_context_marker() -> None:
+    """The ``[1m]`` marker denotes a distinct request, so only the prefix folds."""
+    assert prefix_folded_model_id("system.ai.claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
+    assert prefix_folded_model_id("databricks-claude-sonnet-5") == "claude-sonnet-5"
+    assert prefix_folded_model_id("Claude-Opus-4-8[1M]") == "claude-opus-4-8[1m]"
+    assert prefix_folded_model_id("claude-haiku-4-5") == "claude-haiku-4-5"
+
+
 def test_catalog_prefixes_match_the_routing_defaults() -> None:
     """This module duplicates the prefix list to stay stdlib-only; keep it equal."""
-    from omnigent.claude_model_vocabulary import _CATALOG_PREFIXES
+    from omnigent.models.claude_model_vocabulary import _CATALOG_PREFIXES
     from omnigent.server.smart_routing import MODEL_ID_PREFIXES
 
     assert _CATALOG_PREFIXES == MODEL_ID_PREFIXES

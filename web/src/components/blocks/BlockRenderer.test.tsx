@@ -467,6 +467,49 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("All done here.")).toBeDefined();
     });
 
+    it("starts a response containing a user interjection expanded", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "No conflict.", final: true },
+        tool(2, "Bash"),
+        { kind: "text", itemId: "m2", text: "Merged.", final: true },
+      ];
+      render(<BlockRenderer items={items} sessionStatus="idle" defaultExpanded />);
+
+      const fold = screen.getByRole("button", { name: "Worked" });
+      expect(fold).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByText("Checking.")).toBeDefined();
+      expect(screen.getByText("No conflict.")).toBeDefined();
+      expect(screen.getByText("Merged.")).toBeDefined();
+
+      fireEvent.click(fold);
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      expect(screen.queryByText("No conflict.")).toBeNull();
+      expect(screen.getByText("Merged.")).toBeDefined();
+    });
+
+    it("honors late interjection detection without overriding a user collapse", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "No conflict.", final: true },
+        tool(2, "Bash"),
+        { kind: "text", itemId: "m2", text: "Merged.", final: true },
+      ];
+      const view = render(<BlockRenderer items={items} sessionStatus="idle" />);
+      const fold = screen.getByRole("button", { name: "Worked" });
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+
+      view.rerender(<BlockRenderer items={items} sessionStatus="idle" defaultExpanded />);
+      expect(fold).toHaveAttribute("aria-expanded", "true");
+
+      fireEvent.click(fold);
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      view.rerender(<BlockRenderer items={items} sessionStatus="idle" defaultExpanded />);
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+    });
+
     it("labels the Worked row with the turn duration when provided", () => {
       const items: RenderItem[] = [
         tool(1),

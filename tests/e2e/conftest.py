@@ -290,22 +290,15 @@ def using_mock_llm(request: pytest.FixtureRequest) -> bool:
     return request.config.getoption("--llm-api-key") is None
 
 
-@pytest.fixture(scope="session")
-def mock_llm_server_url(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[str]:
+def _mock_llm_server_process(log_dir: Path) -> Iterator[str]:
     """
-    Start a mock LLM server for the test session.
+    Run a mock gateway with its own response queues and request ledger.
 
-    Always started regardless of ``--llm-api-key`` so mock-only
-    e2e tests run alongside real-LLM tests in the same session.
-    The mock server is a lightweight FastAPI/uvicorn subprocess.
-
-    :param tmp_path_factory: Pytest temp path factory for logs.
+    :param log_dir: Existing directory for the subprocess log.
     :returns: The mock server base URL.
     """
     mock_port = find_free_port()
-    mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
+    mock_log = log_dir / "mock_llm.log"
     log_handle = open(mock_log, "w")  # noqa: SIM115
 
     proc = subprocess.Popen(
@@ -349,6 +342,28 @@ def mock_llm_server_url(
             proc.kill()
             proc.wait(timeout=5)
         log_handle.close()
+
+
+@pytest.fixture(scope="session")
+def mock_llm_server_url(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """
+    Start a mock LLM server for the test session.
+
+    Always started regardless of ``--llm-api-key`` so mock-only
+    e2e tests run alongside real-LLM tests in the same session.
+
+    :param tmp_path_factory: Pytest temp path factory for logs.
+    :returns: The mock server base URL.
+    """
+    yield from _mock_llm_server_process(tmp_path_factory.mktemp("mock_llm_logs"))
+
+
+@pytest.fixture
+def isolated_mock_llm_server_url(tmp_path: Path) -> Iterator[str]:
+    """Give one test a gateway whose request ledger cannot receive earlier tests' calls."""
+    yield from _mock_llm_server_process(tmp_path)
 
 
 def configure_mock_llm(

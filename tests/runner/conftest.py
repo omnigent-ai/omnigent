@@ -14,7 +14,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import claude_native, codex_native_app_server
+from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
@@ -28,6 +29,7 @@ from tests.runner.helpers import NullServerClient
 REAL_CLAUDE_LAUNCH_CATALOG = claude_native.claude_launch_catalog
 REAL_CLAUDE_REPROBED_LAUNCH_CATALOG = claude_native.claude_reprobed_launch_catalog
 REAL_CODEX_LAUNCH_CATALOG = codex_native_app_server.codex_launch_catalog
+REAL_CODEX_REPROBED_LAUNCH_CATALOG = codex_native_app_server.codex_reprobed_launch_catalog
 
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,14 +50,21 @@ def _isolated_model_catalog_store(
     explicitly.
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
-    monkeypatch.setattr("omnigent.model_catalog_store._data_dir", lambda: store_dir)
+    monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)
 
     async def _no_catalog(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _no_catalog)
-    monkeypatch.setattr("omnigent.claude_native.claude_reprobed_launch_catalog", _no_catalog)
-    monkeypatch.setattr("omnigent.codex_native_app_server.codex_launch_catalog", _no_catalog)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _no_catalog)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_reprobed_launch_catalog", _no_catalog
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.codex_launch_catalog", _no_catalog
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.codex_reprobed_launch_catalog", _no_catalog
+    )
 
 
 @pytest.fixture(autouse=True)

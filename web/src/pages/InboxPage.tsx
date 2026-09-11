@@ -334,6 +334,7 @@ export function InboxPage() {
                   exitPlanMode={item.elicitation.exitPlanMode}
                   codexCommand={item.elicitation.codexCommand}
                   allowAllEdits={item.elicitation.allowAllEdits}
+                  allowAutoMode={item.elicitation.allowAutoMode}
                   rememberScope={item.elicitation.rememberScope}
                   codexPersistModes={item.elicitation.codexPersistModes}
                   onSubmit={makeSubmit(item)}

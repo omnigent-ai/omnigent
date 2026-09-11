@@ -58,6 +58,9 @@ class EffortFamily(str, Enum):
     GEMINI = "gemini"
     COPILOT = "copilot"
     PI = "pi"
+    # The real codex process is the per-model authority on reasoning levels
+    # (Sol reaches ``ultra``); the SDK codex wire caps at ``xhigh``.
+    CODEX_NATIVE = "codex-native"
 
 
 class ModelFamily(str, Enum):

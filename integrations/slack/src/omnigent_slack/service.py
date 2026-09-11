@@ -461,6 +461,10 @@ class SlackOmnigentService:
                         owner_user_id=record.owner_user_id or requester,
                         workspace=record.workspace,
                         host_id=record.host_id,
+                        # From the SESSION, not the user's current config: a
+                        # thread keeps running where it was created even if the
+                        # user re-runs setup and switches host type.
+                        host_type=record.host_type,
                     )
                 )
                 spawned = True
@@ -494,6 +498,7 @@ class SlackOmnigentService:
                     owner_user_id=requester,
                     workspace=config.workspace,
                     host_id=config.host_id,
+                    host_type=config.host_type,
                 )
             )
             spawned = True
@@ -628,6 +633,23 @@ class SlackOmnigentService:
         except Exception:
             self._logger.warning("Failed to deliver re-login prompt thread=%s", turn.key.display())
 
+    async def _discard_unlaunched_session(
+        self, omnigent: OmnigentClient, session_id: str, turn: SlackTurn
+    ) -> None:
+        """Best-effort delete of a session whose runner launch failed.
+
+        A delete failure is logged and swallowed: the user's launch-failure
+        message must still be delivered.
+        """
+        try:
+            await omnigent.delete_session(session_id)
+        except Exception:
+            self._logger.warning(
+                "Failed to delete unlaunched session session_id=%s thread=%s",
+                session_id,
+                turn.key.display(),
+            )
+
     async def _ensure_session(self, turn: SlackTurn, omnigent: OmnigentClient) -> str | None:
         """Return the session id for this turn, creating one if needed.
 
@@ -651,10 +673,31 @@ class SlackOmnigentService:
             return None
 
         try:
-            session_id = await omnigent.create_session(turn.agent_id, turn.title)
-            runner_id = await omnigent.launch_runner(
-                session_id, workspace=turn.workspace or "", host_id=turn.host_id
+            session_id = await omnigent.create_session(
+                turn.agent_id, turn.title, host_type=turn.host_type
             )
+            runner_id: str | None = None
+            if turn.host_type == "managed":
+                # The server provisions this session's sandbox in the background,
+                # so there is no host to launch a runner on — and none is needed:
+                # the server holds the first message until the launch settles.
+                self._logger.info(
+                    "Managed session; the server provisions its host thread=%s session_id=%s",
+                    turn.key.display(),
+                    session_id,
+                )
+            else:
+                try:
+                    runner_id = await omnigent.launch_runner(
+                        session_id, workspace=turn.workspace or "", host_id=turn.host_id
+                    )
+                except Exception:
+                    # The binding write below never runs when the launch fails,
+                    # so nothing could find this session again — delete it
+                    # rather than strand it on the server (a retry creates a
+                    # fresh one).
+                    await self._discard_unlaunched_session(omnigent, session_id, turn)
+                    raise
         except AuthRequiredError as exc:
             # Expired/lost token: DM a re-login button rather than a plain notice.
             self._logger.info(
@@ -693,6 +736,7 @@ class SlackOmnigentService:
             owner_user_id=turn.owner_user_id,
             host_id=turn.host_id,
             workspace=turn.workspace,
+            host_type=turn.host_type,
         )
         self._logger.info(
             "Mapped Slack thread to new Omnigent session thread=%s session_id=%s runner_id=%s",
@@ -749,7 +793,11 @@ class SlackOmnigentService:
             # idle windows (a timeout must NOT cancel it — that would end the
             # generator); we re-await it next window.
             events = omnigent.run_turn(
-                session_id, turn.text, workspace=turn.workspace, host_id=turn.host_id
+                session_id,
+                turn.text,
+                workspace=turn.workspace,
+                host_id=turn.host_id,
+                host_type=turn.host_type,
             ).__aiter__()
             pending: asyncio.Task[dict[str, Any]] | None = None
             try:
@@ -885,6 +933,10 @@ class SlackOmnigentService:
 
         item_text = extract_assistant_text(event)
         if item_text:
+            # ``response.output_item.done`` for an assistant message: it committed.
+            # For an id-less harness (claude-sdk) that is the only signal the
+            # message ended, so the next delta gets a break instead of running on.
+            reply.mark_message_end()
             reply.set_final(item_text)
 
         event_error = extract_error_text(event)
