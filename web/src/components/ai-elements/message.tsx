@@ -534,7 +534,14 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
       ? createPortal(
           <div
             className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 backdrop-blur-sm"
-            onClick={close}
+            // Close on a click that lands on the backdrop or the padding around
+            // the diagram, but not one that bubbles up from the diagram itself —
+            // hence the `target === currentTarget` gate on both this backdrop and
+            // the inner wrapper (which must stay size-full so the SVG's own
+            // width="100%" resolves against a real box rather than collapsing).
+            onClick={(e) => {
+              if (e.target === e.currentTarget) close();
+            }}
             role="presentation"
           >
             <Button
@@ -552,7 +559,9 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
               className="flex size-full items-center justify-center p-8 [&>svg]:h-auto [&>svg]:max-h-full [&>svg]:w-auto [&>svg]:max-w-full"
               // The cloned SVG is Mermaid's own trusted, already-sanitized render.
               dangerouslySetInnerHTML={{ __html: svgMarkup }}
-              onClick={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                if (e.target === e.currentTarget) close();
+              }}
               role="presentation"
             />
           </div>,
