@@ -153,6 +153,9 @@ export const ComposerHarnessTrigger = forwardRef<
     pending?: boolean;
     effort?: string;
     icon?: ReactNode;
+    /** Ellipsize the model label on one line under flex pressure (no fixed
+     * width cap) instead of wrapping it onto extra lines. */
+    truncateLabel?: boolean;
     testIdPrefix?: string;
     labelClassName?: string;
   }
@@ -163,6 +166,7 @@ export const ComposerHarnessTrigger = forwardRef<
     effort,
     icon,
     pending = false,
+    truncateLabel = false,
     testIdPrefix = "composer",
     labelClassName,
     className,
@@ -192,12 +196,19 @@ export const ComposerHarnessTrigger = forwardRef<
         />
       )}
       <span
-        className={cn("inline-flex min-w-0 flex-wrap items-baseline gap-1", labelClassName)}
+        className={cn(
+          "inline-flex min-w-0 items-baseline gap-1",
+          !truncateLabel && "flex-wrap",
+          labelClassName,
+        )}
         data-testid={`${testIdPrefix}-agent-config-value`}
       >
         {model && (
           <span
-            className="min-w-0 whitespace-normal break-words text-left text-ui font-medium text-foreground"
+            className={cn(
+              "min-w-0 text-left text-ui font-medium text-foreground",
+              truncateLabel ? "truncate" : "whitespace-normal break-words",
+            )}
             data-testid={`${testIdPrefix}-agent-model-value`}
           >
             {model}

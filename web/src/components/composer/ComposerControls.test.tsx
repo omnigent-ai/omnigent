@@ -43,6 +43,24 @@ describe("shared composer controls", () => {
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
   });
 
+  it("ellipsizes the session-composer model label on one line when asked", () => {
+    render(
+      <ComposerHarnessTrigger
+        label="Configure session"
+        model="Fable 5.1 (1M context)"
+        effort="High"
+        truncateLabel
+      />,
+    );
+    // Truncate engages only under flex pressure: no fixed width cap returns.
+    const trigger = screen.getByRole("button", { name: "Configure session" });
+    expect(trigger).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
+    const value = screen.getByTestId("composer-agent-config-value");
+    expect(value).not.toHaveClass("flex-wrap");
+    expect(screen.getByTestId("composer-agent-model-value")).toHaveClass("min-w-0", "truncate");
+    expect(screen.getByTestId("composer-agent-effort-value")).toHaveClass("shrink-0");
+  });
+
   it("dispatches permission selections through the caller's handler", () => {
     const onSelect = vi.fn();
     render(
