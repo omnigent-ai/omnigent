@@ -358,7 +358,7 @@ async def _recover_retry_session(
             require_success=True,
         )
 
-    if _is_native_terminal_session(conv):
+    if await asyncio.to_thread(_is_native_terminal_session, conv):
         if not terminal_ready_from_init:
             terminal_outcome = await _ensure_native_terminal_ready(
                 runner_client,
@@ -1230,7 +1230,9 @@ def register_events_routes(
             # session (runner_asleep / host_asleep) should wake and compact
             # just like sending a message does, so relaunch the runner the same
             # way the message-dispatch path does, then retry the forward once.
-            if runner_result is None and _is_native_terminal_session(conv):
+            if runner_result is None and await asyncio.to_thread(
+                _is_native_terminal_session, conv
+            ):
                 conv, woke_client = await _wake_bound_runner_for_control(conv)
                 if woke_client is not None:
                     # Same TUI-inject budget as the initial forward: a
@@ -1778,7 +1780,9 @@ def register_events_routes(
                 # the runner must initialize the child's terminal session.
                 # For SDK/non-native sub-agents the parent runner already
                 # holds the child's state — no re-initialization needed.
-                _runner_needs_session_init = _is_native_terminal_session(conv)
+                _runner_needs_session_init = await asyncio.to_thread(
+                    _is_native_terminal_session, conv
+                )
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = cast(
@@ -1936,7 +1940,9 @@ def register_events_routes(
             # harness). Other event types and non-native sessions still
             # raise: their message would replay to a relaunched runner, so
             # persisting now WOULD desync the store from harness state.
-            if body.type == "message" and _is_native_terminal_session(conv):
+            if body.type == "message" and await asyncio.to_thread(
+                _is_native_terminal_session, conv
+            ):
                 exit_cause = (
                     runner_exit_reports.get(conv.runner_id)
                     if runner_exit_reports is not None and conv.runner_id is not None

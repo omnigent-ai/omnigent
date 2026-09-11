@@ -301,6 +301,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_declared_subagent,
     _require_external_status_forward,
     _resolve_harness,
+    _resolve_harness_async,
     _resolve_llm_model,
     _resolve_subagent_spec,
     _resource_event_item_from_sse,
@@ -4128,7 +4129,7 @@ async def _ensure_native_terminal_ready(
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
     """
-    display_name, _, harness = _native_terminal_runtime(conv)
+    display_name, _, harness = await asyncio.to_thread(_native_terminal_runtime, conv)
     terminal_name = _native_terminal_name_for_harness(harness)
     try:
         resp = await runner_client.post(
@@ -4478,8 +4479,13 @@ async def _forward_native_terminal_message(
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
-    display_name, _, harness = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
+    display_name, _, harness = await asyncio.to_thread(_native_terminal_runtime, conv)
+    event = await asyncio.to_thread(
+        _build_native_terminal_message_event,
+        conv,
+        body,
+        model_override=model_override,
+    )
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
         display_name,
@@ -4833,7 +4839,7 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
-def _native_pane_harness(conv: Conversation) -> str | None:
+async def _native_pane_harness(conv: Conversation) -> str | None:
     """The native harness a pane actually runs, past the ``"auto"`` sentinel.
 
     A forced-auto child keeps ``harness_override="auto"`` until its first
@@ -4846,10 +4852,10 @@ def _native_pane_harness(conv: Conversation) -> str | None:
     :returns: The canonical native harness, e.g. ``"claude-native"``, or
         ``None`` when it cannot be resolved.
     """
-    harness = _resolve_harness(conv)
+    harness = await _resolve_harness_async(conv)
     if harness is not None and harness != "auto":
         return harness
-    native = _native_coding_agent_for_session(conv)
+    native = await asyncio.to_thread(_native_coding_agent_for_session, conv)
     return native.harness if native is not None else harness
 
 
@@ -5336,7 +5342,7 @@ async def _forward_event_to_runner(
                 # brain's claude family and a claude worker the codex family;
                 # under an auto parent it dropped the restriction entirely, so
                 # a pi child could be handed a codex verdict it then ran pi on.
-                _child_harness = _resolve_harness(conv)
+                _child_harness = await _resolve_harness_async(conv)
                 _child_pinned = _child_harness is not None and _child_harness != "auto"
                 _child_family = harness_family(_child_harness) if _child_pinned else None
                 # A single-harness candidate set is the honest offer for a
@@ -5408,7 +5414,7 @@ async def _forward_event_to_runner(
                 # Top-level sessions: model-only routing (harness already fixed by spec).
                 from omnigent.server.smart_routing import route_turn_or_decline
 
-                _harness = _resolve_harness(conv)
+                _harness = await _resolve_harness_async(conv)
                 # A turn cannot change harness, so only this session's own
                 # family has to be gateway-backed for the workspace router.
                 _turn_backed = _gateway_backed(
@@ -5587,13 +5593,14 @@ async def _forward_event_to_runner(
                 and _bare_model_id(_attempted_override) != _bare_model_id(_routed_model)
                 else None
             )
+            _decision_harness = _routed_harness or await _resolve_harness_async(conv)
             _decision_id = await _emit_server_routing_decision(
                 session_id,
                 conversation_store,
                 _routed_model,
                 _verdict,
                 scope=_decision_scope,
-                harness=_routed_harness or _resolve_harness(conv),
+                harness=_decision_harness,
                 attempted_override=_overridden,
             )
             if not _route_failed:
@@ -5614,7 +5621,7 @@ async def _forward_event_to_runner(
                     _verdict,
                     agent=agent_name or "",
                     scope=_decision_scope,
-                    harness=_routed_harness or _resolve_harness(conv),
+                    harness=_decision_harness,
                     decision_id=_decision_id,
                     attempted_override=_overridden,
                 )
@@ -5871,11 +5878,11 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
-    if body.type == "message" and _is_native_terminal_session(conv):
+    if body.type == "message" and await asyncio.to_thread(_is_native_terminal_session, conv):
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
-        _build_native_terminal_message_event(conv, body)
+        await asyncio.to_thread(_build_native_terminal_message_event, conv, body)
         ensure_outcome = (
             _NativeTerminalEnsureOutcome(error=None)
             if native_terminal_ready
@@ -5963,15 +5970,18 @@ async def _dispatch_session_event_to_runner_impl(
         ):
             from omnigent.server.smart_routing import route_turn_or_decline
 
-            _harness = _native_pane_harness(conv)
+            _harness = await _native_pane_harness(conv)
             _user_text = _extract_user_text_for_routing(body)
             # Cross-family spawns belong to auto-harness sessions: a pinned
             # session's children stay in its family (the rule the in-harness
             # spawn gate applies via ``candidate_models(cross_harness=False)``).
             # This pane already runs another family's CLI, so the parent's
             # family has no candidate for it and nothing is routed.
-            _native_out_of_family = _out_of_family_spawn_notice(
-                conv, _native_parent_conv, _harness
+            _native_out_of_family = await asyncio.to_thread(
+                _out_of_family_spawn_notice,
+                conv,
+                _native_parent_conv,
+                _harness,
             )
             if _user_text and _native_out_of_family is not None:
                 _native_routed_model, _native_verdict = _unavailable_routing_card(
@@ -6067,13 +6077,14 @@ async def _dispatch_session_event_to_runner_impl(
         if _native_routed_model is not None and _native_verdict is not None:
             if _native_applied_model is None and not _native_route_failed:
                 _native_verdict = _unapplied_routed_verdict(_native_routed_model, _native_verdict)
+            _native_decision_harness = await _resolve_harness_async(conv)
             _native_decision_id = await _emit_server_routing_decision(
                 session_id,
                 conversation_store,
                 _native_routed_model,
                 _native_verdict,
                 scope=_native_scope,
-                harness=_resolve_harness(conv),
+                harness=_native_decision_harness,
             )
             if not _native_route_failed:
                 # The label is the route-once gate, so a failed call must not
@@ -6090,7 +6101,7 @@ async def _dispatch_session_event_to_runner_impl(
                     _native_verdict,
                     agent=agent_name or "",
                     scope=_native_scope,
-                    harness=_resolve_harness(conv),
+                    harness=_native_decision_harness,
                     decision_id=_native_decision_id,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
@@ -6751,7 +6762,8 @@ async def _relay_runner_stream_once(
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
                         # subtree roll-up below sees the new totals.
-                        _accumulate_session_usage(
+                        await asyncio.to_thread(
+                            _accumulate_session_usage,
                             event.get("response", {}),
                             session_id,
                             conversation_store,
@@ -8528,8 +8540,9 @@ async def _create_session_from_existing_agent(
         # rather than created and declined afterwards. Auto parents are
         # unaffected (the router owns their family) and so is a parent that
         # routes no spawns — neither resolves the child's harness at all.
-        if _pinned_spawn_family(_parent_for_routing) is not None:
-            _reject_out_of_family_child(
+        if await asyncio.to_thread(_pinned_spawn_family, _parent_for_routing) is not None:
+            await asyncio.to_thread(
+                _reject_out_of_family_child,
                 _parent_for_routing,
                 await asyncio.to_thread(
                     _create_resolved_harness, agent, body.harness_override, agent_cache
@@ -8677,7 +8690,8 @@ async def _create_session_from_existing_agent(
     # opt-ins only, never the headless worker default bypass.
     sub_spec: AgentSpec | None = None
     if body.sub_agent_name:
-        sub_spec = _resolve_subagent_spec(
+        sub_spec = await asyncio.to_thread(
+            _resolve_subagent_spec,
             agent=agent,
             sub_agent_name=body.sub_agent_name,
             agent_cache=agent_cache,
@@ -8868,7 +8882,8 @@ async def _create_session_from_existing_agent(
         body.sub_agent_name is None
         and body.host_id is not None
         and (
-            _repl_labels := _repl_terminal_ui_labels(
+            _repl_labels := await asyncio.to_thread(
+                _repl_terminal_ui_labels,
                 agent=agent,
                 agent_cache=agent_cache,
                 harness_override=harness_override,
@@ -8989,7 +9004,8 @@ async def _create_session_from_existing_agent(
             elif conv.harness_override:
                 _tel_harness = conv.harness_override
             elif agent_cache is not None:
-                _tel_loaded = agent_cache.load(
+                _tel_loaded = await asyncio.to_thread(
+                    agent_cache.load,
                     agent.id,
                     agent.bundle_location,
                     expand_env=agent.session_id is None,
@@ -10127,7 +10143,13 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
-    return _build_session_response(
+    pending_elicitation_events = await asyncio.to_thread(
+        _pending_elicitation_snapshot_for_session,
+        conv_store,
+        conv,
+    )
+    return await asyncio.to_thread(
+        _build_session_response,
         conv,
         items,
         status,
@@ -10144,11 +10166,7 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        pending_elicitation_events=await asyncio.to_thread(
-            _pending_elicitation_snapshot_for_session,
-            conv_store,
-            conv,
-        ),
+        pending_elicitation_events=pending_elicitation_events,
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
         agent_store=agent_store,

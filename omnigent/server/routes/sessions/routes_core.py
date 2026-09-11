@@ -2334,7 +2334,7 @@ def register_core_routes(
             # polly/debby also carry) — see _persist_model_change_note for the
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
-            if _is_native_terminal_session(updated):
+            if await asyncio.to_thread(_is_native_terminal_session, updated):
                 # The injection is the only thing that moves a LIVE native
                 # pane's model, so a forward its runner refused must not pass as
                 # applied. A stopped session reaches no runner and stays quiet —
@@ -2952,7 +2952,8 @@ def register_core_routes(
             order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
-        return _build_session_response(
+        return await asyncio.to_thread(
+            _build_session_response,
             new_conv,
             list(reversed(fork_items.data)),
             "idle",
@@ -3183,7 +3184,8 @@ def register_core_routes(
 
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
         level = await _get_permission_level(user_id, session_id, permission_store)
-        return _build_session_response(
+        return await asyncio.to_thread(
+            _build_session_response,
             updated,
             items.data,
             "idle",
