@@ -34,9 +34,11 @@ def external_link_session(
     yield (base_url, session_id, link_url)
 
 
+@pytest.mark.parametrize("activation", ["click", "keyboard"])
 def test_external_chat_link_opens_new_page(
     page: Page,
     external_link_session: tuple[str, str, str],
+    activation: str,
 ) -> None:
     """External links open a new page while the chat remains in place."""
     base_url, session_id, link_url = external_link_session
@@ -48,10 +50,22 @@ def test_external_chat_link_opens_new_page(
     expect(link).to_have_attribute("href", link_url)
     expect(link).to_have_attribute("target", "_blank")
 
-    with page.expect_popup() as popup_info:
-        link.click()
+    with (
+        page.context.expect_event(
+            "request", predicate=lambda request: request.url == link_url
+        ) as request_info,
+        page.expect_popup() as popup_info,
+    ):
+        if activation == "keyboard":
+            link.focus()
+            link.press("Enter")
+        else:
+            link.click()
 
     popup = popup_info.value
-    popup.wait_for_load_state("domcontentloaded")
+    popup.wait_for_url(link_url)
     expect(popup).to_have_url(link_url)
     expect(page).to_have_url(chat_url)
+    assert popup.evaluate("window.opener === null")
+    assert popup.evaluate("document.referrer") == ""
+    assert "referer" not in request_info.value.all_headers()

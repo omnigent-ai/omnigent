@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -1021,6 +1023,164 @@ async def test_codex_native_model_options_query_model_list(
     ]
     assert fake_client.connected
     assert fake_client.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["default", "other", "missing-spec", "invalid-config"])
+async def test_codex_model_catalog_writeback_uses_session_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """Session rows stay in their provider's shared cache, including across sessions."""
+    from omnigent.harnesses.codex_native import app_server as codex
+    from omnigent.models import model_catalog_store
+    from omnigent.runner.session_init_protocol import (
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+    from omnigent.spec.types import DatabricksAuth
+
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text("[default]\nhost = https://a.example\n[other]\nhost = https://b.example\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.setattr(codex, "_find_codex_cli", lambda: sys.executable)
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    profile = "default" if case == "default" else "other"
+    spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native"},
+            auth=DatabricksAuth(profile=profile),
+        ),
+    )
+
+    async def resolve_spec(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    def resolve_launch(
+        *, model: str | None, spec: AgentSpec | None = None
+    ) -> codex.NativeCodexLaunch:
+        if case == "invalid-config":
+            raise RuntimeError("provider configuration unavailable")
+        selected = spec.executor.auth.profile if spec is not None else "default"
+        return codex.NativeCodexLaunch([], model, selected)
+
+    launch_resolver = Mock(side_effect=resolve_launch)
+    monkeypatch.setattr(codex, "resolve_native_codex_launch", launch_resolver)
+    credentials = Mock(side_effect=AssertionError("cache reuse must not acquire credentials"))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
+    )
+    catalogs = {}
+    fingerprints = {}
+    for provider in ("default", "other"):
+        rows = [
+            {"id": "shared-picker", "model": f"{provider}.schema.model", "isDefault": True},
+            {"id": "second-picker", "model": f"{provider}.schema.second"},
+        ]
+        fingerprint = codex.codex_catalog_fingerprint(codex.NativeCodexLaunch([], None, provider))
+        model_catalog_store.write_catalog("codex-native", fingerprint, rows)
+        catalogs[provider], fingerprints[provider] = rows, fingerprint
+    live_rows = [dict(row, displayName="Live model") for row in catalogs[profile]]
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "second-picker"\n')
+    fake_client = _RecordingCodexAppServerClient("ws://codex.test", "test")
+    monkeypatch.setattr(codex, "client_for_transport", lambda *args, **kwargs: fake_client)
+
+    async def fake_launch(session_id: str, *args: Any, **kwargs: Any) -> SessionResourceView:
+        return SessionResourceView(
+            id="terminal_codex_main",
+            type="terminal",
+            session_id=session_id,
+            name="codex:main",
+            metadata={"running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", fake_launch
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=None if case == "missing-spec" else resolve_spec,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        for session_id in (uuid.uuid4().hex, uuid.uuid4().hex):
+            codex_native_bridge.write_bridge_state(
+                codex_native_bridge.bridge_dir_for_bridge_id(session_id),
+                codex_native_bridge.CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path="ws://codex.test",
+                    thread_id="test-thread",
+                    codex_home=str(codex_home),
+                ),
+            )
+            init = RunnerSessionInitEnvelope(
+                protocol_version=2,
+                server_version="0.14.0",
+                session_id=session_id,
+                agent_id="test-agent",
+                suppress_recovery_turn=True,
+                snapshot=RunnerSessionInitSnapshot(
+                    created_at=0,
+                    updated_at=0,
+                    harness_override="codex-native",
+                ),
+            )
+            created = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": "test-agent",
+                    "session_init": init.model_dump(mode="json"),
+                },
+            )
+            assert created.status_code == 201, created.text
+            fake_client.model_list_responses = [{"result": {"data": live_rows}}]
+            response = await client.get(f"/v1/sessions/{session_id}/codex-model-options")
+            assert response.status_code == 200, response.text
+            assert response.json()["models"] == codex.mark_launch_default(
+                live_rows, "second-picker"
+            )
+            await asyncio.gather(
+                *[
+                    task
+                    for task in asyncio.all_tasks()
+                    if getattr(task.get_coro(), "__name__", "") == "_write_back_codex_catalog"
+                ]
+            )
+            for provider in ("default", "other"):
+                expected = (
+                    live_rows
+                    if provider == profile and case in {"default", "other"}
+                    else catalogs[provider]
+                )
+                assert (
+                    model_catalog_store.read_catalog("codex-native", fingerprints[provider])
+                    == expected
+                )
+            catalog_dir = model_catalog_store.catalog_path(
+                "codex-native", fingerprints[profile]
+            ).parent
+            assert len(list(catalog_dir.glob("*.json"))) == 2
+            for provider, host in (
+                ("default", "https://a.example"),
+                ("other", "https://b.example"),
+            ):
+                assert (
+                    codex._resolve_databricks_codex_model(
+                        host, provider, "shared-picker", codex_path=sys.executable
+                    )
+                    == f"{provider}.schema.model"
+                )
+            credentials.assert_not_called()
+    if case == "missing-spec":
+        launch_resolver.assert_not_called()
+    else:
+        assert launch_resolver.call_count == 2
+        launch_resolver.assert_called_with(model=None, spec=spec)
 
 
 @pytest.mark.asyncio

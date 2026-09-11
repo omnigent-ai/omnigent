@@ -83,6 +83,7 @@ from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    _SANDBOX_REPO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -4285,11 +4286,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             # that combination reflects lost metadata, not a chat-only
             # session. Other workspace-less sources resume in-process like
             # a brand-new chat session.
-            # Per-user pin keys (``omnigent.pinned.<user>``) are dynamic-suffix,
-            # so they're never in the exact-match drop sets — drop them by prefix
+            # Per-user pin keys (``omnigent.pinned.<user>``) and per-repo sandbox
+            # labels (``omnigent.sandbox.repo.<index>``) are dynamic-suffix, so
+            # they're never in the exact-match drop sets — drop them by prefix
             # instead. A fork is a NEW conversation; inheriting the source's pins
             # would show the clone as pinned for the forker AND carry every other
-            # user's pin key along as dead data.
+            # user's pin key along as dead data, and inheriting the repo labels
+            # would re-clone the source's repos even into a fork asked for empty.
             source_labels = _fetch_labels(session, source_conversation_id)
             fork_labels = {
                 key: value
@@ -4301,6 +4304,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     | dropped_label_keys
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
+                and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None

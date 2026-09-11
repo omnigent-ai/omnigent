@@ -1866,9 +1866,10 @@ async def supervise_forwarder(
         state on thread rotation, so the executor keeps reaching the
         live app-server after a native ``/clear``.
     :param thread_id: Codex thread id to subscribe to.
-    :param client: Optional client connected before thread creation or
-        resume, retaining startup notifications. The forwarder still calls
-        ``thread/resume`` so that connection receives turn/item notifications.
+    :param client: Optional already-connected client. Fresh Codex
+        sessions pass the listener that observed ``thread/started``;
+        the forwarder still calls ``thread/resume`` once the id is
+        known so that connection receives turn/item notifications.
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.

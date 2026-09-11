@@ -8,7 +8,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import {
   BotIcon,
@@ -41,6 +40,7 @@ import {
   ComposerWorkspaceTrigger,
   ComposerPermissionPicker,
   ComposerHarnessTrigger,
+  ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -185,6 +185,7 @@ import {
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
+import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
@@ -2005,12 +2006,15 @@ export function buildSlashCommandMap(
   showEffort: boolean,
   showModel: boolean,
   showCompact = true,
+  showBtw = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
+    // /btw is a Claude Code CLI built-in — only offer it on claude-native.
+    if (name === "/btw" && !showBtw) continue;
     m[name] = description;
   }
   for (const skill of skills) {
@@ -2038,10 +2042,13 @@ export function buildSlashCommandWithArgsSet(
   skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
+  showBtw = false,
 ): Set<string> {
   const s = new Set<string>();
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
+  // Selecting /btw fills "/btw " so the user types the side question after it.
+  if (showBtw) s.add("/btw");
   for (const skill of skills) s.add(`/${skill.name}`);
   return s;
 }
@@ -2563,6 +2570,28 @@ function ComposerImpl({
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  // A settled /btw side-chat overlay is open, so Escape dismisses it here
+  // (before the "Esc cancels turn" branch) rather than interrupting a turn.
+  const btwSidechat = useChatStore((s) => s.btwSidechat);
+  const dismissBtwSidechat = useChatStore((s) => s.dismissBtwSidechat);
+  // While the /btw "Claude Quick Answer" overlay is open, lock the composer:
+  // the side chat is modal (like the terminal overlay), so the next input is
+  // Esc / ✕ to dismiss it, not a new message.
+  const composerLockedByBtw = btwSidechat !== null;
+  // The composer's own Escape handler can't fire while the textarea is
+  // disabled (disabled inputs emit no keydown), so close the overlay from a
+  // document-level Escape while it's open — matching native Claude Code.
+  useEffect(() => {
+    if (!composerLockedByBtw) return;
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        dismissBtwSidechat();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [composerLockedByBtw, dismissBtwSidechat]);
   // The conversation whose draft the composer's value/files currently hold.
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
@@ -2787,16 +2816,20 @@ function ComposerImpl({
   // codex-native) which inject the slash command into the terminal.
   // SDK harnesses (openai-agents-sdk, claude-sdk) don't support it yet.
   const showCompact = isNativeWrapper;
+  // /btw is a Claude Code CLI built-in (side chat), so offer it only on
+  // claude-native sessions. Selected/typed, it sends as plaintext to the
+  // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
+  const showBtw = sessionHarness === "claude-native";
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact),
-    [skills, showEffort, showModel, showCompact],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw),
+    [skills, showEffort, showModel, showCompact, showBtw],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
-    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel),
-    [skills, showEffort, showModel],
+    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw),
+    [skills, showEffort, showModel, showBtw],
   );
 
   // Suggestions menu is open while the user is still typing the command
@@ -3185,6 +3218,8 @@ function ComposerImpl({
   const submit = ({
     resetNativeInputSession = false,
   }: { resetNativeInputSession?: boolean } = {}) => {
+    // The /btw overlay locks the composer — never send while it's open.
+    if (composerLockedByBtw) return;
     const trimmed = value.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
@@ -3232,7 +3267,11 @@ function ComposerImpl({
         setPickerOpenNonce((n) => n + 1);
         return;
       }
-      if (cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
+      // /btw is a built-in for menu/autocomplete purposes only — it is NOT
+      // executed locally. It must reach the vendor TUI as plaintext so Claude
+      // Code opens its side chat and the forwarder relays the answer to the
+      // web overlay; fall through to the plaintext send path below.
+      if (cmd !== "/btw" && cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
         executeSlashCommand(cmd, arg);
         return;
       }
@@ -3365,6 +3404,12 @@ function ComposerImpl({
       submit();
       return;
     }
+    // Esc dismisses the /btw sidechat overlay if open
+    if (e.key === "Escape" && btwSidechat) {
+      e.preventDefault();
+      dismissBtwSidechat();
+      return;
+    }
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
@@ -3486,7 +3531,11 @@ function ComposerImpl({
                 title={composerWorkspace ?? "No workspace bound"}
               />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" side="top" className="max-w-[min(90vw,24rem)]">
+            <DropdownMenuContent
+              align="start"
+              side="top"
+              className="max-w-[min(90vw,28rem)] whitespace-normal"
+            >
               <DropdownMenuLabel>Session workspace</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
                 {composerWorkspace ?? "This session has no workspace binding."}
@@ -3504,7 +3553,11 @@ function ComposerImpl({
                 data-testid="composer-git-branch"
               />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" side="top" className="max-w-[min(90vw,24rem)]">
+            <DropdownMenuContent
+              align="start"
+              side="top"
+              className="max-w-[min(90vw,28rem)] whitespace-normal"
+            >
               <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
                 {composerBranch || "The runner has not reported a branch for this session."}
@@ -3568,8 +3621,9 @@ function ComposerImpl({
             if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
           },
           "aria-label": "Message the agent",
-          placeholder:
-            readOnlyReason !== null
+          placeholder: composerLockedByBtw
+            ? "Side chat open — press Esc to close"
+            : readOnlyReason !== null
               ? readOnlyReason
               : isReadOnly
                 ? "You have read-only access to this session"
@@ -3583,7 +3637,7 @@ function ComposerImpl({
                         ? "Send a follow-up (queued) — Esc to stop"
                         : "Send a message…",
           rows: 1,
-          disabled: disabled || isReadOnly || unreachable,
+          disabled: disabled || isReadOnly || unreachable || composerLockedByBtw,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
@@ -3616,6 +3670,39 @@ function ComposerImpl({
                   onOpenDir={openMentionDir}
                   onAttach={attachMention}
                 />
+              )}
+              {/* /btw side-chat overlay — transient question+answer panel,
+            dismissed with Esc / ✕. Never persisted to the transcript. */}
+              {btwSidechat && (
+                <div className="border-b border-border bg-card/50 p-4 backdrop-blur-sm">
+                  <div className="mb-3 flex items-start justify-between">
+                    <h3 className="text-sm font-medium">Claude Quick Answer</h3>
+                    <button
+                      type="button"
+                      onClick={() => dismissBtwSidechat()}
+                      className="rounded-full p-0.5 text-muted-foreground hover:text-foreground"
+                      aria-label="Close side chat"
+                    >
+                      <XIcon className="size-4" />
+                    </button>
+                  </div>
+                  <div className="mb-2">
+                    <p className="mb-1 text-xs text-muted-foreground">Question:</p>
+                    <p className="text-sm">{btwSidechat.question}</p>
+                  </div>
+                  <div className="mb-2">
+                    <p className="mb-1 text-xs text-muted-foreground">Answer:</p>
+                    <div className="prose prose-sm dark:prose-invert max-w-none text-sm">
+                      <FilePathAwareMessageResponse>
+                        {btwSidechat.answer}
+                      </FilePathAwareMessageResponse>
+                    </div>
+                  </div>
+                  {btwSidechat.truncated && (
+                    <p className="text-xs italic text-muted-foreground">Answer was truncated</p>
+                  )}
+                  <p className="mt-2 text-xs text-muted-foreground">Press Esc to close</p>
+                </div>
               )}
               {/* Quote chips — one per quoted selection, shown above the textarea */}
               {replyQuotes.length > 0 && (
@@ -3749,7 +3836,9 @@ function ComposerImpl({
             <>
               <ComposerAddMenu
                 disabled={false}
-                attachDisabled={disabled || isReadOnly || hasPendingElicitation}
+                attachDisabled={
+                  disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw
+                }
                 onAttach={() => fileInputRef.current?.click()}
                 showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
                 onGoal={() => setGoalDialogOpen(true)}
@@ -3784,45 +3873,39 @@ function ComposerImpl({
           trailing: (
             <>
               <div className="flex min-w-0 items-center rounded-lg">
-                <ComposerModelSource
+                <SessionHarnessPicker
+                  busy={configBusy}
+                  busyRef={configBusyRef}
+                  setBusy={setConfigBusy}
+                  agentName={
+                    subAgentName ??
+                    agents?.find((agent) => agent.id === selectedAgentId)?.name ??
+                    agents?.[0]?.name ??
+                    null
+                  }
+                  harnessLabel={harnessLabel}
+                  showModels={showModels}
+                  showEffort={showEffort}
+                  showClaudePermissionMode={showClaudePermissionMode}
+                  showCodexApprovalMode={showCodexApprovalMode}
+                  effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
                   costRoutingEligible={costRoutingEligible}
-                >
-                  <SessionHarnessPicker
-                    busy={configBusy}
-                    busyRef={configBusyRef}
-                    setBusy={setConfigBusy}
-                    agentName={
-                      subAgentName ??
-                      agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                      agents?.[0]?.name ??
-                      null
-                    }
-                    harnessLabel={harnessLabel}
-                    showModels={showModels}
-                    showEffort={showEffort}
-                    showClaudePermissionMode={showClaudePermissionMode}
-                    showCodexApprovalMode={showCodexApprovalMode}
-                    effortLevels={effortLevels}
-                    modelPickerKind={modelPickerKind}
-                    codexModelOptions={codexModelOptions}
-                    costRoutingEligible={costRoutingEligible}
-                    subagentRoutingEligible={subagentRoutingEligible}
-                    // Config changes persist server-side and apply on the next
-                    // wake/turn (the runner forward is best-effort), so the gear
-                    // stays live wherever a message could be sent — including
-                    // asleep/starting/unknown. Only read-only viewers and sessions
-                    // no message can wake (unreachable) get an inert gear.
-                    disabled={isReadOnly || unreachable}
-                    openNonce={pickerOpenNonce}
-                  />
-                </ComposerModelSource>
+                  subagentRoutingEligible={subagentRoutingEligible}
+                  // Config changes persist server-side and apply on the next
+                  // wake/turn (the runner forward is best-effort), so the gear
+                  // stays live wherever a message could be sent — including
+                  // asleep/starting/unknown. Only read-only viewers and sessions
+                  // no message can wake (unreachable) get an inert gear.
+                  disabled={isReadOnly || unreachable}
+                  openNonce={pickerOpenNonce}
+                />
               </div>
               <ComposerMicButton
                 className="size-8 md:size-7"
                 enableHotkey
-                disabled={disabled || isReadOnly || hasPendingElicitation}
+                disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
                   voiceSnapshotRef.current = value;
                 }}
@@ -4675,6 +4758,11 @@ function SessionHarnessPicker({
       setConfigMenuOpen(true);
     }
   }, [openNonce, disabled, configurable]);
+  // The pill's summary tooltip must not flash open over the menu, nor
+  // instantly reopen when closing the menu refocuses the trigger; see
+  // useMenuGuardedTooltip. Internal menuOpen covers every open path,
+  // including the programmatic /model (openNonce) one.
+  const gearTooltip = useMenuGuardedTooltip(menuOpen);
   useEffect(() => {
     setMenuOpen(false);
     setConfigMenuOpen(false);
@@ -4802,9 +4890,9 @@ function SessionHarnessPicker({
         }}
       >
         <TooltipProvider>
-          <Tooltip>
+          <Tooltip open={gearTooltip.open} onOpenChange={gearTooltip.onOpenChange}>
             <TooltipTrigger asChild>
-              <span className="flex min-w-0">
+              <span className="flex min-w-0" {...gearTooltip.triggerProps}>
                 <DropdownMenuTrigger asChild>
                   <ComposerHarnessTrigger
                     label="Configure session"
@@ -4829,11 +4917,7 @@ function SessionHarnessPicker({
               className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
               data-testid="composer-config-gear-tooltip"
             >
-              {summary.map((row) => (
-                <span key={row.label}>
-                  {row.label}: {row.value}
-                </span>
-              ))}
+              <ComposerConfigTooltipRows rows={summary} />
             </TooltipContent>
           </Tooltip>
         </TooltipProvider>
@@ -5122,59 +5206,51 @@ function useResolvedComposerModel(
     modelLabel,
   };
 }
+/**
+ * How long after the menu closes tooltip open requests stay swallowed.
+ * Radix hands focus back to the trigger on close in the same tick, so the
+ * window only needs to outlive that programmatic focus (and any queued
+ * focus/pointer fallout from the closing menu); 600ms — one hover-open
+ * delay — is comfortably past it without being noticeable to a user who
+ * genuinely re-engages the trigger later.
+ */
+const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
 
-/** Compact, inspectable provenance beside the composer's model label. */
-function ComposerModelSource({
-  modelPickerKind,
-  codexModelOptions,
-  costRoutingEligible,
-  children,
-}: {
-  modelPickerKind: NativeModelPickerKind | null;
-  codexModelOptions: readonly NativeModelOption[];
-  costRoutingEligible: boolean;
-  children: ReactNode;
-}) {
-  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
-  const { effectiveModel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
-  const source =
-    findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
-    codexModelOptions.find((option) => option.source)?.source;
-  const routingOn = costRoutingEligible && costControlModeOverride === "on";
-  if (routingOn || !source) return children;
-
-  const rows = modelConfigurationSourceRows(source);
-  return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span
-            tabIndex={0}
-            data-testid="composer-model-source"
-            // `flex` keeps the min-width chain flowing through this wrapper:
-            // as a plain span the label inside loses its flex-imposed width
-            // and its `truncate` never engages, running under the Stop button.
-            className="flex min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {children}
-          </span>
-        </TooltipTrigger>
-        <TooltipContent
-          side="top"
-          className="flex max-w-80 flex-col items-start gap-1 px-3 py-2"
-          data-testid="composer-model-source-tooltip"
-        >
-          <span className="font-medium text-background dark:text-popover-foreground">
-            Model configuration
-          </span>
-          {rows.map((row) => (
-            <span key={row.label} className="max-w-72 truncate text-muted-foreground">
-              {row.label}:{" "}
-              <span className="text-background dark:text-popover-foreground">{row.value}</span>
-            </span>
-          ))}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
+/**
+ * Open state for a tooltip whose trigger contains (or is) a menu trigger.
+ *
+ * Keeps the tooltip closed while the menu is open: the menu trigger sits
+ * inside the tooltip trigger's span, so the focus Radix gives it on open
+ * bubbles to the tooltip trigger and would instantly open the tooltip,
+ * painting it over the menu (equal z-index, later-mounted; the menu content
+ * itself is a portalled React sibling whose events do not bubble here).
+ * Closing the menu hands focus back to that same trigger, which would just
+ * as instantly reopen the tooltip, so open requests stay blocked for a short
+ * window after close — unless the pointer re-enters the trigger, which is
+ * unmistakably fresh hover intent.
+ */
+function useMenuGuardedTooltip(menuOpen: boolean) {
+  const [wantsOpen, setWantsOpen] = useState(false);
+  // Epoch millis until which open requests are ignored; Infinity while the
+  // menu is open. A ref, not state: it is only read when Radix requests an
+  // open, so changing it never needs a re-render.
+  const suppressedUntil = useRef(0);
+  useEffect(() => {
+    if (menuOpen) {
+      setWantsOpen(false);
+      suppressedUntil.current = Number.POSITIVE_INFINITY;
+    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
+      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
+    }
+  }, [menuOpen]);
+  return {
+    open: wantsOpen && !menuOpen,
+    onOpenChange: (next: boolean) =>
+      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
+    triggerProps: {
+      onPointerEnter: () => {
+        if (!menuOpen) suppressedUntil.current = 0;
+      },
+    },
+  } as const;
 }

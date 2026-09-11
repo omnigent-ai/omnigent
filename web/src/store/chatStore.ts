@@ -841,6 +841,12 @@ export interface ConversationState {
    * MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
+  /**
+   * Transient /btw sidechat overlay state (question + answer from `/btw`).
+   * Set by `session_btw_sidechat` SSE events, cleared on Escape or dismiss.
+   * Not persisted across page reloads. `null` when no overlay is open.
+   */
+  btwSidechat: { question: string; answer: string; truncated: boolean } | null;
 
   // Internal mutable bookkeeping. NOT meant to be subscribed to.
   abortController: AbortController | null;
@@ -1093,6 +1099,11 @@ export interface ChatActions {
   refreshSessionState: (conversationId?: string) => Promise<void>;
   /** Dismiss the too-many-tabs banner for the current over-budget episode. */
   dismissStreamBudgetBanner: () => void;
+  /**
+   * Dismiss the /btw sidechat overlay.
+   * TODO: reconcile with terminal Escape on native sessions.
+   */
+  dismissBtwSidechat: () => void;
 }
 
 /**
@@ -1604,6 +1615,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
   interruptedResponseIds: [],
@@ -2513,6 +2525,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   clearPendingComposerAttachments: () => setActive({ pendingComposerAttachments: [] }),
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
+
+  dismissBtwSidechat: () => {
+    const { conversationId } = get();
+    setActive({ btwSidechat: null });
+    // Mirror the close to the terminal so its own /btw overlay (a separate
+    // surface) shuts in lockstep. Best-effort and fire-and-forget: the pane
+    // overlay also auto-dismisses on the next injected message, so a failed
+    // or no-op forward changes nothing the user sees.
+    if (conversationId) {
+      void postEvent(conversationId, { type: "external_btw_dismiss", data: {} }).catch(() => {});
+    }
+  },
 
   markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
 
@@ -6358,6 +6382,21 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // runner moved to the new one — so its optimistic bubble would otherwise
       // spin forever. Drop it; resuming starts a fresh turn.
       applyToNamedConversation(event.conversationId, { pendingUserMessages: [] });
+      return;
+    case "session_btw_sidechat":
+      // Transient /btw sidechat overlay: show the question + answer in a
+      // dismissable panel. Guard on active conversation so late events from
+      // switched-away streams don't hijack the UI. Clear pendingUserMessages
+      // and activeResponse (mirroring superseded behavior) to reset state.
+      applyToNamedConversation(event.conversationId, {
+        btwSidechat: {
+          question: event.question,
+          answer: event.answer,
+          truncated: event.truncated,
+        },
+        pendingUserMessages: [],
+        activeResponse: null,
+      });
       return;
     case "session_resource_created":
       if (event.resource.type === "terminal") {
