@@ -291,6 +291,15 @@ def _tmux_status_option_commands() -> list[list[str]]:
     ]
 
 
+class TmuxSpawnError(RuntimeError):
+    """The tmux client subprocess could not be started (e.g. fork ``EAGAIN``).
+
+    Distinct from a tmux command that ran and exited non-zero: when the OS
+    cannot spawn the client at all, tmux liveness is unknown, so probes must
+    not read this as evidence that the server, session, or pane is gone.
+    """
+
+
 # How long the tmux pane must show no changes to be considered idle, and how
 # often we poll capture-pane to check. Exposed as module-level constants so
 # tests can lower them instead of waiting the full threshold per assertion.
@@ -1443,6 +1452,17 @@ class TerminalInstance:
                     "-p",
                     "-e",
                 )
+            except TmuxSpawnError as exc:
+                # The OS could not spawn the probe (e.g. fork EAGAIN): liveness
+                # is unknown, not evidence of exit. Back off and retry.
+                logger.warning(
+                    "tmux liveness probe could not be spawned for terminal %s:%s; "
+                    "treating liveness as unknown: %s",
+                    self.name,
+                    self.session_key,
+                    exc,
+                )
+                continue
             except RuntimeError as exc:
                 logger.warning(
                     "tmux capture-pane probe failed for terminal %s:%s: %s",
@@ -1450,7 +1470,13 @@ class TerminalInstance:
                     self.session_key,
                     exc,
                 )
-                if await self._tmux_session_exists_async():
+                try:
+                    session_exists = await self._tmux_session_exists_async()
+                except TmuxSpawnError:
+                    # Confirmation probe could not be spawned either: still
+                    # unknown, so neither reset nor count the failure.
+                    continue
+                if session_exists:
                     consecutive_capture_failures = 0
                     continue
                 consecutive_capture_failures += 1
@@ -1631,9 +1657,27 @@ class TerminalInstance:
                 return
             if not self.running:
                 return
-            snapshot = self._capture_pane_for_idle_or_none()
+            try:
+                snapshot = self._capture_pane_for_idle_or_none()
+            except TmuxSpawnError as exc:
+                # The OS could not spawn the probe (e.g. fork EAGAIN): liveness
+                # is unknown, not evidence of exit. Back off and retry.
+                logger.warning(
+                    "tmux liveness probe could not be spawned for terminal %s:%s; "
+                    "treating liveness as unknown: %s",
+                    self.name,
+                    self.session_key,
+                    exc,
+                )
+                continue
             if snapshot is None:
-                if self._tmux_session_exists_sync():
+                try:
+                    session_exists = self._tmux_session_exists_sync()
+                except TmuxSpawnError:
+                    # Confirmation probe could not be spawned either: still
+                    # unknown, so neither reset nor count the failure.
+                    continue
+                if session_exists:
                     consecutive_capture_failures = 0
                     continue
                 consecutive_capture_failures += 1
@@ -1701,11 +1745,15 @@ class TerminalInstance:
         Capture the pane for an idle tick, or signal "tmux gone".
 
         :returns: Pane bytes from ``tmux capture-pane -p -e``, or
-            ``None`` when the tmux subprocess raised. The threaded loop
+            ``None`` when tmux ran and failed. The threaded loop
             confirms and counts this failure before treating it as exit.
+        :raises TmuxSpawnError: When the probe could not be spawned —
+            the pane's state is then unknown, not gone.
         """
         try:
             return self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
+        except TmuxSpawnError:
+            raise
         except RuntimeError as exc:
             logger.warning(
                 "tmux capture-pane probe failed for terminal %s:%s: %s",
@@ -1716,9 +1764,17 @@ class TerminalInstance:
             return None
 
     def _tmux_session_exists_sync(self) -> bool:
-        """Confirm that this instance's tmux session still exists."""
+        """Confirm that this instance's tmux session still exists.
+
+        :returns: ``True`` when ``has-session`` succeeds; ``False`` when tmux
+            ran and reported the session gone.
+        :raises TmuxSpawnError: When the probe could not be spawned —
+            existence is then unknown, not disproved.
+        """
         try:
             self._tmux_output_sync("has-session", "-t", self.tmux_target)
+        except TmuxSpawnError:
+            raise
         except RuntimeError:
             return False
         return True
@@ -1831,10 +1887,12 @@ class TerminalInstance:
         implies a live process. The terminal is alive only when the session
         exists AND its pane process has not exited.
 
-        When the session is gone (probe exits non-zero), the pane is dead, or
-        the probe cannot start, this marks ``self.running`` false. That side
-        effect is intentional: subsequent pollers use the in-memory flag as a
-        fast path instead of re-forking tmux after the process has exited.
+        When the session is gone (probe exits non-zero) or the pane is dead,
+        this marks ``self.running`` false. That side effect is intentional:
+        subsequent pollers use the in-memory flag as a fast path instead of
+        re-forking tmux after the process has exited. When the probe itself
+        cannot start (e.g. fork ``EAGAIN``), liveness is unknown, so the last
+        known state is reported unchanged — no evidence of death was observed.
 
         :returns: ``True`` when the session exists and its pane process is
             still running; otherwise ``False``.
@@ -1863,8 +1921,9 @@ class TerminalInstance:
                 return False
             return True
         except OSError:
-            self.running = False
-            return False
+            # The probe could not be spawned (e.g. fork EAGAIN): liveness is
+            # unknown, so keep the last known state instead of declaring death.
+            return self.running
 
     async def _pane_is_dead_async(self) -> bool:
         """
@@ -1884,9 +1943,17 @@ class TerminalInstance:
         return out.split()[:1] == ["1"]
 
     async def _tmux_session_exists_async(self) -> bool:
-        """Async confirmation that this instance's tmux session still exists."""
+        """Async confirmation that this instance's tmux session still exists.
+
+        :returns: ``True`` when ``has-session`` succeeds; ``False`` when tmux
+            ran and reported the session gone.
+        :raises TmuxSpawnError: When the probe could not be spawned —
+            existence is then unknown, not disproved.
+        """
         try:
             await self._tmux_output("has-session", "-t", self.tmux_target)
+        except TmuxSpawnError:
+            raise
         except RuntimeError:
             return False
         return True
@@ -1901,7 +1968,7 @@ class TerminalInstance:
                 stderr=asyncio.subprocess.PIPE,
             )
         except OSError as exc:
-            raise RuntimeError(f"tmux command could not start: {' '.join(cmd)}: {exc}") from exc
+            raise TmuxSpawnError(f"tmux command could not start: {' '.join(cmd)}: {exc}") from exc
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             detail = stderr.decode(errors="replace").strip() or "<no stderr>"
@@ -1919,7 +1986,7 @@ class TerminalInstance:
                 stderr=asyncio.subprocess.PIPE,
             )
         except OSError as exc:
-            raise RuntimeError(f"tmux command could not start: {' '.join(cmd)}: {exc}") from exc
+            raise TmuxSpawnError(f"tmux command could not start: {' '.join(cmd)}: {exc}") from exc
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             detail = stderr.decode(errors="replace").strip() or "<no stderr>"
@@ -1940,6 +2007,8 @@ class TerminalInstance:
         :param args: Args to pass after ``tmux -S <socket>``,
             e.g. ``("capture-pane", "-t", "main", "-p", "-e")``.
         :returns: The captured stdout, decoded as UTF-8.
+        :raises TmuxSpawnError: When the tmux subprocess could not be
+            spawned at all (e.g. fork ``EAGAIN``) — liveness unknown.
         :raises RuntimeError: When the tmux subprocess exits
             non-zero (typically because the server has gone away).
         """
@@ -1947,7 +2016,7 @@ class TerminalInstance:
         try:
             proc = subprocess.run(cmd, capture_output=True, check=False)
         except OSError as exc:
-            raise RuntimeError(f"tmux command could not start: {' '.join(cmd)}: {exc}") from exc
+            raise TmuxSpawnError(f"tmux command could not start: {' '.join(cmd)}: {exc}") from exc
         if proc.returncode != 0:
             detail = proc.stderr.decode(errors="replace").strip() or "<no stderr>"
             raise RuntimeError(

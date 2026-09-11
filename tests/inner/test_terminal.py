@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import shutil
 import subprocess
@@ -434,6 +435,146 @@ async def test_is_alive_true_when_pane_live(
         "asyncio",
         SimpleNamespace(
             create_subprocess_exec=fake_create_subprocess_exec,
+            subprocess=terminal_mod.asyncio.subprocess,
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert await instance.is_alive() is True
+    assert instance.running is True
+
+
+def _eagain_spawn(*cmd: object, **kwargs: object) -> object:
+    """Refuse to spawn, like a host that has exhausted its task quota."""
+    raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+
+
+def test_threaded_idle_watcher_treats_probe_spawn_eagain_as_liveness_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe that cannot be spawned must not be read as terminal death.
+
+    Under fork exhaustion every liveness probe (``capture-pane`` and the
+    confirming ``has-session``) fails to *start* while the tmux server and
+    pane stay alive. The watcher cannot tell anything about liveness from
+    that, so it must keep waiting instead of firing ``on_exit`` and failing
+    the session with a false ``required_terminal_exited``.
+
+    :param tmp_path: Temporary directory for the placeholder tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(terminal_mod, "subprocess", SimpleNamespace(run=_eagain_spawn))
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    # Dozens of poll ticks pass, far beyond the consecutive-failure threshold.
+    assert not exited.wait(timeout=0.5)
+    instance._stop_idle_watcher_thread()
+    assert instance.running is True
+
+
+def test_threaded_idle_watcher_still_reports_exit_when_tmux_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probes that run and fail (server gone) still classify as exit.
+
+    Counterpart of the spawn-failure test: when the probe subprocess starts
+    but tmux reports failure, the repeated-failure path must keep declaring
+    the terminal dead.
+
+    :param tmp_path: Temporary directory for the placeholder tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    def _tmux_gone(*cmd: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=1, stdout=b"", stderr=b"no server running")
+
+    monkeypatch.setattr(terminal_mod, "subprocess", SimpleNamespace(run=_tmux_gone))
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+
+    assert exited.wait(timeout=1.0)
+    assert instance.running is False
+
+
+@pytest.mark.asyncio
+async def test_async_idle_watcher_treats_probe_spawn_eagain_as_liveness_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asyncio sibling: a probe spawn failure is liveness-unknown, not exit.
+
+    :param tmp_path: Temporary directory for the placeholder tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _eagain_spawn)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exit_fired = asyncio.Event()
+
+    instance.start_idle_watcher(lambda: None, on_exit=exit_fired.set)
+
+    # Dozens of poll ticks pass, far beyond the consecutive-failure threshold.
+    await asyncio.sleep(0.5)
+    assert not exit_fired.is_set()
+    assert instance.running is True
+    await instance._stop_idle_watcher()
+
+
+@pytest.mark.asyncio
+async def test_is_alive_keeps_last_known_state_when_probe_spawn_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``is_alive`` must not declare death when its probe cannot be spawned.
+
+    A fork-exhausted host refuses to start the ``list-panes`` probe; that says
+    nothing about the pane, so the last known state must be reported and
+    ``running`` must not flip — otherwise heal paths kill a live terminal.
+
+    :param tmp_path: Temporary directory for the placeholder tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    async def _refuse_spawn(*cmd: object, **kwargs: object) -> object:
+        raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=_refuse_spawn,
             subprocess=terminal_mod.asyncio.subprocess,
         ),
     )
