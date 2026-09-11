@@ -168,12 +168,11 @@ def test_claude_native_picker_lists_only_live_databricks_models(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
     # The model options carry the same data-model-id rows as before (plus the
     # "Default" sentinel row the modal always offers).
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_ROWS))
     for index, (model_id, label) in enumerate(_EXPECTED_ROWS):
         row = rows.nth(index)
@@ -182,10 +181,10 @@ def test_claude_native_picker_lists_only_live_databricks_models(
 
     # The bound system.ai.claude-sonnet-5 model implicitly selects the "sonnet"
     # (Sonnet 5) row; fable / sonnet_5 aren't in the live catalog at all.
-    sonnet_row = page.locator('[role="option"][data-model-id="sonnet"]')
-    expect(sonnet_row).to_have_attribute("data-active", "true")
-    expect(page.locator('[role="option"][data-model-id="fable"]')).to_have_count(0)
-    expect(page.locator('[role="option"][data-model-id="sonnet_5"]')).to_have_count(0)
+    sonnet_row = page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')
+    expect(sonnet_row).to_have_attribute("aria-checked", "true")
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="fable"]')).to_have_count(0)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet_5"]')).to_have_count(0)
     _screenshot(page, "pinned-catalog-picker")
 
 
@@ -258,9 +257,8 @@ def test_claude_native_picker_updates_after_delayed_catalog(
     expect(label).to_contain_text("Sonnet 5", timeout=10_000)
     assert not any("model_override" in body for body in patch_bodies)
     page.get_by_test_id("composer-config-gear").click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    page.get_by_test_id("composer-config-model").click()
-    expect(page.locator('[role="option"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
 
 
 def test_claude_native_alias_selection_persists(
@@ -286,11 +284,9 @@ def test_claude_native_alias_selection_persists(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
     # Selecting only drafts the pick; the PATCH fires on Save.
-    page.locator('[role="option"][data-model-id="opus"]').click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -298,7 +294,7 @@ def test_claude_native_alias_selection_persists(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
     assert patch_bodies[-1] == {"model_override": "opus"}
     # The read-only composer label keeps the reported model — a request is
@@ -395,14 +391,12 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_have_attribute("aria-disabled", "false")
     gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
     # The catalog still populates the dropdown while the session sleeps.
-    expect(page.locator('[role="option"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
     _screenshot(page, "asleep-config-gear")
 
-    page.locator('[role="option"][data-model-id="opus"]').click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -410,7 +404,7 @@ def test_claude_native_picker_saves_model_while_host_asleep(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
     assert patch_bodies[-1] == {"model_override": "opus"}
 
@@ -458,17 +452,16 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
 
     page.get_by_test_id("composer-config-gear").click()
 
-    page.get_by_test_id("composer-advanced-settings").click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
     # Exactly one row — the provider's routable default, pre-selected — so no
     # alias row exists to canonicalize into an id the gateway rejects. Picking
     # it can only ever PATCH the concrete gateway id, which the launch
     # resolver passes through verbatim.
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(1)
     expect(rows.first).to_have_attribute("data-model-id", default_model)
-    expect(rows.first).to_have_attribute("data-active", "true")
+    expect(rows.first).to_have_attribute("aria-checked", "true")
     _screenshot(page, "unpinned-gateway-picker")
 
 
@@ -808,11 +801,9 @@ def test_union_catalog_pick_patches_the_row_id_verbatim(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    page.get_by_test_id("composer-config-model").click()
-    bracket_row = page.locator('[role="option"][data-model-id="sonnet[1m]"]')
+    page.get_by_test_id("composer-agent-edit").click()
+    bracket_row = page.locator('[role="menuitemcheckbox"][data-model-id="sonnet[1m]"]')
     expect(bracket_row).to_contain_text("Sonnet 5 (1M context)")
-    bracket_row.click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -820,7 +811,7 @@ def test_union_catalog_pick_patches_the_row_id_verbatim(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        bracket_row.click()
 
     assert patch_bodies[-1] == {"model_override": "sonnet[1m]"}
     # The label keeps the reported model ("Sonnet 5" — the bound
@@ -848,17 +839,16 @@ def test_claude_native_picker_highlights_the_reported_model(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
-    expect(page.locator('[role="option"][data-model-id="sonnet"]')).to_have_attribute(
-        "data-active", "true"
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')).to_have_attribute(
+        "aria-checked", "true"
     )
-    expect(page.locator('[role="option"][data-model-id="opus"]')).not_to_have_attribute(
-        "data-active", "true"
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="opus"]')).not_to_have_attribute(
+        "aria-checked", "true"
     )
-    expect(page.locator('[role="option"][data-model-id="haiku"]')).not_to_have_attribute(
-        "data-active", "true"
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="haiku"]')).not_to_have_attribute(
+        "aria-checked", "true"
     )
 
 

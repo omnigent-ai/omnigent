@@ -50,6 +50,7 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { iconForAgent } from "@/components/AgentCard";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -61,7 +62,6 @@ import {
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
-  RoutingModelSelect,
   defaultModelLabel,
   nativeModelLabel,
 } from "@/components/HarnessConfigControls";
@@ -1852,104 +1852,6 @@ export function AgentHarnessPicker({
   );
 }
 
-function SearchableModelPicker({
-  value,
-  options,
-  loading,
-  onValueChange,
-}: {
-  value: string;
-  options: readonly { id: string; displayName: string }[];
-  loading: boolean;
-  onValueChange: (value: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const selectedLabel =
-    value === MODEL_SELECT_DEFAULT
-      ? "Default"
-      : (options.find((option) => option.id === value)?.displayName ?? value);
-  const select = (nextValue: string) => {
-    onValueChange(nextValue);
-    setOpen(false);
-  };
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          aria-label="Model"
-          className="h-8 w-full justify-between gap-2 px-2.5 font-normal"
-          data-testid="new-chat-landing-config-model"
-        >
-          <span className="min-w-0 truncate">{selectedLabel}</span>
-          <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        align="start"
-        className="max-h-[var(--radix-popover-content-available-height)] w-[var(--radix-popover-trigger-width)] overflow-hidden p-0"
-      >
-        <Command className="h-auto min-h-0">
-          <CommandInput
-            placeholder="Search models…"
-            data-testid="new-chat-landing-config-model-search"
-          />
-          <CommandList
-            className="max-h-72 min-h-0 overflow-y-auto overscroll-contain"
-            onWheel={(event) => event.stopPropagation()}
-          >
-            <CommandItem
-              value={MODEL_SELECT_DEFAULT}
-              data-checked={value === MODEL_SELECT_DEFAULT}
-              onSelect={() => select(MODEL_SELECT_DEFAULT)}
-            >
-              Default
-            </CommandItem>
-            {options.map((option) => (
-              <CommandItem
-                key={option.id}
-                value={option.id}
-                keywords={[option.displayName]}
-                title={option.displayName}
-                data-model-id={option.id}
-                data-checked={value === option.id}
-                onSelect={() => select(option.id)}
-              >
-                <span className="min-w-0 truncate">{option.displayName}</span>
-              </CommandItem>
-            ))}
-            {!loading && <CommandEmpty>No models found</CommandEmpty>}
-            {loading && (
-              <div className="px-2 py-3 text-center text-xs text-muted-foreground">
-                Loading models…
-              </div>
-            )}
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-/**
- * Harness-configuration modal opened from the composer's gear icon. Shows the
- * selected agent's run-config knobs — Claude: model / effort / permissions;
- * Pi: model;
- * Codex/OpenCode: approval mode (+ Codex's dangerous full-bypass opt-in);
- * Cursor: exec mode; bundle agents: brain-harness override. On the fully-auto
- * harness the router owns harness and model, so every harness-specific knob
- * drops out — a bundle agent keeps its brain-harness row (the pick lives there
- * and is how the user switches away) plus a locked Permissions row.
- *
- * The modal edits a LOCAL draft seeded from the live state each time it opens,
- * and only commits to the parent state + per-harness persistence on Save;
- * Cancel / dismiss discards. This is the deliberate Save/Cancel UX (the old
- * in-dropdown submenu committed on every change).
- */
 function HarnessConfigModal({
   open,
   onOpenChange,
@@ -1957,33 +1859,18 @@ function HarnessConfigModal({
   brainHarnessLabels,
   host,
   hideUnconfigured,
-  smartRoutingEligible,
   permissionMode,
   approvalMode,
   cursorExecMode,
   agySkipMode,
   bypassSandbox,
-  pickedModel,
-  claudeModelOptions,
-  claudeModelsLoading,
-  claudeModelsError,
-  codexModelOptions,
-  codexModelsLoading,
-  codexModelsError,
-  piModelOptions,
-  piModelsLoading,
-  pickedEffort,
   pickedHarness,
-  costControlMode,
   setPermissionMode,
   setApprovalMode,
   setCursorExecMode,
   setAgySkipMode,
   setBypassSandbox,
-  setPickedModel,
-  setPickedEffort,
   setPickedHarness,
-  setCostControlMode,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -1991,35 +1878,18 @@ function HarnessConfigModal({
   brainHarnessLabels: Record<string, string>;
   host: Host | undefined | null;
   hideUnconfigured: boolean;
-  smartRoutingEligible: boolean;
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
   agySkipMode: string;
   bypassSandbox: boolean;
-  pickedModel: string;
-  claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
-  claudeModelsLoading: boolean;
-  claudeModelsError: string | null;
-  // Full catalog rows (not a narrowed Pick): the Effort row reads each
-  // model's supportedReasoningEfforts ladder off the same response.
-  codexModelOptions: readonly NativeModelOption[];
-  codexModelsLoading: boolean;
-  codexModelsError: string | null;
-  piModelOptions: readonly { id: string; displayName: string }[];
-  piModelsLoading: boolean;
-  pickedEffort: string;
   pickedHarness: string | null;
-  costControlMode: CostControlMode;
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
   setCursorExecMode: (mode: string) => void;
   setAgySkipMode: (mode: string) => void;
   setBypassSandbox: (enabled: boolean) => void;
-  setPickedModel: (model: string) => void;
-  setPickedEffort: (effort: string) => void;
   setPickedHarness: (harness: string | null, agentId?: string) => void;
-  setCostControlMode: (mode: CostControlMode) => void;
 }) {
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
@@ -2029,42 +1899,31 @@ function HarnessConfigModal({
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
   const hasAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
-  const hasModelPicker = nativeAgentHasCapability(agent, "modelPicker");
   const isCodex = entryHarness === "codex-native";
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
   // Local draft — seeded from the live state each time the modal opens so
   // Cancel can discard and re-opening always reflects the committed state.
-  const [draftModel, setDraftModel] = useState(pickedModel);
-  const [draftEffort, setDraftEffort] = useState(pickedEffort);
   const [draftPermission, setDraftPermission] = useState(permissionMode);
   const [draftApproval, setDraftApproval] = useState(approvalMode);
   const [draftCursor, setDraftCursor] = useState(cursorExecMode);
   const [draftAgySkip, setDraftAgySkip] = useState(agySkipMode);
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
-  const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
 
   useEffect(() => {
     if (!open) return;
-    setDraftModel(pickedModel);
-    setDraftEffort(pickedEffort);
     setDraftPermission(permissionMode);
     setDraftApproval(approvalMode);
     setDraftCursor(cursorExecMode);
     setDraftAgySkip(agySkipMode);
     setDraftBypass(bypassSandbox);
     setDraftHarness(pickedHarness);
-    setDraftRouting(costControlMode);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // Only treat routing as "on" when it's actually offered for this agent —
-  // otherwise a stale costControlMode="on" (e.g. server later disabled the
-  // flag) would select the __smart__ sentinel with no matching Select item.
-  const smartRoutingOn = smartRoutingEligible && draftRouting === "on";
   // Fully-auto: the router picks the harness AND the model, so the only knob
   // left is what the picked harness may do without asking. Everything else is
   // harness-specific and can't be decided before the pick.
@@ -2078,85 +1937,6 @@ function HarnessConfigModal({
   // bundle agent's routed brain is a knob on that agent, so the modal keeps its
   // name: "Configure Debby", not "Configure Smart Routing".
   const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
-  const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
-  const claudeModelSelectOptions = useMemo(
-    () =>
-      claudeModelOptions.map((m) => ({
-        id: m.id,
-        label: visibleModelLabel(nativeModelLabel(m)),
-      })),
-    [claudeModelOptions],
-  );
-  const codexModelSelectOptions = useMemo(
-    () =>
-      codexModelOptions.map((m) => ({
-        id: m.id,
-        label: visibleModelLabel(nativeModelLabel(m)),
-      })),
-    [codexModelOptions],
-  );
-  // Codex advertises a per-model effort ladder, so the Effort row follows the
-  // DRAFTED model — else picking another model still lists the old rungs.
-  // "Default" ("") resolves to the catalog-default row: for a new session
-  // that is the model a bare launch truly runs.
-  const codexEffortLevels = useMemo(
-    () =>
-      isCodex
-        ? codexEffortLevelsForModel(
-            codexModelOptions,
-            draftModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
-          )
-        : [],
-    [isCodex, codexModelOptions, draftModel],
-  );
-  // Drop a drafted level the newly-picked model doesn't offer, so no stale
-  // rung shows and Save never commits a level the model rejects. Codex only:
-  // other harnesses use a model-independent ladder.
-  const clampCodexDraftEffort = (modelId: string) => {
-    if (!isCodex) return;
-    setDraftEffort((prev) =>
-      prev &&
-      codexEffortLevelsForModel(
-        codexModelOptions,
-        modelId || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
-      ).includes(prev)
-        ? prev
-        : "",
-    );
-  };
-  // The host catalog re-polls while the modal is open (a provider switch under
-  // it). A draft the new catalog no longer lists would render a blank trigger,
-  // so it falls back to Default.
-  const draftModelOptions = hasPermission
-    ? claudeModelSelectOptions
-    : hasApproval
-      ? codexModelSelectOptions
-      : piModelOptions;
-  useEffect(() => {
-    if (!open || !draftModel || draftModelOptions.length === 0) return;
-    if (!draftModelOptions.some((m) => m.id === draftModel)) setDraftModel("");
-  }, [open, draftModel, draftModelOptions]);
-  const onModelChange = (value: string) => {
-    if (value === MODEL_SELECT_SMART) {
-      setDraftRouting("on");
-      setDraftModel("");
-      // The router picks the model (and its effort) per turn, so an explicit
-      // effort is meaningless — reset it so it doesn't ride along frozen.
-      setDraftEffort("");
-    } else if (value === MODEL_SELECT_DEFAULT) {
-      setDraftModel("");
-      // "Default" = no override; defer routing to the spec default (null,
-      // omitted from create) — never emit an explicit "on"/"off".
-      setDraftRouting(null);
-      clampCodexDraftEffort("");
-    } else {
-      setDraftModel(value);
-      // Picking an explicit model turns routing off (mutually exclusive).
-      setDraftRouting(null);
-      clampCodexDraftEffort(value);
-    }
-  };
-
   const save = () => {
     // Top-level Smart Routing has nothing to commit — the router owns the
     // harness and model, and Permissions is locked to Default. Committing the
@@ -2167,37 +1947,15 @@ function HarnessConfigModal({
       return;
     }
     if (hasPermission) {
-      // Order matters: commit model first (its setter clears routing when a
-      // model is set), then routing (its setter clears the model when "on") —
-      // the two setters enforce the mutual exclusion between them.
-      setPickedModel(draftModel);
-      setPickedEffort(draftEffort);
       setPermissionMode(draftPermission);
-      if (entryHarness) {
-        writeHarnessOption(entryHarness, {
-          model: draftModel,
-          effort: draftEffort,
-          mode: draftPermission,
-        });
-      }
-    } else if (hasModelPicker) {
-      setPickedModel(draftModel);
-      setPickedEffort(draftEffort);
-      if (entryHarness)
-        writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
+      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftPermission });
     } else if (hasApproval) {
-      if (isCodex) {
-        setPickedModel(draftModel);
-        setPickedEffort(draftEffort);
-      }
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
-      if (entryHarness) {
+      if (entryHarness)
         writeHarnessOption(entryHarness, {
           mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
-          ...(isCodex ? { model: draftModel, effort: draftEffort } : {}),
         });
-      }
     } else if (hasCursor) {
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
@@ -2207,28 +1965,6 @@ function HarnessConfigModal({
     } else if (brainDefault) {
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
-    }
-    // Smart Routing rides the Model dropdown on both routable harnesses
-    // (Claude Code and Codex), so commit it outside the per-capability branches.
-    // Remembered per harness like the model pick, so the next new session with
-    // this harness starts on it again.
-    if (smartRoutingEligible) {
-      setCostControlMode(draftRouting);
-      if (draftRouting === "on") {
-        // Routing owns the model and its effort, so clear both — live state AND
-        // the harness's remembered pick. A harness whose modal has no model
-        // picker (Codex) never touches them in its own branch above, so a model
-        // remembered from an earlier build would otherwise survive and ride
-        // along with routing, which the server reads as an already-pinned model.
-        setPickedModel("");
-        setPickedEffort("");
-      }
-      if (entryHarness) {
-        writeHarnessOption(entryHarness, {
-          routing: draftRouting === "on" ? "on" : "off",
-          ...(draftRouting === "on" ? { model: "", effort: "" } : {}),
-        });
-      }
     }
     onOpenChange(false);
   };
@@ -2256,207 +1992,43 @@ function HarnessConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {!autoRouting && hasModelPicker && !hasPermission && (
-            <>
-              <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
-                <SearchableModelPicker
-                  value={modelValue}
-                  options={piModelOptions}
-                  loading={piModelsLoading}
-                  onValueChange={onModelChange}
-                />
-              </ConfigRow>
-              <ConfigRow label="Thinking level" description="Reasoning depth vs. speed">
-                <Select
-                  value={draftEffort || EFFORT_SELECT_NONE}
-                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
-                >
-                  <SelectTrigger
-                    className="w-full cursor-pointer"
-                    data-testid="new-chat-landing-config-pi-effort"
-                    aria-label="Thinking level"
-                  >
-                    <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
-                  </SelectTrigger>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
-                  >
-                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                    {PI_NATIVE_EFFORTS.map((e) => (
-                      <SelectItem key={e.value} value={e.value}>
-                        {e.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </ConfigRow>
-            </>
-          )}
-
           {!autoRouting && hasPermission && (
-            <>
-              <ConfigRow label="Model" description="Underlying LLM">
-                <RoutingModelSelect
-                  value={modelValue}
-                  onValueChange={onModelChange}
-                  offerSmartRouting={smartRoutingEligible}
-                  testId="new-chat-landing-config-model"
-                  models={claudeModelSelectOptions}
-                  defaultLabel={visibleModelLabel(defaultModelLabel(claudeModelOptions))}
-                  contentClassName="[&_[data-slot=select-item]]:pl-2.5"
-                  componentId="new_chat.config.model"
-                >
-                  {claudeModelsLoading && (
-                    <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
-                  )}
-                  {!claudeModelsLoading && claudeModelOptions.length === 0 && (
-                    <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      {claudeModelsError ?? "Models unavailable"}
-                    </div>
-                  )}
-                </RoutingModelSelect>
-              </ConfigRow>
-
-              <ConfigRow label="Effort" description="Reasoning depth vs. speed">
-                <Select
-                  // Smart Routing picks the model (and its effort) per
-                  // turn, so an explicit effort is meaningless: the row is
-                  // frozen and reads as an em-dash placeholder. Radix shows the
-                  // placeholder for the empty value, which no item can carry.
-                  value={smartRoutingOn ? "" : draftEffort || EFFORT_SELECT_NONE}
-                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
-                  disabled={smartRoutingOn}
-                >
-                  <SelectTrigger
-                    className="w-full cursor-pointer"
-                    data-testid="new-chat-landing-config-effort"
-                    aria-label="Reasoning effort"
-                  >
-                    <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
-                  </SelectTrigger>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
-                  >
-                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                    {CLAUDE_NATIVE_EFFORTS.map((e) => (
-                      <SelectItem key={e.value} value={e.value}>
-                        {e.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </ConfigRow>
-
-              <ConfigRow label="Permissions" description="What the agent can do without asking">
-                <DescribedSelect
-                  value={draftPermission}
-                  onValueChange={setDraftPermission}
-                  options={CLAUDE_NATIVE_PERMISSION_MODES}
-                  testId="new-chat-landing-config-permission"
-                  ariaLabel="Permissions"
-                  componentId="new_chat.config.permission"
-                />
-              </ConfigRow>
-            </>
+            <ConfigRow label="Permissions" description="What the agent can do without asking">
+              <DescribedSelect
+                value={draftPermission}
+                onValueChange={setDraftPermission}
+                options={CLAUDE_NATIVE_PERMISSION_MODES}
+                testId="new-chat-landing-config-permission"
+                ariaLabel="Permissions"
+                componentId="new_chat.config.permission"
+              />
+            </ConfigRow>
           )}
 
           {!autoRouting && hasApproval && (
-            <>
-              {/* Codex's catalog is resolved by the host, so the row lists real
-              models alongside the two choices the create call can express on its
-              own: the harness's default, or the router picking per turn (only
-              when routing is offered). */}
-              <ConfigRow label="Model" description="Underlying LLM">
-                <RoutingModelSelect
-                  value={modelValue}
-                  onValueChange={onModelChange}
-                  offerSmartRouting={smartRoutingEligible}
-                  testId="new-chat-landing-config-model"
-                  models={codexModelSelectOptions}
-                  defaultLabel={visibleModelLabel(defaultModelLabel(codexModelOptions))}
-                  contentClassName="[&_[data-slot=select-item]]:pl-2.5"
-                  componentId="new_chat.config.model"
-                >
-                  {codexModelsLoading && (
-                    <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
-                  )}
-                  {!codexModelsLoading && codexModelOptions.length === 0 && (
-                    <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      {codexModelsError ?? "Models unavailable"}
-                    </div>
-                  )}
-                </RoutingModelSelect>
-              </ConfigRow>
-              {/* Codex's effort ladder is per-model metadata off the same
-              catalog response; hidden when the drafted model advertises no
-              levels (mirroring the in-session gear's composer-config-effort
-              row). */}
-              {isCodex && codexEffortLevels.length > 0 && (
-                <ConfigRow label="Effort" description="Reasoning depth vs. speed">
-                  <Select
-                    // Smart Routing picks the model (and its effort) per
-                    // turn, so an explicit effort is meaningless: the row is
-                    // frozen and reads as an em-dash placeholder. Radix shows
-                    // the placeholder for the empty value, which no item can
-                    // carry.
-                    value={smartRoutingOn ? "" : draftEffort || EFFORT_SELECT_NONE}
-                    onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
-                    disabled={smartRoutingOn}
-                  >
-                    <SelectTrigger
-                      className="w-full cursor-pointer"
-                      data-testid="new-chat-landing-config-effort"
-                      aria-label="Reasoning effort"
-                    >
-                      <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
-                    </SelectTrigger>
-                    <SelectContent
-                      position="popper"
-                      align="start"
-                      className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
-                    >
-                      <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                      {/* Codex efforts render raw — its ids aren't title-cased
-                      (matching the in-session gear's labeling). */}
-                      {codexEffortLevels.map((level) => (
-                        <SelectItem key={level} value={level}>
-                          {level}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </ConfigRow>
-              )}
-              <ConfigRow label="Approval" description="What the agent can do without asking">
-                <DescribedSelect
-                  // Codex adds the DANGEROUS full-bypass as a 4th option; when
-                  // armed the select shows it (draftBypass wins over the preset).
-                  value={
-                    isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval
+            <ConfigRow label="Approval" description="What the agent can do without asking">
+              <DescribedSelect
+                // Codex adds the DANGEROUS full-bypass as a 4th option; when
+                // armed the select shows it (draftBypass wins over the preset).
+                value={isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval}
+                onValueChange={(v) => {
+                  if (v === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
+                    setDraftBypass(true);
+                  } else {
+                    setDraftBypass(false);
+                    setDraftApproval(v);
                   }
-                  onValueChange={(v) => {
-                    if (v === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
-                      setDraftBypass(true);
-                    } else {
-                      setDraftBypass(false);
-                      setDraftApproval(v);
-                    }
-                  }}
-                  options={
-                    isCodex
-                      ? [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
-                      : CODEX_NATIVE_APPROVAL_MODES
-                  }
-                  testId="new-chat-landing-config-approval"
-                  ariaLabel="Approval"
-                  componentId="new_chat.config.approval"
-                />
-              </ConfigRow>
-            </>
+                }}
+                options={
+                  isCodex
+                    ? [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
+                    : CODEX_NATIVE_APPROVAL_MODES
+                }
+                testId="new-chat-landing-config-approval"
+                ariaLabel="Approval"
+                componentId="new_chat.config.approval"
+              />
+            </ConfigRow>
           )}
 
           {!autoRouting && hasCursor && (
@@ -3770,6 +3342,24 @@ export function NewChatLandingScreen() {
       : selectedNativeHarness === "codex-native"
         ? codexModelOptions
         : [];
+  const [pickerModelSearch, setPickerModelSearch] = useState("");
+  const pickerModelsLoading =
+    !sandboxSelected &&
+    selectedHostId !== null &&
+    (selectedNativeHarness === "claude-native"
+      ? hostClaudeModelsLoading
+      : selectedNativeHarness === "codex-native"
+        ? hostCodexModelsLoading
+        : selectedNativeHarness === "pi-native"
+          ? hostPiModelsLoading
+          : false);
+  const pickerModelsError =
+    selectedNativeHarness === "claude-native"
+      ? hostClaudeModelsError
+      : selectedNativeHarness === "codex-native"
+        ? hostCodexModelsError
+        : null;
+  useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
     : selectedNativeHarness === "pi-native"
@@ -3782,6 +3372,7 @@ export function NewChatLandingScreen() {
         : [];
   const selectPickerModel = (model: string) => {
     if (!selectedNativeHarness) return;
+    userPickedModelRef.current = true;
     if (model === MODEL_SELECT_SMART) {
       setPickedModel("");
       setPickedEffort("");
@@ -3825,25 +3416,68 @@ export function NewChatLandingScreen() {
           <DropdownMenuSeparator />
         </>
       )}
-      {pickerModelOptions.length > 0 && (
+      {(supportsModelPicker ||
+        supportsPermissionMode ||
+        selectedNativeHarness === "codex-native") && (
         <div data-testid="new-chat-landing-agent-models">
           <PickerSectionHeader>Models</PickerSectionHeader>
-          {pickerModelOptions.map((option) => (
-            <DropdownMenuCheckboxItem
-              key={option.id}
-              checked={
-                !routingOn &&
-                (pickedModel === option.id || (pickedModel === "" && option.isDefault === true))
-              }
-              onCheckedChange={() =>
-                selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id)
-              }
-              onSelect={(event) => event.preventDefault()}
-              data-testid={`new-chat-landing-agent-model-${option.id}`}
-            >
-              {visibleModelLabel(nativeModelLabel(option))}
-            </DropdownMenuCheckboxItem>
-          ))}
+          {selectedNativeHarness === "pi-native" && (
+            <Input
+              aria-label="Search models"
+              placeholder="Search models…"
+              value={pickerModelSearch}
+              onChange={(event) => setPickerModelSearch(event.target.value)}
+              onKeyDown={(event) => event.stopPropagation()}
+              data-testid="new-chat-landing-agent-model-search"
+            />
+          )}
+          {pickerModelsLoading && (
+            <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
+          )}
+          {!pickerModelsLoading && pickerModelOptions.length === 0 && (
+            <div className="px-2 py-1 text-xs text-muted-foreground">
+              {pickerModelsError?.message ?? "Models unavailable"}
+            </div>
+          )}
+          {pickerModelOptions.length > 0 &&
+            !pickerModelOptions.some((option) => option.isDefault) && (
+              <DropdownMenuCheckboxItem
+                checked={!routingOn && pickedModel === ""}
+                onCheckedChange={() => selectPickerModel(MODEL_SELECT_DEFAULT)}
+                onSelect={(event) => event.preventDefault()}
+                data-testid="new-chat-landing-agent-model-default"
+              >
+                Harness default
+              </DropdownMenuCheckboxItem>
+            )}
+          {pickerModelOptions
+            .filter((option) =>
+              pickerModelSearch
+                .toLowerCase()
+                .trim()
+                .split(/\s+/)
+                .every((term) =>
+                  `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
+                ),
+            )
+            .map((option) => (
+              <DropdownMenuCheckboxItem
+                key={option.id}
+                checked={
+                  !routingOn &&
+                  (pickedModel === option.id || (pickedModel === "" && option.isDefault === true))
+                }
+                onCheckedChange={() =>
+                  selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id)
+                }
+                onSelect={(event) => event.preventDefault()}
+                data-testid={`new-chat-landing-agent-model-${option.id}`}
+                title={nativeModelLabel(option)}
+                className="whitespace-normal break-words [&>span:last-child]:min-w-0"
+              >
+                {visibleModelLabel(nativeModelLabel(option))}
+              </DropdownMenuCheckboxItem>
+            ))}
         </div>
       )}
       {pickerEffortOptions.length > 0 && (
@@ -6366,55 +6000,18 @@ export function NewChatLandingScreen() {
                         brainHarnessLabels={brainHarnessLabels}
                         host={harnessWarningHost}
                         hideUnconfigured={hideUnconfiguredHarnesses}
-                        smartRoutingEligible={smartRoutingEligible}
                         permissionMode={permissionMode}
                         approvalMode={approvalMode}
                         cursorExecMode={cursorExecMode}
                         agySkipMode={agySkipMode}
                         bypassSandbox={bypassSandbox}
-                        pickedModel={pickedModel}
-                        claudeModelOptions={claudeModelOptions}
-                        claudeModelsLoading={
-                          !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
-                        }
-                        claudeModelsError={
-                          !sandboxSelected ? (hostClaudeModelsError?.message ?? null) : null
-                        }
-                        codexModelOptions={codexModelOptions}
-                        codexModelsLoading={
-                          !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
-                        }
-                        codexModelsError={
-                          !sandboxSelected ? (hostCodexModelsError?.message ?? null) : null
-                        }
-                        piModelOptions={piModelOptions}
-                        piModelsLoading={
-                          !sandboxSelected && selectedHostId !== null && hostPiModelsLoading
-                        }
-                        pickedEffort={pickedEffort}
                         pickedHarness={pickedHarness}
-                        costControlMode={costControlMode}
                         setPermissionMode={setPermissionMode}
                         setApprovalMode={setApprovalMode}
                         setCursorExecMode={setCursorExecMode}
                         setAgySkipMode={setAgySkipMode}
                         setBypassSandbox={setBypassSandbox}
-                        setPickedModel={(m) => {
-                          // A commit from the config modal is the user's explicit
-                          // choice for this visit — later async project-config
-                          // arrivals must not reseed over it.
-                          userPickedModelRef.current = true;
-                          setPickedModel(m);
-                        }}
-                        setPickedEffort={setPickedEffort}
                         setPickedHarness={handleSetPickedHarness}
-                        setCostControlMode={(mode) => {
-                          // Turning routing on drops the model pick by design;
-                          // that too is an explicit user decision the project
-                          // default must not override afterwards.
-                          userPickedModelRef.current = true;
-                          setCostControlMode(mode);
-                        }}
                       />
                     )}
                     <ComposerMicButton

@@ -138,29 +138,29 @@ def test_codex_native_picker_uses_raw_model_metadata(
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
         "Codex Pretty 5.5", timeout=15_000
     )
-    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xhigh")
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
     page.get_by_test_id("composer-config-gear").hover()
     expect(page.get_by_test_id("composer-config-gear-tooltip")).to_contain_text("Codex")
 
     # Open the config modal; its Model dropdown renders Codex's displayName raw.
     page.get_by_test_id("composer-config-gear").click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
-    page.get_by_test_id("composer-config-model").click()
-    model_row = page.locator('[role="option"][data-model-id="gpt-5.5"]')
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
+
+    model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.5"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("Codex Pretty 5.5")
     # Re-select the current model to close the listbox without sending Escape
     # to the surrounding dialog.
-    model_row.click()
-    expect(model_row).to_be_hidden()
-    effort_trigger = page.get_by_test_id("composer-config-effort")
+
+    expect(model_row).to_be_visible()
+    effort_trigger = page.get_by_test_id("composer-agent-efforts")
     expect(effort_trigger).to_be_visible()
-    effort_trigger.click()
-    effort_row = page.locator('[role="option"][data-effort-level="xhigh"]')
+
+    effort_row = page.locator('[role="menuitemcheckbox"][data-effort-level="xhigh"]')
     expect(effort_row).to_be_visible()
-    expect(effort_row).to_contain_text("xhigh")
+    expect(effort_row).to_contain_text("xHigh")
     # Codex effort ids render raw (not title-cased) even in the shared Select.
     assert effort_row.evaluate("el => getComputedStyle(el).textTransform") == "none"
 
@@ -189,14 +189,14 @@ def test_custom_codex_native_agent_keeps_model_and_effort_controls(
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
         "Codex Pretty 5.5", timeout=15_000
     )
-    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xhigh")
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible()
     gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    expect(page.get_by_test_id("composer-config-model")).to_be_visible()
-    expect(page.get_by_test_id("composer-config-effort")).to_contain_text("xhigh")
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-models")).to_be_visible()
+    expect(page.get_by_test_id("composer-agent-efforts")).to_contain_text("xHigh")
 
 
 def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
@@ -370,24 +370,26 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
 
     # The Effort row is present although the session catalog is still empty.
-    effort_trigger = page.get_by_test_id("composer-config-effort")
+    effort_trigger = page.get_by_test_id("composer-agent-efforts")
     expect(effort_trigger).to_be_visible(timeout=10_000)
 
     # The Model menu lists the host probe row under its display name.
-    page.get_by_test_id("composer-config-model").click()
-    model_row = page.locator('[role="option"][data-model-id="gpt-5.6-luna"]')
+
+    model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("GPT-5.6-Luna")
     # Re-select the current model to close the listbox without sending
     # Escape to the surrounding dialog.
-    model_row.click()
-    expect(model_row).to_be_hidden()
+
+    expect(model_row).to_be_visible()
 
     # The Effort menu offers exactly the host row's reasoning efforts.
-    effort_trigger.click()
+
     for level in ("low", "medium", "xhigh"):
-        expect(page.locator(f'[role="option"][data-effort-level="{level}"]')).to_be_visible()
+        expect(
+            page.locator(f'[role="menuitemcheckbox"][data-effort-level="{level}"]')
+        ).to_be_visible()

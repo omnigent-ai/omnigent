@@ -38,6 +38,8 @@ describe("shared composer controls", () => {
     expect(trigger).toHaveClass("w-auto");
     expect(trigger).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
     expect(trigger).toHaveTextContent("High");
+    expect(screen.getByTestId("composer-agent-model-value")).not.toHaveClass("truncate");
+    expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
   });
 
@@ -46,7 +48,7 @@ describe("shared composer controls", () => {
     render(
       <ComposerPermissionPicker
         label="Permissions"
-        value="Manual"
+        value="Bypass permissions"
         options={[
           { value: "manual", label: "Manual" },
           { value: "plan", label: "Plan" },
@@ -54,8 +56,10 @@ describe("shared composer controls", () => {
         onSelect={onSelect}
       />,
     );
-    const trigger = screen.getByRole("button", { name: "Permissions: Manual" });
-    expect(screen.getByText("Manual")).not.toHaveClass("hidden");
+    const trigger = screen.getByRole("button", { name: "Permissions: Bypass permissions" });
+    for (const forbidden of ["hidden", "max-w-20", "truncate"]) {
+      expect(screen.getByText("Bypass permissions")).not.toHaveClass(forbidden);
+    }
     expect(trigger).toHaveClass("w-auto", "gap-1", "px-2");
     fireEvent.keyDown(trigger, {
       key: "ArrowDown",

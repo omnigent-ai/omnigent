@@ -1179,6 +1179,11 @@ function selectUnconfiguredAgent(agentId: string): void {
 
 /** Select <agentId>, open its config submenu, then open Advanced settings. */
 function openAgentConfig(agentId: string): void {
+  openAgentModels(agentId);
+  fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+}
+
+function openAgentModels(agentId: string): void {
   const picker = screen.getByTestId("new-chat-landing-agent-select");
   fireEvent.pointerDown(picker, { button: 0 });
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
@@ -1192,7 +1197,33 @@ function openAgentConfig(agentId: string): void {
     }
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
-  fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+}
+
+function pickPrimaryOption(section: "model" | "effort", label: string): void {
+  const scope =
+    section === "effort"
+      ? screen.getByTestId("new-chat-landing-agent-efforts")
+      : screen.getByTestId("new-chat-landing-agent-models").closest<HTMLElement>('[role="menu"]')!;
+  fireEvent.click(within(scope).getByRole("menuitemcheckbox", { name: label }));
+}
+function selectedPickerModel(): HTMLElement {
+  return screen
+    .getAllByRole("menuitemcheckbox", { checked: true })
+    .find((item) => item.dataset.testid?.startsWith("new-chat-landing-agent-model-"))!;
+}
+function selectedPickerEffort(): HTMLElement {
+  return within(screen.getByTestId("new-chat-landing-agent-efforts")).getByRole(
+    "menuitemcheckbox",
+    { checked: true },
+  );
+}
+function closePrimaryPicker(): void {
+  fireEvent.keyDown(
+    screen.getByTestId("new-chat-landing-agent-models").closest<HTMLElement>('[role="menu"]')!,
+    { key: "Escape" },
+  );
+  const row = screen.queryByTestId("new-chat-landing-agent-a1");
+  if (row) fireEvent.keyDown(row, { key: "Escape" });
 }
 
 /** Open a Radix Select trigger (opens on pointerdown in jsdom). */
@@ -1598,7 +1629,8 @@ describe("NewChatLandingScreen", () => {
     );
     expect(permission.querySelectorAll("svg")[0]).toHaveClass("size-3");
     expect(permission.querySelectorAll("svg")[1]).toHaveClass("size-4");
-    expect(permission.querySelector("span")).toHaveClass("max-w-20", "truncate", "text-ui");
+    expect(permission.querySelector("span")).toHaveClass("whitespace-nowrap", "text-ui");
+    expect(permission.querySelector("span")).not.toHaveClass("truncate");
     expect(permission.querySelector("span")).not.toHaveClass("hidden");
     expect(worktree).toHaveClass(
       "h-6",
@@ -1621,7 +1653,7 @@ describe("NewChatLandingScreen", () => {
     expect(worktree.querySelectorAll("svg")[0]).toHaveClass("size-3.5");
     expect(worktree.querySelectorAll("svg")[1]).toHaveClass("size-3");
     expect(harness).toHaveClass(
-      "h-8",
+      "min-h-8",
       "min-w-0",
       "w-auto",
       "max-w-full",
@@ -1631,7 +1663,7 @@ describe("NewChatLandingScreen", () => {
       "pr-0",
       "text-[13px]",
       "leading-5",
-      "md:h-7",
+      "md:min-h-7",
     );
     expect(harness).not.toHaveClass("px-2");
     expect(voice).toHaveClass("size-8", "md:size-7");
@@ -1732,7 +1764,8 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass(
       "min-w-0",
-      "truncate",
+      "whitespace-normal",
+      "break-words",
       "text-ui",
       "font-medium",
       "text-foreground",
@@ -1769,14 +1802,21 @@ describe("NewChatLandingScreen", () => {
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
-      "hidden",
       "shrink-0",
       "text-ui",
       "font-normal",
       "text-muted-foreground",
-      "md:inline",
     );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).not.toHaveClass("hidden");
     expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort High");
+  });
+
+  it("does not duplicate model or effort controls in landing Advanced settings", () => {
+    renderLanding();
+    openAgentConfig("a2");
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
   });
 
   it("offers model-specific Codex effort in the adjacent selector and sends the selection", async () => {
@@ -1862,7 +1902,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
   });
 
-  it("sizes model names to content and only truncates at the available control width", () => {
+  it("sizes model names to content and wraps instead of truncating", () => {
     vi.stubGlobal(
       "SpeechRecognition",
       class {
@@ -1892,7 +1932,8 @@ describe("NewChatLandingScreen", () => {
     expect(picker).toHaveClass("w-auto", "max-w-full", "pl-2", "pr-0");
     expect(picker).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
     expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "px-2");
-    expect(model).toHaveClass("min-w-0", "truncate");
+    expect(model).toHaveClass("min-w-0", "whitespace-normal", "break-words");
+    expect(model).not.toHaveClass("truncate");
     expect(model).toHaveTextContent("Extraordinarily Long Claude Model Name");
     expect(voice).toHaveClass("shrink-0", "size-8", "md:size-7");
     expect(submit.parentElement).toHaveClass("shrink-0");
@@ -1906,7 +1947,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(permission, { button: 0 });
     expect(screen.queryByRole("dialog")).toBeNull();
     const permissionMenu = screen.getByTestId("new-chat-landing-permission-menu");
-    expect(permissionMenu).toHaveClass("w-[13.75rem]", "min-w-0");
+    expect(permissionMenu).toHaveClass("w-max", "min-w-[13.75rem]", "max-w-[calc(100vw-2rem)]");
     expect(permissionMenu).toHaveTextContent("Bypass permissions");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-option-acceptEdits"));
@@ -2254,9 +2295,9 @@ describe("NewChatLandingScreen", () => {
 
   it("names Smart Routing model and effort semantics in the harness trigger", () => {
     renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
+    openAgentModels("a1");
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
 
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
       "Claude Code, Model Smart Routing, Effort —",
@@ -2761,25 +2802,18 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows the Claude Code config knobs (model / effort / permission mode) in the gear modal", () => {
+  it("keeps model and effort in the primary picker and permissions in Advanced", () => {
     renderLanding();
-    // The knobs live in the gear-icon config modal — absent until it's opened.
-    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-    // a1 (Claude Code, claude-native) is the default agent. Open its config
-    // modal: model + effort + permission-mode selects all appear together.
-    openAgentConfig("a1");
-    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-config-effort")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-config-permission")).toBeTruthy();
-    // The model select offers the selected host's live catalog (mocked to
-    // Opus 4.8 / Sonnet 4.6 / Haiku 4.5) — never the removed/static rows.
-    openSelect("new-chat-landing-config-model");
-    expect(screen.getByText("Opus 4.8")).toBeTruthy();
-    expect(screen.getByText("Sonnet 4.6")).toBeTruthy();
+    openAgentModels("a1");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" })).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Sonnet 4.6" })).toBeVisible();
     expect(screen.queryByText("Fable")).toBeNull();
     expect(screen.queryByText("Sonnet 5")).toBeNull();
-    closeMenu();
-    // The permission select offers every permission mode.
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
     openSelect("new-chat-landing-config-permission");
     expect(screen.getByText("Plan")).toBeTruthy();
     expect(screen.getByText("Bypass permissions")).toBeTruthy();
@@ -2791,9 +2825,9 @@ describe("NewChatLandingScreen", () => {
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
     renderLanding();
-    openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Haiku 4.5");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Haiku 4.5");
+    openAgentModels("a1");
+    pickPrimaryOption("model", "Haiku 4.5");
+    expect(selectedPickerModel().textContent).toContain("Haiku 4.5");
 
     // The host's provider changes under the open modal: its next poll of the
     // catalog no longer lists the pick.
@@ -2811,12 +2845,12 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
     });
-    const trigger = screen.getByTestId("new-chat-landing-config-model");
-    expect(trigger.textContent).toContain("Default");
+    const trigger = selectedPickerModel();
+    expect(trigger.textContent).toContain("Harness default");
     expect(trigger.textContent).not.toContain("Haiku 4.5");
 
     // Saving the fallback sends no override, so the launch uses the provider's default.
-    saveConfig();
+    closePrimaryPicker();
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
@@ -2828,7 +2862,7 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     // Open Codex's (a2) config modal — it carries the approval-mode select.
     openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
     openSelect("new-chat-landing-config-approval");
     expect(screen.getByText("Full access")).toBeTruthy();
@@ -2841,16 +2875,15 @@ describe("NewChatLandingScreen", () => {
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
     renderLanding();
-    openAgentConfig("a2");
+    openAgentModels("a2");
     // With no model pinned, the row lists the catalog default's (GPT-5.5)
     // ladder — raw Codex ids, never another model's rungs.
-    openSelect("new-chat-landing-config-effort");
-    expect(screen.getByRole("option", { name: "low" })).toBeTruthy();
-    expect(screen.getByRole("option", { name: "medium" })).toBeTruthy();
-    expect(screen.queryByRole("option", { name: "xhigh" })).toBeNull();
-    fireEvent.click(screen.getByRole("option", { name: "high" }));
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
-    saveConfig();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Low" })).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Medium" })).toBeTruthy();
+    expect(screen.queryByRole("menuitemcheckbox", { name: "xHigh" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    expect(selectedPickerEffort().textContent).toContain("High");
+    closePrimaryPicker();
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
@@ -2870,20 +2903,18 @@ describe("NewChatLandingScreen", () => {
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
     renderLanding();
-    openAgentConfig("a2");
+    openAgentModels("a2");
     // Pin GPT-5.6: the Effort row follows the DRAFTED model, so its ladder
     // swaps in (xhigh appears, low disappears).
-    pickSelectOption("new-chat-landing-config-model", "GPT-5.6");
-    openSelect("new-chat-landing-config-effort");
-    expect(screen.queryByRole("option", { name: "low" })).toBeNull();
-    fireEvent.click(screen.getByRole("option", { name: "xhigh" }));
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("xhigh");
-    // Back to Default (GPT-5.5), whose ladder has no xhigh: the stale rung
+    pickPrimaryOption("model", "GPT-5.6");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Low" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "xHigh" }));
+    expect(selectedPickerEffort().textContent).toContain("xHigh");
+    // Back to GPT-5.5, whose ladder has no xhigh: the stale rung
     // resets so Save can't commit a level the model rejects.
-    openSelect("new-chat-landing-config-model");
-    fireEvent.click(screen.getByRole("option", { name: "Default (GPT-5.5)" }));
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("Default");
-    saveConfig();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "GPT-5.5" }));
+    expect(selectedPickerEffort().textContent).toContain("Default");
+    closePrimaryPicker();
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
@@ -2897,19 +2928,19 @@ describe("NewChatLandingScreen", () => {
 
   it("remembers the Codex effort per harness without leaking it onto Claude", () => {
     renderLanding();
-    openAgentConfig("a2");
-    pickSelectOption("new-chat-landing-config-effort", "high");
-    saveConfig();
+    openAgentModels("a2");
+    pickPrimaryOption("effort", "High");
+    closePrimaryPicker();
 
     // Claude's row reopens on its own remembered effort (nothing stored →
     // Default) — the Codex pick must not ride the shared state across.
-    openAgentConfig("a1");
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("Default");
-    saveConfig();
+    openAgentModels("a1");
+    expect(selectedPickerEffort().textContent).toContain("Default");
+    closePrimaryPicker();
 
     // Codex reopens on the remembered pick, still valid for its ladder.
-    openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
+    openAgentModels("a2");
+    expect(selectedPickerEffort().textContent).toContain("High");
   });
 
   it("sends the selected Codex launch model without changing Claude's remembered model", async () => {
@@ -2919,25 +2950,22 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     renderLanding();
 
-    openAgentConfig("a2");
-    openSelect("new-chat-landing-config-model");
-    expect(screen.getAllByText("Default (GPT-5.5)").length).toBeGreaterThan(0);
+    openAgentModels("a2");
+    expect(screen.getAllByText("GPT-5.5").length).toBeGreaterThan(0);
     expect(screen.getByText("GPT-5.6")).toBeTruthy();
     fireEvent.click(screen.getByText("GPT-5.6"));
-    saveConfig();
+    closePrimaryPicker();
 
     // The Codex model is remembered under codex-native only; Claude Code's
     // picker should reopen on its own Default instead of inheriting the GPT id.
-    openAgentConfig("a1");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Default");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).not.toContain(
-      "GPT-5.6",
-    );
-    saveConfig();
+    openAgentModels("a1");
+    expect(selectedPickerModel().textContent).toContain("Harness default");
+    expect(selectedPickerModel().textContent).not.toContain("GPT-5.6");
+    closePrimaryPicker();
 
-    openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("GPT-5.6");
-    saveConfig();
+    openAgentModels("a2");
+    expect(selectedPickerModel().textContent).toContain("GPT-5.6");
+    closePrimaryPicker();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
     });
@@ -5259,20 +5287,19 @@ describe("NewChatLandingScreen smart routing", () => {
   // the server flag off, Smart Routing is never an option.
   it.each([
     ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
-    ["Claude Code", "a1", false, null, "Default"],
-    ["Codex", "a2", true, "Smart Routing", "Default (GPT-5.5)"],
+    ["Claude Code", "a1", false, null, "Harness default"],
+    ["Codex", "a2", true, "Smart Routing", "GPT-5.5"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
     (_label, agentId, flag, routingOption, siblingOption) => {
       renderLanding({ smart_routing_enabled: flag });
-      openAgentConfig(agentId);
-      openSelect("new-chat-landing-config-model");
+      openAgentModels(agentId);
       if (routingOption === null) {
-        expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
+        expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeNull();
       } else {
-        expect(screen.getByRole("option", { name: routingOption })).toBeTruthy();
+        expect(screen.getByRole("menuitemcheckbox", { name: routingOption })).toBeTruthy();
       }
-      expect(screen.getByRole("option", { name: siblingOption })).toBeTruthy();
+      expect(screen.getByRole("menuitemcheckbox", { name: siblingOption })).toBeTruthy();
     },
   );
 
@@ -5317,16 +5344,15 @@ describe("NewChatLandingScreen smart routing", () => {
     (_label, agentId, gateway, offered) => {
       mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
       renderLanding({ smart_routing_enabled: true });
-      openAgentConfig(agentId);
-      openSelect("new-chat-landing-config-model");
+      openAgentModels(agentId);
       if (offered) {
-        expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
+        expect(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeTruthy();
       } else {
         // The row stays — it still names the harness's own models — but the
         // routing sentinel is gone.
-        expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
+        expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeNull();
         expect(
-          screen.getByRole("option", {
+          screen.getByRole("menuitemcheckbox", {
             name: agentId === "a2" ? "GPT-5.6" : "Opus 4.8",
           }),
         ).toBeTruthy();
@@ -5348,9 +5374,8 @@ describe("NewChatLandingScreen smart routing", () => {
         smart_routing_enabled: true,
         smart_routing_sources: { external: true, oss: true },
       });
-      openAgentConfig(agentId);
-      openSelect("new-chat-landing-config-model");
-      expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
+      openAgentModels(agentId);
+      expect(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeTruthy();
     },
   );
 
@@ -5365,9 +5390,8 @@ describe("NewChatLandingScreen smart routing", () => {
       smart_routing_enabled: true,
       smart_routing_sources: { external: false, oss: true },
     });
-    openAgentConfig("a1");
-    openSelect("new-chat-landing-config-model");
-    expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
+    openAgentModels("a1");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeTruthy();
   });
 
   // Neither source can answer, so the option goes even on a gateway-backed
@@ -5383,34 +5407,33 @@ describe("NewChatLandingScreen smart routing", () => {
       smart_routing_enabled: true,
       smart_routing_sources: { external: false, oss: false },
     });
-    openAgentConfig("a1");
-    openSelect("new-chat-landing-config-model");
-    expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
-    expect(screen.getByRole("option", { name: "Opus 4.8" })).toBeTruthy();
+    openAgentModels("a1");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeNull();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" })).toBeTruthy();
   });
 
   it("offers Smart Routing on a host that reports no gateway_inference at all", () => {
     // Older host / server: unknown must not gate the option away.
     renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    openSelect("new-chat-landing-config-model");
-    expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
-    closeMenu();
-    openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
+    openAgentModels("a1");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeTruthy();
+    closePrimaryPicker();
+    openAgentModels("a2");
+    expect(selectedPickerModel()).toBeTruthy();
   });
 
-  it("freezes Effort to an em-dash while Smart Routing is selected", () => {
+  it("disables effort choices while Smart Routing owns effort", () => {
     renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    // Pin an effort first, so the em-dash can't pass vacuously on an unset row.
-    pickSelectOption("new-chat-landing-config-effort", "High");
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("High");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    const effort = screen.getByTestId("new-chat-landing-config-effort");
-    expect(effort).toBeDisabled();
-    expect(effort.textContent).toContain("—");
-    expect(effort.textContent).not.toContain("High");
+    openAgentModels("a1");
+    pickPrimaryOption("effort", "High");
+    expect(selectedPickerEffort()).toHaveTextContent("High");
+    pickPrimaryOption("model", "Smart Routing");
+    for (const option of within(screen.getByTestId("new-chat-landing-agent-efforts")).getAllByRole(
+      "menuitemcheckbox",
+    )) {
+      expect(option).toHaveAttribute("data-disabled");
+      expect(option).toHaveAttribute("aria-checked", "false");
+    }
   });
 
   it("sends cost_control_mode_override 'on' and no model/effort override when routing is picked", async () => {
@@ -5422,12 +5445,12 @@ describe("NewChatLandingScreen smart routing", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
-    openAgentConfig("a1");
+    openAgentModels("a1");
     // Pin a model + effort first so the routing pick has something to clear.
-    pickSelectOption("new-chat-landing-config-model", "Opus 4.8");
-    pickSelectOption("new-chat-landing-config-effort", "High");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
+    pickPrimaryOption("model", "Opus 4.8");
+    pickPrimaryOption("effort", "High");
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
 
     const { body } = await submitAndReadBody();
     // Anchor on a required field so the absence checks can't pass vacuously.
@@ -5455,9 +5478,9 @@ describe("NewChatLandingScreen smart routing", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
-    openAgentConfig(agentId);
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
+    openAgentModels(agentId);
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
 
     const { body } = await submitAndReadBody("refactor the auth module");
     expect(body.agent_id).toBe(agentId);
@@ -5492,54 +5515,49 @@ describe("NewChatLandingScreen smart routing", () => {
 
   it("preselects Smart Routing on a later session for the same harness", () => {
     renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
+    openAgentModels("a1");
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
     expect(
       JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["claude-native"],
     ).toMatchObject({ routing: "on" });
 
     remountLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "Smart Routing",
-    );
+    openAgentModels("a1");
+    expect(selectedPickerModel().textContent).toContain("Smart Routing");
   });
 
   it("remembers Codex's routing pick without touching Claude Code's", () => {
     renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a2");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
 
     remountLanding({ smart_routing_enabled: true });
-    openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "Smart Routing",
-    );
-    closeMenu();
+    openAgentModels("a2");
+    expect(selectedPickerModel().textContent).toContain("Smart Routing");
+    closePrimaryPicker();
     // Claude Code never had routing picked, so it stays on Default.
-    openAgentConfig("a1");
-    const model = screen.getByTestId("new-chat-landing-config-model");
-    expect(model.textContent).toContain("Default");
+    openAgentModels("a1");
+    const model = selectedPickerModel();
+    expect(model.textContent).toContain("Harness default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
   it("drops back to Default once the user picks a model again", () => {
     renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
-    openAgentConfig("a1");
-    openSelect("new-chat-landing-config-model");
+    openAgentModels("a1");
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
+    openAgentModels("a1");
     // By role, not text: "Default" also labels the Permissions row's value.
-    fireEvent.click(screen.getByRole("option", { name: "Default" }));
-    saveConfig();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Harness default" }));
+    closePrimaryPicker();
 
     remountLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    const model = screen.getByTestId("new-chat-landing-config-model");
-    expect(model.textContent).toContain("Default");
+    openAgentModels("a1");
+    const model = selectedPickerModel();
+    expect(model.textContent).toContain("Harness default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
@@ -5549,9 +5567,9 @@ describe("NewChatLandingScreen smart routing", () => {
       JSON.stringify({ "claude-native": { routing: "on" } }),
     );
     renderLanding({ smart_routing_enabled: false });
-    openAgentConfig("a1");
-    const model = screen.getByTestId("new-chat-landing-config-model");
-    expect(model.textContent).toContain("Default");
+    openAgentModels("a1");
+    const model = selectedPickerModel();
+    expect(model.textContent).toContain("Harness default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
@@ -5608,9 +5626,9 @@ describe("NewChatLandingScreen smart routing", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
-    openAgentConfig("a2");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
     expect(
       JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["codex-native"],
     ).toMatchObject({ routing: "on", model: "", effort: "" });
@@ -5653,11 +5671,9 @@ describe("NewChatLandingScreen smart routing", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "ship it" },
     });
-    openAgentConfig("a1");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "Smart Routing",
-    );
-    closeMenu();
+    openAgentModels("a1");
+    expect(selectedPickerModel().textContent).toContain("Smart Routing");
+    closePrimaryPicker();
 
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     const { body } = await readCreateBody();
