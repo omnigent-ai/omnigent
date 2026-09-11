@@ -2015,6 +2015,8 @@ async def _forward_one_subagent(
     batch_capability: _SessionEventBatchCapability,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
+    if entry.terminal_evidence_pending:
+        return
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
     if not jsonl_path.exists():
         return
@@ -2243,7 +2245,7 @@ async def _forward_one_subagent(
 
     delivery_pending = any(item.item.source_id not in seen for item in pending)
     desired_status: str | None = None
-    if had_item:
+    if had_item or (new_entry.terminal_status is None and new_entry.status_reconcile_pending):
         desired_status = "running"
     elif (
         not delivery_pending
@@ -2251,7 +2253,20 @@ async def _forward_one_subagent(
         and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
     ):
         desired_status = "failed" if new_entry.delivery_error else "idle"
-    if desired_status is None or desired_status == new_entry.last_status:
+    # Authoritative parent evidence overrides the quiescence guess; a
+    # failed POST retries next tick since ``last_status`` moves on success.
+    desired_output: str | None = None
+    terminal_post = _SUBAGENT_TERMINAL_STATUS_POSTS.get(new_entry.terminal_status or "")
+    if terminal_post is not None:
+        desired_status = terminal_post
+        desired_output = new_entry.terminal_output or (
+            _SUBAGENT_FAILED_NO_RESULT_OUTPUT if terminal_post == "failed" else None
+        )
+    elif desired_status == "failed":
+        desired_output = new_entry.delivery_error
+    if desired_status is None or (
+        desired_status == new_entry.last_status and not new_entry.status_reconcile_pending
+    ):
         return
     retry_key = f"subagent_status:{entry.child_conversation_id}"
     if status_retry_tracker.retry_delay_s(retry_key) is not None:
@@ -2261,7 +2276,7 @@ async def _forward_one_subagent(
             client,
             session_id=entry.child_conversation_id,
             status=desired_status,
-            output=new_entry.delivery_error if desired_status == "failed" else None,
+            output=desired_output,
         )
     except httpx.HTTPError as exc:
         decision = status_retry_tracker.record_failure(retry_key, exc)
@@ -2278,7 +2293,9 @@ async def _forward_one_subagent(
         )
         return
     status_retry_tracker.clear(retry_key)
-    await checkpoint.put(replace(new_entry, last_status=desired_status))
+    await checkpoint.put(
+        replace(new_entry, last_status=desired_status, status_reconcile_pending=False)
+    )
 
 
 def _tool_use_ids_in_transcript(
@@ -2600,15 +2617,13 @@ async def _forward_available_subagents(
                             subagent_id,
                             parent_subagent_id,
                         )
-                        updated = SubagentForwardState(
-                            subagents={
-                                **updated.subagents,
-                                subagent_id: SubagentEntry(
-                                    subagent_id=subagent_id,
-                                    child_conversation_id="",
-                                    parent_subagent_id=parent_subagent_id,
-                                ),
-                            }
+                        updated = _with_entry(
+                            updated,
+                            SubagentEntry(
+                                subagent_id=subagent_id,
+                                child_conversation_id="",
+                                parent_subagent_id=parent_subagent_id,
+                            ),
                         )
                         await _write_subagent_forward_state_async(bridge_dir, updated)
                         made_progress = True
@@ -2649,15 +2664,13 @@ async def _forward_available_subagents(
                         delivered_ambiguous=False,
                         http_status=_http_status_for_log(exc),
                     )
-                    updated = SubagentForwardState(
-                        subagents={
-                            **updated.subagents,
-                            subagent_id: SubagentEntry(
-                                subagent_id=subagent_id,
-                                child_conversation_id="",
-                                parent_subagent_id=parent_subagent_id,
-                            ),
-                        }
+                    updated = _with_entry(
+                        updated,
+                        SubagentEntry(
+                            subagent_id=subagent_id,
+                            child_conversation_id="",
+                            parent_subagent_id=parent_subagent_id,
+                        ),
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
@@ -2676,16 +2689,13 @@ async def _forward_available_subagents(
                 )
                 continue
             start_retry_tracker.clear(retry_key)
-            updated = SubagentForwardState(
-                subagents={
-                    **updated.subagents,
-                    subagent_id: SubagentEntry(
-                        subagent_id=subagent_id,
-                        child_conversation_id=child_id,
-                        parent_subagent_id=parent_subagent_id,
-                    ),
-                }
+            entry = SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id=child_id,
+                parent_subagent_id=parent_subagent_id,
+                tool_use_id=meta["toolUseId"],
             )
+            updated = _with_entry(updated, entry)
             await _write_subagent_forward_state_async(bridge_dir, updated)
             made_progress = True
         if not made_progress:
@@ -2701,6 +2711,71 @@ async def _forward_available_subagents(
                 )
             break
         pending = deferred
+
+    # ── Drain parent task evidence ────────────────────────
+    # Notifications apply by task id, then spawn tool-use id, else park.
+    parent_result = await asyncio.to_thread(
+        read_transcript_items_from_offset,
+        transcript_path,
+        updated.parent_byte_offset,
+        start_line=updated.parent_line_cursor,
+        agent_name=agent_name,
+        include_sidechains=False,
+    )
+    pre_drain = updated
+    for notification in parent_result.task_notifications:
+        updated = _apply_terminal_notification(updated, notification)
+    pending_rows = dict(updated.pending_terminal_notifications)
+    aliases = dict(updated.pending_terminal_tool_use_ids)
+    for sid, entry in updated.subagents.items():
+        if entry.terminal_evidence_pending:
+            continue
+        keys = [
+            key
+            for key in pending_rows
+            if key == sid
+            or (
+                entry.tool_use_id is not None
+                and (key == entry.tool_use_id or aliases.get(key) == entry.tool_use_id)
+            )
+        ]
+        selected = (
+            sid
+            if sid in keys
+            else max(
+                keys,
+                key=lambda key: (
+                    _parse_record_timestamp(pending_rows[key][2])
+                    or datetime.min.replace(tzinfo=timezone.utc)
+                ),
+                default=None,
+            )
+        )
+        if selected is not None:
+            status, output, observed_at = pending_rows[selected]
+            updated = _apply_terminal_notification(
+                updated,
+                ClaudeTaskNotification(
+                    task_id=sid,
+                    tool_use_id=entry.tool_use_id,
+                    status=status,
+                    result=output,
+                    timestamp=observed_at,
+                ),
+            )
+        for key in keys:
+            pending_rows.pop(key)
+            aliases.pop(key, None)
+    updated = replace(
+        updated, pending_terminal_notifications=pending_rows, pending_terminal_tool_use_ids=aliases
+    )
+    updated = replace(
+        updated,
+        parent_byte_offset=parent_result.byte_offset,
+        parent_line_cursor=parent_result.line_cursor,
+    )
+    if updated != pre_drain:
+        await _write_subagent_forward_state_async(bridge_dir, updated)
 
     checkpoint = _SubagentStateCheckpoint(bridge_dir, updated)
     semaphore = asyncio.Semaphore(_SUBAGENT_FORWARD_CONCURRENCY)
