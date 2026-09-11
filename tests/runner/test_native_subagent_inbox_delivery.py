@@ -89,9 +89,12 @@ class _SnapshotServerClient(NullServerClient):
     parent). All other endpoints fall through to the empty-200 base.
     """
 
-    def __init__(self, child_body: dict[str, Any]) -> None:
-        """Configure the JSON body returned for the child session GET."""
+    def __init__(
+        self, child_body: dict[str, Any], parent_body: dict[str, Any] | None = None
+    ) -> None:
+        """Configure the bodies returned for the child and parent session GETs."""
         self._child_body = child_body
+        self._parent_body = parent_body
 
     class _Resp:
         def __init__(self, payload: dict[str, Any]) -> None:
@@ -108,6 +111,8 @@ class _SnapshotServerClient(NullServerClient):
         del kwargs
         if url.rstrip("/").endswith(CHILD_SESSION_ID):
             return self._Resp(self._child_body)
+        if self._parent_body is not None and url.rstrip("/").endswith(PARENT_SESSION_ID):
+            return self._Resp(self._parent_body)
         if url.rstrip("/").endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
         return self._Response()
@@ -216,12 +221,26 @@ def _child_snapshot(
     }
 
 
+def _parent_snapshot(*, parent_session_id: str | None) -> dict[str, Any]:
+    """Build the parent's ``SessionResponse``-shaped body."""
+    return {
+        "id": PARENT_SESSION_ID,
+        "agent_id": "ag_orchestrator",
+        "agent_name": "claude-native-ui",
+        "sub_agent_name": "explorer" if parent_session_id else None,
+        "parent_session_id": parent_session_id,
+        "created_at": 0,
+        "workspace": None,
+    }
+
+
 async def _post_native_idle(
     *,
     child_body: dict[str, Any],
     seed_parent_inbox: bool,
     register_work: bool,
     output: str = "review complete: LGTM",
+    parent_body: dict[str, Any] | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """POST a native ``external_session_status: idle`` and return (http, inbox items).
 
@@ -229,7 +248,8 @@ async def _post_native_idle(
     ``register_work`` seeds the in-memory work entry (the healthy case); leaving
     it ``False`` models a reconnect-wiped map or a ``sys_session_create`` child
     the dispatch never registered. ``seed_parent_inbox`` controls whether the
-    parent's inbox queue is present on this runner.
+    parent's inbox queue is present on this runner. ``parent_body`` is the
+    parent's session snapshot; when omitted the parent reads as top-level.
     """
     if seed_parent_inbox:
         runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
@@ -254,7 +274,7 @@ async def _post_native_idle(
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=_SnapshotServerClient(child_body),  # type: ignore[arg-type]
+        server_client=_SnapshotServerClient(child_body, parent_body),  # type: ignore[arg-type]
     )
 
     async with _runner_client(app) as client:
@@ -370,6 +390,33 @@ async def test_undeliverable_native_completion_returns_503_not_silent_204(
         "an undeliverable native sub-agent completion was acked with "
         f"http={http}; expected 503 so the forwarder retries. Items={items!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_nested_subagent_parent_without_inbox_is_acked(
+    _clean_subagent_registry: None,
+) -> None:
+    """A completion whose parent is itself a sub-agent is ACKed without an inbox.
+
+    Claude Code sub-agents can fan out further, and the forwarder mirrors the
+    grandchildren under the mid-level child. That parent is never initialized
+    on the runner, so its inbox never exists and a 503 only made the forwarder
+    retry every 30 s for the life of the runner. The entry stays terminal and
+    undelivered for the parent's own recovery scan.
+    """
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        seed_parent_inbox=False,
+        register_work=False,
+        parent_body=_parent_snapshot(parent_session_id="conv_top_level"),
+    )
+
+    assert http == 204
+    assert items == []
+    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None
+    assert entry.status == "completed"
+    assert entry.delivered is False
 
 
 @pytest.mark.asyncio

@@ -2056,9 +2056,8 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
         )
     inbox = _session_inboxes_ref.get(entry.parent_session_id)
     if inbox is None:
-        _logger.info(
-            "Sub-agent work completed but parent inbox is missing; leaving it for "
-            "init-time recovery; parent=%s child=%s",
+        _logger.warning(
+            "Sub-agent work completed but parent inbox is missing; parent=%s child=%s",
             entry.parent_session_id,
             entry.child_session_id,
         )
@@ -2312,44 +2311,42 @@ def _subagent_delivery_not_confirmed_response(
     is_runner_known_subagent: bool,
 ) -> JSONResponse | None:
     """
-    Build a 503 response when a known sub-agent's handoff metadata is gone.
+    Build a 503 response when a known sub-agent result was not delivered.
 
     Top-level sessions also post terminal status but have no parent inbox, so
     an untracked status remains a no-op unless the runner knows this session
-    was created as a sub-agent. A known sub-agent with no work entry (runner
-    state loss) must not be acknowledged: the 503 makes the forwarder retry
-    until the handoff metadata is recovered.
-
-    A tracked entry whose parent inbox is missing is acknowledged instead. The
-    parent has no session on this runner — a mirrored sub-agent that never
-    gets one, a closed parent, or one not yet re-initialized after a restart —
-    so nothing can drain the inbox now. The entry stays terminal and
-    undelivered, and the parent's initialization re-queues undrained results
-    from the server (``_recover_undrained_subagent_results``). A 503 here made
-    the forwarder retry every 30 s for as long as the runner lived.
+    was created as a sub-agent. For known sub-agents, Omnigent must not receive a
+    2xx acknowledgement unless the terminal payload is confirmed in the
+    parent's inbox.
 
     :param ack: Delivery acknowledgement returned by
         ``mark_subagent_work_terminal``.
     :param is_runner_known_subagent: Whether runner session state identifies
         the status sender as a sub-agent child.
-    :returns: A 503 JSON response when the work entry is missing, or ``None``
+    :returns: A 503 JSON response when delivery is not confirmed, or ``None``
         when the status can be acknowledged.
     """
     if ack.delivered:
         return None
-    if ack.entry is not None:
+    if ack.entry is None and not is_runner_known_subagent:
         return None
-    if not is_runner_known_subagent:
-        return None
+    reason = _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY if ack.entry is None else ack.reason
+    detail_by_reason = {
+        _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY: (
+            "Sub-agent terminal status arrived, but the runner has no "
+            "tracked work entry to deliver to the parent inbox."
+        ),
+        _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX: (
+            "Sub-agent terminal status arrived, but the parent inbox is missing on this runner."
+        ),
+    }
+    detail = detail_by_reason[reason]
     return JSONResponse(
         status_code=503,
         content={
             "error": "subagent_delivery_not_confirmed",
-            "reason": _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY,
-            "detail": (
-                "Sub-agent terminal status arrived, but the runner has no "
-                "tracked work entry to deliver to the parent inbox."
-            ),
+            "reason": reason,
+            "detail": detail,
         },
     )
 
@@ -4963,6 +4960,23 @@ def create_runner_app(
             agent=agent,
             title=snapshot.sub_agent_name or "",
         )
+
+    async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
+        """
+        Return whether an undelivered result's parent is itself a sub-agent.
+
+        A sub-agent parent that has no inbox on this runner never gets one: a
+        mirrored claude-native child is never initialized here, and a
+        runner-launched one re-queues undrained results from the server when
+        it is re-initialized. Retrying its children's terminal status buys
+        nothing. An unreadable parent snapshot reads as a top-level parent, so
+        the retry contract still covers a parent that lives elsewhere.
+
+        :param entry: Terminal work entry whose parent inbox was missing.
+        :returns: ``True`` when the parent's snapshot names its own parent.
+        """
+        snapshot = await _session_snapshot(entry.parent_session_id)
+        return snapshot.ok and snapshot.parent_session_id is not None
 
     async def _recover_undrained_subagent_results(parent_id: str) -> None:
         """
@@ -8741,6 +8755,14 @@ def create_runner_app(
                     output=output or "Error: native sub-agent turn failed",
                 )
             if delivery_ack is not None:
+                if (
+                    delivery_ack.entry is not None
+                    and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
+                    and await _parent_is_nested_subagent(delivery_ack.entry)
+                ):
+                    # No inbox will appear here for this result; the entry stays
+                    # terminal and undelivered for the parent's own recovery scan.
+                    return Response(status_code=204)
                 is_known = (
                     conversation_id in _session_sub_agent_names or recovered_entry is not None
                 )
