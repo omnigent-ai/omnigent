@@ -2,13 +2,10 @@
 event POSTs.
 
 The claude-native, codex-native, and antigravity-native forwarders mirror
-transcript items into AP as ``external_conversation_item`` POSTs. The server
-persists those with a random primary key and does NOT dedupe them — producers
-are responsible for not re-posting items they have already sent. That makes a
-blind retry after a failed POST unsafe: if the server committed the item and
-published ``session.input.consumed`` but the response was lost, a retry appends
-a second copy and the web UI renders a duplicate bubble. The native tmux pane
-is unaffected, which is why the duplicate is web-only.
+transcript items into AP as ``external_conversation_item`` POSTs. Producers
+that include a stable ``source_id`` receive store-level idempotency; legacy
+payloads without one still use random item ids, so an ambiguous retry can
+append a duplicate bubble visible only in the web UI.
 
 :func:`post_may_have_been_delivered` is the shared classifier all forwarders
 use to decide whether a failed POST is safe to retry.
@@ -77,8 +74,8 @@ def append_dead_letter(
     :param reason: Short human-readable cause, e.g.
         ``"permanent HTTP failure after retries"``.
     :param delivered_ambiguous: Whether the failure was ambiguous (request sent,
-        response lost), so the server may have committed the item. Such records are
-        NEVER replayed — a re-POST risks a duplicate (no server-side dedup).
+        response lost), so the server may have committed the item. Replay is safe
+        only when the payload carries a stable server-side ``source_id``.
     :param http_status: Final HTTP status code when the server responded, e.g.
         ``503`` or ``400``; ``None`` for a transport failure that saw no response.
     :param transport_error: Transport-error class name when the POST raised without a
@@ -349,11 +346,11 @@ def _dead_letter_record_replayable(
     """
     Return whether a dead-letter record is safe to re-POST on startup (#1579).
 
-    Only *proven-undelivered* records are replayable: a transport failure that
-    never reached the server, or a retryable status (e.g. ``503``) exhausted
-    after the forwarder's bounded retries. Ambiguous failures (the server may
-    have committed the item) and permanent rejections (a 4xx the server will
-    just reject again) are never replayed.
+    Proven-undelivered records are replayable: a transport failure that never
+    reached the server, or a retryable status (e.g. ``503``) exhausted after
+    bounded retries. Ambiguous conversation-item failures are also replayable
+    when their payload carries a stable ``source_id`` because the server
+    deduplicates the retry. Permanent rejections remain forensic only.
 
     Records written before classification was added (#1579) lack the
     ``delivered_ambiguous`` field; they are treated as unsafe (forensic only)
@@ -380,11 +377,18 @@ def _dead_letter_record_replayable(
     if "delivered_ambiguous" not in record:
         return False
     if record.get("delivered_ambiguous"):
-        return False
+        payload = record.get("payload")
+        source_id = payload.get("source_id") if isinstance(payload, dict) else None
+        if not (
+            event_type == "external_conversation_item"
+            and isinstance(source_id, str)
+            and bool(source_id.strip())
+        ):
+            return False
     http_status = record.get("http_status")
     if http_status is None:
-        # Transport failure with no response (ambiguous already excluded above)
-        # — proven undelivered, so safe to re-POST.
+        # Either the request was proven undelivered, or it was ambiguous but
+        # carries a source id that makes the replay idempotent.
         return True
     # The server responded: only a retryable status is recoverable; a permanent
     # 4xx would just be rejected again.

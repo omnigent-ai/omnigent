@@ -1078,6 +1078,9 @@ class HostProcess:
         self._supersede_stop_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
+        # Background sweep of native bridge dirs orphaned by prior runs; kept
+        # off the startup path so it never delays registration (see run()).
+        self._bridge_sweep_task: asyncio.Task[None] | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -3406,6 +3409,17 @@ class HostProcess:
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
 
+    async def _sweep_orphaned_bridge_dirs(self) -> None:
+        """Reclaim native bridge dirs orphaned by prior runs (best-effort)."""
+        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+        try:
+            reaped = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
+            if reaped:
+                _logger.info("Reaped %d orphaned native bridge dir(s) from prior runs", reaped)
+        except Exception:  # noqa: BLE001 — housekeeping must never break the host
+            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -3436,19 +3450,12 @@ class HostProcess:
         # that died uncleanly (crash / SIGKILL / host restart mid-run). The
         # runner performs the same sweep at its own startup, but after a
         # crash no new runner may ever launch on this machine, so the host
-        # (re)start is the reliable moment to reclaim them. Best-effort and
-        # off-loop: a sweep failure must never block host registration.
-        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
-
-        try:
-            reaped_bridge_dirs = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
-            if reaped_bridge_dirs:
-                _logger.info(
-                    "Reaped %d orphaned native bridge dir(s) from prior runs",
-                    reaped_bridge_dirs,
-                )
-        except Exception:  # noqa: BLE001 — housekeeping must never block registration
-            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
+        # (re)start is the reliable moment to reclaim them. Runs as a
+        # background task: a slow sweep (many stale dirs) must not sit on the
+        # critical path of the connect loop below, which registers the host.
+        self._bridge_sweep_task = asyncio.create_task(
+            self._sweep_orphaned_bridge_dirs(), name="host-bridge-dir-sweep"
+        )
         # Detect wake from system suspend (laptop sleep) and force-drop the
         # then-dead tunnel so the reconnect loop reattaches within seconds
         # instead of waiting out the ~90s keepalive ping timeout.
@@ -3645,6 +3652,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._reaper_task
                 self._reaper_task = None
+            if self._bridge_sweep_task is not None:
+                self._bridge_sweep_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._bridge_sweep_task
+                self._bridge_sweep_task = None
             if self._suspend_task is not None:
                 self._suspend_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

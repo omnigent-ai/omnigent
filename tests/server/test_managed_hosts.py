@@ -3688,7 +3688,13 @@ async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
-    tombstones = host_store.list_stale_managed_sandbox_hosts(now_epoch())
+    tombstones = [
+        host
+        for _, host in host_store.list_current_managed_sandbox_hosts_page(
+            after=None,
+            limit=10,
+        )
+    ]
     assert len(tombstones) == 1
     assert tombstones[0].deleted_at is not None
     assert tombstones[0].sandbox_id == "sb-term-2"
@@ -3700,7 +3706,8 @@ async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
     )
     assert await reaper.sweep_once() == 1
     assert fake.terminated == ["sb-term-2"]
-    assert host_store.list_stale_managed_sandbox_hosts(now_epoch()) == []
+    assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
 
 
 async def test_terminate_managed_host_retains_only_failed_generation(
@@ -3745,7 +3752,13 @@ async def test_terminate_managed_host_retains_only_failed_generation(
     await terminate_managed_host(host, host_store, _injected_config(fake))
 
     assert attempts == ["sb-term-new-partial", "sb-term-old-partial"]
-    tombstones = host_store.list_stale_managed_sandbox_hosts(now_epoch())
+    tombstones = [
+        host
+        for _, host in host_store.list_current_managed_sandbox_hosts_page(
+            after=None,
+            limit=10,
+        )
+    ]
     assert len(tombstones) == 1
     assert tombstones[0].sandbox_id == "sb-term-new-partial"
     assert tombstones[0].terminating_sandbox_id is None
@@ -3757,7 +3770,8 @@ async def test_terminate_managed_host_retains_only_failed_generation(
     )
     assert await reaper.sweep_once() == 1
     assert fake.terminated == ["sb-term-old-partial", "sb-term-new-partial"]
-    assert host_store.list_stale_managed_sandbox_hosts(now_epoch()) == []
+    assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:

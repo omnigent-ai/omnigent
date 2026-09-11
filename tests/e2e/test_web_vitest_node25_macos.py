@@ -53,8 +53,11 @@ LOCALSTORAGE_TYPE_ERROR = "Cannot read properties of undefined (reading 'clear')
 # reads "This machine", which the component derives from navigator.userAgent.
 HOST_CHIP_TEST_NAMES = (
     "renders the reference two-layer composer with one in-form control row",
-    "keeps compact host and working-directory controls accessibly named",
+    # Parametrized upstream over three user agents; the prefix matches all three.
+    "keeps compact controls accessibly named for",
 )
+# One plain test plus the three parametrized cases.
+HOST_CHIP_EXPECTED_PASSES = 4
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -211,8 +214,8 @@ def test_host_chip_tests_pass_under_macos_jsdom_user_agent() -> None:
                 "|".join(re.escape(name) for name in HOST_CHIP_TEST_NAMES),
             ]
         )
-        assert re.search(r"\b2 passed\b", output), (
-            "the two NewChatDialog host-chip tests did not both pass under "
+        assert re.search(rf"\b{HOST_CHIP_EXPECTED_PASSES} passed\b", output), (
+            "the NewChatDialog host-chip tests did not all pass under "
             "the macOS jsdom user agent (the chip shows the host-name "
             f"fallback instead of 'This machine').\n{_tail(output)}"
         )

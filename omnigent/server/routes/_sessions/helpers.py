@@ -2829,6 +2829,7 @@ def _publish_external_conversation_item(
     session_id: str,
     item: ConversationItem,
     cleared_pending_id: str | None = None,
+    message_id: str | None = None,
 ) -> None:
     """
     Broadcast a terminal-observed conversation item.
@@ -2847,6 +2848,7 @@ def _publish_external_conversation_item(
         at the persist site — see :func:`_persist_external_conversation_item`
         — because it also folds the entry's file blocks into the durable
         item before append.
+    :param message_id: Optional live-preview stream finalized by this item.
     :returns: None.
     """
     if item.type == "message" and isinstance(item.data, MessageData):
@@ -2858,7 +2860,10 @@ def _publish_external_conversation_item(
             # path that filters on the flag, so keep it off the stream.
             return
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
-    session_stream.publish(session_id, event.model_dump())
+    payload = event.model_dump()
+    if message_id is not None:
+        payload["message_id"] = message_id
+    session_stream.publish(session_id, payload)
 
 
 def _publish_external_output_text_delta(session_id: str, body: SessionEventInput) -> None:
@@ -3183,6 +3188,12 @@ def _parse_external_conversation_item(
             "external_conversation_item data.response_id must be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
+    message_id = body.data.get("message_id")
+    if message_id is not None and (not isinstance(message_id, str) or not message_id):
+        raise OmnigentError(
+            "external_conversation_item data.message_id must be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # NOTE: producers that can re-post (the native transcript forwarders
     # retry timed-out POSTs whose disposition they cannot know) send a
     # ``data.source_id`` dedup key; the persist path derives the item's
@@ -3199,6 +3210,8 @@ def _parse_external_conversation_item(
             f"Invalid data payload for external item type {item_type!r}: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if message_id is not None and isinstance(data, MessageData) and data.role == "assistant":
+        data = data.model_copy(update={"stream_message_id": message_id})
     return NewConversationItem(
         type=item_type,
         response_id=response_id.strip(),
@@ -3546,18 +3559,19 @@ async def _persist_external_subagent_start(
         return existing.id
 
     # Title format mirrors omnigent-spawned children
-    # (``"{tool}:{session_name}"``) so the rail's split-on-colon
-    # parser surfaces the same ``tool`` shape. The ``session_name``
-    # half must be unique per parent because the conversation store
-    # has a ``(parent_conversation_id, title)`` unique index — using
-    # the description here would collide whenever Claude's LLM
-    # passes the same agentType + description for parallel
-    # sub-agents (which the Task tool does routinely). The
-    # ``subagent_id`` is the only stable per-sub-agent identifier
-    # in the meta file, so it goes here. The human-readable
-    # description is stored as a label below for downstream surfaces
-    # that want it; the rail's ``SubagentsPanel`` already hides the
-    # ``session_name`` half so the user only sees ``agent_type``.
+    # (``"{tool}:{session_name}"``). The ``session_name`` half must be
+    # unique per parent because the conversation store has a
+    # ``(parent_conversation_id, title)`` unique index — using the
+    # description here would collide whenever Claude's LLM passes the
+    # same agentType + description for parallel sub-agents (which the
+    # Task tool does routinely). The ``subagent_id`` is the only stable
+    # per-sub-agent identifier in the meta file, so it goes here.
+    #
+    # The title is therefore a uniqueness key, not a display string:
+    # nothing user-facing should render it. The human-readable
+    # description goes on a label below, and
+    # ``_claude_subagent_display_tool`` turns that label into the
+    # rail's row label.
     title = f"{agent_type}:{subagent_id}"
     labels = {
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -3760,6 +3774,47 @@ def _codex_subagent_display_tool(labels: dict[str, str]) -> str:
     if role:
         return role
     return _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK
+
+
+def _claude_subagent_display_tool(conv: Conversation, labels: dict[str, str]) -> str | None:
+    """
+    Return the UI-facing label for a Claude Code sub-agent child.
+
+    The Task tool's free-form ``description`` ("wave-worker-696") is
+    the only part a human recognises, so it wins. Without one, fall
+    back to the agent type's trailing segment: plugin-namespaced types
+    arrive as ``"rpw-published:debug-lead"`` and only the agent name
+    carries meaning. The row's title is a uniqueness key built from the
+    opaque ``subagent_id``, so it is never a display candidate.
+
+    :param conv: Claude-native sub-agent child row; its
+        ``sub_agent_name`` holds the Claude ``agentType``.
+    :param labels: Conversation labels from that row.
+    :returns: Display label, e.g. ``"wave-worker-696"`` or
+        ``"debug-lead"``; ``None`` when the row carries neither.
+    """
+    description = " ".join((labels.get(_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY) or "").split())
+    if description:
+        return description
+    agent_type = (conv.sub_agent_name or "").strip()
+    if agent_type:
+        return agent_type.rpartition(":")[2] or agent_type
+    return None
+
+
+def _is_claude_native_subagent(conv: Conversation) -> bool:
+    """
+    Return whether a child conversation tracks a Claude Code sub-agent.
+
+    :param conv: Conversation row to inspect.
+    :returns: ``True`` when the row carries the claude-native sub-agent
+        wrapper label.
+    """
+    return (
+        conv.kind == "sub_agent"
+        and conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        == _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
+    )
 
 
 def _is_codex_native_subagent(conv: Conversation) -> bool:
@@ -4964,7 +5019,7 @@ def _publish_btw_sidechat(
     Publish a transient ``session.btw_sidechat`` overlay to the live stream.
 
     Emitted when the claude-native forwarder scrapes a settled ``/btw``
-    side-chat from the pane (see ``_forward_btw_overlay_from_pane`` in the
+    side-chat from the pane (see ``_relay_btw_overlay`` in the
     claude-native forwarder). Broadcast-only: nothing is written to the
     conversation store, so the ephemeral exchange never lands in the main
     transcript. Live viewers render a dismissable overlay; a client that
@@ -9760,6 +9815,10 @@ def _child_session_summary_from_conversation(
     the raw title and ``session_name`` is ``None`` — the row is still
     surfaced so debug views can investigate.
 
+    Native-harness children are the exception: their titles are
+    uniqueness keys built from opaque runtime ids, so Codex and Claude
+    rows take ``tool`` from their labels instead of the title.
+
     ``busy`` is derived from the relay-fed ``_session_status_cache``
     (the tasks table has been removed). ``agent_id`` and ``agent_name``
     are read from the conversation row directly.
@@ -9795,6 +9854,14 @@ def _child_session_summary_from_conversation(
         # ``tool`` and the raw thread id as ``session_name`` for correlation.
         tool = _codex_subagent_display_tool(labels)
         session_name = labels.get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
+    elif _is_claude_native_subagent(conv):
+        # Claude-native child: the title is "{agentType}:{subagent_id}" — an
+        # opaque uniqueness key whose halves are both unreadable once the
+        # agent type is plugin-namespaced. Surface the Task description (or
+        # the bare agent name) as ``tool`` and keep the raw Claude id as
+        # ``session_name`` for correlation.
+        tool = _claude_subagent_display_tool(conv, labels)
+        session_name = labels.get(_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY)
     elif display_title and ":" in display_title:
         head, _, tail = display_title.partition(":")
         if head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail:
@@ -10636,6 +10703,7 @@ __all__ = [
     "_child_session_current_task_status_from_cached_status",
     "_child_session_summary_from_conversation",
     "_claude_native_remember_host",
+    "_claude_subagent_display_tool",
     "_client_supplied_hook_elicitation_id",
     "_codex_plan_mode_enabled",
     "_codex_subagent_display_tool",
@@ -10675,6 +10743,7 @@ __all__ = [
     "_host_model_options_via_registry",
     "_if_none_match_matches",
     "_invalidate_runner_backed_snapshot_state",
+    "_is_claude_native_subagent",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
     "_last_task_error_from_labels",

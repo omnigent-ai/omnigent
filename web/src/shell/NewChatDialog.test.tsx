@@ -1468,11 +1468,6 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
   });
 });
 
-// The host chip labels this machine from the user agent ("This machine" on
-// Linux, "This Mac" on macOS). jsdom reports the host OS, so pin the Linux
-// agent CI uses for the assertions that spell the label out.
-const LINUX_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64)";
-
 describe("NewChatLandingScreen", () => {
   beforeEach(setupLandingMocks);
   afterEach(() => {
@@ -1534,6 +1529,68 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it.each([false, true])(
+    "restores an offline remembered host and requires an explicit switch (managed=%s)",
+    async (managedSandboxesEnabled) => {
+      localStorage.setItem("omnigent:last-host-choice", "host_2");
+      localStorage.setItem(
+        RECENT_KEY,
+        JSON.stringify({ host_1: ["/Users/corey/repo"], host_2: ["/work/repo"] }),
+      );
+      mockHosts([host("online", 1), host("offline", 2)]);
+      renderLanding({ managed_sandboxes_enabled: managedSandboxesEnabled });
+
+      const chip = screen.getByTestId("new-chat-landing-host-chip");
+      await waitFor(() => expect(chip).toHaveAccessibleName("Host: machine-2, Offline"));
+      const input = screen.getByTestId("new-chat-landing-input");
+      fireEvent.change(input, { target: { value: "Work on this repository" } });
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+        "Working directory: /work/repo",
+      );
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_2");
+
+      fireEvent.pointerDown(chip, { button: 0 });
+      expect(screen.getByTestId("new-chat-landing-host-host_2")).toHaveAttribute(
+        "data-active",
+        "true",
+      );
+      fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_1");
+    },
+  );
+
+  it.each(["offline", "missing"])(
+    "blocks creation when the selected host becomes %s and recovers when it returns",
+    async (availability) => {
+      localStorage.setItem("omnigent:last-host-choice", "host_1");
+      renderLanding();
+      const input = screen.getByTestId("new-chat-landing-input");
+      fireEvent.change(input, { target: { value: "Work on this repository" } });
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      await waitFor(() => expect(submit).toBeEnabled());
+
+      mockHosts([host("online", 2), ...(availability === "offline" ? [host("offline", 1)] : [])]);
+      fireEvent.change(input, { target: { value: "Keep working on this repository" } });
+      expect(submit).toBeDisabled();
+      fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_1");
+
+      mockHosts([host("online", 2), host("online", 1)]);
+      fireEvent.change(input, { target: { value: "Continue on the same host" } });
+      expect(submit).toBeEnabled();
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        "Host: machine-1, Online",
+      );
+    },
+  );
+
   it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
     renderLanding();
 
@@ -1549,6 +1606,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("renders the reference two-layer composer with one in-form control row", () => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (X11; Linux x86_64)");
     vi.stubGlobal(
       "SpeechRecognition",
       class {
@@ -1564,7 +1622,6 @@ describe("NewChatLandingScreen", () => {
     useHostWorktreesMock.mockReturnValue({
       data: [{ path: "/Users/corey/repo", branch: "main", is_main: true, detached: false }],
     } as unknown as ReturnType<typeof useHostWorktrees>);
-    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(LINUX_USER_AGENT);
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
@@ -1654,7 +1711,7 @@ describe("NewChatLandingScreen", () => {
     expect(permission.querySelector("span")).not.toHaveClass("hidden");
     expect(worktree).toHaveClass(
       "h-6",
-      "max-w-[180px]",
+      "max-w-[calc(50%-0.25rem)]",
       "gap-1",
       "rounded-md",
       "bg-transparent",
@@ -2082,15 +2139,19 @@ describe("NewChatLandingScreen", () => {
     expect(notices).toContainElement(error);
   });
 
-  it("keeps compact host and working-directory controls accessibly named", () => {
-    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(LINUX_USER_AGENT);
+  it.each([
+    ["Mozilla/5.0 (X11; Linux x86_64)", "This machine"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "This Mac"],
+    ["unknown-browser", "machine-1"],
+  ])("keeps compact controls accessibly named for %s", (userAgent, label) => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(userAgent);
     renderLanding();
 
     const hostTrigger = screen.getByTestId("new-chat-landing-host-chip");
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
-    expect(hostTrigger).toHaveAccessibleName("Host: This machine, Online");
+    expect(hostTrigger).toHaveAccessibleName(`Host: ${label}, Online`);
     expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
-    expect(hostTrigger).toHaveAttribute("title", "Host: This machine, Online");
+    expect(hostTrigger).toHaveAttribute("title", `Host: ${label}, Online`);
     expect(within(hostTrigger).getByTestId("new-chat-landing-host-status")).toHaveClass(
       "bg-success",
     );
@@ -3193,6 +3254,7 @@ describe("NewChatLandingScreen", () => {
     expect(workspaceLabel).toHaveClass("min-w-0", "truncate", "text-left");
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveClass(
       "h-6",
+      "max-w-[calc(50%-0.25rem)]",
       "gap-1",
       "px-1",
       "text-xs",

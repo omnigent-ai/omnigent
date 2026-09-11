@@ -462,6 +462,74 @@ def test_parse_instructions_overrides_agents_md(agent_dir: Path) -> None:
     assert spec.instructions == "Inline wins."
 
 
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt", None])
+@pytest.mark.parametrize("filename", ["AGENTS.md", "CLAUDE.md", ".cursorrules"])
+def test_parse_instructions_rejects_symlink_escape(
+    tmp_path: Path, instruction_key: str | None, filename: str
+) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / filename).symlink_to(secret)
+    config = {"spec_version": 1, "name": "test-agent"}
+    if instruction_key is not None:
+        config[instruction_key] = filename
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(bundle)
+
+    assert spec.instructions == (filename if instruction_key is not None else None)
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_rejects_sibling_prefix(tmp_path: Path, instruction_key: str) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sibling = tmp_path / "bundle-other"
+    sibling.mkdir()
+    secret = sibling / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    config = {"spec_version": 1, instruction_key: str(secret)}
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+
+    assert parse(bundle).instructions == str(secret)
+
+
+@pytest.mark.parametrize("root_kind", ["direct", "relative", "symlink"])
+@pytest.mark.parametrize("reference_kind", ["nested", "absolute", "symlink"])
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_reads_contained_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_kind: str,
+    reference_kind: str,
+    instruction_key: str,
+) -> None:
+    bundle = tmp_path / "bundle"
+    prompt_dir = bundle / "prompts"
+    prompt_dir.mkdir(parents=True)
+    prompt_file = prompt_dir / "system.md"
+    prompt_file.write_text("Contained instructions.")
+    reference = "prompts/system.md"
+    if reference_kind == "absolute":
+        reference = str(prompt_file)
+    elif reference_kind == "symlink":
+        (bundle / "linked.md").symlink_to(prompt_file)
+        reference = "linked.md"
+    config = {"spec_version": 1, instruction_key: reference}
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+    root = bundle
+    if root_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        root = Path("bundle")
+    elif root_kind == "symlink":
+        root = tmp_path / "bundle-alias"
+        root.symlink_to(bundle, target_is_directory=True)
+
+    assert parse(root).instructions == "Contained instructions."
+
+
 def test_parse_instructions_file_overrides_agents_md(agent_dir: Path) -> None:
     """instructions pointing to a file takes precedence over AGENTS.md."""
     (agent_dir / "AGENTS.md").write_text("Fallback instructions.")
@@ -554,6 +622,25 @@ def test_auto_detect_none_when_no_context_files(agent_dir: Path) -> None:
     """No context files present → instructions is None."""
     spec = parse(agent_dir)
     assert spec.instructions is None
+
+
+def test_auto_detect_skips_escaping_context_file(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "config.yaml").write_text(yaml.dump({"spec_version": 1}))
+    (bundle / "AGENTS.md").symlink_to(secret)
+    (bundle / "CLAUDE.md").write_text("Safe fallback.")
+
+    assert parse(bundle).instructions == "Safe fallback."
+
+
+def test_auto_detect_empty_context_file_keeps_priority(agent_dir: Path) -> None:
+    (agent_dir / "AGENTS.md").write_text("")
+    (agent_dir / "CLAUDE.md").write_text("Lower priority.")
+
+    assert parse(agent_dir).instructions == ""
 
 
 def test_parse_skill(agent_dir: Path) -> None:

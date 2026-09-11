@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Error, Page, Route, expect
 
 from tests.e2e_ui.conftest import MockedCodexNativeSession, fetch_with_retry
 from tests.e2e_ui.messages.test_message_render_parity import (
@@ -52,7 +53,15 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     runner_online = {"value": True}
 
     def _patch_health(route: Route) -> None:
-        response = fetch_with_retry(route)
+        try:
+            response = fetch_with_retry(route)
+        except Error as exc:
+            # Playwright swallows handler exceptions, so a dead upstream would
+            # wedge the test until the pytest timeout. Log + abort instead:
+            # the poll rejects and the next assertion fails on its own terms.
+            print(f"_patch_health: upstream fetch failed: {exc}", file=sys.stderr, flush=True)
+            route.abort()
+            return
         payload = response.json()
         live = {"runner_online": runner_online["value"], "host_online": True}
         if isinstance(payload.get("sessions"), dict):

@@ -68,6 +68,16 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         # An unrecognised effort is dropped (not a Claude effort), so it
         # never reaches the CLI as a bogus ``--effort`` value.
         ("bogus-effort", None, None, ()),
+        # A leading positional prompt (how the CLI forwards ``-p``) keeps
+        # its place ahead of pass-through value flags, and the model
+        # default is appended after — re-appending the prompt last would
+        # let a variadic flag like ``--mcp-config`` swallow it.
+        (
+            None,
+            "claude-opus-4-7",
+            ["hello", "--mcp-config", "mcp.json"],
+            ("hello", "--mcp-config", "mcp.json", "--model", "claude-opus-4-7"),
+        ),
     ],
     ids=[
         "effort-only",
@@ -78,6 +88,7 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         "all-none",
         "empty-passthrough-still-adds-model",
         "unknown-effort-dropped",
+        "leading-prompt-stays-first",
     ],
 )
 def test_build_claude_native_base_args(
