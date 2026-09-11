@@ -272,6 +272,15 @@ _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 
+# The exact message Starlette's BaseHTTPMiddleware.call_next raises when the
+# downstream app sent nothing and raised no Exception — which only a bare
+# CancelledError escaping a cancelled in-flight handler produces.
+_NO_RESPONSE_RETURNED = "No response returned."
+
+# Nginx's nonstandard "client closed request" status: the request was torn
+# down before a response could be sent.
+_HTTP_CLIENT_CLOSED_REQUEST = 499
+
 
 def _session_id_from_request(request: Request) -> str | None:
     """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
@@ -1769,6 +1778,27 @@ def create_app(
             status_code = response.status_code
             response.headers["X-Request-Id"] = request_id
             return response
+        except RuntimeError as exc:
+            if str(exc) != _NO_RESPONSE_RETURNED:
+                failed = True
+                raise
+            # The downstream app was cancelled mid-flight (client disconnect /
+            # request teardown) before sending anything: BaseHTTPMiddleware
+            # captures every Exception it raises, so an empty response stream
+            # means a bare CancelledError escaped. A client-gone teardown, not
+            # a server fault — book a benign 499 instead of letting the
+            # catch-all log it as an unhandled UNKNOWN 500.
+            status_code = _HTTP_CLIENT_CLOSED_REQUEST
+            _logger.info(
+                "Request cancelled before a response was sent "
+                "(client disconnect / request teardown): %s %s",
+                request.method,
+                request.url.path,
+            )
+            return Response(
+                status_code=_HTTP_CLIENT_CLOSED_REQUEST,
+                headers={"X-Request-Id": request_id},
+            )
         except Exception:
             failed = True
             raise
