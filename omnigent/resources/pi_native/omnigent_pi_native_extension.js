@@ -989,28 +989,43 @@ function modelReference(model) {
  * picker populates in every auth path, including ``/login`` where no Omnigent
  * models.json exists.
  *
- * Prefers ``getAvailable()`` — only models with configured auth — over
- * ``getAll()`` (Pi's entire built-in catalog spanning every vendor, most with
- * no credentials). This scopes the picker to models the user can actually
- * switch to, and naturally to whichever provider(s) they are logged into.
- * Falls back to ``getAll()`` only when ``getAvailable()`` is unavailable
- * (older Pi). Best-effort and fire-and-forget: an empty or unavailable
- * registry posts nothing, leaving the picker hidden.
+ * Prefers the session's resolved model scope (``ctx.scopedModels`` — Pi's
+ * own resolution of ``--models`` / settings ``enabledModels``, the exact set
+ * its Ctrl+P picker cycles), keeping the current model listed even when the
+ * scope excludes it so the picker's active row always resolves. An empty
+ * scope means no curation; then prefers ``getAvailable()`` — only models
+ * with configured auth — over ``getAll()`` (Pi's entire built-in catalog
+ * spanning every vendor, most with no credentials), falling back to
+ * ``getAll()`` only when ``getAvailable()`` is unavailable (older Pi).
+ * Best-effort and fire-and-forget: an empty or unavailable registry posts
+ * nothing, leaving the picker hidden.
  */
 async function postModelOptions(config, ctx) {
-  const registry = ctx ? ctx.modelRegistry : undefined;
-  if (!registry) return;
-  let models;
-  try {
-    if (typeof registry.getAvailable === "function") {
-      models = registry.getAvailable();
-    } else if (typeof registry.getAll === "function") {
-      models = registry.getAll();
-    } else {
+  let models = [];
+  const scoped = ctx && Array.isArray(ctx.scopedModels) ? ctx.scopedModels : [];
+  for (const entry of scoped) {
+    if (entry && entry.model) models.push(entry.model);
+  }
+  if (models.length > 0) {
+    const current = ctx ? ctx.model : undefined;
+    const currentId = modelReference(current);
+    if (currentId && !models.some((model) => modelReference(model) === currentId)) {
+      models = [current, ...models];
+    }
+  } else {
+    const registry = ctx ? ctx.modelRegistry : undefined;
+    if (!registry) return;
+    try {
+      if (typeof registry.getAvailable === "function") {
+        models = registry.getAvailable();
+      } else if (typeof registry.getAll === "function") {
+        models = registry.getAll();
+      } else {
+        return;
+      }
+    } catch (_err) {
       return;
     }
-  } catch (_err) {
-    return;
   }
   if (!Array.isArray(models) || models.length === 0) return;
   const options = [];

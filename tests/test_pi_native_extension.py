@@ -2896,6 +2896,87 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
     _run_extension_script(node, _extension_path(), script)
 
 
+def test_session_start_scoped_models_curate_model_options(tmp_path: Path) -> None:
+    """
+    A session with a resolved model scope posts THAT scope, not the registry.
+
+    Pi resolves ``--models`` / settings ``enabledModels`` into
+    ``ctx.scopedModels`` — the exact set its own Ctrl+P picker cycles. When
+    the scope is non-empty the extension must post it as the picker catalog
+    (keeping the launch model listed even when the scope excludes it) instead
+    of dumping ``registry.getAvailable()`` — the union of every logged-in
+    provider's full catalog. An empty scope still falls back to the registry.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  // Scope excludes the launch model: the posted catalog is the launch model
+  // plus the scope, and the registry is never consulted (it throws if read).
+  const throwingRegistry = {
+    getAvailable: () => { throw new Error("scoped session must not list the registry"); },
+    getAll: () => { throw new Error("scoped session must not list the registry"); },
+  };
+  const scopedCtx = {
+    ...ctx,
+    scopedModels: [
+      { model: { provider: "omnigent", id: "databricks-claude-opus-4-1", name: "Opus" } },
+    ],
+    modelRegistry: throwingRegistry,
+  };
+  await handlers.session_start({}, scopedCtx);
+  let opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 1, JSON.stringify(posted));
+  assert.deepEqual(
+    opts[0].data.models.map((m) => m.id),
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
+    JSON.stringify(opts[0].data.models),
+  );
+  assert.equal(opts[0].data.models[1].displayName, "Opus");
+
+  // Scope includes the launch model: exactly the scope, no duplicate row.
+  const inScopeCtx = {
+    ...scopedCtx,
+    scopedModels: [
+      { model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet" } },
+    ],
+  };
+  await handlers.session_start({}, inScopeCtx);
+  opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 2, JSON.stringify(posted));
+  assert.deepEqual(opts[1].data.models.map((m) => m.id), [
+    "omnigent/databricks-claude-sonnet-4-6",
+  ]);
+
+  // An empty scope means "no curation": fall back to getAvailable().
+  await handlers.session_start({}, { ...ctx, scopedModels: [] });
+  opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 3, JSON.stringify(posted));
+  assert.deepEqual(
+    opts[2].data.models.map((m) => m.id),
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
+  );
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_models_without_provider_keep_bare_id_behavior(tmp_path: Path) -> None:
     """Older Pi model objects without ``provider`` still populate and mirror."""
     node = shutil.which("node")
