@@ -460,7 +460,7 @@ async def test_call_tool_reconnects_when_session_died_after_connect() -> None:
         # steady-state transport fault).
         conn._session = None
 
-        async def _restore_session() -> None:
+        async def _restore_session(**_: object) -> None:
             conn._session = mock_session
 
         with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
@@ -508,6 +508,71 @@ async def test_call_tool_reconnect_failure_after_session_death_propagates() -> N
 
         # Retried rather than raising the None-session guard once.
         assert mock_reconnect.await_count >= 2
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_after_deliberate_close_still_raises() -> None:
+    """
+    A deliberately closed connection must stay closed.
+
+    ``close()`` drops the connected latch, so a later ``call_tool``
+    is caller misuse (hard error) — not a dead session to silently
+    resurrect via the reconnect path, which would leak a fresh
+    lifecycle task after shutdown.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport():
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        await conn.close()
+
+        with pytest.raises(RuntimeError, match="has no live session"):
+            await conn.call_tool("test_tool", {"query": "hi"})
+
+
+@pytest.mark.asyncio()
+async def test_concurrent_calls_after_session_death_reconnect_once() -> None:
+    """
+    Pooled callers that all find the session dead coalesce on one
+    rebuild.
+
+    Without single-flighting, every concurrent ``call_tool`` would
+    run ``_reconnect`` itself — each teardown killing the lifecycle
+    another caller just built. Exactly one rebuild must happen, and
+    every call must complete against it.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        mock_session.call_tool.return_value = ok_result
+
+        # Lifecycle death cleared the session (steady-state fault).
+        conn._session = None
+
+        rebuilds = 0
+        real_lifecycle = conn._run_lifecycle
+
+        async def _counting_lifecycle() -> None:
+            nonlocal rebuilds
+            rebuilds += 1
+            await real_lifecycle()
+
+        with patch.object(conn, "_run_lifecycle", side_effect=_counting_lifecycle):
+            results = await asyncio.gather(
+                *(conn.call_tool("test_tool", {"query": "hi"}) for _ in range(5))
+            )
+
+        assert results == ["recovered"] * 5
+        assert rebuilds == 1
 
     await conn.close()
 
@@ -1351,7 +1416,7 @@ async def test_call_tool_reconnects_on_dead_session_timeout() -> None:
 
         mock_session.call_tool.side_effect = _die_mid_call
 
-        async def _restore_session() -> None:
+        async def _restore_session(**_: object) -> None:
             conn._session = mock_session
 
         with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
@@ -1480,7 +1545,7 @@ async def test_call_tool_retries_when_reconnect_itself_fails() -> None:
             None,
         ]
 
-        async def _flaky_reconnect() -> None:
+        async def _flaky_reconnect(**_: object) -> None:
             outcome = reconnect_results.pop(0)
             if outcome is not None:
                 raise outcome
