@@ -2,11 +2,10 @@
 
 When creating a new Codex session in the Web UI, the composer gear's config
 modal used to show Model + Approval rows but no reasoning-effort selector,
-while the gear of an existing Codex session (the ``composer-config-effort``
-row, driven by the same per-model ``supportedReasoningEfforts`` metadata)
-does let effort be picked. The new-session composer must expose the Codex
-effort selector before the session starts, consistent with the
-existing-session composer.
+while an existing Codex session's picker (driven by the same per-model
+``supportedReasoningEfforts`` metadata) does let effort be picked. The
+new-session composer must expose the Codex effort selector before the
+session starts, consistent with the existing-session composer.
 
 The driving surface is the real SPA in a browser; only the server edges the
 landing screen consults (hosts, agents, model-options) are faked, exactly like

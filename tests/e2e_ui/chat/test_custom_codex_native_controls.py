@@ -206,13 +206,13 @@ def test_custom_codex_native_session_shows_model_and_effort_controls(
         model_row.click()
         expect(model_row).to_be_hidden()
 
-        # The effort control is enabled and derives its ladder from the
-        # selected Codex model's supportedReasoningEfforts.
-        effort_trigger = page.get_by_test_id("composer-config-effort")
-        expect(effort_trigger).to_be_visible()
-        effort_trigger.click()
+        # The picker's inline effort list is offered and derives its ladder
+        # from the session's Codex model's supportedReasoningEfforts.
+        page.get_by_test_id("composer-config-cancel").click()
+        gear.click()
+        page.get_by_test_id("composer-agent-edit").click()
         for effort in ("low", "medium", "high", "xhigh"):
-            expect(page.locator(f'[role="option"][data-effort-level="{effort}"]')).to_be_visible()
+            expect(page.get_by_test_id(f"composer-agent-effort-{effort}")).to_be_visible()
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         if respawned is not None:
