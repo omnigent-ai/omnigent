@@ -59,6 +59,16 @@ function prefixSelector(selector: string): string {
   if (rootMatch) {
     return `${SCOPE}${rootMatch[1]}`;
   }
+  // `.dark`-rooted selectors are theme state that standalone stamps on <html>
+  // (`:root`). The embed stamps `dark` on the scope root (see embed.tsx), so
+  // these need a compound `.omnigent-app.dark` form too — otherwise the token
+  // blocks (`.dark:not([data-theme]) { --background: … }`) never match the
+  // scope root and the collapsed `body { background: var(--background) }`
+  // paints it with the light tokens. The lookahead excludes escaped class
+  // names (Tailwind's `.dark\:*` variant utilities), which are not theme roots.
+  if (/^\.dark(?=$|[\s.:#[>+~])/.test(s)) {
+    return `${SCOPE}${s}, ${SCOPE} ${s}`;
+  }
   return `${SCOPE} ${s}`;
 }
 
@@ -94,7 +104,8 @@ const scopePlugin = (): postcss.Plugin => ({
 });
 scopePlugin.postcss = true;
 
-function scopeCss(css: string): string {
+/** Exported for unit tests (the embed build calls it via the plugin below). */
+export function scopeCss(css: string): string {
   return postcss([scopePlugin()]).process(css, { from: undefined }).css;
 }
 
