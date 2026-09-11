@@ -1833,6 +1833,25 @@ def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None
     return dispatch_id
 
 
+def _side_chat_text_from_content(content: object) -> str:
+    """
+    Join user text from message content blocks for a Codex ``/side`` follow-up.
+
+    :param content: A message body's ``content`` list, e.g.
+        ``[{"type": "input_text", "text": "and why?"}]``.
+    :returns: The concatenated text, or ``""`` when there is none.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
 class _SubagentRecoveryReadError(Exception):
     """A sessions API read needed by restart recovery returned a non-200."""
 
@@ -8685,6 +8704,47 @@ def create_runner_app(
             body.get("model_override") if isinstance(body, dict) else None,
             extra={"session_id": conversation_id},
         )
+        _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
+        if _side_thread_id:
+            # Codex /side follow-up: the server redirected a side-chat child's
+            # message here (this endpoint's conversation_id is the PARENT), tagged
+            # with the child Codex thread id. Drive it on that thread via the
+            # parent's bridge, isolated from the parent's turn buffer/active-turn
+            # state on purpose so the main conversation is untouched.
+            from omnigent.harnesses.codex_native import side_chat
+            from omnigent.harnesses.codex_native.app_server import client_for_transport
+
+            _side_text = _side_chat_text_from_content(
+                body.get("content") if isinstance(body, dict) else None
+            )
+            if not _side_text:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "side chat message had no text",
+                    },
+                )
+            _side_state = await _codex_native_bridge_state_for_session(
+                conversation_id, action="side chat turn"
+            )
+            if _side_state is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_no_bridge",
+                        "detail": "Codex /side follow-up requires a loaded parent Codex bridge.",
+                    },
+                )
+            _side_client = client_for_transport(
+                _side_state.socket_path, client_name="omnigent-codex-native-runner"
+            )
+            try:
+                await _side_client.connect()
+                await side_chat.submit_side_turn(_side_client, str(_side_thread_id), _side_text)
+            finally:
+                await _side_client.close()
+            return Response(status_code=202)
         if body_type == "message" or body_type is None:
             if not isinstance(body, dict):
                 return JSONResponse(
