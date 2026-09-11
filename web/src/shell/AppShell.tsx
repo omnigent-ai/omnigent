@@ -1517,6 +1517,17 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
+  // A `/side` fork the user just opened: reveal it in the Agents rail so the
+  // move out of the main chat is visible. `ChatPage` does the navigation off
+  // `redirectToConversationId`; this only owns the rail, which lives here.
+  const sideChatRailRequest = useChatStore((s) => s.sideChatRailRequest);
+  const clearSideChatRailRequest = useChatStore((s) => s.clearSideChatRailRequest);
+  useEffect(() => {
+    if (sideChatRailRequest === null) return;
+    handleRightRailTabChange("subagents");
+    clearSideChatRailRequest();
+  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange]);
+
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();

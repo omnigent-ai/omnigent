@@ -401,3 +401,22 @@ async def test_drive_side_chat_requests_waits_for_a_parent_thread(
         )
 
     assert client.calls == []  # no thread to fork from yet
+
+
+# --------------------------------------------------------------------------- #
+# parent-wake suppression for codex sub-agents
+# --------------------------------------------------------------------------- #
+def test_codex_native_subagent_wrapper_is_recognized() -> None:
+    """A codex sub-agent must not wake the parent with an inbox notice.
+
+    Its result is consumed inside the parent's own app-server thread tree, so a
+    wake would inject "[System: sub-agent … finished …]" into the chat the user
+    is reading.
+    """
+    from omnigent.runner.app import is_codex_native_subagent_wrapper
+
+    assert is_codex_native_subagent_wrapper("codex-native-ui-subagent") is True
+    # other harnesses' sub-agents still deliver through the inbox
+    assert is_codex_native_subagent_wrapper("claude-code-native-ui-subagent") is False
+    assert is_codex_native_subagent_wrapper("something-else") is False
+    assert is_codex_native_subagent_wrapper(None) is False

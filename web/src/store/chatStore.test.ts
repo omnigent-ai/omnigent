@@ -6211,7 +6211,54 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.created", () => {
+    it("opens the side chat the user asked for with /side", () => {
+      // `awaitingSideChatFor` is set when the command is sent; the fork's
+      // session.created then moves the user into it and reveals the rail.
+      useChatStore.setState({
+        conversationId: "conv_parent",
+        awaitingSideChatFor: "conv_parent",
+        redirectToConversationId: null,
+        sideChatRailRequest: null,
+      });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_parent",
+        childSessionId: "conv_side",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_parent",
+      } as SessionCreatedEvent);
+
+      const after = useChatStore.getState();
+      expect(after.redirectToConversationId).toBe("conv_side");
+      expect(after.sideChatRailRequest).toBe("conv_side");
+      // one-shot: a later spawn must not move the user again
+      expect(after.awaitingSideChatFor).toBeNull();
+    });
+
+    it("does not move the user for an agent-spawned sub-agent", () => {
+      useChatStore.setState({
+        conversationId: "conv_parent",
+        awaitingSideChatFor: null,
+        redirectToConversationId: null,
+        sideChatRailRequest: null,
+      });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_parent",
+      } as SessionCreatedEvent);
+
+      const after = useChatStore.getState();
+      expect(after.redirectToConversationId).toBeNull();
+      expect(after.sideChatRailRequest).toBeNull();
+    });
+
     it("is a no-op (sub-agent rendering is future work — R8)", () => {
+      useChatStore.setState({ awaitingSideChatFor: null });
       const before = useChatStore.getState();
       const event: SessionCreatedEvent = {
         type: "session_created",

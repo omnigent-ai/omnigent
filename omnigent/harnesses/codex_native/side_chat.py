@@ -70,6 +70,35 @@ _logger = logging.getLogger(__name__)
 _JsonObject = dict[str, Any]
 
 
+def side_chat_question_from_text(text: str) -> str | None:
+    """
+    Return the question when *text* is a ``/side`` command.
+
+    The one place the command is recognized, so the server hides exactly what
+    the executor forks: any divergence would either strand the typed text in
+    the parent chat or drop it entirely.
+
+    :param text: Raw user text, e.g. ``"/side why?"``.
+    :returns: The trimmed question after ``/side``, or ``None`` when *text* is
+        not a ``/side <question>`` command.
+    """
+    if not text.startswith(_SIDE_PREFIX):
+        return None
+    question = text[len(_SIDE_PREFIX) :].strip()
+    return question or None
+
+
+def is_side_chat_command(text: str) -> bool:
+    """
+    Whether *text* is a ``/side`` command that opens a side chat.
+
+    :param text: Raw user text, e.g. ``"/side why?"``.
+    :returns: ``True`` when the text forks a side chat instead of reaching the
+        main thread.
+    """
+    return side_chat_question_from_text(text) is not None
+
+
 def side_chat_question(input_items: list[_JsonObject]) -> str | None:
     """
     Return the question when normalized turn input is a ``/side`` command.
@@ -85,10 +114,9 @@ def side_chat_question(input_items: list[_JsonObject]) -> str | None:
     if item.get("type") != "text":
         return None
     text = item.get("text")
-    if not isinstance(text, str) or not text.startswith(_SIDE_PREFIX):
+    if not isinstance(text, str):
         return None
-    question = text[len(_SIDE_PREFIX) :].strip()
-    return question or None
+    return side_chat_question_from_text(text)
 
 
 async def fork_ephemeral_side_thread(
