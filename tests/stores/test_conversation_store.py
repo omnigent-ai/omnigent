@@ -3271,6 +3271,53 @@ def test_set_host_id_with_workspace_satisfies_constraint(
     assert updated.workspace == "/Users/corey/projects/myapp"
 
 
+def test_set_workspace_persists_and_round_trips(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify set_workspace repoints the workspace column and persists.
+
+    Browsing to a folder in the Files rail repoints the session
+    workdir: the runner resolves the browse target to a canonical
+    absolute path and the server persists it here. If the returned
+    value is right but a re-fetch disagrees, the UPDATE is not
+    committing and the runner would cd back to the stale directory
+    on the next turn.
+    """
+    conv = conversation_store.create_conversation(
+        workspace="/Users/corey/projects/myapp",
+    )
+    assert conv.workspace == "/Users/corey/projects/myapp"
+
+    updated = conversation_store.set_workspace(
+        conv.id, "/Users/corey/projects/myapp/subdir"
+    )
+    assert updated.workspace == "/Users/corey/projects/myapp/subdir"
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.workspace == "/Users/corey/projects/myapp/subdir"
+
+
+def test_set_workspace_missing_conversation_raises(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify set_workspace raises ConversationNotFoundError for a
+    nonexistent conversation.
+
+    If it silently succeeds, the guard clause is missing and a
+    workspace could be written to a phantom row, masking a bad
+    session id from the caller.
+    """
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    with pytest.raises(ConversationNotFoundError):
+        conversation_store.set_workspace(
+            "ad563e906854634c49e1a6fd2fbb31d4", "/Users/corey/projects/other"
+        )
+
+
 def test_clear_host_binding_nulls_all_binding_fields(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,

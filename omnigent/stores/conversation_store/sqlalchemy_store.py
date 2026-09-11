@@ -3616,6 +3616,47 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
+    def set_workspace(
+        self,
+        conversation_id: str,
+        workspace: str,
+    ) -> Conversation:
+        """
+        Repoint the session's workspace to a resolved absolute path.
+
+        See :meth:`ConversationStore.set_workspace`. Only writes a
+        non-empty ``workspace``, so the row never violates
+        ``ck_conversations_workspace_required_for_host`` (which forbids
+        only the ``host_id`` set / ``workspace`` NULL combination).
+
+        :param conversation_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param workspace: Canonical absolute workspace path, e.g.
+            ``"/Users/corey/projects/myapp/subdir"``.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If no conversation row
+            exists for ``conversation_id``.
+        """
+
+        def write(session: Session) -> SqlConversationMetadata:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            meta.workspace = workspace
+            return meta
+
+        meta = run_write_transaction(self._session_immediate, "set_workspace", write)
+        with self._conv_session("set_workspace") as ap_sess:
+            ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
+
     def set_external_session_id(
         self,
         conversation_id: str,
