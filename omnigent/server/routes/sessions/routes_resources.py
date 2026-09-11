@@ -122,6 +122,13 @@ class _RunnerStreamResponse(StreamingResponse):
             await self._upstream.aclose()
 
 
+# Bounds how many image compressions run concurrently across the worker.
+# Each decodes/re-encodes a raster (up to IMAGE_MAX_DECODED_PIXELS, several
+# full buffers live at once), so an unbounded burst of large uploads could
+# spike peak memory even with the to_thread offload keeping the loop responsive.
+_IMAGE_COMPRESSION_CONCURRENCY = asyncio.Semaphore(4)
+
+
 def register_resources_routes(
     router: APIRouter,
     *,
@@ -1538,9 +1545,12 @@ def register_resources_routes(
             )
         from omnigent.runtime.content_resolver import (
             MAX_ATTACHMENT_UPLOAD_BYTES,
+            ImageCompressionError,
             _resolve_content_type,
             attachment_text_type_for_extension,
             attachment_upload_limit,
+            compress_image_attachment,
+            image_filename_for_content_type,
         )
 
         # Resolve the type from the declared MIME + filename BEFORE reading
@@ -1575,9 +1585,29 @@ def register_resources_routes(
             file,
             min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES),
         )
+        # Images upload at the larger image cap; shrink an oversized one under
+        # the provider's per-image limit before storing, so the base64 inlined
+        # every turn always fits. Non-images pass through untouched.
+        filename = file.filename
+        if content_type.startswith("image/"):
+            try:
+                # Compression decodes + re-encodes (CPU/memory heavy). Run it off
+                # the event loop, and bound concurrency so a burst of large
+                # uploads can't drive peak memory unbounded.
+                async with _IMAGE_COMPRESSION_CONCURRENCY:
+                    compressed, resolved_type = await asyncio.to_thread(
+                        compress_image_attachment, content, content_type
+                    )
+            except ImageCompressionError as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from exc
+            # A re-encode (e.g. PNG → JPEG) changes the type; realign the
+            # filename extension so name, bytes, and MIME stay consistent.
+            if resolved_type != content_type:
+                filename = image_filename_for_content_type(file.filename, resolved_type)
+            content, content_type = compressed, resolved_type
         stored = file_store.create(
             session_id=session_id,
-            filename=file.filename,
+            filename=filename,
             bytes=len(content),
             content_type=content_type,
         )
