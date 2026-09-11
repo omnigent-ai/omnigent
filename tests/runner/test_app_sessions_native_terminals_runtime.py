@@ -156,6 +156,11 @@ async def test_create_session_threads_workspace_to_pi_cwd(
 ) -> None:
     """Pi pre-spawn receives the session workspace, not the bundle dir."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    # Isolate $HOME too: ambient provider detection reads ~/.databrickscfg,
+    # which on a multi-profile Databricks dev box otherwise 400s the create
+    # with "match <host>; use --profile" (issue #4279).
+    monkeypatch.setenv("HOME", str(tmp_path / "config-home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "config-home"))
     session_id = "18f39ab73f49285e4dab0c80ff7b8455"
     runner_workspace = tmp_path / "runner-workspace"
     runner_workspace.mkdir()
@@ -224,6 +229,11 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
 ) -> None:
     """Pi pre-spawn falls back to runner workspace when session workspace is empty."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    # Isolate $HOME too: ambient provider detection reads ~/.databrickscfg,
+    # which on a multi-profile Databricks dev box otherwise 400s the create
+    # with "match <host>; use --profile" (issue #4279).
+    monkeypatch.setenv("HOME", str(tmp_path / "config-home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "config-home"))
     session_id = "3f1d20a97a7d0ba93e02cf17aeb92367"
     runner_workspace = tmp_path / "runner-workspace"
     runner_workspace.mkdir()
@@ -508,14 +518,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         app_server.codex_home = kwargs["codex_home"]
         return app_server
 
-    class _UnexpectedDiscoveryClient:
-        """
-        App-server client that must not connect on a known-thread resume.
-
-        Fresh sessions connect this listener to discover ``thread/started``.
-        Resume sessions already have ``external_session_id`` and should go
-        straight to the known-thread forwarder.
-        """
+    class _StartupEventClient:
+        """Listener retained across known-thread preload and forwarding."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -526,12 +530,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """
-            Fail if the resume path tries to discover a fresh thread.
-
-            :returns: None.
-            """
-            raise AssertionError("resume path must not connect discovery client")
+            """Record the connection established before preload."""
+            self.connected = True
 
         async def close(self) -> None:
             """:returns: None."""
@@ -610,7 +610,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         "build_codex_native_server",
         _fake_build_codex_native_server,
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 
@@ -678,12 +678,16 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     del forward_calls[0]["subagent_router"]
     assert "turn_router" in forward_calls[0]
     del forward_calls[0]["turn_router"]
+    event_client = forward_calls[0]["event_client"]
+    assert isinstance(event_client, _StartupEventClient)
+    assert event_client.connected
     assert forward_calls == [
         {
             "session_id": session_id,
             "bridge_dir": bridge_dir,
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
+            "event_client": event_client,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
@@ -838,8 +842,8 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         del kwargs
         return app_server
 
-    class _UnexpectedDiscoveryClient:
-        """Discovery client that must not connect on the resume path."""
+    class _StartupEventClient:
+        """No-op listener for the known-thread startup path."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -850,8 +854,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """:raises AssertionError: Always — the fork resumes a known thread."""
-            raise AssertionError("fork resume path must not connect discovery client")
+            """No-op connect."""
 
         async def close(self) -> None:
             """:returns: None."""
@@ -924,7 +927,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 
@@ -1115,8 +1118,8 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         del kwargs
         return app_server
 
-    class _UnexpectedDiscoveryClient:
-        """Discovery client that must not connect on the resume path."""
+    class _StartupEventClient:
+        """No-op listener for the known-thread startup path."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """:param ws_url: App-server URL. :param client_name: RPC client name."""
@@ -1124,8 +1127,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """:raises AssertionError: Always — the fork resumes a known thread."""
-            raise AssertionError("fork resume path must not connect discovery client")
+            """No-op connect."""
 
         async def close(self) -> None:
             """:returns: None."""
@@ -1184,7 +1186,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 
@@ -3520,8 +3522,8 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         app_server.codex_home = kwargs["codex_home"]
         return app_server
 
-    class _UnexpectedDiscoveryClient:
-        """App-server client that must not connect on a known-thread resume."""
+    class _StartupEventClient:
+        """No-op listener for the known-thread startup path."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -3532,8 +3534,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """Fail if the resume path tries to discover a fresh thread."""
-            raise AssertionError("resume path must not connect discovery client")
+            """No-op connect."""
 
         async def close(self) -> None:
             """No-op close."""
@@ -3596,7 +3597,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 
@@ -3757,8 +3758,8 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         app_server.codex_home = kwargs["codex_home"]
         return app_server
 
-    class _UnexpectedDiscoveryClient:
-        """App-server client that must not connect on a known-thread resume."""
+    class _StartupEventClient:
+        """No-op listener for the known-thread startup path."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -3769,8 +3770,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """Fail if the resume path tries to discover a fresh thread."""
-            raise AssertionError("resume path must not connect discovery client")
+            """No-op connect."""
 
         async def close(self) -> None:
             """No-op close."""
@@ -3813,7 +3813,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 

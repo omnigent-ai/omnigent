@@ -600,6 +600,7 @@ def build_job_manifest(
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     secret_mounts: Sequence[Mapping[str, object]] | None = None,
+    tolerations: Sequence[Mapping[str, object]] | None = None,
     agent_name: str | None = None,
     backoff_limit: int = _JOB_BACKOFF_LIMIT,
     active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
@@ -673,6 +674,10 @@ def build_job_manifest(
       the Pod onto a sandboxed container runtime the cluster provides via a
       ``RuntimeClass`` object (e.g. Kata Containers micro-VMs, gVisor). Unset
       keeps the cluster's default runtime — today's behaviour exactly.
+    - Operator *tolerations* become ``spec.tolerations`` verbatim, letting the
+      Pod land on a tainted NodePool dedicated to sandboxes. A toleration only
+      permits scheduling there — pair it with *node_selector* to also pin the
+      Pod to that pool, or it may just as well land anywhere else untainted.
 
     :param job_name: DNS-label-safe Job name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Job is created in.
@@ -707,6 +712,10 @@ def build_job_manifest(
     :param secret_mounts: Normalized Secret mounts (``{secret_name,
         mount_path}``) added as read-only ``secret`` volumes on the host
         container only, or ``None``.
+    :param tolerations: Normalized Toleration entries (``{key?, operator?,
+        value?, effect?, tolerationSeconds?}``) added to ``spec.tolerations``
+        verbatim, or ``None`` for none. Permits scheduling onto a tainted
+        NodePool; it does not by itself attract the Pod there.
     :param agent_name: Server-resolved built-in agent name the session runs,
         added as the ``omnigent.ai/agent`` classifier label. Stamped verbatim
         when it is already a valid label value, otherwise omitted (extending the
@@ -901,6 +910,10 @@ def build_job_manifest(
         # Opt-in only: an absent key (not an explicit None/null) keeps the
         # manifest byte-compatible with pre-runtime_class deployments.
         pod_spec["runtimeClassName"] = runtime_class
+    if tolerations:
+        # Opt-in only, same rationale as runtime_class above: an absent key
+        # keeps the manifest byte-compatible with pre-tolerations deployments.
+        pod_spec["tolerations"] = list(tolerations)
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1141,6 +1154,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
+        tolerations: Sequence[Mapping[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
         home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
@@ -1169,6 +1183,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
+        self._tolerations = list(tolerations) if tolerations else None
         self._pod_ready_timeout_s = pod_ready_timeout_s
         self._runtime_class = runtime_class
         self._home_size_limit = home_size_limit
@@ -1462,6 +1477,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     resources=self._resources,
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
+                    tolerations=self._tolerations,
                     agent_name=agent_name,
                     runtime_class=self._runtime_class,
                     home_size_limit=self._home_size_limit,

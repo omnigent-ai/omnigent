@@ -108,6 +108,7 @@ def test_codex_native_approval_mode_switch_persists(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+    page.get_by_test_id("composer-advanced-settings").click()
 
     # The Approvals picker is visible for codex-native sessions even before
     # any switch; with no read-back label yet it shows its placeholder.
@@ -139,6 +140,7 @@ def test_codex_native_approval_mode_switch_persists(
     # The store reads the mode back from the PATCH response's stamped label,
     # so reopening the modal shows the confirmed preset, not a draft.
     gear.click()
+    page.get_by_test_id("composer-advanced-settings").click()
     picker = page.get_by_test_id("composer-config-approval-mode")
     expect(picker).to_be_visible()
     expect(picker).to_contain_text("Approve for me")
@@ -169,6 +171,7 @@ def test_codex_native_approval_mode_starts_from_label(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+    page.get_by_test_id("composer-advanced-settings").click()
 
     picker = page.get_by_test_id("composer-config-approval-mode")
     expect(picker).to_be_visible()

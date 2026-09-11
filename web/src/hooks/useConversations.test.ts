@@ -16,6 +16,7 @@ import {
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useBulkStopSessions,
+  undoArchiveConversations,
   useConversations,
   useDeleteProject,
   useProjects,
@@ -2754,5 +2755,52 @@ describe("useDeleteProject", () => {
       succeeded: ["conv_a"],
       total: 2,
     });
+  });
+});
+
+describe("undoArchiveConversations optimistic restore", () => {
+  it("re-injects evicted rows into cached lists before the unarchive PATCH settles", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // A refetch already evicted the archived row from the sidebar list, so the
+    // flag-flip overlay has nothing to un-hide — this exercises the injection.
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_keep" })]),
+    );
+    // Search lists have server-owned membership; the row must not land there.
+    queryClient.setQueryData(["conversations", "term", false], infinitePage([]));
+    // Hold the unarchive PATCH in flight so the assertions below can only be
+    // satisfied by the synchronous cache write, never the network round-trip.
+    let resolvePatch!: (value: Response) => void;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvePatch = resolve;
+        }),
+    );
+
+    const undo = undoArchiveConversations(queryClient, [
+      conversation({ id: "conv_a", archived: true }),
+    ]);
+
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      expect(data?.pages[0].data.map((c) => c.id)).toEqual(["conv_a", "conv_keep"]);
+    });
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data?.pages[0].data[0].archived).toBe(false);
+    const search = queryClient.getQueryData<ConversationsInfiniteData>([
+      "conversations",
+      "term",
+      false,
+    ]);
+    expect(search?.pages[0].data).toEqual([]);
+
+    resolvePatch(mockResponse(conversation({ id: "conv_a", archived: false, updated_at: 101 })));
+    await undo;
   });
 });

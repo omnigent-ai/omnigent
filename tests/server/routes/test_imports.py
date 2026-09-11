@@ -131,6 +131,76 @@ async def test_import_dedupes_against_native_session(
     assert found.id == native.id
 
 
+async def test_import_binds_session_to_supplied_host(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A CLI ``host_id`` binds the imported session to the origin machine.
+
+    The transcript's workspace lives on that host, so resume defaults there.
+    ``_persist_import`` binds only alongside a workspace (the check constraint).
+    """
+    _seed_claude_agent(db_uri)
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-host-1",
+        "workspace": "/repo",
+        "host_id": "a1b2c3d4e5f67890abcdef1234567890",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "bind me"}],
+                },
+            }
+        ],
+    }
+
+    created = await client.post("/v1/imports", json=payload)
+    assert created.status_code == 201
+
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
+        created.json()["session_id"]
+    )
+    assert conversation is not None
+    assert conversation.host_id == "a1b2c3d4e5f67890abcdef1234567890"
+    assert conversation.workspace == "/repo"
+
+
+async def test_import_host_id_without_workspace_stays_unbound(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """No workspace means no host bind (the check constraint forbids it)."""
+    _seed_claude_agent(db_uri)
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-host-2",
+        "host_id": "a1b2c3d4e5f67890abcdef1234567890",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "no workspace"}],
+                },
+            }
+        ],
+    }
+
+    created = await client.post("/v1/imports", json=payload)
+    assert created.status_code == 201
+
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
+        created.json()["session_id"]
+    )
+    assert conversation is not None
+    assert conversation.host_id is None
+
+
 async def test_import_session_uses_native_title_when_supplied(
     client: httpx.AsyncClient,
     db_uri: str,

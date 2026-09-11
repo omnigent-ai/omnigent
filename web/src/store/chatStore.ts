@@ -141,7 +141,7 @@ import {
   onResponseStart,
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
-import { isSystemUserContent } from "@/lib/systemMessage";
+import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
@@ -5411,18 +5411,24 @@ export async function pumpStreamEvents(
  * Returns `null` if the event does not describe a user message.
  */
 function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentBlock[] | null {
-  if (event.isMeta === true) return null;
   if (event.itemType !== "message") return null;
   if (event.data.role !== "user") return null;
   const raw = event.data.content;
   if (!Array.isArray(raw)) return null;
-  return raw.filter(
+  const content = raw.filter(
     (b): b is MessageContentBlock =>
       typeof b === "object" &&
       b !== null &&
       "type" in b &&
       (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
   );
+  // A Claude background-task wake is hidden context (`is_meta`) that still
+  // has to start a new turn on screen: render it as a system marker. Every
+  // other meta message (injected skill text) stays hidden.
+  const marker = taskNotificationMarkerContent(content);
+  if (marker !== null) return marker;
+  if (event.isMeta === true) return null;
+  return content;
 }
 
 function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
@@ -6164,7 +6170,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_input_consumed":
-      if (event.isMeta === true) return;
+      // Hidden meta inputs stay hidden — except a background-task wake,
+      // which `userContentFromEvent` re-labels as a system marker.
+      if (event.isMeta === true && userContentFromEvent(event) === null) return;
       // Promote the matching optimistic bubble into committed history.
       // Three ways to find it, in order of precision:
       //   1. By id — the server tells us which pending-input entry this
@@ -6430,7 +6438,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         const updated: ElicitationBlock = {
           ...target,
           status: "responded",
-          response: { action: "auto_resolved" },
+          // Carry the verdict when the event delivers one so an approval
+          // answered on another surface reads "Approved"/"Rejected";
+          // fall back to the neutral pill only when it is truly unknown.
+          // "unanswered" refines that pill: nobody answered before the
+          // agent stopped waiting, so the card can say what to do next.
+          response: {
+            action: event.action ?? "auto_resolved",
+            ...(event.reason ? { reason: event.reason } : {}),
+          },
         };
         return {
           blocks: [...s.blocks.slice(0, matchIdx), updated, ...s.blocks.slice(matchIdx + 1)],

@@ -1229,6 +1229,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     """
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
+    from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, _ = resolve_claude_launch("claude", [])
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
@@ -1239,6 +1240,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         claude_config.model if claude_config is not None else None,
         binary_identity(command),
         ambient_gateway,
+        claude_managed_model_picker() if claude_config is None else None,
     )
 
 
@@ -1261,10 +1263,16 @@ async def claude_model_catalog(
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows, or ``None`` when the probe failed.
     """
+    from omnigent.onboarding.ambient import claude_managed_model_picker
+
+    managed_picker = claude_managed_model_picker() if claude_config is None else ()
+    managed_rows: list[dict[str, object]] = [
+        {"id": model, "model": model, "displayName": label} for model, label in managed_picker
+    ]
     probe = await probe_claude_model_options(claude_config)
     if probe is None:
-        return None
-    rows = list(probe.alias_rows)
+        return managed_rows or None
+    rows = managed_rows or list(probe.alias_rows)
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
     ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
@@ -3107,6 +3115,143 @@ def _native_claude_config_from_entry(
     return None
 
 
+# Refresh cadence for the broker-backed apiKeyHelper on the managed connect
+# path. The broker vends a ~1h OAuth access token; re-mint well before expiry so
+# a long session never presents an expired bearer to the gateway.
+_BROKER_APIKEY_HELPER_TTL_MS = 900_000
+
+
+# A managed connect deployment can pin the gateway serving-endpoint model (e.g.
+# ``databricks-claude-sonnet-4-6``) so sessions default to a model the workspace
+# actually serves, rather than the bundled catalog default (which may name a
+# family the workspace has not deployed). Mirrors the opencode gateway env var.
+# Discovering the served model from the gateway is a follow-up cleanup.
+_DATABRICKS_GATEWAY_MODEL_ENV = "OMNIGENT_DATABRICKS_GATEWAY_MODEL"
+
+
+# Routing/model env keys the connect-broker path accepts from the *writable* ucode
+# ``state.json``. An explicit allowlist (mirroring the discipline of
+# ``_ucode_config_for_profile``), not a prefix match: it must exclude credential
+# keys — ``ANTHROPIC_API_KEY`` (raw key + the broker apiKeyHelper hard-fails
+# ``build_native_claude_terminal_env``) and ``ANTHROPIC_AUTH_TOKEN`` (would
+# override the helper) — and arbitrary process env.
+_CONNECT_BROKER_UCODE_ENV_ALLOWLIST = frozenset(
+    {
+        _UCODE_CLAUDE_BASE_URL_ENV,
+        _CLAUDE_CODE_USE_GATEWAY_ENV,
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV,
+        _ANTHROPIC_MODEL_ENV,
+        _ANTHROPIC_DEFAULT_FABLE_MODEL_ENV,
+        _ANTHROPIC_DEFAULT_OPUS_MODEL_ENV,
+        _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
+        _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
+    }
+)
+
+
+def _connect_broker_default_model() -> str:
+    """The model a managed connect session pins: the deployment override if set,
+    else the bundled Databricks Claude catalog default."""
+    pinned = os.environ.get(_DATABRICKS_GATEWAY_MODEL_ENV, "").strip()
+    if pinned:
+        return pinned
+    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+
+
+def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
+    """Gateway config for a managed host connected via the credential broker.
+
+    When the owner links Databricks through the connect flow, ``omnigent host``
+    writes a host-only ``[omnigent]`` ``~/.databrickscfg`` profile (workspace
+    host, no token), a broker sidecar, and exports ``DATABRICKS_CONFIG_PROFILE``
+    — but configures no ucode / spec / global-auth provider. Without this,
+    :func:`resolve_native_claude_config` finds nothing and native Claude Code
+    falls back to its own login, never reaching the owner's workspace gateway.
+
+    Bridge it: derive the gateway base URL from the profile's workspace host and
+    mint the bearer on demand from the broker
+    (:func:`omnigent.host.databricks_credential.broker_token_command`, which
+    re-fetches the server-refreshed token each call), so Claude Code auto-connects
+    to Databricks model serving as the owner and refreshes per the helper TTL.
+    Returns ``None`` off the managed connect path (profile is not the host connect
+    profile, or no broker sidecar is present).
+    """
+    from omnigent.host.databricks_credential import (
+        HOST_DATABRICKS_PROFILE,
+        broker_token_command,
+        https_url_on_workspace_host,
+    )
+    from omnigent.inner.databricks_executor import _read_databrickscfg_host
+
+    # Gate on the on-disk [omnigent] profile + broker sidecar, NOT on the
+    # ``DATABRICKS_CONFIG_PROFILE`` env var: that var is deliberately stripped
+    # from the runner/terminal process (a set profile makes MCP WorkspaceClients
+    # prefer its cached OAuth over their own token), so keying off it misses the
+    # very process that builds the Claude terminal. The host-only profile +
+    # sidecar that ``configure_host_databricks`` writes are the reliable
+    # managed-connect signal and survive that strip. The host-only profile holds
+    # no token, so it can't reintroduce the MCP collision the strip prevents.
+    workspace_host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+    if not workspace_host:
+        return None
+    api_key_helper = broker_token_command(workspace_host)
+    if not api_key_helper:
+        return None  # no broker sidecar → not a managed connect host
+    workspace_host = workspace_host.rstrip("/")
+
+    # Prefer the gateway config ucode generated at host boot (see
+    # ``omnigent.onboarding.ucode_setup.configure_ucode_for_sandbox``): ucode owns
+    # the base URL/route, coding-agent headers, and the discovered served model.
+    # We still mint the bearer through our own broker ``apiKeyHelper`` and launch
+    # Claude Code ourselves (bridge intact), so this consumes ucode's config
+    # without ucode launching or authenticating the binary. Fall back to a
+    # hand-built config when ucode wrote nothing usable (configure still running,
+    # skipped, or absent).
+    env = {
+        _UCODE_CLAUDE_BASE_URL_ENV: f"{workspace_host}/ai-gateway/anthropic",
+        _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
+    }
+    model = _connect_broker_default_model()
+
+    from omnigent.onboarding.ucode_state import read_ucode_state
+
+    workspace_state = read_ucode_state(workspace_host)
+    agent_state = workspace_state.agent(_UCODE_CLAUDE_AGENT_NAME) if workspace_state else None
+    if agent_state is not None:
+        ucode_base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
+        # Security: state.json is writable, and the broker bearer (apiKeyHelper)
+        # is presented to whatever ANTHROPIC_BASE_URL resolves to. Only adopt
+        # ucode's env/model when its base URL is HTTPS on the connected workspace
+        # host (mirrors the opencode guard); otherwise keep the profile-derived
+        # route rather than forwarding the bearer to an unverified origin.
+        if ucode_base_url and https_url_on_workspace_host(ucode_base_url, workspace_host):
+            # Adopt only the explicit routing/model keys from the writable
+            # state.json — never credential keys or arbitrary process env — then
+            # re-pin the base URL to the guarded value.
+            allowed = {
+                k: v
+                for k, v in agent_state.env.items()
+                if k in _CONNECT_BROKER_UCODE_ENV_ALLOWLIST
+            }
+            env = {**env, **allowed, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
+            # The served model is adopted only alongside a trusted (guarded) base
+            # URL; a model with no/off-host URL falls back to the catalog default
+            # rather than trusting a half-validated state entry.
+            if agent_state.model:
+                model = agent_state.model
+        elif ucode_base_url:
+            _logger.warning(
+                "native-claude connect: ignoring ucode state base URL (not HTTPS on the "
+                "connected workspace host) — using the profile-derived gateway route.",
+            )
+
+    env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
+    return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
+
+
 def resolve_native_claude_config(
     *,
     spec: AgentSpec | None,
@@ -3139,6 +3284,7 @@ def resolve_native_claude_config(
         only need the routing shape pass ``False`` to stay network-free.
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
+    from omnigent.host.databricks_credential import api_key_auth_precludes_broker
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
         default_provider_for_harness,
@@ -3155,26 +3301,50 @@ def resolve_native_claude_config(
         entry = _resolve_provider_for_build(spec, harness_type="claude-sdk")
         if entry is not None:
             return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-        return _ucode_config_for_profile(spec.executor.profile, refresh_models=refresh_models)
-
-    # 2. Spec-less (omnigent claude): explicit default wins first.
-    explicit = load_config()
-    entry = default_provider_for_harness(explicit, "claude-sdk")
-    if entry is not None:
-        return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-    # A global databricks auth block → ucode.
-    global_auth = _load_global_auth()
-    if isinstance(global_auth, DatabricksAuth):
-        return _ucode_config_for_profile(global_auth.profile, refresh_models=refresh_models)
-    if global_auth is not None:
-        # A global api_key auth: let Claude's own login handle it (parity
-        # with the subscription path); the in-process harness would inject
-        # it, but the native CLI uses its configured account.
-        return None
-    # 3. Ambient detection (first run without configure).
-    entry = default_provider_for_harness(effective_config_with_detected(explicit), "claude-sdk")
-    if entry is not None:
-        return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
+        ucode_config = _ucode_config_for_profile(
+            spec.executor.profile, refresh_models=refresh_models
+        )
+        if ucode_config is not None:
+            return ucode_config
+        # The spec named no provider and no usable ucode profile — fall through to
+        # the managed-connect-host broker fallback (step 4) rather than giving up.
+    else:
+        # 2. Spec-less (omnigent claude): explicit default wins first.
+        explicit = load_config()
+        entry = default_provider_for_harness(explicit, "claude-sdk")
+        if entry is not None:
+            return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
+        # A global databricks auth block → ucode.
+        global_auth = _load_global_auth()
+        if isinstance(global_auth, DatabricksAuth):
+            return _ucode_config_for_profile(global_auth.profile, refresh_models=refresh_models)
+        if global_auth is not None:
+            # A global api_key auth: let Claude's own login handle it (parity
+            # with the subscription path); the in-process harness would inject
+            # it, but the native CLI uses its configured account.
+            return None
+        # 3. Ambient detection (first run without configure).
+        entry = default_provider_for_harness(
+            effective_config_with_detected(explicit), "claude-sdk"
+        )
+        if entry is not None:
+            return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
+    # 4. Managed connect host: no provider config, but the host linked Databricks
+    #    via the connect flow (host-only [omnigent] profile + broker sidecar).
+    #    Route Claude Code through the owner's gateway, minting via the broker —
+    #    unless an explicit API key (spec-level or global) is configured, which
+    #    Claude's own login threads and must not be silently rerouted (the
+    #    spec-less branch returns None above for the same reason; this covers the
+    #    spec branch, where _resolve_provider_for_build also returns None for it).
+    if not api_key_auth_precludes_broker(spec):
+        broker_config = _connect_broker_claude_config()
+        if broker_config is not None:
+            log_info_once(
+                _logger,
+                "native-claude routing: managed connect host — Databricks AI gateway via the "
+                "credential broker (host-only [omnigent] profile + broker sidecar).",
+            )
+            return broker_config
     log_info_once(
         _logger,
         "native-claude routing: Claude CLI login (no provider configured for the Claude "

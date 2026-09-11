@@ -39,7 +39,7 @@ _PROBE = """() => {
     const rail = document.querySelector('.turn-rail-fade');
     const sections = [...document.querySelectorAll(
         '[data-testid="assistant-text-section"]')];
-    const composerTop = Math.round(card.getBoundingClientRect().top);
+    const composerTop = Math.round(card.parentElement.getBoundingClientRect().top);
     const transcriptBottom = Math.round(scroller.getBoundingClientRect().bottom);
     return {
         messageTops: sections.map(
@@ -632,7 +632,8 @@ def test_composer_growth_reflows_transcript_without_covering_output(
     button_relocked = _settled_geometry(page)
     assert button_relocked["distanceFromBottom"] <= 1, button_relocked
 
-    composer.press("Shift+Enter")
+    for _ in range(3):
+        composer.press("Shift+Enter")
     button_relocked_grown = _settled_geometry(page)
     assert button_relocked_grown["composerHeight"] > button_relocked["composerHeight"], (
         button_relocked,
@@ -658,7 +659,7 @@ def test_composer_growth_reflows_transcript_without_covering_output(
     send_relocked = _settled_geometry(page)
     assert send_relocked["distanceFromBottom"] <= 1, send_relocked
 
-    composer.fill("next draft\nline two")
+    composer.fill("next draft\nline two\nline three")
     send_relocked_grown = _settled_geometry(page)
     assert send_relocked_grown["distanceFromBottom"] <= 1, send_relocked_grown
     assert abs(send_relocked_grown["overlap"]) <= 1, send_relocked_grown

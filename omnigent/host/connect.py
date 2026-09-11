@@ -33,7 +33,9 @@ from omnigent.debug_logging import (
     ORIGIN_WORKSPACE_ID_ENV_VAR,
     PRIMARY_SESSION_ID_ENV_VAR,
     USER_ID_ENV_VAR,
+    debug_event,
 )
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -2163,7 +2165,21 @@ class HostProcess:
             _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
+        # A non-zero runner exit is a runner-process fault that blocks the
+        # session; the specific cause lives in the unparsed log tail (lifecycle
+        # stage unknown).
+        _logger.warning(
+            "Runner %s died unexpectedly: %s",
+            runner_id,
+            error,
+            extra=debug_event(
+                "runner_died",
+                runner_id=runner_id,
+                error_category=ErrorCategory.RUNNER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
+            ),
+        )
         await self._report_runner_exit(runner_id, error)
 
     async def _report_runner_exit(self, runner_id: str, error: str) -> None:
@@ -3028,16 +3044,21 @@ class HostProcess:
                 limit=_coerce_int(params.get("limit", 500)),
             )
         if op == "github_info":
-            return r.github_info()
+            return r.github_info(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_changes":
-            return r.github_changes()
+            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
                 str(params.get("path", "")),
+                session_id=session_id,
+                pr_url=cast("str | None", params.get("pr_url")),
+                previous_path=cast("str | None", params.get("previous_path")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff()
+            return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
@@ -3070,7 +3091,9 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
         try:
-            payload = self._dispatch_fs_write_op(expanded, frame.op, frame.params or {})
+            payload = self._dispatch_fs_write_op(
+                expanded, frame.op, {**(frame.params or {}), "session_id": frame.session_id}
+            )
         except ValueError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3110,6 +3133,15 @@ class HostProcess:
                 workspace,
                 account=cast("str | None", params.get("account")),
                 remote=cast("str | None", params.get("remote")),
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+            )
+        if op == "github_prs_update":
+            return github_resource.update_session_pr(
+                workspace,
+                str(params["session_id"]),
+                str(params["url"]),
+                str(params.get("action", "attach")),
             )
         raise ValueError(f"unknown fs write op: {op!r}")
 
@@ -4184,6 +4216,47 @@ class HostProcess:
             await self._handle_import_local(ws, frame)
 
 
+def _generate_ucode_configs() -> None:
+    """At host boot, have ucode generate the harnesses' gateway config (OSS connect).
+
+    The OSS managed-connect gate: only when the host-only ``[omnigent]`` profile +
+    broker sidecar are present (the owner linked Databricks via the connect flow)
+    do we drive ucode, passing the broker command in the configure env so ucode
+    mints per request and nothing lands on disk. The reusable run lives in
+    :func:`omnigent.onboarding.ucode_setup.configure_ucode_for_sandbox` (a
+    background, best-effort populate of ``~/.ucode/state.json``), which the
+    managed lakebox launcher shares with ``use_pat=True`` against its injected PAT.
+
+    Configures opencode too (alongside claude/codex/pi), overlapping host boot, so
+    the runner never has to fall back to a synchronous on-demand ``ucode
+    configure`` when opencode first launches — the slow path for opencode startup.
+    """
+    from omnigent.host.databricks_credential import (
+        HOST_DATABRICKS_PROFILE,
+        broker_token_command,
+    )
+    from omnigent.inner.databricks_executor import _read_databrickscfg_host
+    from omnigent.onboarding.ucode_setup import configure_ucode_for_sandbox
+
+    workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+    if not workspace:
+        return
+    bearer_command = broker_token_command(workspace)
+    if not bearer_command:
+        return  # no broker sidecar → not a managed connect host
+    # opencode is included here (unlike lakebox's claude/codex/pi ``--use-pat``
+    # wrappers) so its config is ready at first launch instead of forcing a
+    # synchronous on-demand ``ucode configure`` on the runner.
+    configure_ucode_for_sandbox(
+        HOST_DATABRICKS_PROFILE,
+        agents=("claude", "codex", "pi", "opencode"),
+        extra_env={
+            "DATABRICKS_BEARER_COMMAND": bearer_command,
+            "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,
+        },
+    )
+
+
 def run_host_process(
     server_url: str,
     config_path: Path | None = None,
@@ -4278,6 +4351,15 @@ def run_host_process(
     # broker blip at startup can't strand a connected owner for the whole session).
     configure_host_gh(server_url, identity.host_id)
     start_host_gh_refresh(server_url, identity.host_id)
+
+    # Executor-agnostic Databricks setup: when the owner has linked a workspace,
+    # materialize their per-user token as a ``~/.databrickscfg`` profile so the
+    # agent's model serving + MCP route through their Databricks AI Gateway.
+    # Best-effort; a no-op when Databricks isn't connected/configured.
+    from omnigent.host.databricks_credential import configure_host_databricks
+
+    configure_host_databricks(server_url, identity.host_id)
+    _generate_ucode_configs()
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)

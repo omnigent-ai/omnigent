@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -28,6 +30,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.debug_logging import (
+    add_audit_attrs,
     audit_event_logger,
     current_request_audit_attrs,
     debug_event,
@@ -36,7 +39,7 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
     ResolvedBundle,
@@ -1083,6 +1086,8 @@ def create_app(
     sandbox_config: ManagedSandboxDeployment | None = None,
     github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
+    databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
+    databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
@@ -1572,7 +1577,10 @@ def create_app(
     # enabled_connections list and the router mounting below both read these.
     from omnigent.server.connections_registry import connection_providers
 
-    _connection_inputs = {"github": (github_config, github_store)}
+    _connection_inputs = {
+        "github": (github_config, github_store),
+        "databricks": (databricks_config, databricks_store),
+    }
     for _provider in connection_providers():
         _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
         _on = _cfg is not None and _store is not None
@@ -1838,6 +1846,18 @@ def create_app(
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
+        # Stamp attribution onto the per-request audit-envelope row (table-only,
+        # one per request) for EVERY code, so the 4xx we deliberately don't log
+        # to the ERROR stream are still queryable by owner/impact/phase. The
+        # dedicated ERROR/WARN logs below stay reserved for the 5xx and the
+        # offline-runner state, keeping the ERROR stream low-noise (see #6242).
+        add_audit_attrs(
+            code=str(exc.code),
+            http_status=str(exc.http_status),
+            error_category=exc.category.value,
+            error_impact=exc.impact.value,
+            error_phase=exc.phase.value,
+        )
         if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
             # A session state, not a fault: the user's machine is asleep or
             # the host disconnected, and clients render it as a reconnect
@@ -1848,7 +1868,13 @@ def create_app(
                 "Runner unavailable: %s",
                 exc.message,
                 extra=_error_audit_extra(
-                    request, phase="unavailable", code=str(exc.code), http_status="503"
+                    request,
+                    phase="unavailable",
+                    code=str(exc.code),
+                    http_status="503",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
                 ),
             )
         elif exc.http_status >= 500:
@@ -1857,7 +1883,12 @@ def create_app(
                 exc.message,
                 exc_info=exc,
                 extra=_error_audit_extra(
-                    request, code=str(exc.code), http_status=str(exc.http_status)
+                    request,
+                    code=str(exc.code),
+                    http_status=str(exc.http_status),
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
                 ),
             )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
@@ -1866,13 +1897,44 @@ def create_app(
                 request.url.path,
                 exc.message,
                 extra=_error_audit_extra(
-                    request, phase="rejected", code=str(exc.code), http_status="400"
+                    request,
+                    phase="rejected",
+                    code=str(exc.code),
+                    http_status="400",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
                 ),
             )
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
         )
+
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        """Attribute schema-validation rejections, then return the stock 422 body.
+
+        A schema/transport-invalid request is caller-side input (category=user),
+        and it rejects one request without harming the session (impact=benign).
+        Attribution rides the per-request audit row rather than a dedicated
+        ERROR/WARN line; the response is delegated to FastAPI's default handler
+        so the 422 shape is unchanged.
+        """
+        # Attribute on the per-request audit row, not the ERROR stream: a schema
+        # rejection is expected, low-signal caller input, so it should be
+        # queryable without adding noise where the 500s must stand out.
+        add_audit_attrs(
+            code=str(ErrorCode.INVALID_INPUT),
+            http_status="422",
+            error_category=ErrorCategory.USER.value,
+            error_impact=ErrorImpact.BENIGN.value,
+            error_phase=ErrorPhase.REQUEST.value,
+        )
+        return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
@@ -1895,6 +1957,15 @@ def create_app(
         :returns: 404 for a malformed id, otherwise a 500 JSON response.
         """
         if isinstance(exc.orig, InvalidUuidError):
+            # A malformed id is caller-side input (a value no row can ever
+            # address), not a human referencing a real-but-gone one.
+            add_audit_attrs(
+                code=str(ErrorCode.NOT_FOUND),
+                http_status="404",
+                error_category=ErrorCategory.USER.value,
+                error_impact=ErrorImpact.BENIGN.value,
+                error_phase=ErrorPhase.REQUEST.value,
+            )
             # Keep a trace: a malformed id is usually a client bug, but this
             # branch would otherwise mask a server-side id-generation defect
             # as a routine 404.
@@ -1908,7 +1979,12 @@ def create_app(
             exc,
             exc_info=exc,
             extra=_error_audit_extra(
-                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+                request,
+                code=str(ErrorCode.INTERNAL_ERROR),
+                http_status="500",
+                error_category=ErrorCategory.SERVER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
             ),
         )
         return JSONResponse(
@@ -1936,12 +2012,22 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
+        # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
+        # fault is ours. Booking it as server would inflate our fault rate; the
+        # exception type is logged as a signature to rank for promotion to a real
+        # category. The client still gets internal_error / 500.
         _logger.error(
             "Unhandled exception: %s",
             exc,
             exc_info=exc,
             extra=_error_audit_extra(
-                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+                request,
+                code=str(ErrorCode.INTERNAL_ERROR),
+                http_status="500",
+                error_category=ErrorCategory.UNKNOWN.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
+                error_type=type(exc).__name__,
             ),
         )
         return JSONResponse(
@@ -2382,7 +2468,7 @@ def create_app(
         # and its connection store are present.
         enabled_connections = [
             provider
-            for provider in ("github",)
+            for provider in ("github", "databricks")
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]
@@ -2852,9 +2938,13 @@ def create_app(
             )
             return
         runner_session_initializer.invalidate_runner(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other
-        # replicas flip offline immediately rather than after the TTL.
-        session_live_state.clear_runner_liveness(runner_id)
+        # Graceful disconnect: clear the persisted liveness stamp so other replicas
+        # flip offline at once. Not on our own shutdown: the runner is alive and
+        # re-tunnels to the replacement, which must not settle its turns to idle.
+        if shutdown_state.server_shutting_down():
+            session_live_state.touch_runner_liveness([runner_id])
+        else:
+            session_live_state.clear_runner_liveness(runner_id)
 
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.

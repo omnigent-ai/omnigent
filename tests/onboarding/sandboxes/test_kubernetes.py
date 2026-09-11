@@ -290,6 +290,27 @@ def test_build_job_manifest_node_selector_can_override_arch() -> None:
     assert selector["disktype"] == "ssd"
 
 
+def test_build_job_manifest_omits_tolerations_by_default() -> None:
+    """No tolerations → no tolerations key: byte-compatible with pre-tolerations manifests."""
+    manifest = build_job_manifest(**_MANIFEST_KW)
+    assert "tolerations" not in _pod_spec(manifest)
+
+
+def test_build_job_manifest_tolerations_land_on_the_pod_spec_verbatim() -> None:
+    """Normalized toleration entries reach spec.tolerations verbatim."""
+    tolerations = [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        },
+        {"operator": "Exists"},
+    ]
+    manifest = build_job_manifest(**{**_MANIFEST_KW, "tolerations": tolerations})
+    assert _pod_spec(manifest)["tolerations"] == tolerations
+
+
 def test_build_job_manifest_omits_runtime_class_by_default() -> None:
     """No runtime_class → no runtimeClassName key: the cluster default runtime."""
     manifest = build_job_manifest(**_MANIFEST_KW)
@@ -856,6 +877,38 @@ def test_launch_host_threads_pvc_mounts_into_the_job(
         "name": "pvc-0",
         "persistentVolumeClaim": {"claimName": "omnigent-datasets", "readOnly": True},
     } in pod_spec["volumes"]
+
+
+def test_launch_host_threads_tolerations_into_the_job(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """A launcher built with tolerations creates Jobs whose Pod spec carries them."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    tolerations = [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        }
+    ]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        tolerations=tolerations,
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    pod_spec = batch.created_jobs[0]["spec"]["template"]["spec"]
+    assert pod_spec["tolerations"] == tolerations
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ import os
 import queue
 import select
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -9934,3 +9935,383 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Bridge HTTP server bind/advertise behavior.
+#
+# The servers default to loopback (127.0.0.1). Sandbox backends with SSRF
+# hardening (e.g. OpenShell) deny loopback destinations unconditionally, so a
+# loopback-advertised relay is unreachable from hook subprocesses inside such
+# a sandbox; that integrator opts into an all-interfaces bind via
+# OMNIGENT_BRIDGE_BIND_HOST="0.0.0.0", which advertises the host's routable
+# address. Ports come from a stable, allowlistable pool.
+# ---------------------------------------------------------------------------
+
+
+async def _noop_relay_executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+    """Accept any relayed tool call; these tests only exercise binding."""
+    del name, arguments
+    return {}
+
+
+def _relay_tools() -> list[dict[str, Any]]:
+    """Minimal tool list for a relay advertisement."""
+    return [{"name": "sys_noop", "description": "", "parameters": {"type": "object"}}]
+
+
+@pytest.fixture
+def _no_ambient_bridge_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate bind/advertise decisions from ambient host environment."""
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, raising=False)
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, raising=False)
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_tool_relay_defaults_to_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no override the relay stays loopback-only, even given a routable IP.
+
+    Loopback is the default posture so an ordinary host keeps the relay off
+    every other interface. A routable address is present here (mocked) to
+    prove detection alone never widens the bind without the opt-in.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    bridge_dir = prepare_bridge_dir("conv_default_loopback", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert info["url"].startswith("http://127.0.0.1:"), (
+            "detecting a routable address must not widen the default bind"
+        )
+        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+            encoding="utf-8"
+        )
+        assert "OMNIGENT_RELAY_URL='http://127.0.0.1:" in env_text
+    finally:
+        relay.close()
+    assert not (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).exists(), (
+        "close() must recognise its own advertisement and unlink it"
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_all_interfaces_opt_in_advertises_routable_host_reachable_locally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OMNIGENT_BRIDGE_BIND_HOST=0.0.0.0 advertises the routable host.
+
+    This is the sandbox integrator's opt-in: a loopback advertisement is
+    unreachable from an SSRF-hardened sandbox, so the relay must advertise a
+    routable host while still binding all interfaces. TEST-NET-3 stands in for
+    the detected routable address; it is deliberately not locally bindable,
+    proving the server listens on all interfaces rather than on the advertised
+    address itself, so loopback consumers keep working.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_routable_bind", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        port = int(info["url"].rsplit(":", 1)[1])
+        assert info["url"] == f"http://203.0.113.9:{port}", (
+            "relay advertised a non-routable URL; sandboxed hooks cannot reach it"
+        )
+        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+            encoding="utf-8"
+        )
+        assert f"OMNIGENT_RELAY_URL='http://203.0.113.9:{port}'" in env_text
+        # Bound on all interfaces: local (loopback) consumers keep working
+        # even though the advertised host is not bindable here.
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            pass
+    finally:
+        relay.close()
+    assert not (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).exists(), (
+        "close() must recognise its own routable-host advertisement and unlink it"
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_all_interfaces_opt_in_falls_back_to_loopback_advertise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 0.0.0.0 opt-in advertises loopback when no routable address exists.
+
+    Binding all interfaces still includes loopback, so a local consumer keeps
+    working; a sandbox that filters loopback cannot be helped when the host has
+    no routable interface, but that is a misconfiguration, not this fix's path.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: None,
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_loopback_fallback", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+        )
+        assert info["url"].startswith("http://127.0.0.1:")
+    finally:
+        relay.close()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_tool_relay_bind_host_override_pins_advertised_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit bind-host override wins over routable-address detection."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "127.0.0.1")
+    bridge_dir = prepare_bridge_dir("conv_pinned_bind", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+        )
+        assert info["url"].startswith("http://127.0.0.1:")
+    finally:
+        relay.close()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_relay_ports_draw_from_stable_pool_with_bind_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pool ports are allocated with bind-retry, then fall back to ephemeral.
+
+    A sandbox network policy allowlists exact host+port pairs, so relay ports
+    must come from the configured pool. Multiple bridge servers run per host
+    (MCP ingress + one relay per session), so an occupied pool port is skipped
+    rather than fatal, and an exhausted pool degrades to an OS-assigned port
+    instead of refusing to start. The bind host is pinned to loopback so the
+    test occupies and probes ports on a single interface.
+    """
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "127.0.0.1")
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        taken_port = int(taken.getsockname()[1])
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = int(probe.getsockname()[1])
+        monkeypatch.setenv(
+            claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, f"{taken_port},{free_port}"
+        )
+
+        first_dir = prepare_bridge_dir("conv_pool_first", workspace=tmp_path)
+        first = start_tool_relay(
+            bridge_dir=first_dir,
+            tools=_relay_tools(),
+            tool_executor=_noop_relay_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        second = None
+        try:
+            first_info = json.loads(
+                (first_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+            )
+            assert first_info["url"] == f"http://127.0.0.1:{free_port}", (
+                "relay must skip the occupied pool port and bind the next one"
+            )
+
+            second_dir = prepare_bridge_dir("conv_pool_second", workspace=tmp_path)
+            second = start_tool_relay(
+                bridge_dir=second_dir,
+                tools=_relay_tools(),
+                tool_executor=_noop_relay_executor,
+                loop=asyncio.get_running_loop(),
+            )
+            second_info = json.loads(
+                (second_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+            )
+            second_port = int(second_info["url"].rsplit(":", 1)[1])
+            assert second_port not in (taken_port, free_port), (
+                "an exhausted pool must degrade to an OS-assigned port, not rebind"
+            )
+        finally:
+            first.close()
+            if second is not None:
+                second.close()
+
+
+def test_bridge_port_pool_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pool override accepts ports and inclusive ranges; junk is ignored."""
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "28800-28802,29000")
+    assert claude_native_bridge._bridge_port_pool() == (28800, 28801, 28802, 29000)
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "not-ports")
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "70000")
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, raising=False)
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_all_interfaces_opt_in_advertises_routable_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The MCP control ingress shares the relay's bind/advertise rules.
+
+    It is the bridge's second HTTP bind site; leaving it loopback-only under
+    the 0.0.0.0 opt-in would reintroduce the sandbox fail-closed path for
+    tools-changed control calls.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_ingress_bind", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+        )
+        port = int(info["url"].rsplit(":", 1)[1])
+        assert info["url"] == f"http://203.0.113.9:{port}"
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            pass
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_approval_wait_marker_tracks_a_parked_permission_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A touched marker reads fresh, a stale one does not, and clearing removes it.
+
+    The idle pane reaper spares a native pane only while this marker is fresh,
+    so a marker that reads stale mid-wait reproduces the wedge where a reaped
+    pane strands its approval card unanswerable.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT_PARENT", tmp_path / "omnigent-test"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT",
+        tmp_path / "omnigent-test" / "approval-parent" / "approval-waits",
+    )
+
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_wait")
+
+    marker = claude_native_bridge.approval_wait_marker_path("conv_wait")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
+    assert marker.exists()
+    assert claude_native_bridge.approval_wait_is_fresh("conv_wait")
+    # One session's parked prompt must not spare another session's pane.
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_other")
+
+    # Each hook owns its own marker, so one finishing (an AskUserQuestion beside
+    # a permission request, or parallel tool calls) leaves the other's evidence.
+    sibling = marker.with_name(marker.name.replace(f".{os.getpid()}.", f".{os.getpid() + 1}."))
+    assert sibling != marker
+    claude_native_bridge.touch_approval_wait_marker(sibling)
+    claude_native_bridge.clear_approval_wait_marker(marker)
+    assert not marker.exists()
+    assert claude_native_bridge.approval_wait_is_fresh("conv_wait")
+
+    # A stale marker (a hook killed mid-wait) reads idle and is pruned.
+    stale = time.time() - claude_native_bridge.APPROVAL_WAIT_MARKER_TTL_S - 1
+    os.utime(sibling, (stale, stale))
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_wait")
+    assert not sibling.exists()
+
+    # The hook clears on exit, so clearing an absent marker must not raise.
+    claude_native_bridge.clear_approval_wait_marker(marker)
+
+    # A hook subprocess derives the root from the bridge dir it was handed,
+    # which must land on the same path the runner-side reaper checks.
+    bridge_dir = tmp_path / "omnigent-test" / "approval-parent" / "abc123"
+    assert (
+        claude_native_bridge.approval_wait_marker_path("conv_wait", bridge_dir=bridge_dir)
+        == marker
+    )
+
+
+def test_hold_approval_wait_marker_refreshes_until_released(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The held marker is re-touched on a timer and gone once the block exits.
+
+    A direct server holds one POST for the whole wait, so a marker touched
+    only at the start of the attempt read stale after the TTL and the reaper
+    killed the parked pane an hour later.
+    """
+    monkeypatch.setattr(claude_native_bridge, "APPROVAL_WAIT_MARKER_REFRESH_S", 0.02)
+    touches: list[Path] = []
+    real_touch = claude_native_bridge.touch_approval_wait_marker
+
+    def _counting_touch(marker: Path) -> None:
+        """
+        Record a touch, then perform it.
+
+        :param marker: Marker path being touched.
+        :returns: None.
+        """
+        touches.append(marker)
+        real_touch(marker)
+
+    monkeypatch.setattr(claude_native_bridge, "touch_approval_wait_marker", _counting_touch)
+    marker = tmp_path / "approval-waits" / "digest.1234.wait"
+    marker.parent.mkdir()
+
+    with claude_native_bridge.hold_approval_wait_marker(marker):
+        assert marker.exists(), "touched before the block starts"
+        deadline = time.monotonic() + 5.0
+        while len(touches) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(touches) >= 3, "the refresher must keep touching while the block runs"
+    assert not marker.exists()
+    settled = len(touches)
+    time.sleep(0.1)
+    assert len(touches) == settled, "the refresher must stop when the block exits"

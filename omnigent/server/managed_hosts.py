@@ -315,6 +315,9 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # value). ``conversations.workspace`` is overwritten with the CLONED
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
+# Per-session state: a fork never inherits it (the store drops it, and
+# the fork's own launch re-stamps whatever repository it resolves),
+# while an in-place agent switch keeps it — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 
 
@@ -1367,6 +1370,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "secret_name",
                     "service_account",
                     "node_selector",
+                    "tolerations",
                     "kubeconfig",
                     "in_cluster",
                     "resources",
@@ -1389,6 +1393,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             secret_name=_parse_provider_string(raw, "kubernetes", "secret_name"),
             service_account=_parse_provider_string(raw, "kubernetes", "service_account"),
             node_selector=_parse_provider_str_mapping(raw, "kubernetes", "node_selector"),
+            tolerations=_parse_kubernetes_tolerations(raw),
             kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
@@ -2538,6 +2543,116 @@ def _validate_kubernetes_identifiers(
             )
 
 
+# Kubernetes Toleration ``operator`` / ``effect`` enums for parse-time
+# validation of ``sandbox.kubernetes.tolerations`` entries.
+_K8S_TOLERATION_OPERATORS: frozenset[str] = frozenset({"Exists", "Equal"})
+_K8S_TOLERATION_EFFECTS: frozenset[str] = frozenset(
+    {"NoSchedule", "PreferNoSchedule", "NoExecute"}
+)
+
+
+def _parse_kubernetes_tolerations(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.tolerations`` list.
+
+    Each entry is a Kubernetes Toleration — ``{key?, operator?, value?,
+    effect?, tolerationSeconds?}`` — added to every runner Pod's
+    ``spec.tolerations`` verbatim. Lets an operator dedicate a tainted
+    NodePool to sandbox Pods (pair with ``node_selector`` to also pin them
+    there — a toleration alone only permits scheduling, it does not attract
+    it). Validated at parse time so a malformed entry fails server startup
+    instead of the first managed launch.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Normalized entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, or
+        combines fields Kubernetes itself would reject (an ``Exists``
+        operator with a ``value``, an empty ``key`` with an operator other
+        than ``Exists``, or a ``tolerationSeconds`` without ``effect:
+        NoExecute``).
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("tolerations")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.tolerations' must be a list of "
+            "{key?, operator?, value?, effect?, tolerationSeconds?} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.tolerations[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        _reject_unknown_keys(
+            entry, {"key", "operator", "value", "effect", "tolerationSeconds"}, path_prefix
+        )
+        key = entry.get("key")
+        if key is not None and (not isinstance(key, str) or not key.strip()):
+            raise ValueError(f"server config '{path_prefix}.key' must be a non-empty string")
+        if key is not None and not _validate_label_key(key.strip()):
+            raise ValueError(
+                f"server config '{path_prefix}.key' is not a valid Kubernetes label key: {key!r}"
+            )
+        operator = entry.get("operator", "Equal")
+        if not isinstance(operator, str) or operator not in _K8S_TOLERATION_OPERATORS:
+            raise ValueError(
+                f"server config '{path_prefix}.operator' must be one of: "
+                f"{', '.join(sorted(_K8S_TOLERATION_OPERATORS))} (got {operator!r})"
+            )
+        if key is None and operator != "Exists":
+            raise ValueError(
+                f"server config '{path_prefix}' omits 'key' but sets operator "
+                f"{operator!r} — an empty key only pairs with 'Exists' "
+                "(Kubernetes' 'tolerate everything' form)"
+            )
+        entry_value = entry.get("value")
+        if entry_value is not None and not isinstance(entry_value, str):
+            raise ValueError(f"server config '{path_prefix}.value' must be a string")
+        if entry_value and (len(entry_value) > 63 or not _K8S_LABEL_SEGMENT_RE.match(entry_value)):
+            raise ValueError(
+                f"server config '{path_prefix}.value' is not a valid Kubernetes "
+                f"label value: {entry_value!r}"
+            )
+        if operator == "Exists" and entry_value:
+            raise ValueError(
+                f"server config '{path_prefix}.value' is not allowed with operator 'Exists'"
+            )
+        effect = entry.get("effect")
+        if effect is not None and (
+            not isinstance(effect, str) or effect not in _K8S_TOLERATION_EFFECTS
+        ):
+            raise ValueError(
+                f"server config '{path_prefix}.effect' must be one of: "
+                f"{', '.join(sorted(_K8S_TOLERATION_EFFECTS))} (got {effect!r})"
+            )
+        toleration_seconds = entry.get("tolerationSeconds")
+        if toleration_seconds is not None:
+            if not isinstance(toleration_seconds, int) or isinstance(toleration_seconds, bool):
+                raise ValueError(
+                    f"server config '{path_prefix}.tolerationSeconds' must be an integer"
+                )
+            if effect != "NoExecute":
+                raise ValueError(
+                    f"server config '{path_prefix}.tolerationSeconds' only applies "
+                    "with effect 'NoExecute'"
+                )
+        normalized_entry: dict[str, object] = {"operator": operator}
+        if key is not None:
+            normalized_entry["key"] = key.strip()
+        if entry_value:
+            normalized_entry["value"] = entry_value
+        if effect is not None:
+            normalized_entry["effect"] = effect
+        if toleration_seconds is not None:
+            normalized_entry["tolerationSeconds"] = toleration_seconds
+        normalized.append(normalized_entry)
+    return normalized or None
+
+
 def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the optional ``sandbox.kubernetes.resources`` block.
@@ -2878,6 +2993,7 @@ def _kubernetes_launcher_factory(
     secret_name: str | None,
     service_account: str | None,
     node_selector: dict[str, str] | None,
+    tolerations: list[dict[str, object]] | None,
     kubeconfig: str | None,
     in_cluster: bool | None,
     resources: dict[str, object] | None,
@@ -2905,6 +3021,10 @@ def _kubernetes_launcher_factory(
     :param node_selector: Extra node selector labels merged with a default
         ``kubernetes.io/arch: amd64`` (an entry for that key overrides it),
         or ``None``.
+    :param tolerations: Normalized Toleration entries added to every runner
+        Pod's ``spec.tolerations`` verbatim, or ``None``. Permits scheduling
+        onto a tainted NodePool; pair with *node_selector* to also pin the
+        Pod there.
     :param kubeconfig: Explicit kubeconfig path for the out-of-cluster fallback,
         or ``None``.
     :param in_cluster: Force the cluster-config source, or ``None`` to try
@@ -2944,6 +3064,7 @@ def _kubernetes_launcher_factory(
             secret_name=secret_name,
             service_account=service_account,
             node_selector=node_selector,
+            tolerations=tolerations,
             kubeconfig=kubeconfig,
             in_cluster=in_cluster,
             resources=resources,

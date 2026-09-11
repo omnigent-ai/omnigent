@@ -524,22 +524,66 @@ class WorkspaceReader:
     # and patch come from ``gh`` (the developer's authenticated CLI) and only the
     # per-file reader shells out to a read-only ``git show``.
 
-    def github_info(self) -> _WorkspacePayload:
-        """GitHub context (repo, branch, base ref, PR) for the workspace."""
-        return cast("_WorkspacePayload", github_resource.github_info(str(self._root)))
-
-    def github_changes(self) -> _WorkspacePayload:
-        """The PR's changed files (empty when the branch has no PR)."""
-        return cast("_WorkspacePayload", github_resource.github_changed_files(str(self._root)))
-
-    def github_file_diff(self, base: str | None, relative_path: str) -> _WorkspacePayload:
-        """Before/after content for one file, HEAD vs the base merge-base."""
-        resolved = github_resource.resolve_base_ref(str(self._root), base)
+    def github_info(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """GitHub context for an explicit session PR or the workspace branch."""
         return cast(
             "_WorkspacePayload",
-            github_resource.github_file_diff(str(self._root), resolved or "", relative_path),
+            github_resource.github_info(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
         )
 
-    def github_pr_diff(self) -> _WorkspacePayload:
-        """The whole PR as one unified diff patch (empty when there's no PR)."""
-        return cast("_WorkspacePayload", github_resource.github_pr_diff(str(self._root)))
+    def github_changes(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The selected PR's changed files."""
+        return cast(
+            "_WorkspacePayload",
+            github_resource.github_changed_files(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )
+
+    def github_file_diff(
+        self,
+        base: str | None,
+        relative_path: str,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        previous_path: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """Before/after content for the selected PR's revisions."""
+        return cast(
+            "_WorkspacePayload",
+            github_resource.github_file_diff(
+                str(self._root),
+                base or "",
+                relative_path,
+                session_id=session_id,
+                pr_url=pr_url,
+                previous_path=previous_path,
+                head_sha=head_sha,
+                base_sha=base_sha,
+            ),
+        )
+
+    def github_pr_diff(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The selected PR's unified diff patch."""
+        return cast(
+            "_WorkspacePayload",
+            github_resource.github_pr_diff(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )

@@ -6328,3 +6328,60 @@ async def test_sibling_environment_routes_are_not_gzipped(
 
     assert resp.status_code == 200
     assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.parametrize(
+    "resource,op",
+    [
+        ("", "github_info"),
+        ("/changes", "github_changes"),
+        ("/diff", "github_pr_diff"),
+        ("/diff/new.py", "github_diff"),
+    ],
+)
+async def test_selected_pr_reaches_offline_host(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    op: str,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"object": "session.github.info"}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params={"pr_url": url}
+    )
+    assert response.status_code == 200
+    assert captured["op"] == op
+    assert captured["session_id"] == _OFFLINE_SESSION
+    assert captured["params"]["pr_url"] == url
+
+
+async def test_pr_attachment_uses_bound_session_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"object": "session.github.info", "prs": []}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/prs",
+        json={"url": url, "action": "attach", "session_id": "untrusted"},
+    )
+    assert response.status_code == 200, response.text
+    assert captured["op"] == "github_prs_update"
+    assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}

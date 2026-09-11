@@ -2841,10 +2841,15 @@ def _find_daemon_record(target: str) -> _HostDaemonRecord | None:
     Find a daemon record by target.
 
     :param target: Normalized daemon target, e.g. ``"local"``.
-    :returns: Matching daemon record, or ``None``.
+    :returns: Matching daemon record, including a pre-canonicalization record,
+        or ``None``.
     """
-    for record in _list_daemon_records():
+    records = _list_daemon_records()
+    for record in records:
         if record.target == target:
+            return record
+    for record in records:
+        if _normalize_daemon_target(record.target) == target:
             return record
     return None
 
@@ -2985,7 +2990,7 @@ class _DaemonReuseDecision:
     config_changed: bool
 
 
-def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
+def _daemon_owner_is_live(record: _HostDaemonRecord) -> bool:
     """Whether the daemon that wrote *record* is still alive.
 
     A held record flock is a definitive live owner (the kernel drops it on
@@ -2997,11 +3002,11 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     process is. Reaping therefore requires a free lock and a dead-or-foreign
     PID.
 
-    :param record: Existing daemon record for *target*.
-    :param target: Normalized daemon target, e.g. ``"local"``.
+    :param record: Existing daemon record whose original target identifies the
+        lock path held by its owner.
     :returns: ``True`` if the daemon should be treated as alive.
     """
-    if _record_flock_is_held(_daemon_record_path(target)) is True:
+    if _record_flock_is_held(_daemon_record_path(record.target)) is True:
         return True
     return _pid_is_recorded_daemon(record)
 
@@ -3035,7 +3040,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     existing = _find_daemon_record(target)
     if existing is None:
         return _DaemonReuseDecision(reuse=False, config_changed=False)
-    if not _daemon_owner_is_live(existing, target):
+    if not _daemon_owner_is_live(existing):
         _delete_daemon_record(existing)
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
@@ -3144,7 +3149,7 @@ def _wait_for_daemon_claim(
     deadline = time.monotonic() + timeout_s
     while True:
         record = _find_daemon_record(target)
-        if record is not None and _daemon_owner_is_live(record, target):
+        if record is not None and _daemon_owner_is_live(record):
             return record
         if time.monotonic() >= deadline:
             return None
@@ -3239,7 +3244,7 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     """
     existing = _find_daemon_record(record.target)
     if existing is not None and existing.pid != record.pid:
-        if _daemon_owner_is_live(existing, record.target):
+        if _daemon_owner_is_live(existing):
             return existing
         # Dead, or alive but not our daemon (pid recycled after a reboot):
         # the record is stale, not a conflict — prune it and start normally.
@@ -3255,14 +3260,14 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+            and _daemon_owner_is_live(local_record)
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and not _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+            and not _daemon_owner_is_live(local_record)
         ):
             _delete_daemon_record(local_record)
     return None
@@ -4373,6 +4378,26 @@ def server(
 
             github_store = GithubConnectionStore(db_uri, cipher)
 
+    # Databricks Connect (per-user OAuth U2M). Shares the credential store's
+    # cipher; inert unless OMNIGENT_DATABRICKS_CLIENT_ID/_SECRET are set.
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logging.getLogger(__name__).error(
+                "Databricks Connect is configured but disabled: set the credential "
+                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
+
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
     # OMNIGENT_AUTH_PROVIDER=accounts), supply sensible defaults
@@ -4442,6 +4467,8 @@ def server(
         sandbox_config=sandbox_config,
         github_config=github_config,
         github_store=github_store,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
         server_config=title_server_config,
     )
 
@@ -6336,6 +6363,14 @@ def import_session_command(
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
 
+    # If this machine is itself a host, bind the imported session to it so it
+    # resumes where the transcript came from. Read-only: never mints an identity
+    # on a machine that isn't already a host. Read from the effective config
+    # path so an OMNIGENT_CONFIG_HOME override is honored.
+    from omnigent.host.identity import load_host_identity_if_present
+
+    host_identity = load_host_identity_if_present(_effective_global_config_path())
+
     def _import_one(target: tuple[ImportSource, str]) -> _SessionImportResult:
         # Each target carries its own harness so an "all" batch can span them.
         current_source, sid = target
@@ -6346,7 +6381,7 @@ def import_session_command(
         except (OSError, TypeError, ValueError) as exc:
             return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
 
-        payload = {
+        payload: dict[str, object] = {
             "source": imported.source,
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
@@ -6361,6 +6396,8 @@ def import_session_command(
                 for item in imported.items
             ],
         }
+        if host_identity is not None:
+            payload["host_id"] = host_identity.host_id
         try:
             response = httpx.post(
                 f"{base_url}/v1/imports",
@@ -11706,7 +11743,18 @@ def _resolve_server_url(server: str) -> ServerUrl:
 
     def _resolved(api_base: str) -> ServerUrl:
         if org_id is not None:
-            return ServerUrl(api_base=api_base, org_id=org_id)
+            resolved = ServerUrl(api_base=api_base, org_id=org_id)
+            if resolved.is_workspace_hosted:
+                from omnigent.cli_auth import store_databricks_org_id
+
+                try:
+                    store_databricks_org_id(resolved.api_base, org_id)
+                except OSError as exc:
+                    raise click.ClickException(
+                        "Could not persist the workspace routing selector. "
+                        "Check that the Omnigent data directory is writable, then retry."
+                    ) from exc
+            return resolved
         return ServerUrl.from_api_base(api_base)
 
     # A URL copied from the browser while a conversation is open carries the

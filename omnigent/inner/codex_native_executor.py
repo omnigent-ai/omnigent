@@ -28,9 +28,13 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_mcp_startup,
     update_active_turn_id,
+    write_codex_config_effort,
     write_codex_config_model,
 )
-from omnigent.inner.codex_goal_command import goal_objective_from_content
+from omnigent.inner.codex_goal_command import (
+    goal_objective_from_content,
+    goal_objective_length_error,
+)
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -90,6 +94,19 @@ async def _start_codex_turn(
                 _logger.warning(
                     "Failed to mirror codex model switch into config.toml: model=%s",
                     switched_model,
+                )
+        # Mirror an applied effort the same way (after the model write, whose
+        # clamp may have rewritten the stale effort line): the forwarder's
+        # effort mirror treats config.toml as the source of truth, and a fresh
+        # forwarder state (thread resume / reconnect) re-reads it — without
+        # this write it would revert a composer-picked effort to the stale
+        # launch value.
+        switched_effort = settings_overrides.get("effort")
+        if isinstance(switched_effort, str) and switched_effort:
+            if not write_codex_config_effort(bridge_dir, switched_effort):
+                _logger.warning(
+                    "Failed to mirror codex effort switch into config.toml: effort=%s",
+                    switched_effort,
                 )
     response = await client.request(
         "turn/start",
@@ -355,6 +372,13 @@ class CodexNativeExecutor(Executor):
         settings_overrides = _model_effort_overrides(config)
         latest_user_content = _latest_user_content(messages)
         goal_objective = goal_objective_from_content(latest_user_content)
+        if goal_objective is not None:
+            # Reject over-long objectives here so the app-server's raw
+            # JSON-RPC -32600 error never reaches the user.
+            length_error = goal_objective_length_error(goal_objective)
+            if length_error is not None:
+                yield ExecutorError(message=length_error)
+                return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
             if goal_objective is not None

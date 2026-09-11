@@ -173,6 +173,42 @@ async def test_create_session_managed_asks_the_server_to_provision_a_host() -> N
 
 
 @respx.mock
+async def test_delete_session_issues_delete_and_tolerates_absent() -> None:
+    # Cleanup of a session stranded by a failed launch: DELETE the session, and
+    # treat 404 (already gone) as success — that IS the desired end state.
+    delete = respx.delete("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"id": "conv_1", "deleted": True})
+    )
+    gone = respx.delete("http://omnigent.test/v1/sessions/conv_2").mock(
+        return_value=httpx.Response(404, json={"error": {"code": "not_found"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        await client.delete_session("conv_1")
+        await client.delete_session("conv_2")  # already gone: must not raise
+    finally:
+        await client.aclose()
+
+    assert delete.called
+    assert gone.called
+
+
+@respx.mock
+async def test_delete_session_raises_on_server_error() -> None:
+    respx.delete("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(500, json={"error": {"code": "internal"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        with pytest.raises(OmnigentError):
+            await client.delete_session("conv_1")
+    finally:
+        await client.aclose()
+
+
+@respx.mock
 async def test_managed_host_support_reads_the_server_capability_probe() -> None:
     info = respx.get("http://omnigent.test/v1/info").mock(
         return_value=httpx.Response(
@@ -1462,3 +1498,134 @@ async def test_run_turn_survives_many_drops_that_each_make_progress(
     # Every leg's new delta was forwarded and the turn completed — not abandoned
     # despite far more drops than the consecutive-reconnect cap.
     assert "".join(d for d in deltas if d) == "".join(f"part{i} " for i in range(n_legs))
+
+
+@respx.mock
+async def test_run_turn_reconnects_when_a_reopen_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The proxy severs the stream mid-turn and the re-open is then REFUSED — one
+    # transient connect blip inside the reconnect window. The turn is still
+    # running server-side, so that blip spends a reconnect attempt like any other
+    # and the next open resumes the answer; it must NOT end the turn.
+    monkeypatch.setattr(omnigent_module, "_STREAM_RECONNECT_BACKOFF_S", 0.0)
+
+    async def _first_leg() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Running tests"}\n\n'
+        raise httpx.RemoteProtocolError("proxy max-duration cap")
+
+    # The leg after the blip replays the streamed-so-far text, then finishes.
+    third_body = (
+        'data: {"type":"response.output_text.delta","delta":"Running tests"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":" All 216 pass."}\n\n'
+        'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'
+    )
+    stream = respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=[
+            httpx.Response(200, stream=_first_leg()),
+            httpx.ConnectError("connection refused"),
+            httpx.Response(200, text=third_body),
+        ]
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "run the suite")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # The answer rode through the refused re-open and read to its end, once.
+    assert "".join(d for d in deltas if d) == "Running tests All 216 pass."
+    assert stream.call_count == 3
+    assert submit.call_count == 1
+
+
+@respx.mock
+async def test_run_turn_gives_up_when_every_reopen_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A refused re-open SPENDS the reconnect budget rather than extending it: a
+    # server that stays down is given the same bounded number of attempts, then
+    # reported unreachable — no unbounded retry against a dead server.
+    monkeypatch.setattr(omnigent_module, "_STREAM_RECONNECT_BACKOFF_S", 0.0)
+
+    async def _first_leg() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.output_text.delta","delta":"Working"}\n\n'
+        raise httpx.RemoteProtocolError("proxy max-duration cap")
+
+    opens = 0
+
+    def _refuse_after_first_leg(request: httpx.Request) -> httpx.Response:
+        nonlocal opens
+        opens += 1
+        if opens > 1:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, stream=_first_leg())
+
+    stream = respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=_refuse_after_first_leg
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    raised: Exception | None = None
+    try:
+        try:
+            async for _ in client.run_turn("conv_1", "go"):
+                pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    # Bounded at the same cap the mid-tail drop uses: the opening leg plus one
+    # re-open per remaining attempt, and not one more.
+    assert stream.call_count == omnigent_module._STREAM_RECONNECT_MAX_ATTEMPTS
+    assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, StreamInterruptedError)
+
+
+@respx.mock
+async def test_run_turn_does_not_retry_a_refused_first_connection() -> None:
+    # Nothing is running server-side until the first connection lands, so a
+    # refused FIRST open reports the server unreachable straight away instead of
+    # spending the reconnect budget on a turn that never started.
+    stream = respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    raised: Exception | None = None
+    try:
+        try:
+            async for _ in client.run_turn("conv_1", "go"):
+                pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, StreamInterruptedError)
+    assert stream.call_count == 1
+    # The message never reached a server that never answered.
+    assert submit.call_count == 0

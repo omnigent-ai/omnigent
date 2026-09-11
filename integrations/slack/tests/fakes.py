@@ -221,6 +221,7 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     ("GET", "/v1/hosts/{host_id}/filesystem", True),
     # Session lifecycle.
     ("POST", "/v1/sessions", True),
+    ("DELETE", "/v1/sessions/{session_id}", True),
     ("GET", "/v1/sessions/{session_id}", True),
     ("GET", "/v1/sessions/{session_id}/items", True),
     ("GET", "/v1/sessions/{session_id}/stream", True),
@@ -316,6 +317,12 @@ class FakeOmnigentServer:
         # then succeeds — models a session whose bound runner died: run_turn
         # catches it, launches a fresh runner, and retries the turn once.
         self.first_submit_runner_unavailable = False
+        # Every message-submit (POST /events) returns 503 runner_unavailable
+        # carrying this curated reason — models a managed session whose sandbox
+        # launch hasn't settled within the server's rendezvous window (still
+        # provisioning), where the server owns the relaunch and the client must
+        # not retry blindly.
+        self.submit_runner_unavailable_message: str | None = None
         # Launch responds with this status (404/409 → host-unavailable) instead
         # of 200. None means the normal success path.
         self.launch_status: int | None = None
@@ -422,6 +429,14 @@ class FakeOmnigentServer:
 
         respx_mock.post(b + "/v1/sessions").mock(side_effect=_create_session)
 
+        # Session delete — cleanup of a session whose runner launch failed.
+        def _delete_session(request: httpx.Request) -> httpx.Response:
+            self._record(request)
+            deleted_id = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json={"id": deleted_id, "deleted": True})
+
+        respx_mock.delete(url__regex=rf"{b}/v1/sessions/[^/]+$").mock(side_effect=_delete_session)
+
         def _launch_runner(request: httpx.Request) -> httpx.Response:
             self._record(request)
             self._launch_calls += 1
@@ -449,6 +464,16 @@ class FakeOmnigentServer:
                         "error": {
                             "code": "harness_not_configured",
                             "message": self.harness_not_configured_message,
+                        }
+                    },
+                )
+            if self.submit_runner_unavailable_message is not None:
+                return httpx.Response(
+                    503,
+                    json={
+                        "error": {
+                            "code": "runner_unavailable",
+                            "message": self.submit_runner_unavailable_message,
                         }
                     },
                 )
