@@ -1429,7 +1429,7 @@ export function AgentHarnessPicker({
             <span
               data-testid={`new-chat-landing-agent-summary-${agent.id}`}
               className={cn(
-                "ml-auto w-[5.25rem] min-w-0 shrink-0 truncate text-left text-xs leading-4 text-muted-foreground",
+                "ml-auto min-w-0 flex-1 whitespace-normal break-words text-left text-xs leading-4 text-muted-foreground",
                 active
                   ? "opacity-100"
                   : "opacity-0 group-hover/agent:opacity-100 group-focus-within/agent:opacity-100",
@@ -6354,8 +6354,8 @@ export function NewChatLandingScreen() {
                         autoHarnessAvailable={smartRoutingHarnessAvailable}
                         autoHarnessActive={smartRoutingHarnessSelected}
                         onSelectAutoHarness={handleSelectSmartRoutingHarness}
-                        contentClassName="w-[17.5rem] min-w-0"
-                        triggerClassName="h-8 min-w-0 w-full max-w-[7.25rem] gap-1 rounded-lg pl-2 pr-0 text-[13px] leading-5 md:h-7 md:w-auto md:max-w-40"
+                        contentClassName="w-[22rem] min-w-0"
+                        triggerClassName="text-[13px] leading-5"
                       />
                     </div>
                     {selectedAgent && selectedAgentHasKnobs && (

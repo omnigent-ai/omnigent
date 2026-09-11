@@ -1623,8 +1623,8 @@ describe("NewChatLandingScreen", () => {
     expect(harness).toHaveClass(
       "h-8",
       "min-w-0",
-      "w-full",
-      "max-w-[7.25rem]",
+      "w-auto",
+      "max-w-full",
       "gap-1",
       "rounded-lg",
       "pl-2",
@@ -1632,8 +1632,6 @@ describe("NewChatLandingScreen", () => {
       "text-[13px]",
       "leading-5",
       "md:h-7",
-      "md:w-auto",
-      "md:max-w-40",
     );
     expect(harness).not.toHaveClass("px-2");
     expect(voice).toHaveClass("size-8", "md:size-7");
@@ -1644,10 +1642,12 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
     expect(Array.from(actions.children)).toEqual([leftControls, rightControls]);
-    expect(leftControls).toHaveClass("min-w-0", "flex-1", "gap-1", "overflow-visible");
+    expect(actions).toHaveClass("flex-wrap");
+    expect(leftControls).toHaveClass("min-w-0", "flex-auto", "gap-1", "overflow-visible");
     expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "absolute");
     expect(rightControls).toHaveClass("flex", "shrink-0", "items-center", "gap-1");
-    expect(rightControls).not.toHaveClass("ml-auto", "flex-1");
+    expect(rightControls).toHaveClass("ml-auto", "max-w-full");
+    expect(rightControls).not.toHaveClass("flex-1");
     for (const control of [attach, hostChip, permission]) {
       expect(leftControls).toContainElement(control);
     }
@@ -1672,7 +1672,7 @@ describe("NewChatLandingScreen", () => {
       }
     }
     const harnessShell = harness.parentElement;
-    expect(harness).toHaveClass("min-w-0", "w-full", "md:w-auto");
+    expect(harness).toHaveClass("min-w-0", "w-auto");
     expect(harnessShell).toHaveClass("min-w-0", "items-center", "rounded-lg");
     expect(harnessShell).not.toHaveClass("flex-1", "md:flex-none");
     expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveClass("size-4");
@@ -1742,7 +1742,7 @@ describe("NewChatLandingScreen", () => {
 
     fireEvent.pointerDown(picker, { button: 0 });
     const [rootMenu] = screen.getAllByRole("menu");
-    expect(rootMenu).toHaveClass("w-[17.5rem]", "min-w-0", "composer-agent-menu");
+    expect(rootMenu).toHaveClass("w-[22rem]", "min-w-0", "composer-agent-menu");
     expect(screen.getByTestId("new-chat-landing-agent-a1").querySelector("img")).toHaveAttribute(
       "src",
       productIcon?.getAttribute("src"),
@@ -1798,7 +1798,10 @@ describe("NewChatLandingScreen", () => {
       "true",
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
-    expect(screen.getByTestId("new-chat-landing-agent-summary-a2")).toHaveTextContent("High");
+    const summary = screen.getByTestId("new-chat-landing-agent-summary-a2");
+    expect(summary).toHaveTextContent("High");
+    expect(summary).toHaveClass("flex-1", "whitespace-normal", "break-words");
+    expect(summary).not.toHaveClass("w-[5.25rem]", "truncate", "shrink-0");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"));
     expect(screen.queryByTestId("new-chat-landing-agent-effort-low")).toBeNull();
@@ -1859,7 +1862,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
   });
 
-  it("caps and truncates a long model before fixed trailing controls", () => {
+  it("sizes model names to content and only truncates at the available control width", () => {
     vi.stubGlobal(
       "SpeechRecognition",
       class {
@@ -1886,7 +1889,8 @@ describe("NewChatLandingScreen", () => {
     const model = screen.getByTestId("new-chat-landing-agent-model-value");
     const voice = screen.getByRole("button", { name: "Voice dictation" });
     const submit = screen.getByTestId("new-chat-landing-submit");
-    expect(picker).toHaveClass("max-w-[7.25rem]", "md:max-w-40", "pl-2", "pr-0");
+    expect(picker).toHaveClass("w-auto", "max-w-full", "pl-2", "pr-0");
+    expect(picker).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
     expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "px-2");
     expect(model).toHaveClass("min-w-0", "truncate");
     expect(model).toHaveTextContent("Extraordinarily Long Claude Model Name");

@@ -28,13 +28,15 @@ describe("shared composer controls", () => {
     render(
       <ComposerHarnessTrigger
         label="Codex configuration"
-        model="GPT-5.6"
+        model="GPT-5.6-Sol"
         effort="High"
         icon={<span data-testid="product-icon" />}
       />,
     );
     const trigger = screen.getByRole("button", { name: "Codex configuration" });
-    expect(trigger).toHaveTextContent("GPT-5.6");
+    expect(trigger).toHaveTextContent("GPT-5.6-Sol");
+    expect(trigger).toHaveClass("w-auto");
+    expect(trigger).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
     expect(trigger).toHaveTextContent("High");
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
   });
