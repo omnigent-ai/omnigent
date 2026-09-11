@@ -988,14 +988,15 @@ async def test_external_status_for_untracked_session_does_not_wake() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tracked_subagent_status_without_parent_inbox_returns_503() -> None:
+async def test_tracked_subagent_status_without_parent_inbox_is_acked() -> None:
     """
-    A tracked sub-agent terminal status is not ACKed without parent delivery.
+    A tracked sub-agent terminal status is ACKed when the parent has no inbox here.
 
-    The parent inbox is the durable handoff point for async sub-agent results.
-    If the runner has a child work entry but the parent inbox is missing, a
-    204 would tell AP/the forwarder the completion was delivered even though
-    the parent can never drain it.
+    The parent has no session on this runner (a mirrored sub-agent, a closed
+    parent, or one not yet re-initialized after a restart), so nothing can
+    drain the inbox now; a 503 only made the forwarder retry every 30 s for
+    the life of the runner. The entry stays terminal and undelivered so the
+    parent's initialization can still re-queue the result.
     """
     from omnigent.runner import app as runner_app
 
@@ -1026,11 +1027,10 @@ async def test_tracked_subagent_status_without_parent_inbox_returns_503() -> Non
     finally:
         runner_app.unregister_subagent_work(child_id)
 
-    assert resp.status_code == 503, resp.text
-    assert resp.json()["reason"] == "missing_parent_inbox"
+    assert resp.status_code == 204, resp.text
     assert entry is not None
-    # The child is terminal, but not delivered; if delivered were True here,
-    # the runner would have ACKed a result the parent cannot read.
+    # Terminal but undelivered: recovery at parent init still has a result to
+    # deliver, and nothing was ACKed as read.
     assert entry.status == "completed"
     assert entry.delivered is False
 
