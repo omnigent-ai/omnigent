@@ -10155,6 +10155,13 @@ def create_runner_app(
     async def _github_workspace_root(session_id: str) -> str:
         """Resolve the workspace root for GitHub routes, or 404 when headless."""
         agent_spec = await _require_os_env(session_id)
+        # The session's stored workspace wins — the same per-session value the
+        # native terminal launches honor — so a session bound to a checkout on
+        # a shared runner reads git state from that checkout rather than the
+        # runner-wide default root.
+        workspace = await _session_workspace_value(session_id)
+        if workspace and workspace.strip():
+            return str(Path(workspace.strip()).expanduser().resolve())
         root = resource_registry.compute_default_env_root(session_id, agent_spec)
         if root is None:
             raise HTTPException(

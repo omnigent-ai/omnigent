@@ -163,7 +163,7 @@ import {
 } from "@/components/chat/chatBubbleParts";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useSession } from "@/hooks/useSession";
-import { useGithubInfo } from "@/hooks/useGithub";
+import { useGithubInfo, type GithubInfo } from "@/hooks/useGithub";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
@@ -2278,6 +2278,37 @@ function ComposerStatusLine({
 }
 
 /**
+ * What the composer's branch chip shows: the runner's live-reported branch
+ * (`/resources/github`, git-first and refetched at turn end) wins; the branch
+ * persisted at session create (worktree sessions) is the fallback while the
+ * runner hasn't reported. Empty states name which state the workspace is in —
+ * "No branch reported" is reserved for a genuinely unreported one.
+ */
+export function composerBranchChip(
+  info: GithubInfo | undefined,
+  persistedBranch: string | null,
+): { label: string; detail: string } {
+  if (info?.available && info.branch) {
+    if (info.branch !== "HEAD") return { label: info.branch, detail: info.branch };
+    return {
+      label: "Detached HEAD",
+      detail: "The workspace is on a detached HEAD — no branch is checked out.",
+    };
+  }
+  if (info && !info.available && info.reason === "not_a_git_repo") {
+    return {
+      label: "Not a git repository",
+      detail: "The session workspace is not a git repository.",
+    };
+  }
+  if (persistedBranch) return { label: persistedBranch, detail: persistedBranch };
+  return {
+    label: "No branch reported",
+    detail: "The runner has not reported a branch for this session.",
+  };
+}
+
+/**
  * Resolve the sub-agent instance label for the composer's "Chatting with
  * sub-agent …" tray, mirroring the Agents rail's child-row label
  * (``childPrimaryLabel`` in ``SubagentsPanel``).
@@ -2667,11 +2698,18 @@ function ComposerImpl({
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
   const { session: composerSession } = useSession(composerSessionId);
   const composerBranch = useChatStore((s) => s.gitBranch);
+  // Live git state from the runner; shares the query cache with the GitHub
+  // panel and status line, and refetches on the turn-end invalidate.
+  const composerGithub = useGithubInfo(composerSessionId ?? undefined);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
   const composerWorkspace = composerSession?.workspace;
+  const branchChip = composerBranchChip(composerGithub?.data, composerBranch);
+  // A branch persisted at create marks a session-scoped worktree, and the
+  // session workspace is that worktree's path.
+  const composerWorktreePath = composerBranch ? (composerWorkspace ?? null) : null;
   const permissionOptions = showClaudePermissionMode
     ? CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
     : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
@@ -3500,18 +3538,23 @@ function ComposerImpl({
             <DropdownMenuTrigger asChild>
               <ComposerWorkspaceTrigger
                 kind="worktree"
-                label={composerBranch || "No branch reported"}
+                label={branchChip.label}
                 data-testid="composer-git-branch"
               />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" side="top" className="max-w-[min(90vw,24rem)]">
-              <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
+              <DropdownMenuLabel>Session branch</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
-                {composerBranch || "The runner has not reported a branch for this session."}
+                {branchChip.detail}
               </p>
-              <p className="px-2 py-1 text-xs text-muted-foreground">
-                The current session keeps its workspace and worktree.
-              </p>
+              {composerWorktreePath ? (
+                <>
+                  <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
+                  <p className="break-all px-2 py-1 text-xs text-muted-foreground">
+                    {composerWorktreePath}
+                  </p>
+                </>
+              ) : null}
             </DropdownMenuContent>
           </DropdownMenu>
         </ComposerWorkspaceBar>
