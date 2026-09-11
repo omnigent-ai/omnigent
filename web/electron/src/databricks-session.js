@@ -77,9 +77,11 @@ async function mintSessionCookie(ses, origin, accessToken, nextPath) {
 
   const status = await new Promise((resolve, reject) => {
     const url = `${origin}${SESSION_CREATE_PATH}?next_url=${encodeURIComponent(nextPath)}`;
-    // Default redirect mode = follow: Electron processes the 302 (storing its
-    // Set-Cookie in `ses`) before landing on next_url.
-    const request = net.request({ method: "GET", url, session: ses });
+    // useSessionCookies:true is required for the response's Set-Cookie to be
+    // stored in `ses` (it defaults to false — session:ses alone won't persist
+    // cookies). Default redirect mode = follow, so Electron processes the 302
+    // (committing DBAUTH into the jar) before landing on next_url.
+    const request = net.request({ method: "GET", url, session: ses, useSessionCookies: true });
     request.setHeader("Authorization", `Bearer ${accessToken}`);
     request.on("response", (response) => {
       response.on("data", () => {});
