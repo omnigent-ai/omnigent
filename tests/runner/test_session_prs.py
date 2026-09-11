@@ -385,7 +385,7 @@ def test_creation_metadata_preserves_other_write_identities() -> None:
         "gh api repos/example/one/pulls/42/merge -X PUT",
         "gh api repos/example/one/pulls/42/reviews -f body=test -f event=APPROVE",
         "gh api repos/example/one/pulls/42/reviews "
-        "--raw-field=body=test --field=event=REQUEST_CHANGES",
+        + "--raw-field=body=test --field=event=REQUEST_CHANGES",
         "gh api repos/example/one/pulls/42/reviews/123/events -fevent=APPROVE",
     ],
 )
