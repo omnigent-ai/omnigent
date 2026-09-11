@@ -1474,6 +1474,7 @@ describe("NewChatLandingScreen", () => {
     cleanup();
     localStorage.clear();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("renders the inline composer with the prompt headline", () => {
@@ -1605,6 +1606,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("renders the reference two-layer composer with one in-form control row", () => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (X11; Linux x86_64)");
     vi.stubGlobal(
       "SpeechRecognition",
       class {
@@ -1691,7 +1693,7 @@ describe("NewChatLandingScreen", () => {
       "md:h-7",
     );
     expect(hostChip).toHaveClass("justify-center");
-    expect(hostChip).toHaveAttribute("title", "Host: machine-1, Online");
+    expect(hostChip).toHaveAttribute("title", "Host: This machine, Online");
     expect(permission).toHaveClass(
       "h-8",
       "w-auto",
@@ -2137,14 +2139,19 @@ describe("NewChatLandingScreen", () => {
     expect(notices).toContainElement(error);
   });
 
-  it("keeps compact host and working-directory controls accessibly named", () => {
+  it.each([
+    ["Mozilla/5.0 (X11; Linux x86_64)", "This machine"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "This Mac"],
+    ["unknown-browser", "machine-1"],
+  ])("keeps compact controls accessibly named for %s", (userAgent, label) => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(userAgent);
     renderLanding();
 
     const hostTrigger = screen.getByTestId("new-chat-landing-host-chip");
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
-    expect(hostTrigger).toHaveAccessibleName("Host: machine-1, Online");
+    expect(hostTrigger).toHaveAccessibleName(`Host: ${label}, Online`);
     expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
-    expect(hostTrigger).toHaveAttribute("title", "Host: machine-1, Online");
+    expect(hostTrigger).toHaveAttribute("title", `Host: ${label}, Online`);
     expect(within(hostTrigger).getByTestId("new-chat-landing-host-status")).toHaveClass(
       "bg-success",
     );
