@@ -2205,69 +2205,69 @@ export function composerHarnessLabel(
 }
 
 /**
- * Status tray under the composer: branch left, model/context right.
- * Pulled up behind the card so a shelf peeks below; skips render when empty.
- * Session cost lives in the header agent-info popover, not here.
+ * GitHub PR chip in the gray workspace bar above the composer, next to the
+ * directory/branch chips. Opens the workspace rail's GitHub tab; self-gates
+ * to null when the session has no tracked PR (or is a sub-agent session).
  */
-function ComposerStatusLine({
-  goal,
-  isSubAgentSession,
-}: {
-  goal: Goal | null;
-  isSubAgentSession: boolean;
-}) {
+function ComposerPrChip({ isSubAgentSession }: { isSubAgentSession: boolean }) {
   const conversationId = useChatStore((s) => s.conversationId);
-  // A client-only temp id has no server session — gate the server-scoped hooks
-  // below on it so they never fetch `/v1/sessions/temp:*` during the create
+  // A client-only temp id has no server session — gate the server-scoped hook
+  // below on it so it never fetches `/v1/sessions/temp:*` during the create
   // window (mirrors ChatPage's top-level `sessionConvId`).
   const sessionId = isTempConvId(conversationId) ? null : conversationId;
-  const contextWindow = useChatStore((s) => s.contextWindow);
-  const tokensUsed = useChatStore((s) => s.tokensUsed);
-  const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  // PR link → opens the workspace rail's GitHub tab. Shares the info query's
-  // cache with the GitHub panel, so opening the tab is instant.
+  // Shares the info query's cache with the GitHub panel, so opening the tab
+  // is instant.
   const github = useGithubInfo(sessionId ?? undefined);
   const openGithubTab = useOpenGithubTab();
   const prs = github.data?.prs;
   const prNumber = prs?.[0]?.number ?? github.data?.pr?.number ?? null;
   const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
-  const showPr = !!conversationId && !isSubAgentSession && prCount > 0 && !!openGithubTab;
+  if (!conversationId || isSubAgentSession || prCount === 0 || !openGithubTab) return null;
+
+  return (
+    <button
+      type="button"
+      data-testid="composer-pr-link"
+      onClick={() => openGithubTab()}
+      title={prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"}
+      className="inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+    >
+      <GithubMono size={14} aria-hidden />
+      <span className="tabular-nums whitespace-nowrap">
+        {prCount > 1 ? `${prCount} PRs` : `#${prNumber}`}
+      </span>
+    </button>
+  );
+}
+
+/**
+ * Status tray under the composer: plan mode / goal / context ring, right-
+ * aligned. Pulled up behind the card so a shelf peeks below; skips render
+ * when empty. Session cost lives in the header agent-info popover, not here.
+ */
+function ComposerStatusLine({ goal }: { goal: Goal | null }) {
+  const conversationId = useChatStore((s) => s.conversationId);
+  const contextWindow = useChatStore((s) => s.contextWindow);
+  const tokensUsed = useChatStore((s) => s.tokensUsed);
+  const codexPlanMode = useChatStore((s) => s.codexPlanMode);
 
   const showPlanMode = !!conversationId && codexPlanMode;
   const showGoal = !!conversationId && goal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showPr && !showPlanMode && !showGoal && !showRing) return null;
+  if (!showPlanMode && !showGoal && !showRing) return null;
 
   return (
     <div
       data-testid="composer-status-line"
       className={cn(
         // -mt-4 tucks under the card; pt-5.5 keeps content below the overlap.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
+        "mx-auto -mt-4 flex w-full items-center justify-end gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
         COMPOSER_COLUMN_WIDTH,
       )}
     >
-      <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
-        {showPr && (
-          <button
-            type="button"
-            data-testid="composer-pr-link"
-            onClick={() => openGithubTab?.()}
-            title={
-              prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"
-            }
-            className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-          >
-            <GithubMono size={14} aria-hidden />
-            <span className="tabular-nums whitespace-nowrap underline underline-offset-2">
-              {prCount > 1 ? `${prCount} PRs` : `#${prNumber}`}
-            </span>
-          </button>
-        )}
-      </div>
-      {/* Right: model/effort and context ring, never shrinks. */}
+      {/* Right: plan mode, goal, and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
           <span
@@ -3573,6 +3573,7 @@ function ComposerImpl({
               </p>
             </DropdownMenuContent>
           </DropdownMenu>
+          <ComposerPrChip isSubAgentSession={subAgentLabel != null} />
         </ComposerWorkspaceBar>
       </div>
       <ChatComposer
@@ -3979,7 +3980,7 @@ function ComposerImpl({
           />
         )
       )}
-      <ComposerStatusLine goal={goal} isSubAgentSession={subAgentLabel != null} />
+      <ComposerStatusLine goal={goal} />
     </form>
   );
 }
