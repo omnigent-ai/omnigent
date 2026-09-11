@@ -906,7 +906,7 @@ def github_changed_files(
             "api",
             *host_args,
             "--paginate",
-            *(["--slurp"] if tracked_reference else []),
+            "--slurp",
             f"repos/{reference.repository}/pulls/{reference.number}/files?per_page=100",
         ],
         cwd=root,
@@ -921,10 +921,7 @@ def github_changed_files(
     if not isinstance(entries, list):
         return empty
 
-    if tracked_reference:
-        entries = [
-            entry for page in entries for entry in (page if isinstance(page, list) else [page])
-        ]
+    entries = [entry for page in entries for entry in (page if isinstance(page, list) else [page])]
     data: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):

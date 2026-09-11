@@ -755,7 +755,9 @@ function FileViewerBody({
   // then switching to an HTML file keeps you in source, etc.
   const fileViewMode: "editor" | "preview" | "source" = hostMode
     ? isPreviewable
-      ? "preview"
+      ? lang !== "markdown" && previewableViewMode === "source"
+        ? "source"
+        : "preview"
       : "source"
     : isPreviewable
       ? lang === "markdown"

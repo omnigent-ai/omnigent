@@ -176,6 +176,131 @@ describe("useDraftWorkspace", () => {
     expect(result.current.terminals).toHaveLength(1);
   });
 
+  it("does not erase a newly created terminal with an older inventory response", async () => {
+    let resolveList: ((value: Response) => void) | undefined;
+    const listResponse = new Promise<Response>((resolve) => {
+      resolveList = resolve;
+    });
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/v1/hosts/host_1/workspace-contexts" && init?.method === "POST") {
+        return response(context("context_inventory", "/repo"));
+      }
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_inventory/resources/terminals") {
+        return init?.method === "POST" ? response(terminal("terminal_new")) : listResponse;
+      }
+      throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+    });
+
+    const { result } = renderHook(() => useDraftWorkspace(null));
+    await act(async () => {
+      await result.current.ensureContext("host_1", "/repo");
+    });
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/v1/hosts/host_1/workspace-contexts/context_inventory/resources/terminals",
+      ),
+    );
+
+    await act(async () => {
+      await result.current.createTerminal();
+    });
+    expect(result.current.terminals).toEqual([expect.objectContaining({ id: "terminal_new" })]);
+
+    await act(async () => {
+      resolveList?.(response({ object: "list", data: [] }));
+      await listResponse;
+    });
+    expect(result.current.terminals).toEqual([expect.objectContaining({ id: "terminal_new" })]);
+  });
+
+  it("does not resurrect a deleted terminal with an older inventory response", async () => {
+    let inventoryRequests = 0;
+    let resolveStaleList: ((value: Response) => void) | undefined;
+    const staleListResponse = new Promise<Response>((resolve) => {
+      resolveStaleList = resolve;
+    });
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/v1/hosts/host_1/workspace-contexts" && init?.method === "POST") {
+        return response(context("context_delete", "/repo"));
+      }
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_delete/resources/terminals") {
+        inventoryRequests += 1;
+        return inventoryRequests === 1
+          ? response({ object: "list", data: [terminal("terminal_old")] })
+          : staleListResponse;
+      }
+      if (
+        url ===
+          "/v1/hosts/host_1/workspace-contexts/context_delete/resources/terminals/terminal_old" &&
+        init?.method === "DELETE"
+      ) {
+        return response({ id: "terminal_old", deleted: true });
+      }
+      throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+    });
+
+    const { result } = renderHook(() => useDraftWorkspace(null));
+    await act(async () => {
+      await result.current.ensureContext("host_1", "/repo");
+    });
+    await waitFor(() =>
+      expect(result.current.terminals).toEqual([expect.objectContaining({ id: "terminal_old" })]),
+    );
+
+    let staleRefresh: Promise<unknown> | undefined;
+    act(() => {
+      staleRefresh = result.current.refreshTerminals();
+    });
+    await waitFor(() => expect(inventoryRequests).toBe(2));
+    await act(async () => {
+      await result.current.deleteTerminal("terminal_old");
+    });
+    expect(result.current.terminals).toEqual([]);
+
+    await act(async () => {
+      resolveStaleList?.(response({ object: "list", data: [terminal("terminal_old")] }));
+      await staleRefresh;
+    });
+    expect(result.current.terminals).toEqual([]);
+  });
+
+  it("accepts a slow inventory response while a newer poll is still in flight", async () => {
+    const resolveLists: ((value: Response) => void)[] = [];
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/v1/hosts/host_1/workspace-contexts" && init?.method === "POST") {
+        return response(context("context_slow", "/repo"));
+      }
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_slow/resources/terminals") {
+        return new Promise<Response>((resolve) => {
+          resolveLists.push(resolve);
+        });
+      }
+      throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+    });
+
+    const { result } = renderHook(() => useDraftWorkspace(null));
+    await act(async () => {
+      await result.current.ensureContext("host_1", "/repo");
+    });
+    await waitFor(() => expect(resolveLists).toHaveLength(1));
+
+    let newerPoll: Promise<unknown> | undefined;
+    act(() => {
+      newerPoll = result.current.refreshTerminals();
+    });
+    await waitFor(() => expect(resolveLists).toHaveLength(2));
+
+    await act(async () => {
+      resolveLists[0](response({ object: "list", data: [terminal("terminal_slow")] }));
+    });
+    expect(result.current.terminals).toEqual([expect.objectContaining({ id: "terminal_slow" })]);
+
+    await act(async () => {
+      resolveLists[1](response({ object: "list", data: [terminal("terminal_slow")] }));
+      await newerPoll;
+    });
+  });
+
   it("hydrates every retained context, heartbeats all, and lists only the selected session", async () => {
     localStorage.setItem(
       STORAGE_KEY,
@@ -413,6 +538,69 @@ describe("useDraftWorkspace", () => {
     });
     await waitFor(() => expect(result.current.context).toBeNull());
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("does not undo a successful handoff with a late pre-handoff heartbeat", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "context_handoff",
+          workspace: "/repo",
+          hostId: "host_1",
+          leaseSeconds: 600,
+          sessionId: null,
+        },
+      ]),
+    );
+    let resolveHeartbeat: ((value: Response) => void) | undefined;
+    const heartbeatResponse = new Promise<Response>((resolve) => {
+      resolveHeartbeat = resolve;
+    });
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_handoff/heartbeat") {
+        return heartbeatResponse;
+      }
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_handoff/resources/terminals") {
+        return response({ object: "list", data: [] });
+      }
+      if (
+        url === "/v1/hosts/host_1/workspace-contexts/context_handoff/handoff" &&
+        init?.method === "POST"
+      ) {
+        return response(context("context_handoff", "/repo", "conv_1"));
+      }
+      throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+    });
+
+    const { result, rerender } = renderHook(
+      ({ sessionId }: { sessionId: string | null }) => useDraftWorkspace(sessionId),
+      { initialProps: { sessionId: null as string | null } },
+    );
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/v1/hosts/host_1/workspace-contexts/context_handoff/heartbeat",
+        { method: "POST" },
+      ),
+    );
+
+    await act(async () => {
+      await result.current.adopt("conv_1");
+    });
+    rerender({ sessionId: "conv_1" });
+    expect(result.current.context).toMatchObject({ id: "context_handoff", session_id: "conv_1" });
+
+    await act(async () => {
+      resolveHeartbeat?.(response(context("context_handoff", "/repo")));
+      await heartbeatResponse;
+    });
+    await waitFor(() =>
+      expect(result.current.context).toMatchObject({
+        id: "context_handoff",
+        session_id: "conv_1",
+      }),
+    );
+    expect(localStorage.getItem(STORAGE_KEY)).toContain('"sessionId":"conv_1"');
   });
 
   it("retains the draft and its terminals when handoff fails", async () => {

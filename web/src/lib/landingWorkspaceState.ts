@@ -254,7 +254,9 @@ export function confirmLandingWorkspaceChange(): boolean {
   void resourceLifecycle
     .discard()
     .catch(() =>
-      toast.error("Couldn't close draft shells. Return to the previous workspace to retry."),
+      toast.error(
+        "Couldn't confirm draft shells closed. Any remaining shells will expire automatically.",
+      ),
     )
     .finally(() => {
       discardingNamespaces.delete(namespace);

@@ -166,6 +166,7 @@ import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import type { WorkspaceResourceTarget } from "@/lib/workspaceTarget";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
@@ -214,6 +215,8 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  /** Explicit host target for pre-session read-only coverage. */
+  target?: WorkspaceResourceTarget;
 }
 
 /**
@@ -231,6 +234,7 @@ function viewerTree({
   onClose = vi.fn(),
   sort,
   onNavigateTo,
+  target,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -241,6 +245,7 @@ function viewerTree({
         <FileViewer
           open={open}
           conversationId="conv_1"
+          target={target}
           path={path}
           onClose={onClose}
           sort={sort}
@@ -1161,6 +1166,22 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     fireEvent.click(screen.getByRole("button", { name: "View source" }));
     expect(viewModeOf()).toBe("source");
   });
+
+  it.each(["page.html", "analysis.ipynb"])(
+    "switches pre-session %s between read-only preview and source",
+    (path) => {
+      renderViewer({
+        open: true,
+        path,
+        target: { kind: "host", hostId: "host_1", workspace: "/repo" },
+      });
+      expect(viewModeOf()).toBe("preview");
+
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(viewModeOf()).toBe("source");
+      expect(screen.getByRole("button", { name: "View preview" })).toBeInTheDocument();
+    },
+  );
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
     renderViewer({ open: true, path: "notes.md" });

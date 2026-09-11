@@ -498,11 +498,13 @@ def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
 
     def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
-            return (0, '{"number": 3}', "")
+            return (0, '{"number": 3, "url": "https://github.com/upstream/repo/pull/3"}', "")
         if tuple(argv[:1]) == ("api",):
+            assert argv[-1] == "repos/upstream/repo/pulls/3/files?per_page=100"
             return (
                 0,
-                '[{"filename": "app.txt", "status": "modified", "additions": 1, "deletions": 1}]',
+                '[[{"filename": "app.txt", "status": "modified", '
+                '"additions": 1, "deletions": 1}]]',
                 "",
             )
         return (1, "", "")
@@ -535,8 +537,9 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
 
     def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
-            return (0, '{"number": 3}', "")
+            return (0, '{"number": 3, "url": "https://github.com/upstream/repo/pull/3"}', "")
         if tuple(argv[:2]) == ("pr", "diff"):
+            assert argv[2:] == ["3", "-R", "github.com/upstream/repo"]
             return (0, "diff --git a/app.txt b/app.txt\n+changed\n", "")
         return (1, "", "")
 

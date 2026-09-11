@@ -438,6 +438,91 @@ async def test_terminal_survives_reconnect_and_obeys_lease(
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+async def test_multiple_viewers_preserve_lazy_shell_across_handoff(tmp_path: Path) -> None:
+    """Concurrent creation, handoff, and one viewer leaving preserve the shared shell."""
+    now = [0.0]
+    manager = WorkspaceContextManager(clock=lambda: now[0])
+    tunnels = [object(), object()]
+    streams = [_StreamSink(), _StreamSink()]
+    try:
+        context_id = str(
+            _ok(await _request(manager, "create", params={"workspace": str(tmp_path)}))["id"]
+        )
+        assert _ok(await _request(manager, "list_terminals", context_id=context_id))["data"] == []
+        created = await asyncio.gather(
+            *(
+                _request(
+                    manager,
+                    "create_terminal",
+                    context_id=context_id,
+                    params={"session_key": "shared"},
+                )
+                for _ in range(2)
+            )
+        )
+        terminal_id = _ok(created[0])["id"]
+        assert _ok(created[1])["id"] == terminal_id
+        [entry] = manager.registry.list_for_conversation(context_id)
+        pane_pid = entry.instance.pane_pid_sync()
+        assert pane_pid is not None
+        for index in range(2):
+            _ok(
+                await _request(
+                    manager,
+                    "attach",
+                    context_id=context_id,
+                    params={"terminal_id": terminal_id, "channel_id": f"viewer-{index}"},
+                    tunnel=tunnels[index],
+                    send=streams[index].send,
+                )
+            )
+
+        async def both_attached() -> None:
+            while True:
+                clients = await entry.instance._tmux_output("list-clients", "-F", "#{client_name}")
+                if len(clients.splitlines()) == 2:
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(both_attached(), timeout=5)
+        manager.receive(
+            HostWorkspaceContextStreamFrame(
+                channel_id="viewer-0",
+                data=base64.b64encode(b"printf 'SHARED_VIEW_READY\\n'\r").decode("ascii"),
+                binary=True,
+            ),
+            tunnel=tunnels[0],
+        )
+        await asyncio.gather(
+            *(_wait_for_stream(stream, b"SHARED_VIEW_READY") for stream in streams)
+        )
+        _ok(
+            await _request(
+                manager,
+                "handoff",
+                context_id=context_id,
+                params={"session_id": "session-shared", "workspace": str(tmp_path)},
+            )
+        )
+        [resource] = _ok(await _request(manager, "list_terminals", context_id=context_id))["data"]
+        assert resource["id"] == terminal_id
+        assert resource["session_id"] == "session-shared"
+        await manager.disconnect(tunnels[0])
+        now[0] = LEASE_SECONDS + 1
+        await manager.reap_expired()
+        assert entry.instance.pane_pid_sync() == pane_pid
+        assert await entry.instance.is_alive()
+        assert not any(frame.close_code is not None for frame in streams[1].frames)
+        await manager.disconnect(tunnels[1])
+        now[0] += LEASE_SECONDS
+        await manager.reap_expired()
+        assert (await _request(manager, "describe", context_id=context_id)).error_status == 404
+        await _wait_for_process_exit(pane_pid)
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 async def test_explicit_terminal_and_context_deletion_kill_processes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -643,12 +643,18 @@ describe(
           await launched.window.getByTestId("new-chat-landing-agent-select").click();
           await launched.window.getByTestId("new-chat-landing-custom-agents").hover();
           await launched.window.getByText(/hello_world/i, { exact: true }).click();
-          await launched.window.keyboard.press("Escape");
+          const visibleOverlays = launched.window.locator(
+            '[role="menu"]:visible, [role="dialog"]:visible',
+          );
+          for (let attempt = 0; attempt < 4 && (await visibleOverlays.count()) > 0; attempt += 1) {
+            await launched.window.keyboard.press("Escape");
+            await launched.window.waitForTimeout(100);
+          }
           await launched.window.waitForFunction(
             () => getComputedStyle(document.body).pointerEvents !== "none",
           );
           assert.equal(
-            await launched.window.locator('[role="menu"]:visible, [role="dialog"]:visible').count(),
+            await visibleOverlays.count(),
             0,
             "agent picker remained visible after dismissal",
           );

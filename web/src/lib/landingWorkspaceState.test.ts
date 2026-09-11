@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as HostModule from "./host";
 import type * as IdentityModule from "./identity";
 import { landingStorageKey } from "./landingStorage";
+import { toast } from "sonner";
 
 const LANDING_STORAGE_PREFIX = "omnigent:landing-workspace";
 const SESSION_STORAGE_KEY = "omnigent:session-workspace-state";
@@ -18,6 +19,7 @@ vi.mock("./identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   getCurrentUserId: () => storageScope.user,
 }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 
 async function loadLandingWorkspaceState() {
   return import("./landingWorkspaceState");
@@ -30,6 +32,7 @@ beforeEach(() => {
   vi.restoreAllMocks();
   vi.resetModules();
   Reflect.deleteProperty(window, "omnigentDesktop");
+  vi.mocked(toast.error).mockReset();
 });
 
 describe("landingWorkspaceState", () => {
@@ -662,6 +665,24 @@ describe("landingWorkspaceState", () => {
     expect(discard).toHaveBeenCalledOnce();
     finishDiscard();
     await discard.mock.results[0]?.value;
+  });
+
+  it("does not promise an unavailable retry when confirmed cleanup fails", async () => {
+    const landing = await loadLandingWorkspaceState();
+    const discard = vi.fn().mockRejectedValue(new Error("host disconnected"));
+    landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard,
+      adopt: vi.fn().mockResolvedValue(undefined),
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    expect(landing.confirmLandingWorkspaceChange()).toBe(true);
+    await vi.waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Couldn't confirm draft shells closed. Any remaining shells will expire automatically.",
+      ),
+    );
   });
 
   it("adopts the draft resources and browser namespace into the created session", async () => {

@@ -25,6 +25,7 @@ from omnigent.runner.github_resource import (
     github_info,
     github_pr_diff,
 )
+from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 
 
 def _stub_gh(
@@ -554,6 +555,54 @@ def test_github_file_diff_deleted(repo: Path) -> None:
     diff = github_file_diff(str(repo), "main", "fileB.py")
     assert diff["before"] == "B base"
     assert diff["after"] is None
+
+
+@pytest.mark.parametrize("pr_url", [None, "https://github.com/upstream/repo/pull/42"])
+@pytest.mark.parametrize("file_count", [0, 101])
+def test_github_changed_files_preserves_multiple_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pr_url: str | None, file_count: int
+) -> None:
+    """Automatic and selected PRs retain empty pages and later deleted files."""
+    pages = (
+        [
+            [{"filename": f"file-{index}.py", "status": "added"} for index in range(100)],
+            [{"filename": "last-file.py", "status": "removed"}],
+        ]
+        if file_count
+        else [[]]
+    )
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    if pr_url:
+        SessionPrRegistry("pagination-session").record(
+            [PullRequestRef.from_url(pr_url)], relationship="created", source="test"
+        )
+    monkeypatch.setattr(github_resource, "_account_token_for", lambda _root: None)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda _root, _reference: None)
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (
+                0,
+                json.dumps({"number": 42, "url": "https://github.com/upstream/repo/pull/42"}),
+                "",
+            )
+        if argv[0] == "api":
+            assert argv[-1] == "repos/upstream/repo/pulls/42/files?per_page=100"
+            output = json.dumps(pages) if "--slurp" in argv else "\n".join(map(json.dumps, pages))
+            return 0, output, ""
+        raise AssertionError(f"Unexpected gh command: {argv}")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    result = github_changed_files(
+        "/workspace", session_id="pagination-session" if pr_url else None, pr_url=pr_url
+    )
+    assert len(result["data"]) == file_count
+    if file_count:
+        assert result["data"][-1]["path"] == "last-file.py"
+        assert result["data"][-1]["status"] == "deleted"
+    assert result["has_more"] is False
 
 
 def test_github_changed_files_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
