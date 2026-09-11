@@ -878,6 +878,51 @@ describe("Composer slash-command submit routing", () => {
     );
   });
 
+  it("suppresses the model-source tooltip while the selector popover is open", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    // Open the selector popover from the pill.
+    fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+    const menu = screen.getByTestId("composer-agent-menu");
+
+    // The popover portals inside the tooltip trigger's React tree, so focus
+    // landing in it bubbles to the trigger; the tooltip must stay closed
+    // rather than paint over the open menu.
+    fireEvent.focus(menu);
+    fireEvent.focus(screen.getByTestId("composer-model-source"));
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-model-source-tooltip")).toBeNull();
+
+    // Closing the popover releases the suppression: focus shows the tooltip.
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("composer-agent-menu")).toBeNull());
+    fireEvent.focus(screen.getByTestId("composer-model-source"));
+    expect(await screen.findByTestId("composer-model-source-tooltip")).toBeInTheDocument();
+  });
+
   it("keeps the label's truncation chain intact when the source tooltip wraps it", () => {
     useChatStore.setState({ llmModel: "sonnet" });
     const options = CLAUDE_MODEL_OPTIONS.map((option) => ({

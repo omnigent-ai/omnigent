@@ -2580,6 +2580,10 @@ function ComposerImpl({
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
+  // Whether the harness picker's selector popover is open; ComposerModelSource
+  // holds its tooltip closed while it is (the popover portals inside the
+  // tooltip trigger's React tree, so its events would open the tooltip on top).
+  const [harnessMenuOpen, setHarnessMenuOpen] = useState(false);
   // Single send-telemetry point (see submit()). Emitting here rather than via
   // the Button's componentId covers Enter-key sends too — a textarea Enter never
   // submits the form, so it would otherwise bypass the Button entirely.
@@ -3798,6 +3802,7 @@ function ComposerImpl({
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
                   costRoutingEligible={costRoutingEligible}
+                  pickerMenuOpen={harnessMenuOpen}
                 >
                   <SessionHarnessPicker
                     busy={configBusy}
@@ -3826,6 +3831,7 @@ function ComposerImpl({
                     // no message can wake (unreachable) get an inert gear.
                     disabled={isReadOnly || unreachable}
                     openNonce={pickerOpenNonce}
+                    onMenuOpenChange={setHarnessMenuOpen}
                   />
                 </ComposerModelSource>
               </div>
@@ -4838,6 +4844,7 @@ function SessionHarnessPicker({
   subagentRoutingEligible,
   disabled,
   openNonce = 0,
+  onMenuOpenChange,
 }: {
   busy: boolean;
   busyRef: { current: boolean };
@@ -4855,6 +4862,8 @@ function SessionHarnessPicker({
   subagentRoutingEligible: boolean;
   disabled: boolean;
   openNonce?: number;
+  /** Reports selector-popover open/close; pass a stable callback. */
+  onMenuOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -4908,10 +4917,17 @@ function SessionHarnessPicker({
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) setOpen(true);
   }, [openNonce, disabled, configurable]);
+  const updateMenuOpen = (next: boolean) => {
+    setMenuOpen(next);
+    onMenuOpenChange?.(next);
+  };
   useEffect(() => {
-    setMenuOpen(false);
+    updateMenuOpen(false);
     setOpen(false);
     setError(null);
+    // Reset on session switch only; re-running on callback identity would
+    // close a menu the user just opened.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
     if (disabled || busyRef.current) return;
@@ -4950,7 +4966,7 @@ function SessionHarnessPicker({
       <DropdownMenu
         open={menuOpen}
         onOpenChange={(next) => {
-          if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
+          if (!next || (!disabled && !busy && configurable)) updateMenuOpen(next);
         }}
       >
         <TooltipProvider>
@@ -5287,13 +5303,21 @@ function ComposerModelSource({
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
+  pickerMenuOpen,
   children,
 }: {
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
+  /** Whether the wrapped picker's selector popover is open. */
+  pickerMenuOpen: boolean;
   children: ReactNode;
 }) {
+  // Controlled so the tooltip stays closed while the selector popover is
+  // open: the popover portals inside this TooltipTrigger's React tree, so
+  // its focus/pointer events bubble here and would instantly open the
+  // tooltip, painting it over the popover (equal z-index, later-mounted).
+  const [tooltipOpen, setTooltipOpen] = useState(false);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { effectiveModel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const source =
@@ -5305,7 +5329,10 @@ function ComposerModelSource({
   const rows = modelConfigurationSourceRows(source);
   return (
     <TooltipProvider>
-      <Tooltip>
+      <Tooltip
+        open={tooltipOpen && !pickerMenuOpen}
+        onOpenChange={(next) => setTooltipOpen(next && !pickerMenuOpen)}
+      >
         <TooltipTrigger asChild>
           <span
             tabIndex={0}
