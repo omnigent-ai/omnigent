@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 import click
+from websockets.exceptions import WebSocketException
 
 from omnigent.native.native_terminal import terminal_attach_url
 
@@ -49,14 +50,20 @@ async def attach_terminal_websocket(
         attach_local_terminal,
     )
 
-    await _attach_with_reconnect(
-        attach=attach_local_terminal,
-        attach_url=terminal_attach_url(base_url, session_id, terminal_id),
-        headers=headers,
-        recover=None,
-        session_name=session_name,
-        base_url=base_url,
-        session_id=session_id,
-        terminal_id=terminal_id,
-        close_attach_on_terminal_gone=True,
-    )
+    try:
+        await _attach_with_reconnect(
+            attach=attach_local_terminal,
+            attach_url=terminal_attach_url(base_url, session_id, terminal_id),
+            headers=headers,
+            recover=None,
+            session_name=session_name,
+            base_url=base_url,
+            session_id=session_id,
+            terminal_id=terminal_id,
+            close_attach_on_terminal_gone=True,
+        )
+    except (WebSocketException, OSError) as exc:
+        raise click.ClickException(
+            f"Terminal WebSocket connection failed ({type(exc).__name__}: {exc}). "
+            f"Rerun your resume command for session {session_id} to reconnect."
+        ) from exc

@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
+import click
 import pytest
+from click.testing import CliRunner
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
+from websockets.frames import Close
+from websockets.http11 import Response
 
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.native.terminal_attach import (
     CONTROL_MODE_ATTACH_ENV,
     attach_native_terminal,
+    attach_terminal_websocket,
+)
+from omnigent.terminals.ws_common import (
+    WS_CLOSE_TERMINAL_DETACHED,
+    WS_CLOSE_TERMINAL_NOT_FOUND,
 )
 
 _SIMPLE_LAUNCHERS = {
@@ -57,13 +69,112 @@ async def test_failed_control_mode_does_not_silently_fall_back(
     default.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionRefusedError("connection refused"),
+        TimeoutError("opening handshake timed out"),
+        ConnectionClosedError(Close(1011, "server failure"), None),
+        InvalidStatus(Response(401, "Unauthorized", Headers())),
+        InvalidStatus(Response(403, "Forbidden", Headers())),
+        InvalidStatus(Response(502, "Bad Gateway", Headers())),
+    ],
+    ids=["refused", "timeout", "abnormal-close", "unauthorized", "forbidden", "proxy"],
+)
+async def test_terminal_websocket_reports_transport_errors(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """The real reconnect loop's transport failures become actionable CLI errors."""
+    attach = AsyncMock(side_effect=error)
+    monkeypatch.setattr(claude_native, "attach_local_terminal", attach)
+
+    with pytest.raises(
+        click.ClickException, match="Terminal WebSocket connection failed"
+    ) as raised:
+        await attach_terminal_websocket(
+            base_url="http://localhost",
+            headers={},
+            session_id="conv_selection",
+            terminal_id="terminal_main",
+            session_name="Cursor",
+        )
+
+    assert raised.value.__cause__ is error
+    assert type(error).__name__ in raised.value.message
+    assert str(error) in raised.value.message
+    assert "resume" in raised.value.message
+    assert "conv_selection" in raised.value.message
+    attach.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        True,
+        False,
+        ConnectionClosedError(Close(WS_CLOSE_TERMINAL_NOT_FOUND, ""), None),
+        ConnectionClosedError(Close(WS_CLOSE_TERMINAL_DETACHED, ""), None),
+    ],
+    ids=["user-exit", "clean-close", "terminal-gone", "detached"],
+)
+async def test_terminal_websocket_preserves_normal_exits(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    result: bool | ConnectionClosedError,
+) -> None:
+    """Normal closure and lifecycle sentinels must not become transport errors."""
+    attach = (
+        AsyncMock(side_effect=result)
+        if isinstance(result, ConnectionClosedError)
+        else AsyncMock(return_value=result)
+    )
+    monkeypatch.setattr(claude_native, "attach_local_terminal", attach)
+
+    await attach_terminal_websocket(
+        base_url="http://localhost",
+        headers={},
+        session_id="conv_selection",
+        terminal_id="terminal_main",
+        session_name="Cursor",
+    )
+
+    attach.assert_awaited_once()
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("bug"), asyncio.CancelledError(), SystemExit(143), KeyboardInterrupt()]
+)
+async def test_terminal_websocket_does_not_wrap_unrelated_errors(
+    monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """Programming errors, cancellation, and signal exits retain their meaning."""
+    monkeypatch.setattr(claude_native, "attach_local_terminal", AsyncMock(side_effect=error))
+
+    with pytest.raises(type(error)) as raised:
+        await attach_terminal_websocket(
+            base_url="http://localhost",
+            headers={},
+            session_id="conv_selection",
+            terminal_id="terminal_main",
+            session_name="Cursor",
+        )
+
+    assert raised.value is error
+
+
 @pytest.mark.parametrize("harness", _SIMPLE_LAUNCHERS)
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    ("enabled", "failed"),
+    [(False, False), (True, False), (True, True)],
+    ids=["default", "control-mode", "control-mode-failure"],
+)
 def test_native_launchers_use_shared_transport_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
     enabled: bool,
+    failed: bool,
 ) -> None:
     """Run each launcher through preparation and actual shared transport selection."""
     import omnigent.chat as chat
@@ -96,17 +207,32 @@ def test_native_launchers_use_shared_transport_selection(
     )
     monkeypatch.setattr(launcher, "open_conversation_link_if_enabled", Mock())
     direct = AsyncMock()
-    websocket = AsyncMock(return_value=claude_native._AttachOutcome.EXITED)
+    websocket = AsyncMock(
+        return_value=claude_native._AttachOutcome.EXITED,
+        side_effect=ConnectionRefusedError("connection refused") if failed else None,
+    )
     monkeypatch.setattr(launcher, "_attach_terminal_resource", direct)
     monkeypatch.setattr(claude_native, "_attach_with_reconnect", websocket)
 
-    launcher._run_with_remote_server(
-        "http://localhost",
-        tmp_path / "agent.yaml",
-        session_id=prepared.session_id,
-        resume_picker=False,
-        **{f"{harness}_args": ()},
-    )
+    @click.command()
+    def launch() -> None:
+        launcher._run_with_remote_server(
+            "http://localhost",
+            tmp_path / "agent.yaml",
+            session_id=prepared.session_id,
+            resume_picker=False,
+            **{f"{harness}_args": ()},
+        )
+
+    result = CliRunner().invoke(launch)
+    assert result.exit_code == (1 if failed else 0), result.output
+    if failed:
+        assert isinstance(result.exception, SystemExit)
+        assert "Error: Terminal WebSocket connection failed" in result.output
+        assert "connection refused" in result.output
+        assert "conv_selection" in result.output
+        assert "resume" in result.output
+        assert "Traceback" not in result.output
 
     if enabled:
         direct.assert_not_awaited()

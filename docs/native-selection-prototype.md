@@ -64,6 +64,11 @@ In Cursor's integrated terminal, and then in a standalone terminal:
 6. Exit the agent normally and verify your shell still echoes input correctly.
    Reattach using your usual resume command with the variable set and check
    the restored screen and scrollback.
+7. For a launcher without automatic reconnect (for example, Cursor), interrupt
+   the remote connection while attached. An abnormal disconnect should exit
+   with `Error: Terminal WebSocket connection failed`, the session ID, and a
+   reminder to resume, not a Python traceback. A clean server close may exit
+   silently. Restore connectivity and resume the same session.
 
 ## Prototype limitations
 
@@ -72,6 +77,8 @@ In Cursor's integrated terminal, and then in a standalone terminal:
   availability. Claude, Codex, and Antigravity retain their existing reconnect
   recovery and session-lifecycle handling. The other launchers use a single
   WebSocket attachment; if the connection drops, rerun your resume command.
+  Connection, handshake, and abnormal-close failures report a concise CLI error
+  with the session ID and resume guidance; they do not trigger a tmux fallback.
 - Tmux's status line, conversation link, copy-mode, and popups are absent.
   Keep the web UI available for approvals normally shown as tmux popups.
 - Terminal clipboard shortcuts are the intended copy path. The native
