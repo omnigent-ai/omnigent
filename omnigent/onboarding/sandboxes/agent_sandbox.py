@@ -63,7 +63,10 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
-from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
+from omnigent.onboarding.sandboxes.base import (
+    resolve_managed_idle_shutdown_s,
+    resolve_managed_keepalive_interval_s,
+)
 from omnigent.onboarding.sandboxes.kubernetes import (
     _POD_READY_REQUEST_TIMEOUT_S,
     KubernetesSandboxLauncher,
@@ -95,6 +98,17 @@ SHUTDOWN_WINDOW_ENV_VAR: str = "OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S"
 """Environment variable overriding :data:`DEFAULT_SHUTDOWN_WINDOW_S`."""
 
 DEFAULT_SHUTDOWN_WINDOW_S: int = 3600
+
+_BOOT_GRACE_S: int = 300
+"""Floor on the shutdownTime set at create/wake, decoupled from the steady
+window. A freshly created or woken Pod cannot get its first keepalive until it
+has booted, its host has started, and a session's runner has connected and
+dialed back (tens of seconds, longer on a cold image pull). If the steady window
+is shorter than that, the initial deadline would lapse before the first refresh
+and the controller would reap the Pod mid-boot. Flooring only the INITIAL
+deadline at this grace lets the steady window (which governs how fast an idle
+sandbox suspends) be short without breaking cold start. A sandbox that boots but
+never gets a runner is genuinely unused and suspends once this grace elapses."""
 """How far ahead of now ``spec.shutdownTime`` is set, in seconds.
 
 This is effectively the sandbox's inactivity timeout: a sandbox with no live
@@ -173,6 +187,11 @@ def resolve_shutdown_window_s() -> int:
     :returns: The window in seconds, always >= :func:`min_shutdown_window_s`.
     """
     floor = min_shutdown_window_s()
+    # The single idle-shutdown knob drives the window to its floor (2x interval);
+    # the runner idle timeout carries the rest of the budget. It wins over the
+    # explicit window env so the one knob stays authoritative.
+    if resolve_managed_idle_shutdown_s() is not None:
+        return floor
     # Fallbacks (empty/malformed/non-positive) must also respect the floor: with a
     # configurable interval, DEFAULT is no longer guaranteed >= floor.
     fallback = max(DEFAULT_SHUTDOWN_WINDOW_S, floor)
@@ -207,6 +226,17 @@ def resolve_shutdown_window_s() -> int:
                 fallback,
             )
     return fallback
+
+
+def initial_shutdown_window_s() -> int:
+    """Window for the shutdownTime set at create/wake time.
+
+    The steady :func:`resolve_shutdown_window_s`, floored at :data:`_BOOT_GRACE_S`
+    so a short steady window cannot expire the Pod before its first keepalive.
+    Once the runner connects, keepalive brings the deadline down to the steady
+    window.
+    """
+    return max(resolve_shutdown_window_s(), _BOOT_GRACE_S)
 
 
 def _shutdown_time(window_s: int, *, now: datetime | None = None) -> str:
@@ -351,7 +381,7 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
 
         body = build_sandbox_manifest(
             manifest,
-            shutdown_time=_shutdown_time(resolve_shutdown_window_s()),
+            shutdown_time=_shutdown_time(initial_shutdown_window_s()),
             workspace_volume=resolve_workspace_volume(),
         )
         custom = self._load_custom()

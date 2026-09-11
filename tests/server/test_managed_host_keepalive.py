@@ -266,3 +266,13 @@ def test_successful_keepalive_logs_at_info_on_the_server_logger(
     with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
         managed_host_keepalive._keep_alive_for_runner("r1")
     assert any("kept managed sandbox sbx1 alive" in r.getMessage() for r in caplog.records)
+
+
+def test_keepalive_interval_accessor_reflects_configure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The interval the tunnel keepalive loop sleeps is the value configure snapshotted."""
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "12")
+    monkeypatch.setattr(
+        managed_host_keepalive, "_min_interval_s", managed_host_keepalive._min_interval_s
+    )
+    managed_host_keepalive.configure(SimpleNamespace(), None, None)
+    assert managed_host_keepalive.keepalive_interval_s() == 12.0

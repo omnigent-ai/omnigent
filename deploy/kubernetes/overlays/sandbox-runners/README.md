@@ -278,34 +278,41 @@ PVC). This is a *suspend* (resumable) — distinct from the deployment-wide reap
 which logs its own `reaper terminated N generation(s)` when it deletes a
 long-abandoned sandbox for good.
 
-**Tune how fast idle sandboxes suspend.** Two server-env knobs plus one injected
-into the sandbox:
+**Tune how fast idle sandboxes suspend — one knob.** Set
+`OMNIGENT_MANAGED_IDLE_SHUTDOWN_S` and a sandbox suspends about that many seconds
+after the agent goes quiet. It derives the three underlying timers together
+(runner idle timeout, keepalive interval, shutdown window) so they can't drift or
+fight each other:
+
+```yaml
+sandbox:
+  provider: agent_sandbox
+# server env: OMNIGENT_MANAGED_IDLE_SHUTDOWN_S=30   # suspend ~30s after idle
+```
+
+Finish a turn → the runner idles out → keepalive stops → the controller suspends
+the sandbox, ~30s after the agent went quiet in total. Leave it unset in
+production (sandboxes then use the 1h defaults); a short value means a paused
+session re-wakes its sandbox on the next message, which is the intended trade for
+snappy reclamation.
+
+How the knob splits (roughly `runner_idle + window ≈ idle_shutdown`): the
+keepalive `interval` becomes a fraction of the value, the `window` is `2×` that
+interval (one missed-refresh of headroom), and the runner idle timeout carries
+the rest. Because keepalive runs on its **own timer** (not the fixed 30s liveness
+ping), the interval — and therefore the window — can safely go below 30s without
+a busy sandbox dying between refreshes; the initial (create/wake) deadline is
+floored separately at a boot grace so a short window never reaps a still-booting
+Pod.
+
+For manual control, the three underlying knobs still work (and
+`OMNIGENT_MANAGED_IDLE_SHUTDOWN_S` overrides them when set):
 
 | Knob | What | Default |
 |---|---|---|
 | `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S` | how often the server refreshes a live sandbox's deadline | `600` |
 | `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` | the inactivity window, floored at 2× the interval | `3600` |
 | `runner.idle_timeout_s` (via `host_config`) | how long the runner lives after its last turn | `3600` |
-
-The window floor is `2×` the interval so a busy sandbox always outlasts a missed
-refresh; lowering the interval lowers the floor with it. To watch a sandbox
-suspend seconds after it idles (a demo, or experimentation), set all three low —
-`host_config` in the server config, the other two in the server's environment:
-
-```yaml
-sandbox:
-  provider: agent_sandbox
-  host_config:
-    runner:
-      idle_timeout_s: 30      # runner exits 30s after the last turn
-# server env: OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S=15
-#             OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S=30
-```
-
-Then: finish a turn → the runner exits ~30s later → nothing refreshes the
-deadline → the controller suspends the sandbox ~30s after that, and the
-`omnigent.sandbox.lifecycle` log goes quiet as it does. Leave these at their
-defaults in production.
 
 ### Durable workspace (`OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE`)
 

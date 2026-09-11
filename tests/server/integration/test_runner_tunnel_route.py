@@ -1235,3 +1235,25 @@ async def test_ping_loop_restamps_runner_liveness(
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=1.0)
         session_live_state.configure(None)
+
+
+async def test_keepalive_loop_fires_faster_than_the_ping_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The keepalive loop runs on its own cadence, decoupled from the 30s ping
+    loop, so a short interval yields several refreshes within one ping period."""
+    from omnigent.server.routes import runner_tunnel
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runner_tunnel.managed_host_keepalive, "touch", lambda rid: calls.append(rid)
+    )
+    monkeypatch.setattr(
+        runner_tunnel.managed_host_keepalive, "keepalive_interval_s", lambda: 0.01
+    )
+    task = asyncio.create_task(runner_tunnel._keepalive_loop("r1"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert len(calls) >= 3 and set(calls) == {"r1"}

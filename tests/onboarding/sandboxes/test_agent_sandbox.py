@@ -605,3 +605,42 @@ def test_terminate_still_hard_deletes(
 
     assert custom.deleted == [_SANDBOX_ID]
     assert core.deleted_secrets == [f"{_SANDBOX_ID}-token"]
+
+
+def test_idle_shutdown_knob_makes_death_track_its_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single OMNIGENT_MANAGED_IDLE_SHUTDOWN_S knob splits into runner-idle +
+    window so a sandbox suspends ~that many seconds after the agent goes idle."""
+    from omnigent.onboarding.sandboxes.base import (
+        managed_runner_idle_timeout_s,
+        resolve_managed_keepalive_interval_s,
+    )
+
+    monkeypatch.delenv(SHUTDOWN_WINDOW_ENV_VAR, raising=False)
+    monkeypatch.delenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", raising=False)
+    for target in (30, 60, 120, 300):
+        monkeypatch.setenv("OMNIGENT_MANAGED_IDLE_SHUTDOWN_S", str(target))
+        runner_idle = managed_runner_idle_timeout_s()
+        assert runner_idle is not None
+        death = runner_idle + resolve_shutdown_window_s()
+        assert abs(death - target) <= resolve_managed_keepalive_interval_s()
+
+
+def test_idle_shutdown_overrides_explicit_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one knob wins over an explicit shutdown-window env var."""
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "3600")
+    monkeypatch.setenv("OMNIGENT_MANAGED_IDLE_SHUTDOWN_S", "30")
+    assert resolve_shutdown_window_s() == min_shutdown_window_s()
+
+
+def test_initial_window_floors_at_boot_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A short steady window still gets a boot-safe initial (create/wake) deadline."""
+    from omnigent.onboarding.sandboxes.agent_sandbox import (
+        _BOOT_GRACE_S,
+        initial_shutdown_window_s,
+    )
+
+    monkeypatch.setenv("OMNIGENT_MANAGED_IDLE_SHUTDOWN_S", "30")
+    assert resolve_shutdown_window_s() < _BOOT_GRACE_S
+    assert initial_shutdown_window_s() == _BOOT_GRACE_S

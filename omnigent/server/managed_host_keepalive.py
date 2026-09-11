@@ -98,6 +98,17 @@ def configure(
         _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="managed-keepalive")
 
 
+def keepalive_interval_s() -> float:
+    """Current per-runner keepalive cadence, in seconds.
+
+    The runner tunnel's keepalive loop sleeps this between refreshes; it is the
+    same value :func:`touch` throttles to, so the loop cannot outrun the
+    throttle. Set by :func:`configure` from
+    :func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`.
+    """
+    return _min_interval_s
+
+
 def touch(runner_id: str) -> None:
     """Keep the sandbox behind *runner_id* warm, at most every :data:`_min_interval_s`.
 

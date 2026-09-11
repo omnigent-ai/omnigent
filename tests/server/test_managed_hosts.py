@@ -4850,3 +4850,16 @@ def test_agent_sandbox_reuses_the_kubernetes_config_block() -> None:
     # keep_alive is what the managed path needs from it, so it must not be the
     # raising capability default it inherits two levels up.
     assert type(launcher).keep_alive is not SandboxHostLauncher.keep_alive
+
+
+def test_idle_shutdown_injects_runner_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The single idle-shutdown knob sets a matching runner idle timeout in
+    host_config, but never overrides an explicit operator value."""
+    from omnigent.server.managed_hosts import _apply_managed_idle_shutdown_runner_idle as apply
+
+    monkeypatch.setenv("OMNIGENT_MANAGED_IDLE_SHUTDOWN_S", "30")
+    assert apply(None) == {"runner": {"idle_timeout_s": 20}}
+    assert apply({"runner": {"idle_timeout_s": 999}})["runner"]["idle_timeout_s"] == 999
+    assert apply({"runner": {"foo": 1}})["runner"] == {"foo": 1, "idle_timeout_s": 20}
+    monkeypatch.delenv("OMNIGENT_MANAGED_IDLE_SHUTDOWN_S")
+    assert apply({"providers": {}}) == {"providers": {}}

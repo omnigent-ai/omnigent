@@ -1007,6 +1007,30 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxHostLaun
     return _reject
 
 
+def _apply_managed_idle_shutdown_runner_idle(
+    host_config: dict[str, object] | None,
+) -> dict[str, object] | None:
+    """Inject the idle-shutdown-derived runner idle timeout into *host_config*.
+
+    When the single ``OMNIGENT_MANAGED_IDLE_SHUTDOWN_S`` knob is set, the runner
+    must give up in step with the (derived) shutdown window, or a large default
+    ``runner.idle_timeout_s`` would keep the sandbox warm long past the intended
+    idle-shutdown. Sets ``runner.idle_timeout_s`` only when the operator has not
+    set one explicitly (their value wins). A no-op when the knob is unset.
+    """
+    from omnigent.onboarding.sandboxes.base import managed_runner_idle_timeout_s
+
+    runner_idle = managed_runner_idle_timeout_s()
+    if runner_idle is None:
+        return host_config
+    merged = dict(host_config or {})
+    existing = merged.get("runner")
+    runner = dict(existing) if isinstance(existing, dict) else {}
+    runner.setdefault("idle_timeout_s", round(runner_idle))
+    merged["runner"] = runner
+    return merged
+
+
 def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the top-level ``sandbox.host_config`` block.
@@ -1261,6 +1285,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    if provider == "agent_sandbox":
+        host_config = _apply_managed_idle_shutdown_runner_idle(host_config)
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
