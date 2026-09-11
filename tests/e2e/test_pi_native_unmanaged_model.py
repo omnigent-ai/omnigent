@@ -44,6 +44,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tarfile
 import time
 import uuid
@@ -92,78 +93,29 @@ pytestmark = [
 
 
 def _bridge_marker(session_id: str) -> str:
-    """Return the hashed bridge-dir path segment for *session_id*.
-
-    The harness writes a session's Pi bridge under
-    ``~/.omnigent/pi-native/<sha256(session_id)[:32]>``; the launched
-    ``pi`` process references that dir via ``--extension`` / ``--session-dir``,
-    so the segment is a reliable needle for finding the process in ``/proc``.
-
-    :param session_id: The session/conversation id.
-    :returns: ``"pi-native/<32-hex>"``.
-    """
+    """Return the session's hashed bridge-dir path segment."""
     digest = hashlib.sha256(session_id.encode()).hexdigest()[:32]
     return f"pi-native/{digest}"
 
 
-def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
-    """Scan ``/proc`` for the launched ``pi`` CLI naming *marker*.
-
-    The pi CLI runs as ``node .../pi --extension <bridge>/... --approve
-    --session-dir <bridge>/...`` (after the fix, additionally ``--provider ...
-    --model <resolved>``). Two *other* processes also name the bridge marker
-    and must be skipped:
-
-    - the ``tmux new-session ... '<pi command string>'`` launcher, which
-      embeds the entire pi command as ONE argv element (so ``--extension``
-      is not a standalone token there); and
-    - the ``python -m omnigent.runner...`` runner that spawned it.
-
-    Match only the process where ``--extension`` is its own argv token and
-    ``argv[0]`` is not tmux -- that is the real pi CLI.
-
-    :param marker: The ``pi-native/<hash>`` bridge segment from
-        :func:`_bridge_marker`.
-    :returns: ``(pid, argv)`` of the pi process, or ``None`` if not found yet.
-    """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle not in raw:
-            continue
-        argv = [chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk]
-        if not argv:
-            continue
-        # ``--extension`` as a STANDALONE token uniquely identifies the real pi
-        # CLI: tmux embeds the pi command as one string, the runner never
-        # carries ``--extension`` at all.
-        if "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux"):
-            return int(pid_dir.name), argv
-    return None
-
-
-def _kill_pi_processes(marker: str) -> None:
-    """Best-effort SIGKILL of any process still naming *marker*.
-
-    :param marker: The bridge segment; kills the pi CLI and any child that
-        inherited it so the test leaves no orphaned tmux/pi tree.
-    """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle in raw:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(int(pid_dir.name), signal.SIGKILL)
+def _write_pi_launch_recorder(home: Path, executable: str) -> Path:
+    """Capture launch arguments before the real Pi CLI changes its process title."""
+    launcher = home / "pi-launcher"
+    launcher.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "if '--extension' in sys.argv:\n"
+        f"    record = Path({str(home / 'pi-launch.json')!r})\n"
+        "    pending = record.with_suffix('.tmp')\n"
+        "    pending.write_text(json.dumps(sys.argv[1:]))\n"
+        "    pending.replace(record)\n"
+        f"os.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n"
+    )
+    launcher.chmod(0o755)
+    return launcher
 
 
 class _UnmanagedPiHost:
@@ -277,6 +229,9 @@ def unmanaged_pi_host(
     """
     home = tmp_path_factory.mktemp("unmanaged-pi-home")
     host_id = _seed_unmanaged_pi_home(home)
+    pi_executable = shutil.which("pi")
+    assert pi_executable is not None
+    pi_launcher = _write_pi_launch_recorder(home, pi_executable)
     daemon_log = home / "host-daemon.log"
     # Pin BOTH HOME and OMNIGENT_CONFIG_HOME to the seeded dir so the daemon
     # reads the seeded (provider-less) omnigent config and Pi login, not any
@@ -289,6 +244,9 @@ def unmanaged_pi_host(
         **os.environ,
         "HOME": str(home),
         "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
+        "OMNIGENT_DATA_DIR": str(home / ".omnigent"),
+        "OMNIGENT_PI_PATH": str(pi_launcher),
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "OMNIGENT_PI_PATH",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
     # Prepend ABSOLUTE worktree roots to PYTHONPATH. The runner the daemon
@@ -361,7 +319,7 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
     """Facet 2: a spec-pinned ``executor.model`` must reach the ``pi`` argv.
 
     Create a pi-native terminal session whose spec pins ``executor.model``,
-    let the runner auto-launch the real ``pi`` CLI, then inspect its argv.
+    let the runner auto-launch the real ``pi`` CLI, then inspect its recorded argv.
     The buggy build launches ``pi`` with NO ``--model`` (the pick is dropped
     because ``_auto_create_pi_terminal`` only appends launch args when a
     provider is configured); the fix passes ``--model`` through.
@@ -418,13 +376,18 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
     marker = _bridge_marker(session_id)
 
     pi_argv: list[str] | None = None
+    pi_started = False
+    launch_record = host.home / "pi-launch.json"
     deadline = time.monotonic() + 150.0
     try:
         while time.monotonic() < deadline:
-            found = _find_pi_process(marker)
-            if found is not None:
-                pi_argv = found[1]
-                break
+            if launch_record.exists():
+                pi_argv = json.loads(launch_record.read_text())
+                session = http_client.get(f"/v1/sessions/{session_id}", timeout=10.0)
+                session.raise_for_status()
+                if session.json().get("external_session_id"):
+                    pi_started = True
+                    break
             if host.proc.poll() is not None:
                 raise AssertionError(
                     f"host daemon exited (rc={host.proc.returncode}) before pi launched; "
@@ -433,9 +396,16 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
             time.sleep(1.0)
 
         assert pi_argv is not None, (
-            "the launched 'pi' process never appeared for session "
+            "the Pi launch was never recorded for session "
             f"{session_id!r}; daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
         )
+        assert pi_started, (
+            f"Pi never reported its native session ID for {session_id!r}; "
+            f"argv: {pi_argv}; daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
+        )
+        assert "--extension" in pi_argv, pi_argv
+        extension_idx = pi_argv.index("--extension")
+        assert marker in pi_argv[extension_idx + 1], pi_argv
         assert "--model" in pi_argv, (
             "the spec-pinned model was silently DROPPED: the launched pi argv "
             f"carries no --model flag. _auto_create_pi_terminal appends --model "
@@ -444,5 +414,7 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
         )
         model_idx = pi_argv.index("--model")
         assert model_idx + 1 < len(pi_argv), f"--model had no value in argv: {pi_argv}"
+        assert pi_argv[model_idx + 1] == _PINNED_SPEC_MODEL, pi_argv
     finally:
-        _kill_pi_processes(marker)
+        with contextlib.suppress(httpx.HTTPError):
+            http_client.delete(f"/v1/sessions/{session_id}", timeout=10.0).raise_for_status()
