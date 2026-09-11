@@ -2454,7 +2454,9 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     ``omnigent server --port <new>`` reuse and exit. Explicit port
     selection is the user asking for another listener, while the
     canonical local-server reuse path is only for bare
-    ``omnigent server``.
+    ``omnigent server``. The bind preflight is spied rather than
+    really bound; port availability is covered by the adjacent
+    occupied-port and bind-probe tests.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test data directory for default server state.
@@ -2491,12 +2493,19 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
         """
         raise AssertionError("explicit --port must not touch the shared pidfile")
 
+    bind_probes: list[tuple[str, int]] = []
+
+    def _spy_port_bindable(host: str, port: int) -> None:
+        """Record the preflight bind probe without opening a real socket."""
+        bind_probes.append((host, port))
+
     from omnigent.host import local_server as _local_server_mod
 
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
     monkeypatch.setattr(_local_server_mod, "local_server_url_if_healthy", _must_not_check_existing)
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_touch_pidfile)
     monkeypatch.setattr(_local_server_mod, "clear_local_server_record", _must_not_touch_pidfile)
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", _spy_port_bindable)
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
 
@@ -2516,6 +2525,7 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     assert "already running" not in result.output
     assert captured["uvicorn_kwargs"]["port"] == 44770
     assert "Starting omnigent server on 127.0.0.1:44770" in result.output
+    assert bind_probes == [("127.0.0.1", 44770)]
 
 
 def test_server_command_explicit_occupied_port_fails() -> None:

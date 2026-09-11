@@ -583,11 +583,13 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
             f"tail:\n{host.daemon_log.read_text()[-2000:]}"
         )
         pi_argv = [str(token) for token in observation.get("argv") or []]
-        assert (
-            len(pi_argv) > 1 and "pi-coding-agent" in pi_argv[1] and pi_argv[1].endswith("cli.js")
-        ), (
-            "the observed process is not the real Pi CLI -- expected "
-            f"node .../pi-coding-agent/.../cli.js, got argv: {pi_argv}"
+        # npm exposes the package bin as .bin/pi (a shim or symlink); resolve
+        # through it so both entry styles verify the real package identity.
+        resolved_entry = os.path.realpath(pi_argv[1]) if len(pi_argv) > 1 else ""
+        assert resolved_entry.endswith(os.path.join("pi-coding-agent", "dist", "cli.js")), (
+            "the observed process is not the real Pi CLI -- expected its node "
+            "entry point to resolve to .../pi-coding-agent/dist/cli.js, got "
+            f"argv: {pi_argv} (resolved: {resolved_entry})"
         )
         assert "--model" in pi_argv, (
             "the spec-pinned model was silently DROPPED: the launched pi argv "
