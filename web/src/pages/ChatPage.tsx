@@ -8,7 +8,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import {
   BotIcon,
@@ -41,6 +40,7 @@ import {
   ComposerWorkspaceTrigger,
   ComposerPermissionPicker,
   ComposerHarnessTrigger,
+  ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -2570,10 +2570,6 @@ function ComposerImpl({
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
-  // Whether the harness picker's selector popover is open; ComposerModelSource
-  // holds its tooltip closed while it is (the popover portals inside the
-  // tooltip trigger's React tree, so its events would open the tooltip on top).
-  const [harnessMenuOpen, setHarnessMenuOpen] = useState(false);
   // Single send-telemetry point (see submit()). Emitting here rather than via
   // the Button's componentId covers Enter-key sends too — a textarea Enter never
   // submits the form, so it would otherwise bypass the Button entirely.
@@ -3788,42 +3784,34 @@ function ComposerImpl({
           trailing: (
             <>
               <div className="flex min-w-0 items-center rounded-lg">
-                <ComposerModelSource
+                <SessionHarnessPicker
+                  busy={configBusy}
+                  busyRef={configBusyRef}
+                  setBusy={setConfigBusy}
+                  agentName={
+                    subAgentName ??
+                    agents?.find((agent) => agent.id === selectedAgentId)?.name ??
+                    agents?.[0]?.name ??
+                    null
+                  }
+                  harnessLabel={harnessLabel}
+                  showModels={showModels}
+                  showEffort={showEffort}
+                  showClaudePermissionMode={showClaudePermissionMode}
+                  showCodexApprovalMode={showCodexApprovalMode}
+                  effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
                   costRoutingEligible={costRoutingEligible}
-                  pickerMenuOpen={harnessMenuOpen}
-                >
-                  <SessionHarnessPicker
-                    busy={configBusy}
-                    busyRef={configBusyRef}
-                    setBusy={setConfigBusy}
-                    agentName={
-                      subAgentName ??
-                      agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                      agents?.[0]?.name ??
-                      null
-                    }
-                    harnessLabel={harnessLabel}
-                    showModels={showModels}
-                    showEffort={showEffort}
-                    showClaudePermissionMode={showClaudePermissionMode}
-                    showCodexApprovalMode={showCodexApprovalMode}
-                    effortLevels={effortLevels}
-                    modelPickerKind={modelPickerKind}
-                    codexModelOptions={codexModelOptions}
-                    costRoutingEligible={costRoutingEligible}
-                    subagentRoutingEligible={subagentRoutingEligible}
-                    // Config changes persist server-side and apply on the next
-                    // wake/turn (the runner forward is best-effort), so the gear
-                    // stays live wherever a message could be sent — including
-                    // asleep/starting/unknown. Only read-only viewers and sessions
-                    // no message can wake (unreachable) get an inert gear.
-                    disabled={isReadOnly || unreachable}
-                    openNonce={pickerOpenNonce}
-                    onMenuOpenChange={setHarnessMenuOpen}
-                  />
-                </ComposerModelSource>
+                  subagentRoutingEligible={subagentRoutingEligible}
+                  // Config changes persist server-side and apply on the next
+                  // wake/turn (the runner forward is best-effort), so the gear
+                  // stays live wherever a message could be sent — including
+                  // asleep/starting/unknown. Only read-only viewers and sessions
+                  // no message can wake (unreachable) get an inert gear.
+                  disabled={isReadOnly || unreachable}
+                  openNonce={pickerOpenNonce}
+                />
               </div>
               <ComposerMicButton
                 className="size-8 md:size-7"
@@ -4609,7 +4597,6 @@ function SessionHarnessPicker({
   subagentRoutingEligible,
   disabled,
   openNonce = 0,
-  onMenuOpenChange,
 }: {
   busy: boolean;
   busyRef: { current: boolean };
@@ -4627,8 +4614,6 @@ function SessionHarnessPicker({
   subagentRoutingEligible: boolean;
   disabled: boolean;
   openNonce?: number;
-  /** Reports selector-popover open/close; pass a stable callback. */
-  onMenuOpenChange?: (open: boolean) => void;
 }) {
   const isMobile = useIsMobileViewport();
   const [open, setOpen] = useState(false);
@@ -4676,36 +4661,24 @@ function SessionHarnessPicker({
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
       : effortLevels;
-  const updateMenuOpen = (next: boolean) => {
-    setMenuOpen(next);
-    onMenuOpenChange?.(next);
-  };
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
-      // Through updateMenuOpen, not setMenuOpen: the programmatic `/model`
-      // open must report the popover to the parent like every other open
-      // path, or the pill tooltips would not be suppressed over it.
-      updateMenuOpen(true);
+      setMenuOpen(true);
       setConfigMenuOpen(true);
     }
-    // updateMenuOpen's identity changes per render; the nonce guard already
-    // limits this effect to one run per request.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openNonce, disabled, configurable]);
-  // The trigger's own summary tooltip must not flash open over the menu, nor
+  // The pill's summary tooltip must not flash open over the menu, nor
   // instantly reopen when closing the menu refocuses the trigger; see
-  // useMenuGuardedTooltip.
+  // useMenuGuardedTooltip. Internal menuOpen covers every open path,
+  // including the programmatic /model (openNonce) one.
   const gearTooltip = useMenuGuardedTooltip(menuOpen);
   useEffect(() => {
-    updateMenuOpen(false);
+    setMenuOpen(false);
     setConfigMenuOpen(false);
     setOpen(false);
     setError(null);
-    // Reset on session switch only; re-running on callback identity would
-    // close a menu the user just opened.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
     if (disabled || busyRef.current || pendingModelChange !== null) return;
@@ -4823,7 +4796,7 @@ function SessionHarnessPicker({
       <DropdownMenu
         open={menuOpen}
         onOpenChange={(next) => {
-          if (!next || (!disabled && !busy && configurable)) updateMenuOpen(next);
+          if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
           if (!next) setConfigMenuOpen(false);
         }}
       >
@@ -4855,11 +4828,7 @@ function SessionHarnessPicker({
               className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
               data-testid="composer-config-gear-tooltip"
             >
-              {summary.map((row) => (
-                <span key={row.label}>
-                  {row.label}: {row.value}
-                </span>
-              ))}
+              <ComposerConfigTooltipRows rows={summary} />
             </TooltipContent>
           </Tooltip>
         </TooltipProvider>
@@ -5148,8 +5117,6 @@ function useResolvedComposerModel(
     modelLabel,
   };
 }
-
-/** Compact, inspectable provenance beside the composer's model label. */
 /**
  * How long after the menu closes tooltip open requests stay swallowed.
  * Radix hands focus back to the trigger on close in the same tick, so the
@@ -5195,67 +5162,4 @@ function useMenuGuardedTooltip(menuOpen: boolean) {
       },
     },
   } as const;
-}
-
-function ComposerModelSource({
-  modelPickerKind,
-  codexModelOptions,
-  costRoutingEligible,
-  pickerMenuOpen,
-  children,
-}: {
-  modelPickerKind: NativeModelPickerKind | null;
-  codexModelOptions: readonly NativeModelOption[];
-  costRoutingEligible: boolean;
-  /** Whether the wrapped picker's selector popover is open. */
-  pickerMenuOpen: boolean;
-  children: ReactNode;
-}) {
-  // Controlled so the tooltip stays closed while the selector popover is
-  // open (and until fresh hover/focus intent after it closes); see
-  // useMenuGuardedTooltip.
-  const tooltip = useMenuGuardedTooltip(pickerMenuOpen);
-  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
-  const { effectiveModel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
-  const source =
-    findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
-    codexModelOptions.find((option) => option.source)?.source;
-  const routingOn = costRoutingEligible && costControlModeOverride === "on";
-  if (routingOn || !source) return children;
-
-  const rows = modelConfigurationSourceRows(source);
-  return (
-    <TooltipProvider>
-      <Tooltip open={tooltip.open} onOpenChange={tooltip.onOpenChange}>
-        <TooltipTrigger asChild>
-          <span
-            {...tooltip.triggerProps}
-            tabIndex={0}
-            data-testid="composer-model-source"
-            // `flex` keeps the min-width chain flowing through this wrapper:
-            // as a plain span the label inside loses its flex-imposed width
-            // and its `truncate` never engages, running under the Stop button.
-            className="flex min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {children}
-          </span>
-        </TooltipTrigger>
-        <TooltipContent
-          side="top"
-          className="flex max-w-80 flex-col items-start gap-1 px-3 py-2"
-          data-testid="composer-model-source-tooltip"
-        >
-          <span className="font-medium text-background dark:text-popover-foreground">
-            Model configuration
-          </span>
-          {rows.map((row) => (
-            <span key={row.label} className="max-w-72 truncate text-muted-foreground">
-              {row.label}:{" "}
-              <span className="text-background dark:text-popover-foreground">{row.value}</span>
-            </span>
-          ))}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
 }

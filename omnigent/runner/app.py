@@ -218,11 +218,12 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
 
-# Settle delay between keystrokes when driving Codex's /permissions popup. The
-# slash-command menu, the popup, and the Full Access confirm sub-dialog are each
-# drawn asynchronously; without a pause the next key races ahead (e.g. Enter
-# arrives before the /permissions menu commits, so the command never submits).
-_CODEX_PERMISSION_POPUP_RENDER_S = 0.7
+# Settle delay between keystrokes when driving Codex TUI popups. The
+# slash-command menu, the /permissions popup, and the Full Access confirm
+# sub-dialog are each drawn asynchronously; without a pause the next key races
+# ahead (e.g. Enter arrives before the menu commits, so the command never
+# submits).
+_CODEX_POPUP_RENDER_S = 0.7
 
 # Budget for confirming an approval switch actually landed. Codex echoes
 # "Permissions updated to <label>" once the popup applies; we poll the pane for
@@ -5383,11 +5384,11 @@ def create_runner_app(
         # session — keeping the SHAPE's stored default (a session's own pin
         # must not become the host-wide default).
         asyncio.get_running_loop().create_task(
-            _write_back_codex_catalog([dict(row) for row in rows])
+            _write_back_codex_catalog(conv_id, [dict(row) for row in rows])
         )
         return marked
 
-    async def _write_back_codex_catalog(rows: list[_JsonObject]) -> None:
+    async def _write_back_codex_catalog(session_id: str, rows: list[_JsonObject]) -> None:
         try:
             from omnigent.harnesses.codex_native.app_server import (
                 codex_catalog_fingerprint,
@@ -5396,7 +5397,10 @@ def create_runner_app(
             )
             from omnigent.models import model_catalog_store
 
-            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+            spec = await _resolve_session_agent_spec(session_id)
+            if spec is None:
+                return
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None, spec=spec)
             fingerprint = codex_catalog_fingerprint(launch)
             stored = model_catalog_store.read_catalog("codex-native", fingerprint)
             stored_default = next(
@@ -5413,7 +5417,7 @@ def create_runner_app(
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
-                extra={"session_id": runner_primary_session_id()},
+                extra={"session_id": session_id},
             )
 
     async def _handle_pi_native_effort_change(
@@ -6164,10 +6168,14 @@ def create_runner_app(
         return Response(status_code=200)
 
     def _inject_codex_compact(socket_path: str, target: str) -> None:
+        # Typing "/compact" opens Codex's slash-command popup, which draws
+        # asynchronously: an Enter sent back-to-back is swallowed by the
+        # still-opening popup and the command never submits, so settle first.
         from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
     def _inject_codex_permission_mode(
@@ -6191,12 +6199,12 @@ def create_runner_app(
         _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
-        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
-        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, menu_key)
         if needs_confirm:
-            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+            time.sleep(_CODEX_POPUP_RENDER_S)
             _run_tmux(socket_path, "send-keys", "-l", "-t", target, "1")
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
@@ -6216,7 +6224,7 @@ def create_runner_app(
                 return True
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+            time.sleep(_CODEX_POPUP_RENDER_S)
 
     async def _handle_hermes_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.hermes_native.bridge import (

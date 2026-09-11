@@ -6,6 +6,7 @@ import {
   ComposerHostTrigger,
   ComposerPermissionPicker,
   ComposerHarnessTrigger,
+  ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import {
@@ -1292,6 +1293,7 @@ export function AgentHarnessPicker({
   triggerClassName,
   triggerLabelClassName,
   triggerTooltip,
+  triggerTooltipRows,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
   triggerIcon,
   selectedConfigContent,
@@ -1340,6 +1342,10 @@ export function AgentHarnessPicker({
   /** Hover text explaining the current pick, when the label alone doesn't say
    *  what runs (e.g. "Auto"). Omitted → no tooltip, as before. */
   triggerTooltip?: string;
+  /** Structured label/value rows for the trigger's hover tooltip — the same
+   *  merged config summary the session composer's pill shows, with bold keys.
+   *  Takes precedence over `triggerTooltip`. */
+  triggerTooltipRows?: readonly { label: string; value: string }[];
   /** Model / effort values joined inside the harness trigger. */
   triggerDetails?: readonly { label: string; value: string }[];
   /** Harness glyph rendered before the joined model / effort label. */
@@ -1647,6 +1653,34 @@ export function AgentHarnessPicker({
     if (menuPage === "config" && !showConfig) setMenuPage(null);
   }, [menuPage, showMore, showCustom, showConfig]);
 
+  const menuTrigger = (
+    <DropdownMenuTrigger asChild>
+      <ComposerHarnessTrigger
+        ref={triggerRef}
+        disabled={!hasAgents}
+        label={triggerAccessibleName}
+        model={
+          visibleModelText ||
+          (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "")
+        }
+        effort={visibleEffortText}
+        icon={triggerIcon}
+        className={triggerClassName}
+        labelClassName={triggerLabelClassName}
+        testIdPrefix="new-chat-landing"
+        data-testid="new-chat-landing-agent-select"
+      />
+    </DropdownMenuTrigger>
+  );
+  // Structured rows (bold keys, like the session composer's pill) win over
+  // prose; either renders as a real tooltip surface, never the unstyled
+  // native `title` hover.
+  const triggerTooltipContent = triggerTooltipRows?.length ? (
+    <ComposerConfigTooltipRows rows={triggerTooltipRows} />
+  ) : (
+    triggerTooltip || null
+  );
+
   return (
     <DropdownMenu
       modal={dropdownModal}
@@ -1663,24 +1697,26 @@ export function AgentHarnessPicker({
         }
       }}
     >
-      <DropdownMenuTrigger asChild>
-        <ComposerHarnessTrigger
-          ref={triggerRef}
-          disabled={!hasAgents}
-          label={triggerAccessibleName}
-          title={triggerTooltip}
-          model={
-            visibleModelText ||
-            (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "")
-          }
-          effort={visibleEffortText}
-          icon={triggerIcon}
-          className={triggerClassName}
-          labelClassName={triggerLabelClassName}
-          testIdPrefix="new-chat-landing"
-          data-testid="new-chat-landing-agent-select"
-        />
-      </DropdownMenuTrigger>
+      {triggerTooltipContent == null ? (
+        menuTrigger
+      ) : (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              {/* `flex min-w-0` keeps the label's truncation chain flowing
+                  through this wrapper, like the session composer's pill. */}
+              <span className="flex min-w-0">{menuTrigger}</span>
+            </TooltipTrigger>
+            <TooltipContent
+              side="top"
+              className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
+              data-testid="new-chat-landing-agent-tooltip"
+            >
+              {triggerTooltipContent}
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
       <DropdownMenuContent
         align={contentAlign}
         onPointerMoveCapture={(event) => {
@@ -4366,16 +4402,15 @@ export function NewChatLandingScreen() {
       : configuredAgentUnavailable
         ? "Agent unavailable"
         : "Select agent";
-  const harnessTriggerTooltipDetails = [
+  // Rows for the trigger's hover tooltip: the pick itself plus its model /
+  // effort / connection summary — the same union the session composer's pill
+  // tooltip shows. Rows only render for native-harness picks (a Model/Effort
+  // detail exists), where the agent label names the harness.
+  const harnessTriggerTooltipRows = [
+    { label: "Harness", value: agentLabel },
     ...harnessTriggerDetails,
     ...configSummary.filter((detail) => detail.label === "Connection"),
   ];
-  const harnessTriggerTitle = [
-    agentLabel,
-    ...harnessTriggerTooltipDetails.map(
-      (detail) => `${detail.label} ${compactHarnessTriggerValue(detail.value)}`,
-    ),
-  ].join(", ");
 
   // Wrap the harness setter so every explicit pick is persisted to
   // localStorage. The caller can pass an explicit `agentId` for the
@@ -5993,11 +6028,12 @@ export function NewChatLandingScreen() {
                         onCreateCustomAgent={() => setCreateAgentOpen(true)}
                         sandboxSelected={sandboxSelected}
                         triggerTooltip={
-                          smartRoutingHarnessSelected
-                            ? AUTO_HARNESS_DESCRIPTION
-                            : harnessTriggerDetails.length > 0
-                              ? harnessTriggerTitle
-                              : undefined
+                          smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
+                        }
+                        triggerTooltipRows={
+                          !smartRoutingHarnessSelected && harnessTriggerDetails.length > 0
+                            ? harnessTriggerTooltipRows
+                            : undefined
                         }
                         triggerDetails={harnessTriggerDetails}
                         triggerIcon={

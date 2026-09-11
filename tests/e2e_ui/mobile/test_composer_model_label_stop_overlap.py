@@ -23,8 +23,7 @@ Harness notes:
   is patched into a claude-native session on a Databricks workspace model at
   ``xhigh`` effort — the exact shape the reporter's session has — the same
   route-patch approach as ``chat/test_claude_model_picker.py``. The catalog
-  rows carry a ``databricks`` ``source`` so the label renders inside the
-  ``composer-model-source`` tooltip wrapper, exactly as on a real Databricks
+  rows carry a ``databricks`` ``source``, exactly as on a real Databricks
   workspace session.
 - The turn is held open with the mock LLM's ``block`` gate (released in the
   ``finally``), so the Stop button is genuinely showing while the geometry

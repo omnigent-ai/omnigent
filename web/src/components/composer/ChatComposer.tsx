@@ -11,8 +11,9 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { isComposerSendKey } from "@/lib/composerSendShortcutPreferences";
+import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
-export const COMPOSER_COLUMN_WIDTH = "w-full max-w-[720px]";
+export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
 
 export interface ComposerKeyIntent {
   shouldSubmitFromKeyboard: boolean;

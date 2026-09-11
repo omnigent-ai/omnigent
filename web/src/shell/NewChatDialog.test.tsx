@@ -1703,8 +1703,12 @@ describe("NewChatLandingScreen", () => {
         expect(control.compareDocumentPosition(nextControl)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
       }
     }
-    const harnessShell = harness.parentElement;
+    // The tooltip-trigger wrapper keeps the truncation chain flowing (flex +
+    // min-w-0); the rounded shell sits outside it.
+    const harnessTooltipWrapper = harness.parentElement;
     expect(harness).toHaveClass("min-w-0", "w-auto");
+    expect(harnessTooltipWrapper).toHaveClass("flex", "min-w-0");
+    const harnessShell = harnessTooltipWrapper?.parentElement;
     expect(harnessShell).toHaveClass("min-w-0", "items-center", "rounded-lg");
     expect(harnessShell).not.toHaveClass("flex-1", "md:flex-none");
     expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveClass("size-4");
@@ -1734,7 +1738,7 @@ describe("NewChatLandingScreen", () => {
     expect(worktree).toBeDisabled();
   });
 
-  it("renders structured model and effort details in the harness picker", () => {
+  it("renders structured model and effort details in the harness picker", async () => {
     mockClaudeModels([
       {
         id: "opus",
@@ -1750,7 +1754,18 @@ describe("NewChatLandingScreen", () => {
     expect(picker).not.toHaveTextContent("Claude Code");
     expect(picker).not.toHaveTextContent("Default");
     expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort Default");
-    expect(picker).toHaveAttribute("title", "Claude Code, Model Opus 4.8, Effort Default");
+    // The hover summary is a styled tooltip with bold keys, never the
+    // unstyled native `title` hover.
+    expect(picker).not.toHaveAttribute("title");
+    fireEvent.focus(picker);
+    const pickerTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
+    expect(pickerTooltip).toHaveTextContent("Harness: Claude Code");
+    expect(pickerTooltip).toHaveTextContent("Model: Default (Opus 4.8)");
+    expect(pickerTooltip).toHaveTextContent("Effort: Default");
+    for (const key of within(pickerTooltip).getAllByText(/^(Harness|Model|Effort):$/)) {
+      expect(key).toHaveClass("font-semibold");
+    }
+    fireEvent.blur(picker);
     const productIcon = screen.getByTestId("new-chat-landing-agent-icon").querySelector("img");
     expect(screen.getByTestId("new-chat-landing-agent-icon")).toHaveClass("size-4");
     expect(productIcon).toHaveClass("size-4");
@@ -4957,7 +4972,7 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
   });
 
-  it("shows the selected host's model provider in the compact selector tooltip", () => {
+  it("shows the selected host's model provider in the compact selector tooltip", async () => {
     useHostModelOptionsMock.mockImplementation(
       (_hostId, harness) =>
         (harness === "claude-native"
@@ -4971,10 +4986,15 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
           : CODEX_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
     );
     renderLanding();
-    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAttribute(
-      "title",
-      "Claude Code, Model Default, Effort Default, Connection Claude subscription",
-    );
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).not.toHaveAttribute("title");
+    fireEvent.focus(picker);
+    const pickerTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
+    expect(pickerTooltip).toHaveTextContent("Harness: Claude Code");
+    expect(pickerTooltip).toHaveTextContent("Model: Default");
+    expect(pickerTooltip).toHaveTextContent("Effort: Default");
+    expect(pickerTooltip).toHaveTextContent("Connection: Claude subscription");
+    fireEvent.blur(picker);
   });
 
   it("reflects an armed Codex bypass in the anchored Approval control", () => {
@@ -6012,14 +6032,19 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toHaveAttribute("data-disabled");
   });
 
-  it("reads 'Smart Routing' on the composer chip and highlights only its own row", () => {
+  it("reads 'Smart Routing' on the composer chip and highlights only its own row", async () => {
     renderLanding({ smart_routing_enabled: true });
     selectSmartRoutingHarness();
     const chip = screen.getByTestId("new-chat-landing-agent-select");
     expect(chip.textContent).toContain("Smart Routing");
     // The placeholder wrapper must not be named — the router owns the pick.
     expect(chip.textContent).not.toContain("Claude Code");
-    expect(chip).toHaveAttribute("title", "Harness and model picked per task by smart routing");
+    // The routing description rides the styled tooltip, not the native hover.
+    expect(chip).not.toHaveAttribute("title");
+    fireEvent.focus(chip);
+    const chipTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
+    expect(chipTooltip).toHaveTextContent("Harness and model picked per task by smart routing");
+    fireEvent.blur(chip);
     // Two rows lit at once would misreport what runs.
     openPicker();
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toHaveAttribute("data-active", "true");

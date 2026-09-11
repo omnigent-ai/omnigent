@@ -2,8 +2,9 @@
 
 In an existing session whose model catalog rows carry a connection
 ``source`` (e.g. a Databricks workspace), the composer's model/effort pill
-renders inside the ``composer-model-source`` tooltip wrapper, whose hover
-tooltip reads ``Model configuration`` / ``Connection: Databricks · …``.
+carries a hover tooltip. Since the pill's tooltips were merged (#7045)
+that is the single config-summary surface ``composer-config-gear-tooltip``
+(``Harness: … / Model: … / Effort: … / Connection: Databricks · …``).
 Clicking the pill opens the session selector popover
 (``composer-agent-menu``). On the buggy build the tooltip is not suppressed
 while the popover is open: clicking the pill gives its trigger focus, and
@@ -17,7 +18,7 @@ User journey covered:
 
 1. open an existing session in the web UI,
 2. move the pointer onto the composer's model/effort pill (its
-   ``Model configuration`` tooltip surface),
+   config-summary tooltip surface),
 3. click the pill to open the selector popover,
 4. with the pointer still on the pill, the tooltip must not remain painted
    over the popover,
@@ -65,9 +66,8 @@ from playwright.sync_api import Page, Route, expect
 from tests.e2e_ui.conftest import fetch_with_retry
 
 # The reporter's session shape: a Databricks-served Claude catalog whose rows
-# carry a non-secret connection ``source`` — required for the pill to render
-# inside the ``composer-model-source`` tooltip wrapper at all. The tooltip
-# then reads ``Model configuration`` / ``Connection: Databricks · oss``.
+# carry a non-secret connection ``source``, so the pill's config-summary
+# tooltip carries a ``Connection: Databricks · oss`` row.
 _DATABRICKS_SOURCE = {
     "kind": "databricks",
     "label": "Workspace",
@@ -134,7 +134,7 @@ def _patch_session_as_databricks_claude_native(page: Page, session_id: str) -> N
 # order on a tie) is exactly the browser's paint order for these two.
 _OCCLUSION_PROBE = """
 () => {
-  const tooltip = document.querySelector('[data-testid="composer-model-source-tooltip"]');
+  const tooltip = document.querySelector('[data-testid="composer-config-gear-tooltip"]');
   const menu = document.querySelector('[data-testid="composer-agent-menu"]');
   if (!menu) return "no-menu";
   if (!tooltip) return "no-tooltip";
@@ -232,25 +232,20 @@ def test_pill_tooltip_does_not_obscure_open_selector(
 
         # 5. click away to close the popover. The open menu is modal, so the
         # outside pointerdown only dismisses it. Radix then returns focus to
-        # the pill's trigger; neither the model-source tooltip nor the
-        # trigger's own summary tooltip may instantly reopen on that
-        # programmatic focus (wait out the hover/animation window before
-        # probing).
+        # the pill's trigger; the pill's summary tooltip must not instantly
+        # reopen on that programmatic focus (wait out the hover/animation
+        # window before probing).
         page.mouse.click(cx, max(cy - 300, 10))
         expect(menu).not_to_be_visible()
         page.wait_for_timeout(1_200)
         _screenshot(page, "pill-tooltips-after-clicking-away")
-        for tooltip_test_id in (
-            "composer-model-source-tooltip",
-            "composer-config-gear-tooltip",
-        ):
-            expect(page.get_by_test_id(tooltip_test_id)).not_to_be_visible()
+        expect(page.get_by_test_id("composer-config-gear-tooltip")).not_to_be_visible()
 
         # 6. fresh hover intent reopens: move back onto the pill and wait out
         # the normal hover delay. Also the positive baseline proving the
-        # patched session rendered the composer-model-source wrapper.
+        # pill's tooltip renders at all in this session shape.
         page.mouse.move(cx, cy)
-        expect(page.get_by_test_id("composer-model-source-tooltip")).to_be_visible(timeout=5_000)
+        expect(page.get_by_test_id("composer-config-gear-tooltip")).to_be_visible(timeout=5_000)
         _screenshot(page, "pill-tooltip-back-on-fresh-hover")
     finally:
         page.unroute_all(behavior="ignoreErrors")
