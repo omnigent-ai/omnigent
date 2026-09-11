@@ -2722,6 +2722,43 @@ describe("Composer config gear", () => {
     }
   });
 
+  it("closes the Models / Effort flyout when Edit is clicked again", async () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    await openSessionModels();
+    fireEvent.click(screen.getByTestId("composer-agent-edit"));
+    await waitFor(() => expect(screen.queryByTestId("composer-agent-config-menu")).toBeNull());
+    // The flyout toggles closed; the picker itself stays open.
+    expect(screen.getByTestId("composer-agent-menu")).toBeTruthy();
+  });
+
+  it("closes just the flyout on Escape, keeping the picker open", async () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    await openSessionModels();
+    fireEvent.keyDown(screen.getByTestId("composer-agent-config-menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("composer-agent-config-menu")).toBeNull());
+    expect(screen.getByTestId("composer-agent-menu")).toBeTruthy();
+    // Focus returns to the Edit row so keyboard navigation continues.
+    expect(screen.getByTestId("composer-agent-edit")).toHaveFocus();
+  });
+
   it("offers inline effort choices and exactly one Advanced entry in the session picker", async () => {
     useChatStore.setState({
       selectedEffort: "xhigh",

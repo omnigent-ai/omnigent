@@ -196,16 +196,17 @@ function DropdownMenuSub({ ...props }: React.ComponentProps<typeof DropdownMenuP
   return <DropdownMenuPrimitive.Sub data-slot="dropdown-menu-sub" {...props} />;
 }
 
-function DropdownMenuSubTrigger({
-  className,
-  inset,
-  children,
-  ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.SubTrigger> & {
-  inset?: boolean;
-}) {
+// forwardRef is required for React 18: callers focus the sub-trigger when
+// dismissing its flyout, and a plain function component drops the ref.
+const DropdownMenuSubTrigger = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentProps<typeof DropdownMenuPrimitive.SubTrigger> & {
+    inset?: boolean;
+  }
+>(function DropdownMenuSubTrigger({ className, inset, children, ...props }, ref) {
   return (
     <DropdownMenuPrimitive.SubTrigger
+      ref={ref}
       data-slot="dropdown-menu-sub-trigger"
       data-inset={inset}
       className={cn(
@@ -218,7 +219,7 @@ function DropdownMenuSubTrigger({
       <ChevronRightIcon className="ml-auto" />
     </DropdownMenuPrimitive.SubTrigger>
   );
-}
+});
 
 function DropdownMenuSubContent({
   className,
