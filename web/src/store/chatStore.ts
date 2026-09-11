@@ -838,15 +838,13 @@ export interface ConversationState {
    */
   sandboxStatus: SandboxStatus | null;
   /**
-   * Per-MCP-server startup map for the bound session (codex-native).
-   * Updated by `session.mcp_startup` SSE events while the harness boots
-   * its MCP servers; cleared back to `null` once no server is still
-   * `starting`. Settled failures/cancellations are setup diagnostics
-   * (host logs), never conversation content, so they are dropped rather
-   * than retained. Always `null` for sessions whose harness reports no
-   * MCP startup.
+   * Native MCP startup progress, cleared when startup settles or live
+   * assistant text arrives. Failures/cancellations stay in host diagnostics,
+   * not the conversation. Null for harnesses that report no MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
+  /** Live text superseded MCP startup for this launch; ignore late progress. */
+  mcpStartupDismissed: boolean;
   /**
    * Transient /btw sidechat overlay state (question + answer from `/btw`).
    * Set by `session_btw_sidechat` SSE events, cleared on Escape or dismiss.
@@ -1676,6 +1674,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
+  mcpStartupDismissed: false,
   abortController: null,
   historyGeneration: 0,
 
@@ -3391,18 +3390,15 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
 }
 
 /**
- * An MCP startup map reduced to what the chat surface may show: the map
- * while any server is still `starting`, else `null`. A settled round —
- * all ready, or ended with failures/cancellations — renders nothing:
- * failure notices are setup diagnostics that belong in host logs, not
- * items in the conversation viewport. Applied at both intake points
- * (SSE event and session snapshot) so a reload can't resurrect a notice
- * the live handler would have dropped.
+ * Show pending MCP startup only until live assistant text supersedes it.
+ * Shared by SSE and snapshots so late progress cannot resurrect the band.
+ * Settled failures/cancellations remain setup diagnostics, not chat content.
  */
 function activeMcpStartup(
   servers: Record<string, McpServerStartup> | null | undefined,
+  dismissed: boolean,
 ): Record<string, McpServerStartup> | null {
-  if (!servers) return null;
+  if (dismissed || !servers) return null;
   const anyStarting = Object.values(servers).some((r) => r.status === "starting");
   return anyStarting ? servers : null;
 }
@@ -3427,6 +3423,7 @@ function activeMcpStartup(
  */
 function sessionBindingPatch(
   session: Session,
+  state: Pick<ConversationState, "mcpStartupDismissed">,
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
@@ -3480,7 +3477,7 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
-    mcpStartup: activeMcpStartup(session.mcpStartup),
+    mcpStartup: activeMcpStartup(session.mcpStartup, state.mcpStartupDismissed),
   };
 }
 
@@ -3516,7 +3513,7 @@ async function refreshSessionBinding(id: string): Promise<void> {
   // an agent switch in a backgrounded conversation must still re-derive its
   // binding (most importantly `isNativeTerminalSession`, which gates the
   // optimistic-bubble lifecycle). `setterFor` no-ops once it is evicted.
-  setterFor(id)(sessionBindingPatch(session));
+  setterFor(id)((s) => sessionBindingPatch(session, s));
 }
 
 /**
@@ -3636,10 +3633,6 @@ async function bindStream(
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
     // Sticky-pref handoff for CLI-created sessions with no override.
-    // Binding-derived fields (isNativeTerminalSession, bound agent,
-    // model/skills metadata) — shared with the session.agent_changed
-    // refresh path; see sessionBindingPatch.
-    const bindingPatch = sessionBindingPatch(session);
     // Sub-agents inherit orchestrator choices.
     const isSubAgentSession = session.parentSessionId != null;
     const canApplyEffort = supportsEffortControl(session);
@@ -3680,6 +3673,7 @@ async function bindStream(
     let resolvedStickyModel: string | null = null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
+      const bindingPatch = sessionBindingPatch(session, state);
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
         bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
@@ -4000,7 +3994,7 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   // Re-derive the MCP startup band from the snapshot: a settle (or update)
   // `session.mcp_startup` event that fired into the gap is never replayed,
   // so a stale band would otherwise stay stuck until a full reload.
-  patch.mcpStartup = activeMcpStartup(session.mcpStartup);
+  patch.mcpStartup = activeMcpStartup(session.mcpStartup, s.mcpStartupDismissed);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -5009,18 +5003,22 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
 function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
+    const startupPatch = delta.length > 0 ? { mcpStartup: null, mcpStartupDismissed: true } : {};
     const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
     if (at === -1) {
       const live = s.activeResponse;
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
-      return { blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)] };
+      return {
+        ...startupPatch,
+        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)],
+      };
     }
     const existing = s.blocks[at]!;
     if (existing.type !== "text_done") return {};
     const fullText = existing.fullText + delta;
     const next = s.blocks.slice();
     next[at] = { ...existing, fullText, hasCodeBlocks: fullText.includes("```") };
-    return { blocks: next };
+    return { ...startupPatch, blocks: next };
   });
 }
 
@@ -5300,7 +5298,17 @@ export async function pumpStreamEvents(
         );
       }
       if (fresh.length === 0) return extra ?? {};
-      return { ...(extra ?? {}), blocks: [...s.blocks, ...fresh] };
+      // Only newly streamed text counts, never restored transcript history.
+      const hasAssistantText = fresh.some((b) =>
+        b.type === "text_chunk"
+          ? b.text.length > 0
+          : b.type === "text_done" && b.fullText.length > 0,
+      );
+      return {
+        ...(extra ?? {}),
+        ...(hasAssistantText ? { mcpStartup: null, mcpStartupDismissed: true } : {}),
+        blocks: [...s.blocks, ...fresh],
+      };
     });
   };
 
@@ -5706,7 +5714,7 @@ async function refetchRunnerBackedSessionState(
   // the reported-model semantics, so a delayed catalog only hydrates state.
   const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
-      ? sessionBindingPatch(session)
+      ? sessionBindingPatch(session, currentState)
       : {
           skills: session.skills ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
@@ -5860,7 +5868,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Toggle the Terminal-pill spinner. The runner sets pending=true
       // before auto-creating the terminal and clears it once the
       // terminal lands or auto-create fails.
-      applyToConversation({ terminalPending: event.pending });
+      applyToConversation((s) => ({
+        terminalPending: event.pending,
+        // A new harness launch may have a fresh MCP startup round.
+        ...(event.pending && !s.terminalPending ? { mcpStartupDismissed: false } : {}),
+      }));
       return;
     case "session_sandbox_status":
       // Advance the managed-sandbox provisioning indicator. `ready`
@@ -5877,7 +5889,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Failures/cancellations are setup diagnostics (host logs), not
       // conversation content — retaining them rendered an inline notice
       // in the chat viewport and pinned the message-flow branch open.
-      applyToConversation({ mcpStartup: activeMcpStartup(event.servers) });
+      applyToConversation((s) => ({
+        mcpStartup: activeMcpStartup(event.servers, s.mcpStartupDismissed),
+      }));
       return;
     }
     case "session_usage": {

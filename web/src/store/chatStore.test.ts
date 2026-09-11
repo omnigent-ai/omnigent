@@ -4902,6 +4902,210 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.mcp_startup", () => {
+    const starting: Record<string, McpServerStartup> = {
+      safe: { status: "starting", error: null },
+    };
+
+    async function bindStartingSession(history: ConversationItem[] = []): Promise<void> {
+      await useChatStore.getState().switchTo(null);
+      seedSession("conv_abc", history);
+      sessionMcpStartup.set("conv_abc", starting);
+      sessionLabels.set("conv_abc", { "omnigent.wrapper": "codex-native-ui" });
+      await useChatStore.getState().switchTo("conv_abc");
+    }
+
+    async function streamFrames(...frames: string[]): Promise<void> {
+      const sink = pushableStream();
+      const pump = pumpStreamEvents(
+        "conv_abc",
+        sink.stream,
+        new AbortController(),
+        useChatStore.setState,
+        useChatStore.getState,
+      );
+      frames.forEach(sink.push);
+      sink.push("data: [DONE]\n\n");
+      sink.close();
+      await pump;
+    }
+
+    describe.each(["new", "resumed"])("%s session", (kind) => {
+      it.each([
+        ["native text delta", sse("response.output_text.delta", { message_id: "m1", delta: "H" })],
+        [
+          "response text delta",
+          sse("response.output_text.delta", { delta: "Hello from the active assistant turn. " }),
+        ],
+        [
+          "live committed text",
+          sse("response.output_item.done", {
+            item: assistantMessage("resp_current", "New assistant text"),
+          }),
+        ],
+      ])(
+        "dismisses MCP startup on the first %s without waiting for MCP readiness",
+        async (_label, frame) => {
+          const history =
+            kind === "resumed"
+              ? [
+                  userMessage("resp_old", "Old question"),
+                  assistantMessage("resp_old", "Old answer"),
+                ]
+              : [];
+          await bindStartingSession(history);
+          expect(useChatStore.getState().mcpStartup).toEqual(starting);
+
+          handleSessionEvent({
+            type: "session_status",
+            conversationId: "conv_abc",
+            status: "running",
+            responseId: "resp_current",
+          });
+          expect(useChatStore.getState().mcpStartup).toEqual(starting);
+
+          const sink = pushableStream();
+          const pump = pumpStreamEvents(
+            "conv_abc",
+            sink.stream,
+            new AbortController(),
+            useChatStore.setState,
+            useChatStore.getState,
+          );
+          try {
+            sink.push(frame);
+            await tick();
+            expect(useChatStore.getState().mcpStartup).toBeNull();
+            expect(useChatStore.getState().sessionStatus).toBe("running");
+            expect(useChatStore.getState().activeResponse?.state).toBe("streaming");
+          } finally {
+            sink.push("data: [DONE]\n\n");
+            sink.close();
+            await pump;
+          }
+        },
+      );
+    });
+
+    it("keeps startup dismissed through late progress and metadata snapshots, then re-arms on a new launch", async () => {
+      await bindStartingSession();
+
+      await streamFrames(sse("response.output_text.delta", { message_id: "m1", delta: "Hello" }));
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: starting,
+      });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+
+      handleSessionEvent({
+        type: "session_agent_changed",
+        conversationId: "conv_abc",
+        agentId: "agent_xyz",
+        agentName: "Test agent",
+      });
+      await tick();
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+
+      handleSessionEvent({
+        type: "session_terminal_pending",
+        conversationId: "conv_abc",
+        pending: true,
+      });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: starting,
+      });
+      expect(useChatStore.getState().mcpStartup).toEqual(starting);
+
+      await streamFrames(sse("response.output_text.delta", { message_id: "m2", delta: "Resumed" }));
+      handleSessionEvent({
+        type: "session_terminal_pending",
+        conversationId: "conv_abc",
+        pending: true,
+      });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: starting,
+      });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+    });
+
+    it("does not dismiss startup for empty deltas or restored assistant history", async () => {
+      await bindStartingSession([assistantMessage("resp_old", "Historical answer")]);
+      expect(useChatStore.getState().mcpStartup).toEqual(starting);
+
+      await streamFrames(
+        sse("response.output_text.delta", { message_id: "m1", delta: "", final: true }),
+        sse("response.output_item.done", {
+          item: assistantMessage("resp_old", "Historical answer"),
+        }),
+      );
+      expect(useChatStore.getState().mcpStartup).toEqual(starting);
+    });
+
+    it("ignores startup progress that first arrives after live text", async () => {
+      await bindStartingSession();
+      handleSessionEvent({ type: "session_mcp_startup", conversationId: "conv_abc", servers: {} });
+      await streamFrames(sse("response.output_text.delta", { message_id: "m1", delta: "Hello" }));
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: starting,
+      });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+    });
+
+    it("does not resurrect startup when the initial snapshot resolves after live text", async () => {
+      await useChatStore.getState().switchTo(null);
+      seedSession("conv_abc", [assistantMessage("resp_old", "Historical answer")]);
+      sessionMcpStartup.set("conv_abc", starting);
+      let resolveSnapshot!: (response: Response) => void;
+      const snapshot = new Promise<Response>((resolve) => {
+        resolveSnapshot = resolve;
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).split("?")[0] === "/v1/sessions/conv_abc") return snapshot;
+        return defaultFetchHandler(input, init);
+      });
+      const binding = useChatStore.getState().switchTo("conv_abc");
+      await tick();
+      expect(useChatStore.getState().loadingConversation).toBe(true);
+
+      await streamFrames(sse("response.output_text.delta", { message_id: "m1", delta: "Hello" }));
+      resolveSnapshot(defaultFetchHandler("/v1/sessions/conv_abc"));
+      await binding;
+      expect(useChatStore.getState().loadingConversation).toBe(false);
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+    });
+
+    it("dismisses only the conversation whose background stream produced text", async () => {
+      const sink = pushableStream();
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === "/v1/sessions/conv_abc/stream") {
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      await bindStartingSession();
+      seedSession("conv_other");
+      sessionMcpStartup.set("conv_other", starting);
+      await useChatStore.getState().switchTo("conv_other");
+      try {
+        sink.push(sse("response.output_text.delta", { message_id: "m1", delta: "Hello" }));
+        await tick();
+        expect(conversationRegistry.peek("conv_abc")?.getState().mcpStartup).toBeNull();
+        expect(useChatStore.getState().mcpStartup).toEqual(starting);
+        await useChatStore.getState().switchTo("conv_abc");
+        expect(useChatStore.getState().mcpStartup).toBeNull();
+      } finally {
+        sink.push("data: [DONE]\n\n");
+        sink.close();
+        await tick();
+      }
+    });
+
     it("mirrors an in-flight startup map for the MCP startup band", () => {
       useChatStore.setState({ mcpStartup: null });
       handleSessionEvent({
@@ -9638,6 +9842,36 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
     last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps MCP startup dismissed on reconnect after assistant text has streamed", async () => {
+    const starting: Record<string, McpServerStartup> = {
+      safe: { status: "starting", error: null },
+    };
+    seedSession("conv_mcp_text", []);
+    sessionMcpStartup.set("conv_mcp_text", starting);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_mcp_text",
+      abortController: controller,
+      mcpStartup: starting,
+    });
+    const loop = startStreamPump("conv_mcp_text", controller, setState, getState);
+    await drainAsync();
+
+    sinks[0]!.push(sse("response.output_text.delta", { message_id: "m1", delta: "Hello" }));
+    await drainAsync();
+    expect(useChatStore.getState().mcpStartup).toBeNull();
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    expect(useChatStore.getState().mcpStartup).toBeNull();
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
     await drainAsync(2);
     await loop;
   });
