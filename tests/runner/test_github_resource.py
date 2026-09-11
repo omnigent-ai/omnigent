@@ -234,6 +234,9 @@ def test_github_info_pr_via_commit_fork_fallback(
     assert info["base_ref"] == "main"
     # Resolved via the FORK's commits/{sha}/pulls, never a base-repo branch list.
     assert any(c[0] == "api" and "daniellok-db/repo/commits/" in c[1] for c in calls)
+    # Inference is read-only. The explicit -R lookup above does not need to
+    # persist a gh default into the workspace's git config.
+    assert not any(c[:2] == ("repo", "set-default") for c in calls)
 
 
 def test_github_info_no_false_positive_on_default_branch(
@@ -482,7 +485,11 @@ def test_github_changed_files_via_pr_view(repo: Path, monkeypatch: pytest.Monkey
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
         if tuple(argv[:2]) == ("pr", "view"):
-            return (0, json.dumps({"number": 9}), "")
+            return (
+                0,
+                json.dumps({"number": 9, "url": "https://github.com/acme/repo/pull/9"}),
+                "",
+            )
         if argv and argv[0] == "api":
             return (0, json.dumps(files), "")
         return (1, "", "no stub")
@@ -509,7 +516,11 @@ def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPa
     _stub_gh(
         monkeypatch,
         {
-            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("pr", "view"): (
+                0,
+                json.dumps({"number": 7, "url": "https://github.com/acme/repo/pull/7"}),
+                "",
+            ),
             ("api",): (0, json.dumps(files), ""),
         },
     )
@@ -557,7 +568,11 @@ def test_github_pr_diff_returns_gh_patch(monkeypatch: pytest.MonkeyPatch) -> Non
     _stub_gh(
         monkeypatch,
         {
-            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("pr", "view"): (
+                0,
+                json.dumps({"number": 7, "url": "https://github.com/acme/repo/pull/7"}),
+                "",
+            ),
             ("pr", "diff"): (0, patch, ""),
         },
     )
@@ -583,7 +598,11 @@ def test_github_pr_diff_resolves_number_then_diffs(
         calls.append(tuple(argv))
         head = tuple(argv[:2])
         if head == ("pr", "view"):
-            return (0, json.dumps({"number": 9}), "")
+            return (
+                0,
+                json.dumps({"number": 9, "url": "https://github.com/acme/repo/pull/9"}),
+                "",
+            )
         if head == ("pr", "diff"):
             return (0, patch, "")
         return (1, "", "no stub")
@@ -592,7 +611,56 @@ def test_github_pr_diff_resolves_number_then_diffs(
     result = github_pr_diff(str(repo))
     assert result == {"object": "session.github.pr_diff", "patch": patch}
     # The diff was fetched by the resolved number, never a bare 'gh pr diff'.
-    assert [c for c in calls if c[:2] == ("pr", "diff")] == [("pr", "diff", "9")]
+    assert [c for c in calls if c[:2] == ("pr", "diff")] == [
+        ("pr", "diff", "9", "-R", "github.com/acme/repo")
+    ]
+
+
+@pytest.mark.parametrize("operation", ["changes", "diff"])
+def test_github_workspace_operations_keep_fork_pr_base_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Commit fallback carries the fork PR's base repo into downstream reads."""
+    _run(["git", "remote", "add", "origin", "git@github.com:daniellok-db/repo.git"], repo)
+    files = [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 1}]
+    patch = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if tuple(argv[:2]) == ("pr", "view") and argv[2] == "--json":
+            return (1, "", "no pull requests found for branch")
+        if argv[0] == "api" and any("repos/daniellok-db/repo/commits/" in arg for arg in argv):
+            row = {"number": 77, "state": "open", "base": {"repo": {"full_name": "acme/repo"}}}
+            return (0, json.dumps([row]), "")
+        if tuple(argv[:2]) == ("pr", "view") and "-R" in argv:
+            assert argv[argv.index("-R") + 1] == "acme/repo"
+            return (
+                0,
+                json.dumps({"number": 77, "url": "https://github.com/acme/repo/pull/77"}),
+                "",
+            )
+        if argv[0] == "api" and any(
+            arg == "repos/acme/repo/pulls/77/files?per_page=100" for arg in argv
+        ):
+            return (0, json.dumps(files), "")
+        if tuple(argv[:2]) == ("pr", "diff"):
+            return (0, patch, "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+
+    if operation == "changes":
+        assert [entry["path"] for entry in github_changed_files(str(repo))["data"]] == ["a.py"]
+        assert any(
+            c[0] == "api" and "repos/acme/repo/pulls/77/files?per_page=100" in c for c in calls
+        )
+    else:
+        assert github_pr_diff(str(repo))["patch"] == patch
+        assert ("pr", "diff", "77", "-R", "github.com/acme/repo") in calls
+    assert not any(c[:2] == ("repo", "set-default") for c in calls)
 
 
 # ── Account selection ────────────────────────────────────────────────────────

@@ -363,6 +363,58 @@ def _cleanup_host(host: HostProcess) -> None:
         task.cancel()
 
 
+@pytest.mark.parametrize(
+    ("wire_session_id", "helper_session_id"),
+    [("", None), ("conv_owned", "conv_owned")],
+)
+async def test_dispatch_fs_github_ops_normalize_workspace_session_id(
+    wire_session_id: str,
+    helper_session_id: str | None,
+) -> None:
+    """Pre-session GitHub reads must not share the empty-id PR registry."""
+    calls: list[tuple[str, str | None]] = []
+
+    def github_info(session_id: str | None, _pr_url: str | None) -> dict[str, object]:
+        calls.append(("info", session_id))
+        return {}
+
+    def github_changes(session_id: str | None, _pr_url: str | None) -> dict[str, object]:
+        calls.append(("changes", session_id))
+        return {}
+
+    def github_file_diff(
+        _base: str | None,
+        _path: str,
+        *,
+        session_id: str | None,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        calls.append(("file_diff", session_id))
+        return {}
+
+    def github_pr_diff(session_id: str | None, _pr_url: str | None) -> dict[str, object]:
+        calls.append(("pr_diff", session_id))
+        return {}
+
+    reader = SimpleNamespace(
+        github_info=github_info,
+        github_changes=github_changes,
+        github_file_diff=github_file_diff,
+        github_pr_diff=github_pr_diff,
+    )
+    HostProcess._dispatch_fs_op(reader, "github_info", wire_session_id, {})
+    HostProcess._dispatch_fs_op(reader, "github_changes", wire_session_id, {})
+    HostProcess._dispatch_fs_op(reader, "github_diff", wire_session_id, {"path": "README.md"})
+    HostProcess._dispatch_fs_op(reader, "github_pr_diff", wire_session_id, {})
+
+    assert calls == [
+        ("info", helper_session_id),
+        ("changes", helper_session_id),
+        ("file_diff", helper_session_id),
+        ("pr_diff", helper_session_id),
+    ]
+
+
 async def test_handle_launch_spawns_subprocess(
     tmp_path: Path,
 ) -> None:

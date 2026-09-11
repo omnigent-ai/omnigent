@@ -3049,22 +3049,23 @@ class HostProcess:
                 exclude=cast("str | None", params.get("exclude")),
                 limit=_coerce_int(params.get("limit", 500)),
             )
+        github_session_id = session_id or None
         if op == "github_info":
-            return r.github_info(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_info(github_session_id, cast("str | None", params.get("pr_url")))
         if op == "github_changes":
-            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_changes(github_session_id, cast("str | None", params.get("pr_url")))
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
                 str(params.get("path", "")),
-                session_id=session_id,
+                session_id=github_session_id,
                 pr_url=cast("str | None", params.get("pr_url")),
                 previous_path=cast("str | None", params.get("previous_path")),
                 head_sha=cast("str | None", params.get("head_sha")),
                 base_sha=cast("str | None", params.get("base_sha")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_pr_diff(github_session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:

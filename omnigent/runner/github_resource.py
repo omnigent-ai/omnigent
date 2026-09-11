@@ -251,22 +251,6 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     return rc == 0, []
 
 
-def _resolved_base_nwo(root: str) -> str | None:
-    """Return the gh-resolved base repo ``owner/repo`` for the checkout, or ``None``.
-
-    Reads ``gh repo set-default --view`` — a local git-config read (no network),
-    the same base ``gh`` itself resolves PRs against. ``None`` when no default is
-    set (``--view`` exits non-zero) or the output isn't an ``owner/repo``.
-    """
-    rc, out, _ = _gh(["repo", "set-default", "--view"], cwd=root)
-    if rc != 0:
-        return None
-    value = out.strip()
-    if value and "/" in value and " " not in value:
-        return value
-    return None
-
-
 def _workspace_key(root: str) -> str | None:
     """Return the stable per-workspace key for the account preference, or ``None``.
 
@@ -535,12 +519,6 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
     if resolved is None:
         return None
     number, base_repo = resolved
-    # First-run convenience: point gh's default at the PR's real base so the
-    # agent's own `gh` in the terminal targets it too. Only when unset, so a
-    # manual `gh repo set-default` is never overridden; best-effort — resolution
-    # itself doesn't need it (the explicit ``-R`` below carries the base).
-    if not _resolved_base_nwo(root):
-        _gh(["repo", "set-default", base_repo], cwd=root, token=token)
     rc, out, _ = _gh(
         ["pr", "view", str(number), "-R", base_repo, "--json", fields], cwd=root, token=token
     )
@@ -880,19 +858,27 @@ _GH_STATUS_MAP = {
 }
 
 
-def _pr_number(root: str, *, token: str | None = None) -> int | None:
-    """Return the PR number for the workspace's branch, or ``None``.
+def _workspace_pr_reference(root: str, *, token: str | None = None) -> PullRequestRef | None:
+    """Return the PR identity for the workspace's branch, or ``None``.
 
     :param root: Absolute workspace path.
     :param token: Optional GH_TOKEN to run ``gh`` as the selected account.
-    :returns: The associated PR's number, or ``None`` when no PR resolves (none
-        for the branch, ``gh`` missing, or not authenticated).
+    :returns: The associated PR's host/repository/number identity, or ``None``
+        when no PR resolves (none for the branch, ``gh`` missing, or not
+        authenticated).
     """
-    data = _pr_view_json(root, "number", token=token)
+    data = _pr_view_json(root, "number,url", token=token)
     if data is None:
         return None
     number = data.get("number")
-    return number if isinstance(number, int) else None
+    url = data.get("url")
+    if not isinstance(number, int) or not isinstance(url, str):
+        return None
+    try:
+        reference = PullRequestRef.from_url(url)
+    except ValueError:
+        return None
+    return reference if reference.number == number else None
 
 
 def github_changed_files(
@@ -909,20 +895,19 @@ def github_changed_files(
         / ``status`` / ``lines_added`` / ``lines_removed``.
     """
     empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
-    reference = _default_pr(session_id, pr_url)
-    token = _pr_token(root, reference) if reference else _account_token_for(root)
-    number = reference.number if reference else _pr_number(root, token=token)
-    if number is None:
+    tracked_reference = _default_pr(session_id, pr_url)
+    token = _pr_token(root, tracked_reference) if tracked_reference else _account_token_for(root)
+    reference = tracked_reference or _workspace_pr_reference(root, token=token)
+    if reference is None:
         return empty
-    repository = reference.repository if reference else "{owner}/{repo}"
-    host_args = _host_args(root, reference) if reference else []
+    host_args = _host_args(root, reference)
     rc, out, _ = _gh(
         [
             "api",
             *host_args,
             "--paginate",
-            *(["--slurp"] if reference else []),
-            f"repos/{repository}/pulls/{number}/files?per_page=100",
+            *(["--slurp"] if tracked_reference else []),
+            f"repos/{reference.repository}/pulls/{reference.number}/files?per_page=100",
         ],
         cwd=root,
         token=token,
@@ -936,7 +921,7 @@ def github_changed_files(
     if not isinstance(entries, list):
         return empty
 
-    if reference:
+    if tracked_reference:
         entries = [
             entry for page in entries for entry in (page if isinstance(page, list) else [page])
         ]
@@ -1022,24 +1007,26 @@ def github_pr_diff(
 
     ``gh pr diff <number>`` yields the PR's "Files changed" patch (server-computed
     against the base's merge-base), which the web view parses client-side into
-    per-file diffs. The PR is resolved by number first (via :func:`_pr_number`,
-    which handles fork / triangular heads a bare ``gh pr diff`` can't); empty when
-    the branch has no PR.
+    per-file diffs. The PR's full host/repository/number identity is resolved
+    first, which handles fork / triangular heads a bare ``gh pr diff`` can't;
+    empty when the branch has no PR.
 
     :param root: Absolute workspace path.
     :returns: A ``session.github.pr_diff`` object with the ``patch`` text
         (empty when there's no PR / no changes).
     """
     empty: dict[str, Any] = {"object": "session.github.pr_diff", "patch": ""}
-    reference = _default_pr(session_id, pr_url)
-    token = _pr_token(root, reference) if reference else _account_token_for(root)
-    number = reference.number if reference else _pr_number(root, token=token)
-    if number is None:
+    tracked_reference = _default_pr(session_id, pr_url)
+    token = _pr_token(root, tracked_reference) if tracked_reference else _account_token_for(root)
+    reference = tracked_reference or _workspace_pr_reference(root, token=token)
+    if reference is None:
         return empty
-    if reference:
-        _host_args(root, reference)
-    repo_args = ["-R", reference.repo_argument] if reference else []
-    rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
+    _host_args(root, reference)
+    rc, out, _ = _gh(
+        ["pr", "diff", str(reference.number), "-R", reference.repo_argument],
+        cwd=root,
+        token=token,
+    )
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
 
 
