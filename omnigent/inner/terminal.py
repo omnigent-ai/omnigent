@@ -1206,14 +1206,22 @@ class TerminalInstance:
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        _, stderr = await proc.communicate()
+        stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
+            # tmux may report the failure on either stream (or neither);
+            # preserve both so the surfaced reason is never silently empty.
+            reason = "; ".join(
+                stream.decode(errors="replace").strip()
+                for stream in (stderr, stdout)
+                if stream.strip()
+            )
             raise RuntimeError(
-                f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
+                f"tmux launch failed (rc={proc.returncode}): "
+                f"{reason or '<tmux produced no output>'}"
             )
 
         self.running = True

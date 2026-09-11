@@ -932,6 +932,105 @@ async def _capture_launch_argv(
     return captured[0]
 
 
+@dataclass
+class _FailingProcess:
+    """Launch-failure subprocess stand-in with configurable output streams."""
+
+    returncode: int = 1
+    stdout: bytes = b""
+    stderr: bytes = b""
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        """Return the configured ``(stdout, stderr)`` byte strings."""
+        return self.stdout, self.stderr
+
+
+async def _failed_launch_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process: _FailingProcess,
+) -> str:
+    """Launch with a failing mocked tmux and return the raised error message.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param process: The fake tmux process the launch observes.
+    :returns: The ``RuntimeError`` message ``launch`` raised.
+    """
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+        env: dict[str, str],
+    ) -> _FailingProcess:
+        """Ignore the argv and hand back the configured failing process."""
+        del cmd, stdout, stderr, env
+        return process
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=fake_create_subprocess_exec,
+            subprocess=terminal_mod.asyncio.subprocess,
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await instance.launch(cwd=tmp_path)
+    return str(excinfo.value)
+
+
+async def test_launch_failure_preserves_stdout_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux failing with its diagnostic on stdout must surface that text.
+
+    Discarding stdout leaves the runner log with the unactionable
+    ``tmux launch failed (rc=1): `` (empty reason) whenever tmux reports
+    its failure on stdout rather than stderr.
+    """
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _FailingProcess(stdout=b"new-session refused: server socket unavailable\n"),
+    )
+    assert "tmux launch failed (rc=1)" in message
+    assert "new-session refused: server socket unavailable" in message
+
+
+async def test_launch_failure_reports_stderr_before_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When both streams carry text, stderr leads and stdout is preserved."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _FailingProcess(stdout=b"stdout-detail\n", stderr=b"stderr-detail\n"),
+    )
+    assert "stderr-detail" in message
+    assert "stdout-detail" in message
+    assert message.index("stderr-detail") < message.index("stdout-detail")
+
+
+async def test_launch_failure_names_silent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux failing with no output on either stream yields an explicit
+    placeholder reason, never a trailing-colon empty message."""
+    message = await _failed_launch_error(tmp_path, monkeypatch, _FailingProcess(returncode=2))
+    assert "tmux launch failed (rc=2)" in message
+    assert not message.rstrip().endswith(":")
+    assert "<tmux produced no output>" in message
+
+
 @pytest.mark.parametrize("version", [(3, 3), (3, 10)])
 def test_require_supported_tmux_accepts_minimum_or_newer(
     monkeypatch: pytest.MonkeyPatch,
