@@ -233,6 +233,7 @@ def test_hello_frame_round_trip() -> None:
         frame_protocol_version=1,
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
+        interactive_shells=["zsh", "bash"],
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -240,6 +241,23 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
+    assert decoded.interactive_shells == ["zsh", "bash"]
+
+
+def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
+    """An older host hello leaves its shell inventory unknown."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "old-host",
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.interactive_shells is None
 
 
 def test_hello_frame_empty_runners() -> None:

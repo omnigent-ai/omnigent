@@ -950,6 +950,25 @@ export interface SessionSupersededEvent {
 }
 
 /**
+ * `session.btw_sidechat` — a transient side-chat answer from `/btw` command.
+ *
+ * Broadcast-only (never persisted, no SSE replay). The answer appears in a
+ * dismissable overlay near the composer — not as a persisted message — and
+ * Escape closes it. Nothing persists; a reload drops it.
+ */
+export interface SessionBtwSidechatEvent {
+  type: "session_btw_sidechat";
+  /** The conversation this side-chat was spawned in. */
+  conversationId: string;
+  /** The original `/btw` question text. */
+  question: string;
+  /** The assistant's answer. */
+  answer: string;
+  /** True when the answer was truncated (user should check the terminal for full response). */
+  truncated: boolean;
+}
+
+/**
  * `browser.action_request` — the agent's `browser_*` tool asks the desktop shell
  * to run a browser action against this conversation's WebContentsView. Every
  * renderer sees the event, but the relay (`useBrowserAgentRelay`) claims it first
@@ -1023,4 +1042,5 @@ export type StreamEvent =
   | SessionSkillsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
+  | SessionBtwSidechatEvent
   | BrowserActionRequestEvent;

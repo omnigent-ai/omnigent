@@ -262,6 +262,9 @@ class _FakeProcessManager:
         self.marked_in_flight: list[tuple[str, str]] = []
         self.cleared_in_flight: list[str] = []
         self.activity_noted: list[str] = []
+        # Every release call with its idle-cutoff guard, including calls the
+        # guard suppressed; ``released`` records only completed releases.
+        self.release_calls: list[tuple[str, float | None]] = []
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -302,8 +305,21 @@ class _FakeProcessManager:
         self.cancelled.append(conversation_id)
         return True
 
-    async def release(self, conversation_id: str) -> None:
-        """Record a release and remove the session."""
+    async def release(
+        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+    ) -> None:
+        """Record a release and remove the session.
+
+        Mirrors the real manager's conditional release: with a cutoff, an
+        entry with a turn in flight is left alone.
+
+        :param conversation_id: Session/conversation id being released.
+        :param only_if_idle_cutoff: Idle-reap cutoff; when given, a
+            conversation with an active turn is not torn down.
+        """
+        self.release_calls.append((conversation_id, only_if_idle_cutoff))
+        if only_if_idle_cutoff is not None and conversation_id in self._active_turns:
+            return
         self.released.append(conversation_id)
         self._sessions.discard(conversation_id)
 

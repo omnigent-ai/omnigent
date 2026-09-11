@@ -24,6 +24,24 @@ describe("shared composer controls", () => {
     expect(screen.getByRole("button", { name: "This machine" })).toHaveClass("w-11", "md:h-7");
   });
 
+  it("lets workspace labels use half the bar instead of a fixed pixel cap", () => {
+    render(
+      <ComposerWorkspaceBar>
+        <ComposerWorkspaceTrigger kind="directory" label="new-composer-width" />
+        <ComposerWorkspaceTrigger kind="worktree" label="feature/new-composer-width" />
+      </ComposerWorkspaceBar>,
+    );
+
+    for (const trigger of screen.getAllByRole("button")) {
+      expect(trigger).toHaveClass("min-w-0", "max-w-[calc(50%-0.25rem)]");
+      expect(trigger).not.toHaveClass("max-w-[180px]");
+      expect(trigger.querySelector("span")).toHaveClass("min-w-0", "truncate");
+      for (const icon of trigger.querySelectorAll("svg")) {
+        expect(icon).toHaveClass("shrink-0");
+      }
+    }
+  });
+
   it("renders a product-icon model trigger instead of a separate settings gear", () => {
     render(
       <ComposerHarnessTrigger

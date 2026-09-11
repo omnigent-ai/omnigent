@@ -830,8 +830,8 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         app_server.codex_home = kwargs["codex_home"]
         return app_server
 
-    class _StartupEventClient:
-        """No-op listener for the known-thread startup path."""
+    class _UnexpectedDiscoveryClient:
+        """App-server client that must not connect on a known-thread resume."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -842,7 +842,8 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """No-op connect."""
+            """Fail if the resume path tries to discover a fresh thread."""
+            raise AssertionError("resume path must not connect discovery client")
 
         async def close(self) -> None:
             """:returns: None."""
@@ -902,7 +903,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         "build_codex_native_server",
         _fake_build_codex_native_server,
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(
         runner_app_mod,
@@ -1111,10 +1112,8 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         app_server.codex_home = kwargs["codex_home"]
         return app_server
 
-    listener_events: list[str] = []
-
-    class _StartupEventClient:
-        """Record cleanup of the listener when preload refuses the resume."""
+    class _IdleClient:
+        """Event client that must never connect before the resume succeeds."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -1125,12 +1124,11 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """Record the connection established before preload."""
-            listener_events.append("connected")
+            """Fail if the refused resume still wires the listener."""
+            raise AssertionError("refused resume must not connect the event client")
 
         async def close(self) -> None:
-            """Record listener cleanup."""
-            listener_events.append("closed")
+            """:returns: None."""
 
     async def _refusing_preload(
         transport: str,
@@ -1161,7 +1159,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         "build_codex_native_server",
         _fake_build_codex_native_server,
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _IdleClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _refusing_preload)
 
     agent_spec = AgentSpec(
@@ -1183,7 +1181,6 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
                 server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
             )
         assert closed == ["closed"], "refused resume left the app-server running"
-        assert listener_events == ["connected", "closed"]
         assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS, (
             "failed create left its app-server tracked; the next attempt would "
             "overwrite (and leak) it"

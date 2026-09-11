@@ -856,7 +856,7 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getByTestId("composer-agent-models")).toBeTruthy();
   });
 
-  it("shows the model connection from both the model label and session gear", async () => {
+  it("shows one merged tooltip on the pill, carrying the model connection", async () => {
     useChatStore.setState({ llmModel: "sonnet" });
     const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
       ...option,
@@ -877,26 +877,113 @@ describe("Composer slash-command submit routing", () => {
       />,
     );
 
-    const source = screen.getByTestId("composer-model-source");
-    expect(source).toHaveTextContent("Sonnet 4.6");
-    expect(source).not.toHaveTextContent("Workspace");
-    fireEvent.focus(source);
-    const tooltip = await screen.findByTestId("composer-model-source-tooltip");
-    expect(tooltip).toHaveTextContent("Connection: Databricks · production-west");
-    expect(tooltip).not.toHaveTextContent("acme.cloud.databricks.com");
-    expect(tooltip).not.toHaveTextContent("Profile:");
-    expect(tooltip).not.toHaveTextContent("Host:");
-
-    fireEvent.blur(source);
-    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const pill = screen.getByTestId("composer-config-gear");
+    expect(pill).toHaveTextContent("Sonnet 4.6");
+    expect(pill).not.toHaveTextContent("Workspace");
+    fireEvent.focus(pill);
     const gearTooltip = await screen.findByTestId("composer-config-gear-tooltip");
     expect(gearTooltip).toHaveTextContent("Connection: Databricks · production-west");
+    expect(gearTooltip).not.toHaveTextContent("acme.cloud.databricks.com");
+    expect(gearTooltip).not.toHaveTextContent("Profile:");
+    expect(gearTooltip).not.toHaveTextContent("Host:");
     expect(gearTooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
       gearTooltip.textContent?.indexOf("Effort:") ?? -1,
     );
+    // Bold keys separate each row's label from its value.
+    for (const key of within(gearTooltip).getAllByText(/^(Harness|Model|Effort|Connection):$/)) {
+      expect(key).toHaveClass("font-semibold");
+    }
+    // The pill owns exactly one tooltip surface — a second wrapper surface
+    // (the old model-source tooltip) stacked over it is the reported bug.
+    expect(screen.queryByTestId("composer-model-source-tooltip")).toBeNull();
+    expect(document.querySelectorAll('[data-slot="tooltip-content"]')).toHaveLength(1);
   });
 
-  it("keeps the label's truncation chain intact when the source tooltip wraps it", () => {
+  it("suppresses the pill tooltip when bare /model opens the picker", async () => {
+    // The programmatic openNonce path (bare `/model`) must suppress the
+    // pill's summary tooltip exactly like the click/keyboard open paths;
+    // otherwise the focus the gear receives (inside the tooltip trigger's
+    // span, so it bubbles there) paints the tooltip over the just-opened
+    // selector.
+    useChatStore.setState({ llmModel: "sonnet" });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    await screen.findByTestId("composer-agent-menu");
+
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+  });
+
+  it("suppresses the pill tooltip while the selector popover is open", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+
+    // Open the selector popover from the pill.
+    const gear = screen.getByTestId("composer-config-gear");
+    fireEvent.keyDown(gear, { key: "ArrowDown" });
+    const menu = screen.getByTestId("composer-agent-menu");
+
+    // Opening the menu focuses the gear, which sits inside the tooltip
+    // trigger's span and bubbles to it (the menu content is a portalled
+    // React sibling — its events do not bubble to the trigger); the tooltip
+    // must stay closed rather than paint over the open menu.
+    fireEvent.focus(gear);
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+
+    // Closing the popover hands focus back to the trigger; that programmatic
+    // focus must NOT instantly reopen the tooltip.
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("composer-agent-menu")).toBeNull());
+    fireEvent.focus(gear);
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+
+    // Fresh intent releases the suppression: the pointer re-entering the
+    // tooltip trigger (the span wrapping the pill, which carries the
+    // guard's pointer handler) lets the tooltip open again.
+    fireEvent.pointerEnter(gear.parentElement!);
+    fireEvent.focus(gear);
+    expect(await screen.findByTestId("composer-config-gear-tooltip")).toBeInTheDocument();
+  });
+
+  it("keeps the label's truncation chain intact through the pill's wrapper", () => {
     useChatStore.setState({ llmModel: "sonnet" });
     const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
       ...option,
@@ -917,12 +1004,12 @@ describe("Composer slash-command submit routing", () => {
       />,
     );
 
-    // jsdom does no layout, so pin the CSS contract instead: the tooltip
-    // wrapper must be a shrinkable flex container (flex + min-w-0 + shrink),
-    // or the label's `truncate` never engages and a long model id runs under
-    // the Stop button on phone-width viewports.
-    const wrapper = screen.getByTestId("composer-model-source");
-    for (const cls of ["flex", "min-w-0", "shrink"]) {
+    // jsdom does no layout, so pin the CSS contract instead: the pill's
+    // tooltip-trigger wrapper must be a shrinkable flex container (flex +
+    // min-w-0), or the label's `truncate` never engages and a long model id
+    // runs under the Stop button on phone-width viewports.
+    const wrapper = screen.getByTestId("composer-config-gear").parentElement as HTMLElement;
+    for (const cls of ["flex", "min-w-0"]) {
       expect(wrapper.classList.contains(cls), `wrapper is missing "${cls}"`).toBe(true);
     }
     const label = screen.getByTestId("composer-agent-config-value");
@@ -947,8 +1034,8 @@ describe("Composer slash-command submit routing", () => {
       />,
     );
 
-    fireEvent.focus(screen.getByTestId("composer-model-source"));
-    const tooltip = await screen.findByTestId("composer-model-source-tooltip");
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const tooltip = await screen.findByTestId("composer-config-gear-tooltip");
     expect(tooltip).toHaveTextContent("Connection: Claude subscription");
     expect(tooltip).not.toHaveTextContent("Authentication");
   });
@@ -1145,7 +1232,7 @@ describe("Composer model/effort label", () => {
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
-  it("reads 'Smart Routing' with no model/effort when routing is on", () => {
+  it("reads 'Smart Routing' with no model/effort when routing is on", async () => {
     // The router picks model + effort per turn, so the label must not surface a
     // stale pinned model/effort — it reads "Smart Routing" instead.
     useChatStore.setState({
@@ -1172,7 +1259,11 @@ describe("Composer model/effort label", () => {
     expect(label()).toHaveTextContent("Smart Routing");
     expect(label()).not.toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
-    expect(screen.queryByTestId("composer-model-source")).toBeNull();
+    // Routing picks the connection per turn, so the pill tooltip must not
+    // surface a stale pinned provenance row.
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const gearTooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(gearTooltip).not.toHaveTextContent("Connection:");
   });
 
   it("renders the reported model, never the request or the sticky", () => {
@@ -1521,6 +1612,24 @@ describe("Composer shared visible controls", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["Session workspace", 0],
+    ["Session worktree", 1],
+  ])("wraps text inside the %s popover", (label, triggerIndex) => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const controls = screen.getByTestId("composer-workspace-controls");
+    fireEvent.keyDown(within(controls).getAllByRole("button")[triggerIndex], {
+      key: "ArrowDown",
+    });
+
+    const popover = screen.getByRole("menu");
+    expect(within(popover).getByText(label)).toBeVisible();
+    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,28rem)]");
+    expect(popover).not.toHaveClass("whitespace-nowrap");
+    expect(popover.querySelector("p")).toHaveClass("break-all");
   });
 
   it("renders the same workspace, host, permission and model controls as landing", () => {

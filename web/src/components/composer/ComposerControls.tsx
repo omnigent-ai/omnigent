@@ -39,7 +39,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
       ref={ref}
       type="button"
       className={cn(
-        "relative inline-flex h-6 min-w-0 max-w-[180px] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50",
+        "relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50",
         className,
       )}
       {...props}
@@ -145,6 +145,26 @@ export function ComposerPermissionPicker({
   );
 }
 
+/**
+ * Label/value rows for a composer trigger's config tooltip. The bold key
+ * separates each row's label from its value.
+ */
+export function ComposerConfigTooltipRows({
+  rows,
+}: {
+  rows: readonly { label: string; value: string }[];
+}) {
+  return (
+    <>
+      {rows.map((row) => (
+        <span key={row.label}>
+          <span className="font-semibold">{row.label}:</span> {row.value}
+        </span>
+      ))}
+    </>
+  );
+}
+
 export const ComposerHarnessTrigger = forwardRef<
   HTMLButtonElement,
   Omit<ComponentPropsWithoutRef<typeof Button>, "children"> & {
@@ -178,7 +198,7 @@ export const ComposerHarnessTrigger = forwardRef<
       size="sm"
       aria-label={label}
       className={cn(
-        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0 md:min-h-7",
+        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
         className,
       )}
       {...props}
