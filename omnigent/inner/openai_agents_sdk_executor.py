@@ -1174,7 +1174,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                     ) -> None:
                         try:
                             await super().run_compaction(args)
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             logger.debug(
                                 "Compaction call failed (endpoint may not support "
                                 "responses.compact), continuing without compaction",
@@ -1753,7 +1753,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                     yield ExecutorError(message=auth_msg)
                 else:
                     logger.error("OpenAIAgentsSDKExecutor: run failed: %s", exc)
-                    yield ExecutorError(message=f"OpenAI Agents SDK error: {exc}")
+                    # Carry the SDK exception so the adapter's classifier can
+                    # map it to a semantic code (e.g. 429 → rate_limit_exceeded).
+                    yield ExecutorError(message=f"OpenAI Agents SDK error: {exc}", exception=exc)
                 return
             finally:
                 # If the outer generator was aclose'd before the
@@ -1898,7 +1900,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                     _compacted: list[ReplayItem] | None = None
                     try:
                         _compacted = await state.sdk_session.get_items()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             "Failed to read compacted session items",
                             exc_info=True,
