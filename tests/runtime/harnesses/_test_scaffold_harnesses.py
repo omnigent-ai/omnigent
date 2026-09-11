@@ -429,11 +429,8 @@ class _WedgeOnceThenCompleteHarness(HarnessApp):
     """
     Wedges on the first ``run_turn`` invocation, completes on the second.
 
-    Models the reported mid-run failure: a turn makes real progress, then
-    one LLM call hangs and emits nothing for the whole idle window. The
-    scaffold's recovery must abandon the wedged invocation and re-run the
-    turn; the retry finds a healthy "call" and the turn completes instead
-    of the whole run hard-stopping on a single transiently wedged call.
+    The first invocation emits no output, so replay cannot duplicate prior
+    progress. The retry finds a healthy call and completes.
     """
 
     def __init__(self) -> None:
@@ -443,13 +440,6 @@ class _WedgeOnceThenCompleteHarness(HarnessApp):
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         del request
         self._attempts += 1
-        # Real progress first — the wedge hits a turn that was working.
-        ctx.emit(
-            OutputTextDeltaEvent(
-                type="response.output_text.delta",
-                delta=f"progress-attempt-{self._attempts} ",
-            )
-        )
         if self._attempts == 1:
             await asyncio.Event().wait()  # the wedged call: emits nothing more
         ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="recovered-done"))

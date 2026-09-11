@@ -1,8 +1,8 @@
-"""A transiently wedged turn is recovered by the scaffold, not hard-stopped.
+"""Pre-output wedges recover; turns with progress must never be replayed.
 
 An idle-watchdog expiry means one call (typically an LLM request that opened
 a stream and then emitted nothing) wedged mid-turn. That is usually
-transient, so ``HarnessApp._guarded_run_turn`` must abandon the wedged
+transient, so before any output ``HarnessApp._guarded_run_turn`` abandons the wedged
 ``run_turn`` invocation and re-run the turn (announcing the recovery with a
 ``response.retry`` event) instead of failing the whole run on the first
 expiry. Only when every attempt wedges — or the absolute ceiling leaves no
@@ -16,7 +16,8 @@ The tests cover the rules of that recovery:
    says recovery was attempted;
 3. recovery must not retry past the absolute ceiling — with less than one
    idle window of absolute budget left, the expiry fails immediately;
-4. a cancelled turn is not retried.
+4. a cancelled turn is not retried;
+5. partial output or tool dispatch prevents replay and duplicate side effects.
 
 How to run::
 
@@ -38,6 +39,14 @@ import pytest
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.server.schemas import (
+    HeartbeatEvent,
+    OutputItemDoneEvent,
+    OutputTextDeltaEvent,
+    PolicyEvaluationRequestEvent,
+    ResponseObject,
+    RetryEvent,
+)
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -332,3 +341,117 @@ async def test_recovered_turn_failure_counts_only_final_attempt_in_message(
     message = str(excinfo.value)
     assert "idle watchdog" in message, message
     assert "1 recovery retry was attempted and also wedged" in message, message
+
+
+async def test_partial_output_is_not_replayed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    attempts = 0
+
+    class PartialOutputApp(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            nonlocal attempts
+            attempts += 1
+            ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="once"))
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
+    app = PartialOutputApp()
+    queue = asyncio.Queue()
+    ctx = TurnContext(response_id="partial", event_queue=queue, cancelled=asyncio.Event())
+    with pytest.raises(RuntimeError, match="idle watchdog"):
+        await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    assert attempts == 1
+    assert queue.get_nowait().delta == "once"
+    assert queue.get_nowait() is None
+    assert queue.empty()
+
+
+async def test_counting_tool_is_executed_once_before_wedge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    attempts = 0
+    executions = 0
+
+    class CountingToolApp(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            nonlocal attempts
+            attempts += 1
+            await ctx.dispatch_tool(f"call_{attempts}", "count", "{}", "agent")
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
+    app = CountingToolApp()
+    queue = asyncio.Queue()
+    ctx = TurnContext(response_id="count", event_queue=queue, cancelled=asyncio.Event())
+    events = []
+
+    async def resolve_tools() -> None:
+        nonlocal executions
+        while (event := await queue.get()) is not None:
+            events.append(event)
+            if (
+                isinstance(event, OutputItemDoneEvent)
+                and event.item.get("status") == "action_required"
+            ):
+                executions += 1
+                ctx._pending_tool_calls[event.item["call_id"]].set_result(str(executions))
+
+    async with asyncio.timeout(5):
+        async with asyncio.TaskGroup() as group:
+            group.create_task(resolve_tools())
+            with pytest.raises(RuntimeError, match="idle watchdog"):
+                await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    assert attempts == executions == 1
+    assert not any(isinstance(event, RetryEvent) for event in events)
+    assert (
+        sum(
+            isinstance(event, OutputItemDoneEvent)
+            and event.item.get("type") == "function_call_output"
+            for event in events
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("phase", ["PHASE_LLM_REQUEST", "PHASE_TOOL_CALL"])
+async def test_policy_handshake_replay_gate(monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    attempts = 0
+
+    class PolicyApp(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                ctx.emit(
+                    PolicyEvaluationRequestEvent(
+                        type="policy_evaluation.requested",
+                        evaluation_id="policy",
+                        phase=phase,
+                        data={},
+                    )
+                )
+                ctx.emit(
+                    HeartbeatEvent(
+                        type="response.heartbeat",
+                        response=ResponseObject(
+                            id=ctx.response_id, model="agent", status="in_progress", created_at=0
+                        ),
+                    )
+                )
+                await asyncio.Event().wait()
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
+    app = PolicyApp()
+    ctx = TurnContext(response_id="policy", event_queue=asyncio.Queue(), cancelled=asyncio.Event())
+    if phase == "PHASE_LLM_REQUEST":
+        await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+        assert attempts == 2
+    else:
+        with pytest.raises(RuntimeError, match="idle watchdog"):
+            await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+        assert attempts == 1

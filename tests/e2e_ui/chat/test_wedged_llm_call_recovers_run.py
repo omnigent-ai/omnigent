@@ -1,38 +1,9 @@
-"""A transiently wedged LLM call must not hard-stop the whole run.
+"""Recover pre-output wedges without replaying side-effectful turns.
 
-Reproduces the reported failure: an agent working through a multi-step task
-runs several iterations of real progress, then one LLM call wedges — the
-stream opens (or the request hangs) and emits nothing for the whole idle
-window. The harness idle watchdog fires and the run stops completely with::
-
-    Error · execution · RuntimeError
-    turn exceeded the 600s harness idle watchdog (run_turn emitted no
-    events for 600s; likely a wedged LLM or tool call)
-
-All progress stops; the user must notice and manually re-prompt. The desired
-behavior is that a single wedged LLM call is recovered (the wedged call is
-abandoned and retried, or the failure is classified retryable so the platform
-restarts the turn) and the run continues to completion.
-
-Journey (the reported 600 s idle window is scaled to 10 s via the product's
-own ``HARNESS_TURN_TIMEOUT_S`` env knob on a dedicated runner — the same
-time-scaling ``test_absolute_watchdog_spares_active_turn.py`` uses — so the
-reproduction runs in seconds while exercising the identical code path in
-``omnigent/runtime/harnesses/_scaffold.py``):
-
-1. start a session on a scaffolded-harness agent (openai-agents, driven by
-   the mock LLM),
-2. send a message that starts a multi-step task: the agent completes two
-   tool-call iterations of real progress,
-3. the next LLM call wedges — the mock holds the request open on its gate
-   and emits nothing past the idle window,
-4. observe: the turn dies with the "harness idle watchdog" RuntimeError, the
-   chat shows the error pill, and the run never resumes (the wedged call is
-   not retried; the queued fallback reply is never fetched).
-
-On a buggy build this test FAILS at the ``watchdog_error is None`` assertion
-(the reproduction); after a fix the same journey recovers from the wedged
-call and completes, and the test passes.
+A dedicated runner scales the idle window to ten seconds. A gated mock LLM
+wedges either before any output or after two counting-tool calls. The former
+recovers and completes; the latter fails safely instead of replaying tools.
+Both journeys assert the persisted calls and actual counter-file effects.
 
 Run::
 
@@ -46,6 +17,7 @@ import io
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -65,7 +37,7 @@ from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# Scaled-down idle watchdog window (prod default: 600 s). The wedged LLM
+# Scaled-down idle watchdog window. The wedged LLM
 # call below emits nothing for far longer than this, so the watchdog fires
 # in seconds instead of ten minutes.
 _IDLE_TIMEOUT_S = 10
@@ -76,8 +48,7 @@ _ABSOLUTE_TIMEOUT_S = 600
 # Seconds for the dedicated runner to tunnel into the shared server.
 _RUNNER_ONLINE_TIMEOUT_S = 30.0
 
-# Iterations of real progress before the wedge — the run visibly works
-# through the task first, exactly as reported.
+# Counting-tool iterations, either before the wedge or after recovery.
 _PROGRESS_ROUNDS = 2
 
 # The sentinel the post-recovery assistant reply carries; its presence in
@@ -156,8 +127,7 @@ def short_idle_watchdog_runner(
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
         "ANTHROPIC_API_KEY": "",
-        # The reproduction's time scaling: prod's 600 s idle window becomes
-        # 10 s; the absolute ceiling stays far above the journey.
+        # Scale the idle window to 10 s and keep the absolute ceiling well above the journey.
         "HARNESS_TURN_TIMEOUT_S": str(_IDLE_TIMEOUT_S),
         "HARNESS_TURN_ABSOLUTE_TIMEOUT_S": str(_ABSOLUTE_TIMEOUT_S),
         # A fresh, empty config home: an ambient OMNIGENT_CONFIG_HOME (e.g.
@@ -189,7 +159,9 @@ def short_idle_watchdog_runner(
                 ready = True
                 break
         except httpx.HTTPError:
-            pass
+            # Transient readiness failures should retry at the same polling cadence.
+            time.sleep(0.25)
+            continue
         time.sleep(0.25)
 
     if not ready:
@@ -217,8 +189,8 @@ def wedged_turn_session(
     live_server: str,
     short_idle_watchdog_runner: str,
     mock_llm_server_url: str,
-) -> Iterator[tuple[str, str, str]]:
-    """Create a session on the short-idle-window runner; yield (base, sid, model)."""
+) -> Iterator[tuple[str, str, str, Path]]:
+    """Yield the session URL, id, model, and a counter file on its runner."""
     ws = Path(tempfile.mkdtemp(prefix="omnigent-e2e-idle-watchdog-"))
     name = f"wedge_probe_{uuid.uuid4().hex[:8]}"
     model = f"wedge-probe-{uuid.uuid4().hex[:8]}"
@@ -253,7 +225,7 @@ def wedged_turn_session(
         )
         env_resp.raise_for_status()
 
-        yield (live_server, session_id, model)
+        yield (live_server, session_id, model, ws / "tool-effects.txt")
     finally:
         # Never leave the mock's gate holding the wedged request — a stuck
         # request outlives the test and wedges the dedicated runner's
@@ -264,25 +236,19 @@ def wedged_turn_session(
         shutil.rmtree(ws, ignore_errors=True)
 
 
-def _queue_progress_then_wedge(mock_url: str, model: str) -> None:
-    """Script iterations of real progress, then a wedged LLM call.
-
-    The first rounds are ordinary tool calls — the harness emits real
-    (non-heartbeat) events, so the idle watchdog is healthy and resetting.
-    The next LLM request then blocks on the mock's gate and emits nothing:
-    a wedged LLM call that outlasts the whole idle window. The fallback
-    reply carries the completion sentinel — on a build that recovers the
-    wedged call (abandon + retry), the retried request drains the queue to
-    the fallback and the run finishes; on a buggy build the run hard-stops
-    and the fallback is never fetched.
-    """
+def _queue_wedge(
+    mock_url: str, model: str, counter_path: Path, wedge_after_progress: bool
+) -> None:
+    """Script counting-tool calls and wedge before or after those calls."""
     responses: list[dict[str, object]] = [
         {
             "tool_calls": [
                 {
                     "call_id": f"call_iteration_{step}",
                     "name": "sys_os_shell",
-                    "arguments": json.dumps({"command": f'echo "iteration {step} done"'}),
+                    "arguments": json.dumps(
+                        {"command": f"echo {step} >> {shlex.quote(str(counter_path))}"}
+                    ),
                 }
             ]
         }
@@ -290,7 +256,10 @@ def _queue_progress_then_wedge(mock_url: str, model: str) -> None:
     ]
     # The wedge: the request is accepted, then held open on the gate,
     # emitting no events. Never released during the test.
-    responses.append({"block": True, "text": "never delivered"})
+    responses.insert(
+        len(responses) if wedge_after_progress else 0,
+        {"block": True, "text": "never delivered"},
+    )
     configure_mock_llm(mock_url, responses, key=model)
     set_fallback_mock_llm(mock_url, model, _DONE_SENTINEL)
 
@@ -336,22 +305,16 @@ def _poll_turn_outcome(base_url: str, session_id: str) -> tuple[bool, str | None
 
 
 @pytest.mark.timeout(280)
-def test_wedged_llm_call_must_not_hard_stop_the_run(
+@pytest.mark.parametrize("wedge_after_progress", [False, True], ids=["pre-output", "after-tools"])
+def test_wedged_llm_call_recovery_is_safe(
     page: Page,
-    wedged_turn_session: tuple[str, str, str],
+    wedged_turn_session: tuple[str, str, str, Path],
     mock_llm_server_url: str,
+    wedge_after_progress: bool,
 ) -> None:
-    """A run whose LLM call wedges mid-task must recover, not stop completely.
-
-    On a build with the bug this fails at the ``watchdog_error`` assertion:
-    after two iterations of real progress the wedged LLM call trips the
-    harness idle watchdog, the turn dies with the ``RuntimeError`` the user
-    reported, the chat shows the failure pill, and the run never resumes —
-    the wedged call is not retried and the queued completion reply is never
-    fetched from the mock.
-    """
-    base_url, session_id, model = wedged_turn_session
-    _queue_progress_then_wedge(mock_llm_server_url, model)
+    """Only pre-output stalls recover, and counting tools execute exactly once."""
+    base_url, session_id, model, counter_path = wedged_turn_session
+    _queue_wedge(mock_llm_server_url, model, counter_path, wedge_after_progress)
 
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
@@ -361,31 +324,17 @@ def test_wedged_llm_call_must_not_hard_stop_the_run(
 
     completed, watchdog_error, call_count = _poll_turn_outcome(base_url, session_id)
 
-    # The run made real progress before the wedge — this is what
-    # distinguishes the reported failure (a productive run killed by one
-    # wedged call) from a turn that never started.
-    assert call_count >= 1, (
-        f"Expected at least one executed tool call before the turn settled; "
-        f"got {call_count}. Without prior progress this journey would not "
-        f"exercise the mid-run wedged-LLM-call path."
-    )
+    assert call_count == _PROGRESS_ROUNDS
+    assert counter_path.read_text().splitlines() == [
+        str(step) for step in range(1, _PROGRESS_ROUNDS + 1)
+    ]
+    if wedge_after_progress:
+        assert watchdog_error is not None
+        assert not completed
+        expect(page.get_by_test_id("error-pill").first).to_be_visible(timeout=15_000)
+        return
 
-    # When the watchdog killed the run, let the user-visible failure land
-    # on screen (the error pill) before failing — the recorded journey then
-    # ends on exactly what the user sees.
-    if watchdog_error is not None:
-        with contextlib.suppress(AssertionError):
-            expect(page.get_by_test_id("error-pill").first).to_be_visible(timeout=15_000)
-        page.wait_for_timeout(1_500)
-
-    # THE BUG: one wedged LLM call terminally fails the whole run.
-    assert watchdog_error is None, (
-        f"The run hard-stopped with the harness idle watchdog error after "
-        f"{call_count} executed tool call(s): {watchdog_error!r}. A single "
-        f"wedged LLM call must be recovered (abandoned and retried, or "
-        f"failed with a retryable classification) so the run continues "
-        f"instead of stopping completely."
-    )
+    assert watchdog_error is None
 
     assert completed, (
         f"The turn neither completed nor failed with the idle-watchdog "
