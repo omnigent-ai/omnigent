@@ -9,7 +9,7 @@
 // Host capability discovery must never consult the developer's OS keychain.
 process.env.OMNIGENT_DISABLE_KEYRING = "1";
 
-const { spawn, spawnSync } = require("node:child_process");
+const { spawnSync } = require("node:child_process");
 const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -25,7 +25,10 @@ const {
   launchDesktop,
   saveRecording,
 } = require("./desktopHarness");
-const { startWorkspaceFixtures } = require("./desktop_pre_session_workspace_setup");
+const {
+  startPodServices,
+  startWorkspaceFixtures,
+} = require("./desktop_pre_session_workspace_setup");
 
 const deps = desktopDepsAvailable();
 const RECORD_DIR = path.join(__dirname, "recordings", "desktop-pre-session-workspace");
@@ -237,68 +240,52 @@ async function startIsolatedPod(root) {
     "--server-port",
     String(serverPort),
   ]);
-  const log = fs.openSync(logPath, "w");
-  const mockLog = fs.openSync(mockLogPath, "w");
-  const mockProc = spawn(
-    path.join(REPO_ROOT, ".venv", "bin", "python"),
-    [MOCK_LLM_SERVER, String(mockPort)],
-    {
-      cwd: REPO_ROOT,
-      env: isolatedChildEnv({
-        OMNIGENT_CONFIG_HOME: seedConfigDir,
-        OMNIGENT_DISABLE_KEYRING: "1",
-        PYTHONPATH: REPO_ROOT,
-      }),
-      stdio: ["ignore", mockLog, mockLog],
-    },
-  );
-  await waitForHttp(`http://127.0.0.1:${mockPort}/stats`, mockProc, mockLogPath, "mock LLM");
-  await postJson(`http://127.0.0.1:${mockPort}/mock/set_fallback`, {
-    key: "gpt-4o-mini",
-    text: "DESKTOP_HANDOFF_OK",
-  });
-  const proc = spawn("/usr/bin/expect", [expectPath], {
-    cwd: REPO_ROOT,
-    env: isolatedChildEnv({
-      OMNIGENT_CONFIG_HOME: seedConfigDir,
-      OMNIGENT_DATA_DIR: path.join(root, "supervisor-data"),
-      GH_CONFIG_DIR: path.join(root, "gh-config"),
-      OMNIGENT_DISABLE_KEYRING: "1",
-      OMNIGENT_NO_UPDATE_CHECK: "1",
-      OPENAI_BASE_URL: `http://127.0.0.1:${mockPort}/v1`,
-      OPENAI_API_KEY: "mock-key",
-      ANTHROPIC_API_KEY: "",
-    }),
-    stdio: ["ignore", log, log],
-  });
   const serverUrl = `http://127.0.0.1:${serverPort}`;
-  let hosts;
-  try {
-    hosts = await waitForPod(serverUrl, proc, logPath);
-  } catch (error) {
-    if (proc.exitCode === null) proc.kill("SIGTERM");
-    if (mockProc.exitCode === null) mockProc.kill("SIGTERM");
-    fs.closeSync(log);
-    fs.closeSync(mockLog);
-    throw error;
-  }
+  const services = await startPodServices({
+    mock: {
+      command: path.join(REPO_ROOT, ".venv", "bin", "python"),
+      args: [MOCK_LLM_SERVER, String(mockPort)],
+      logPath: mockLogPath,
+      options: {
+        cwd: REPO_ROOT,
+        env: isolatedChildEnv({
+          OMNIGENT_CONFIG_HOME: seedConfigDir,
+          OMNIGENT_DISABLE_KEYRING: "1",
+          PYTHONPATH: REPO_ROOT,
+        }),
+      },
+    },
+    pod: {
+      command: "/usr/bin/expect",
+      args: [expectPath],
+      logPath,
+      options: {
+        cwd: REPO_ROOT,
+        env: isolatedChildEnv({
+          OMNIGENT_CONFIG_HOME: seedConfigDir,
+          OMNIGENT_DATA_DIR: path.join(root, "supervisor-data"),
+          GH_CONFIG_DIR: path.join(root, "gh-config"),
+          OMNIGENT_DISABLE_KEYRING: "1",
+          OMNIGENT_NO_UPDATE_CHECK: "1",
+          OPENAI_BASE_URL: `http://127.0.0.1:${mockPort}/v1`,
+          OPENAI_API_KEY: "mock-key",
+          ANTHROPIC_API_KEY: "",
+        }),
+      },
+    },
+    waitForMock: (proc, mockLog) =>
+      waitForHttp(`http://127.0.0.1:${mockPort}/stats`, proc, mockLog, "mock LLM"),
+    configureMock: () =>
+      postJson(`http://127.0.0.1:${mockPort}/mock/set_fallback`, {
+        key: "gpt-4o-mini",
+        text: "DESKTOP_HANDOFF_OK",
+      }),
+    waitForPod: (proc, podLog) => waitForPod(serverUrl, proc, podLog),
+  });
   return {
     serverUrl,
-    hostId: hosts.find((host) => host.status === "online").host_id,
-    async close() {
-      const exited = new Promise((resolve) => {
-        proc.once("exit", resolve);
-      });
-      if (proc.exitCode === null) proc.kill("SIGTERM");
-      await Promise.race([exited, wait(10_000)]);
-      if (proc.exitCode === null) {
-        proc.kill("SIGTERM");
-        await Promise.race([exited, wait(2_000)]);
-      }
-      if (mockProc.exitCode === null) mockProc.kill("SIGTERM");
-      fs.closeSync(log);
-      fs.closeSync(mockLog);
-    },
+    hostId: services.hosts.find((host) => host.status === "online").host_id,
+    close: services.close,
   };
 }
 

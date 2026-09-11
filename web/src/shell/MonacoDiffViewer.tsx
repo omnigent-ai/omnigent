@@ -57,6 +57,7 @@ interface MonacoDiffViewerProps {
   /** Whether long lines soft-wrap (no horizontal scroll). */
   wrapLines: boolean;
   conversationId: string;
+  readOnly?: boolean;
   /** Saved comments — highlighted on the modified side. */
   comments: Comment[];
   activeSelection: ActiveSelection | null;
@@ -94,6 +95,7 @@ export function MonacoDiffViewer({
   hideWhitespace,
   wrapLines,
   conversationId,
+  readOnly = false,
   comments,
   activeSelection,
   onSetActiveSelection,
@@ -101,7 +103,7 @@ export function MonacoDiffViewer({
   searchOpen,
   onSearchHandled,
 }: MonacoDiffViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canEdit = useCanEdit(conversationId) && !readOnly;
   const lang = detectLang(path);
   const monacoTheme = resolvedThemeToMonaco(useResolvedThemeMode());
 

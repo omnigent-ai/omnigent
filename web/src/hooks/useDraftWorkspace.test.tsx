@@ -277,6 +277,79 @@ describe("useDraftWorkspace", () => {
     expect(result.current.terminals).toEqual([]);
   });
 
+  it("forgets an adopted context when its final terminal deletion retires it", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "context_final",
+          workspace: "/repo",
+          hostId: "host_1",
+          leaseSeconds: 600,
+          sessionId: "conv_1",
+        },
+      ]),
+    );
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_final/heartbeat") {
+        return response(context("context_final", "/repo", "conv_1"));
+      }
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_final/resources/terminals") {
+        return response({ object: "list", data: [terminal("terminal_final")] });
+      }
+      if (
+        url ===
+          "/v1/hosts/host_1/workspace-contexts/context_final/resources/terminals/terminal_final" &&
+        init?.method === "DELETE"
+      ) {
+        return response({ id: "terminal_final", deleted: true, context_deleted: true });
+      }
+      throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+    });
+
+    const { result } = renderHook(() => useDraftWorkspace("conv_1"));
+    await waitFor(() =>
+      expect(result.current.terminals).toEqual([expect.objectContaining({ id: "terminal_final" })]),
+    );
+
+    await act(async () => {
+      await result.current.deleteTerminal("terminal_final");
+    });
+    expect(result.current.context).toBeNull();
+    expect(result.current.terminals).toEqual([]);
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("forgets an adopted context when another viewer removes its final terminal", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "context_remote_final",
+          workspace: "/repo",
+          hostId: "host_1",
+          leaseSeconds: 600,
+          sessionId: "conv_1",
+        },
+      ]),
+    );
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_remote_final/heartbeat") {
+        return response(context("context_remote_final", "/repo", "conv_1"));
+      }
+      if (url === "/v1/hosts/host_1/workspace-contexts/context_remote_final/resources/terminals") {
+        return response({}, 404);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useDraftWorkspace("conv_1"));
+    await waitFor(() => expect(result.current.context).toBeNull());
+    expect(result.current.terminals).toEqual([]);
+    expect(result.current.error).toBeNull();
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
   it("accepts a slow inventory response while a newer poll is still in flight", async () => {
     const resolveLists: ((value: Response) => void)[] = [];
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {

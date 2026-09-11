@@ -69,6 +69,7 @@ interface FloatingAnchor {
 export interface PdfViewerProps {
   data: FileContentResponse;
   conversationId: string;
+  readOnly?: boolean;
   comments?: Comment[];
   activeSelection?: ActiveSelection | null;
   onSetActiveSelection?: (sel: ActiveSelection | null) => void;
@@ -129,11 +130,12 @@ function PdfCommentHighlights({
 export function PdfViewer({
   data,
   conversationId,
+  readOnly = false,
   comments = EMPTY_COMMENTS,
   activeSelection = null,
   onSetActiveSelection,
 }: PdfViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canEdit = useCanEdit(conversationId) && !readOnly;
   const [numPages, setNumPages] = useState(0);
   const [errored, setErrored] = useState(false);
   const [scale, setScale] = useState(1);

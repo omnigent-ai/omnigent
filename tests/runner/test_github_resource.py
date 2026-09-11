@@ -460,7 +460,11 @@ def test_github_info_runs_gh_as_preferred_account(
         "github_account_preference",
         lambda key: "bob" if key == "/ws/omnigent" else None,
     )
-    monkeypatch.setattr(github_resource, "_gh_auth_token", lambda _root, login: f"tok-{login}")
+    monkeypatch.setattr(
+        github_resource,
+        "_gh_auth_token",
+        lambda _root, login, host="github.com": f"tok-{login}",
+    )
     seen: dict[str, str | None] = {}
 
     def fake_gh(
@@ -482,6 +486,192 @@ def test_github_info_runs_gh_as_preferred_account(
     github_info(str(repo))
     assert seen["pr_view"] == "tok-bob"
     assert seen["repo_view"] == "tok-bob"
+
+
+def test_workspace_pr_reads_keep_workspace_account(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/omnigent")
+    monkeypatch.setattr(
+        github_resource._config,
+        "github_account_preference",
+        lambda key: "workspace-user" if key == "/ws/omnigent" else "other-user",
+    )
+    monkeypatch.setattr(
+        github_resource,
+        "_gh_auth_token",
+        lambda _root, login, host="github.com": f"token-{login}",
+    )
+    seen: list[tuple[tuple[str, ...], str | None]] = []
+
+    def encoded(value: str) -> str:
+        return b64encode(value.encode()).decode()
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        seen.append((tuple(argv), token))
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": 42,
+                        "title": "Draft PR",
+                        "state": "OPEN",
+                        "url": "https://github.com/acme/repo/pull/42",
+                        "isDraft": False,
+                        "author": {"login": "alice"},
+                        "baseRefName": "main",
+                        "headRefName": "feature",
+                        "headRefOid": "head",
+                        "baseRefOid": "base",
+                        "statusCheckRollup": [],
+                    }
+                ),
+                "",
+            )
+        if tuple(argv[:2]) == ("pr", "diff"):
+            return (0, "patch", "")
+        endpoint = argv[-1]
+        if endpoint.endswith("/files?per_page=100"):
+            return (0, "[[]]", "")
+        if endpoint == "repos/acme/repo/pulls/42":
+            value = {
+                "head": {"sha": "head", "repo": {"full_name": "alice/repo"}},
+                "base": {"sha": "base"},
+            }
+            return (0, json.dumps(value), "")
+        if endpoint == "repos/acme/repo/compare/base...head":
+            return (0, json.dumps({"merge_base_commit": {"sha": "merge"}}), "")
+        if endpoint == "repos/acme/repo/contents/fileA.py?ref=merge":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("before")}), "")
+        if endpoint == "repos/alice/repo/contents/fileA.py?ref=head":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("after")}), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+    url = "https://github.com/acme/repo/pull/42"
+
+    info = github_info(str(repo))
+    assert info["selected_pr_url"] == url
+    assert github_changed_files(str(repo), pr_url=url)["data"] == []
+    assert github_pr_diff(str(repo), pr_url=url)["patch"] == "patch"
+    contents = github_file_diff(
+        str(repo), "main", "fileA.py", pr_url=url, head_sha="head", base_sha="base"
+    )
+    assert contents["before"] == "before"
+    assert contents["after"] == "after"
+    assert {token for argv, token in seen if argv[0] != "auth"} == {"token-workspace-user"}
+
+
+def test_session_pr_reads_keep_repository_account(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    url = "https://github.com/acme/repo/pull/42"
+    reference = PullRequestRef.from_url(url)
+    SessionPrRegistry("session-account").record(
+        [reference], relationship="attached", source="test"
+    )
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/omnigent")
+    monkeypatch.setattr(
+        github_resource._config,
+        "github_account_preference",
+        lambda key: "repo-user" if key == reference.repo_argument else "workspace-user",
+    )
+    monkeypatch.setattr(
+        github_resource,
+        "_gh_auth_token",
+        lambda _root, login, host="github.com": f"token-{login}",
+    )
+    seen: list[str | None] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        seen.append(token)
+        return (0, "[[]]", "")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    assert github_changed_files(str(repo), session_id="session-account", pr_url=url)["data"] == []
+    assert seen == ["token-repo-user"]
+
+
+def test_workspace_pr_reads_scope_token_to_enterprise_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/omnigent")
+    monkeypatch.setattr(
+        github_resource._config, "github_account_preference", lambda _key: "workspace-user"
+    )
+    token_hosts: list[str] = []
+
+    def auth_token(_root: str, _login: str, host: str = "github.com") -> str:
+        token_hosts.append(host)
+        return f"secret-for-{host}"
+
+    seen: list[tuple[tuple[str, ...], str | None]] = []
+
+    def encoded(value: str) -> str:
+        return b64encode(value.encode()).decode()
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        seen.append((tuple(argv), token))
+        if tuple(argv[:2]) == ("pr", "diff"):
+            return (0, "patch", "")
+        endpoint = argv[-1]
+        if endpoint.endswith("/files?per_page=100"):
+            return (0, "[[]]", "")
+        if endpoint == "repos/acme/repo/pulls/42":
+            value = {
+                "head": {"sha": "head", "repo": {"full_name": "alice/repo"}},
+                "base": {"sha": "base"},
+            }
+            return (0, json.dumps(value), "")
+        if endpoint == "repos/acme/repo/compare/base...head":
+            return (0, json.dumps({"merge_base_commit": {"sha": "merge"}}), "")
+        if endpoint == "repos/acme/repo/contents/fileA.py?ref=merge":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("before")}), "")
+        if endpoint == "repos/alice/repo/contents/fileA.py?ref=head":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("after")}), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh_auth_token", auth_token)
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(
+        github_resource,
+        "_list_accounts",
+        lambda _root: (
+            True,
+            [
+                {
+                    "login": "workspace-user",
+                    "active": True,
+                    "state": "success",
+                    "host": "github.example.org",
+                }
+            ],
+        ),
+    )
+    url = "https://github.example.org/acme/repo/pull/42"
+
+    assert github_changed_files(str(repo), pr_url=url)["data"] == []
+    assert github_pr_diff(str(repo), pr_url=url)["patch"] == "patch"
+    contents = github_file_diff(
+        str(repo), "main", "fileA.py", pr_url=url, head_sha="head", base_sha="base"
+    )
+
+    assert contents["before"] == "before"
+    assert contents["after"] == "after"
+    assert set(token_hosts) == {"github.example.org"}
+    assert {token for _argv, token in seen} == {"secret-for-github.example.org"}
 
 
 def test_github_changed_files_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -603,7 +793,7 @@ def test_workspace_github_file_diff_reads_remote_pr_revisions(
         return (1, "", "no stub")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
-    monkeypatch.setattr(github_resource, "_account_token_for", lambda _root: None)
+    monkeypatch.setattr(github_resource, "_account_token_for", lambda _root, **_kwargs: None)
     monkeypatch.setattr(github_resource, "_pr_token", lambda _root, _reference: None)
 
     diff = github_file_diff(
@@ -639,7 +829,7 @@ def test_github_changed_files_preserves_multiple_pages(
         SessionPrRegistry("pagination-session").record(
             [PullRequestRef.from_url(pr_url)], relationship="created", source="test"
         )
-    monkeypatch.setattr(github_resource, "_account_token_for", lambda _root: None)
+    monkeypatch.setattr(github_resource, "_account_token_for", lambda _root, **_kwargs: None)
     monkeypatch.setattr(github_resource, "_pr_token", lambda _root, _reference: None)
 
     def fake_gh(

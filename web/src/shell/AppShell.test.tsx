@@ -21,6 +21,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { readLandingNavigationGeneration } from "@/lib/landingWorkspaceState";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
@@ -639,6 +640,16 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("AppShell header", () => {
+  it("advances landing navigation identity on a same-URL New session entry", () => {
+    mockConversations([]);
+    renderShell("/");
+    const priorGeneration = readLandingNavigationGeneration();
+
+    fireEvent.click(screen.getByTestId("nav-home"));
+
+    expect(readLandingNavigationGeneration()).toBeGreaterThan(priorGeneration);
+  });
+
   it("renders the sidebar toggle on all pages", () => {
     mockConversations([]);
     renderShell("/");
@@ -1878,6 +1889,34 @@ describe("Chat-mode terminal panel layout", () => {
 });
 
 describe("Workspace rail maximize", () => {
+  it("restores the landing composer after leaving a maximized session", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell(
+      "/c/conv_abc",
+      undefined,
+      <>
+        <textarea aria-label="New chat composer" />
+        <NavProbe />
+      </>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    fireEvent.click(screen.getByTestId("nav-home"));
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByRole("textbox", { name: "New chat composer" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+    expect(rail.className).not.toContain("md:absolute");
+    expect(screen.getByRole("button", { name: "Full screen" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "New chat composer" })).toBeVisible();
+  });
+
   it("toggles the rail between docked and full-screen, collapsing the sidebar on maximize", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },

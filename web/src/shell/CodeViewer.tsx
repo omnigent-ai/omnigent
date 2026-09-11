@@ -765,6 +765,7 @@ export function CodeViewer({
         <PdfViewer
           data={fileQuery.data}
           conversationId={conversationId}
+          readOnly={readOnly}
           comments={previewComments}
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
@@ -798,6 +799,7 @@ export function CodeViewer({
       <MarkdownRichTextViewer
         content={content}
         conversationId={conversationId}
+        readOnly={readOnly}
         path={path}
         isSettled={fileQuery.isSuccess}
         truncated={truncated}
@@ -820,6 +822,7 @@ export function CodeViewer({
     return (
       <HtmlCommentViewer
         conversationId={conversationId}
+        readOnly={readOnly}
         content={content}
         truncated={truncated}
         comments={previewComments}
@@ -844,7 +847,7 @@ export function CodeViewer({
         tocOpen={tocOpen}
         onTocOpenChange={(open) => !open && onTocToggle?.()}
         commentHint={
-          !isNotebook && onRequestEditMode
+          canEdit && !isNotebook && onRequestEditMode
             ? { conversationId, onSwitchToEdit: onRequestEditMode }
             : undefined
         }
@@ -864,6 +867,7 @@ export function CodeViewer({
         <MonacoCodeEditor
           content={content}
           conversationId={conversationId}
+          readOnly={readOnly}
           path={path}
           isSettled={fileQuery.isSuccess}
           truncated={truncated}

@@ -1554,6 +1554,7 @@ function FileViewerBody({
                   hideWhitespace={hideWhitespace}
                   wrapLines={wrapLines}
                   conversationId={sessionId ?? ""}
+                  readOnly={hostMode}
                   comments={openComments}
                   activeSelection={activeSelection}
                   onSetActiveSelection={handleSetActiveSelection}

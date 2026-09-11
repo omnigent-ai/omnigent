@@ -704,6 +704,53 @@ async def test_explicit_terminal_and_context_deletion_kill_processes(
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+async def test_repeated_adopted_terminal_deletion_does_not_exhaust_context_limit(
+    tmp_path: Path,
+) -> None:
+    """Deleting each adopted context's final terminal releases its quota slot."""
+
+    manager = WorkspaceContextManager()
+    try:
+        for index in range(20):
+            context_id = str(
+                _ok(await _request(manager, "create", params={"workspace": str(tmp_path)}))["id"]
+            )
+            terminal = _ok(
+                await _request(
+                    manager,
+                    "create_terminal",
+                    context_id=context_id,
+                    params={"terminal": "bash", "session_key": f"cycle-{index}"},
+                )
+            )
+            _ok(
+                await _request(
+                    manager,
+                    "handoff",
+                    context_id=context_id,
+                    params={"session_id": f"session-{index}", "workspace": str(tmp_path)},
+                )
+            )
+            deleted = _ok(
+                await _request(
+                    manager,
+                    "delete_terminal",
+                    context_id=context_id,
+                    params={"terminal_id": terminal["id"]},
+                )
+            )
+            assert deleted == {
+                "id": terminal["id"],
+                "deleted": True,
+                "context_deleted": True,
+            }
+            assert context_id not in manager._contexts  # pyright: ignore[reportPrivateUsage]
+        assert manager._contexts == {}  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 async def test_shutdown_closes_shell_and_refuses_new_work(tmp_path: Path) -> None:
     """Host shutdown terminates all shells and closes the manager to new requests."""
 

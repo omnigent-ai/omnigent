@@ -22,6 +22,8 @@ const h = vi.hoisted(() => ({
   scrollTops: [] as number[],
   scroll: null as ((e: { scrollTop: number }) => void) | null,
   domNode: document.createElement("div"),
+  readOnly: null as boolean | null,
+  canComment: null as boolean | null,
 }));
 
 // Minimal Monaco namespace: only the members handleMount touches.
@@ -97,8 +99,10 @@ vi.mock("@monaco-editor/react", async () => {
     Editor: (props: {
       onMount?: (editor: unknown, monaco: unknown) => void;
       onChange?: (value: string | undefined, ev: unknown) => void;
+      options?: { readOnly?: boolean };
     }) => {
       h.onChange = props.onChange ?? null;
+      h.readOnly = props.options?.readOnly ?? false;
       useEffect(() => {
         props.onMount?.(fakeEditor, fakeMonaco);
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -117,7 +121,12 @@ vi.mock("./monacoSetup", () => ({
   resolvedThemeToMonaco: vi.fn(() => "github-light"),
 }));
 // Comment layer is unrelated to save wiring and needs a large editor surface.
-vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null }));
+vi.mock("./useMonacoCommentLayer", () => ({
+  useMonacoCommentLayer: (opts: { canComment: boolean }) => {
+    h.canComment = opts.canComment;
+    return null;
+  },
+}));
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
@@ -146,14 +155,24 @@ function mockWrite(): void {
 
 // Fresh element each call so rerender() doesn't bail on an identical reference
 // (the reconnect test relies on re-reading the runner-online mock).
-function makeEditor() {
+function makeEditor({
+  readOnly = false,
+  conversationId = "conv_monaco_autosave",
+  onDirtyChange,
+}: {
+  readOnly?: boolean;
+  conversationId?: string;
+  onDirtyChange?: (dirty: boolean) => void;
+} = {}) {
   return (
     <MonacoCodeEditor
       content={INITIAL}
       // Not the focused/running session → pre-write conflict GET is skipped.
-      conversationId="conv_monaco_autosave"
+      conversationId={conversationId}
+      readOnly={readOnly}
       path={PATH}
       isSettled={true}
+      onDirtyChange={onDirtyChange}
       comments={[]}
       activeSelection={null}
       onSetActiveSelection={() => {}}
@@ -185,6 +204,8 @@ beforeEach(() => {
   h.scrollTops = [];
   h.scroll = null;
   h.domNode = document.createElement("div");
+  h.readOnly = null;
+  h.canComment = null;
   mockWrite();
   // Online → auto-save enabled.
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
@@ -197,6 +218,23 @@ afterEach(() => {
 });
 
 describe("MonacoCodeEditor auto-save wiring (integration)", () => {
+  it("ignores typing and exposes no comment action in explicit read-only mode", async () => {
+    const onDirtyChange = vi.fn();
+    await renderMounted(makeEditor({ readOnly: true, conversationId: "", onDirtyChange }));
+
+    expect(h.readOnly).toBe(true);
+    expect(h.canComment).toBe(false);
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      h.blur?.();
+      h.cmdS?.();
+    });
+
+    expect(onDirtyChange).not.toHaveBeenCalledWith(true);
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
   it("debounced save fires after an edit (onChange → schedule → write)", async () => {
     await renderMounted(makeEditor());
     // onMount must have registered the ⌘S command and blur listener.

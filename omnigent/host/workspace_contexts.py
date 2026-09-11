@@ -345,7 +345,11 @@ class WorkspaceContextManager:
                 raise WorkspaceContextError(404, "Terminal not found")
             if frame.op == "delete_terminal":
                 await self.registry.close(ctx.id, entry.terminal_name, entry.session_key)
-                return {"id": terminal_id, "deleted": True}
+                payload: dict[str, Any] = {"id": terminal_id, "deleted": True}
+                if ctx.session_id is not None and not self.registry.list_for_conversation(ctx.id):
+                    await self._delete(ctx)
+                    payload["context_deleted"] = True
+                return payload
             if frame.op == "attach":
                 channel_id = frame.params.get("channel_id")
                 if (

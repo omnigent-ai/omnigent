@@ -17,6 +17,7 @@ import {
   readLandingWorkspaceState,
   setLandingWorkspaceStarting,
   setLandingWorkspaceBusy,
+  readLandingNavigationGeneration,
 } from "@/lib/landingWorkspaceState";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
@@ -4713,6 +4714,11 @@ export function NewChatLandingScreen() {
     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
     // don't emit, matching the disabled Start button.
     trackClick("new_chat.start_session", "button");
+    const createNavigationGeneration = readLandingNavigationGeneration();
+    const createHistoryKey = window.history.state?.key;
+    const createNavigationIsCurrent = () =>
+      readLandingNavigationGeneration() === createNavigationGeneration &&
+      window.history.state?.key === createHistoryKey;
     // BrowserRouter may defer its React update even though history already
     // changed. Remember the submit location so a late create cannot redirect
     // after the user has navigated elsewhere while this component is still
@@ -5229,8 +5235,9 @@ export function NewChatLandingScreen() {
           skill,
           navigate,
           () =>
-            window.location.pathname.endsWith(tempRouteSuffix) ||
-            window.location.href === createLocation,
+            createNavigationIsCurrent() &&
+            (window.location.pathname.endsWith(tempRouteSuffix) ||
+              window.location.href === createLocation),
           localProject,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
@@ -5240,7 +5247,11 @@ export function NewChatLandingScreen() {
         recordOptimisticTitle(data.id, initialPrompt);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
-        if (onScreenRef.current && window.location.href === createLocation) {
+        if (
+          createNavigationIsCurrent() &&
+          onScreenRef.current &&
+          window.location.href === createLocation
+        ) {
           navigate(`/c/${data.id}`);
         }
       }

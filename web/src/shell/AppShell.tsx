@@ -135,6 +135,7 @@ import {
   registerLandingResourceLifecycle,
   setLandingWorkspaceBusy,
   landingContextClaimedElsewhere,
+  advanceLandingNavigationGeneration,
 } from "@/lib/landingWorkspaceState";
 import { LandingWorkspacePanel, DraftTerminalSurface } from "./LandingWorkspacePanel";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -252,6 +253,7 @@ export function AppShell() {
   const workspaceNavigationGenerationRef = useRef(0);
   useLayoutEffect(() => {
     workspaceNavigationGenerationRef.current += 1;
+    advanceLandingNavigationGeneration();
   }, [location.pathname, location.search, location.key]);
   const landingRoute = location.pathname === "/";
   const landingWorkspace = useLandingWorkspaceState();
@@ -407,6 +409,9 @@ export function AppShell() {
   // Sidebar open-state captured when entering full screen, so exiting can
   // restore whatever the user had (collapsed stays collapsed; open reopens).
   const sidebarOpenBeforeMaximizeRef = useRef(false);
+  const restoreSidebarAfterMaximize = useCallback(() => {
+    setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
+  }, []);
   // Scope of the mobile Files drawer: false = full folder tree, true =
   // changed-files-only flat list. On desktop the scope is the selected rail
   // tab (Files vs Changes); on a phone there's no tab strip, so the two FAB
@@ -466,9 +471,20 @@ export function AppShell() {
       (navigationType === "REPLACE" || navigationType === undefined)
     )
       return;
+    setRightPanelMaximized((wasMaximized) => {
+      if (wasMaximized) restoreSidebarAfterMaximize();
+      return false;
+    });
     setRightPanelOpen(false);
     writeLandingWorkspacePanel({ open: false });
-  }, [landingRoute, location.pathname, location.search, location.key, navigationType]);
+  }, [
+    landingRoute,
+    location.pathname,
+    location.search,
+    location.key,
+    navigationType,
+    restoreSidebarAfterMaximize,
+  ]);
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
   // Truncation point for a "fork from here" opened from a message's
@@ -1097,6 +1113,10 @@ export function AppShell() {
     // terminal absent from the new session's list.
     pendingShellCreateRef.current = null;
     setTerminalPendingClose(null);
+    setRightPanelMaximized((wasMaximized) => {
+      if (wasMaximized) restoreSidebarAfterMaximize();
+      return false;
+    });
     if (!conversationId) {
       // Draft tools stay available when the user opens the collapsed landing rail.
       setRightPanelOpen(false);
@@ -1151,13 +1171,6 @@ export function AppShell() {
     // file selection (one content slot).
     autoFocusTerminalKeyRef.current = null;
     setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
-    // A maximized rail is transient too — the incoming session starts docked.
-    // If we were maximized, restore the sidebar we collapsed on entry (the
-    // toggle handler won't run on a session switch).
-    setRightPanelMaximized((wasMaximized) => {
-      if (wasMaximized) restoreSidebarAfterMaximize();
-      return false;
-    });
     // A selected file must be visible in the rail. The Files and Changes tabs
     // both surface the inline viewer; the Agents/Browser tabs don't, so
     // pull the rail to Files unless it's already on a files scope.
@@ -1465,9 +1478,6 @@ export function AppShell() {
   // side effect is done here — outside any state updater — so the maximize
   // setter stays a plain boolean flip. ``restoreSidebarAfterMaximize`` is
   // shared with the session-switch reset, which also drops out of full screen.
-  const restoreSidebarAfterMaximize = useCallback(() => {
-    setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
-  }, []);
   const toggleRightPanelMaximized = useCallback(() => {
     if (!rightPanelMaximized) {
       sidebarOpenBeforeMaximizeRef.current = sidebarOpen;

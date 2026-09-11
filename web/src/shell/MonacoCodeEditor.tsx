@@ -74,6 +74,7 @@ interface CommentProps {
 interface MonacoCodeEditorProps extends CommentProps {
   content: string;
   conversationId: string;
+  readOnly?: boolean;
   path: string;
   /** True once the file query has settled (fileQuery.isSuccess). */
   isSettled: boolean;
@@ -112,6 +113,7 @@ interface MonacoCodeEditorProps extends CommentProps {
 export function MonacoCodeEditor({
   content,
   conversationId,
+  readOnly = false,
   path,
   isSettled,
   truncated = false,
@@ -125,7 +127,7 @@ export function MonacoCodeEditor({
   pendingBodyRef,
 }: MonacoCodeEditorProps) {
   // A truncated buffer must never be editable, regardless of permission.
-  const canEdit = useCanEdit(conversationId) && !truncated;
+  const canEdit = useCanEdit(conversationId) && !readOnly && !truncated;
 
   // Lets the sync hook push external content into the live editor without a
   // full remount, preserving scroll/cursor.
@@ -385,6 +387,7 @@ function MonacoCodeEditorInner({
 
   const handleChange: OnChange = useCallback(
     (value) => {
+      if (!canEdit) return;
       const next = value ?? "";
       latestContentRef.current = next;
       const dirty = next !== baselineRef.current;
@@ -393,7 +396,7 @@ function MonacoCodeEditorInner({
       // sync) re-baselines first, so this sees a clean buffer and won't schedule.
       if (dirty) autoSave.schedule();
     },
-    [setDirty, autoSave],
+    [canEdit, setDirty, autoSave],
   );
 
   // Surface the auto-save lifecycle to the FileViewer toolbar chip (this editor

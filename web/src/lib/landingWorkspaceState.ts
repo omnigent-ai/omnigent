@@ -7,6 +7,14 @@ import { writeSessionWorkspaceState } from "./sessionWorkspaceState";
 import type { WorkspaceResourceTarget } from "./workspaceTarget";
 
 const STORAGE_KEY = "omnigent:landing-workspace";
+let navigationGeneration = 0;
+export function advanceLandingNavigationGeneration(): number {
+  navigationGeneration += 1;
+  return navigationGeneration;
+}
+export function readLandingNavigationGeneration(): number {
+  return navigationGeneration;
+}
 export interface LandingWorkspaceSelection {
   hostId: string | null;
   workspace: string;

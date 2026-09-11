@@ -420,6 +420,58 @@ describe("NewChatLandingScreen create flow", () => {
     expect(landing.readLandingWorkspaceState().starting).toBe(false);
   });
 
+  it("does not redirect a newer same-URL landing after server-first Start resolves", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("older start");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+    landing.advanceLandingNavigationGeneration();
+    resolveCreate({ ok: true, json: async () => ({ id: "conv_old" }) } as Response);
+
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    expect(navigateMock).not.toHaveBeenCalledWith("/c/conv_old");
+  });
+
+  it("rejects local handoff navigation after a newer same-URL landing entry", async () => {
+    let resolveCreate!: (response: Response) => void;
+    window.history.replaceState({ idx: 0 }, "", window.location.href);
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pending-old",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("older local start");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+    window.history.pushState(
+      { ...(window.history.state ?? {}), key: "newer-landing" },
+      "",
+      window.location.href,
+    );
+    resolveCreate({ ok: true, json: async () => ({ id: "conv_old" }) } as Response);
+
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
+    const mayNavigate = hydrateLocalConversationMock.mock.calls[0]?.[8] as () => boolean;
+    expect(mayNavigate()).toBe(false);
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

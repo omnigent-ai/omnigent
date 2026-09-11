@@ -277,7 +277,7 @@ export async function deleteDraftTerminal(
   hostId: string,
   contextId: string,
   terminalId: string,
-): Promise<void> {
+): Promise<boolean | null> {
   const response = await authenticatedFetch(
     `${contextBasePath(hostId, contextId)}/resources/terminals/${encodeURIComponent(terminalId)}`,
     { method: "DELETE" },
@@ -285,6 +285,13 @@ export async function deleteDraftTerminal(
   if (!response.ok && response.status !== 404) {
     throw httpError("draft terminal delete failed", response);
   }
+  if (response.status === 404) return null;
+  const body: unknown = await response.json();
+  return (
+    body !== null &&
+    typeof body === "object" &&
+    (body as Record<string, unknown>).context_deleted === true
+  );
 }
 
 export async function discardDraftWorkspaceContext(
@@ -567,12 +574,17 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
           requestSequence > (terminalAppliedRequestRef.current.get(active.id) ?? 0)
         ) {
           terminalAppliedRequestRef.current.set(active.id, requestSequence);
+          if (cause instanceof DraftWorkspaceHttpError && cause.status === 404) {
+            clearContext(active.id);
+            setError(null);
+            return [];
+          }
           setError(nextError);
         }
         throw nextError;
       }
     },
-    [],
+    [clearContext],
   );
 
   const createTerminal = useCallback(
@@ -621,7 +633,7 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
       const active = targetContext ?? contextRef.current;
       if (active === null) throw noActiveContextError();
       const operationStorageKey = activeStorageKeyRef.current;
-      await deleteDraftTerminal(active.hostId, active.id, terminalId);
+      const contextDeleted = await deleteDraftTerminal(active.hostId, active.id, terminalId);
       if (
         activeStorageKeyRef.current !== operationStorageKey ||
         tombstonesRef.current.has(active.id)
@@ -632,13 +644,22 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
         active.id,
         (terminalMutationGenerationRef.current.get(active.id) ?? 0) + 1,
       );
+      if (contextDeleted === true) {
+        clearContext(active.id);
+        setError(null);
+        return;
+      }
+      if (contextDeleted === null) {
+        await refreshTerminals(active);
+        return;
+      }
       setTerminalsByContext((current) => ({
         ...current,
         [active.id]: (current[active.id] ?? []).filter((row) => row.id !== terminalId),
       }));
       setError(null);
     },
-    [],
+    [clearContext, refreshTerminals],
   );
 
   const discard = useCallback(
