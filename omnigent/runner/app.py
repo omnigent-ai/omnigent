@@ -5617,6 +5617,34 @@ def create_runner_app(
             )
         return JSONResponse(status_code=200, content={"permission_mode": settled})
 
+    async def _handle_claude_native_btw_dismiss(conv_id: str) -> Response:
+        """
+        Close a live claude-native session's ``/btw`` overlay from the web UI.
+
+        The reader dismissed the transient side-chat overlay in the web view;
+        mirror that to the terminal by sending Escape to the pane — but only
+        when the ``/btw`` overlay is actually on screen (the bridge guards on
+        this), because a blind Escape on the bare composer would cancel an
+        in-flight turn. Best-effort: the overlay also auto-dismisses on the
+        next injected message, so a miss is harmless.
+        """
+        from omnigent.harnesses.claude_native.bridge import (
+            bridge_dir_for_bridge_id,
+            dismiss_btw_overlay,
+        )
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        try:
+            await asyncio.to_thread(dismiss_btw_overlay, bridge_dir)
+        except (RuntimeError, ValueError):
+            # Nothing to recover: the pane overlay closes on the next inject.
+            return Response(status_code=204)
+        return Response(status_code=200)
+
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
         bridge_dir: Path,
@@ -8939,6 +8967,12 @@ def create_runner_app(
                     conversation_id,
                     mode,
                 )
+            return Response(status_code=204)
+
+        if body_type == "btw_dismiss":
+            harness = _session_harness_name(conversation_id)
+            if harness == "claude-native":
+                return await _handle_claude_native_btw_dismiss(conversation_id)
             return Response(status_code=204)
 
         if body_type == "codex_approval_mode_change":

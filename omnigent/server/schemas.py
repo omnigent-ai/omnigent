@@ -3732,6 +3732,41 @@ class SessionSupersededEvent(_SSEEventBase):
     reason: Literal["clear"] = "clear"
 
 
+class SessionBtwSidechatEvent(_SSEEventBase):
+    """
+    A Claude Code ``/btw`` side-chat exchange to show transiently.
+
+    ``/btw`` opens an ephemeral side conversation whose answer Claude Code
+    keeps only in its in-TUI overlay — it is never written to the session
+    transcript. The claude-native forwarder scrapes the settled overlay
+    from the pane and emits this event so the managed web UI can show the
+    same ephemeral overlay (dismissed with Escape), WITHOUT adding a
+    persisted side-chat turn to the main conversation.
+
+    Category: **transient** (SSE-only), live-only by design. Nothing is
+    persisted and there is no SSE replay, so a reload drops the overlay —
+    matching the terminal, where Escape closes it and leaves no history.
+
+    The wire shape is FLAT (not enveloped):
+    ``{"type": "session.btw_sidechat", "conversation_id": <id>,
+    "question": <str>, "answer": <str>, "truncated": <bool>}``.
+
+    :param type: Always ``"session.btw_sidechat"``.
+    :param conversation_id: The conversation whose stream this rides.
+    :param question: The ``/btw`` request line as typed, e.g.
+        ``"/btw is this backward compatible?"``.
+    :param answer: The side-chat answer text.
+    :param truncated: True when the pane clipped a longer answer; the web
+        overlay notes it and points at the terminal for the full text.
+    """
+
+    type: Literal["session.btw_sidechat"]
+    conversation_id: str
+    question: str
+    answer: str
+    truncated: bool = False
+
+
 # ── Response pass-through events (response.*) ──────────────────────
 
 
@@ -4728,6 +4763,7 @@ ServerStreamEvent = Annotated[
     | SessionInterruptedEvent
     | SessionCreatedEvent
     | SessionSupersededEvent
+    | SessionBtwSidechatEvent
     | SessionPresenceEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────
     | SessionResourceCreatedEvent

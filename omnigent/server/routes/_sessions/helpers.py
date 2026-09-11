@@ -239,6 +239,7 @@ from omnigent.server.schemas import (
     ResponseObject,
     RetryErrorDetail,
     SandboxStatus,
+    SessionBtwSidechatEvent,
     SessionChildSessionUpdatedEvent,
     SessionCodexApprovalModeEvent,
     SessionCollaborationModeEvent,
@@ -4947,6 +4948,55 @@ def _publish_session_superseded(session_id: str, target_conversation_id: str) ->
         _logger.info(
             "Discarded %d unconsumed pending input(s) on superseded session %s",
             discarded,
+            session_id,
+            extra={"session_id": session_id},
+        )
+
+
+def _publish_btw_sidechat(
+    session_id: str,
+    *,
+    question: str,
+    answer: str,
+    truncated: bool,
+) -> None:
+    """
+    Publish a transient ``session.btw_sidechat`` overlay to the live stream.
+
+    Emitted when the claude-native forwarder scrapes a settled ``/btw``
+    side-chat from the pane (see ``_forward_btw_overlay_from_pane`` in the
+    claude-native forwarder). Broadcast-only: nothing is written to the
+    conversation store, so the ephemeral exchange never lands in the main
+    transcript. Live viewers render a dismissable overlay; a client that
+    connects later never sees it (no SSE replay), matching the terminal
+    overlay's Escape-to-close, leave-no-history behavior.
+
+    The oldest pending input is also discarded so a web composer's
+    optimistic ``/btw`` bubble does not linger as a stuck "queued" message —
+    the same reconciliation ``_publish_session_superseded`` performs.
+    ``/btw`` is never committed as a user turn (no ``session.input.consumed``
+    is emitted); the overlay carries the request text instead.
+
+    :param session_id: Conversation id whose stream receives the event.
+    :param question: The ``/btw`` request line as typed.
+    :param answer: The side-chat answer text.
+    :param truncated: True when the pane clipped a longer answer.
+    """
+    event = SessionBtwSidechatEvent(
+        type="session.btw_sidechat",
+        conversation_id=session_id,
+        question=question,
+        answer=answer,
+        truncated=truncated,
+    )
+    session_stream.publish(session_id, event.model_dump())
+    # Drop the optimistic ``/btw`` bubble (the oldest unconsumed input) so it
+    # does not spin forever — ``/btw`` never round-trips through the transcript
+    # to earn a ``session.input.consumed``. Only the oldest is resolved so a
+    # follow-up the user queued after ``/btw`` is left intact.
+    if pending_inputs.resolve_oldest(session_id) is not None:
+        _logger.info(
+            "Discarded the pending /btw input on session %s",
             session_id,
             extra={"session_id": session_id},
         )
@@ -10683,6 +10733,7 @@ __all__ = [
     "_prune_pre_resolved_harness_elicitations",
     "_prune_session_read_state",
     "_publish_and_persist_resource_event",
+    "_publish_btw_sidechat",
     "_publish_changed_files_invalidated",
     "_publish_codex_approval_mode",
     "_publish_collaboration_mode",

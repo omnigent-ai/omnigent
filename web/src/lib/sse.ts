@@ -33,6 +33,7 @@ import type {
   ResponseInProgress,
   ResponseQueued,
   RetryEvent,
+  SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
   SessionModelOptionsEvent,
@@ -873,6 +874,23 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       targetConversationId,
       reason: "clear",
     } satisfies SessionSupersededEvent;
+  }
+  if (eventType === "session.btw_sidechat") {
+    const conversationId = data.conversation_id;
+    const question = data.question;
+    const answer = data.answer;
+    const truncated = data.truncated;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (typeof question !== "string") return null;
+    if (typeof answer !== "string") return null;
+    if (typeof truncated !== "boolean") return null;
+    return {
+      type: "session_btw_sidechat",
+      conversationId,
+      question,
+      answer,
+      truncated,
+    } satisfies SessionBtwSidechatEvent;
   }
   if (eventType === "session.resource.created") {
     const resource = parseSessionResource(data.resource);

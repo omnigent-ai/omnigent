@@ -24,10 +24,10 @@ locally is covered by the chatStore unit tests.
 
 from __future__ import annotations
 
-import re
-
 import httpx
 from playwright.sync_api import Locator, Page, expect
+
+from tests.e2e_ui.chat._working_labels import WORKING_LABEL_RE as _WORKING_LABEL_RE
 
 _WORKING = '[data-testid="working-indicator"]'
 _PILL = '[data-testid="background-task-pill"]'
@@ -43,21 +43,6 @@ def _pill_badge(page: Page, count: int) -> Locator:
     return page.get_by_role(
         "button", name=f"{count} background task{plural} still running", exact=True
     )
-
-
-# Rotating labels the working indicator cycles through — mirror of
-# WORKING_MESSAGES in web/src/pages/ChatPage.tsx. The running-turn label is
-# whichever entry the wall-clock bucket lands on, so the test accepts any of
-# them. Keep this list in sync if that pool changes.
-_WORKING_LABELS = (
-    "Working…",
-    "Cooking…",
-    "Crunching…",
-    "Tinkering…",
-    "Pondering…",
-    "Brewing…",
-)
-_WORKING_LABEL_RE = re.compile("|".join(re.escape(label) for label in _WORKING_LABELS))
 
 
 def _publish_status(
