@@ -6431,6 +6431,18 @@ async def execute_tool(
         )
         output = f"Error: {type(exc).__name__}: {exc}"
 
+    if conversation_id and tool_name == "sys_os_shell":
+        from omnigent.runner.pr_observer import observe_tool_completion
+
+        await asyncio.to_thread(
+            observe_tool_completion,
+            conversation_id,
+            tool_name=tool_name,
+            arguments=args,
+            result=output,
+            successful=not output.startswith("Error:"),
+            source="runner_shell",
+        )
     return output
 
 

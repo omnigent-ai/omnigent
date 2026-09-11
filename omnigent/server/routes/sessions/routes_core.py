@@ -38,7 +38,7 @@ from omnigent.entities import (
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -247,35 +247,40 @@ def register_core_routes(
         agent_id: str | None,
         user_id: str | None,
         sandbox_provider: str | None,
-        workspace: str | None,
+        workspaces: list[str],
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
 
-        Shared by both create paths: the JSON path (an existing
-        ``agent_id``) and the multipart bundle path (a freshly-created
-        session-scoped ``agent_id``). Validates that managed hosts are
-        configured and the provider is offered, records the repository
-        workspace for relaunch, seeds the launch-progress indicator, and
-        schedules the background ``_run_managed_launch`` — returning
-        immediately, since provisioning takes tens of seconds and must
-        not block the create POST. Config problems and malformed repo
+        Shared by the two create paths and the fork path: the JSON create
+        (an existing ``agent_id``), the multipart bundle create (a
+        freshly-created session-scoped ``agent_id``), and a fork (the
+        clone's own session-scoped ``agent_id``). Validates that managed
+        hosts are configured and the provider is offered, records the
+        repository workspace for relaunch, seeds the launch-progress
+        indicator, and schedules the background ``_run_managed_launch`` —
+        returning immediately, since provisioning takes tens of seconds
+        and must not block the POST. Config problems and malformed repo
         workspaces fail the POST synchronously (4xx).
 
-        :param request: The create request (for ``app.state`` lookups).
+        :param request: The originating request (for ``app.state``
+            lookups).
         :param session_id: The newly-created session id to bind the host
             to, e.g. ``"conv_abc123"``.
         :param agent_id: The session's bound agent id (built-in for the
-            JSON path, session-scoped for the bundle path); the managed
-            runner fetches its spec over the tunnel either way.
+            JSON create path, session-scoped for the bundle and fork
+            paths); the managed runner fetches its spec over the tunnel
+            either way.
         :param user_id: Authenticated caller, or ``None`` on an
             auth-disabled server (registers under the reserved local
             owner).
         :param sandbox_provider: Provider to provision, or ``None`` for
             the server's first configured provider.
-        :param workspace: Managed workspace — a git repository URL
-            (optionally ``#<branch>``) cloned into the sandbox, or
-            ``None`` for an empty sandbox.
+        :param workspaces: Managed workspaces — git repository URLs
+            (each optionally ``#<branch>``) cloned into the sandbox in
+            parallel; empty for an empty sandbox. One repo becomes the
+            session's working directory; several are cloned as siblings
+            and the working directory is the parent that holds them.
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
@@ -290,7 +295,7 @@ def register_core_routes(
             )
         from omnigent.server.auth import RESERVED_USER_LOCAL
         from omnigent.server.managed_hosts import (
-            MANAGED_REPO_LABEL_KEY,
+            managed_repo_labels,
             parse_repo_workspace,
         )
 
@@ -303,18 +308,32 @@ def register_core_routes(
                 f"on this server — available: {offered}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Reject several repos on a provider that clones only one, with a clear
+        # 4xx (the web picker already caps this per provider; this guards direct
+        # API callers). Resolve the provider the launch will actually use.
+        if len(workspaces) > 1:
+            resolved = sandbox_provider or sandbox_config.default.provider
+            caps = sandbox_config.provider_ui_capabilities().get(resolved or "", {})
+            if not caps.get("multi_repo", False):
+                raise OmnigentError(
+                    f"sandbox provider '{resolved}' clones only one repository; "
+                    "select a single repository or choose a provider that supports several",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         # A managed workspace is a repository URL (schema-validated) the
-        # launch clones inside the sandbox; parse it now so a malformed
+        # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
-        repo = parse_repo_workspace(workspace) if workspace is not None else None
-        if workspace is not None:
-            # The session row's workspace is overwritten with the CLONED
-            # path at bind time; record the raw request value so a
-            # sandbox relaunch can re-clone the same repository.
+        repos = [parse_repo_workspace(w) for w in workspaces]
+        if workspaces:
+            # The session row's workspace is overwritten with the CLONED path at
+            # bind time; record the raw request value(s) so a sandbox relaunch
+            # can re-clone the same repositories. Stored one label per repo (not
+            # a single joined value) so the 256-char label-value cap can't
+            # silently truncate the list and drop repos on relaunch.
             await asyncio.to_thread(
                 conversation_store.set_labels,
                 session_id,
-                {MANAGED_REPO_LABEL_KEY: workspace},
+                managed_repo_labels(workspaces),
             )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
@@ -329,7 +348,7 @@ def register_core_routes(
                 # host registers under the reserved local owner.
                 owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
                 sandbox_config=sandbox_config,
-                repo=repo,
+                repos=repos,
                 tracker=managed_launches,
                 conversation_store=conversation_store,
                 host_store=host_store_for_managed,
@@ -447,19 +466,35 @@ def register_core_routes(
                 harness=harness,
             )
         )
-        host_registry.send_text(conn, launch_frame)
         try:
+            host_registry.send_text(conn, launch_frame)
             launch_result = await asyncio.wait_for(future, timeout=30.0)
+        except ConnectionError as exc:
+            launch_result = {"status": "failed", "error": str(exc)}
         except asyncio.TimeoutError:
-            conn.pending_launches.pop(request_id, None)
             launch_result = {"status": "failed", "error": "host launch timed out"}
+        finally:
+            conn.pending_launches.pop(request_id, None)
+            if not future.done():
+                future.cancel()
         launch_failed = launch_result.get("status") == "failed"
         if launch_failed:
+            # The runner failed to come up (generic launch-failure path with no
+            # structured error_code), blocking the session at launch. A coded
+            # deployment failure (harness_not_configured, etc.) is attributed
+            # CONFIG where it raises as OmnigentError.
             _logger.warning(
                 "Host %s failed to launch runner for session %s: %s",
                 host_id,
                 session_id,
                 launch_result.get("error"),
+                extra=debug_event(
+                    "runner_launch_failed",
+                    session_id=session_id,
+                    error_category=ErrorCategory.RUNNER.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+                ),
             )
         return runner_id, launch_failed
 
@@ -654,7 +689,7 @@ def register_core_routes(
                 agent_id=conv.agent_id if conv is not None else None,
                 user_id=user_id,
                 sandbox_provider=body.sandbox_provider,
-                workspace=body.workspace,
+                workspaces=body.managed_repo_workspaces(),
             )
 
         # Host launch: if a host is targeted (caller-supplied or
@@ -827,7 +862,11 @@ def register_core_routes(
                 agent_id=result.agent_id,
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
-                workspace=parsed_metadata.workspace,
+                # Bundle metadata carries a single repo; multi-repo is a
+                # web-picker (JSON) feature. Empty list = no repo.
+                workspaces=[parsed_metadata.workspace]
+                if parsed_metadata.workspace is not None
+                else [],
             )
         # Caller-supplied external host: bind + launch a runner on it,
         # exactly like the JSON create form (same authorization, atomic
@@ -2568,6 +2607,15 @@ def register_core_routes(
         parent. The source keeps running under its parent untouched,
         and the fork does not adopt the source's own children.
 
+        ``body.host_type: "managed"`` gives the fork its own
+        server-provisioned sandbox instead of leaving it unbound for the
+        caller to bind a host to. It schedules the same background launch
+        a managed create does — this POST returns before the sandbox
+        exists — and the sandbox is registered to the FORKING caller, not
+        to the source session's owner. The fork's workspace is the
+        repository named by ``body.workspace``, or the one the source
+        recorded when that field is omitted.
+
         :param request: The incoming FastAPI request (for auth).
         :param source_id: Session/conversation identifier of the
             source session to fork, e.g. ``"conv_abc123"``.
@@ -2577,8 +2625,9 @@ def register_core_routes(
         :raises OmnigentError: 404 if *source_id* does not exist
             or ``body.agent_id`` is not a bindable built-in agent;
             403 if the caller lacks read access; 400 if the source
-            has no agent binding, or ``body.up_to_response_id`` names
-            no response in the source session.
+            has no agent binding, ``body.up_to_response_id`` names
+            no response in the source session, or a managed fork asks
+            for a sandbox this server has not configured.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -2653,6 +2702,7 @@ def register_core_routes(
         model_override_set = "model_override" in fields_set
         effort_set = "reasoning_effort" in fields_set
         launch_args_set = "terminal_launch_args" in fields_set
+        workspace_set = "workspace" in fields_set
 
         override_model: str | None = None
         clear_override_model = False
@@ -2761,10 +2811,15 @@ def register_core_routes(
         # runner takes the rebuild path instead of a doomed clone attempt
         # (a failed clone launches fresh, losing history). cursor never clones a
         # native session (server-backed; it carries history via the preamble),
-        # so it always skips the source directive too.
+        # so it always skips the source directive too. A managed fork gets its
+        # OWN fresh sandbox, whose filesystem has no copy of the source's local
+        # native rollout, so the clone is likewise doomed — skip the directive
+        # so the runner rebuilds from the copied Omnigent items instead.
         resume_source_native_session = (
-            not switching_agent or copy_model_settings
-        ) and not target_is_cursor
+            (not switching_agent or copy_model_settings)
+            and not target_is_cursor
+            and body.host_type != "managed"
+        )
 
         # On an agent switch, recompute the Web UI presentation labels for
         # the TARGET harness so the clone isn't left in the source's UI mode
@@ -2871,11 +2926,42 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+        # Grant ownership BEFORE scheduling the managed launch, mirroring
+        # both create paths: a managed-guard failure (misconfigured server,
+        # unconfigured provider) must not leave the just-forked session
+        # unowned and thus invisible to the caller.
         if permission_store is not None and user_id is not None:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
         # Push the forked session to this user's other open tabs.
         _announce_session_added(user_id, new_conv.id)
+
+        from omnigent.server.managed_hosts import read_managed_repo_workspaces
+
+        # Managed host: schedule the fork's own BACKGROUND sandbox provision
+        # and return immediately, exactly like a managed create. The host is
+        # registered to the forking caller, so the sandbox resolves THEIR
+        # credentials, never the source owner's. An omitted workspace inherits
+        # ALL of the repositories the source recorded (read off the SOURCE,
+        # since a fork never inherits the labels itself), so cloning a
+        # multi-repo sandbox session lands the fork with every repo.
+        if body.host_type == "managed":
+            fork_workspaces = (
+                ([body.workspace] if body.workspace is not None else [])
+                if workspace_set
+                else read_managed_repo_workspaces(source.labels)
+            )
+            await _schedule_managed_launch(
+                request,
+                session_id=new_conv.id,
+                # The fork's own session-scoped agent clone. Deliberately not
+                # the built-in it derives from: only a genuine built-in may
+                # classify a managed runner, and a clone must not inherit that.
+                agent_id=new_conv.agent_id,
+                user_id=user_id,
+                sandbox_provider=body.sandbox_provider,
+                workspaces=fork_workspaces,
+            )
 
         # Bound the response like the GET-session snapshot: newest item page,
         # chronological. Clients navigate by the fork's id and hydrate the

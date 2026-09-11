@@ -8,6 +8,7 @@ import re
 import sys
 import types
 import uuid
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,8 +52,10 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     launch_managed_host,
+    managed_repo_labels,
     parse_repo_workspace,
     parse_sandbox_config,
+    read_managed_repo_workspaces,
     relaunch_managed_host,
     resolve_managed_agent_label,
     resume_managed_host,
@@ -2053,6 +2056,10 @@ def test_parse_repo_workspace_accepts_url_forms(workspace: str, expected: RepoWo
         # unsupported in the fragment form.
         ("https://github.com/org/repo#a#b", "not a valid git branch name"),
         ("https://github.com/org/repo#a b", "must not contain whitespace"),
+        # Embedded credentials would be persisted verbatim in a label + Pod spec —
+        # rejected in the https AND the ssh (scp-form) branch.
+        ("https://user:token@github.com/org/repo", "must not embed credentials"),
+        ("git@x-access-token:tok@github.com:org/repo.git", "must not embed credentials"),
     ],
 )
 def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragment: str) -> None:
@@ -2064,6 +2071,98 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
     with pytest.raises(ValueError, match="") as exc:
         parse_repo_workspace(workspace)
     assert expected_fragment in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        "https://x-access-token:s3cr3t@github.com/org/repo",
+        # No path → trips the shape guard; the secret must still not be echoed
+        # (the credential check runs before any URL-echoing error).
+        "https://user:s3cr3t@github.com",
+        "git@x-access-token:s3cr3t@github.com:org/repo.git",
+    ],
+)
+def test_credential_rejection_does_not_echo_the_token(workspace: str) -> None:
+    """The credential-URL error must not include the URL — that carries the secret."""
+    with pytest.raises(ValueError) as exc:
+        parse_repo_workspace(workspace)
+    assert "s3cr3t" not in str(exc.value)
+
+
+def test_managed_repo_labels_round_trip() -> None:
+    """Per-repo labels avoid the 256-char single-label cap and read back in order.
+
+    A bare space-joined key rides along as a rollback compat shim (it fits here),
+    but the indexed labels are what the current reader uses.
+    """
+    workspaces = ["https://github.com/org/api#main", "https://github.com/org/web"]
+    labels = managed_repo_labels(workspaces)
+    assert labels == {
+        "omnigent.sandbox.repo.0": "https://github.com/org/api#main",
+        "omnigent.sandbox.repo.1": "https://github.com/org/web",
+        # Legacy bare key for a rolled-back/older reader (written only when it fits).
+        "omnigent.sandbox.repo": "https://github.com/org/api#main https://github.com/org/web",
+    }
+    assert read_managed_repo_workspaces(labels) == workspaces
+    assert managed_repo_labels([]) == {}
+
+
+def test_managed_repo_labels_omit_bare_key_when_over_cap() -> None:
+    """The compat bare key is skipped (never truncated) when the joined value
+    would exceed the label-value cap; the indexed labels still carry every repo."""
+    # Enough long URLs that the space-joined value exceeds 256 chars.
+    workspaces = [f"https://github.com/some-long-org-name/repository-number-{i}" for i in range(6)]
+    labels = managed_repo_labels(workspaces)
+    assert "omnigent.sandbox.repo" not in labels  # no truncated bare value stored
+    assert read_managed_repo_workspaces(labels) == workspaces  # indexed labels intact
+
+
+def test_read_managed_repo_workspaces_orders_numerically_and_falls_back() -> None:
+    """Indices order numerically (not lexically), and the legacy single label still reads."""
+    # .10 must sort after .2, not before it (lexical order would break past 9).
+    many = {f"omnigent.sandbox.repo.{i}": f"https://github.com/o/r{i}" for i in range(11)}
+    assert read_managed_repo_workspaces(many)[-1] == "https://github.com/o/r10"
+    # Legacy single space-joined label (pre-per-repo storage) still round-trips.
+    legacy = {"omnigent.sandbox.repo": "https://github.com/o/a https://github.com/o/b"}
+    assert read_managed_repo_workspaces(legacy) == [
+        "https://github.com/o/a",
+        "https://github.com/o/b",
+    ]
+    assert read_managed_repo_workspaces({}) == []
+
+
+def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
+    """The /v1/info map reflects each launchable provider's declared multi_repo,
+    keyed by provider name; a provider declaring nothing stays off."""
+
+    class _MultiRepoFake(FakeSandboxLauncher):
+        @property
+        def capabilities(self) -> Any:
+            return replace(super().capabilities, multi_repo=True)
+
+    single = FakeSandboxLauncher()  # exec-model default → multi_repo False
+    multi = _MultiRepoFake()
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="single",
+                token_ttl_s=3600,
+                launcher_factory=lambda: single,
+            ),
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="multi",
+                token_ttl_s=3600,
+                launcher_factory=lambda: multi,
+            ),
+        )
+    )
+    assert deployment.provider_ui_capabilities() == {
+        "single": {"multi_repo": False},
+        "multi": {"multi_repo": True},
+    }
 
 
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
@@ -2457,9 +2556,7 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
             host_id: str,
             host_name: str,
             server_url: str,
-            repo_url: str | None = None,
-            repo_branch: str | None = None,
-            repo_name: str | None = None,
+            repos: Sequence[RepoWorkspace] = (),
         ) -> str:
             return super().start_host(
                 sandbox_id,
@@ -2467,9 +2564,7 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
                 host_id=host_id,
                 host_name=host_name,
                 server_url=server_url,
-                repo_url=repo_url,
-                repo_branch=repo_branch,
-                repo_name=repo_name,
+                repos=repos,
             )
 
     fake = _LegacySignatureLauncher(on_host_start=_register, can_resume=True)
@@ -2668,7 +2763,7 @@ async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
         config=_injected_config(fake),
         owner=_OWNER,
         host_store=host_store,
-        repo=parse_repo_workspace("https://github.com/org/myrepo.git#release-1.2"),
+        repos=[parse_repo_workspace("https://github.com/org/myrepo.git#release-1.2")],
     )
 
     # The session workspace is the clone directory, named after the repo.
@@ -2704,7 +2799,7 @@ async def test_launch_clone_failure_terminates_and_deletes_host(db_uri: str) -> 
             config=_injected_config(fake),
             owner=_OWNER,
             host_store=host_store,
-            repo=parse_repo_workspace("https://github.com/org/private#main"),
+            repos=[parse_repo_workspace("https://github.com/org/private#main")],
         )
     assert exc.value.status_code == 502
     assert "failed to clone repository 'https://github.com/org/private'" in exc.value.detail
@@ -2751,9 +2846,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage=None,
     ) -> str:
@@ -2764,8 +2857,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
                 "token": token,
                 "host_id": host_id,
                 "server_url": server_url,
-                "repo_url": repo_url,
-                "repo_name": repo_name,
+                "repos": list(repos),
             }
         )
         # The token was registered before start_host, so it resolves now.
@@ -2774,7 +2866,12 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         )
         # Simulate the host's entrypoint dialing back over the tunnel.
         self._host_store.upsert_on_connect(host_id=host_id, name=host_name, user_id=_OWNER)
-        return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
+        # One repo → its clone dir; none or several → the workspace parent.
+        return (
+            f"/home/omnigent/workspace/{repos[0].repo_name}"
+            if len(repos) == 1
+            else "/home/omnigent/workspace"
+        )
 
 
 async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: str) -> None:
@@ -2790,7 +2887,7 @@ async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: 
         config=_injected_config(fake),
         owner=_OWNER,
         host_store=host_store,
-        repo=parse_repo_workspace("https://github.com/org/repo.git#main"),
+        repos=[parse_repo_workspace("https://github.com/org/repo.git#main")],
     )
 
     # start_host ran once, with the reserved id and repo info.
@@ -2798,8 +2895,8 @@ async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: 
     call = fake.start_calls[0]
     assert call["sandbox_id"] == "omnigent-pod-1"
     assert call["server_url"] == "https://srv.example.com"
-    assert call["repo_url"] == "https://github.com/org/repo.git"
-    assert call["repo_name"] == "repo"
+    assert [r.url for r in call["repos"]] == ["https://github.com/org/repo.git"]
+    assert [r.repo_name for r in call["repos"]] == ["repo"]
     # The token was already resolvable when start_host ran (no dial-back race).
     assert fake.token_resolved_at_start is True
     # The workspace (cloned dir) is returned and the host is online + bound.
@@ -4348,7 +4445,7 @@ async def test_run_managed_launch_leaves_the_runner_unclassified(
         session_id="conv_1",
         owner=_OWNER,
         sandbox_config=SimpleNamespace(),
-        repo=None,
+        repos=[],
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -4391,7 +4488,7 @@ async def test_run_managed_launch_resolves_the_classifier_on_its_own_task(
         session_id="conv_1",
         owner=_OWNER,
         sandbox_config=SimpleNamespace(),
-        repo=None,
+        repos=[],
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -4430,7 +4527,7 @@ async def test_run_managed_launch_omits_the_classifier_for_a_session_scoped_impo
         session_id="conv_1",
         owner=_OWNER,
         sandbox_config=SimpleNamespace(),
-        repo=None,
+        repos=[],
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),

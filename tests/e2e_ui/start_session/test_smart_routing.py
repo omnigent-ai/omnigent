@@ -33,9 +33,9 @@ from playwright.async_api import Route, async_playwright, expect
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _SESSIONS_RE,
-    _open_entry_config,
+    _close_entry_models,
+    _open_entry_models,
     _run_in_fresh_loop,
-    _save_config,
     _wait_until,
 )
 
@@ -256,15 +256,18 @@ async def _drive_smart_routing_model_option(base_url: str, session_id: str) -> N
             )
 
             # Pin Claude Code, then open its run-config modal.
-            await _open_entry_config(page, "ag_claude_e2e")
-            model = page.get_by_test_id("new-chat-landing-config-model")
+            await _open_entry_models(page, "ag_claude_e2e")
+            model = page.get_by_test_id("new-chat-landing-agent-models")
             await expect(model).to_be_visible()
-            await model.click()
-            await page.get_by_role("option", name="Smart Routing", exact=True).click()
-            await expect(model).to_contain_text("Smart Routing")
+            await page.get_by_role("menuitemcheckbox", name="Smart Routing", exact=True).click()
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-model-smart-routing")
+            ).to_have_attribute("aria-checked", "true")
             # The router picks the effort with the model, so the row is frozen.
-            await expect(page.get_by_test_id("new-chat-landing-config-effort")).to_be_disabled()
-            await _save_config(page)
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-effort-high")
+            ).to_have_attribute("data-disabled", "")
+            await _close_entry_models(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("fix the flaky test")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -281,7 +284,7 @@ async def _drive_smart_routing_model_option(base_url: str, session_id: str) -> N
             await browser.close()
 
 
-def test_start_session_hides_smart_routing_when_server_disables_it(
+def test_start_session_disables_smart_routing_when_server_disables_it(
     seeded_session: tuple[str, str],
 ) -> None:
     """Routing off on the server withholds both Smart Routing surfaces.
@@ -314,20 +317,22 @@ async def _drive_smart_routing_disabled(base_url: str, session_id: str) -> None:
             )
 
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            # The Harnesses group renders, so the picker is populated — only the
-            # routing row is missing.
+            # The routing entry remains visible but cannot be selected.
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
             ).to_be_visible()
             await expect(
                 page.get_by_test_id("new-chat-landing-harness-smart-routing")
-            ).to_have_count(0)
+            ).to_be_disabled()
 
-            await page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e").click()
-            await page.get_by_test_id("new-chat-landing-config-gear").click()
-            await page.get_by_test_id("new-chat-landing-config-model").click()
+            await (
+                page.get_by_test_id("new-chat-landing-agent-config-ag_claude_e2e")
+                .get_by_text("Edit", exact=True)
+                .click()
+            )
+
             await expect(
-                page.get_by_role("option", name="Smart Routing", exact=True)
+                page.get_by_role("menuitemcheckbox", name="Smart Routing", exact=True)
             ).to_have_count(0)
         finally:
             await browser.close()

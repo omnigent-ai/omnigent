@@ -723,42 +723,57 @@ export async function createBundledSession(
  * POST /v1/sessions/{source_id}/fork.
  *
  * The server deep-copies the source's transcript and clones its agent
- * into a fresh, unbound session owned by the caller (read access on the
- * source is required). Comments and permissions are NOT copied, and the
- * fork starts `idle` with no runner — the caller binds their own via
- * `PATCH /v1/sessions/{id}`. `title` is only sent when provided; omitted,
- * the server derives `"Fork of <source title>"`.
+ * into a fresh session owned by the caller (read access on the source is
+ * required). Comments and permissions are NOT copied. Unless
+ * `options.sandbox` is given, the fork starts `idle` and unbound — the
+ * caller binds their own runner via `PATCH /v1/sessions/{id}`.
+ * `options.title` is only sent when provided; omitted, the server derives
+ * `"Fork of <source title>"`.
  *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
- * @param title - Optional title for the new fork.
- * @param agentId - Optional built-in agent to switch the fork to (e.g.
- *   fork a Claude-SDK session into Claude Code). Omitted → keep the
+ * @param options.title - Optional title for the new fork.
+ * @param options.agentId - Optional built-in agent to switch the fork to
+ *   (e.g. fork a Claude-SDK session into Claude Code). Omitted → keep the
  *   source's agent. The server carries model settings (and native
  *   history) across only within the same provider family.
- * @param upToResponseId - Optional truncation point, e.g. "resp_abc". When
- *   set, the fork copies history only up to and including that response
- *   ("fork from here"); omitted, the full history is copied.
- * @param config - Optional run-config overrides from the fork dialog's
- *   model / effort / permission-mode pickers. Each field is opt-in: a field
- *   left `undefined` inherits the source (model settings carry within the
- *   same provider family), while a sent field overrides it. The
- *   permission-/approval-mode selector rides `terminalLaunchArgs` (e.g.
- *   `["--permission-mode", "auto"]`); `[]` clears the source's launch args.
- *   `codexBypassSandbox: true` (Codex only) arms the dangerous full-bypass on
- *   the fork — sent only on an explicit, banner-gated pick.
+ * @param options.upToResponseId - Optional truncation point, e.g.
+ *   "resp_abc". When set, the fork copies history only up to and including
+ *   that response ("fork from here"); omitted, the full history is copied.
+ * @param options.config - Optional run-config overrides from the fork
+ *   dialog's model / effort / permission-mode pickers. Each field is
+ *   opt-in: a field left `undefined` inherits the source (model settings
+ *   carry within the same provider family), while a sent field overrides
+ *   it. The permission-/approval-mode selector rides `terminalLaunchArgs`
+ *   (e.g. `["--permission-mode", "auto"]`); `[]` clears the source's launch
+ *   args. `codexBypassSandbox: true` (Codex only) arms the dangerous
+ *   full-bypass on the fork — sent only on an explicit, banner-gated pick.
+ * @param options.sandbox - Present when the fork should run on a
+ *   server-provisioned sandbox instead of a host the caller binds. It asks
+ *   for the same background launch a `host_type: "managed"` create
+ *   schedules, so the call still returns as soon as the fork row exists —
+ *   `host_id` / `workspace` stay null until the sandbox registers.
+ *   `provider` names one of the server's configured sandbox providers
+ *   (`null` takes its first). `workspace` is a `<url>[#<branch>]`
+ *   repository the server clones into the sandbox; `null` gives the fork an
+ *   empty sandbox, and leaving the key off inherits the repository the
+ *   source session recorded.
  */
 export async function forkSession(
   sourceId: string,
-  title?: string,
-  agentId?: string,
-  upToResponseId?: string,
-  config?: {
-    modelOverride?: string;
-    reasoningEffort?: string;
-    terminalLaunchArgs?: string[];
-    codexBypassSandbox?: boolean;
-  },
+  options: {
+    title?: string;
+    agentId?: string;
+    upToResponseId?: string;
+    config?: {
+      modelOverride?: string;
+      reasoningEffort?: string;
+      terminalLaunchArgs?: string[];
+      codexBypassSandbox?: boolean;
+    };
+    sandbox?: { provider?: string | null; workspace?: string | null };
+  } = {},
 ): Promise<Session> {
+  const { title, agentId, upToResponseId, config, sandbox } = options;
   const body: {
     title?: string;
     agent_id?: string;
@@ -767,6 +782,9 @@ export async function forkSession(
     reasoning_effort?: string;
     terminal_launch_args?: string[];
     codex_bypass_sandbox?: boolean;
+    host_type?: "managed";
+    sandbox_provider?: string;
+    workspace?: string | null;
   } = {};
   if (title !== undefined) {
     body.title = title;
@@ -790,6 +808,18 @@ export async function forkSession(
   // otherwise keeps the request minimal and the server default (no bypass).
   if (config?.codexBypassSandbox) {
     body.codex_bypass_sandbox = true;
+  }
+  if (sandbox !== undefined) {
+    body.host_type = "managed";
+    // A provider the server didn't name is omitted so it picks its first.
+    if (sandbox.provider != null) {
+      body.sandbox_provider = sandbox.provider;
+    }
+    // Key presence is the signal here: an explicit null means "empty
+    // sandbox", while omitting it inherits the source's repository.
+    if (sandbox.workspace !== undefined) {
+      body.workspace = sandbox.workspace;
+    }
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",

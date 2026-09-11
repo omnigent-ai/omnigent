@@ -2841,10 +2841,15 @@ def _find_daemon_record(target: str) -> _HostDaemonRecord | None:
     Find a daemon record by target.
 
     :param target: Normalized daemon target, e.g. ``"local"``.
-    :returns: Matching daemon record, or ``None``.
+    :returns: Matching daemon record, including a pre-canonicalization record,
+        or ``None``.
     """
-    for record in _list_daemon_records():
+    records = _list_daemon_records()
+    for record in records:
         if record.target == target:
+            return record
+    for record in records:
+        if _normalize_daemon_target(record.target) == target:
             return record
     return None
 
@@ -2985,7 +2990,7 @@ class _DaemonReuseDecision:
     config_changed: bool
 
 
-def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
+def _daemon_owner_is_live(record: _HostDaemonRecord) -> bool:
     """Whether the daemon that wrote *record* is still alive.
 
     A held record flock is a definitive live owner (the kernel drops it on
@@ -2997,11 +3002,11 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     process is. Reaping therefore requires a free lock and a dead-or-foreign
     PID.
 
-    :param record: Existing daemon record for *target*.
-    :param target: Normalized daemon target, e.g. ``"local"``.
+    :param record: Existing daemon record whose original target identifies the
+        lock path held by its owner.
     :returns: ``True`` if the daemon should be treated as alive.
     """
-    if _record_flock_is_held(_daemon_record_path(target)) is True:
+    if _record_flock_is_held(_daemon_record_path(record.target)) is True:
         return True
     return _pid_is_recorded_daemon(record)
 
@@ -3035,7 +3040,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     existing = _find_daemon_record(target)
     if existing is None:
         return _DaemonReuseDecision(reuse=False, config_changed=False)
-    if not _daemon_owner_is_live(existing, target):
+    if not _daemon_owner_is_live(existing):
         _delete_daemon_record(existing)
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
@@ -3144,7 +3149,7 @@ def _wait_for_daemon_claim(
     deadline = time.monotonic() + timeout_s
     while True:
         record = _find_daemon_record(target)
-        if record is not None and _daemon_owner_is_live(record, target):
+        if record is not None and _daemon_owner_is_live(record):
             return record
         if time.monotonic() >= deadline:
             return None
@@ -3239,7 +3244,7 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     """
     existing = _find_daemon_record(record.target)
     if existing is not None and existing.pid != record.pid:
-        if _daemon_owner_is_live(existing, record.target):
+        if _daemon_owner_is_live(existing):
             return existing
         # Dead, or alive but not our daemon (pid recycled after a reboot):
         # the record is stale, not a conflict — prune it and start normally.
@@ -3255,14 +3260,14 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+            and _daemon_owner_is_live(local_record)
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
         if (
             local_record is not None
             and local_record.pid != record.pid
-            and not _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+            and not _daemon_owner_is_live(local_record)
         ):
             _delete_daemon_record(local_record)
     return None

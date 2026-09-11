@@ -11002,3 +11002,330 @@ async def test_claude_model_catalog_keeps_canonical_ids_without_ambient_gateway(
     # Both canonical models should be present
     assert [row["id"] for row in rows] == ["sonnet", "opus"]
     assert rows[1]["isDefault"] is True
+
+
+def _isolate_to_connect_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the spec-less resolution reach the connect-broker fallback: no explicit
+    default, no global auth, no ambient-detected provider."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.default_provider_for_harness",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.effective_config_with_detected", lambda cfg: cfg
+    )
+
+
+def test_resolve_native_claude_config_connect_broker_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed connect host (host-only [omnigent] profile + broker sidecar) routes
+    native Claude Code through the workspace gateway with a broker-minted apiKeyHelper."""
+    _isolate_to_connect_fallback(monkeypatch)
+    from omnigent.host import databricks_credential as dc
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
+
+    assert config is not None
+    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
+    assert config.env["CLAUDE_CODE_USE_GATEWAY"] == "1"
+    assert config.api_key_helper is not None
+    assert "omnigent.host.databricks_credential token" in config.api_key_helper
+    # Model comes from the catalog default (stubbed by _stub_catalog_default).
+    assert config.model == "catalog-databricks-claude-default"
+
+
+def test_connect_fallback_prefers_ucode_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ucode has populated ~/.ucode/state.json for the connected workspace,
+    the managed-connect config uses ucode's base URL and discovered served model,
+    while still minting the bearer through our own broker apiKeyHelper."""
+    _isolate_to_connect_fallback(monkeypatch)
+    from omnigent.host import databricks_credential as dc
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    state = UcodeWorkspaceState(
+        workspace_url="https://ws.example",
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-sonnet-4-6",
+                env={"ANTHROPIC_BASE_URL": "https://ws.example/serving-endpoints/anthropic"},
+            )
+        },
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", lambda url: state)
+
+    config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
+
+    assert config is not None
+    # ucode's base URL + discovered model win over the hand-built defaults.
+    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/serving-endpoints/anthropic"
+    assert config.model == "system.ai.claude-sonnet-4-6"
+    # But the bearer is still our own broker command, not ucode's.
+    assert config.api_key_helper is not None
+    assert "omnigent.host.databricks_credential token" in config.api_key_helper
+
+
+def test_connect_fallback_rejects_ucode_base_url_off_workspace_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Security: state.json is writable and the broker bearer is presented to
+    whatever ANTHROPIC_BASE_URL resolves to. A ucode base URL that is not HTTPS on
+    the connected workspace host (a stale/tampered file) is ignored — the config
+    keeps the profile-derived gateway route rather than forwarding the bearer to an
+    unverified origin."""
+    _isolate_to_connect_fallback(monkeypatch)
+    from omnigent.host import databricks_credential as dc
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    # ucode state points the base URL at a DIFFERENT origin (and the model it
+    # would otherwise adopt). Must be refused.
+    state = UcodeWorkspaceState(
+        workspace_url="https://ws.example",
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-sonnet-4-6",
+                env={"ANTHROPIC_BASE_URL": "https://evil.example/anthropic"},
+            )
+        },
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", lambda url: state)
+
+    config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
+
+    assert config is not None
+    # The profile-derived route wins; the off-host base URL is not adopted.
+    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
+    # And its paired model is not adopted either (falls back to the catalog default).
+    assert config.model != "system.ai.claude-sonnet-4-6"
+    assert config.api_key_helper is not None
+
+
+def test_connect_fallback_pins_deployment_gateway_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deployment can pin the served gateway model via
+    OMNIGENT_DATABRICKS_GATEWAY_MODEL so managed sessions default to a model the
+    workspace actually serves, rather than the bundled catalog default."""
+    _isolate_to_connect_fallback(monkeypatch)
+    from omnigent.host import databricks_credential as dc
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-claude-sonnet-4-6")
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
+
+    assert config is not None
+    # The deployment override wins over the (stubbed) catalog default.
+    assert config.model == "databricks-claude-sonnet-4-6"
+
+
+def test_resolve_native_claude_config_declines_without_broker_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host-only profile with NO broker sidecar is not a managed connect host: the
+    fallback declines and Claude Code uses its own login (returns None)."""
+    _isolate_to_connect_fallback(monkeypatch)
+    from omnigent.host import databricks_credential as dc
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    dc._write_profile(cfg, "https://ws.example")  # profile but no sidecar
+
+    assert claude_native.resolve_native_claude_config(spec=None, refresh_models=False) is None
+
+
+def test_configured_provider_wins_over_connect_broker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering non-regression: the connect-broker fallback is the LAST resort. A
+    configured provider (spec / explicit default / global auth / ambient) wins even
+    when a broker sidecar is present, so a normal Claude harness is never overridden."""
+    sentinel = claude_native.ClaudeNativeUcodeConfig(env={"MARK": "configured-provider"})
+    # Step-2 explicit-default returns an entry → its config is used, short-circuiting.
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.default_provider_for_harness",
+        lambda cfg, harness: object(),
+    )
+    monkeypatch.setattr(
+        claude_native,
+        "_native_claude_config_from_entry",
+        lambda entry, *, refresh_models: sentinel,
+    )
+    # A broker sidecar IS present, but must be ignored (a provider is configured).
+    from omnigent.host import databricks_credential as dc
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "tok", "https://ws.example")
+
+    result = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
+    assert result is sentinel  # configured provider wins; broker fallback not consulted
+
+
+def test_configured_provider_wins_over_connect_broker_spec_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering in the SPEC branch (not just spec-less): when a spec resolves to a
+    provider, its config wins over the connect-broker fallback even with a broker
+    sidecar present — the broker is a last resort in the spec path too."""
+    from types import SimpleNamespace
+
+    sentinel = claude_native.ClaudeNativeUcodeConfig(env={"MARK": "spec-provider"})
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda spec, harness_type: object(),  # spec resolves to a provider entry
+    )
+    monkeypatch.setattr(
+        claude_native,
+        "_native_claude_config_from_entry",
+        lambda entry, *, refresh_models: sentinel,
+    )
+    from omnigent.host import databricks_credential as dc
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "tok", "https://ws.example")
+
+    spec = SimpleNamespace(executor=SimpleNamespace(profile=None, auth=None))
+    result = claude_native.resolve_native_claude_config(spec=spec, refresh_models=False)
+    assert result is sentinel  # spec provider wins; broker fallback not consulted
+
+
+def test_connect_fallback_drops_credential_env_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The connect-broker path adopts only allowlisted routing keys from the writable
+    state.json. Credential keys — ANTHROPIC_API_KEY (which would hard-fail the
+    terminal-env build alongside the apiKeyHelper) and ANTHROPIC_AUTH_TOKEN (which
+    would override the helper) — and arbitrary process env (PATH) are dropped."""
+    _isolate_to_connect_fallback(monkeypatch)
+    from omnigent.host import databricks_credential as dc
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    state = UcodeWorkspaceState(
+        workspace_url="https://ws.example",
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-sonnet-4-6",
+                env={
+                    "ANTHROPIC_BASE_URL": "https://ws.example/serving-endpoints/anthropic",
+                    "ANTHROPIC_API_KEY": "must-not-leak",
+                    "ANTHROPIC_AUTH_TOKEN": "must-not-leak",
+                    "PATH": "/evil/bin",
+                },
+            )
+        },
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", lambda url: state)
+
+    config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
+
+    assert config is not None
+    assert "ANTHROPIC_API_KEY" not in config.env
+    assert "ANTHROPIC_AUTH_TOKEN" not in config.env
+    assert "PATH" not in config.env
+    # The allowlisted routing key (the guarded base URL) is kept, and the bearer
+    # still reaches Claude Code via the broker helper, not a raw key.
+    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/serving-endpoints/anthropic"
+    assert config.api_key_helper is not None
+
+
+def test_resolve_native_claude_config_spec_path_reaches_connect_broker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner resolves with a spec (spec is not None). When that spec names no
+    provider and no usable ucode profile, resolution must still fall through to the
+    managed-connect-host broker fallback — not return None (which leaves Claude Code
+    'not logged in' on the real product path)."""
+    from types import SimpleNamespace
+
+    # Spec routes to no provider and carries no ucode profile.
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda spec, harness_type: None
+    )
+    monkeypatch.setattr(
+        claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None
+    )
+    spec = SimpleNamespace(executor=SimpleNamespace(profile=None))
+
+    from omnigent.host import databricks_credential as dc
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    config = claude_native.resolve_native_claude_config(spec=spec, refresh_models=False)
+    assert config is not None
+    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
+    assert (
+        config.api_key_helper
+        and "omnigent.host.databricks_credential token" in config.api_key_helper
+    )
+
+
+def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec that explicitly configures an API key must NOT be rerouted through
+    the owner's Databricks gateway on a managed connect host — Claude Code threads
+    that key itself. Even with a broker sidecar present, resolution returns None
+    (Claude's own login), not the broker config."""
+    from types import SimpleNamespace
+
+    from omnigent.spec.types import ApiKeyAuth
+
+    # The shared resolver returns None for an explicit ApiKeyAuth (it leaves bare
+    # keys to Claude's own login), which previously fell through to the broker.
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda spec, harness_type: None
+    )
+    monkeypatch.setattr(
+        claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None
+    )
+    spec = SimpleNamespace(executor=SimpleNamespace(profile=None, auth=ApiKeyAuth(api_key="sk-x")))
+
+    from omnigent.host import databricks_credential as dc
+
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    assert claude_native.resolve_native_claude_config(spec=spec, refresh_models=False) is None

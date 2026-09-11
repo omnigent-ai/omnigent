@@ -79,7 +79,15 @@ _logger = logging.getLogger(__name__)
 
 
 class RunnerUnavailableError(OmnigentError):
-    pass
+    """No runner is serving the session (HTTP 503 ``runner_unavailable``).
+
+    Distinct from :class:`HostUnavailableError`: nothing is known to be offline,
+    the session just has no runner bound — a managed session's sandbox is still
+    provisioning (or its launch failed; the server raises the same code for
+    both), or an external host's runner needs launching. Often recoverable by
+    waiting or by a relaunch, never by reconfiguring — but this class alone does
+    not prove the wait will resolve, so callers must not promise recovery.
+    """
 
 
 class AuthRequiredError(OmnigentError):
@@ -91,7 +99,12 @@ class AuthRequiredError(OmnigentError):
 
 
 class ServerUnreachableError(OmnigentError):
-    """The Omnigent server could not be reached at all (transport failure)."""
+    """The Omnigent server could not be reached at all (transport failure).
+
+    Ends a turn only when the FIRST connection fails — nothing is running
+    server-side yet to rejoin. A refused re-open inside the reconnect window
+    spends the stream budget instead, like any other mid-turn drop.
+    """
 
 
 class TokenRefreshTransientError(OmnigentError):
@@ -145,6 +158,12 @@ class HarnessNotConfiguredError(OmnigentError):
 # healthy turn riding through many proxy caps is never abandoned. A separate hard
 # cap on *total* reconnects backstops a pathological "replay one byte then drop"
 # loop, which would otherwise reset the consecutive counter forever.
+#
+# A failure to RE-open the stream (``ServerUnreachableError``) spends the same
+# budget: a refused connection during the reconnect window is the same transient
+# blip one step earlier in the request lifecycle, and the turn is still running
+# server-side. Only the very FIRST connection fails fast, because nothing is
+# running yet to rejoin.
 _STREAM_RECONNECT_MAX_ATTEMPTS = 6
 _STREAM_RECONNECT_MAX_TOTAL = 200
 _STREAM_RECONNECT_BACKOFF_S = 1.0
@@ -639,8 +658,9 @@ class OmnigentClient:
         # A transport error BEFORE the stream connects means the server is
         # unreachable; one AFTER the ``200 OK`` (thrown back in when the caller's
         # tail iteration fails) is a mid-stream drop — a proxy severing a
-        # long-lived chunked response, not a down server. The caller reconnects
-        # on the latter, so the two are classified distinctly.
+        # long-lived chunked response, not a down server. The caller reconnects on
+        # the latter, and on the former too once a turn is in flight — only the
+        # first open fails fast — so the two stay classified distinctly.
         connected = False
         try:
             async with self._client.stream(
@@ -937,7 +957,12 @@ class OmnigentClient:
                 # The stream ended without a terminal event or a drop (the server
                 # closed it cleanly) — the turn is over from this client's view.
                 return
-            except StreamInterruptedError as exc:
+            except (StreamInterruptedError, ServerUnreachableError) as exc:
+                if isinstance(exc, ServerUnreachableError) and attempt == 0:
+                    # The FIRST connection never landed, so no turn is running
+                    # server-side to rejoin — report the server unreachable rather
+                    # than retrying into nothing.
+                    raise
                 total_reconnects += 1
                 # A leg that forwarded a NEW event before dropping is progress, not
                 # a failing reconnect — reset the consecutive budget so the cap
@@ -952,19 +977,21 @@ class OmnigentClient:
                     attempt >= _STREAM_RECONNECT_MAX_ATTEMPTS
                     or total_reconnects >= _STREAM_RECONNECT_MAX_TOTAL
                 ):
-                    # Give up reconnecting — surface as a stream interruption (a
-                    # non-alarming "lost the live connection", not "server down").
+                    # Give up reconnecting — surface the last failure as it was
+                    # classified: a mid-tail drop stays the non-alarming "lost the
+                    # live connection", a run of refused re-opens is "server down".
                     self._logger.info(
-                        "Omnigent stream dropped and reconnect exhausted "
-                        "(%s attempts) session_id=%s",
+                        "Omnigent stream reconnect exhausted (%s attempts) session_id=%s: %s",
                         attempt,
                         session_id,
+                        exc,
                     )
                     raise
                 # The turn may have finished during the drop. If the server reports
                 # it no longer running, stop cleanly — the caller's end-of-turn
                 # reconcile recovers the committed final text. Unknown status means
-                # reconnect (a truly-down server re-fails as ServerUnreachableError).
+                # reconnect (this probe is best-effort, and a truly-down server
+                # re-fails on the next open until the budget runs out).
                 activity = await self.get_session_activity(session_id)
                 if activity.status in ("idle", "failed"):
                     self._logger.info(

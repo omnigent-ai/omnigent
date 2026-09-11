@@ -79,6 +79,7 @@ function renderHeader(props: {
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
   showFilesPanel?: boolean;
+  pending?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
   onFork?: () => void;
@@ -116,6 +117,7 @@ function renderHeader(props: {
             hasRailContent={props.hasRailContent ?? true}
             rightPanelOpen={false}
             onToggleRightPanel={() => {}}
+            pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
           />
         </TooltipProvider>
@@ -170,6 +172,38 @@ describe("ChatHeader — deployed Share presentation", () => {
       "share-button-glassy",
     );
     expect(share.querySelector(".lucide-user-plus")).not.toBeNull();
+  });
+});
+
+describe("ChatHeader — pending session presentation", () => {
+  it("shows the full desktop control shell disabled while Workspace remains available", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "temp:12345678",
+      conversationTitle: "Inspect the workspace",
+      pending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Add to project" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Agent tools and policies" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Chat view" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Terminal view" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Share session" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeEnabled();
+  });
+
+  it("collapses pending controls into one disabled mobile actions button", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "temp:12345678",
+      conversationTitle: "Inspect the workspace",
+      pending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Session actions" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Share session" })).toBeNull();
   });
 });
 

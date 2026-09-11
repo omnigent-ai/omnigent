@@ -340,6 +340,15 @@ export function clearRecentlyCreated(): void {
 }
 
 /**
+ * Drop one row from the keep-alive map — e.g. an optimistic unarchive whose
+ * PATCH failed, so the row must stop being re-injected and fall back to
+ * archived. Safe to call for an id that isn't tracked.
+ */
+export function unmarkRecentlyCreated(id: string): void {
+  recentlyCreatedSessions.delete(id);
+}
+
+/**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
  * refetch (which lags the search index). A new row sorts newest-first, so page 0
