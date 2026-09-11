@@ -352,6 +352,16 @@ _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 # pane in submission order, so the program sees one contiguous stream.
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
 
+# The same 16KB imsg cap rejects the one-shot launch invocation. A pane
+# command whose quoted argv exceeds this byte budget (e.g. large agent
+# instructions riding the CLI argv) is materialized into a launcher
+# script inside the private dir, so the ``new-session`` command tmux
+# sees stays small no matter how big the argv grows. Half the cap
+# leaves ample headroom for the option commands sharing the invocation.
+_LAUNCH_COMMAND_BYTES_MAX = 8192
+# Launcher script filename inside the instance's private dir.
+_LAUNCH_SCRIPT_FILENAME = "launch.sh"
+
 
 class _IdleDetector:
     """
@@ -1043,6 +1053,29 @@ class TerminalInstance:
             conversation_link or "",
         )
 
+    def _materialize_launch_script(self, inner_str: str) -> str:
+        """
+        Write the pane command to a script and return a short run command.
+
+        tmux's client->server protocol caps one command at ~16KB, the same
+        cap :meth:`send` chunks literal text for. A launch argv carrying
+        e.g. large agent instructions (``--append-system-prompt``) cannot
+        ride the ``new-session`` invocation inline, so the composed command
+        moves byte-for-byte into a script the pane shell execs — the pane
+        still runs the exact same argv while the command tmux sees stays
+        constant-size. The script lives in the private dir, sharing the
+        instance's 0700 confinement and cleanup lifecycle.
+
+        :param inner_str: The fully shell-quoted pane command.
+        :returns: A short shell command that runs the script.
+        """
+        script_path = self.private_dir / _LAUNCH_SCRIPT_FILENAME
+        script_path.write_text(f"#!/bin/sh\nexec {inner_str}\n", encoding="utf-8")
+        script_path.chmod(0o700)
+        # Run via /bin/sh (not direct exec) so a noexec-mounted temp dir
+        # cannot break the launch.
+        return f"/bin/sh {_shell_quote(str(script_path))}"
+
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
         if self.running:
@@ -1110,6 +1143,11 @@ class TerminalInstance:
         else:
             inner_cmd = [self.command, *self.args]
         inner_str = " ".join(_shell_quote(c) for c in inner_cmd)
+        # tmux rejects the whole launch invocation over its ~16KB cap
+        # ("command too long"), so an oversized pane command runs via a
+        # launcher script instead of riding ``new-session`` inline.
+        if len(inner_str.encode("utf-8")) > _LAUNCH_COMMAND_BYTES_MAX:
+            inner_str = self._materialize_launch_script(inner_str)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 
