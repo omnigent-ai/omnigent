@@ -214,7 +214,7 @@ def create_session_policies_router(
                 f"Policy with name '{body.name}' already exists in this session",
                 code=ErrorCode.CONFLICT,
             ) from exc
-        invalidate_session_policy_specs_cache(session_id)
+        invalidate_session_policy_specs_cache(session_id, store)
         _logger.info(
             "session_policies/create: user=%s created policy_id=%s session_id=%s handler=%s",
             user_id or "(single-user)",
@@ -382,7 +382,7 @@ def create_session_policies_router(
             ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
-        invalidate_session_policy_specs_cache(session_id)
+        invalidate_session_policy_specs_cache(session_id, store)
         _logger.info(
             "session_policies/update: user=%s updated policy_id=%s session_id=%s",
             user_id or "(single-user)",
@@ -418,7 +418,7 @@ def create_session_policies_router(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
         store.delete(policy_id, session_id)
-        invalidate_session_policy_specs_cache(session_id)
+        invalidate_session_policy_specs_cache(session_id, store)
         _logger.info(
             "session_policies/delete: user=%s deleted policy_id=%s session_id=%s",
             user_id or "(single-user)",

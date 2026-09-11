@@ -86,7 +86,10 @@ _SESSION_OWNER_CACHE: cachetools.LRUCache[str, str] = cachetools.LRUCache(maxsiz
 # TTL cache of ``workspace_id -> list[PolicySpec]`` for DB-stored default
 # policies. Default policies are admin-managed and change infrequently, so
 # a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
-# evaluation while still propagating changes within half a minute.
+# evaluation while still propagating changes within half a minute. Keyed by
+# ``PolicyStore.effective_workspace_id()`` — the workspace the store call
+# observes — because integrations that scope stores per call leave the
+# caller's ambient workspace context unbound.
 _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachetools.TTLCache(
     maxsize=256, ttl=30
 )
@@ -1469,8 +1472,10 @@ def _load_default_policy_specs(
 
     Results are cached per workspace for 30 s (see
     :data:`_DEFAULT_POLICY_SPECS_CACHE`) to avoid a ``list_defaults()``
-    DB round-trip on every tool-call evaluation. The cache is keyed by
-    workspace id so multi-tenant deployments never share results across
+    DB round-trip on every tool-call evaluation. The cache key is
+    :meth:`~omnigent.stores.policy_store.PolicyStore.effective_workspace_id`
+    — the workspace the store call itself observes — so multi-tenant
+    deployments that scope only store calls never share results across
     tenants. Call :func:`invalidate_default_policy_specs_cache` after any
     mutation to make changes visible before the TTL expires.
 
@@ -1481,9 +1486,7 @@ def _load_default_policy_specs(
     """
     if policy_store is None:
         return []
-    from omnigent.db.db_models import current_workspace_id
-
-    workspace_id = current_workspace_id()
+    workspace_id = policy_store.effective_workspace_id()
     cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
     if cached is not None:
         return cached
@@ -1511,34 +1514,55 @@ def _load_default_policy_specs(
     return specs
 
 
-def invalidate_default_policy_specs_cache() -> None:
+def invalidate_default_policy_specs_cache(
+    policy_store: PolicyStore | None = None,
+) -> None:
     """
-    Evict the current workspace's entry from the default-policy specs cache.
+    Evict one workspace's entry from the default-policy specs cache.
 
     Call this after any mutation (create, update, delete) of a default
     policy so the next :func:`build_policy_engine` call re-reads from the
-    DB rather than serving a stale TTL entry. Scoped to the current
-    workspace context via :func:`~omnigent.db.db_models.current_workspace_id`.
+    DB rather than serving a stale TTL entry.
+
+    :param policy_store: The store the mutation went through. When given,
+        the eviction targets the workspace that store's calls observe
+        (matching the load-path cache key); when ``None``, falls back to
+        the ambient :func:`~omnigent.db.db_models.current_workspace_id`.
     """
-    from omnigent.db.db_models import current_workspace_id
+    if policy_store is not None:
+        workspace_id = policy_store.effective_workspace_id()
+    else:
+        from omnigent.db.db_models import current_workspace_id
 
-    _DEFAULT_POLICY_SPECS_CACHE.pop(current_workspace_id(), None)
+        workspace_id = current_workspace_id()
+    _DEFAULT_POLICY_SPECS_CACHE.pop(workspace_id, None)
 
 
-def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
+def invalidate_session_policy_specs_cache(
+    conversation_id: str,
+    policy_store: PolicyStore | None = None,
+) -> None:
     """
     Evict a conversation's entry from the session policy specs cache.
 
     Call this after any mutation (create, update, delete) of a session
     policy so the next :func:`build_policy_engine` call re-reads from
-    the DB. Scoped to the current workspace context.
+    the DB.
 
     :param conversation_id: The session whose cache entry to evict,
         e.g. ``"conv_abc123"``.
+    :param policy_store: The store the mutation went through. When given,
+        the eviction targets the workspace that store's calls observe
+        (matching the load-path cache key); when ``None``, falls back to
+        the ambient :func:`~omnigent.db.db_models.current_workspace_id`.
     """
-    from omnigent.db.db_models import current_workspace_id
+    if policy_store is not None:
+        workspace_id = policy_store.effective_workspace_id()
+    else:
+        from omnigent.db.db_models import current_workspace_id
 
-    _SESSION_POLICY_SPECS_CACHE.pop((current_workspace_id(), conversation_id), None)
+        workspace_id = current_workspace_id()
+    _SESSION_POLICY_SPECS_CACHE.pop((workspace_id, conversation_id), None)
 
 
 def _load_session_policy_specs(
@@ -1575,9 +1599,7 @@ def _load_session_policy_specs(
     """
     if policy_store is None:
         return []
-    from omnigent.db.db_models import current_workspace_id
-
-    key = (current_workspace_id(), conversation_id)
+    key = (policy_store.effective_workspace_id(), conversation_id)
     cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(key)
     if cached is not None:
         return cached

@@ -227,7 +227,7 @@ def create_default_policies_router(
                 f"Default policy with name '{body.name}' already exists",
                 code=ErrorCode.CONFLICT,
             ) from exc
-        invalidate_default_policy_specs_cache()
+        invalidate_default_policy_specs_cache(store)
         _logger.info(
             "policies/create: user=%s created policy_id=%s handler=%s",
             user_id or "(single-user)",
@@ -370,7 +370,7 @@ def create_default_policies_router(
             ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
-        invalidate_default_policy_specs_cache()
+        invalidate_default_policy_specs_cache(store)
         _logger.info(
             "policies/update: user=%s updated policy_id=%s",
             user_id or "(single-user)",
@@ -398,7 +398,7 @@ def create_default_policies_router(
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
         store.delete_default(policy_id)
-        invalidate_default_policy_specs_cache()
+        invalidate_default_policy_specs_cache(store)
         _logger.info(
             "policies/delete: user=%s deleted policy_id=%s",
             user_id or "(single-user)",

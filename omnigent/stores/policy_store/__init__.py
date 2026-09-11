@@ -38,6 +38,23 @@ class PolicyStore(ABC):
         """
         self.storage_location = storage_location
 
+    def effective_workspace_id(self) -> int:
+        """
+        Return the workspace id this store's calls observe.
+
+        Multi-tenant integrations bind ``workspace_scope()`` around each
+        store method call, so the workspace read *inside* a call can
+        differ from the caller's ambient context. Key any cache of this
+        store's results by this value, never by ambient
+        ``current_workspace_id()`` read outside a store call.
+
+        :returns: The workspace id in effect during this call, e.g. ``0``
+            in the single-workspace OSS deployment.
+        """
+        from omnigent.db.db_models import current_workspace_id
+
+        return current_workspace_id()
+
     # ── Session-scoped policy methods ────────────────────────────
 
     @abstractmethod

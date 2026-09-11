@@ -11,8 +11,11 @@ Also covers DB-stored default policies (``session_id IS NULL``) and the
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.function import FunctionPolicy
@@ -35,6 +38,7 @@ from omnigent.spec.types import (
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
 # ── _stored_policy_to_spec ──────────────────────────────────────────────────
@@ -710,3 +714,148 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
         "yaml_admin_policy",
         "__ask_on_add_policy",
     ]
+
+
+# ── multi-tenant cache keying ────────────────────────────────────────────────
+
+
+class _PerCallWorkspaceScopedStore:
+    """Scopes every store call to one workspace, like a tenant store router.
+
+    Emulates the multi-tenant integration contract: only store method
+    calls run inside ``workspace_scope``; the caller's ambient context
+    stays unscoped (``current_workspace_id() == 0``).
+    """
+
+    def __init__(self, inner: SqlAlchemyPolicyStore, workspace_id: int) -> None:
+        self._inner = inner
+        self._workspace_id = workspace_id
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def scoped(*args: Any, **kwargs: Any) -> Any:
+            with workspace_scope(self._workspace_id):
+                return attr(*args, **kwargs)
+
+        return scoped
+
+
+def _per_call_scoped_store(inner: SqlAlchemyPolicyStore, workspace_id: int) -> PolicyStore:
+    """A store whose every call runs scoped to *workspace_id*."""
+    return cast(PolicyStore, _PerCallWorkspaceScopedStore(inner, workspace_id))
+
+
+def test_default_policy_cache_not_shared_across_store_scoped_workspaces(
+    db_uri: str,
+) -> None:
+    """One workspace's cached default specs must not serve another workspace.
+
+    With per-call-scoped stores, the cache must key by the workspace the
+    store call observes — not by the caller's ambient context (0 for
+    every tenant), which would collapse all tenants onto one cache slot.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    inner = SqlAlchemyPolicyStore(db_uri)
+    ws_a = _per_call_scoped_store(inner, 101)
+    ws_b = _per_call_scoped_store(inner, 202)
+    ws_a.create_default(
+        policy_id="a3f1c2d4e5b697a8b9c0d1e2f3a4b5c6",
+        name="ws_a_guard",
+        type="python",
+        handler="myorg.policies.deny_all",
+        enabled=True,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    try:
+        specs_a = _load_default_policy_specs(ws_a)
+        assert [s.name for s in specs_a] == ["ws_a_guard"]
+
+        specs_b = _load_default_policy_specs(ws_b)
+        assert specs_b == [], (
+            "workspace 202 was served workspace 101's cached default policies: "
+            f"{[s.name for s in specs_b]}; "
+            f"cache keys={list(_DEFAULT_POLICY_SPECS_CACHE.keys())}"
+        )
+
+        # Reverse direction: one workspace's cached empty list must not
+        # mask another workspace's real default policies.
+        _DEFAULT_POLICY_SPECS_CACHE.clear()
+        assert _load_default_policy_specs(ws_b) == []
+        specs_a_again = _load_default_policy_specs(ws_a)
+        assert [s.name for s in specs_a_again] == ["ws_a_guard"], (
+            "workspace 101's default policy was masked by workspace 202's cached empty result"
+        )
+    finally:
+        _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+
+def test_session_policy_cache_not_shared_across_store_scoped_workspaces(
+    db_uri: str,
+) -> None:
+    """One workspace's cached session specs must not serve another workspace.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation()
+    inner = SqlAlchemyPolicyStore(db_uri)
+    ws_a = _per_call_scoped_store(inner, 101)
+    ws_b = _per_call_scoped_store(inner, 202)
+    ws_a.create(
+        policy_id="b4e2d3c5f6a798b9c0d1e2f3a4b5c6d7",
+        session_id=conv.id,
+        name="ws_a_session_guard",
+        type="python",
+        handler="myorg.policies.deny_all",
+    )
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    try:
+        specs_a = _load_session_policy_specs(conv.id, ws_a)
+        assert [s.name for s in specs_a] == ["ws_a_session_guard"]
+
+        specs_b = _load_session_policy_specs(conv.id, ws_b)
+        assert specs_b == [], (
+            "workspace 202 was served workspace 101's cached session policies: "
+            f"{[s.name for s in specs_b]}; "
+            f"cache keys={list(_SESSION_POLICY_SPECS_CACHE.keys())}"
+        )
+    finally:
+        _SESSION_POLICY_SPECS_CACHE.clear()
+
+
+def test_invalidate_default_policy_specs_cache_uses_store_scope(
+    db_uri: str,
+) -> None:
+    """Invalidating via the store evicts the workspace its calls observe.
+
+    A default-policy mutation route runs with an unscoped ambient context
+    in per-call-scoped deployments; passing the store makes the eviction
+    hit the same key the load path used.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    inner = SqlAlchemyPolicyStore(db_uri)
+    ws_a = _per_call_scoped_store(inner, 101)
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    try:
+        assert _load_default_policy_specs(ws_a) == []
+
+        ws_a.create_default(
+            policy_id="c5f3e4d6a7b899c0d1e2f3a4b5c6d7e8",
+            name="ws_a_new_guard",
+            type="python",
+            handler="myorg.policies.deny_all",
+            enabled=True,
+        )
+        invalidate_default_policy_specs_cache(ws_a)
+
+        specs = _load_default_policy_specs(ws_a)
+        assert [s.name for s in specs] == ["ws_a_new_guard"], (
+            "store-scoped invalidation missed the workspace's cache entry; "
+            f"cache keys={list(_DEFAULT_POLICY_SPECS_CACHE.keys())}"
+        )
+    finally:
+        _DEFAULT_POLICY_SPECS_CACHE.clear()
