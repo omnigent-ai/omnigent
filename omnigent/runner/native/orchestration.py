@@ -1531,7 +1531,139 @@ async def _supervise_opencode_forwarder(
 # (``POLICY_ACTION_ASK``), so the evaluate POST may block until a human
 # resolves it. Match the codex-native policy hook's day-long budget; the
 # server caps the real wait via the deciding policy's ``ask_timeout``.
+# This is the ATTENDED budget: a human is expected to be watching the
+# session, so waiting a day beats auto-refusing someone who stepped away.
 _OPENCODE_POLICY_EVALUATE_TIMEOUT_S = 86400.0
+
+# ── Headless ASK resolution ────────────────────────────────────────────
+#
+# A fleet/headless OpenCode session has NO human to resolve the approval
+# card the server parks on an ASK verdict (see
+# ``routes_hooks.evaluate_policy`` → ``_hold_native_ask_gate``), so the
+# day-long budget above becomes a day-long wedge: the worker blocks on one
+# POST until ``ask_timeout`` fires, then gets a DENY anyway. The runner
+# already knows the session is headless — this evaluator is built only when
+# ``server_client is not None`` — so it resolves the ASK itself instead of
+# waiting for a human who will never arrive.
+#
+# ``omnigent/runner/pending_approvals.py`` names this exact gap in its own
+# docstring: "Headless/unattended agents that want a fast fail-closed should
+# pass a finite ``timeout_seconds``." Nothing did, for OpenCode.
+#
+# IMPORTANT: this does NOT touch ``config["permission"] = "ask"`` in
+# opencode.json. OpenCode has no pre-tool hook, so ``"ask"`` is the only
+# channel that routes tool calls through the policy engine at all. The point
+# is to RESOLVE the verdict, not to blind the engine — a fix that flips
+# opencode.json to ``"allow"`` silently disables server-side policy for the
+# whole session, which is strictly worse than the wedge it cures.
+OPENCODE_HEADLESS_ASK_MODE_ENV = "OMNIGENT_OPENCODE_HEADLESS_ASK"
+OPENCODE_HEADLESS_ASK_TIMEOUT_ENV = "OMNIGENT_OPENCODE_HEADLESS_ASK_TIMEOUT_S"
+
+# ``deny``  — resolve an unattended ASK to DENY after a short wait (DEFAULT).
+# ``allow`` — resolve it to ALLOW after a short wait, logged at WARNING.
+# ``wait``  — legacy behaviour: keep the day-long budget and pass ASK through
+#             (the forwarder then fails it closed to ``reject``). Escape hatch
+#             for a session someone really is babysitting.
+_OPENCODE_HEADLESS_ASK_MODES = frozenset({"deny", "allow", "wait"})
+
+# DEFAULT = ``deny``, deliberately. Rationale, so the next reader does not
+# re-litigate it:
+#   * Every existing failure path in this evaluator already returns
+#     ``deny``. Defaulting to ``allow`` would convert a uniformly
+#     fail-closed posture into fail-open for every fleet OpenCode session
+#     at once, with no opt-in — the same regression that sank the two
+#     earlier ``permission: "allow"`` patches.
+#   * An ASK verdict is a policy author's explicit statement that a human
+#     should look at this call. Auto-allowing deletes that decision and
+#     leaves only a log line; auto-denying preserves it while handing
+#     control back to the agent in minutes instead of a day.
+#   * The failure modes are asymmetric and only one is recoverable. A
+#     wrongly-denied tool call costs a retry: the agent sees the reject,
+#     reports it, or a human re-runs it. A wrongly-allowed destructive call
+#     (rm, force-push, spend) cannot be un-run.
+#   * Nothing is hidden by denying. The elicitation card is still parked
+#     server-side for audit, and a human who is watching can still see what
+#     the agent tried to do.
+# Operators who genuinely want unattended autonomy (a sandboxed throwaway
+# workspace, say) set the env var to ``allow`` and get a WARNING per call.
+OPENCODE_HEADLESS_ASK_MODE_DEFAULT = "deny"
+
+# Short enough that a wedged fleet worker recovers within one human's
+# attention span rather than a day; long enough that a human who IS at the
+# console can still catch and resolve the card. Overridable per deployment.
+OPENCODE_HEADLESS_ASK_TIMEOUT_DEFAULT_S = 300.0
+
+
+def resolve_opencode_headless_ask_mode(
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """
+    Resolve how an unattended ASK verdict is settled for OpenCode.
+
+    Reads :data:`OPENCODE_HEADLESS_ASK_MODE_ENV`, case-insensitively, and
+    falls back to :data:`OPENCODE_HEADLESS_ASK_MODE_DEFAULT` when unset,
+    blank, or not one of ``deny`` / ``allow`` / ``wait``. An unrecognised
+    value falls back rather than raising: a typo in a fleet launch env must
+    not take the session's permission gate down with it, and the fallback
+    is the conservative mode.
+
+    :param env: Environment mapping to read; defaults to ``os.environ``.
+    :returns: One of ``"deny"``, ``"allow"``, ``"wait"``.
+    """
+    source = os.environ if env is None else env
+    raw = (source.get(OPENCODE_HEADLESS_ASK_MODE_ENV) or "").strip().lower()
+    if raw in _OPENCODE_HEADLESS_ASK_MODES:
+        return raw
+    if raw:
+        _logger.warning(
+            "Ignoring unrecognised %s=%r; falling back to %r",
+            OPENCODE_HEADLESS_ASK_MODE_ENV,
+            raw,
+            OPENCODE_HEADLESS_ASK_MODE_DEFAULT,
+        )
+    return OPENCODE_HEADLESS_ASK_MODE_DEFAULT
+
+
+def resolve_opencode_headless_ask_timeout_s(
+    env: Mapping[str, str] | None = None,
+) -> float:
+    """
+    Resolve the wait budget before an unattended ASK is auto-resolved.
+
+    Reads :data:`OPENCODE_HEADLESS_ASK_TIMEOUT_ENV` as a float number of
+    seconds, falling back to
+    :data:`OPENCODE_HEADLESS_ASK_TIMEOUT_DEFAULT_S` when unset,
+    unparseable, or non-positive. In ``wait`` mode this value is unused and
+    the full :data:`_OPENCODE_POLICY_EVALUATE_TIMEOUT_S` budget applies.
+
+    :param env: Environment mapping to read; defaults to ``os.environ``.
+    :returns: Positive timeout in seconds.
+    """
+    source = os.environ if env is None else env
+    raw = (source.get(OPENCODE_HEADLESS_ASK_TIMEOUT_ENV) or "").strip()
+    if not raw:
+        return OPENCODE_HEADLESS_ASK_TIMEOUT_DEFAULT_S
+    try:
+        parsed = float(raw)
+    except ValueError:
+        _logger.warning(
+            "Ignoring unparseable %s=%r; falling back to %ss",
+            OPENCODE_HEADLESS_ASK_TIMEOUT_ENV,
+            raw,
+            OPENCODE_HEADLESS_ASK_TIMEOUT_DEFAULT_S,
+        )
+        return OPENCODE_HEADLESS_ASK_TIMEOUT_DEFAULT_S
+    if parsed <= 0:
+        _logger.warning(
+            "Ignoring non-positive %s=%r; falling back to %ss",
+            OPENCODE_HEADLESS_ASK_TIMEOUT_ENV,
+            raw,
+            OPENCODE_HEADLESS_ASK_TIMEOUT_DEFAULT_S,
+        )
+        return OPENCODE_HEADLESS_ASK_TIMEOUT_DEFAULT_S
+    return parsed
+
+
 # Map the server's proto verdict onto the forwarder's verdict vocabulary
 # (``map_verdict_to_decision`` reads ``decision``). Anything unknown is
 # treated as ``ask`` → the forwarder fails it closed to ``reject``.
@@ -1593,9 +1725,36 @@ def _build_opencode_policy_evaluator(
                 "context": {"harness": OPENCODE_NATIVE_HARNESS},
             },
         }
+        ask_mode = resolve_opencode_headless_ask_mode()
+        # In ``wait`` mode keep the attended day-long budget. Otherwise cap the
+        # POST so a parked approval card nobody can resolve stops holding the
+        # worker: the server keeps the elicitation for audit, we settle locally.
+        post_timeout = (
+            _OPENCODE_POLICY_EVALUATE_TIMEOUT_S
+            if ask_mode == "wait"
+            else resolve_opencode_headless_ask_timeout_s()
+        )
         try:
-            resp = await server_client.post(
-                url, json=body, timeout=_OPENCODE_POLICY_EVALUATE_TIMEOUT_S
+            resp = await server_client.post(url, json=body, timeout=post_timeout)
+        except httpx.TimeoutException:
+            # Distinguished from a transport failure below: a timeout in a
+            # non-``wait`` mode is the expected shape of "the server parked an
+            # approval card and no human is here", which is precisely the
+            # verdict this policy exists to settle. A timeout in ``wait`` mode
+            # means the full day elapsed, so it still fails closed.
+            if ask_mode == "wait":
+                _logger.warning(
+                    "OpenCode policy evaluate timed out for %s; failing closed",
+                    conversation_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
+                return {"decision": "deny"}
+            return _resolve_headless_ask(
+                ask_mode,
+                conversation_id=conversation_id,
+                tool_name=str(normalized.get("action") or "permission"),
+                cause=f"no human resolved the approval card within {post_timeout}s",
             )
         except httpx.HTTPError:
             _logger.warning(
@@ -1622,9 +1781,68 @@ def _build_opencode_policy_evaluator(
             )
             return {"decision": "deny"}
         action = result.get("result") if isinstance(result, Mapping) else None
-        return {"decision": _OPENCODE_POLICY_ACTION_TO_DECISION.get(str(action), "ask")}
+        decision = _OPENCODE_POLICY_ACTION_TO_DECISION.get(str(action), "ask")
+        if decision == "ask" and ask_mode != "wait":
+            # The server answered ASK outright rather than holding the gate
+            # (read-only caller, or a phase it does not park on), and an
+            # unknown verdict lands here too. Either way nobody is going to
+            # resolve it, so settle it instead of handing the forwarder an
+            # ``ask`` it can only turn into a silent reject.
+            return _resolve_headless_ask(
+                ask_mode,
+                conversation_id=conversation_id,
+                tool_name=str(normalized.get("action") or "permission"),
+                cause=f"server returned {action!r} with no attended approval path",
+            )
+        return {"decision": decision}
 
     return _evaluate
+
+
+def _resolve_headless_ask(
+    mode: str,
+    *,
+    conversation_id: str,
+    tool_name: str,
+    cause: str,
+) -> Mapping[str, object]:
+    """
+    Settle an ASK verdict for a session with no human to resolve it.
+
+    Both outcomes are logged at WARNING with the session id, the tool, and
+    why the ASK went unattended: an auto-resolved approval gate must leave a
+    trail whichever way it resolves, since neither outcome is what the
+    policy author asked for.
+
+    :param mode: ``"deny"`` or ``"allow"`` — see
+        :func:`resolve_opencode_headless_ask_mode`. Any other value is
+        treated as ``"deny"``.
+    :param conversation_id: Owning Omnigent session id, for the log record.
+    :param tool_name: OpenCode action being gated, e.g. ``"bash"``.
+    :param cause: Why the ASK could not be resolved by a human.
+    :returns: A verdict mapping the forwarder can act on.
+    """
+    if mode == "allow":
+        _logger.warning(
+            "OpenCode headless ASK auto-ALLOWED for %s (tool=%s): %s. "
+            "Policy wanted a human; %s=allow granted it unattended.",
+            conversation_id,
+            tool_name,
+            cause,
+            OPENCODE_HEADLESS_ASK_MODE_ENV,
+            extra={"session_id": conversation_id},
+        )
+        return {"decision": "allow"}
+    _logger.warning(
+        "OpenCode headless ASK auto-DENIED for %s (tool=%s): %s. "
+        "Set %s=allow to auto-approve unattended asks instead.",
+        conversation_id,
+        tool_name,
+        cause,
+        OPENCODE_HEADLESS_ASK_MODE_ENV,
+        extra={"session_id": conversation_id},
+    )
+    return {"decision": "deny"}
 
 
 def _opencode_native_model_from_spec(
