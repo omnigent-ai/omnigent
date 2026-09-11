@@ -7541,11 +7541,17 @@ async def test_post_external_model_options_populates_picker_and_publishes(
             "type": "external_model_options",
             "data": {
                 "models": [
-                    {"id": "databricks-claude-sonnet-4-6", "displayName": "Sonnet 4.6"},
+                    {
+                        "id": "databricks-claude-sonnet-4-6",
+                        "displayName": "Sonnet 4.6",
+                        "provider": "databricks",
+                    },
                     # No displayName → falls back to the id.
-                    {"id": "anthropic-claude-opus-4-1"},
+                    {"id": "anthropic-claude-opus-4-1", "provider": "anthropic"},
                     # Duplicate id collapses.
                     {"id": "databricks-claude-sonnet-4-6"},
+                    # Provider omitted when absent/invalid.
+                    {"id": "no-provider-model", "provider": None},
                 ]
             },
         },
@@ -7559,10 +7565,15 @@ async def test_post_external_model_options_populates_picker_and_publishes(
     assert [m["id"] for m in snapshot["model_options"]] == [
         "databricks-claude-sonnet-4-6",
         "anthropic-claude-opus-4-1",
+        "no-provider-model",
     ]
     assert snapshot["model_options"][0]["displayName"] == "Sonnet 4.6"
+    assert snapshot["model_options"][0]["provider"] == "databricks"
     # Missing displayName defaults to the id.
     assert snapshot["model_options"][1]["displayName"] == "anthropic-claude-opus-4-1"
+    assert snapshot["model_options"][1]["provider"] == "anthropic"
+    # Provider omitted when absent/invalid.
+    assert "provider" not in snapshot["model_options"][2]
 
 
 async def test_post_external_model_options_empty_evicts_cache(

@@ -3598,6 +3598,177 @@ describe("Composer config gear", () => {
       );
     });
   });
+
+  describe("model search", () => {
+    function longOptions(count: number) {
+      return Array.from({ length: count }, (_, i) => ({
+        id: `model-${i}`,
+        displayName: `Model ${i}`,
+      }));
+    }
+
+    it("shows a search input only for long catalogs", async () => {
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: longOptions(15),
+          })}
+        />,
+      );
+      await openSessionModels();
+      expect(screen.queryByTestId("composer-agent-models-search")).toBeNull();
+    });
+
+    it("filters model items and keeps the Default row visible", async () => {
+      const options = [
+        { id: "alpha", displayName: "Alpha One" },
+        { id: "beta", displayName: "Beta Two" },
+        ...longOptions(14),
+      ];
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      const search = screen.getByTestId("composer-agent-models-search");
+      fireEvent.change(search, { target: { value: "alpha" } });
+      expect(screen.getByTestId("composer-agent-model-alpha")).toBeTruthy();
+      expect(screen.queryByTestId("composer-agent-model-beta")).toBeNull();
+      expect(screen.getByTestId("composer-agent-model-default")).toBeTruthy();
+    });
+
+    it("selects a filtered model", async () => {
+      const setModel = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ setModel });
+      const options = [{ id: "alpha", displayName: "Alpha One" }, ...longOptions(15)];
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      fireEvent.change(screen.getByTestId("composer-agent-models-search"), {
+        target: { value: "alpha" },
+      });
+      fireEvent.click(screen.getByTestId("composer-agent-model-alpha"));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith("alpha", { expectConfirmation: true }),
+      );
+    });
+
+    it("groups models under provider labels when the catalog spans providers", async () => {
+      const options = [
+        { id: "zai/glm-5.3", displayName: "GLM 5.3", provider: "zai" },
+        { id: "moonshotai/kimi-k3", displayName: "Kimi K3", provider: "moonshotai" },
+        ...Array.from({ length: 15 }, (_, i) => ({
+          id: `zai/filler-${i}`,
+          displayName: `Filler ${i}`,
+          provider: "zai",
+        })),
+      ];
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "pi",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+
+      expect(screen.getByTestId("composer-agent-models")).toBeTruthy();
+      const providerLabels = document.querySelectorAll("[data-provider]");
+      expect(providerLabels.length).toBe(2);
+      expect(providerLabels[0]).toHaveTextContent("moonshotai");
+      expect(providerLabels[1]).toHaveTextContent("zai");
+      // Provider-labeled items keep their interaction contracts.
+      fireEvent.click(screen.getByTestId("composer-agent-model-zai/glm-5.3"));
+    });
+
+    it("keeps the list flat when every option carries the same provider", async () => {
+      const options = Array.from({ length: 16 }, (_, i) => ({
+        id: `zai/model-${i}`,
+        displayName: `Model ${i}`,
+        provider: "zai",
+      }));
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "pi",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      expect(screen.getByTestId("composer-agent-model-zai/model-0")).toBeTruthy();
+      expect(document.querySelectorAll("[data-provider]").length).toBe(0);
+    });
+
+    it("keeps the list flat when options carry no or one provider", async () => {
+      const options = [
+        { id: "alpha", displayName: "Alpha One" },
+        ...Array.from({ length: 15 }, (_, i) => ({
+          id: `model-${i}`,
+          displayName: `Model ${i}`,
+        })),
+      ];
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      expect(document.querySelectorAll("[data-provider]").length).toBe(0);
+      expect(screen.getByTestId("composer-agent-model-alpha")).toBeTruthy();
+    });
+
+    it("hides a provider group emptied by the search filter", async () => {
+      const options = [
+        { id: "zai/glm-5.3", displayName: "GLM 5.3", provider: "zai" },
+        { id: "moonshotai/kimi-k3", displayName: "Kimi K3", provider: "moonshotai" },
+        ...Array.from({ length: 15 }, (_, i) => ({
+          id: `zai/filler-${i}`,
+          displayName: `Filler ${i}`,
+          provider: "zai",
+        })),
+      ];
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "pi",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      fireEvent.change(screen.getByTestId("composer-agent-models-search"), {
+        target: { value: "kimi" },
+      });
+      const providerLabels = document.querySelectorAll("[data-provider]");
+      expect(providerLabels.length).toBe(1);
+      expect(providerLabels[0]).toHaveTextContent("moonshotai");
+      expect(screen.getByTestId("composer-agent-model-moonshotai/kimi-k3")).toBeTruthy();
+      expect(screen.queryByTestId("composer-agent-model-zai/glm-5.3")).toBeNull();
+    });
+  });
 });
 
 // The gear modal's "Subagent routing" row — the only in-session routing control,

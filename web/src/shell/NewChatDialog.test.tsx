@@ -2373,6 +2373,102 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBeUndefined();
   });
 
+  describe("model search", () => {
+    function longClaudeModels(count: number) {
+      return Array.from({ length: count }, (_, i) => ({
+        id: `model-${i}`,
+        displayName: `Model ${i}`,
+      }));
+    }
+
+    it("shows a search input only for long catalogs", () => {
+      mockClaudeModels(longClaudeModels(15));
+      renderLanding();
+      openAgentModels("a1");
+      expect(screen.queryByTestId("composer-agent-models-search")).toBeNull();
+    });
+
+    it("filters model items and keeps the Default row visible", () => {
+      mockClaudeModels([
+        { id: "alpha", displayName: "Alpha One" },
+        { id: "beta", displayName: "Beta Two" },
+        ...longClaudeModels(14),
+      ]);
+      renderLanding();
+      openAgentModels("a1");
+      const search = screen.getByTestId("composer-agent-models-search");
+      fireEvent.change(search, { target: { value: "alpha" } });
+      expect(screen.getByTestId("new-chat-landing-agent-model-alpha")).toBeTruthy();
+      expect(screen.queryByTestId("new-chat-landing-agent-model-beta")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-agent-model-default")).toBeTruthy();
+    });
+
+    it("selects a filtered model", async () => {
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      mockClaudeModels([{ id: "alpha", displayName: "Alpha One" }, ...longClaudeModels(15)]);
+      renderLanding();
+      openAgentModels("a1");
+      fireEvent.change(screen.getByTestId("composer-agent-models-search"), {
+        target: { value: "alpha" },
+      });
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-alpha"));
+      closeMenu();
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBe("alpha");
+    });
+
+    it("groups pi models under provider labels and selects from a group", async () => {
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_grouped" }),
+      } as unknown as Response);
+      mockAgents([
+        {
+          id: "ag_pi",
+          name: "pi-native-ui",
+          display_name: "Pi",
+          description: null,
+          harness: "pi-native",
+          skills: [],
+        },
+      ]);
+      useHostModelOptionsMock.mockReturnValue({
+        data: [
+          {
+            id: "zai/glm-5.3",
+            model: "zai/glm-5.3",
+            displayName: "GLM 5.3",
+            provider: "zai",
+          },
+          {
+            id: "moonshotai/kimi-k3",
+            model: "moonshotai/kimi-k3",
+            displayName: "Kimi K3",
+            provider: "moonshotai",
+          },
+        ],
+        isLoading: false,
+      } as unknown as ReturnType<typeof useHostModelOptions>);
+
+      renderLanding();
+      openAgentModels("ag_pi");
+
+      const providerLabels = document.querySelectorAll("[data-provider]");
+      expect(providerLabels.length).toBe(2);
+      expect(providerLabels[0]).toHaveTextContent("moonshotai");
+      expect(providerLabels[1]).toHaveTextContent("zai");
+      expect(screen.getByTestId("new-chat-landing-agent-model-zai/glm-5.3")).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-zai/glm-5.3"));
+      closeMenu();
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBe("zai/glm-5.3");
+    });
+  });
+
   it("names Pi model and thinking-level details in the harness trigger", () => {
     mockAgents([
       {

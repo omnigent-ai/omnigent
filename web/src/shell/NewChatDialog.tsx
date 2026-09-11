@@ -51,7 +51,6 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { iconForAgent } from "@/components/AgentCard";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -63,8 +62,11 @@ import {
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
+  ModelMenuSearch,
+  ModelMenuSections,
   defaultModelLabel,
   nativeModelLabel,
+  useModelMenuFilter,
 } from "@/components/HarnessConfigControls";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import {
@@ -1321,6 +1323,7 @@ export function AgentHarnessPicker({
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
   triggerIcon,
   selectedConfigContent,
+  focusConfigSearch,
   entrySummaries,
   autoHarnessAvailable = false,
   autoHarnessActive = false,
@@ -1376,6 +1379,10 @@ export function AgentHarnessPicker({
   triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
   selectedConfigContent?: ReactNode;
+  /** Focus hook for the config menu's search field, when it shows one.
+   *  Called instead of Radix's default focus-first-item when the sub-menu
+   *  opens, so the search input receives the first keystroke. */
+  focusConfigSearch?: () => void;
   entrySummaries?: Readonly<Record<string, string>>;
   /** Whether the top-level Smart Routing row is offered (routing enabled and
    *  both native CLIs ready). Defaults off, so an embedder that doesn't wire
@@ -1549,6 +1556,15 @@ export function AgentHarnessPicker({
             onFocusOutside={(event) => {
               if (event.target instanceof Element && event.target.getAttribute("role") === "menu") {
                 event.preventDefault();
+              }
+            }}
+            onOpenAutoFocus={(event) => {
+              // Steer Radix's default focus-first-item into the search
+              // field when the config menu shows one, so the first typed
+              // character lands in the filter.
+              if (focusConfigSearch) {
+                event.preventDefault();
+                focusConfigSearch();
               }
             }}
           >
@@ -2616,6 +2632,7 @@ export function NewChatLandingScreen() {
         : (hostPiModelOptions ?? []).map((option) => ({
             id: option.id,
             displayName: option.displayName ?? option.id,
+            provider: option.provider,
             source: option.source,
           })),
     [hostPiModelOptions, sandboxSelected],
@@ -3462,7 +3479,16 @@ export function NewChatLandingScreen() {
       : selectedNativeHarness === "codex-native"
         ? codexModelOptions
         : [];
-  const [pickerModelSearch, setPickerModelSearch] = useState("");
+  const modelFilter = useModelMenuFilter(pickerModelOptions);
+  const { setQuery: setPickerModelQuery } = modelFilter;
+  // Pi keeps the search box even for empty/short catalogs — a stable
+  // affordance of the picker's authed-provider catalog (it can grow as
+  // providers log in), matching the pre-refactor behavior. Other harnesses
+  // ride the hook's length threshold alone.
+  const showPickerSearch = selectedNativeHarness === "pi-native" || modelFilter.showSearch;
+  // Switching harnesses swaps the catalog under the query; start the new
+  // harness's picker from an empty filter (restores the pre-refactor reset).
+  useEffect(() => setPickerModelQuery(""), [selectedNativeHarness, setPickerModelQuery]);
   const pickerModelsLoading =
     !sandboxSelected &&
     selectedHostId !== null &&
@@ -3479,7 +3505,6 @@ export function NewChatLandingScreen() {
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
         : null;
-  useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
     : selectedNativeHarness === "pi-native"
@@ -3541,16 +3566,7 @@ export function NewChatLandingScreen() {
         selectedNativeHarness === "codex-native") && (
         <div data-testid="new-chat-landing-agent-models">
           <PickerSectionHeader>Models</PickerSectionHeader>
-          {selectedNativeHarness === "pi-native" && (
-            <Input
-              aria-label="Search models"
-              placeholder="Search models…"
-              value={pickerModelSearch}
-              onChange={(event) => setPickerModelSearch(event.target.value)}
-              onKeyDown={(event) => event.stopPropagation()}
-              data-testid="new-chat-landing-agent-model-search"
-            />
-          )}
+          {showPickerSearch && <ModelMenuSearch filter={modelFilter} />}
           {pickerModelsLoading && (
             <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
           )}
@@ -3570,17 +3586,10 @@ export function NewChatLandingScreen() {
                 Harness default
               </DropdownMenuCheckboxItem>
             )}
-          {pickerModelOptions
-            .filter((option) =>
-              pickerModelSearch
-                .toLowerCase()
-                .trim()
-                .split(/\s+/)
-                .every((term) =>
-                  `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
-                ),
-            )
-            .map((option) => (
+          <ModelMenuSections
+            options={modelFilter.filteredOptions}
+            allOptions={pickerModelOptions}
+            renderItem={(option) => (
               <DropdownMenuCheckboxItem
                 key={option.id}
                 checked={
@@ -3592,12 +3601,17 @@ export function NewChatLandingScreen() {
                 }
                 onSelect={(event) => event.preventDefault()}
                 data-testid={`new-chat-landing-agent-model-${option.id}`}
+                data-model-id={option.id}
                 title={nativeModelLabel(option)}
                 className="whitespace-normal break-words [&>span:last-child]:min-w-0"
               >
                 {visibleModelLabel(nativeModelLabel(option))}
               </DropdownMenuCheckboxItem>
-            ))}
+            )}
+          />
+          {modelFilter.noResults && (
+            <div className="px-2 py-1 text-xs text-muted-foreground">No models found</div>
+          )}
         </div>
       )}
       {pickerEffortOptions.length > 0 && (
@@ -6200,6 +6214,7 @@ export function NewChatLandingScreen() {
                           ) : null
                         }
                         selectedConfigContent={selectedConfigContent}
+                        focusConfigSearch={showPickerSearch ? modelFilter.focusInput : undefined}
                         entrySummaries={pickerEntrySummaries}
                         autoHarnessAvailable={smartRoutingHarnessAvailable}
                         autoHarnessActive={smartRoutingHarnessSelected}

@@ -1081,7 +1081,8 @@ async function postModelOptions(config, ctx) {
     seen.add(id);
     const name =
       model && typeof model.name === "string" && model.name ? model.name : modelId;
-    options.push({ id, model: id, displayName: name });
+    const provider = model && typeof model.provider === "string" && model.provider ? model.provider : undefined;
+    options.push({ id, model: id, displayName: name, ...(provider ? { provider } : {}) });
   }
   if (options.length === 0) return;
   await postEvent(config, {

@@ -2442,13 +2442,18 @@ def _persist_external_model_options(
             continue
         seen.add(model_id)
         display = raw.get("displayName") if isinstance(raw, dict) else None
-        options.append(
-            {
-                "id": model_id,
-                "displayName": display if isinstance(display, str) and display else model_id,
-                "isDefault": bool(raw.get("isDefault", False)) if isinstance(raw, dict) else False,
-            }
+        provider_raw = raw.get("provider") if isinstance(raw, dict) else None
+        provider: str | None = (
+            provider_raw if isinstance(provider_raw, str) and provider_raw else None
         )
+        option_dict: dict[str, Any] = {
+            "id": model_id,
+            "displayName": display if isinstance(display, str) and display else model_id,
+            "isDefault": bool(raw.get("isDefault", False)) if isinstance(raw, dict) else False,
+        }
+        if provider:
+            option_dict["provider"] = provider
+        options.append(option_dict)
     if options:
         _pushed_model_options_cache[session_id] = options
     else:

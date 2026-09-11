@@ -227,7 +227,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { ConfigRow, nativeModelLabel } from "@/components/HarnessConfigControls";
+import {
+  ConfigRow,
+  ModelMenuSearch,
+  ModelMenuSections,
+  nativeModelLabel,
+  useModelMenuFilter,
+} from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -4857,6 +4863,13 @@ function SessionHarnessPicker({
       )
         await store.setCostControlMode("off");
     });
+  const modelFilter = useModelMenuFilter(modelOptions);
+  // Reset the search when the menu closes: the picker survives warm
+  // conversation switches, and a filter left over from the last open would
+  // silently pre-filter the next conversation's catalog.
+  useEffect(() => {
+    if (!menuOpen) modelFilter.setQuery("");
+  }, [menuOpen, modelFilter]);
   const configContent = (
     <>
       {showModels && (
@@ -4864,6 +4877,7 @@ function SessionHarnessPicker({
           <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
             Models
           </DropdownMenuLabel>
+          {modelFilter.showSearch && <ModelMenuSearch filter={modelFilter} />}
           {!modelOptions.some((model) => model.isDefault) && (
             <DropdownMenuCheckboxItem
               checked={!routingOn && pickerSelectedModel === null}
@@ -4875,24 +4889,31 @@ function SessionHarnessPicker({
               Default
             </DropdownMenuCheckboxItem>
           )}
-          {modelOptions.map((model) => (
-            <DropdownMenuCheckboxItem
-              key={model.id}
-              disabled={busy || pendingModelChange !== null}
-              checked={
-                !routingOn &&
-                (model.id === pickerSelectedModel ||
-                  (pickerSelectedModel === null && model.isDefault === true))
-              }
-              onSelect={(event) => event.preventDefault()}
-              onCheckedChange={() => selectModel(model.isDefault ? null : model.id)}
-              data-testid={`composer-agent-model-${model.id}`}
-              data-model-id={model.id}
-              className="whitespace-normal break-words"
-            >
-              {nativeModelLabel(model)}
-            </DropdownMenuCheckboxItem>
-          ))}
+          <ModelMenuSections
+            options={modelFilter.filteredOptions}
+            allOptions={modelOptions}
+            renderItem={(model) => (
+              <DropdownMenuCheckboxItem
+                key={model.id}
+                disabled={busy || pendingModelChange !== null}
+                checked={
+                  !routingOn &&
+                  (model.id === pickerSelectedModel ||
+                    (pickerSelectedModel === null && model.isDefault === true))
+                }
+                onSelect={(event) => event.preventDefault()}
+                onCheckedChange={() => selectModel(model.isDefault ? null : model.id)}
+                data-testid={`composer-agent-model-${model.id}`}
+                data-model-id={model.id}
+                className="whitespace-normal break-words"
+              >
+                {nativeModelLabel(model)}
+              </DropdownMenuCheckboxItem>
+            )}
+          />
+          {modelFilter.noResults && (
+            <div className="px-2 py-1 text-xs text-muted-foreground">No models found</div>
+          )}
           {pickerSelectedModel &&
             !modelOptions.some((model) => model.id === pickerSelectedModel) && (
               <DropdownMenuCheckboxItem
@@ -5197,6 +5218,7 @@ function useResolvedComposerModel(
     label?: string;
     displayName?: string;
     isDefault?: boolean;
+    provider?: string;
   }[] = usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 

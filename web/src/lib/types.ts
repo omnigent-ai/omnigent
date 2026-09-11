@@ -593,4 +593,6 @@ export interface NativeModelOption {
   isDefault?: boolean;
   /** Configuration that supplies this model; never includes credentials. */
   source?: ModelConfigurationSource;
+  /** Names the owning provider when the source has one; keys the provider-first picker filtering; never derived by splitting qualified ids. */
+  provider?: string;
 }

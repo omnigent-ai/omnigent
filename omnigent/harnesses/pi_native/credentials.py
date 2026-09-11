@@ -448,6 +448,7 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
                 "id": qualified,
                 "model": qualified,
                 "displayName": name if isinstance(name, str) and name else model_id,
+                "provider": provider_id,
             }
     return [options[model_id] for model_id in sorted(options)]
 
@@ -494,6 +495,7 @@ def pi_native_model_options() -> list[dict[str, object]]:
                 "id": qualified,
                 "model": qualified,
                 "displayName": model.get("name") or model_id,
+                "provider": provider_id,
             }
     return [options[model_id] for model_id in sorted(options)]
 

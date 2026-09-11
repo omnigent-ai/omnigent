@@ -1615,7 +1615,7 @@ describe("NewChatLandingScreen create flow", () => {
     );
     expect(fullNameRow).not.toBeNull();
     expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
-    fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
+    fireEvent.change(screen.getByTestId("composer-agent-models-search"), {
       target: { value: "gpt sol" },
     });
     expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();

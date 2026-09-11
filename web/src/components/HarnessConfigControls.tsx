@@ -1,5 +1,10 @@
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { Button } from "@/components/ui/button";
+import { DropdownMenuLabel } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Command, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -9,7 +14,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
+import { ChevronDownIcon } from "lucide-react";
 
 // Sentinel Select values for the Model row. Radix requires a non-empty value,
 // so the two "no explicit model" choices ride on reserved tokens rather than
@@ -22,6 +29,10 @@ export const EFFORT_SELECT_NONE = "__none__";
 // Shown in the frozen Effort row when the router picks the model per turn, so
 // no effort can apply. Rendered as the Select's placeholder (value "").
 export const EFFORT_UNAVAILABLE_PLACEHOLDER = "—";
+
+// Catalog length above which the composer agent-config model menus show a
+// search field. Kept in sync with RoutingModelSelect below.
+export const MODEL_MENU_SEARCH_THRESHOLD = 15;
 
 /** One entry in the Model row's harness-model list. */
 export interface RoutingModelOption {
@@ -58,10 +69,13 @@ export function defaultModelLabel(options: readonly NativeModelLabelFields[]): s
 }
 
 /**
- * The Model row's Select: the Smart Routing sentinel (when offered), the
- * harness's own "Default", then the harness's models. Shared by the landing
- * dialog and the in-session composer so the sentinels and their copy can't
- * drift across the three places the row appears.
+ * The Model row's searchable picker: the Smart Routing sentinel (when offered),
+ * the harness's own "Default", then the harness's models. Uses the same
+ * Popover + cmdk pattern as the landing pi picker so long catalogs are
+ * searchable, while short catalogs fall back to a plain list. The composer
+ * config menus render their own searchable lists; this row now serves the
+ * fork dialog (and any modal surface wanting the same row), keeping the
+ * sentinels and their copy from drifting.
  *
  * @param value Selected value — a model id or one of the sentinels.
  * @param onValueChange Selection callback.
@@ -110,38 +124,343 @@ export function RoutingModelSelect({
   componentId?: string;
   children?: ReactNode;
 }) {
+  const { trackValueChange } = useOmnigentAnalytics();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const modelList = models ?? [];
+
+  const selectedLabel =
+    value === MODEL_SELECT_SMART
+      ? SMART_ROUTING_LABEL
+      : value === MODEL_SELECT_DEFAULT
+        ? defaultLabel
+        : (modelList.find((m) => m.id === value)?.label ?? value);
+
+  const select = (nextValue: string) => {
+    if (componentId) {
+      // valueHasNoPii assumes a bounded catalog; drop it if reused for typed values.
+      trackValueChange(componentId, "select", nextValue, { valueHasNoPii: true });
+    }
+    onValueChange(nextValue);
+    setOpen(false);
+  };
+
+  // Show the search box only for long catalogs. Claude/codex ship ~5-10
+  // models, where a plain list is faster; pi exposes ~90 models and needs
+  // filtering.
+  const showSearch = modelList.length > MODEL_MENU_SEARCH_THRESHOLD;
+  // Filtering is done here (shouldFilter={false} on the Command), not by
+  // cmdk: that keeps the row order stable (cmdk reorders by match score) and
+  // the empty state honest (cmdk does not count force-mounted sentinels, so
+  // its own Empty fired even while they were visible).
+  const filteredModels = showSearch
+    ? modelList.filter((m) => modelQueryMatches(m.id, m.label, query))
+    : modelList;
+  const noResults = showSearch && query.trim().length > 0 && filteredModels.length === 0;
+
   return (
-    // valueHasNoPii assumes a bounded catalog; drop it if reused for typed values.
-    <Select value={value} onValueChange={onValueChange} componentId={componentId} valueHasNoPii>
-      <SelectTrigger
-        className={cn("w-full", triggerClassName)}
-        data-testid={testId}
-        aria-label={ariaLabel}
-      >
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent
-        position="popper"
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          aria-label={ariaLabel}
+          data-testid={testId}
+          className={cn("h-8 w-full justify-between gap-2 px-2.5 font-normal", triggerClassName)}
+        >
+          <span className="min-w-0 truncate">{selectedLabel}</span>
+          <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
         align="start"
-        className={cn("w-max min-w-(--radix-select-trigger-width) max-w-[300px]", contentClassName)}
-      >
-        {offerSmartRouting && (
-          <SelectItem value={MODEL_SELECT_SMART}>{SMART_ROUTING_LABEL}</SelectItem>
+        className={cn(
+          "max-h-[var(--radix-popover-content-available-height)] w-[var(--radix-popover-trigger-width)] min-w-0 overflow-hidden p-0",
+          contentClassName,
         )}
-        <SelectItem value={MODEL_SELECT_DEFAULT}>{defaultLabel}</SelectItem>
-        {(models ?? []).map((m) => (
-          <SelectItem
-            key={m.id}
-            value={m.id}
-            data-model-id={m.id}
-            data-active={activeModelId === m.id ? "true" : undefined}
+      >
+        <Command className="h-auto min-h-0" shouldFilter={false}>
+          {showSearch && (
+            <CommandInput
+              placeholder="Search models…"
+              data-testid={`${testId}-search`}
+              value={query}
+              onValueChange={setQuery}
+            />
+          )}
+          <CommandList
+            className="max-h-72 min-h-0 overflow-y-auto overscroll-contain"
+            onWheel={(event) => event.stopPropagation()}
           >
-            {m.label}
-          </SelectItem>
-        ))}
-        {children}
-      </SelectContent>
-    </Select>
+            {offerSmartRouting && (
+              <CommandItem
+                value={MODEL_SELECT_SMART}
+                data-checked={value === MODEL_SELECT_SMART ? "true" : undefined}
+                onSelect={() => select(MODEL_SELECT_SMART)}
+              >
+                <span className="min-w-0 truncate">{SMART_ROUTING_LABEL}</span>
+              </CommandItem>
+            )}
+            <CommandItem
+              value={MODEL_SELECT_DEFAULT}
+              data-checked={value === MODEL_SELECT_DEFAULT ? "true" : undefined}
+              onSelect={() => select(MODEL_SELECT_DEFAULT)}
+            >
+              <span className="min-w-0 truncate">{defaultLabel}</span>
+            </CommandItem>
+            {filteredModels.map((m) => (
+              <CommandItem
+                key={m.id}
+                value={m.id}
+                title={m.label}
+                data-model-id={m.id}
+                data-active={activeModelId === m.id ? "true" : undefined}
+                data-checked={value === m.id ? "true" : undefined}
+                onSelect={() => select(m.id)}
+              >
+                <span className="min-w-0 truncate">{m.label}</span>
+              </CommandItem>
+            ))}
+            {noResults && (
+              <div className="px-2 py-1 text-xs text-muted-foreground">No models found</div>
+            )}
+            {children}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/**
+ * Whitespace-AND matcher shared by every model-search surface: the query is
+ * split on whitespace and every term must appear in the display label or the
+ * id (case-insensitive). One semantics everywhere, so the same query gives
+ * the same results in any picker.
+ */
+export function modelQueryMatches(id: string, label: string, query: string): boolean {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return true;
+  const idLower = id.toLowerCase();
+  const labelLower = label.toLowerCase();
+  return terms.every((term) => labelLower.includes(term) || idLower.includes(term));
+}
+
+/** One option in a DropdownMenu-based model catalog (composer config menus). */
+export interface ModelMenuFilterOption {
+  id: string;
+  displayName?: string;
+  label?: string;
+}
+
+/** Return value of {@link useModelMenuFilter}. */
+export interface UseModelMenuFilterResult<T extends ModelMenuFilterOption> {
+  query: string;
+  setQuery: (query: string) => void;
+  showSearch: boolean;
+  filteredOptions: readonly T[];
+  noResults: boolean;
+  inputRef: React.RefObject<HTMLInputElement | null>;
+  inputProps: Omit<React.ComponentProps<"input">, "ref" | "type"> & {
+    "data-testid": "composer-agent-models-search";
+    placeholder: "Search models…";
+    "aria-label": "Search models";
+    value: string;
+    onChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
+    onKeyDown: (event: React.KeyboardEvent<HTMLInputElement>) => void;
+  };
+  focusInput: () => void;
+}
+
+/**
+ * Filter state for a DropdownMenu model list. Shows a search field only for
+ * long catalogs (> MODEL_MENU_SEARCH_THRESHOLD); the query is split on
+ * whitespace and every term must match the option's display label or id —
+ * the same semantics as the pre-launch agent menu's pi search.
+ */
+export function useModelMenuFilter<T extends ModelMenuFilterOption>(
+  options: readonly T[],
+): UseModelMenuFilterResult<T> {
+  const [query, setQuery] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const filteredOptions = useMemo(
+    () =>
+      query.trim()
+        ? options.filter((option) =>
+            modelQueryMatches(option.id, option.displayName ?? option.label ?? option.id, query),
+          )
+        : options,
+    // Keyed on the query string, not a derived terms array (a fresh array
+    // per render would defeat the memo entirely).
+    [options, query],
+  );
+
+  const showSearch = options.length > MODEL_MENU_SEARCH_THRESHOLD;
+  // Not gated on showSearch: a caller may render the search field regardless
+  // of catalog size (the pre-launch pi picker does). An unrendered field
+  // can't carry a query, so this stays false there naturally.
+  const noResults = query.trim().length > 0 && filteredOptions.length === 0;
+
+  const focusInput = useCallback(() => {
+    // Defer so the input is present in the DOM when Radix fires onOpenAutoFocus.
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
+  const inputProps = useMemo(
+    () => ({
+      "data-testid": "composer-agent-models-search" as const,
+      placeholder: "Search models…" as const,
+      "aria-label": "Search models" as const,
+      value: query,
+      onChange: (event: React.ChangeEvent<HTMLInputElement>) => setQuery(event.target.value),
+      // Typing must not drive Radix's menu typeahead, but the keys that MOVE
+      // focus must: ArrowDown steps into the item list (otherwise keyboard
+      // users can filter but never reach a row — menus swallow Tab), and
+      // Escape is let through so the menu's dismiss layer still closes it.
+      onKeyDown: (event: React.KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === "Escape") return;
+        if (event.key === "ArrowDown") {
+          const menu = inputRef.current?.closest('[role="menu"]');
+          const firstItem = menu?.querySelector<HTMLElement>(
+            '[role="menuitemcheckbox"], [role="menuitemradio"], [role="menuitem"]',
+          );
+          if (firstItem) {
+            event.stopPropagation();
+            firstItem.focus();
+            return;
+          }
+        }
+        event.stopPropagation();
+      },
+    }),
+    [query],
+  );
+
+  return {
+    query,
+    setQuery,
+    showSearch,
+    filteredOptions,
+    noResults,
+    inputRef,
+    inputProps,
+    focusInput,
+  };
+}
+
+/** Search input rendered at the top of a model menu. */
+export function ModelMenuSearch<T extends ModelMenuFilterOption>({
+  filter,
+}: {
+  filter: UseModelMenuFilterResult<T>;
+}): ReactNode {
+  const { inputRef, inputProps, focusInput, showSearch } = filter;
+
+  useEffect(() => {
+    if (showSearch) focusInput();
+  }, [showSearch, focusInput]);
+
+  return <Input ref={inputRef} type="search" className="mb-1 h-8 text-xs" {...inputProps} />;
+}
+
+/**
+ * Distinct provider ids carried by a model-option list, alphabetically.
+ *
+ * The provider comes from the payload's explicit ``provider`` field — never
+ * derived by splitting qualified ids (``openrouter/z-ai/glm-5.3:batch`` is
+ * ambiguous). Options without the field contribute nothing.
+ */
+export function deriveModelProviders<T extends { provider?: string }>(
+  options: readonly T[],
+): string[] {
+  const providers = new Set<string>();
+  for (const option of options) {
+    if (option.provider) providers.add(option.provider);
+  }
+  return Array.from(providers).sort();
+}
+
+/** One provider-labeled section of a model menu (null = no provider field). */
+export interface ModelMenuSection<T> {
+  provider: string | null;
+  options: readonly T[];
+}
+
+/**
+ * Partition model options into provider sections for menu rendering.
+ *
+ * Providers appear alphabetically; options without a ``provider`` field land
+ * in a trailing unlabeled section (never dropped — they are listed exactly
+ * as a flat menu would list them). When fewer than two distinct providers
+ * are present the caller should keep the flat list; the sections this
+ * returns then reduce to one and no labels are needed.
+ */
+export function partitionModelOptionsByProvider<T extends { provider?: string }>(
+  options: readonly T[],
+): ModelMenuSection<T>[] {
+  const byProvider = new Map<string, T[]>();
+  const unprovidered: T[] = [];
+  for (const option of options) {
+    if (option.provider) {
+      const bucket = byProvider.get(option.provider);
+      if (bucket) bucket.push(option);
+      else byProvider.set(option.provider, [option]);
+    } else {
+      unprovidered.push(option);
+    }
+  }
+  const sections: ModelMenuSection<T>[] = Array.from(byProvider.keys())
+    .sort()
+    .map((provider) => ({ provider, options: byProvider.get(provider)! }));
+  if (unprovidered.length > 0) sections.push({ provider: null, options: unprovidered });
+  return sections;
+}
+
+/**
+ * Render a (search-filtered) model list for a DropdownMenu, flat or grouped
+ * under provider labels.
+ *
+ * Grouping gates on the FULL catalog's provider count (stable while search
+ * filters) but partitions the filtered list, so a group the query empties
+ * hides its label and a filtered single-group view still reads correctly.
+ * Fewer than two distinct providers — including catalogs whose options carry
+ * no provider field — render the flat list, exactly as before the field
+ * existed. Options are never dropped; provider-less ones trail unlabeled.
+ *
+ * Shared by the composer agent-config menus so the two implementations
+ * cannot drift.
+ */
+export function ModelMenuSections<T extends { id: string; provider?: string }>({
+  options,
+  allOptions,
+  renderItem,
+}: {
+  options: readonly T[];
+  allOptions: readonly T[];
+  renderItem: (option: T) => ReactNode;
+}): ReactNode {
+  const grouped =
+    deriveModelProviders(allOptions).length >= 2 && partitionModelOptionsByProvider(options);
+  if (!grouped) return <>{options.map(renderItem)}</>;
+  return (
+    <>
+      {grouped.map((section) => (
+        <div key={section.provider ?? "__no_provider__"}>
+          {section.provider && (
+            <DropdownMenuLabel
+              data-provider={section.provider}
+              className="px-3 pt-1 text-[11px] font-normal text-muted-foreground/80"
+            >
+              {section.provider}
+            </DropdownMenuLabel>
+          )}
+          {section.options.map(renderItem)}
+        </div>
+      ))}
+    </>
   );
 }
 

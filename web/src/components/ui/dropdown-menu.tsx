@@ -32,7 +32,12 @@ function DropdownMenuContent({
   align = "start",
   sideOffset = 4,
   ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.Content>) {
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Content> & {
+  // Supported by Radix at runtime but missing from the unified package's
+  // ContentProps — surfaced so menu content can steer open-focus (e.g. into
+  // a search field).
+  onOpenAutoFocus?: (event: Event) => void;
+}) {
   return (
     <DropdownMenuPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <DropdownMenuPrimitive.Content
@@ -225,7 +230,10 @@ function DropdownMenuSubContent({
   sideOffset = 6,
   collisionPadding = 8,
   ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.SubContent>) {
+}: React.ComponentProps<typeof DropdownMenuPrimitive.SubContent> & {
+  // See DropdownMenuContent's note — same runtime-supported, type-missing prop.
+  onOpenAutoFocus?: (event: Event) => void;
+}) {
   // Portal the sub-flyout (Radix doesn't by default) for the same reason as
   // DropdownMenuContent. Without it, the sub-content's position:fixed popper
   // wrapper renders inside the parent menu's [role="menu"] box. The dark-mode
