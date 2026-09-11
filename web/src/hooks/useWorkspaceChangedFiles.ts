@@ -740,10 +740,18 @@ function hasUnsafeSegments(rel: string): boolean {
   return rel.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
 }
 
+/** One tolerant parent-directory page: its entries plus whether it was cut off. */
+interface DirListingPage {
+  files: WorkspaceFile[];
+  /** True when the listing was truncated (`has_more`), so a file missing
+   * from `files` may simply live past the page limit — absence unproven. */
+  truncated: boolean;
+}
+
 async function fetchDirEntriesTolerant(
   conversationId: string,
   dirPath: string,
-): Promise<WorkspaceFile[] | null> {
+): Promise<DirListingPage | null> {
   // An empty dirPath is the workspace root — its listing lives at the bare
   // ``/filesystem`` endpoint, not ``/filesystem/`` (a root-level file like
   // ``foo.md`` resolves to a "" parent). A leading slash marks a
@@ -765,20 +773,20 @@ async function fetchDirEntriesTolerant(
   // sandbox, or a viewer below the owner level absolute browsing requires) —
   // for this caller that reads the same as "no such openable file". Degrade
   // both to "no entries" rather than surfacing an error.
-  if (res.status === 404 || res.status === 403) return [];
+  if (res.status === 404 || res.status === 403) return { files: [], truncated: false };
   // A parked/unavailable runner can't answer at all — that's "couldn't
   // check" (null), not a verified-absent empty listing, so a dead-link
   // affordance never grows out of a runner that's merely offline.
   if (await isRunnerUnavailable503(res)) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as FilesystemListResponse;
   // Relative listings echo full workspace-relative paths (kept as-is);
   // host-absolute listings echo names relative to the listed dir, so the
   // dir is re-attached to make them absolute.
-  return mapFilesystemEntries(
-    (await res.json()) as FilesystemListResponse,
-    "",
-    hostBase ? dirPath : "",
-  );
+  return {
+    files: mapFilesystemEntries(body, "", hostBase ? dirPath : ""),
+    truncated: !!body.has_more,
+  };
 }
 
 /** Result of {@link useWorkspaceFileExists}. */
@@ -787,12 +795,13 @@ export interface WorkspaceFileExistence {
   exists: boolean;
   /**
    * True only when a parent listing actually completed successfully for the
-   * current inputs, so `exists: false` means "verified absent". False while
-   * the query is loading, disabled (no conversation, workspace not
-   * serveable), errored, answered by an unavailable runner, or skipped
-   * because the candidate isn't path-shaped — in all of those the check
-   * never ran to completion, so nothing was *verified* and callers must not
-   * treat the file as known-missing.
+   * current inputs and fully answered the question, so `exists: false` means
+   * "verified absent". False while the query is loading, disabled (no
+   * conversation, workspace not serveable), errored, answered by an
+   * unavailable runner, skipped because the candidate isn't path-shaped, or
+   * when a truncated (`has_more`) page missed the file (it may live past the
+   * page limit) — in all of those the check never ran to a verified answer,
+   * so callers must not treat the file as known-missing.
    */
   settled: boolean;
 }
@@ -851,11 +860,13 @@ export function useWorkspaceFileExists(
   // No candidate = the check was SKIPPED (not path-shaped and untrusted),
   // not run-and-found-nothing — it must never read as "verified absent".
   if (!candidate) return { exists: false, settled: false };
-  const entries = query.data ?? null;
-  const exists = !!entries?.some((e) => e.type === "file" && e.path === candidate);
+  const listing = query.data ?? null;
+  const exists = !!listing?.files.some((e) => e.type === "file" && e.path === candidate);
   // Only a listing that genuinely completed proves absence: errors and
-  // unavailable-runner responses (data === null) leave the answer open.
-  return { exists, settled: query.isSuccess && entries !== null };
+  // unavailable-runner responses (data === null) leave the answer open. A
+  // hit settles even a truncated page, but a miss on a truncated page
+  // doesn't — the file may simply live past the page limit.
+  return { exists, settled: query.isSuccess && listing !== null && (exists || !listing.truncated) };
 }
 
 // ── Default environment (working folder root) ─────────────────────────────────

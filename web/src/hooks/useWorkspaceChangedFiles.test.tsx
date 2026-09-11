@@ -1209,6 +1209,49 @@ describe("useWorkspaceFileExists", () => {
     expect(results.at(-1)).toEqual({ exists: false, settled: false });
   });
 
+  it("does not settle a miss on a truncated (has_more) listing", async () => {
+    // The parent page was cut off at the listing limit, so a file missing
+    // from it may simply live past the limit — absence is unproven and the
+    // link must stay inert rather than toast a false "not found".
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [dirEntry("docs/other.md")],
+        has_more: true,
+      }),
+    );
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/notes.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await flushMicrotasks();
+    expect(results.at(-1)).toEqual({ exists: false, settled: false });
+  });
+
+  it("settles a hit even on a truncated listing", async () => {
+    // Truncation only leaves absence open; a file present on the page is
+    // affirmatively confirmed regardless of what fell past the limit.
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [dirEntry("docs/notes.md")],
+        has_more: true,
+      }),
+    );
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/notes.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(results.at(-1)).toEqual({ exists: true, settled: true }));
+  });
+
   it("does not settle on a listing error", async () => {
     // Only a listing that actually completed proves absence; a transient 500
     // (or gateway/network failure) leaves the answer open rather than
