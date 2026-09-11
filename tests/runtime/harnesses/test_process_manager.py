@@ -42,6 +42,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
+    HarnessSpawnError,
     NoLiveHarnessError,
     _default_tmp_parent,
     _model_env_key,
@@ -590,6 +591,25 @@ async def test_get_client_any_harness_sentinel_no_subprocess_raises(
             await manager.get_client("conv_never_spawned", "any")
     finally:
         await manager.shutdown()
+
+
+async def test_get_client_unknown_harness_raises_client_safe_spawn_error(
+    manager: HarnessProcessManager,
+) -> None:
+    """An unregistered harness raises ``HarnessSpawnError`` naming the cause.
+
+    The subclass marks its message as client-safe, so the runner's error
+    path can preserve the spawn reason for callers and telemetry instead of
+    redacting it to a log pointer. It stays a ``RuntimeError`` so existing
+    ``except RuntimeError`` dispatch handlers keep catching it.
+    """
+    await manager.start()
+    try:
+        with pytest.raises(HarnessSpawnError, match="unknown harness 'never-registered'"):
+            await manager.get_client("conv_unknown_harness", "never-registered")
+    finally:
+        await manager.shutdown()
+    assert issubclass(HarnessSpawnError, RuntimeError)
 
 
 async def test_get_client_concurrent_first_calls_share_subprocess(
