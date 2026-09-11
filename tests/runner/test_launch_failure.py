@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from omnigent.runner.launch_failure import (
+    _FAILURE_CODE_DESCRIPTIONS,
     FailureDiagnosis,
     classify_terminal_failure,
     describe_failure_code,
@@ -130,3 +134,34 @@ def test_describe_failure_code_known(code: str, expected_substring: str) -> None
 @pytest.mark.parametrize("code", [None, "", "some_unknown_code"])
 def test_describe_failure_code_unknown(code: str | None) -> None:
     assert describe_failure_code(code) is None
+
+
+# The failure card renders client-side, so the frontend keeps a hand-mirrored
+# copy of the server's code -> sentence table. Nothing enforced the mirror and
+# it drifted: ``workspace_missing`` existed only on the frontend.
+_STATUS_BLOCKS_TSX = (
+    Path(__file__).resolve().parents[2] / "web/src/components/blocks/StatusBlocks.tsx"
+)
+_TS_TABLE_RE = re.compile(
+    r"const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = \{(.*?)^\};",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def _frontend_failure_codes() -> set[str]:
+    """
+    Read the frontend's mirrored failure-code keys.
+
+    :returns: The ``FAILURE_CODE_DESCRIPTIONS`` keys declared in
+        ``StatusBlocks.tsx``.
+    :raises AssertionError: When the table can no longer be located, so a
+        rename fails loudly instead of silently comparing an empty set.
+    """
+    body = _TS_TABLE_RE.search(_STATUS_BLOCKS_TSX.read_text(encoding="utf-8"))
+    assert body is not None, f"FAILURE_CODE_DESCRIPTIONS not found in {_STATUS_BLOCKS_TSX}"
+    return set(re.findall(r"^\s{2}(\w+):", body.group(1), re.MULTILINE))
+
+
+def test_failure_code_descriptions_match_frontend_mirror() -> None:
+    """Both copies of the code -> sentence table cover the same codes."""
+    assert _frontend_failure_codes() == set(_FAILURE_CODE_DESCRIPTIONS)
