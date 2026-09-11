@@ -290,6 +290,116 @@ def test_mixed_creation_requires_explicit_metadata(metadata: object) -> None:
     assert refs == []
 
 
+_CREATED = "https://github.com/example/one/pull/43"
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        "gh pr comment 42 --body Reviewed.",
+        "gh pr comment 42 -R example/one --body Reviewed.",
+        "gh pr comment --body Reviewed.",
+        f"gh pr comment {A} --body Reviewed.",
+        "gh pr review 42 --comment --body Reviewed.",
+        "gh pr checkout topic-branch",
+        "gh pr checks 42",
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("envelope", [False, True])
+def test_mixed_terse_read_and_creation_attributes_created_pr(
+    read: str, reverse: bool, envelope: bool
+) -> None:
+    """Without provider metadata, the one unclaimed output URL is the creation's."""
+    commands = [read, "gh pr create --title test --body test"]
+    stdout = f"{A}#issuecomment-2001\n{_CREATED}\n"
+    refs, created = extract_prs(
+        "Bash",
+        {
+            "command": "cd /workspace && "
+            + " && ".join(reversed(commands) if reverse else commands)
+        },
+        {"stdout": stdout, "exit_code": 0} if envelope else stdout,
+    )
+    assert [ref.url for ref in refs] == [_CREATED]
+    assert created
+
+
+def test_codex_envelope_mixed_read_and_creation_attributes_created_pr() -> None:
+    """Codex flattens per-command results into aggregatedOutput; attribution holds."""
+    refs, created = extract_prs(
+        "exec_command",
+        {"cmd": "gh pr comment 42 --body 'Reviewed.' && gh pr create --title t --body b"},
+        {"aggregatedOutput": f"{A}#issuecomment-2001\n{_CREATED}\n", "exitCode": 0},
+    )
+    assert [ref.url for ref in refs] == [_CREATED]
+    assert created
+
+
+def test_mixed_comment_and_rest_creation_uses_response_identity() -> None:
+    url = "https://github.com/example/two/pull/77"
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr comment 42 --body test; gh api repos/example/two/pulls -X POST"},
+        {"stdout": f"{A}#issuecomment-2001\n" + json.dumps({"html_url": url, "body": A})},
+    )
+    assert [ref.url for ref in refs] == [url]
+    assert created
+
+
+def test_mixed_read_and_creation_with_lost_creation_url_stays_unassociated() -> None:
+    """Truncated output that lost the creation URL cannot claim the comment's."""
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr comment 42 --body test && gh pr create"},
+        {"stdout": f"{A}#issuecomment-2001\n"},
+    )
+    assert refs == []
+    assert created
+
+
+def test_mixed_read_and_creation_requires_unique_candidate() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr comment 41 --body test && gh pr create && gh pr create -R example/two"},
+        {"stdout": A + "\n" + B},
+    )
+    assert refs == []
+    assert created
+
+
+def test_mixed_read_and_creation_excludes_candidates_sharing_the_read_number() -> None:
+    """A candidate matching the read's number is ambiguous across repositories."""
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr comment 42 --body test && gh pr create"},
+        {"stdout": B + "\n"},
+    )
+    assert refs == []
+    assert created
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        "gh pr view 42",
+        "gh pr diff 42",
+        "gh pr list",
+        "gh pr status",
+        "gh api repos/example/one/pulls/42",
+    ],
+)
+def test_mixed_content_read_and_creation_stays_unassociated(read: str) -> None:
+    """Rendered body/diff/list output can quote arbitrary URLs; stay conservative."""
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"{read} && gh pr create"},
+        {"stdout": _CREATED + "\n"},
+    )
+    assert refs == []
+    assert created
+
+
 @pytest.mark.parametrize("command", ["gh pr view 42", "gh pr comment 42 --body test"])
 def test_creation_metadata_does_not_enable_excluded_commands(command: str) -> None:
     refs, created = extract_prs(

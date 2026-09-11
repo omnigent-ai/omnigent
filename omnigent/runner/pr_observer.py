@@ -7,6 +7,7 @@ import logging
 import re
 import shlex
 from pathlib import PurePath
+from urllib.parse import urlsplit
 
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
@@ -437,6 +438,49 @@ def _content_only(tokens: list[str]) -> bool:
     )
 
 
+# Reads whose canonical output stays terse (a URL or status line, never a
+# rendered body/diff that could quote arbitrary PR links).
+_TERSE_READS = {"comment", "review", "checkout", "checks"}
+
+
+def _terse_read_targets(commands: list[list[str]]) -> tuple[set[str], set[int]] | None:
+    """Exclusion keys for untracked reads with terse output, or None when unsafe."""
+    urls: set[str] = set()
+    numbers: set[int] = set()
+    for tokens in commands:
+        if tokens[0] != "pr" or len(tokens) < 2 or tokens[1] not in _TERSE_READS:
+            return None
+        if ref := _command_target(tokens):
+            urls.add(ref.url)
+            numbers.add(ref.number)
+        elif (target := _positional_target(tokens[2:])) and target.isdigit():
+            numbers.add(int(target))
+    return urls, numbers
+
+
+def _created_pr_from_output(
+    result: object, exclusions: tuple[set[str], set[int]]
+) -> PullRequestRef | None:
+    """The single output identity left once the reads' own URLs are removed."""
+    urls, numbers = exclusions
+    values: list[object] = [obj.get("html_url", obj.get("url")) for obj in _objects(result)]
+    values.extend(
+        line.strip() for line in _output_text(result).splitlines() if len(line.split()) == 1
+    )
+    candidates: dict[str, PullRequestRef] = {}
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        ref = _reference(value)
+        # Creation URLs are bare; a fragment marks a comment/review permalink.
+        if ref is None or urlsplit(value.strip()).fragment:
+            continue
+        if ref.url not in urls and ref.number not in numbers:
+            candidates[ref.url] = ref
+    refs = list(candidates.values())
+    return refs[0] if len(refs) == 1 else None
+
+
 def _created_pr_metadata(result: object) -> PullRequestRef | None:
     """Read Claude's creation identity from tool metadata, never rendered stdout."""
     if not isinstance(result, dict):
@@ -531,6 +575,13 @@ def extract_prs(
                 for line in text.splitlines():
                     if len(line.split()) == 1 and (ref := _reference(line.strip())):
                         references.append(ref)
+        elif created and not references and not any(_content_only(t) for t in commands):
+            # Shell calls carry no creation metadata, so a creation mixed with
+            # terse reads keeps its identity when exactly one unclaimed URL remains.
+            untracked = [tokens for tokens in gh_commands if not _tracks_pr(tokens)]
+            exclusions = _terse_read_targets(untracked)
+            if exclusions is not None and (ref := _created_pr_from_output(result, exclusions)):
+                references = [ref]
     else:
         name = tool_name.rsplit("__", 1)[-1].removeprefix("github_")
         if name == "write_api_call":
