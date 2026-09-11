@@ -3505,12 +3505,12 @@ function ComposerImpl({
               />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" side="top" className="max-w-[min(90vw,24rem)]">
-              <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
+              <DropdownMenuLabel>Session branch</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
                 {composerBranch || "The runner has not reported a branch for this session."}
               </p>
               <p className="px-2 py-1 text-xs text-muted-foreground">
-                The current session keeps its workspace and worktree.
+                This is the branch checked out in the session&apos;s workspace.
               </p>
             </DropdownMenuContent>
           </DropdownMenu>

@@ -331,6 +331,34 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("No branch reported");
   });
 
+  it("names the git chip and its popover with one consistent noun", () => {
+    // One control naming one concept with two nouns (a chip in branch terms
+    // opening a popover in worktree terms) reads as two different features.
+    // Whichever noun the copy picks, the chip's empty-state label, the
+    // popover title, and the popover body must all use the same one.
+    useChatStore.setState({ gitBranch: null });
+    renderComposer();
+
+    const chip = screen.getByTestId("composer-git-branch");
+    fireEvent.pointerDown(chip, { button: 0 });
+
+    const menu = document.querySelector('[data-slot="dropdown-menu-content"]');
+    expect(menu).not.toBeNull();
+    const title = menu!.querySelector('[data-slot="dropdown-menu-label"]')?.textContent ?? "";
+    const body = Array.from(menu!.querySelectorAll("p"))
+      .map((p) => p.textContent ?? "")
+      .join("\n");
+    expect(title).not.toBe("");
+    expect(body).not.toBe("");
+
+    const nouns = (text: string) =>
+      ["branch", "worktree"].filter((noun) => text.toLowerCase().includes(noun));
+    const chipNouns = nouns(chip.textContent ?? "");
+    expect(chipNouns.length).toBeGreaterThan(0);
+    expect(nouns(title)).toEqual(chipNouns);
+    expect(nouns(body)).toEqual(chipNouns);
+  });
+
   it("shows a persistent Plan mode badge when Codex Plan mode is active", () => {
     useChatStore.setState({ codexPlanMode: true });
     renderComposer();
