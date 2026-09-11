@@ -27,7 +27,8 @@ import {
   useIsChangedPath,
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
-import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import { resolveChatFilePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import { showToast } from "@/components/ui/toast";
 
 // Streamdown hands each component override the source hast node alongside the
 // element's own props. Overrides here spread their props onto a DOM element, so
@@ -38,13 +39,33 @@ type WithHastNode<T> = T & { node?: unknown };
 // Trailing `:line` / `:line:col` on a cited path, e.g. `src/app.ts:42:7`.
 const POSITION_SUFFIX = /:\d+(?::\d+)?$/;
 
+/** What the chat renderers know about a cited path's openability. */
+interface WorkspaceFileOpener {
+  /**
+   * Click handler opening the file in the FileViewer, or null when the text
+   * isn't an openable file (no FileViewer, unresolvable path, or no such
+   * file).
+   */
+  open: (() => void) | null;
+  /**
+   * True when the path is *definitively* not openable — resolution rejected
+   * it outright (traversal segments, the root itself, …), or a parent
+   * listing genuinely completed without finding it. False while the check is
+   * still in flight, skipped, errored, or waiting on the workspace root, so
+   * a link renderer can distinguish "known dead" (give the user feedback)
+   * from "not verified yet" (stay inert).
+   */
+  unopenable: boolean;
+  /** The path resolution produced, for feedback messaging; "" when none. */
+  resolvedPath: string;
+}
+
 /**
- * Resolves `text` to an openable workspace file, returning the click handler
- * that opens it in the FileViewer, or null when it isn't one (no FileViewer,
- * unresolvable path, or no such file). Shared by the inline-code and link
- * renderers so both judge a path the same way.
+ * Resolves `text` to an openable file, returning the click handler that opens
+ * it in the FileViewer plus the openability verdict. Shared by the
+ * inline-code and link renderers so both judge a path the same way.
  */
-function useWorkspaceFileOpener(text: string): (() => void) | null {
+function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
   const openFile = useFileViewer();
   const isChangedPath = useIsChangedPath();
   const conversationId = useFileViewerConversationId();
@@ -55,26 +76,41 @@ function useWorkspaceFileOpener(text: string): (() => void) | null {
   // in the changed-files list or on disk; drop it before resolving. The span
   // still displays the citation the agent wrote.
   const cited = text.replace(POSITION_SUFFIX, "");
-  // Collapse absolute / "~"-relative forms onto a workspace-relative path so
-  // they match the changed-files list and the filesystem API. null = absolute
-  // or "~" path outside the workspace (or the root itself) → never a link.
-  const linkPath = cited ? toWorkspaceRelativePath(cited, root, home) : null;
-  // "Trusted" means we resolved an absolute/"~" form against the root, so the
-  // result is known workspace-relative even if it's a bare basename (no
-  // interior slash) that the existence check's path-shape heuristic rejects.
-  const trusted = linkPath !== null && linkPath !== cited;
+  // Collapse absolute / "~"-relative forms onto a workspace-relative path
+  // (matching the changed-files list and relative filesystem routes), or keep
+  // an outside-workspace path host-absolute — the FileViewer opens both.
+  // null = unresolvable (the root itself, traversal segments, "~" with no
+  // home, …) → never a link.
+  const resolution = cited ? resolveChatFilePath(cited, root, home) : null;
+  const linkPath = resolution?.path ?? null;
 
-  const isChanged = !!linkPath && isChangedPath(linkPath);
+  // Only relative paths can be in the changed-files list (it speaks
+  // workspace-relative); an outside-workspace absolute is never a change.
+  const isChanged = !!linkPath && !linkPath.startsWith("/") && isChangedPath(linkPath);
   // Only hit the filesystem for path-shaped spans that aren't already known
   // changes; passing null disables the query (keeps hook order stable).
-  const existsOnDisk = useWorkspaceFileExists(
+  const { exists, settled } = useWorkspaceFileExists(
     conversationId,
     openFile && linkPath && !isChanged ? linkPath : null,
-    trusted,
+    resolution?.trusted ?? false,
   );
 
-  if (!openFile || !linkPath || !(isChanged || existsOnDisk)) return null;
-  return () => openFile(linkPath);
+  if (!openFile || !linkPath || !(isChanged || exists)) {
+    // An absolute / "~"-relative citation is unjudgeable until the workspace
+    // root is known — resolution returning null then means "not yet", not
+    // "never"; it self-resolves once the environment metadata loads.
+    const rootPending = root === null && (cited.startsWith("/") || cited.startsWith("~"));
+    return {
+      open: null,
+      // Without a FileViewer nothing could ever open, so "unopenable" would
+      // be noise; with one, a hard-rejected resolution is final immediately
+      // and a resolved path is final once its existence check settles with a
+      // completed listing (skipped/pending/errored checks stay unverified).
+      unopenable: !!openFile && !rootPending && (linkPath === null || (settled && !exists)),
+      resolvedPath: linkPath ?? "",
+    };
+  }
+  return { open: () => openFile(linkPath), unopenable: false, resolvedPath: linkPath };
 }
 
 /**
@@ -107,7 +143,10 @@ function WorkspacePathInlineCode({
   ...codeProps
 }: WithHastNode<React.ComponentPropsWithoutRef<"code">>) {
   const text = typeof codeChildren === "string" ? codeChildren : "";
-  const openWorkspaceFile = useWorkspaceFileOpener(text);
+  // A backtick span is prose by default (`git status`, `useState`), so a
+  // non-openable one just stays styled inline code — only an explicit
+  // markdown link (WorkspaceFileLink) earns dead-path feedback.
+  const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
 
   if (openWorkspaceFile) {
     // Rendered as an inline <code> (not a <button>): a button is laid out as
@@ -210,7 +249,7 @@ function WorkspaceFileLink({
 }: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
   const marked = (props as Record<string, unknown>)[WORKSPACE_FILE_LINK_ATTR];
   const path = typeof marked === "string" ? marked : "";
-  const openWorkspaceFile = useWorkspaceFileOpener(path);
+  const { open: openWorkspaceFile, unopenable, resolvedPath } = useWorkspaceFileOpener(path);
 
   if (!path) {
     // Streamdown renders external links with target="_blank"; those need the
@@ -237,9 +276,47 @@ function WorkspaceFileLink({
     );
   }
 
-  // Marked but not an openable file. Drop to text rather than leave a link on
-  // the parked fragment, keeping the path on hover so it stays discoverable.
+  // Marked but not an openable file. Never leave a link on the parked
+  // fragment — it would navigate nowhere.
   if (!openWorkspaceFile) {
+    // Known dead (the path failed to resolve, or the existence check settled
+    // without finding it): keep a visible, activatable affordance that
+    // explains itself. Hover shows the path (desktop); activating it explains
+    // why nothing opens — which is all the feedback a touch user can get,
+    // where a silent non-link reads as "tapping does nothing".
+    if (unopenable) {
+      // Two distinct dead ends: a path the resolver rejected outright was
+      // never searched (claiming it "wasn't found" would be false), while a
+      // resolved path genuinely came up absent from its parent listing.
+      const explain = () =>
+        showToast(
+          resolvedPath
+            ? `Can't open ${resolvedPath}: it wasn't found in this session's reachable filesystem.`
+            : `Can't open ${path}: it doesn't resolve to an openable file path.`,
+        );
+      return (
+        <span
+          role="button"
+          tabIndex={0}
+          className={cn(
+            "cursor-pointer text-muted-foreground underline decoration-dotted underline-offset-2",
+            className,
+          )}
+          title={title ?? path}
+          onClick={explain}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              explain();
+            }
+          }}
+        >
+          {children}
+        </span>
+      );
+    }
+    // Not verified yet (existence check still in flight, or it can't run):
+    // plain text, with the path on hover so it stays discoverable.
     return (
       <span className={className} title={title ?? path}>
         {children}
