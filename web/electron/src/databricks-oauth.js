@@ -7,22 +7,16 @@
 // stop driving Databricks login inside its own BrowserWindow, which SSO providers
 // and Databricks itself are locking down.
 //
-// Config comes from the environment (a first-party OAuth app the operator
-// registers on the workspace/account):
-//   OMNIGENT_DATABRICKS_OAUTH_CLIENT_ID      (required)
-//   OMNIGENT_DATABRICKS_OAUTH_CLIENT_SECRET  (confidential clients; omit for PKCE-only)
-//   OMNIGENT_DATABRICKS_OAUTH_REDIRECT       (default http://localhost; must match the app's
-//                                             registered loopback redirect. The port is bound
-//                                             ephemerally — Databricks ignores it per RFC 8252 —
-//                                             unless you pin one, e.g. http://localhost:8020)
-//   OMNIGENT_DATABRICKS_OAUTH_SCOPES         (default "all-apis offline_access")
-//   OMNIGENT_DATABRICKS_OAUTH_SPOG=1         (single-pane-of-glass entry: route authorize through
-//                                             the login host so the user picks an account+workspace
-//                                             and the token comes back WORKSPACE-scoped. Off = the
-//                                             entered URL must already be a specific workspace.)
-//   OMNIGENT_DATABRICKS_LOGIN_URL            (SISU login host for SPOG account-first login; default
-//                                             https://login.databricks.com. Set to a staging SISU
-//                                             host when testing SPOG on staging.)
+// The OAuth client is a public, first-party Databricks app (client_id "omnigent",
+// PKCE, no secret) registered as a published connector. Optional env:
+//   OMNIGENT_DATABRICKS_OAUTH_REDIRECT  (default http://localhost; must match the app's registered
+//                                        loopback redirect. Databricks ignores the port per RFC 8252,
+//                                        so an ephemeral free port is bound unless one is pinned.)
+//   OMNIGENT_DATABRICKS_OAUTH_SCOPES    (default "all-apis offline_access")
+//   OMNIGENT_DATABRICKS_OAUTH_SPOG=1    (account-first entry via the SISU login host — the user picks
+//                                        an account, then a workspace from the account workspaces API.
+//                                        Off = the entered URL is authorized directly.)
+//   OMNIGENT_DATABRICKS_LOGIN_URL       (SISU login host for SPOG; default https://login.databricks.com)
 
 "use strict";
 
@@ -38,6 +32,8 @@ const DEFAULT_SCOPES = "all-apis offline_access";
 // SISU login host for the SPOG account-first picker (mirrors DB One). Prod; set
 // OMNIGENT_DATABRICKS_LOGIN_URL to a staging SISU host when testing on staging.
 const DEFAULT_LOGIN_URL = "https://login.databricks.com";
+// Public first-party OAuth client (PKCE, no secret), registered as a published connector.
+const OAUTH_CLIENT_ID = "omnigent";
 // Bound on how long we wait for the human to finish logging in in the browser.
 const AUTH_TIMEOUT_MS = 300_000;
 // Renew a little before real expiry so a mint isn't racing the clock.
@@ -49,15 +45,12 @@ const EXPIRY_SKEW_SECONDS = 60;
 // hosts (accounts.…databricks.com) since all end in one of these.
 const TRUSTED_HOST_SUFFIXES = [".databricks.com", ".azuredatabricks.net"];
 
-/** Read the OAuth config from the environment. */
+/** Read the optional OAuth config from the environment. */
 function config() {
   return {
-    clientId: (process.env.OMNIGENT_DATABRICKS_OAUTH_CLIENT_ID ?? "").trim(),
-    clientSecret: (process.env.OMNIGENT_DATABRICKS_OAUTH_CLIENT_SECRET ?? "").trim(),
     redirectBase: (process.env.OMNIGENT_DATABRICKS_OAUTH_REDIRECT ?? DEFAULT_REDIRECT_BASE).trim(),
     scopes: (process.env.OMNIGENT_DATABRICKS_OAUTH_SCOPES ?? DEFAULT_SCOPES).trim(),
-    // Empty unless explicitly set — SPOG then defaults the login host to the entered origin.
-    loginUrl: (process.env.OMNIGENT_DATABRICKS_LOGIN_URL ?? "").trim().replace(/\/+$/, ""),
+    loginUrl: (process.env.OMNIGENT_DATABRICKS_LOGIN_URL ?? DEFAULT_LOGIN_URL).trim().replace(/\/+$/, ""),
     spog: process.env.OMNIGENT_DATABRICKS_OAUTH_SPOG === "1",
   };
 }
@@ -77,9 +70,11 @@ function isTrustedDatabricksOrigin(url) {
   }
 }
 
-/** Whether OAuth is configured enough to attempt (a client_id is the minimum). */
+/** Whether the OAuth flow should be attempted. The client_id is compiled in, so
+ * this is always on for managed Databricks workspaces (the caller gates on that);
+ * kept as the single seam where a future enable gate would live. */
 function databricksOAuthConfigured() {
-  return config().clientId !== "";
+  return true;
 }
 
 // ── PKCE (S256) ────────────────────────────────────────────────────────────
@@ -187,64 +182,36 @@ async function postToken(origin, body) {
   };
 }
 
-/**
- * Decode and log a JWT access token's scope/audience (payload only — never the
- * token itself). Diagnostic: /auth/session/create's route-level check requires
- * the `all-apis` scope, so this shows whether the minted token actually has it.
- */
-function logTokenScopes(accessToken) {
-  try {
-    const parts = String(accessToken).split(".");
-    if (parts.length !== 3) {
-      console.log("[omnigent] databricks oauth: token is opaque (not a JWT); cannot read scopes");
-      return;
-    }
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-    const scope = payload.scope ?? payload.scp ?? "(no scope claim)";
-    console.log(`[omnigent] databricks oauth: token scope="${scope}" aud="${payload.aud ?? ""}"`);
-  } catch (e) {
-    console.warn("[omnigent] databricks oauth: could not decode token scopes:", e.message);
-  }
-}
-
 async function exchangeCode(origin, code, verifier, redirectUri) {
-  const { clientId, clientSecret } = config();
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code,
     redirect_uri: redirectUri,
-    client_id: clientId,
+    client_id: OAUTH_CLIENT_ID,
     code_verifier: verifier,
   });
-  if (clientSecret) body.set("client_secret", clientSecret);
   const tokens = await postToken(origin, body);
   saveTokens(origin, tokens);
-  console.log("[omnigent] databricks oauth: access token minted");
-  logTokenScopes(tokens.access_token);
   return tokens;
 }
 
 async function refreshTokens(origin, refreshToken) {
-  const { clientId, clientSecret } = config();
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
-    client_id: clientId,
+    client_id: OAUTH_CLIENT_ID,
   });
-  if (clientSecret) body.set("client_secret", clientSecret);
   const tokens = await postToken(origin, body);
   // A refresh response may omit a fresh refresh_token; keep the working one.
   if (!tokens.refresh_token) tokens.refresh_token = refreshToken;
   saveTokens(origin, tokens);
-  console.log("[omnigent] databricks oauth: access token refreshed");
   return tokens;
 }
 
 // ── Interactive browser login (loopback redirect) ───────────────────────────
 
 async function runInteractiveLogin(origin) {
-  const { clientId, redirectBase, scopes, loginUrl, spog } = config();
-  if (!clientId) throw new Error("OMNIGENT_DATABRICKS_OAUTH_CLIENT_ID is not set");
+  const { redirectBase, scopes, loginUrl, spog } = config();
   const { verifier, challenge } = makePkce();
   const state = base64url(crypto.randomBytes(24));
   const base = new URL(redirectBase);
@@ -277,13 +244,6 @@ async function runInteractiveLogin(origin) {
       );
       const params = reqUrl.searchParams;
       cleanup();
-      // Full callback shape (code redacted) — the single most useful debug line:
-      // shows whether iss came back (SPOG) and whether the picker round-tripped.
-      console.log(
-        `[omnigent] databricks oauth: callback hasCode=${params.has("code")} ` +
-          `state=${params.get("state") === state ? "ok" : "MISMATCH"} ` +
-          `iss=${params.get("iss") ?? "(none)"} error=${params.get("error") ?? "(none)"}`,
-      );
       const err = params.get("error");
       if (err) {
         const desc = params.get("error_description");
@@ -325,7 +285,7 @@ async function runInteractiveLogin(origin) {
       // workspace before this authorize runs (yielding a workspace-scoped token).
       const authQuery = new URLSearchParams({
         response_type: "code",
-        client_id: clientId,
+        client_id: OAUTH_CLIENT_ID,
         redirect_uri: redirectUri,
         scope: scopes,
         state,
@@ -349,36 +309,25 @@ async function runInteractiveLogin(origin) {
         ? `${loginHost}/?destination_url=${encodeURIComponent(authPath)}` +
           `&target=ACCOUNT&l=${encodeURIComponent(app.getLocale())}`
         : `${origin}${authPath}`;
-      console.log(
-        `[omnigent] databricks oauth: mode=${spog ? `SPOG(login-host=${loginHost})` : "workspace-direct"} ` +
-          `entered=${origin} redirect_uri=${redirectUri}`,
-      );
-      console.log(`[omnigent] databricks oauth: authorize URL = ${authorizeUrl}`);
       void shell.openExternal(authorizeUrl);
-      console.log("[omnigent] databricks oauth: opened system browser; waiting for login…");
+      console.log(
+        `[omnigent] databricks oauth: opened system browser for ${spog ? "account" : "workspace"} sign-in`,
+      );
     });
   });
 
-  // The workspace the token is scoped to comes from the issuer (iss, RFC 9207)
-  // when present — that's how SPOG conveys which workspace the user picked.
-  // Fall back to the entered origin for the workspace-direct flow.
-  let workspaceOrigin = origin;
+  // The origin the token was issued by comes from the issuer (iss, RFC 9207) when
+  // present — the account host in SPOG mode, the workspace in workspace-direct.
+  // Fall back to the entered origin when absent.
+  let issuerOrigin = origin;
   if (callback.iss) {
     if (!isTrustedDatabricksOrigin(callback.iss)) {
       throw new Error(`authorization issuer is not a trusted Databricks origin: ${callback.iss}`);
     }
-    workspaceOrigin = new URL(callback.iss).origin;
-    console.log(`[omnigent] databricks oauth: issuer=${callback.iss} -> workspace origin ${workspaceOrigin}`);
-  } else if (spog) {
-    console.warn(
-      `[omnigent] databricks oauth: SPOG mode but callback carried no iss; ` +
-        `falling back to entered origin ${origin} (token may be account-scoped)`,
-    );
+    issuerOrigin = new URL(callback.iss).origin;
   }
-
-  console.log(`[omnigent] databricks oauth: exchanging code at ${workspaceOrigin}/oidc/v1/token`);
-  const tokens = await exchangeCode(workspaceOrigin, callback.code, verifier, redirectUri);
-  return { tokens, workspaceOrigin };
+  const tokens = await exchangeCode(issuerOrigin, callback.code, verifier, redirectUri);
+  return { tokens, workspaceOrigin: issuerOrigin };
 }
 
 /**
@@ -390,15 +339,10 @@ async function runInteractiveLogin(origin) {
  * opens a browser — it uses a stored/refreshable token or throws.
  *
  * @param {string} origin The entered origin (SPOG/account host or workspace host).
- * @param {{ interactive?: boolean, forceLogin?: boolean }} [opts]
+ * @param {{ interactive?: boolean }} [opts]
  * @returns {Promise<{ accessToken: string, workspaceOrigin: string }>}
  */
-async function getValidAccessToken(origin, { interactive = true, forceLogin = false } = {}) {
-  if (forceLogin) {
-    // Testing: skip any cached/refreshable token and run the full browser flow.
-    const { tokens, workspaceOrigin } = await runInteractiveLogin(origin);
-    return { accessToken: tokens.access_token, workspaceOrigin };
-  }
+async function getValidAccessToken(origin, { interactive = true } = {}) {
   const stored = loadTokens(origin);
   const now = Math.floor(Date.now() / 1000);
   if (
@@ -407,7 +351,6 @@ async function getValidAccessToken(origin, { interactive = true, forceLogin = fa
     typeof stored.expires_at === "number" &&
     stored.expires_at > now
   ) {
-    console.log(`[omnigent] databricks oauth: using cached token for ${origin}`);
     return { accessToken: stored.access_token, workspaceOrigin: origin };
   }
   if (stored && typeof stored.refresh_token === "string" && stored.refresh_token) {

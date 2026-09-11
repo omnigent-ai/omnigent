@@ -22,7 +22,7 @@ const SESSION_CREATE_PATH = "/auth/session/create";
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin e.g. ``"https://ws.databricks.com"``.
- * @param {{ interactive?: boolean, nextPath?: string, forceLogin?: boolean,
+ * @param {{ interactive?: boolean, nextPath?: string,
  *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
  *     => Promise<{fqdn: string, name: string} | null> }} [opts]
  *   ``pickWorkspace`` is required for account-scoped (SPOG) logins — it chooses
@@ -33,31 +33,22 @@ const SESSION_CREATE_PATH = "/auth/session/create";
 async function ensureDatabricksSession(
   ses,
   origin,
-  { interactive = true, nextPath = "/omnigent", forceLogin = false, pickWorkspace } = {},
+  { interactive = true, nextPath = "/omnigent", pickWorkspace } = {},
 ) {
   // `issuerOrigin` is where the token was minted (its refresh/exchange host).
   const { accessToken, workspaceOrigin: issuerOrigin } = await getValidAccessToken(origin, {
     interactive,
-    forceLogin,
   });
 
   // Decide which workspace host to bridge against. A workspace-scoped token
   // bridges against its own origin. An ACCOUNT-scoped token (SPOG / account
-  // entry) cannot — the account host has no /auth/session/create — so resolve a
-  // workspace from the account workspaces API and let the caller pick one, then
-  // bridge the account token against that workspace's FQDN. Mirrors DB One.
+  // entry) cannot — the account host has no /auth/session/create — so resolve the
+  // account's workspaces, let the caller pick one, and bridge the account token
+  // against that workspace's FQDN. Mirrors DB One.
   let bridgeOrigin = issuerOrigin;
   const account = parseAccountFromToken(accessToken);
   if (account) {
-    console.log(
-      `[omnigent] databricks session: account-scoped token (account ${account.accountId} @ ` +
-        `${account.accountOrigin}); resolving a workspace to bridge`,
-    );
     const workspaces = await listRunningWorkspaces(account, accessToken);
-    console.log(
-      `[omnigent] databricks session: account has ${workspaces.length} running workspace(s): ` +
-        workspaces.map((w) => w.fqdn).join(", "),
-    );
     if (workspaces.length === 0) {
       throw new Error("no running workspaces available for this account");
     }
@@ -67,34 +58,11 @@ async function ensureDatabricksSession(
     const picked = await pickWorkspace(workspaces);
     if (!picked) throw new Error("workspace selection cancelled");
     bridgeOrigin = `https://${picked.fqdn}`;
-    console.log(`[omnigent] databricks session: picked workspace ${picked.name} -> ${bridgeOrigin}`);
-  } else if (issuerOrigin !== origin) {
-    console.log(`[omnigent] databricks session: workspace-scoped token; entered ${origin} -> ${issuerOrigin}`);
+    console.log(`[omnigent] databricks session: bridging to workspace ${bridgeOrigin}`);
   }
 
   await mintSessionCookie(ses, bridgeOrigin, accessToken, nextPath);
   return bridgeOrigin;
-}
-
-/**
- * Remove every cookie the given workspace origin would send. Strict test mode
- * uses this to start unauthenticated so a stale workspace session can't silently
- * sign the window in.
- *
- * @param {Electron.Session} ses
- * @param {string} origin
- * @returns {Promise<void>}
- */
-async function clearWorkspaceCookies(ses, origin) {
-  const cookies = await ses.cookies.get({ url: origin });
-  await Promise.all(
-    cookies.map((c) => {
-      const scheme = c.secure ? "https" : "http";
-      const host =
-        c.domain && c.domain.startsWith(".") ? c.domain.slice(1) : c.domain || new URL(origin).hostname;
-      return ses.cookies.remove(`${scheme}://${host}${c.path || "/"}`, c.name);
-    }),
-  );
 }
 
 /**
@@ -105,19 +73,6 @@ async function clearWorkspaceCookies(ses, origin) {
  * rather than parse the header), then confirm DBAUTH is present.
  */
 async function mintSessionCookie(ses, origin, accessToken, nextPath) {
-  // Diagnostic: same token against an ordinary API. 200 => token valid + scoped.
-  try {
-    const probe = await fetch(`${origin}/api/2.0/preview/scim/v2/Me`, {
-      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
-      redirect: "manual",
-    });
-    console.log(
-      `[omnigent] databricks session: token probe /scim/v2/Me -> status=${probe.status} type=${probe.type}`,
-    );
-  } catch (e) {
-    console.warn("[omnigent] databricks session: token probe failed:", e.message);
-  }
-
   const status = await new Promise((resolve, reject) => {
     const url = `${origin}${SESSION_CREATE_PATH}?next_url=${encodeURIComponent(nextPath)}`;
     // useSessionCookies:true is required for the response's Set-Cookie to be
@@ -138,11 +93,10 @@ async function mintSessionCookie(ses, origin, accessToken, nextPath) {
   if (jar.length === 0) {
     throw new Error(`${SESSION_CREATE_PATH}: no DBAUTH cookie stored in the session (final HTTP ${status})`);
   }
-  console.log(`[omnigent] databricks session: DBAUTH cookie set for ${origin} (final HTTP ${status})`);
+  console.log(`[omnigent] databricks session: signed in to ${origin}`);
 }
 
 module.exports = {
   databricksOAuthConfigured,
   ensureDatabricksSession,
-  clearWorkspaceCookies,
 };

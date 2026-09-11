@@ -67,11 +67,7 @@ const arca = require("./arca");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
-const {
-  ensureDatabricksSession,
-  databricksOAuthConfigured,
-  clearWorkspaceCookies,
-} = require("./databricks-session");
+const { ensureDatabricksSession, databricksOAuthConfigured } = require("./databricks-session");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
   SETTINGS_PATH,
@@ -2625,22 +2621,8 @@ function registerIpc() {
       // failure fall through to a plain load and let the SSO gate handle it.
       if (databricksOAuthConfigured() && isDatabricksManagedServerUrl(target)) {
         const dbxOrigin = new URL(target).origin;
-        // Testing switch: OMNIGENT_DATABRICKS_OAUTH_STRICT=1 clears the existing
-        // workspace session, forces a fresh browser login, and removes the
-        // fallback so a pre-auth failure is loud instead of dropping to the
-        // in-window SSO login.
-        const strict = process.env.OMNIGENT_DATABRICKS_OAUTH_STRICT === "1";
-        console.log(`[omnigent] databricks pre-auth: signing in to ${dbxOrigin} before load`);
-        if (strict) {
-          try {
-            await clearWorkspaceCookies(session.defaultSession, dbxOrigin);
-          } catch (err) {
-            console.warn("[omnigent] databricks pre-auth: cookie clear failed:", err.message);
-          }
-        }
         try {
           const resolvedOrigin = await ensureDatabricksSession(session.defaultSession, dbxOrigin, {
-            forceLogin: strict,
             pickWorkspace: (workspaces) => pickWorkspaceForBridge(win, workspaces),
           });
           // SPOG: the picked workspace differs from the entered SPOG/account
@@ -2649,9 +2631,6 @@ function registerIpc() {
           // we just set is valid.
           if (resolvedOrigin && resolvedOrigin !== dbxOrigin) {
             loadTarget = databricksWorkspaceUiUrl(resolvedOrigin) ?? `${resolvedOrigin}/omnigent`;
-            console.log(
-              `[omnigent] databricks pre-auth: re-pointing window ${dbxOrigin} -> ${loadTarget}`,
-            );
             pinWindow(win, resolvedOrigin);
             setWindowServerUrl(win, loadTarget);
             if (!ephemeral) {
@@ -2661,17 +2640,9 @@ function registerIpc() {
             }
           }
         } catch (err) {
-          console.warn(`[omnigent] databricks pre-auth failed: ${err.message}`);
-          if (strict) {
-            console.error("[omnigent] databricks pre-auth STRICT: aborting load (no fallback)");
-            dialog.showErrorBox(
-              "Databricks sign-in failed (strict OAuth test mode)",
-              `${err.message}\n\nOMNIGENT_DATABRICKS_OAUTH_STRICT=1 is set, so the shell did not ` +
-                "fall back to in-window login.",
-            );
-            return;
-          }
-          console.warn("[omnigent] loading without a pre-seeded session (fallback)");
+          // Best-effort: on any failure fall through to a plain load and let the
+          // workspace's own SSO gate handle sign-in in the window.
+          console.warn(`[omnigent] databricks pre-auth failed; loading without a pre-seeded session: ${err.message}`);
         }
       }
       win
