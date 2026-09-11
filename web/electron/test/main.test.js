@@ -47,6 +47,9 @@ function loadNavigationHarness({
   const listeners = new Map();
   const calls = { loadFile: [], loadURL: [] };
   const bannerCalls = { show: [], hide: 0 };
+  const menuBuilds = []; // templates passed to Menu.buildFromTemplate
+  const copyImageCalls = []; // webContents.copyImageAt(x, y) invocations
+  const clipboardWrites = []; // clipboard.writeText payloads
   const browserRegistryCalls = { setActive: [], closeAll: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
@@ -62,6 +65,7 @@ function loadNavigationHarness({
     },
     getURL: () => currentUrl,
     setWindowOpenHandler: () => {},
+    copyImageAt: (x, y) => copyImageCalls.push([x, y]),
   };
   const win = {
     webContents,
@@ -122,9 +126,15 @@ function loadNavigationHarness({
       },
     ),
     WebContentsView: function WebContentsView() {},
-    Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
+    Menu: {
+      buildFromTemplate: (template) => {
+        menuBuilds.push(template);
+        return { popup: () => {}, closePopup: () => {} };
+      },
+      setApplicationMenu: () => {},
+    },
     Notification: { isSupported: () => false },
-    clipboard: { writeText: () => {} },
+    clipboard: { writeText: (text) => clipboardWrites.push(text) },
     dialog: {},
     ipcMain: { handle: () => {}, on: () => {} },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
@@ -203,7 +213,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, registerNavigationFallbacks, windows, SETUP_PAGE, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { attachContextMenu, createWindow, registerNavigationFallbacks, windows, SETUP_PAGE, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -244,6 +254,9 @@ function loadNavigationHarness({
     calls,
     bannerCalls,
     browserRegistryCalls,
+    menuBuilds,
+    copyImageCalls,
+    clipboardWrites,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     hasListener: (eventName) => listeners.has(eventName),
     setUrl: (url) => {
@@ -995,5 +1008,95 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         "close a registry with nothing open. Keep the guard.",
       ].join(" "),
     );
+  });
+});
+
+// The shell window's context menu is the ONLY copy affordance for an image the
+// SPA previews (the desktop shell owns the right-click menu; there is no
+// browser-native fallback). Without an image branch, right-clicking a previewed
+// PNG popped no menu at all, so the image could not be copied.
+describe("shell window context menu — images", () => {
+  const baseParams = {
+    misspelledWord: "",
+    dictionarySuggestions: [],
+    linkURL: "",
+    isEditable: false,
+    selectionText: "",
+    mediaType: "none",
+    hasImageContents: false,
+    x: 0,
+    y: 0,
+  };
+
+  function makeMenuHarness() {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.attachContextMenu(harness.win);
+    return harness;
+  }
+
+  it("pops a menu with Copy Image over an image and copies at the click point", () => {
+    const harness = makeMenuHarness();
+    try {
+      harness.emit("context-menu", {
+        ...baseParams,
+        mediaType: "image",
+        hasImageContents: true,
+        x: 40,
+        y: 50,
+      });
+      assert.equal(harness.menuBuilds.length, 1, "an image right-click must pop a menu");
+      const labels = harness.menuBuilds[0].map((item) => item.label || item.type);
+      assert.ok(
+        labels.some((label) => /copy image/i.test(String(label))),
+        `the menu over an image must offer a copy-image item (got: ${labels.join(", ")})`,
+      );
+      harness.menuBuilds[0].find((item) => item.label === "Copy Image").click();
+      assert.deepEqual(harness.copyImageCalls, [[40, 50]]);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("keeps link items ahead of Copy Image for a linked image", () => {
+    const harness = makeMenuHarness();
+    try {
+      harness.emit("context-menu", {
+        ...baseParams,
+        linkURL: "https://example.com/page",
+        mediaType: "image",
+        hasImageContents: true,
+        x: 1,
+        y: 2,
+      });
+      assert.equal(harness.menuBuilds.length, 1);
+      // Spread into a host-realm array: the template was built inside the vm
+      // context, and deepEqual rejects cross-realm Array prototypes.
+      assert.deepEqual(
+        [...harness.menuBuilds[0].map((item) => item.label || item.type)],
+        ["Copy Link Address", "separator", "Copy Image"],
+      );
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("pops no menu for an image with no contents to copy", () => {
+    const harness = makeMenuHarness();
+    try {
+      harness.emit("context-menu", { ...baseParams, mediaType: "image" });
+      assert.equal(harness.menuBuilds.length, 0, "a broken image has nothing to copy");
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("still pops nothing over dead space", () => {
+    const harness = makeMenuHarness();
+    try {
+      harness.emit("context-menu", { ...baseParams });
+      assert.equal(harness.menuBuilds.length, 0);
+    } finally {
+      harness.cleanup();
+    }
   });
 });
