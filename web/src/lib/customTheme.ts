@@ -367,6 +367,8 @@ function rebaseVariant(
     ),
     primary: primaryChanged ? primary : base.primary,
     primaryForeground: primaryChanged ? readableForeground(primary) : base.primaryForeground,
+    selectionBackground: base.selectionBackground,
+    selectionForeground: base.selectionForeground,
     secondary: rebaseColor(base.secondary, reference.secondary, current.secondary),
     secondaryForeground: rebaseColor(
       base.secondaryForeground,
