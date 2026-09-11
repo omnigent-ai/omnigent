@@ -2484,6 +2484,33 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(readConversationRows()[0]?.provisional).toBeUndefined();
   });
 
+  it("seeds the picked agent + workspace onto the temp conversation", () => {
+    const begun = beginLocalConversation("hello there", undefined, undefined, undefined, {
+      agentId: "agent_next",
+      agentName: "next_agent",
+      harness: "openai-agents",
+      workspace: "/work/repo",
+    })!;
+    expect(isTempConvId(begun.tempConvId)).toBe(true);
+    // Mirrored onto the active store: the composer pill / workspace chip read
+    // these during the create window instead of whatever identity the
+    // previously viewed session left behind.
+    const state = useChatStore.getState();
+    expect(state.boundAgentId).toBe("agent_next");
+    expect(state.boundAgentName).toBe("next_agent");
+    expect(state.sessionHarness).toBe("openai-agents");
+    expect(state.sessionWorkspace).toBe("/work/repo");
+  });
+
+  it("leaves the temp identity unbound when no pick is supplied", () => {
+    const begun = beginLocalConversation("hello there", undefined)!;
+    expect(isTempConvId(begun.tempConvId)).toBe(true);
+    const state = useChatStore.getState();
+    expect(state.boundAgentId).toBeNull();
+    expect(state.boundAgentName).toBeNull();
+    expect(state.sessionWorkspace).toBeNull();
+  });
+
   it("happy path: reuses the bubble (no duplicate), stays streaming, arms the latch", async () => {
     seedSession("conv_real");
     const begun = beginLocalConversation("hello there", undefined);

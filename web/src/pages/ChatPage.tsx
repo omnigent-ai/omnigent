@@ -2681,7 +2681,12 @@ function ComposerImpl({
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
-  const composerWorkspace = composerSession?.workspace;
+  // While the server session isn't fetched (a temp id during the create
+  // window), fall back to the workspace the landing composer picked, seeded
+  // on the conversation entry by `beginLocalConversation` — never a stale
+  // "No workspace" placeholder for a create that carries a workspace.
+  const seededWorkspace = useChatStore((s) => s.sessionWorkspace);
+  const composerWorkspace = composerSession?.workspace ?? seededWorkspace ?? undefined;
   const permissionOptions = showClaudePermissionMode
     ? CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
     : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;

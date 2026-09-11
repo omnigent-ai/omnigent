@@ -5079,7 +5079,18 @@ export function NewChatLandingScreen() {
         // Normal path: bind to an existing registered agent.
         const provisional = newTempConversation();
         try {
-          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject);
+          // Seed the temp conversation with THIS create's identity — the
+          // picked agent and workspace — so the composer never renders the
+          // previously viewed session's model/agent (or a "No workspace"
+          // placeholder) while the create POST is in flight.
+          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
+            agentId: effectiveAgentId,
+            agentName: selectedAgent?.name ?? null,
+            harness: selectedAgent?.harness ?? null,
+            workspace: sandboxSelected
+              ? (composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null)
+              : workspaceTrimmed || null,
+          });
           if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
         } catch {
           /* non-fatal: the response still opens the server session */

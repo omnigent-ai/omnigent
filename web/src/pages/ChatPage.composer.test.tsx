@@ -1543,6 +1543,22 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
+  it("shows the workspace picked for a pending create, not the placeholder", () => {
+    // A temp id has no server session to fetch, so the chip must fall back to
+    // the workspace seeded by `beginLocalConversation` instead of rendering
+    // "No workspace" while the create POST is in flight.
+    useChatStore.setState({
+      conversationId: "temp:0123456789abcdef0123456789abcdef",
+      sessionWorkspace: "/work/repo",
+    });
+    renderWithTooltips(<Composer {...composerProps({})} />);
+    const workspace = screen.getByTestId("composer-workspace-controls");
+    const chip = within(workspace).getAllByRole("button")[0]!;
+    expect(chip).toHaveTextContent("repo");
+    expect(chip).not.toHaveTextContent("No workspace");
+    useChatStore.setState({ sessionWorkspace: null });
+  });
+
   it("dispatches the shared permission picker to the session setter", async () => {
     useChatStore.setState({
       conversationId: "shared-permissions",
