@@ -21,6 +21,7 @@ import {
   terminalInfoFromResource,
   terminalsReconcileInterval,
   terminalTabKey,
+  useCreateTerminal,
   useTerminals,
   type TerminalInfo,
 } from "./useTerminals";
@@ -40,6 +41,13 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(() => undefined),
 }));
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+
+// useCreateTerminal resolves the terminal theme against the app's
+// appearance at mutate time. Mock the app-side resolution so the tests
+// below can pin "the app renders dark" without a next-themes provider.
+vi.mock("@/components/theme/useResolvedThemeMode", () => ({
+  useResolvedThemeMode: vi.fn(() => "dark"),
+}));
 
 const runnerOnlineMock = vi.mocked(useSessionRunnerOnline);
 
@@ -372,6 +380,44 @@ describe("createTerminal", () => {
     });
   });
 
+  it("sends the resolved theme so the pane's PTY learns its background", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "terminal_shell_u-abc123",
+        object: "session.resource",
+        type: "terminal",
+        session_id: "conv_abc",
+        name: "shell:u-abc123",
+        metadata: { terminal_name: "shell", session_key: "u-abc123", running: true },
+      }),
+    );
+
+    await createTerminal("conv_abc", "shell", "dark");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { terminal_theme?: string };
+    expect(body.terminal_theme).toBe("dark");
+  });
+
+  it("omits terminal_theme when no resolved theme is provided", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "terminal_shell_u-abc123",
+        object: "session.resource",
+        type: "terminal",
+        session_id: "conv_abc",
+        name: "shell:u-abc123",
+        metadata: { terminal_name: "shell", session_key: "u-abc123", running: true },
+      }),
+    );
+
+    await createTerminal("conv_abc", "shell");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect("terminal_theme" in body).toBe(false);
+  });
+
   it("surfaces the server gate's message on a 400 rejection", async () => {
     // The server's iff gate (agent has no terminals: block / name not
     // declared) returns a structured error; the UI must surface that
@@ -383,6 +429,56 @@ describe("createTerminal", () => {
       ),
     );
     await expect(createTerminal("conv_abc", "zsh")).rejects.toThrow(/not declared/);
+  });
+});
+
+describe("useCreateTerminal — resolved theme rides the create request", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+    window.localStorage.removeItem("omnigent:terminal-theme");
+  });
+  afterEach(() => {
+    window.localStorage.removeItem("omnigent:terminal-theme");
+    vi.unstubAllGlobals();
+  });
+
+  function makeWrapper() {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+  }
+
+  const created = () =>
+    mockResponse({
+      id: "terminal_zsh_u-abc123",
+      object: "session.resource",
+      type: "terminal",
+      session_id: "conv_abc",
+      name: "zsh:u-abc123",
+      metadata: { terminal_name: "zsh", session_key: "u-abc123", running: true },
+    });
+
+  async function mutateAndReadBody(): Promise<Record<string, unknown>> {
+    fetchMock.mockResolvedValueOnce(created());
+    const { result } = renderHook(() => useCreateTerminal("conv_abc"), {
+      wrapper: makeWrapper(),
+    });
+    await act(async () => {
+      await result.current.mutateAsync("zsh");
+    });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    return JSON.parse(init.body as string) as Record<string, unknown>;
+  }
+
+  it("resolves the default 'Match app' mode against the app appearance (dark)", async () => {
+    // useResolvedThemeMode is mocked to "dark" above; nothing stored = auto.
+    expect((await mutateAndReadBody()).terminal_theme).toBe("dark");
+  });
+
+  it("a pinned Light terminal theme wins over a dark app", async () => {
+    window.localStorage.setItem("omnigent:terminal-theme", "light");
+    expect((await mutateAndReadBody()).terminal_theme).toBe("light");
   });
 });
 
