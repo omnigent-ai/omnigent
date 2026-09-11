@@ -7788,6 +7788,54 @@ async def _delete_native_bridge_dirs(
             )
 
 
+async def _codex_bridge_torn_down_for_live_pane(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> bool:
+    """
+    Return whether a codex session's bridge was torn out from under a live pane.
+
+    :func:`_delete_native_bridge_dirs` (session delete / resource cleanup)
+    removes the whole bridge dir, but the tmux pane can outlive that teardown.
+    A turn delivered afterwards finds neither ``state.json`` nor a recorded
+    startup error, waits out the executor's poll, and fails with the generic
+    "Codex native bridge state is missing" — and nothing regenerates those
+    files while the live pane keeps the per-turn self-heal a no-op. The
+    teardown signature is every runner-written bridge file being gone (see
+    :func:`~omnigent.harnesses.codex_native.bridge.bridge_torn_down`): a cold
+    boot that has not yet written ``state.json`` still has its launch-seeded
+    ``bridge.json``, and a recorded startup failure keeps
+    ``startup_error.json``, so neither is flagged. The session-id-keyed dir is
+    checked first (a stat-only fast path); a rotated bridge-id label is
+    resolved only when that dir is already torn down, so a healthy turn never
+    pays the label lookup.
+
+    :param server_client: Omnigent server client used to resolve a rotated
+        bridge-id label. ``None`` checks only the session-id-keyed dir.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` when the executor's bridge dir was torn down.
+    """
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+        bridge_dir_for_bridge_id,
+        bridge_torn_down,
+    )
+
+    if not bridge_torn_down(bridge_dir_for_bridge_id(session_id)):
+        return False
+    if server_client is None:
+        return True
+    labels = await _session_labels_for_runner_spawn(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
+    if not bridge_id or bridge_id == session_id:
+        return True
+    return bridge_torn_down(bridge_dir_for_bridge_id(bridge_id))
+
+
 async def _claude_native_bridge_id_for_session(
     *,
     server_client: httpx.AsyncClient,
