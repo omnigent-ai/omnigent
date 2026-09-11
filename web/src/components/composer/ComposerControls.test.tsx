@@ -39,6 +39,46 @@ describe("shared composer controls", () => {
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
   });
 
+  it("lets the permission label use free row space and only truncate under flex pressure", () => {
+    render(
+      <ComposerPermissionPicker
+        label="Permissions"
+        value="Bypass permissions"
+        options={[{ value: "bypassPermissions", label: "Bypass permissions" }]}
+        onSelect={() => {}}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Permissions: Bypass permissions" });
+    // The pill must yield to flex pressure instead of being exempt from it.
+    expect(trigger).toHaveClass("min-w-0");
+    expect(trigger).not.toHaveClass("shrink-0");
+    const label = screen.getByText("Bypass permissions");
+    // No fixed cap: with free row space the full mode name renders; the
+    // ellipsis appears only when the row genuinely runs out of width.
+    expect(label).toHaveClass("min-w-0", "truncate");
+    expect(label.className).not.toMatch(/max-w-/);
+  });
+
+  it("lets the model label use free row space and shrink under real width pressure", () => {
+    render(
+      <ComposerHarnessTrigger
+        label="Configure session"
+        model="Fable 5.1 (1M context)"
+        effort="xHigh"
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Configure session" });
+    // `shrink` must win over the Button base's `shrink-0`, and no fixed
+    // max-width cap may clip the label while the row still has free space.
+    expect(trigger).toHaveClass("shrink", "min-w-0");
+    expect(trigger).not.toHaveClass("shrink-0");
+    expect(trigger.className).not.toMatch(/max-w-/);
+    const model = screen.getByText("Fable 5.1 (1M context)");
+    expect(model).toHaveClass("min-w-0", "truncate");
+    // The effort tag never absorbs the shrink; the model label truncates.
+    expect(screen.getByText("xHigh")).toHaveClass("shrink-0");
+  });
+
   it("dispatches permission selections through the caller's handler", () => {
     const onSelect = vi.fn();
     render(

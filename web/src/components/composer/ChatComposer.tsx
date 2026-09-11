@@ -157,7 +157,9 @@ export function ComposerActionGroup({
     <div
       className={cn(
         "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-1 overflow-visible" : "shrink-0",
+        // The right group shrinks too (its icon buttons are shrink-0), so a
+        // long model label truncates under pressure instead of overflowing.
+        side === "left" ? "flex-1 overflow-visible" : "min-w-0",
         className,
       )}
       {...props}

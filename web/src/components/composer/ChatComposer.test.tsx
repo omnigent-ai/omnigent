@@ -33,6 +33,26 @@ describe("ChatComposer", () => {
     expect(onSubmit).toHaveBeenCalledOnce();
   });
 
+  it("keeps the trailing action group shrinkable so pill labels truncate before overflow", () => {
+    render(
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Message" }}
+        actions={{
+          leading: <span>Context controls</span>,
+          trailing: <ComposerSendButton label="Send" />,
+        }}
+      />,
+    );
+    const trailing = screen.getByRole("button", { name: "Send" }).parentElement;
+    // A rigid trailing group would force a long model label to overflow the
+    // row; letting it shrink turns real width pressure into an ellipsis
+    // (the group's icon buttons are shrink-0 and keep their size).
+    expect(trailing).toHaveClass("min-w-0");
+    expect(trailing).not.toHaveClass("shrink-0");
+    expect(screen.getByText("Context controls").parentElement).toHaveClass("flex-1");
+  });
+
   it("preserves interrupt and pending-creation states", () => {
     const { rerender } = render(<ComposerSendButton label="Interrupt" interrupt />);
     expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();

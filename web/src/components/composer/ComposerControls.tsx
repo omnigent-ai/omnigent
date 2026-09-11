@@ -114,13 +114,15 @@ export function ComposerPermissionPicker({
         <button
           type="button"
           disabled={disabled}
-          className="flex h-8 w-auto shrink-0 cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7"
+          className="flex h-8 w-auto min-w-0 cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7"
           aria-label={`${label}: ${value}`}
           title={`${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span className="max-w-20 truncate text-ui font-normal">{value}</span>
+          {/* No fixed cap: the label flexes into free row space and only
+              truncates when the action row genuinely runs out of width. */}
+          <span className="min-w-0 truncate text-ui font-normal">{value}</span>
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
@@ -177,7 +179,10 @@ export const ComposerHarnessTrigger = forwardRef<
       size="sm"
       aria-label={label}
       className={cn(
-        "h-8 min-w-0 w-full max-w-[7.25rem] gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0 md:h-7 md:w-auto md:max-w-40",
+        // `shrink` overrides the Button base's `shrink-0` so the model label
+        // flexes into free row space and only truncates under real width
+        // pressure instead of clipping at a fixed cap.
+        "h-8 min-w-0 w-full shrink gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0 md:h-7 md:w-auto",
         className,
       )}
       {...props}
