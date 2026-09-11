@@ -394,7 +394,32 @@ jobs:
             sleep "$((attempt * 15))"
           done
 
-          if ! URL=$(jq -er '.url | select(type == "string" and startswith("https://"))' <<< "$APP_JSON"); then
+          if ! URL=$(python3 -c '
+          import json
+          import sys
+          from urllib.parse import urlsplit
+
+          url = json.load(sys.stdin).get("url")
+          if not isinstance(url, str) or any(
+              char.isspace() or ord(char) < 32 or ord(char) == 127 or char == "\\"
+              for char in url
+          ):
+              sys.exit(1)
+          try:
+              parsed = urlsplit(url)
+              valid = (
+                  parsed.scheme == "https"
+                  and bool(parsed.hostname)
+                  and parsed.username is None
+                  and parsed.password is None
+                  and (parsed.port is None or parsed.port > 0)
+              )
+          except ValueError:
+              sys.exit(1)
+          if not valid:
+              sys.exit(1)
+          print(url)
+          ' <<< "$APP_JSON"); then
             echo "::error::App has no usable preview URL"
             exit 1
           fi

@@ -309,7 +309,32 @@ def test_provision_timeout_fits_within_deploy_job() -> None:
     assert DEPLOY_JOB["timeout-minutes"] == 60
 
 
-@pytest.mark.parametrize("url", [None, "", "Unavailable"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        None,
+        "",
+        "Unavailable",
+        "https://",
+        "https:///missing-host",
+        "http://preview.example.com",
+        "https://preview.example.com/\nurl=other",
+        "https://preview.example.com/\r",
+        "https://preview.example.com/\t",
+        "https://pre view.example.com",
+        "https://preview.example.com/\x00",
+        "https://preview.example.com/\x1f",
+        "https://preview.example.com/\x7f",
+        " https://preview.example.com",
+        "https://preview.example.com/\u00a0",
+        "https://preview.example.com:invalid",
+        "https://preview.example.com:70000",
+        "https://preview.example.com:0",
+        "https://[invalid",
+        "https://user@preview.example.com",
+        "https://preview.example.com\\extra",
+    ],
+)
 def test_provision_rejects_unavailable_url(tmp_path: Path, url: str | None) -> None:
     result, commands, output = _run_provision(
         tmp_path,
@@ -323,6 +348,27 @@ def test_provision_rejects_unavailable_url(tmp_path: Path, url: str | None) -> N
     assert "App has no usable preview URL" in result.stdout
     assert not any(command.startswith("apps delete") for command in commands)
     assert output == ""
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://preview.example.com/",
+        "https://preview.example.com:443/path?view=1#preview",
+        "https://[2001:db8::1]:8443/preview",
+    ],
+)
+def test_provision_preserves_valid_https_url(tmp_path: Path, url: str) -> None:
+    result, _, output = _run_provision(
+        tmp_path,
+        [
+            _reply("list", []),
+            _reply("create", _app()),
+            _reply("get", _app("ACTIVE", url=url)),
+        ],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output == f"url={url}\n"
 
 
 def test_cleanup_worker_requires_reconciler_identity_fields() -> None:
