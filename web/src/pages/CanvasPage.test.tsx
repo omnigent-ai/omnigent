@@ -4,6 +4,7 @@
 // storage, and card modules run for real.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type * as xyflow from "@xyflow/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
@@ -38,11 +39,15 @@ const { flowProps, flowFitView, flowSetViewport, flowApi, viewerIdRef } = vi.hoi
   };
 });
 
-vi.mock("@xyflow/react", () => ({
+vi.mock("@xyflow/react", async (importActual) => ({
   ReactFlowProvider: ({ children }: { children: ReactNode }) => children,
   ReactFlow: (props: Record<string, unknown>) => {
     flowProps.current = props;
-    const nodes = props.nodes as { id: string; position: { x: number; y: number } }[];
+    const nodes = props.nodes as {
+      id: string;
+      position: { x: number; y: number };
+      selected?: boolean;
+    }[];
     return (
       <div data-testid="react-flow">
         {nodes.map((node) => (
@@ -52,6 +57,7 @@ vi.mock("@xyflow/react", () => ({
             data-testid={`flow-node-${node.id}`}
             data-x={node.position?.x}
             data-y={node.position?.y}
+            data-selected={node.selected ? "true" : "false"}
             onDoubleClick={() =>
               (props.onNodeDoubleClick as (event: MouseEvent, value: unknown) => void)(
                 new MouseEvent("dblclick"),
@@ -68,7 +74,9 @@ vi.mock("@xyflow/react", () => ({
   },
   Background: () => null,
   useReactFlow: () => ({ ...flowApi }),
-  applyNodeChanges: (_changes: unknown, nodes: unknown) => nodes,
+  // The real change reducer, so selection changes reported through
+  // onNodesChange land on the node objects like they do in the app.
+  applyNodeChanges: (await importActual<typeof xyflow>()).applyNodeChanges,
 }));
 
 vi.mock("@/hooks/useConversations", async (importActual) => ({
@@ -371,6 +379,38 @@ describe("CanvasPage", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
     fireEvent.doubleClick(screen.getByTestId("flow-node-conv_1"));
     expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_1");
+  });
+
+  it("keeps the clicked card's selection while the session list churns", () => {
+    const rows = [conversation("conv_keep", 2), conversation("conv_other", 1)];
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
+    const { rerender } = renderPage();
+
+    // React Flow reports a card click as a select change.
+    const onNodesChange = flowProps.current?.onNodesChange as (
+      changes: { id: string; type: "select"; selected: boolean }[],
+    ) => void;
+    act(() => {
+      onNodesChange([{ id: "conv_keep", type: "select", selected: true }]);
+    });
+    expect(screen.getByTestId("flow-node-conv_keep")).toHaveAttribute("data-selected", "true");
+
+    // A refresh publishes a fresh array with identical data (the 30s poll,
+    // a window-focus refresh): the selection must survive the node rebuild.
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub(rows.map((row) => ({ ...row }))),
+    );
+    rerender(pageTree());
+    expect(screen.getByTestId("flow-node-conv_keep")).toHaveAttribute("data-selected", "true");
+
+    // A live update to another session rebuilds the nodes too: still selected,
+    // and the updated card does not steal the selection.
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([rows[0], { ...rows[1], title: "Retitled neighbor" }]),
+    );
+    rerender(pageTree());
+    expect(screen.getByTestId("flow-node-conv_keep")).toHaveAttribute("data-selected", "true");
+    expect(screen.getByTestId("flow-node-conv_other")).toHaveAttribute("data-selected", "false");
   });
 
   it("saves every card's spot once complete, so a moved card leaves the others in place", async () => {
