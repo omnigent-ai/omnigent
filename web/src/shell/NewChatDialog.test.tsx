@@ -1779,6 +1779,86 @@ describe("NewChatLandingScreen", () => {
     expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort High");
   });
 
+  it("offers model-specific Codex effort in the adjacent selector and sends the selection", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("Effort");
+    expect(screen.getByTestId("new-chat-landing-agent-effort-low")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-xhigh")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
+    expect(screen.getAllByRole("menu")).toHaveLength(2);
+    expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
+    expect(screen.getByTestId("new-chat-landing-agent-summary-a2")).toHaveTextContent("High");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"));
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-low")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-xhigh")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.model_override).toBe("databricks-gpt-5-6");
+  });
+
+  it("clears incompatible Codex effort when switching models in the adjacent selector", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-xhigh"));
+    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("xHigh");
+    expect(screen.getByTestId("new-chat-landing-agent-summary-a2")).toHaveTextContent("xHigh");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-5"));
+    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
+    closeMenu();
+    selectAgent("a1");
+    selectAgent("a2");
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
+    const { body } = await submitAndReadBody();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("hides adjacent Codex effort options when the model has no effort metadata", () => {
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native"
+          ? {
+              ...CODEX_MODEL_OPTIONS_RESULT,
+              data: CODEX_MODEL_OPTIONS_RESULT.data.map((option) => ({
+                ...option,
+                supportedReasoningEfforts: [],
+              })),
+            }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
+  });
+
   it("caps and truncates a long model before fixed trailing controls", () => {
     vi.stubGlobal(
       "SpeechRecognition",

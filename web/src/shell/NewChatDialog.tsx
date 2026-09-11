@@ -275,6 +275,10 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // out — other agents keep the "/" menu as the only skill surface.
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 
+function codexPickerEffortLabel(effort: string): string {
+  return effort === "xhigh" ? "xHigh" : effort.charAt(0).toUpperCase() + effort.slice(1);
+}
+
 function createdHarnessOptions({
   harness,
   supportsPermissionMode,
@@ -3695,14 +3699,14 @@ export function NewChatLandingScreen() {
                 ),
               },
             ];
-      // Mirror the modal's Effort row: em-dash while routing picks per turn,
-      // else the picked level (Codex ids render raw, not title-cased).
       const effortRows = !isCodex
         ? []
         : [
             {
               label: "Effort",
-              value: routingOn ? EFFORT_UNAVAILABLE_PLACEHOLDER : pickedEffort || "Default",
+              value: routingOn
+                ? EFFORT_UNAVAILABLE_PLACEHOLDER
+                : codexPickerEffortLabel(pickedEffort) || "Default",
             },
           ];
       return [
@@ -3770,7 +3774,12 @@ export function NewChatLandingScreen() {
     ? CLAUDE_NATIVE_EFFORTS
     : selectedNativeHarness === "pi-native"
       ? PI_NATIVE_EFFORTS
-      : [];
+      : selectedNativeHarness === "codex-native"
+        ? codexEffortLevelsForModel(
+            codexModelOptions,
+            pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
+          ).map((value) => ({ value, label: codexPickerEffortLabel(value) }))
+        : [];
   const selectPickerModel = (model: string) => {
     if (!selectedNativeHarness) return;
     if (model === MODEL_SELECT_SMART) {
@@ -3781,9 +3790,18 @@ export function NewChatLandingScreen() {
       return;
     }
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
+    const effort =
+      selectedNativeHarness === "codex-native" &&
+      !codexEffortLevelsForModel(
+        codexModelOptions,
+        picked || codexModelOptions.find((option) => option.isDefault)?.id,
+      ).includes(pickedEffort)
+        ? ""
+        : pickedEffort;
     setPickedModel(picked);
+    setPickedEffort(effort);
     setCostControlMode(null);
-    writeHarnessOption(selectedNativeHarness, { model: picked, routing: "off" });
+    writeHarnessOption(selectedNativeHarness, { model: picked, effort, routing: "off" });
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectedNativeHarness) return;
@@ -3886,7 +3904,10 @@ export function NewChatLandingScreen() {
       const model = catalog.find((option) => option.id === saved.model);
       const label = visibleModelLabel(model ? nativeModelLabel(model) : defaultModelLabel(catalog));
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
-      const effort = efforts.find((option) => option.value === saved.effort)?.label;
+      const effort =
+        native.iconKind === "codex"
+          ? codexPickerEffortLabel(saved.effort ?? "")
+          : efforts.find((option) => option.value === saved.effort)?.label;
       return [agent.id, [compactHarnessTriggerValue(label), effort].filter(Boolean).join(" ")];
     }),
   );
