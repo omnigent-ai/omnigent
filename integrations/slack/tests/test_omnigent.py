@@ -227,9 +227,11 @@ async def test_managed_host_support_reads_the_server_capability_probe() -> None:
 
 
 @respx.mock
-async def test_managed_host_support_reports_unsupported_when_probe_fails() -> None:
+async def test_managed_host_support_reports_unknown_when_probe_fails() -> None:
     # An unreadable /v1/info must NOT advertise managed sandboxes: setup would
-    # then offer an option the server rejects with a 422 at first message.
+    # then offer an option the server rejects with a 422 at first message. It
+    # reports ``None``, not ``False`` — we never learned the server's answer, and
+    # callers must not repeat the failure to ask as a finding about the server.
     respx.get("http://omnigent.test/v1/info").mock(return_value=httpx.Response(500))
     client = OmnigentClient("http://omnigent.test")
 
@@ -238,7 +240,57 @@ async def test_managed_host_support_reports_unsupported_when_probe_fails() -> No
     finally:
         await client.aclose()
 
-    assert supported == (False, None)
+    assert supported == (None, None)
+
+
+@respx.mock
+async def test_validate_withholds_managed_but_records_an_unread_probe() -> None:
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    respx.get("http://omnigent.test/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1"}]})
+    )
+    respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
+    )
+    respx.get("http://omnigent.test/v1/info").mock(return_value=httpx.Response(500))
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        validated = await client.validate()
+    finally:
+        await client.aclose()
+
+    # Withheld, exactly as before…
+    assert validated.managed_hosts is False
+    # …but flagged as never established, so no caller can report it as a "no".
+    assert validated.managed_support_known is False
+
+
+@respx.mock
+async def test_validate_records_a_readable_probe_as_known() -> None:
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    respx.get("http://omnigent.test/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1"}]})
+    )
+    respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
+    )
+    respx.get("http://omnigent.test/v1/info").mock(
+        return_value=httpx.Response(200, json={"managed_sandboxes_enabled": False})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        validated = await client.validate()
+    finally:
+        await client.aclose()
+
+    assert validated.managed_hosts is False
+    assert validated.managed_support_known is True
 
 
 @respx.mock
