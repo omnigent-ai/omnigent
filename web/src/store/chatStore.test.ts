@@ -7257,6 +7257,36 @@ describe("chatStore — submitApproval", () => {
     }
   });
 
+  it("invalidates the conversations list on success so the sidebar markers drop promptly", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_xyz")],
+    });
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+
+    await useChatStore.getState().submitApproval("elic_xyz", "accept");
+
+    // The row's "Needs response" badge and the Inbox counter derive from the
+    // conversations cache; without this the answered prompt stays advertised
+    // until the session-updates socket's next re-scan.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("does not invalidate the conversations list when the resolve fails", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_xyz")],
+    });
+    fetchMock.mockImplementationOnce(() => mockResponse({}, { ok: false, status: 500 }));
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+
+    await useChatStore.getState().submitApproval("elic_xyz", "accept");
+
+    // The prompt is still pending server-side (the card rolled back), so the
+    // cached count is still correct.
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
   it("rolls back on the answering conversation when the failure outlives a switch", async () => {
     // The approve POST can outlive a switch away. Resolving the rollback target
     // late reopened the card on whatever conversation was then visible while

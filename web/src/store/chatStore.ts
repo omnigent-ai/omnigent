@@ -2513,6 +2513,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
+      // The verdict drained the server-side prompt; refresh the session list
+      // now so the row's "Needs response" badge and the Inbox counter drop
+      // without waiting for the session-updates socket's next re-scan (the
+      // same treatment the Inbox answer path applies).
+      queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch {
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
