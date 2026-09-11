@@ -936,9 +936,9 @@ def test_resolve_image_file_keeps_specific_mime(
 @pytest.mark.parametrize(
     ("content_type", "expected_mb"),
     [
-        ("image/png", 5),
-        ("image/jpeg", 5),
-        ("image/webp", 5),
+        ("image/png", 50),
+        ("image/jpeg", 50),
+        ("image/webp", 50),
         ("application/pdf", 20),
         ("text/plain", 10),
         ("text/markdown", 10),
@@ -986,6 +986,117 @@ def test_attachment_upload_limits_are_under_global_ceiling() -> None:
     assert MAX_IMAGE_UPLOAD_BYTES <= MAX_ATTACHMENT_UPLOAD_BYTES
     assert MAX_PDF_UPLOAD_BYTES <= MAX_ATTACHMENT_UPLOAD_BYTES
     assert MAX_TEXT_UPLOAD_BYTES <= MAX_ATTACHMENT_UPLOAD_BYTES
+
+
+# ── Image attachment compression ──────────────────────────────────────
+
+
+def _png_bytes_over_budget() -> bytes:
+    """A valid opaque PNG whose encoded size exceeds the model budget."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import IMAGE_MODEL_BUDGET_BYTES
+
+    # Random noise resists PNG compression, so the encoded size ~ the raw
+    # pixel count. Size it comfortably above the budget.
+    side = 1600
+    image = Image.frombytes("RGB", (side, side), os.urandom(side * side * 3))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    data = buffer.getvalue()
+    assert len(data) > IMAGE_MODEL_BUDGET_BYTES
+    return data
+
+
+def test_compress_image_leaves_small_image_untouched() -> None:
+    """An image already under the budget is returned byte-for-byte."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import compress_image_attachment
+
+    buffer = BytesIO()
+    Image.new("RGB", (32, 32), (10, 20, 30)).save(buffer, format="PNG")
+    original = buffer.getvalue()
+
+    result, content_type = compress_image_attachment(original, "image/png")
+
+    assert result is original
+    assert content_type == "image/png"
+
+
+def test_compress_image_shrinks_opaque_png_under_budget() -> None:
+    """A large opaque PNG is re-encoded (to JPEG) under the budget."""
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        compress_image_attachment,
+    )
+
+    result, content_type = compress_image_attachment(_png_bytes_over_budget(), "image/png")
+
+    assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
+    assert content_type == "image/jpeg"
+
+
+def test_compress_image_shrinks_alpha_png_under_budget() -> None:
+    """A large image with alpha stays lossless/alpha-capable under the budget."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        compress_image_attachment,
+    )
+
+    side = 1500
+    image = Image.frombytes("RGBA", (side, side), os.urandom(side * side * 4))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    original = buffer.getvalue()
+    assert len(original) > IMAGE_MODEL_BUDGET_BYTES
+
+    result, content_type = compress_image_attachment(original, "image/png")
+
+    assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
+    assert content_type in ("image/webp", "image/png")
+
+
+def test_compress_image_rejects_undecodable_over_budget() -> None:
+    """Bytes over the budget that don't decode as an image are rejected."""
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        ImageCompressionError,
+        compress_image_attachment,
+    )
+
+    garbage = b"\x00" * (IMAGE_MODEL_BUDGET_BYTES + 1)
+    with pytest.raises(ImageCompressionError):
+        compress_image_attachment(garbage, "image/png")
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "expected"),
+    [
+        ("shot.png", "image/jpeg", "shot.jpg"),  # re-encoded PNG → JPEG
+        ("shot.png", "image/webp", "shot.webp"),  # alpha kept, WebP
+        ("my.screen.png", "image/jpeg", "my.screen.jpg"),  # dotted stem preserved
+        ("noext", "image/jpeg", "noext.jpg"),  # no extension → appended
+        ("shot.jpg", "image/jpeg", "shot.jpg"),  # already matches → unchanged
+        ("shot.PNG", "image/png", "shot.PNG"),  # case-insensitive match → unchanged
+        ("shot.png", "image/svg+xml", "shot.png"),  # unknown emit type → unchanged
+    ],
+)
+def test_image_filename_for_content_type(filename: str, content_type: str, expected: str) -> None:
+    """The stored filename's extension is realigned to the (re-)encoded type."""
+    from omnigent.runtime.content_resolver import image_filename_for_content_type
+
+    assert image_filename_for_content_type(filename, content_type) == expected
 
 
 @pytest.mark.parametrize(

@@ -11,7 +11,6 @@ from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
 from omnigent.runtime.content_resolver import (
-    MAX_IMAGE_UPLOAD_BYTES,
     MAX_TEXT_UPLOAD_BYTES,
 )
 from omnigent.server.routes.sessions import create_sessions_router
@@ -87,16 +86,53 @@ def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) 
     assert "Unsupported attachment type" in resp.text
 
 
-def test_upload_rejects_oversized_image(upload_client: tuple[TestClient, str]) -> None:
-    """An image over the per-type limit is rejected with 413."""
+def test_upload_rejects_undecodable_oversized_image(
+    upload_client: tuple[TestClient, str],
+) -> None:
+    """Image bytes over the model budget that don't decode are rejected 413.
+
+    Real images are downscaled under the budget; garbage that only claims to
+    be an image can't be compressed, so the route surfaces a 413 instead of
+    storing an oversized attachment.
+    """
+    from omnigent.runtime.content_resolver import IMAGE_MODEL_BUDGET_BYTES
+
     client, session_id = upload_client
-    oversized = b"\x00" * (MAX_IMAGE_UPLOAD_BYTES + 1)
+    oversized = b"\x00" * (IMAGE_MODEL_BUDGET_BYTES + 1)
     resp = client.post(
         f"/v1/sessions/{session_id}/resources/files",
         files={"file": ("huge.png", oversized, "image/png")},
     )
     assert resp.status_code == 413, resp.status_code
-    assert "limit" in resp.text.lower()
+
+
+def test_upload_large_image_is_compressed_under_budget(
+    upload_client: tuple[TestClient, str],
+) -> None:
+    """A large but valid image uploads and is stored shrunk under the model budget."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import IMAGE_MODEL_BUDGET_BYTES
+
+    client, session_id = upload_client
+    side = 1600
+    buffer = BytesIO()
+    Image.frombytes("RGB", (side, side), os.urandom(side * side * 3)).save(buffer, format="PNG")
+    payload = buffer.getvalue()
+    assert len(payload) > IMAGE_MODEL_BUDGET_BYTES
+
+    resp = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("screenshot.png", payload, "image/png")},
+    )
+    assert resp.status_code in (200, 201), resp.text
+    body = resp.json()
+    assert body["metadata"]["bytes"] <= IMAGE_MODEL_BUDGET_BYTES
+    # Opaque image re-encodes to JPEG, so the stored name is realigned.
+    assert body["name"] == "screenshot.jpg"
 
 
 def test_upload_csv_mislabeled_as_excel_is_accepted(

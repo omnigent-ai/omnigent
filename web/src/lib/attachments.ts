@@ -10,9 +10,15 @@
  * UX only. Keep the limits in sync with the Python constants.
  */
 
-/** Per-type upload size limits, in megabytes. Mirrors the server caps. */
+/**
+ * Per-type upload size limits, in megabytes. Mirrors the server caps.
+ *
+ * Images accept a large upload — the server downscales/re-encodes an oversized
+ * image under the provider's per-image limit before storing it, so screenshots
+ * and retina captures no longer need to be shrunk by hand.
+ */
 export const ATTACHMENT_SIZE_LIMITS_MB = {
-  image: 5,
+  image: 50,
   pdf: 20,
   text: 10,
 } as const;

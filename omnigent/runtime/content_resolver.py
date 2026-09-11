@@ -99,11 +99,32 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 # pages, and ~32 MB per request total. The per-type caps below keep a
 # single attachment usable across a multi-turn conversation; the global
 # ceiling backstops the total request size after base64 inflation (~1.33x).
+#
+# Images are the exception: we accept a much larger upload (screenshots,
+# retina captures) and shrink it under the provider's per-image limit at
+# upload time via :func:`compress_image_attachment`, so the stored blob —
+# and the base64 re-sent every turn — always fits. The compressed result is
+# what lands in the file store (see the ``files`` upload route).
 # Mirrored client-side in web/src/lib/attachments.ts — keep in sync.
-MAX_IMAGE_UPLOAD_BYTES: int = 5 * 1024 * 1024
+MAX_IMAGE_UPLOAD_BYTES: int = 50 * 1024 * 1024
 MAX_PDF_UPLOAD_BYTES: int = 20 * 1024 * 1024
 MAX_TEXT_UPLOAD_BYTES: int = 10 * 1024 * 1024
-MAX_ATTACHMENT_UPLOAD_BYTES: int = 25 * 1024 * 1024
+MAX_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
+
+# Budget an image's stored/inlined bytes must fit after compression. Kept
+# under Anthropic's ~5 MB per-image ceiling with headroom for the data-URI
+# wrapper and base64 metadata. Large uploads are downscaled / re-encoded to
+# land under this; a decodable still image always ends up at or below it.
+IMAGE_MODEL_BUDGET_BYTES: int = 4_500_000
+
+# Longest-edge cap applied before the quality search when re-encoding an
+# oversized image. 8K covers 5K/retina screenshots at full resolution;
+# anything larger is scaled down to this first.
+IMAGE_MAX_EDGE_PX: int = 8192
+
+# Decompression-bomb guard: refuse to decode images whose pixel area is
+# implausibly large for a real screenshot/photo.
+IMAGE_MAX_DECODED_PIXELS: int = 64 * 1024 * 1024
 
 # Copy-at-spawn limits (see the ``files:copy`` endpoint). A parent forwarding
 # files to a subagent copies them through the server, which reads each source
@@ -159,6 +180,163 @@ def attachment_upload_limit(content_type: str) -> int | None:
     if content_type.startswith("text/") or content_type in _TEXT_LIKE_APPLICATION_MIMES:
         return MAX_TEXT_UPLOAD_BYTES
     return None
+
+
+class ImageCompressionError(ValueError):
+    """An image attachment could not be shrunk under the model size budget.
+
+    Raised when the bytes don't decode as an image, or when even the smallest
+    downscale/quality still exceeds :data:`IMAGE_MODEL_BUDGET_BYTES`. Callers
+    reject it with HTTP 413.
+    """
+
+
+# Filename extension for each image type we emit from compression, so a
+# re-encoded attachment's name matches its bytes.
+_IMAGE_CONTENT_TYPE_EXTENSIONS: dict[str, str] = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def image_filename_for_content_type(filename: str, content_type: str) -> str:
+    """Return *filename* with an extension matching *content_type*.
+
+    :func:`compress_image_attachment` may re-encode an image (e.g. PNG →
+    JPEG), leaving the original name's extension inconsistent with the stored
+    bytes. Swapping it keeps name, bytes, and MIME aligned. An unknown image
+    type, or a name already carrying the right extension, is returned
+    unchanged.
+
+    :param filename: The original upload filename, e.g. ``"shot.png"``.
+    :param content_type: The re-encoded image MIME, e.g. ``"image/jpeg"``.
+    :returns: The filename with the matching extension, e.g. ``"shot.jpg"``.
+    """
+    from pathlib import PurePosixPath
+
+    target = _IMAGE_CONTENT_TYPE_EXTENSIONS.get(content_type)
+    if target is None:
+        return filename
+    path = PurePosixPath(filename)
+    if path.suffix.lower() == target:
+        return filename
+    return str(path.with_suffix(target))
+
+
+def _encode_image(image: Any, image_format: str, **params: Any) -> bytes:
+    """Encode *image* to *image_format*, returning the bytes."""
+    from io import BytesIO
+
+    buffer = BytesIO()
+    image.save(buffer, format=image_format, **params)
+    return buffer.getvalue()
+
+
+def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes, str]:
+    """Shrink a raster image so its bytes fit :data:`IMAGE_MODEL_BUDGET_BYTES`.
+
+    Images upload at the larger :data:`MAX_IMAGE_UPLOAD_BYTES`, but every
+    attachment is inlined as base64 into each turn's request, so a big image
+    would blow past the provider's per-image limit. This downscales and/or
+    re-encodes the image to fit the model budget, keeping it a valid in-place
+    attachment (the compressed bytes are what get stored).
+
+    Already-small images (``<=`` budget) and animated images (multi-frame
+    GIF/WebP — re-encoding animation safely is out of scope) are returned
+    unchanged. For still images we search largest-first: alpha images try
+    lossy then lossless WebP then PNG; opaque images try descending-quality
+    JPEG, downscaling the canvas when quality alone isn't enough.
+
+    :param content: Raw uploaded image bytes.
+    :param content_type: The resolved image MIME (``image/*``).
+    :returns: ``(bytes, content_type)`` — the (possibly re-encoded) image and
+        its MIME. For a decodable still image the bytes are ``<=`` the budget;
+        the content_type may change (e.g. ``image/png`` → ``image/jpeg``).
+    :raises ImageCompressionError: If the bytes don't decode as an image, or
+        can't be brought under the budget.
+    """
+    if len(content) <= IMAGE_MODEL_BUDGET_BYTES:
+        return content, content_type
+
+    import warnings
+    from io import BytesIO
+
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(content)) as probe:
+                n_frames = int(getattr(probe, "n_frames", 1))
+                if probe.width * probe.height > IMAGE_MAX_DECODED_PIXELS:
+                    raise ImageCompressionError("image dimensions are too large to process")
+            # Multi-frame (animated) images are left untouched; the upload cap
+            # still bounds them.
+            if n_frames != 1:
+                return content, content_type
+            with Image.open(BytesIO(content)) as opened:
+                image = ImageOps.exif_transpose(opened)
+                image.load()
+    except ImageCompressionError:
+        raise
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ) as exc:
+        raise ImageCompressionError(f"could not decode image: {exc}") from exc
+
+    has_alpha = image.mode in ("RGBA", "LA") or (
+        image.mode == "P" and "transparency" in image.info
+    )
+    if has_alpha:
+        base = image.convert("RGBA")
+
+        def _candidates(frame: Any) -> list[tuple[bytes, str]]:
+            return [
+                (_encode_image(frame, "WEBP", quality=85, method=4), "image/webp"),
+                (_encode_image(frame, "WEBP", quality=70, method=4), "image/webp"),
+                (_encode_image(frame, "PNG", optimize=True), "image/png"),
+            ]
+    else:
+        base = image.convert("RGB")
+
+        def _candidates(frame: Any) -> list[tuple[bytes, str]]:
+            return [
+                (
+                    _encode_image(frame, "JPEG", quality=q, optimize=True, progressive=True),
+                    "image/jpeg",
+                )
+                for q in (88, 80, 72, 62, 50)
+            ]
+
+    # Pre-shrink an oversized canvas to the edge cap before the quality search.
+    longest = max(base.width, base.height)
+    if longest > IMAGE_MAX_EDGE_PX:
+        factor = IMAGE_MAX_EDGE_PX / longest
+        base = base.resize(
+            (max(1, round(base.width * factor)), max(1, round(base.height * factor))),
+            Image.Resampling.LANCZOS,
+        )
+
+    for scale in (1.0, 0.75, 0.5, 0.375, 0.25):
+        if scale == 1.0:
+            frame = base
+        else:
+            frame = base.resize(
+                (max(1, round(base.width * scale)), max(1, round(base.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        for data, mime in _candidates(frame):
+            if len(data) <= IMAGE_MODEL_BUDGET_BYTES:
+                return data, mime
+
+    raise ImageCompressionError("image could not be compressed under the model size budget")
 
 
 # Extensions accepted as text/code attachments even when the upload's
