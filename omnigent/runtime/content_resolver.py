@@ -127,10 +127,13 @@ _COMPRESSIBLE_IMAGE_MIMES: frozenset[str] = frozenset(
 
 # Pillow format names that legitimately back each compressible MIME. Used to
 # reject a spoofed extension (e.g. a TIFF/BMP labeled image/png) before we hand
-# 50 MB of untrusted bytes to an unintended decoder. MPO is multi-picture JPEG.
+# 50 MB of untrusted bytes to an unintended decoder. Multi-picture JPEG (MPO)
+# is deliberately excluded: it reports n_frames >= 2, so admitting it would only
+# route it to the animation rejection with a confusing message — asking for a
+# plain JPEG here is clearer.
 _ALLOWED_PIL_FORMATS: dict[str, frozenset[str]] = {
     "image/png": frozenset({"PNG"}),
-    "image/jpeg": frozenset({"JPEG", "MPO"}),
+    "image/jpeg": frozenset({"JPEG"}),
     "image/webp": frozenset({"WEBP"}),
     "image/gif": frozenset({"GIF"}),
 }
@@ -305,40 +308,40 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
     if len(content) <= IMAGE_MODEL_BUDGET_BYTES or content_type not in _COMPRESSIBLE_IMAGE_MIMES:
         return content, content_type
 
-    import warnings
     from io import BytesIO
 
     from PIL import Image, ImageOps, UnidentifiedImageError
 
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(content)) as probe:
-                # Reject a spoofed extension before decoding: the real container
-                # (probe.format, from the header) must match the declared MIME,
-                # so a TIFF/BMP-as-png can't select an unintended 50 MB decoder.
-                if probe.format not in _ALLOWED_PIL_FORMATS.get(content_type, frozenset()):
-                    raise ImageCompressionError("the file is not a readable image")
-                # Cheap header dimensions first — bail before walking frames
-                # (n_frames enumerates every GIF frame).
-                if probe.width * probe.height > IMAGE_MAX_DECODED_PIXELS:
-                    raise ImageCompressionError("the image's dimensions are too large to process")
-                n_frames = int(getattr(probe, "n_frames", 1))
-            # Animation can't be re-encoded here, and it's over budget, so it
-            # would be rejected by the provider at turn time — reject cleanly now.
-            if n_frames != 1:
+        with Image.open(BytesIO(content)) as probe:
+            # Reject a spoofed extension before decoding: the real container
+            # (probe.format, from the header) must match the declared MIME,
+            # so a TIFF/BMP-as-png can't select an unintended 50 MB decoder.
+            if probe.format not in _ALLOWED_PIL_FORMATS.get(content_type, frozenset()):
                 raise ImageCompressionError(
-                    "this animated image is too large to attach; upload a smaller "
-                    "or static image instead"
+                    "this image format can't be resized; upload a PNG, JPEG, WebP, or GIF"
                 )
-            with Image.open(BytesIO(content)) as opened:
-                image = ImageOps.exif_transpose(opened)
-                image.load()
+            # Cheap header dimensions first — bail before walking frames
+            # (n_frames enumerates every GIF frame). This deterministic area
+            # check is the decompression-bomb guard (fires below Pillow's own
+            # ~89 MP warning), so no warnings.catch_warnings() is needed.
+            if probe.width * probe.height > IMAGE_MAX_DECODED_PIXELS:
+                raise ImageCompressionError("the image's dimensions are too large to process")
+            n_frames = int(getattr(probe, "n_frames", 1))
+        # Animation can't be re-encoded here, and it's over budget, so it
+        # would be rejected by the provider at turn time — reject cleanly now.
+        if n_frames != 1:
+            raise ImageCompressionError(
+                "this animated image is too large to attach; upload a smaller "
+                "or static image instead"
+            )
+        with Image.open(BytesIO(content)) as opened:
+            image = ImageOps.exif_transpose(opened)
+            image.load()
     except ImageCompressionError:
         raise
     except (
         Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
         UnidentifiedImageError,
         OSError,
         SyntaxError,
