@@ -97,8 +97,7 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 # bounded well under the model's context budget and the provider's API
 # limits — Anthropic accepts images up to ~5 MB, PDFs up to ~32 MB / 100
 # pages, and ~32 MB per request total. The per-type caps below keep a
-# single attachment usable across a multi-turn conversation; the global
-# ceiling backstops the total request size after base64 inflation (~1.33x).
+# single attachment usable across a multi-turn conversation.
 #
 # Images are the exception: we accept a much larger upload (screenshots,
 # retina captures) and shrink it under the provider's per-image limit at
@@ -109,13 +108,20 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 MAX_IMAGE_UPLOAD_BYTES: int = 50 * 1024 * 1024
 MAX_PDF_UPLOAD_BYTES: int = 20 * 1024 * 1024
 MAX_TEXT_UPLOAD_BYTES: int = 10 * 1024 * 1024
+# Per-attachment read cap, not an aggregate one. It is applied as
+# ``min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)``: only compressible images
+# reach 50 MB (then shrink to <= IMAGE_MODEL_BUDGET_BYTES before storage);
+# PDF/text keep their smaller per-type caps. So this is no longer a sub-32 MB
+# request backstop — nothing oversized is stored because images are compressed.
 MAX_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
 
 # The larger image cap only applies to raster formats we can actually shrink
-# (see _COMPRESSIBLE_IMAGE_MIMES). Other image types — SVG and any vector /
-# exotic format Pillow can't re-encode for us — keep this conservative cap and
-# skip compression: raising their cap would let an oversized one slip through
-# to the provider uncompressed. This is the pre-compression image limit.
+# (see _COMPRESSIBLE_IMAGE_MIMES). Other image types (SVG, and raster formats we
+# don't re-encode like BMP/TIFF) keep this smaller cap and skip compression, so
+# raising the image cap can't let an oversized uncompressed one through. Note a
+# file near this cap still inflates to ~6.6 MB base64 — over the provider's
+# per-image ceiling — but these formats generally aren't valid model image
+# inputs anyway; this is the pre-existing behavior for uncompressed images.
 IMAGE_UNCOMPRESSED_UPLOAD_BYTES: int = 5 * 1024 * 1024
 
 # Raster image MIMEs compress_image_attachment can decode and re-encode. Only
@@ -349,40 +355,42 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
     ) as exc:
         raise ImageCompressionError("the file is not a readable image") from exc
 
-    # Detect alpha broadly: RGBA/LA modes, and RGB/L/P images carrying a tRNS
-    # chunk (Pillow exposes it as image.info["transparency"] without changing
-    # the mode) — routing them through the alpha branch avoids flattening
-    # transparency to JPEG.
-    has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
-    if has_alpha:
-        base = image.convert("RGBA")
-        # Alpha-preserving encoders, best-compression first. Generated lazily so
-        # the search stops at the first candidate that fits.
-        _encodings: tuple[tuple[str, str, dict[str, Any]], ...] = (
-            ("WEBP", "image/webp", {"quality": 80, "method": 4}),
-            ("WEBP", "image/webp", {"quality": 60, "method": 4}),
-            ("PNG", "image/png", {"optimize": True}),
-        )
-    else:
-        base = image.convert("RGB")
-        _encodings = tuple(
-            ("JPEG", "image/jpeg", {"quality": q, "optimize": True, "progressive": True})
-            for q in (85, 70, 55)
-        )
-
-    # Pre-shrink an oversized canvas to the edge cap before the quality search.
-    longest = max(base.width, base.height)
-    if longest > IMAGE_MAX_EDGE_PX:
-        factor = IMAGE_MAX_EDGE_PX / longest
-        base = base.resize(
-            (max(1, round(base.width * factor)), max(1, round(base.height * factor))),
-            Image.Resampling.LANCZOS,
-        )
-
-    # Largest-first over a small scale/quality grid (≤ 3 scales × 3 encodings),
-    # encoding one candidate at a time and returning at the first that fits, so a
-    # worst-case (incompressible) upload can't fan out into many eager encodes.
+    # convert(), the pre-shrink resize(), and every encode share one try so a
+    # Pillow error anywhere in re-encoding becomes a clean 413, never a 500.
     try:
+        # Detect alpha broadly: RGBA/LA modes, and RGB/L/P images carrying a
+        # tRNS chunk (Pillow exposes it as image.info["transparency"] without
+        # changing the mode) — routing them through the alpha branch avoids
+        # flattening transparency to JPEG.
+        has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
+        if has_alpha:
+            base = image.convert("RGBA")
+            # Alpha-preserving encoders, best-compression first. Tried lazily so
+            # the search stops at the first candidate that fits.
+            _encodings: tuple[tuple[str, str, dict[str, Any]], ...] = (
+                ("WEBP", "image/webp", {"quality": 80, "method": 4}),
+                ("WEBP", "image/webp", {"quality": 60, "method": 4}),
+                ("PNG", "image/png", {"optimize": True}),
+            )
+        else:
+            base = image.convert("RGB")
+            _encodings = tuple(
+                ("JPEG", "image/jpeg", {"quality": q, "optimize": True, "progressive": True})
+                for q in (85, 70, 55)
+            )
+
+        # Pre-shrink an oversized canvas to the edge cap before the quality search.
+        longest = max(base.width, base.height)
+        if longest > IMAGE_MAX_EDGE_PX:
+            factor = IMAGE_MAX_EDGE_PX / longest
+            base = base.resize(
+                (max(1, round(base.width * factor)), max(1, round(base.height * factor))),
+                Image.Resampling.LANCZOS,
+            )
+
+        # Largest-first over a small scale/quality grid (≤ 3 scales × 3 encodings),
+        # encoding one candidate at a time and returning at the first that fits, so
+        # a worst-case (incompressible) upload can't fan out into many eager encodes.
         for scale in (1.0, 0.5, 0.25):
             if scale == 1.0:
                 frame = base
@@ -396,7 +404,7 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
                 if len(data) <= IMAGE_MODEL_BUDGET_BYTES:
                     return data, mime
     except (OSError, ValueError) as exc:
-        # A Pillow encode error becomes a clean 413, not an unhandled 500.
+        # A Pillow convert/resize/encode error becomes a clean 413, not a 500.
         raise ImageCompressionError("the image couldn't be re-encoded") from exc
 
     raise ImageCompressionError("the image couldn't be compressed to a supported size")
