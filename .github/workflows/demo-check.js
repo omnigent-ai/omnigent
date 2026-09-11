@@ -1,12 +1,13 @@
-// Keep `needs-demo` aligned with the current PR. PR_NUMBER checks one PR after
-// a lifecycle event; without it, a manual run also repairs existing labels.
+// Scan contributor PRs opened in the last 24 hours and comment when a Bug fix,
+// Feature, or UI / frontend change is checked but no real demo (screenshot /
+// video) is provided. Runs hourly; the 24-hour window ensures every new PR is
+// checked even if it was opened just before a cron tick. Drafts and maintainer
+// PRs are skipped. Already-flagged PRs (labeled `needs-demo`) are skipped to
+// avoid duplicate comments on subsequent runs.
 
 const MS_PER_HOUR = 60 * 60 * 1000;
 const HOURS_TO_SCAN = 24;
 const NEEDS_DEMO_LABEL = "needs-demo";
-const DEMO_COMMENT_MARKER = "<!-- needs-demo-comment -->";
-const LEGACY_DEMO_COMMENT_TEXT =
-  "This PR is a **Bug fix**, **Feature**, or **UI / frontend change** but the **Demo** section is missing";
 
 const MAINTAINER_ASSOCIATIONS = ["MEMBER", "OWNER", "COLLABORATOR"];
 
@@ -30,7 +31,6 @@ const QUERY = `
       nodes {
         ... on PullRequest {
           number
-          state
           author { login }
           authorAssociation
           isDraft
@@ -42,10 +42,15 @@ const QUERY = `
   }
 `;
 
-// Visual media is required only when UI / frontend change is checked.
+// Returns true when any change type that requires a demo is checked:
+// Bug fix, Feature, or UI / frontend change.
 function requiresDemo(body) {
   const text = body ?? "";
-  return /- \[[xX]\] UI \/ frontend change/.test(text);
+  return (
+    /- \[[xX]\] Bug fix/.test(text) ||
+    /- \[[xX]\] Feature/.test(text) ||
+    /- \[[xX]\] UI \/ frontend change/.test(text)
+  );
 }
 
 // Extracts the text content of the Demo section (between ## Demo and the next
@@ -74,23 +79,15 @@ function hasDemoContent(body) {
   return DEMO_MEDIA_PATTERNS.some((re) => re.test(content));
 }
 
-function bodyNeedsDemo(body) {
-  return requiresDemo(body) && !hasDemoContent(body);
-}
-
 const demoRequiredMessage = (author) =>
-  `${DEMO_COMMENT_MARKER}
-@${author} This PR checks **UI / frontend change**, but the **Demo** section has no screenshot or recording.
+  `@${author} This PR is a **Bug fix**, **Feature**, or **UI / frontend change** but the **Demo** section is missing or only contains a placeholder.
 
-UI / frontend changes require visual evidence so reviewers can see the new behaviour without checking out the branch. Please update the **Demo** section with:
+These change types require a screenshot or screen recording so reviewers can see the new behaviour without checking out the branch. Please update the **Demo** section with:
 
 - A screenshot or screen recording of the change, or
 - A link to a hosted video or GIF showing the new behaviour.
 
-_If this PR has no visual surface, uncheck **UI / frontend change** and provide non-visual evidence in the **Test Plan**._`;
-
-const demoResolvedMessage = `${DEMO_COMMENT_MARKER}
-✅ This PR no longer requires demo follow-up.`;
+_Use \`N/A\` only when the change has no user-visible effect whatsoever (e.g. a pure refactor or test-only change). If that's the case, uncheck the relevant type box and check **Refactor / chore** or **Test / CI** instead._`;
 
 module.exports = async ({ context, github, core }) => {
   const { owner, repo } = context.repo;
@@ -123,7 +120,7 @@ module.exports = async ({ context, github, core }) => {
         repo,
         name: NEEDS_DEMO_LABEL,
         color: "e4e669",
-        description: "UI PR needs a demo screenshot or recording",
+        description: "PR needs a demo screenshot or recording",
       });
     } catch (err) {
       // 422 = already exists; anything else is unexpected.
@@ -132,142 +129,78 @@ module.exports = async ({ context, github, core }) => {
       }
     }
 
-    const findDemoComment = async (issueNumber) => {
-      const comments = await github.paginate(github.rest.issues.listComments, {
-        owner,
-        repo,
-        issue_number: issueNumber,
-        per_page: 100,
-      });
-      return comments.find(
-        (comment) =>
-          comment.user?.type === "Bot" &&
-          (comment.body?.includes(DEMO_COMMENT_MARKER) ||
-            comment.body?.includes(LEGACY_DEMO_COMMENT_TEXT))
-      );
-    };
+    const cutoff = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
+    // GitHub search supports ISO 8601 timestamps for sub-day precision.
+    const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
 
-    const allPRs = new Map();
-    const labeledPRs = new Set();
-    const single = Number(process.env.PR_NUMBER) || null;
+    console.log(`Scanning PRs: ${searchQuery}`);
 
-    if (single) {
-      const response = await github.rest.pulls.get({ owner, repo, pull_number: single });
-      const pr = response.data;
-      allPRs.set(pr.number, {
-        number: pr.number,
-        state: pr.merged ? "MERGED" : pr.state.toUpperCase(),
-        author: { login: pr.user?.login },
-        authorAssociation: pr.author_association,
-        isDraft: pr.draft,
-        labels: { nodes: pr.labels },
-        body: pr.body,
-      });
-      console.log(`Checking PR #${single}`);
-    } else {
-      const fetchPRs = async (searchQuery) => {
-        console.log(`Scanning PRs: ${searchQuery}`);
-        const found = [];
-        let cursor = null;
-        let hasNextPage = true;
-        while (hasNextPage) {
-          const response = await github.graphql(QUERY, { cursor, searchQuery });
-          const { remaining, resetAt } = response.rateLimit;
-          console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
-          const { nodes, pageInfo } = response.search;
-          found.push(...nodes);
-          hasNextPage = pageInfo.hasNextPage;
-          cursor = pageInfo.endCursor;
-        }
-        return found;
-      };
+    let cursor = null;
+    let hasNextPage = true;
+    const allPRs = [];
 
-      const cutoff = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
-      const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
-      const recentQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
-      const labeledQuery = `repo:${owner}/${repo} is:pr label:${NEEDS_DEMO_LABEL}`;
+    while (hasNextPage) {
+      const response = await github.graphql(QUERY, { cursor, searchQuery });
+      const { remaining, resetAt } = response.rateLimit;
+      console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
 
-      for (const pr of await fetchPRs(recentQuery)) allPRs.set(pr.number, pr);
-      for (const pr of await fetchPRs(labeledQuery)) {
-        allPRs.set(pr.number, pr);
-        labeledPRs.add(pr.number);
-      }
-      console.log(`Found ${allPRs.size} PR(s) to check`);
+      const { nodes, pageInfo } = response.search;
+      hasNextPage = pageInfo.hasNextPage;
+      cursor = pageInfo.endCursor;
+      allPRs.push(...nodes);
     }
 
+    console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
+
     let flaggedCount = 0;
-    let clearedCount = 0;
     let skippedCount = 0;
 
-    for (const pr of allPRs.values()) {
-      const author = pr.author?.login ?? "contributor";
-      const labels = pr.labels?.nodes?.map((l) => l.name) ?? [];
-      const isLabeled = labeledPRs.has(pr.number) || labels.includes(NEEDS_DEMO_LABEL);
-      const isMaintainer =
-        MAINTAINER_ASSOCIATIONS.includes(pr.authorAssociation) ||
-        maintainers.has(author.toLowerCase());
-      const needsDemo =
-        pr.state === "OPEN" &&
-        !pr.isDraft &&
-        !isMaintainer &&
-        bodyNeedsDemo(pr.body);
-
-      if (!needsDemo && isLabeled) {
-        try {
-          const existing = await findDemoComment(pr.number);
-          if (existing && existing.body !== demoResolvedMessage) {
-            await github.rest.issues.updateComment({
-              owner,
-              repo,
-              comment_id: existing.id,
-              body: demoResolvedMessage,
-            });
-          }
-        } catch (err) {
-          if (err.status === 429 || err.message?.includes("rate limit")) throw err;
-          core.warning(`Could not resolve the demo reminder on #${pr.number}: ${err.message}`);
-        }
-        try {
-          await github.rest.issues.removeLabel({
-            owner,
-            repo,
-            issue_number: pr.number,
-            name: NEEDS_DEMO_LABEL,
-          });
-          console.log(`PR #${pr.number}: removed '${NEEDS_DEMO_LABEL}'`);
-          clearedCount++;
-        } catch (err) {
-          // A concurrent run may already have removed it.
-          if (err.status !== 404) throw err;
-        }
+    for (const pr of allPRs) {
+      // Skip drafts and maintainer PRs (by association and MAINTAINER file).
+      if (pr.isDraft) {
+        skippedCount++;
+        continue;
+      }
+      if (MAINTAINER_ASSOCIATIONS.includes(pr.authorAssociation)) {
+        skippedCount++;
         continue;
       }
 
-      if (!needsDemo || isLabeled) {
+      const author = pr.author?.login ?? "contributor";
+      if (maintainers.has(author.toLowerCase())) {
         skippedCount++;
+        continue;
+      }
+
+      // Skip PRs we've already flagged.
+      const labels = pr.labels?.nodes?.map((l) => l.name) ?? [];
+      if (labels.includes(NEEDS_DEMO_LABEL)) {
+        skippedCount++;
+        continue;
+      }
+
+      // Only care about PRs that checked Bug fix, Feature, or UI / frontend change.
+      if (!requiresDemo(pr.body)) {
+        continue;
+      }
+
+      // Demo content is present — nothing to do.
+      if (hasDemoContent(pr.body)) {
         continue;
       }
 
       console.log(`PR #${pr.number} (@${author}): demo required but not provided`);
 
-      const body = demoRequiredMessage(author);
-      const existing = await findDemoComment(pr.number);
-
-      if (!existing) {
-        await github.rest.issues.createComment({
-          owner,
-          repo,
-          issue_number: pr.number,
-          body,
-        });
-      } else if (existing.body !== body) {
-        await github.rest.issues.updateComment({
-          owner,
-          repo,
-          comment_id: existing.id,
-          body,
-        });
-      }
+      // Comment before labeling: if the comment fails the PR stays unlabeled
+      // and will be retried on the next run. Labeling first would permanently
+      // suppress the reminder on a transient comment failure.
+      await github.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: pr.number,
+        body: demoRequiredMessage(author),
+      });
 
       await github.rest.issues.addLabels({
         owner,
@@ -280,7 +213,7 @@ module.exports = async ({ context, github, core }) => {
     }
 
     console.log(
-      `Done. Flagged ${flaggedCount} PR(s); cleared ${clearedCount}; skipped ${skippedCount}.`
+      `Done. Flagged ${flaggedCount} PR(s); skipped ${skippedCount} (drafts / maintainers / already labeled).`
     );
   } catch (error) {
     if (error.status === 429 || error.message?.includes("rate limit")) {
@@ -290,5 +223,3 @@ module.exports = async ({ context, github, core }) => {
     throw error;
   }
 };
-
-module.exports.bodyNeedsDemo = bodyNeedsDemo;

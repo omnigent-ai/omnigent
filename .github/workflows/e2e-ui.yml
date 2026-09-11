@@ -1,7 +1,7 @@
 name: E2E UI Tests
 
 # Runs the Playwright UI suite against a freshly built web SPA, split across
-# a 5-shard matrix. The whole suite (including the native Claude/Codex/Cursor
+# a 3-shard matrix. The whole suite (including the native Claude/Codex/Cursor
 # render-parity tests) runs against the in-process mock LLM and needs NO
 # secrets, so it runs on ALL PRs -- same-repo AND fork -- directly, like ci.yml.
 # (The native_*_mock_session fixtures use the real gateway only when LLM_API_KEY
@@ -10,7 +10,7 @@ name: E2E UI Tests
 # Triggers:
 #   pull_request        ALL PRs (same-repo + fork). Draft PRs skip.
 #   schedule            09:00 UTC daily, alongside nightly.yml.
-#   workflow_dispatch   manual run on the selected workflow ref.
+#   workflow_dispatch   manual run. Input `branch` selects a non-main ref.
 
 on:
   pull_request:
@@ -22,13 +22,19 @@ on:
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run UI tests against"
+        required: false
+        default: "main"
 
 permissions:
   contents: read
 
 concurrency:
-  # PRs key by number, dispatch by ref (so re-runs cancel), and schedule by SHA.
-  group: e2e-ui-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.ref) || github.sha }}
+  # PRs key by number, dispatch by branch (so re-runs cancel); push /
+  # schedule key by SHA so each merge to `main` gets its own run.
+  group: e2e-ui-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -80,7 +86,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          NUM_SHARDS: "5"
+          NUM_SHARDS: "3"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
   # Build the Codex-parity sidecar ONCE and publish the binary. The
@@ -100,6 +106,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
@@ -140,13 +148,11 @@ jobs:
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
-      # Matches NUM_SHARDS so all shards run concurrently (no serialized tail);
-      # the suite is in-process mock LLM, so there's no gateway rate-limit cap.
-      max-parallel: 5
+      max-parallel: 3
       # Shards from `setup`; [] when skipped. Shard check names live in
       # merge-ready/required.sh -- keep in sync with NUM_SHARDS above.
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -154,6 +160,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -227,17 +235,19 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        # Same claude-code pin as .github/ci-deps. The native bridge needs a
-        # release that recognises its hook events (older ones show a blocking
-        # startup modal that swallows the first message). Runs the package's
-        # install script so the platform-specific binary is linked into the
-        # temporary CLI directory and put on PATH.
+        # claude-code 2.1.170, NOT the 2.1.124 in .github/ci-deps: 2.1.124
+        # doesn't recognise the hook events the native bridge configures and
+        # shows a blocking startup modal that swallows the first message.
+        # Runs the package's install script so the platform-specific binary is
+        # linked into the temporary CLI directory and put on PATH.
+        # (The install.cjs script was removed in the same version the upstream
+        # npm package no longer ships it, so lifecycle scripts are required.)
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
+          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.212
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
@@ -286,15 +296,8 @@ jobs:
           # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
           # evens out wall-clock better than pytest-shard's hash-bucketing.
           # --group is 1-indexed, so map the 0-indexed shard_id with +1.
-          # --durations surfaces the slowest test phases (setup/call/teardown)
-          # at the end of each shard's log so we can see where the wall-clock
-          # goes and rebalance; the 1s floor keeps trivial phases out.
-          # Retry every otherwise-unmarked failure once for transient CI races;
-          # per-test @pytest.mark.flaky settings still take precedence.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
-            --durations=25 --durations-min=1.0 \
-            --reruns=1 --reruns-delay=5 \
             --ui-skip-build \
             --splits="$NUM_SHARDS" \
             --group="$((SHARD_ID + 1))" \
@@ -345,15 +348,12 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
-          # server.log + runner.log from the live_server and mocked-Codex
-          # fixtures' tmp dirs, plus the native bridge dirs and the Claude /
-          # Codex transcripts staged above -- all needed to triage a native
-          # render-parity or restart failure.
+          # server.log + runner.log from the live_server fixture's tmp dir,
+          # plus the native bridge dirs and the Claude / Codex transcripts
+          # staged above -- all needed to triage a native render-parity failure.
           path: |
             /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
             /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
-            /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/server.log
-            /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/runner.log
             /tmp/omnigent-*/claude-native/**
             /tmp/claude-home-dump/**
             /tmp/codex-home-dump/**

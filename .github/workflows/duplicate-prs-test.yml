@@ -10,8 +10,6 @@ on:
     paths:
       - .github/workflows/duplicate-prs.js
       - .github/workflows/duplicate-prs.test.js
-      - .github/workflows/close-superseded-pr.js
-      - .github/workflows/close-superseded-pr.test.js
   workflow_dispatch:
 
 permissions:
@@ -31,5 +29,3 @@ jobs:
           persist-credentials: false
       - name: Run duplicate-PR unit test
         run: node .github/workflows/duplicate-prs.test.js
-      - name: Run superseded-PR unit test
-        run: node .github/workflows/close-superseded-pr.test.js
