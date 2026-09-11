@@ -9878,9 +9878,11 @@ async def test_patch_permission_mode_persists_label_and_forwards_event(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "auto"
-    # No launch --permission-mode to rewrite, so none is fabricated (see the
-    # rewrite-existing test below for the persist-to-launch-args case).
-    assert resp.json()["terminal_launch_args"] is None
+    # The session launched without --permission-mode, so the confirmed switch
+    # is pinned into the launch args: the launcher rebuilds Claude's args from
+    # them alone, and without the flag a cold resume would reopen in Claude's
+    # default (manual) mode while the label still claimed "auto".
+    assert resp.json()["terminal_launch_args"] == ["--permission-mode", "auto"]
     forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
     assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
     assert forwards[0].body == {"type": "permission_mode_change", "permission_mode": "auto"}
@@ -9945,6 +9947,67 @@ async def test_patch_permission_mode_rewrites_launch_arg_and_keeps_other_args(
         "acceptEdits",
     ]
     assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "acceptEdits"
+
+
+async def test_patch_permission_mode_pins_launch_arg_once_for_flagless_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A confirmed switch on a flag-less session appends --permission-mode once.
+
+    A session created with the default preset carries no ``--permission-mode``;
+    switching it to Auto in the web picker used to land only on the label, so
+    every relaunch after the idle pane reaper or a runner restart reopened it in
+    manual mode. The first PATCH must append the flag after the caller's other
+    args, and a later PATCH must rewrite that flag rather than stack a second.
+    """
+    from omnigent.runtime import set_runner_client
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Confirm whatever mode was requested, like the claude-native runner."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body = json.loads(request.content) if request.content else {}
+        return httpx.Response(200, json={"permission_mode": body.get("permission_mode")})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+            terminal_launch_args=["--model", "opus"],
+        )
+        first = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+        second = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "plan"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert first.status_code == 200, first.text
+    assert first.json()["terminal_launch_args"] == ["--model", "opus", "--permission-mode", "auto"]
+    assert second.status_code == 200, second.text
+    assert second.json()["terminal_launch_args"] == [
+        "--model",
+        "opus",
+        "--permission-mode",
+        "plan",
+    ]
+    assert second.json()["labels"]["omnigent.claude_native.permission_mode"] == "plan"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])

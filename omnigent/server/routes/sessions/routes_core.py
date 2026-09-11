@@ -122,12 +122,12 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
-    _merge_claude_permission_launch_args,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
+    _pin_claude_permission_launch_args,
     _presentation_labels_for_agent,
     _prune_session_read_state,
     _publish_codex_approval_mode,
@@ -2403,12 +2403,13 @@ def register_core_routes(
             )
             labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
             # The launcher restores the mode from terminal_launch_args, not the
-            # label above, so reflect the confirmed mode there too — otherwise a
-            # relaunch reverts to the launch --permission-mode. Merge against
-            # ``updated`` (the post-write row), not the pre-update snapshot, so a
-            # combined PATCH that also set terminal_launch_args keeps those. Only
-            # rewrites an existing --permission-mode; mirrors the shift+tab path.
-            _merged_permission_args = _merge_claude_permission_launch_args(
+            # label above, so pin the confirmed mode there too — otherwise a
+            # relaunch reopens in the launch mode, which is Claude's default
+            # (manual) for a session created without --permission-mode. Merge
+            # against ``updated`` (the post-write row), not the pre-update
+            # snapshot, so a combined PATCH that also set terminal_launch_args
+            # keeps those.
+            _merged_permission_args = _pin_claude_permission_launch_args(
                 updated.terminal_launch_args,
                 _confirmed_permission_mode,
             )
