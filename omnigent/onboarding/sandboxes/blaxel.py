@@ -1010,7 +1010,8 @@ class BlaxelSandboxLauncher(ExecModelHostLauncher):
         name = f"omni-command-{uuid.uuid4().hex[:12]}"
 
         def _discard_progress(_text: str) -> None:
-            pass
+            # Progress chunks are dropped: the final process state is authoritative.
+            return None
 
         handle, _process, identifier, log_stream = self._start_process(
             sandbox_id,

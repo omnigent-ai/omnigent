@@ -95,18 +95,14 @@ class _ProcessLike(Protocol):
     """The subset of ``subprocess.Popen`` / ``asyncio.subprocess.Process`` used here."""
 
     @property
-    def pid(self) -> int | None:
-        pass
+    def pid(self) -> int | None: ...
 
     @property
-    def returncode(self) -> int | None:
-        pass
+    def returncode(self) -> int | None: ...
 
-    def terminate(self) -> None:
-        pass
+    def terminate(self) -> None: ...
 
-    def kill(self) -> None:
-        pass
+    def kill(self) -> None: ...
 
 
 def spawn_kwargs() -> SpawnKwargs:

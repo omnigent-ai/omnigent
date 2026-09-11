@@ -316,8 +316,7 @@ class ContainmentHandle(Protocol):
     process tree.
     """
 
-    def close(self) -> None:
-        pass
+    def close(self) -> None: ...
 
 
 class SandboxBackend(ABC):
