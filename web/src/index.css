@@ -1131,12 +1131,20 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
- * hide the native one so both don't show. */
+ * hide the native one so both don't show. use-stick-to-bottom sets
+ * `scrollbar-gutter: stable both-edges` inline on this element, and the
+ * scrollbar-width/::-webkit-scrollbar hide mechanisms can't both apply at once
+ * (setting scrollbar-width makes Chromium ignore ::-webkit-scrollbar), so force
+ * every knob off: no gutter to paint into, no native bar in any mode. The
+ * custom scrollbar overlays the edge and needs no reserved strip. */
 .transcript-hide-native-scrollbar {
-  scrollbar-width: none;
+  scrollbar-width: none !important;
+  scrollbar-gutter: auto !important;
 }
 .transcript-hide-native-scrollbar::-webkit-scrollbar {
-  display: none;
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
 }
 
 /* Streamdown hard-codes `content-visibility: auto` with a flat 200px intrinsic
