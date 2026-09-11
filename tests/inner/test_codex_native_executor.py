@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -825,6 +827,231 @@ def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_b"
+
+
+@pytest.fixture
+def rejected_steer_client(monkeypatch: pytest.MonkeyPatch) -> type[_FakeCodexNativeClient]:
+    """Install a client that rejects the first steer and accepts a reconciled turn."""
+
+    class _RejectedSteerClient(_FakeCodexNativeClient):
+        requests = []
+        created = []
+        next_turn = 1
+        rejection = CodexAppServerResponseError(
+            {"code": -32600, "message": "expected active turn id `turn_a` but found `turn_b`"}
+        )
+        retry_error: Exception | None = None
+        on_rejection: Callable[[], None] = lambda: None
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method != "turn/steer":
+                return await super().request(method, params)
+            type(self).requests.append((method, params))
+            if sum(method == "turn/steer" for method, _params in type(self).requests) == 1:
+                type(self).on_rejection()
+                raise type(self).rejection
+            if type(self).retry_error is not None:
+                raise type(self).retry_error
+            return {"result": {"turnId": params["expectedTurnId"]}}
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RejectedSteerClient
+    )
+    return _RejectedSteerClient
+
+
+@pytest.mark.parametrize("enqueue", [False, True], ids=["run-turn", "live-message"])
+@pytest.mark.parametrize("bridge_turn", ["turn_a", "turn_c", None])
+def test_mismatched_turn_recovery_preserves_newer_bridge_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rejected_steer_client: type[_FakeCodexNativeClient],
+    bridge_turn: str | None,
+    enqueue: bool,
+) -> None:
+    """Use the rejected RPC's turn only when the bridge has not advanced further."""
+    from omnigent.harnesses.codex_native.bridge import update_active_turn_id
+
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    monkeypatch.setattr(
+        rejected_steer_client, "on_rejection", lambda: update_active_turn_id(tmp_path, bridge_turn)
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    if enqueue:
+        assert asyncio.run(executor.enqueue_session_message("session", "follow up")) is True
+    else:
+        assert [type(event) for event in _collect_turn_events(executor, "follow up")] == [
+            TurnComplete
+        ]
+    expected_turn = "turn_b" if bridge_turn in (None, "turn_a") else bridge_turn
+    requests = rejected_steer_client.requests
+    assert len(requests) == 2
+    assert requests[0][1]["expectedTurnId"] == "turn_a"
+    assert requests[1][0] == "turn/steer"
+    assert requests[1][1]["expectedTurnId"] == expected_turn
+    assert requests[1][1]["input"] == [{"type": "text", "text": "follow up"}]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == expected_turn
+
+
+@pytest.mark.parametrize("field", ["session_id", "thread_id", "socket_path"])
+def test_rejected_steer_does_not_follow_a_rotated_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rejected_steer_client: type[_FakeCodexNativeClient],
+    field: str,
+) -> None:
+    """A clear, session rotation, or app-server replacement must not receive the old input."""
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    original = read_bridge_state(tmp_path)
+    assert original is not None
+    rotated = replace(original, **{field: "different"})
+    monkeypatch.setattr(
+        rejected_steer_client, "on_rejection", lambda: write_bridge_state(tmp_path, rotated)
+    )
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "follow up")
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert "bridge changed" in events[0].message
+    assert len(rejected_steer_client.requests) == 1
+    assert read_bridge_state(tmp_path) == rotated
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": -32600, "message": "expected active turn id `different` but found `turn_b`"},
+        {"code": -32600, "message": "expected active turn id `turn_a` but found `turn_a`"},
+        {"code": -32603, "message": "expected active turn id `turn_a` but found `turn_b`"},
+        {"code": -32600, "message": "cannot steer a compact turn"},
+        {
+            "code": -32600,
+            "data": {"codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "unknown"}}},
+        },
+    ],
+)
+def test_rejected_steer_requires_an_authoritative_recoverable_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rejected_steer_client: type[_FakeCodexNativeClient],
+    error: dict[str, Any],
+) -> None:
+    """Malformed, unrelated and ambiguous errors do not authorize replaying input."""
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    monkeypatch.setattr(rejected_steer_client, "rejection", CodexAppServerResponseError(error))
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "follow up")
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert len(rejected_steer_client.requests) == 1
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_a"
+
+
+def test_mismatched_turn_recovery_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rejected_steer_client: type[_FakeCodexNativeClient],
+) -> None:
+    """A failed retry cannot start another retry or advance unconfirmed bridge state."""
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    monkeypatch.setattr(
+        rejected_steer_client,
+        "retry_error",
+        CodexAppServerResponseError(
+            {"code": -32600, "message": "expected active turn id `turn_b` but found `turn_c`"}
+        ),
+    )
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "follow up")
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert len(rejected_steer_client.requests) == 2
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_a"
+
+
+def _compacting_error() -> CodexAppServerResponseError:
+    return CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": "cannot steer a compact turn",
+            "data": {"codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "compact"}}},
+        }
+    )
+
+
+@pytest.mark.parametrize("enqueue", [False, True], ids=["run-turn", "live-message"])
+@pytest.mark.parametrize("next_turn", [None, "turn_b"])
+def test_compaction_holds_rejected_input_until_the_turn_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rejected_steer_client: type[_FakeCodexNativeClient],
+    next_turn: str | None,
+    enqueue: bool,
+) -> None:
+    """Compaction may finish idle or start a newer turn; deliver the input once either way."""
+    from omnigent.harnesses.codex_native.bridge import update_active_turn_id
+
+    def finish_compaction() -> None:
+        asyncio.get_running_loop().call_soon(update_active_turn_id, tmp_path, next_turn)
+
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    monkeypatch.setattr(rejected_steer_client, "rejection", _compacting_error())
+    monkeypatch.setattr(rejected_steer_client, "on_rejection", finish_compaction)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if enqueue:
+        assert asyncio.run(executor.enqueue_session_message("session", "follow up")) is True
+    else:
+        assert [type(event) for event in _collect_turn_events(executor, "follow up")] == [
+            TurnComplete
+        ]
+
+    requests = rejected_steer_client.requests
+    assert len(requests) == 2
+    assert requests[0][1]["expectedTurnId"] == "turn_compact"
+    assert requests[1][0] == ("turn/steer" if next_turn else "turn/start")
+    assert requests[1][1]["input"] == [{"type": "text", "text": "follow up"}]
+
+
+def test_compaction_wait_expires_without_delivering_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rejected_steer_client: type[_FakeCodexNativeClient],
+) -> None:
+    """A wedged compaction yields a useful error without repeatedly submitting the prompt."""
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    monkeypatch.setattr(rejected_steer_client, "rejection", _compacting_error())
+    monkeypatch.setattr("omnigent.inner.codex_native_executor._COMPACTION_WAIT_TIMEOUT_S", 0)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "follow up")
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert "still compacting" in events[0].message
+    assert len(rejected_steer_client.requests) == 1
+
+
+async def test_compaction_wait_can_be_cancelled_without_delivering_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rejected_steer_client: type[_FakeCodexNativeClient],
+) -> None:
+    """Stopping while waiting for compaction does not inject the pending message later."""
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    rejected = asyncio.Event()
+    monkeypatch.setattr(rejected_steer_client, "rejection", _compacting_error())
+    monkeypatch.setattr(rejected_steer_client, "on_rejection", rejected.set)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    pending = asyncio.create_task(executor.enqueue_session_message("session", "follow up"))
+    await asyncio.wait_for(rejected.wait(), timeout=1)
+    pending.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert len(rejected_steer_client.requests) == 1
 
 
 async def test_concurrent_steering_during_turn_start_is_not_dropped(
