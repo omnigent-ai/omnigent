@@ -4625,6 +4625,7 @@ function SessionHarnessPicker({
   const [open, setOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [configMenuOpen, setConfigMenuOpen] = useState(false);
+  const configTriggerRef = useRef<HTMLDivElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
@@ -4909,11 +4910,14 @@ function SessionHarnessPicker({
               ) : (
                 <DropdownMenuSub open={configMenuOpen} onOpenChange={setConfigMenuOpen}>
                   <DropdownMenuSubTrigger
+                    ref={configTriggerRef}
                     disabled={busy || pendingModelChange !== null}
                     className="gap-2"
                     data-testid="composer-agent-edit"
                     onPointerMove={(event) => event.preventDefault()}
-                    onClick={() => setConfigMenuOpen(true)}
+                    // Toggle so a second click closes the flyout (Radix's own
+                    // handler only ever opens).
+                    onClick={() => setConfigMenuOpen((wasOpen) => !wasOpen)}
                   >
                     <ComposerAgentIcon agent={iconAgent} />
                     <span className="flex-1">{harnessLabel ?? "Session"}</span>
@@ -4931,6 +4935,13 @@ function SessionHarnessPicker({
                         event.target.getAttribute("role") === "menu"
                       )
                         event.preventDefault();
+                    }}
+                    // Esc dismisses just the flyout and returns focus to the
+                    // Edit row; the picker needs a second Esc to close.
+                    onEscapeKeyDown={(event) => {
+                      event.preventDefault();
+                      setConfigMenuOpen(false);
+                      configTriggerRef.current?.focus();
                     }}
                   >
                     {configContent}
