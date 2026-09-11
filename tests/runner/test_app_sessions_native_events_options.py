@@ -3583,3 +3583,61 @@ async def test_events_compact_on_claude_sdk_buffered_compact_dispatches_standalo
     assert _body_carries_text(hc.posted_bodies[0], "/compact"), (
         "the first dispatched turn must carry the /compact command"
     )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -> None:
+    """A buffered /compact that drains and ends with no compaction still clears the spinner.
+
+    When a buffered /compact dispatches as its own turn, the executor can emit
+    `response.compaction.in_progress` (the PreCompact hook) without a matching
+    `response.compaction.completed` (e.g. the compaction-complete event resolves
+    to None). The buffered path must set `_sdk_compact_inprogress` like the idle
+    path so `_on_proxy_stream_end` publishes `response.compaction.failed` and the
+    "Compacting…" spinner is not stranded — and so the relay swallows the
+    executor's own in_progress, leaving exactly one spinner on the web.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.compaction.in_progress"}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, _hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "c8e5f60718293a4b5c6d7e8f90123456"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        # A /compact buffered behind an active turn drains as its own turn.
+        app.state.session_message_buffers[sid] = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "/compact"}],
+                "conversation_id": sid,
+            },
+        ]
+        await app.state.check_and_start_next_turn(sid)
+
+        events = await _accumulate_session_events(sid, until_types={"response.compaction.failed"})
+
+    failed = [e for e in events if e.get("type") == "response.compaction.failed"]
+    in_progress = [e for e in events if e.get("type") == "response.compaction.in_progress"]
+    completed = [e for e in events if e.get("type") == "response.compaction.completed"]
+    assert failed, (
+        "a buffered /compact that ends without a compaction must publish failed to clear the "
+        "spinner (the busy path must set the in-progress flag like the idle path); "
+        f"got types {[e.get('type') for e in events]}"
+    )
+    assert len(in_progress) == 1, (
+        "exactly one in_progress must reach the web (up-front published, executor's duplicate "
+        f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
+    )
+    assert completed == [], "no completed should appear when nothing compacted"
