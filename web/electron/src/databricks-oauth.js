@@ -20,9 +20,10 @@
 //                                             the login host so the user picks an account+workspace
 //                                             and the token comes back WORKSPACE-scoped. Off = the
 //                                             entered URL must already be a specific workspace.)
-//   OMNIGENT_DATABRICKS_LOGIN_URL            (login host for the SPOG picker; default
-//                                             https://login.databricks.com — set the staging host
-//                                             when testing against staging)
+//   OMNIGENT_DATABRICKS_LOGIN_URL            (login host for the SPOG picker; defaults to the host
+//                                             you connected to. Set this only if the account/
+//                                             workspace picker lives on a different host, e.g.
+//                                             https://login.databricks.com)
 
 "use strict";
 
@@ -35,7 +36,6 @@ const { shell, safeStorage } = require("electron");
 
 const DEFAULT_REDIRECT_BASE = "http://localhost";
 const DEFAULT_SCOPES = "all-apis offline_access";
-const DEFAULT_LOGIN_URL = "https://login.databricks.com";
 // Bound on how long we wait for the human to finish logging in in the browser.
 const AUTH_TIMEOUT_MS = 300_000;
 // Renew a little before real expiry so a mint isn't racing the clock.
@@ -54,7 +54,8 @@ function config() {
     clientSecret: (process.env.OMNIGENT_DATABRICKS_OAUTH_CLIENT_SECRET ?? "").trim(),
     redirectBase: (process.env.OMNIGENT_DATABRICKS_OAUTH_REDIRECT ?? DEFAULT_REDIRECT_BASE).trim(),
     scopes: (process.env.OMNIGENT_DATABRICKS_OAUTH_SCOPES ?? DEFAULT_SCOPES).trim(),
-    loginUrl: (process.env.OMNIGENT_DATABRICKS_LOGIN_URL ?? DEFAULT_LOGIN_URL).trim().replace(/\/+$/, ""),
+    // Empty unless explicitly set — SPOG then defaults the login host to the entered origin.
+    loginUrl: (process.env.OMNIGENT_DATABRICKS_LOGIN_URL ?? "").trim().replace(/\/+$/, ""),
     spog: process.env.OMNIGENT_DATABRICKS_OAUTH_SPOG === "1",
   };
 }
@@ -332,12 +333,15 @@ async function runInteractiveLogin(origin) {
       const authPath = `/oidc/v1/authorize?${authQuery}`;
       // SPOG: login-host entry with the picker (NO isMobile — that would route
       // through the /mobile-redirect bounce page; we want a direct loopback
-      // redirect). Otherwise authorize straight against the entered workspace.
+      // redirect). The login host defaults to the entered origin (the SPOG host
+      // the user connected to) unless OMNIGENT_DATABRICKS_LOGIN_URL overrides it.
+      // Otherwise authorize straight against the entered workspace.
+      const loginHost = loginUrl || origin;
       const authorizeUrl = spog
-        ? `${loginUrl}/?destination_url=${encodeURIComponent(authPath)}`
+        ? `${loginHost}/?destination_url=${encodeURIComponent(authPath)}`
         : `${origin}${authPath}`;
       console.log(
-        `[omnigent] databricks oauth: mode=${spog ? "SPOG(login-host+destination_url)" : "workspace-direct"} ` +
+        `[omnigent] databricks oauth: mode=${spog ? `SPOG(login-host=${loginHost})` : "workspace-direct"} ` +
           `entered=${origin} redirect_uri=${redirectUri}`,
       );
       console.log(`[omnigent] databricks oauth: authorize URL = ${authorizeUrl}`);
