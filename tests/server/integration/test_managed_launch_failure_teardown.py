@@ -41,7 +41,7 @@ from omnigent.host.frames import (
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.managed_hosts import parse_sandbox_config
+from omnigent.server.managed_hosts import ONLINE_TIMEOUT_ENV_VAR, parse_sandbox_config
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -294,7 +294,7 @@ async def test_harness_refusal_failure_tears_down_managed_sandbox(
     env = teardown_env
     # A healthy fake host registers in well under a second; shrink the
     # online-poll budget so a registration regression fails in seconds.
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     loop = asyncio.get_running_loop()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
     launched_host_ids: list[str] = []
@@ -367,7 +367,7 @@ async def test_runner_connect_timeout_failure_tears_down_managed_sandbox(
     left to ever delete it.
     """
     env = teardown_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     # No runner ever connects in this test by design; shrink the
     # connect grace so the launch settles in milliseconds, not 30s.
     monkeypatch.setattr(
