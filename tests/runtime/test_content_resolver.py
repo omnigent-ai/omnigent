@@ -1042,6 +1042,9 @@ def test_compress_image_shrinks_opaque_png_under_budget() -> None:
 
     assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
     assert content_type == "image/jpeg"
+    # The stored blob is base64-inlined every turn; the encoded payload must
+    # stay under the provider's ~5 MB per-image ceiling.
+    assert len(base64.b64encode(result)) < 5 * 1024 * 1024
 
 
 def test_compress_image_shrinks_alpha_png_under_budget() -> None:

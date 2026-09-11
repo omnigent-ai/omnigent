@@ -1569,7 +1569,11 @@ def register_resources_routes(
         filename = file.filename
         if content_type.startswith("image/"):
             try:
-                compressed, resolved_type = compress_image_attachment(content, content_type)
+                # Compression decodes + re-encodes (CPU/memory heavy); run it off
+                # the event loop so one large upload can't stall other requests.
+                compressed, resolved_type = await asyncio.to_thread(
+                    compress_image_attachment, content, content_type
+                )
             except ImageCompressionError as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from exc
             # A re-encode (e.g. PNG → JPEG) changes the type; realign the

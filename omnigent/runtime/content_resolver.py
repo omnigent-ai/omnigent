@@ -125,16 +125,19 @@ _COMPRESSIBLE_IMAGE_MIMES: frozenset[str] = frozenset(
     {"image/png", "image/jpeg", "image/webp", "image/gif"}
 )
 
-# Budget an image's stored/inlined bytes must fit after compression. Kept
-# under Anthropic's ~5 MB per-image ceiling with headroom for the data-URI
-# wrapper and base64 metadata. Large uploads are downscaled / re-encoded to
-# land under this; a decodable still image always ends up at or below it.
-IMAGE_MODEL_BUDGET_BYTES: int = 4_500_000
+# Budget for an image's RAW stored bytes after compression. The stored blob is
+# re-encoded as a base64 data URI on every turn (see _resolve_file_id_block),
+# which inflates it ~4/3, and providers apply the ~5 MB per-image ceiling to
+# that encoded payload. So the raw budget is 5 MB / (4/3) with headroom for the
+# data-URI wrapper: 3.5 MB raw → ~4.7 MB encoded, safely under 5 MB. A decodable
+# still image always ends up at or below the raw budget.
+IMAGE_MODEL_BUDGET_BYTES: int = 3_500_000
 
 # Longest-edge cap applied before the quality search when re-encoding an
-# oversized image. 8K covers 5K/retina screenshots at full resolution;
-# anything larger is scaled down to this first.
-IMAGE_MAX_EDGE_PX: int = 8192
+# oversized image. Matches the provider's documented 8000 px max edge (an image
+# already under this is left at native resolution); anything larger is scaled
+# down to this first.
+IMAGE_MAX_EDGE_PX: int = 8000
 
 # Decompression-bomb guard: refuse to decode images whose pixel area is
 # implausibly large for a real screenshot/photo.
@@ -326,24 +329,19 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
     )
     if has_alpha:
         base = image.convert("RGBA")
-
-        def _candidates(frame: Any) -> list[tuple[bytes, str]]:
-            return [
-                (_encode_image(frame, "WEBP", quality=80, method=4), "image/webp"),
-                (_encode_image(frame, "WEBP", quality=60, method=4), "image/webp"),
-                (_encode_image(frame, "PNG", optimize=True), "image/png"),
-            ]
+        # Alpha-preserving encoders, best-compression first. Generated lazily so
+        # the search stops at the first candidate that fits.
+        _encodings: tuple[tuple[str, str, dict[str, Any]], ...] = (
+            ("WEBP", "image/webp", {"quality": 80, "method": 4}),
+            ("WEBP", "image/webp", {"quality": 60, "method": 4}),
+            ("PNG", "image/png", {"optimize": True}),
+        )
     else:
         base = image.convert("RGB")
-
-        def _candidates(frame: Any) -> list[tuple[bytes, str]]:
-            return [
-                (
-                    _encode_image(frame, "JPEG", quality=q, optimize=True, progressive=True),
-                    "image/jpeg",
-                )
-                for q in (85, 70, 55)
-            ]
+        _encodings = tuple(
+            ("JPEG", "image/jpeg", {"quality": q, "optimize": True, "progressive": True})
+            for q in (85, 70, 55)
+        )
 
     # Pre-shrink an oversized canvas to the edge cap before the quality search.
     longest = max(base.width, base.height)
@@ -354,19 +352,25 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
             Image.Resampling.LANCZOS,
         )
 
-    # Largest-first over a small scale/quality grid (≤ 3 scales × 3 encodings)
-    # so a worst-case (incompressible) upload can't fan out into many encodes.
-    for scale in (1.0, 0.5, 0.25):
-        if scale == 1.0:
-            frame = base
-        else:
-            frame = base.resize(
-                (max(1, round(base.width * scale)), max(1, round(base.height * scale))),
-                Image.Resampling.LANCZOS,
-            )
-        for data, mime in _candidates(frame):
-            if len(data) <= IMAGE_MODEL_BUDGET_BYTES:
-                return data, mime
+    # Largest-first over a small scale/quality grid (≤ 3 scales × 3 encodings),
+    # encoding one candidate at a time and returning at the first that fits, so a
+    # worst-case (incompressible) upload can't fan out into many eager encodes.
+    try:
+        for scale in (1.0, 0.5, 0.25):
+            if scale == 1.0:
+                frame = base
+            else:
+                frame = base.resize(
+                    (max(1, round(base.width * scale)), max(1, round(base.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            for image_format, mime, params in _encodings:
+                data = _encode_image(frame, image_format, **params)
+                if len(data) <= IMAGE_MODEL_BUDGET_BYTES:
+                    return data, mime
+    except (OSError, ValueError) as exc:
+        # A Pillow encode error becomes a clean 413, not an unhandled 500.
+        raise ImageCompressionError("the image couldn't be re-encoded") from exc
 
     raise ImageCompressionError("the image couldn't be compressed to a supported size")
 
