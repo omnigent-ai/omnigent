@@ -83,7 +83,7 @@ def test_mcp_startup_band_lifecycle(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Band tracks starting → progress → settled-with-failure → cleared.
+    """Band tracks starting → progress → cleared once the round settles.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server
@@ -125,8 +125,9 @@ def test_mcp_startup_band_lifecycle(
         ),
     )
 
-    # 3. The round settles with a failure: the spinner flips to the
-    #    warning naming the server that never came up.
+    # 3. The round settles with a failure: the band clears entirely.
+    #    Startup failures are setup diagnostics (host logs), not
+    #    conversation content — no inline notice may join the chat.
     _publish_until(
         base_url,
         session_id,
@@ -135,32 +136,21 @@ def test_mcp_startup_band_lifecycle(
             "jira": {"status": "ready", "error": None},
             "safe": {"status": "failed", "error": "handshaking with MCP server failed"},
         },
-        lambda: expect(band).to_contain_text(
-            "MCP startup incomplete (failed: safe)", timeout=3_000
-        ),
-    )
-
-    # 4. A settled-empty map clears the band entirely (and evicts the
-    #    snapshot cache): the session reads as a normal idle chat again.
-    _publish_until(
-        base_url,
-        session_id,
-        {},
         lambda: expect(band).to_have_count(0, timeout=3_000),
     )
 
 
-def test_mcp_startup_band_shows_cancelled_after_stop(
+def test_mcp_startup_band_clears_after_stop_cancels_round(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A Stop-cancelled round renders the cancelled warning, not a spinner.
+    """A Stop-cancelled round clears the band — no stuck spinner, no notice.
 
     The runner's Stop path flips still-``starting`` servers to
     ``cancelled`` and publishes the flipped map (codex's own cancelled
-    edges are owner-only and never reach the web); this pins the rendering
-    of that published map so a user who stopped a slow MCP boot sees what
-    happened instead of a stuck "Starting…" spinner.
+    edges are owner-only and never reach the web); this pins that the
+    published map removes the spinner without adding a diagnostic notice
+    to the conversation.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server
@@ -185,7 +175,5 @@ def test_mcp_startup_band_shows_cancelled_after_stop(
         base_url,
         session_id,
         {"storage-console": {"status": "cancelled", "error": None}},
-        lambda: expect(band).to_contain_text(
-            "MCP startup incomplete (cancelled: storage-console)", timeout=3_000
-        ),
+        lambda: expect(band).to_have_count(0, timeout=3_000),
     )

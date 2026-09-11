@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.claude_native import (
+from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
 )
@@ -68,6 +68,16 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         # An unrecognised effort is dropped (not a Claude effort), so it
         # never reaches the CLI as a bogus ``--effort`` value.
         ("bogus-effort", None, None, ()),
+        # A leading positional prompt (how the CLI forwards ``-p``) keeps
+        # its place ahead of pass-through value flags, and the model
+        # default is appended after — re-appending the prompt last would
+        # let a variadic flag like ``--mcp-config`` swallow it.
+        (
+            None,
+            "claude-opus-4-7",
+            ["hello", "--mcp-config", "mcp.json"],
+            ("hello", "--mcp-config", "mcp.json", "--model", "claude-opus-4-7"),
+        ),
     ],
     ids=[
         "effort-only",
@@ -78,6 +88,7 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         "all-none",
         "empty-passthrough-still-adds-model",
         "unknown-effort-dropped",
+        "leading-prompt-stays-first",
     ],
 )
 def test_build_claude_native_base_args(
@@ -229,8 +240,8 @@ def test_routed_launch_model_reaches_the_terminal_env_as_the_custom_slot() -> No
     slot, which is the only spelling ``/model`` accepts for an id no family
     alias points at (``opus`` here resolves to the newer generation).
     """
-    from omnigent.claude_model_vocabulary import claude_model_command_arg
-    from omnigent.claude_native import claude_config_with_launch_model_pinned
+    from omnigent.harnesses.claude_native.main import claude_config_with_launch_model_pinned
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
     config = ClaudeNativeUcodeConfig(
         env={
@@ -342,14 +353,14 @@ def bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     :param tmp_path: Per-test temp directory.
     :returns: Bridge dir under the patched bridge root.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
     return tmp_path
 
 
 def _augmented(bridge_dir: Path, *, auto_harness: bool) -> list[str]:
     """Run the runner's own claude-native argv composition for one session shape."""
-    from omnigent.claude_native_bridge import augment_claude_args
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
 
     note, allowed = _routed_spawn_launch_args(auto_harness)
     return augment_claude_args(
@@ -393,7 +404,7 @@ def test_pinned_harness_launch_argv_is_unchanged(bridge_dir: Path) -> None:
     sessions only; leaking either into a pinned launch would change every
     non-routed native session's command line.
     """
-    from omnigent.claude_native_bridge import augment_claude_args
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
 
     baseline = augment_claude_args(
         ("--model", "databricks-claude-sonnet-5"),

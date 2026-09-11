@@ -23,7 +23,7 @@ import json
 import secrets
 import shlex
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -34,8 +34,10 @@ from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKE
 from omnigent.onboarding.sandboxes import types as _sandbox_types
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
+
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
 DEFAULT_HOST_IMAGE: str = "ghcr.io/omnigent-ai/omnigent-host:latest"
@@ -483,13 +485,19 @@ class SandboxLifecycle(ABC):
 
     def keep_alive(self, sandbox_id: str) -> None:
         """
-        Configure the sandbox to survive idle periods (disable idle
-        autostop / maximize lifetime), so long agent runs don't lose
-        their host. Soft-fail: implementations should warn rather than
-        raise when the provider rejects the setting.
+        Keep the sandbox from being reclaimed while it is still in use,
+        so long agent runs don't lose their host. Soft-fail:
+        implementations should warn rather than raise when the provider
+        rejects the setting.
 
-        CLI-bootstrap capability — managed-only launchers need not
-        override the raising default.
+        Called BOTH once after a CLI bootstrap provision AND periodically
+        by the managed path for as long as the sandbox has a live runner
+        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
+        must be idempotent and cheap enough to repeat. Either shape
+        satisfies it: "configure once to maximize lifetime" (disable idle
+        autostop, restate a cap) or "push a deadline forward" (refresh an
+        absolute expiry). Managed-only launchers that cannot extend a
+        sandbox keep the raising default and are skipped.
 
         :param sandbox_id: The sandbox to configure.
         :raises SandboxCapabilityError: When the provider does not
@@ -543,7 +551,9 @@ class SandboxLifecycle(ABC):
         Optional capability: the default implementation raises
         :class:`SandboxCapabilityError` — providers whose SDK exposes
         programmatic termination override it. Used by the server's
-        managed-host cleanup when a managed session is deleted.
+        managed-host cleanup when a managed session is deleted. Implementations
+        must treat an already-absent sandbox as success so cleanup can retry
+        safely after a crash or database failure.
 
         :param sandbox_id: The sandbox to terminate, e.g.
             ``"sb-a1b2c3"``.
@@ -802,6 +812,10 @@ class SandboxHostLauncher(SandboxLifecycle):
     without needing any exec transport.
     """
 
+    def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
+        """Bind credentials needed for background cleanup in one workspace."""
+        return nullcontext()
+
     @abstractmethod
     def start_host(
         self,
@@ -811,9 +825,7 @@ class SandboxHostLauncher(SandboxLifecycle):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
@@ -826,16 +838,16 @@ class SandboxHostLauncher(SandboxLifecycle):
         :param host_name: Server-chosen host display name, e.g.
             ``"managed-a1b2c3d4"``.
         :param server_url: URL of this server the host dials back to.
-        :param repo_url: Repository clone URL, or ``None`` for an empty
-            workspace.
-        :param repo_branch: Branch to clone, or ``None`` for the default branch.
-        :param repo_name: Directory the clone lands in under the workspace, or
-            ``None`` when *repo_url* is ``None``.
+        :param repos: Repositories to clone into ``<workspace>/<repo_name>``
+            (empty for an empty workspace). The returned path is the single
+            clone directory when exactly one repo is cloned, else the
+            workspace root that parents them all.
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content installed into the sandbox's config BEFORE the host starts.
         :param on_stage: Progress observer invoked with ``"cloning"`` and
             ``"starting"``.
-        :returns: The absolute in-sandbox workspace path.
+        :returns: The absolute in-sandbox workspace path — the working
+            directory the host starts the agent in.
         """
 
 
@@ -862,9 +874,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
@@ -872,11 +882,16 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         Start ``omnigent host`` in the sandbox and return the workspace path.
 
         The default is the EXEC model: probe ``$HOME``, create
-        ``<HOME>/workspace``, optionally materialize the repository into it (via
-        :meth:`materialize_workspace`, which clones by default), merge any
-        *host_config* into ``~/.omnigent/config.yaml``, and start the host
-        detached (``setsid``-backgrounded, identity + token in the process
+        ``<HOME>/workspace``, clone each requested repo into it (via
+        :meth:`materialize_workspace`), merge any *host_config* into
+        ``~/.omnigent/config.yaml``, and start the host detached
+        (``setsid``-backgrounded, identity + token in the process
         environment) — all driven through :meth:`run` / :meth:`run_background`.
+
+        The working directory is the single clone directory when exactly one
+        repo is cloned, else the workspace root parenting them all (or an empty
+        workspace when none are requested). Clones run sequentially here; the
+        entrypoint-as-host launchers (Kubernetes) clone in parallel.
 
         :returns: The absolute in-sandbox workspace path.
         """
@@ -888,15 +903,24 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             )
         workspace = f"{home}/workspace"
         self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
-        if repo_url is not None:
-            workspace = self.materialize_workspace(
-                sandbox_id,
-                workspace=workspace,
-                repo_url=repo_url,
-                repo_branch=repo_branch,
-                repo_name=repo_name,
-                on_stage=on_stage,
-            )
+        if repos:
+            if on_stage is not None:
+                on_stage("cloning")
+            # Distinct URLs can derive the same repo_name (e.g. two orgs' "api");
+            # disambiguate so they don't clone into one colliding directory.
+            clone_dirs = [
+                self.materialize_workspace(
+                    sandbox_id,
+                    workspace=workspace,
+                    repo_url=repo.url,
+                    repo_branch=repo.branch,
+                    repo_name=dirname,
+                )
+                for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True)
+            ]
+            # One repo → drop the agent straight into it; several → the
+            # workspace root that parents them all.
+            workspace = clone_dirs[0] if len(clone_dirs) == 1 else workspace
         if on_stage is not None:
             on_stage("starting")
         if host_config is not None or self.capabilities.resume_stopped:

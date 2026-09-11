@@ -81,15 +81,23 @@ def auth_app(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> FastAPI:
     """App with auth, permission, and policy stores enabled.
 
     :param runtime_init: Fixture that initializes the runtime with a mock LLM.
     :param db_uri: Per-test SQLite URI.
     :param tmp_path: Pytest temp dir for artifacts.
+    :param monkeypatch: Isolate the app's policy registry from other tests.
     :returns: A :class:`FastAPI` instance with auth and policy routes.
     """
+    from omnigent.policies import registry as policy_registry
     from omnigent.server.auth import UnifiedAuthProvider
+
+    # ASGITransport skips lifespan, which normally initializes the registry.
+    monkeypatch.setattr(policy_registry, "_registry", [])
+    monkeypatch.setattr(policy_registry, "_registry_by_handler", {})
+    policy_registry.load_registry()
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(

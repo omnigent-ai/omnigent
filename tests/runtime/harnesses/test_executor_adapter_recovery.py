@@ -176,6 +176,106 @@ async def test_watchdog_resync_is_idempotent() -> None:
     # Exactly one Tier-1 reset: the cached executor was dropped and closed once.
     assert adapter._executor is None
     assert executor.close_calls == 1
+
+
+async def test_wedge_retry_waits_for_executor_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 10)
+    closing = asyncio.Event()
+    release = asyncio.Event()
+    orphan_result = None
+
+    class SlowCloseExecutor(_FakeExecutor):
+        async def close(self) -> None:
+            nonlocal orphan_result
+            closing.set()
+            await release.wait()
+            orphan_result = await self._tool_executor("count", {})
+            await super().close()
+
+    abandoned = SlowCloseExecutor(block_event=asyncio.Event())
+    fresh = _FakeExecutor(events=[TextChunk(text="done"), TurnComplete(response="done")])
+    creations = 0
+
+    def factory() -> Executor:
+        nonlocal creations
+        creations += 1
+        if creations == 1:
+            return abandoned
+        assert abandoned.close_calls == 1
+        assert abandoned.close_session_calls == 1
+        return fresh
+
+    adapter = ExecutorAdapter(executor_factory=factory)
+    ctx = _ctx("retry_after_close")
+    task = asyncio.create_task(adapter._guarded_run_turn(_request(), ctx))
+    try:
+        async with asyncio.timeout(5):
+            await closing.wait()
+            assert creations == 1
+            assert adapter._current_ctx is None
+            release.set()
+            await task
+        assert creations == 2
+        assert orphan_result is not None and orphan_result.get("error")
+    finally:
+        release.set()
+        await adapter.on_shutdown()
+
+
+@pytest.mark.parametrize(
+    "failure", ["close_error", "close_timeout", "cancel", "budget", "absolute"]
+)
+async def test_cleanup_cannot_enable_unsafe_retry(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from omnigent.runtime.harnesses import _executor_adapter, _scaffold
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(
+        _scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 0.4 if failure in {"budget", "absolute"} else 10
+    )
+    monkeypatch.setattr(
+        _executor_adapter,
+        "INTERRUPT_TIMEOUT_S",
+        0.5 if failure in {"budget", "absolute"} else 0.05,
+    )
+    ctx = _ctx("cleanup_failed")
+
+    class FailedCloseExecutor(_FakeExecutor):
+        async def close(self) -> None:
+            if failure == "close_error":
+                raise RuntimeError("close failed")
+            if failure == "close_timeout":
+                await asyncio.Event().wait()
+            if failure == "cancel":
+                ctx.cancelled.set()
+            if failure in {"budget", "absolute"}:
+                await asyncio.sleep(0.25 if failure == "budget" else 0.4)
+            await super().close()
+
+    executor = FailedCloseExecutor(block_event=asyncio.Event())
+    creations = 0
+
+    def factory() -> Executor:
+        nonlocal creations
+        creations += 1
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=factory)
+    try:
+        async with asyncio.timeout(5):
+            with pytest.raises(RuntimeError, match="idle watchdog"):
+                await adapter._guarded_run_turn(_request(), ctx)
+        assert creations == 1
+        events = []
+        while not ctx._event_queue.empty():
+            events.append(ctx._event_queue.get_nowait())
+        assert not any(getattr(event, "type", None) == "response.retry" for event in events)
+    finally:
+        await adapter.on_shutdown()
     assert executor.close_session_calls == 1
     assert adapter._orphan_callback_count == 0
     assert adapter._resyncing is False

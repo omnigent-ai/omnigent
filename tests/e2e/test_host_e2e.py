@@ -32,6 +32,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import (
@@ -67,6 +68,7 @@ def _spawn_host_daemon(
     tmp_path: Path,
     live_server: str,
     mock_llm_server_url: str,
+    interactive_shells: list[str] | None = None,
 ) -> _SpawnedHostDaemon:
     """
     Spawn an isolated host daemon for a single host e2e test.
@@ -89,6 +91,7 @@ def _spawn_host_daemon(
         ``"http://localhost:18501"``.
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
         ``"http://127.0.0.1:12345"``.
+    :param interactive_shells: Optional deterministic host inventory for tests.
     :returns: The spawned daemon handle and its host_id.
     """
     omni_dir = tmp_path / ".omnigent"
@@ -114,13 +117,32 @@ def _spawn_host_daemon(
         "OPENAI_API_KEY": "mock-key",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
+    command = [
+        runner_executable(),
+        "-m",
+        "omnigent.host._daemon_entry",
+        "--server",
+        live_server,
+    ]
+    if interactive_shells is not None:
+        command = [
+            runner_executable(),
+            "-c",
+            (
+                "import sys; "
+                "from omnigent.host.connect import run_host_process; "
+                "run_host_process(sys.argv[1], interactive_shells=sys.argv[2:])"
+            ),
+            live_server,
+            *interactive_shells,
+        ]
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
             # Compat-aware: pinned OLD host venv in runner compat mode (Config 2),
             # else the test process's python. apply_runner_env drops the inherited
             # worktree PYTHONPATH in that mode; the old host launches old runners
             # (colocated) from its own venv.
-            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            command,
             env=apply_runner_env(env),
             cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
@@ -264,6 +286,72 @@ def test_host_connect_and_list(
     resp = http_client.get(f"/v1/hosts/{host_id}")
     if resp.status_code == 200:
         assert resp.json()["status"] == "offline", "Host should be offline after daemon is killed"
+
+
+@pytest.mark.skipif(shutil.which("zsh") is None, reason="needs zsh on the server-side machine")
+def test_native_shells_follow_bash_only_host_inventory(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """The UI-shaped native session offers and launches only host shells."""
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+        interactive_shells=["bash"],
+    )
+    try:
+        _wait_for_host_online(http_client, daemon.host_id, timeout=30.0)
+        host = http_client.get(f"/v1/hosts/{daemon.host_id}")
+        host.raise_for_status()
+        assert host.json()["interactive_shells"] == ["bash"]
+
+        agents = http_client.get("/v1/agents", params={"limit": 100})
+        agents.raise_for_status()
+        agent_id = next(
+            row["id"] for row in agents.json()["data"] if row["name"] == CLAUDE_NATIVE_AGENT_NAME
+        )
+        workspace = tmp_path / "bash-only-workspace"
+        workspace.mkdir()
+        created = http_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": daemon.host_id,
+                "workspace": str(workspace),
+            },
+            timeout=60.0,
+        )
+        created.raise_for_status()
+        session_id = created.json()["id"]
+
+        agent = http_client.get(f"/v1/sessions/{session_id}/agent")
+        agent.raise_for_status()
+        assert agent.json()["terminals"] == ["bash"]
+
+        rejected = http_client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "zsh", "session_key": "missing"},
+            timeout=30.0,
+        )
+        assert rejected.status_code == 400, rejected.text
+
+        launched = http_client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "bash", "session_key": "e2e"},
+            timeout=90.0,
+        )
+        launched.raise_for_status()
+        assert launched.json()["metadata"]["terminal_name"] == "bash"
+    finally:
+        daemon.proc.send_signal(signal.SIGTERM)
+        try:
+            daemon.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.proc.kill()
+            daemon.proc.wait()
 
 
 def _wait_for_host_online_by_name(
@@ -544,12 +632,20 @@ def test_native_terminal_start_failure_names_the_readable_runner_log(
             f"expected the goose terminal start to fail, got {ensure_resp.status_code}: "
             f"{ensure_resp.text}"
         )
-        message = ensure_resp.json()["error"]["message"]
+        error = ensure_resp.json()["error"]
+        message = error["message"]
         assert "Native Goose terminal failed to start" in message, message
+
+        # The server normalizes runner errors to code + message, so recover the
+        # runner's correlation ID from that preserved public message.
+        error_id_match = re.search(r" Error ID: (err_[0-9a-f]{32})\.$", message)
+        assert error_id_match is not None, f"message has no error ID: {message!r}"
+        error_id = error_id_match.group(1)
+        error_id_suffix = error_id_match.group(0)
 
         # The daemon runs with HOME=tmp_path, so the runner's home-relative
         # path resolves back under the test's temp dir.
-        named_path = message.rsplit(": ", 1)[-1]
+        named_path = message.removesuffix(error_id_suffix).rsplit(": ", 1)[-1]
         assert named_path.endswith(".log"), f"message names no log file: {message!r}"
         runner_log = tmp_path / named_path[2:] if named_path.startswith("~/") else Path(named_path)
         assert runner_log.exists(), (
@@ -557,7 +653,9 @@ def test_native_terminal_start_failure_names_the_readable_runner_log(
         )
         # The message stays free of the raw cause; the named log carries it.
         assert "requires the 'goose' CLI" not in message
-        assert "requires the 'goose' CLI" in runner_log.read_text()
+        runner_log_text = runner_log.read_text()
+        assert "requires the 'goose' CLI" in runner_log_text
+        assert error_id in runner_log_text
 
     finally:
         host_proc.send_signal(signal.SIGTERM)

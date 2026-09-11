@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.opencode_native_provider import (
+from omnigent.harnesses.opencode_native.provider import (
     OpenCodeGatewayResolution,
     _gateway_endpoint_for_model,
     _strip_jsonc_comments,
@@ -18,6 +18,7 @@ from omnigent.opencode_native_provider import (
     build_opencode_model_default_config,
     build_opencode_omnigent_mcp_server,
     build_opencode_provider_config,
+    managed_connect_opencode_config,
     maybe_merge_user_provider_config,
     resolve_databricks_gateway,
     write_opencode_provider_config,
@@ -27,7 +28,7 @@ from omnigent.opencode_native_provider import (
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: types.SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
@@ -40,10 +41,13 @@ def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     entry = block["omnigent"]
     assert entry["type"] == "local"
     assert entry["enabled"] is True
+    # Milliseconds: must exceed the bridge's outer relay hop (330 s) so the
+    # relay's clean timeout error beats opencode's client-side kill.
+    assert entry["timeout"] == 360_000
     cmd = entry["command"]
     # Launches the SHARED serve-mcp relay, pointed at THIS bridge dir.
     assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]
-    assert "omnigent.claude_native_bridge" in cmd
+    assert "omnigent.harnesses.claude_native.bridge" in cmd
     assert entry.get("environment", {}).get("PYTHONUNBUFFERED") == "1"
 
 
@@ -64,7 +68,7 @@ def test_build_omnigent_mcp_server_rejects_non_string_values(
     server: dict[str, object],
 ) -> None:
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.build_mcp_config",
+        "omnigent.harnesses.claude_native.bridge.build_mcp_config",
         lambda bridge_dir, *, python_executable=None: {"mcpServers": {"omnigent": server}},
     )
 
@@ -151,7 +155,13 @@ def test_resolve_gateway_none_when_sdk_absent(monkeypatch: pytest.MonkeyPatch) -
     assert resolve_databricks_gateway("oss") is None
 
 
-def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, *, host: str, token: str | None) -> None:
+def _install_fake_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    host: str,
+    token: str | None,
+    endpoints: list[tuple[str, str]] | None = None,
+) -> None:
     fake = types.ModuleType("databricks.sdk.core")
 
     class _Config:
@@ -163,9 +173,24 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, *, host: str, token: str 
             return {"Authorization": f"Bearer {token}"} if token else {}
 
     fake.Config = _Config  # type: ignore[attr-defined]
+    sdk = types.ModuleType("databricks.sdk")
+    # Only expose WorkspaceClient (used for serving-endpoint discovery) when the
+    # test supplies endpoints; otherwise the import fails and discovery no-ops.
+    if endpoints is not None:
+
+        class _WorkspaceClient:
+            def __init__(self, *, config: object) -> None:
+                self._config = config
+
+            @property
+            def serving_endpoints(self) -> object:
+                eps = [types.SimpleNamespace(name=n, task=t) for n, t in endpoints]
+                return types.SimpleNamespace(list=lambda: eps)
+
+        sdk.WorkspaceClient = _WorkspaceClient  # type: ignore[attr-defined]
     # Ensure parent packages resolve for the dotted import.
     monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
-    monkeypatch.setitem(sys.modules, "databricks.sdk", types.ModuleType("databricks.sdk"))
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk)
     monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake)
 
 
@@ -191,10 +216,73 @@ def test_resolve_gateway_none_when_no_token(monkeypatch: pytest.MonkeyPatch) -> 
     assert resolve_databricks_gateway("oss") is None
 
 
+def test_resolve_gateway_lists_all_chat_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Discovery lists every chat serving-endpoint (pinned default first, embeddings
+    # dropped) so opencode's in-session picker offers them all.
+    _install_fake_sdk(
+        monkeypatch,
+        host="https://ws.databricks.com",
+        token="t",
+        endpoints=[
+            ("databricks-kimi-k3", "llm/v1/chat"),
+            ("databricks-claude-sonnet-4-6", "llm/v1/chat"),
+            ("databricks-gte-large-en", "llm/v1/embeddings"),
+            ("some-other-endpoint", "llm/v1/chat"),
+        ],
+    )
+    res = resolve_databricks_gateway("oss", model_id="databricks-claude-sonnet-4-6")
+    assert res is not None
+    # pinned default first, embeddings + non-databricks dropped, de-duped
+    assert res.model_ids == ("databricks-claude-sonnet-4-6", "databricks-kimi-k3")
+    cfg = build_opencode_provider_config(res)
+    models = cfg["provider"]["databricks-gateway"]["models"]  # type: ignore[index]
+    assert set(models) == {"databricks-claude-sonnet-4-6", "databricks-kimi-k3"}
+
+
+def test_resolve_gateway_single_model_when_discovery_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No WorkspaceClient (endpoints=None) -> discovery no-ops, just the pinned model.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    res = resolve_databricks_gateway("oss", model_id="databricks-kimi-k3")
+    assert res is not None
+    assert res.model_ids == ("databricks-kimi-k3",)
+
+
+def test_resolve_gateway_env_default_applies(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No session model pinned -> the deployment env default steers the endpoint.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+    res = resolve_databricks_gateway("oss")
+    assert res is not None
+    assert res.model_id == "databricks-kimi-k3"
+
+
+def test_resolve_gateway_session_model_beats_env_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+    res = resolve_databricks_gateway("oss", model_id="databricks-gpt-5-5")
+    assert res is not None
+    assert res.model_id == "databricks-gpt-5-5"
+
+
+def test_resolve_gateway_env_default_ignored_when_not_gateway_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non ``databricks-*`` env value is not a routable endpoint -> catalog wins.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "kimi-k3")
+    res = resolve_databricks_gateway("oss")
+    assert res is not None
+    assert res.model_id == "catalog-databricks-claude-default"
+
+
 def test_build_mcp_block_stdio_and_http() -> None:
     from types import SimpleNamespace as N
 
-    from omnigent.opencode_native_provider import build_opencode_mcp_block
+    from omnigent.harnesses.opencode_native.provider import build_opencode_mcp_block
 
     servers = [
         N(
@@ -239,7 +327,7 @@ def test_build_mcp_block_stdio_and_http() -> None:
 def test_build_mcp_block_http_databricks_injects_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     from types import SimpleNamespace as N
 
-    import omnigent.opencode_native_provider as prov
+    import omnigent.harnesses.opencode_native.provider as prov
 
     monkeypatch.setattr(prov, "_databricks_bearer_token", lambda _p: "tok123")
     servers = [
@@ -421,6 +509,52 @@ def test_merge_user_provider_config_carries_model_without_user_providers(
     assert result["model"] == "databricks/databricks-claude-opus-4-8"
 
 
+def test_merge_user_provider_config_preserves_plugins_and_deduplicates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Global plugins survive per-session config synthesis."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"plugin": ["/opt/pulse-agents-harnesses/marshal-opencode", '
+        '"/opt/pulse-agents-harnesses/other"]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {
+        "plugin": ["/tmp/omnigent-policy.js", "/opt/pulse-agents-harnesses/other"]
+    }
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["plugin"] == [
+        "/tmp/omnigent-policy.js",
+        "/opt/pulse-agents-harnesses/other",
+        "/opt/pulse-agents-harnesses/marshal-opencode",
+    ]
+
+
+def test_merge_user_provider_config_skips_non_string_plugins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed plugin entries are dropped rather than propagated."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"plugin": ["/opt/pulse-agents-harnesses/marshal-opencode", {"bad": "entry"}, "", 42]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {"plugin": ["/tmp/omnigent-policy.js"]}
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["plugin"] == [
+        "/tmp/omnigent-policy.js",
+        "/opt/pulse-agents-harnesses/marshal-opencode",
+    ]
+
+
 def test_merge_user_provider_config_merges_alongside_synthesized_providers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -523,3 +657,174 @@ def test_merge_user_provider_config_handles_jsonc_trailing_commas(
 
     result = maybe_merge_user_provider_config({})
     assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
+
+
+def test_build_mcp_block_preserves_custom_timeout() -> None:
+    from types import SimpleNamespace as N
+
+    from omnigent.harnesses.opencode_native.provider import build_opencode_mcp_block
+
+    servers = [
+        N(
+            name="local_custom",
+            transport="stdio",
+            command="python",
+            args=["-m", "custom_server"],
+            env={},
+            url=None,
+            headers={},
+            timeout=120,
+        ),
+        N(
+            name="remote_custom",
+            transport="http",
+            url="https://remote.mcp/api",
+            headers={},
+            command=None,
+            args=[],
+            env={},
+            timeout=45.5,
+        ),
+    ]
+    block = build_opencode_mcp_block(servers)
+    # MCPServerConfig.timeout is seconds; the opencode entry is milliseconds.
+    assert block["local_custom"]["timeout"] == 120_000
+    assert block["remote_custom"]["timeout"] == 45_500
+
+
+def test_extract_progress_token_variants() -> None:
+    from omnigent.harnesses.claude_native.bridge import _extract_progress_token
+
+    # Meta style (MCP standard)
+    assert _extract_progress_token({"_meta": {"progressToken": "tok-123"}}) == "tok-123"
+    assert _extract_progress_token({"_meta": {"progressToken": 42}}) == 42
+    # Top-level fallback
+    assert _extract_progress_token({"progressToken": "tok-456"}) == "tok-456"
+    # None or malformed
+    assert _extract_progress_token(None) is None
+    assert _extract_progress_token({}) is None
+    assert _extract_progress_token({"_meta": {}}) is None
+    assert _extract_progress_token({"_meta": {"progressToken": ["invalid"]}}) is None
+
+
+def test_mcp_progress_heartbeat_lifecycle() -> None:
+    import itertools
+    import threading
+    import time
+
+    lock = threading.Lock()
+    written_messages: list[dict[str, object]] = []
+
+    def fake_write(
+        payload: dict[str, object],
+        stdout_lock: threading.Lock,
+        **_kwargs: object,
+    ) -> None:
+        with stdout_lock:
+            written_messages.append(payload)
+
+    import omnigent.harnesses.claude_native.bridge as bridge_mod
+
+    orig_write = bridge_mod._write_jsonrpc
+    bridge_mod._write_jsonrpc = fake_write
+    try:
+        # With interval = 0.05s, should emit progress notifications
+        with bridge_mod._McpProgressHeartbeat("test-token", lock, interval_s=0.05):
+            time.sleep(0.12)
+        assert len(written_messages) >= 2
+        assert all(m["method"] == "notifications/progress" for m in written_messages)
+        assert all(m["params"]["progressToken"] == "test-token" for m in written_messages)
+        progresses = [m["params"]["progress"] for m in written_messages]
+        assert all(b > a for a, b in itertools.pairwise(progresses))
+
+        # Once exited, no more messages are emitted
+        count_at_exit = len(written_messages)
+        time.sleep(0.1)
+        assert len(written_messages) == count_at_exit
+    finally:
+        bridge_mod._write_jsonrpc = orig_write
+
+
+def test_managed_connect_opencode_config_consumes_ucode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a managed connect host, opencode reuses ucode's generated config
+    (provider block + system.ai model) and its refreshing auth plugin, copied into
+    the per-session XDG dir."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # ucode's generated opencode config + auth plugin (its own XDG root).
+    ucode_dir = tmp_path / ".ucode" / "opencode-xdg" / "opencode"
+    (ucode_dir / "plugin").mkdir(parents=True)
+    (ucode_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "model": "databricks-anthropic/system.ai.claude-opus-4-8",
+                "provider": {"databricks-anthropic": {"options": {"baseURL": "https://ws/x"}}},
+            }
+        )
+    )
+    (ucode_dir / "plugin" / "ucode-auth.js").write_text("// ucode auth plugin\n")
+    # A managed connect host (broker sidecar present) — and the ucode config
+    # already exists, so no on-demand configure is triggered.
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential._read_sidecar",
+        lambda path: {
+            "server": "s",
+            "host_id": "h",
+            "host_token": "t",
+            "workspace_host": "https://ws",
+        },
+    )
+
+    session_xdg = tmp_path / "session-xdg"
+    config = managed_connect_opencode_config(session_xdg)
+
+    assert config is not None
+    assert config["model"] == "databricks-anthropic/system.ai.claude-opus-4-8"  # system.ai
+    assert "databricks-anthropic" in config["provider"]
+    # auth plugin copied into the session dir and registered.
+    session_plugin = session_xdg / "opencode" / "plugin" / "ucode-auth.js"
+    assert session_plugin.exists()
+    assert config["plugin"] == [str(session_plugin)]
+
+
+def test_managed_connect_opencode_config_none_without_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No broker sidecar (e.g. a laptop) → None, so opencode's normal launch is
+    untouched off a managed sandbox."""
+    monkeypatch.setattr("omnigent.host.databricks_credential._read_sidecar", lambda path: None)
+    assert managed_connect_opencode_config(Path("/tmp/unused-xdg")) is None
+
+
+@pytest.mark.parametrize("bad_url", ["https://evil.example/x", "http://ws/x"])
+def test_managed_connect_opencode_config_rejects_untrusted_base_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_url: str
+) -> None:
+    """A ucode config whose provider baseURL is not HTTPS on the sidecar's
+    workspace host (a stale file from a prior connection, or a tampered one) is
+    refused, so the freshly-minted broker bearer is never forwarded to an
+    unverified origin."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ucode_dir = tmp_path / ".ucode" / "opencode-xdg" / "opencode"
+    (ucode_dir / "plugin").mkdir(parents=True)
+    (ucode_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "model": "databricks-anthropic/system.ai.claude-opus-4-8",
+                "provider": {"databricks-anthropic": {"options": {"baseURL": bad_url}}},
+            }
+        )
+    )
+    (ucode_dir / "plugin" / "ucode-auth.js").write_text("// ucode auth plugin\n")
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential._read_sidecar",
+        lambda path: {
+            "server": "s",
+            "host_id": "h",
+            "host_token": "t",
+            "workspace_host": "https://ws",  # bad_url points elsewhere / non-HTTPS
+        },
+    )
+
+    assert managed_connect_opencode_config(tmp_path / "session-xdg") is None

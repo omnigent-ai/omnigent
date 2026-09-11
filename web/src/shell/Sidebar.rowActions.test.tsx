@@ -8,7 +8,7 @@
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -53,6 +53,7 @@ const mocks = vi.hoisted(() => {
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
+    projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
@@ -107,7 +108,13 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
+  useProjects: () => ({
+    data: mocks.projects.map((name: string) => ({
+      id: `p_${name}`,
+      name,
+      icon: mocks.projectIcons[name],
+    })),
+  }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
   // (this suite keeps its test row unfiled; the picker only needs the name).
@@ -135,6 +142,12 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));
 vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("./ForkSessionDialog", () => ({
+  ForkSessionDialog: ({ open, sourceSessionId }: { open: boolean; sourceSessionId: string }) =>
+    open ? (
+      <div data-testid="fork-session-dialog" data-source-session-id={sourceSessionId} />
+    ) : null,
+}));
 // Force a multi-user (non-local) server so the "Shared with me" tab renders —
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
@@ -202,6 +215,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
@@ -258,6 +272,7 @@ beforeEach(() => {
   mocks.moveToProject.mutate.mockReset();
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
+  mocks.projectIcons = {};
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -303,11 +318,11 @@ describe("quick pin/unpin hover button", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).not.toHaveClass("md:pr-14");
+    expect(rowLink).not.toHaveClass("md:pr-20");
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    expect(rowLink).toHaveClass("md:pr-14");
+    expect(rowLink).toHaveClass("md:pr-20");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
@@ -368,9 +383,9 @@ describe("quick pin/unpin hover button", () => {
     // Hover-capable desktop: fades out until the header is hovered / focused /
     // a menu opens.
     expect(wrapper).toHaveClass(
-      "[@media(hover:hover)]:md:opacity-0",
-      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
-      "[@media(hover:hover)]:md:has-[:focus-visible]:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
     );
   });
 
@@ -747,11 +762,45 @@ describe("leave a shared session", () => {
   });
 });
 
+describe("quick-archive owner gate", () => {
+  // Archive is owner-only: the kebab renders its Archive item disabled for
+  // non-owners ("Only the session owner can archive this session"). The hover
+  // quick button must enforce the same gate — so a non-owner never gets the
+  // affordance the menu deliberately blocks.
+  it("hides the quick-archive button on a shared row the viewer doesn't own", () => {
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    // Non-owned rows live on the "Shared with me" tab (activates on mousedown).
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-archive-conversation")).toBeNull();
+
+    // The kebab still carries the (disabled) Archive item — the gate hides only
+    // the quick button, not the explanatory menu entry.
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("archive-conversation")).toHaveAttribute("data-disabled");
+  });
+
+  it("shows the quick-archive button on a row the viewer owns", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+
+    expect(screen.getByTestId("quick-archive-conversation")).toBeInTheDocument();
+  });
+});
+
 describe("pinned row project flyout", () => {
   // Pinning lifts a session out of its project folder into the flat "Pinned"
   // section, so the folder no longer conveys which project it came from. The
-  // hover flyout restores that cue: title + folder icon + project name. It
-  // opens on focus/hover — fire focus on the row link and await the portal.
+  // hover flyout restores that cue: title + project icon (the project's chosen
+  // emoji, or a folder fallback) + project name. It opens on focus/hover — fire
+  // focus on the row link and await the portal.
 
   it("shows the project name in the flyout for a pinned, project-owned row", async () => {
     // Seed the pin so the row lifts into the always-expanded Pinned section
@@ -781,6 +830,46 @@ describe("pinned row project flyout", () => {
     expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
       "fix/sidebar-row-height",
     );
+  });
+
+  it("shows the project's real emoji icon in the flyout when the project has one", async () => {
+    // The flyout mirrors the folder/picker: a first-class project that carries a
+    // chosen emoji surfaces that glyph next to its name, not the generic folder.
+    // The icon is keyed off the row's first-class `project_id`, so seed one that
+    // resolves into the mocked projects list (id `p_<name>`).
+    mocks.projects = ["Moonshot"];
+    mocks.projectIcons = { Moonshot: "🚀" };
+    mocks.pinnedStore.set(["conv_1"]);
+    mockConversations([{ ...CONV, project_id: "p_Moonshot" }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    // The emoji renders via ProjectRowIcon (data-testid project-icon), replacing
+    // the folder svg the fallback would otherwise draw.
+    const icon = within(flyout).getByTestId("project-icon");
+    expect(icon).toHaveTextContent("🚀");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+    expect(within(flyout).queryByRole("img", { hidden: true })).toBeNull();
+  });
+
+  it("falls back to the folder icon in the flyout for a project with no emoji", async () => {
+    // A label-only project (no first-class id/icon) has no glyph to surface, so
+    // the flyout keeps the folder icon — proving the emoji path is opt-in.
+    mocks.pinnedStore.set(["conv_1"]);
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    // No emoji span; the project line leads with the folder svg fallback.
+    expect(within(flyout).queryByTestId("project-icon")).toBeNull();
+    const projectLine = within(flyout).getByText("Moonshot").closest("p")!;
+    expect(projectLine.querySelector("svg")).not.toBeNull();
   });
 
   it("renders no project flyout for a pinned row with no project", () => {
@@ -912,6 +1001,71 @@ describe("mobile in-place project picker", () => {
     expect(screen.queryByRole("menuitem", { name: /Create/ })).toBeNull();
   });
 
+  it("orders decorative project icons and a folder fallback before their names", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42", "Legacy project"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    const emoji = iconRow.firstElementChild;
+    expect(emoji).toHaveAttribute("data-testid", "project-icon");
+    expect(emoji).toHaveAttribute("aria-hidden", "true");
+    expect(emoji).toHaveTextContent("🚀");
+    expect(emoji?.nextElementSibling).toHaveTextContent("Sprint 42");
+
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).firstElementChild;
+    expect(fallback?.tagName.toLowerCase()).toBe("svg");
+    expect(fallback).toHaveAttribute("aria-hidden", "true");
+    expect(fallback?.nextElementSibling).toHaveTextContent("Legacy project");
+
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    expect(removeItem.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(removeItem.firstElementChild).toHaveTextContent("🚀");
+  });
+
+  it("uses project names and the Remove label for desktop picker typeahead", async () => {
+    mocks.projects = ["Alpha", "Sprint 42"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    const view = renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const moveTrigger = screen.getByTestId("move-to-project");
+    moveTrigger.focus();
+    fireEvent.keyDown(moveTrigger, { key: "ArrowRight" });
+
+    const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    expect(alphaRow.firstElementChild?.tagName.toLowerCase()).toBe("svg");
+    expect(alphaRow.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
+    expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
+    await waitFor(() => expect(alphaRow).toHaveFocus());
+    fireEvent.keyDown(alphaRow, { key: "s" });
+    await waitFor(() => expect(sprintRow).toHaveFocus());
+
+    view.unmount();
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const freshMoveTrigger = screen.getByTestId("move-to-project");
+    freshMoveTrigger.focus();
+    fireEvent.keyDown(freshMoveTrigger, { key: "ArrowRight" });
+
+    const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    await waitFor(() => expect(freshAlphaRow).toHaveFocus());
+    fireEvent.keyDown(freshAlphaRow, { key: "r" });
+    await waitFor(() => expect(removeItem).toHaveFocus());
+  });
+
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {
     // Desktop viewport (default). The project entry is a submenu trigger, and
     // opening the kebab never renders the in-place Back control.
@@ -985,6 +1139,18 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("opens the fork dialog for the selected session", () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 

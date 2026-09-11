@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { effortLevelsForConv, shouldShowEffortPicker, shouldShowModelPicker } from "./ChatPage";
 
-// These pin the label-driven composer capability gates (effort levels, model
-// picker, effort picker). They fail closed on missing labels, so a refactor
-// that loosens the gate would expose model/effort controls on sessions that
-// can't honor mid-session overrides (codex-native pins its model at launch;
-// non-claude wrappers have no Web UI effort dial).
+// These pin the composer capability gates (effort levels, model picker, effort
+// picker). Wrapper labels are authoritative; the resolved harness is the
+// fallback for chat-first custom Codex agents that intentionally have no
+// presentation label. Unrelated label-less sessions still fail closed.
 
 const NATIVE = "claude-code-native-ui";
 
@@ -64,8 +63,8 @@ describe("shouldShowModelPicker", () => {
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
-    // WHY: a loosened gate would pop a non-functional picker on codex-native
-    // (model pinned at launch) and on pre-hydration rows.
+    // WHY: a wrapper-looking string is not a resolved harness, and
+    // pre-hydration rows still have no capability evidence.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "codex-native" } })).toBe(false);
     expect(shouldShowModelPicker({ labels: {} })).toBe(false);
     expect(shouldShowModelPicker(null)).toBe(false);

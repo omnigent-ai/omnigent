@@ -283,7 +283,7 @@ def test_builtin_native_provider_paths_resolve() -> None:
     This is the guard that keeps the provider rows honest: a typo'd import path
     or a renamed run_<x>_native symbol fails here rather than at dispatch time.
     """
-    from omnigent import native_dispatch
+    from omnigent.native import native_dispatch
 
     for provider in hp.native_providers():
         for hook in (
@@ -304,9 +304,9 @@ def test_builtin_native_provider_bridge_id_label_keys_match_constants() -> None:
     modules (which would break its import-light contract). Pin the derivation
     against the actual constants so a rename can't silently diverge.
     """
-    from omnigent.antigravity_native_bridge import ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY
-    from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
-    from omnigent.opencode_native_bridge import OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.harnesses.antigravity_native.bridge import ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.harnesses.opencode_native.bridge import OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY
 
     expected = {
         "codex": CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
