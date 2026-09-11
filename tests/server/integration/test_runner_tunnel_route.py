@@ -1252,6 +1252,5 @@ async def test_keepalive_loop_fires_faster_than_the_ping_interval(
     task = asyncio.create_task(runner_tunnel._keepalive_loop("r1"))
     await asyncio.sleep(0.05)
     task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await asyncio.gather(task, return_exceptions=True)
     assert len(calls) >= 3 and set(calls) == {"r1"}
