@@ -2595,6 +2595,24 @@ function ComposerImpl({
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
   const dismissBtwSidechat = useChatStore((s) => s.dismissBtwSidechat);
+  // While the /btw "Claude Quick Answer" overlay is open, lock the composer:
+  // the side chat is modal (like the terminal overlay), so the next input is
+  // Esc / ✕ to dismiss it, not a new message.
+  const composerLockedByBtw = btwSidechat !== null;
+  // The composer's own Escape handler can't fire while the textarea is
+  // disabled (disabled inputs emit no keydown), so close the overlay from a
+  // document-level Escape while it's open — matching native Claude Code.
+  useEffect(() => {
+    if (!composerLockedByBtw) return;
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        dismissBtwSidechat();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [composerLockedByBtw, dismissBtwSidechat]);
   // The conversation whose draft the composer's value/files currently hold.
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
@@ -3174,6 +3192,8 @@ function ComposerImpl({
   };
 
   const submit = () => {
+    // The /btw overlay locks the composer — never send while it's open.
+    if (composerLockedByBtw) return;
     const trimmed = value.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
@@ -3665,22 +3685,26 @@ function ComposerImpl({
             }}
             aria-label="Message the agent"
             placeholder={
-              readOnlyReason !== null
-                ? readOnlyReason
-                : isReadOnly
-                  ? "You have read-only access to this session"
-                  : unreachable
-                    ? "Session offline — reconnect below to continue"
-                    : hasPendingElicitation
-                      ? "Respond to the pending request above to continue"
-                      : disabled
-                        ? "Waiting for agents…"
-                        : isStreaming
-                          ? "Send a follow-up (queued) — Esc to stop"
-                          : "Send a message…"
+              composerLockedByBtw
+                ? "Side chat open — press Esc to close"
+                : readOnlyReason !== null
+                  ? readOnlyReason
+                  : isReadOnly
+                    ? "You have read-only access to this session"
+                    : unreachable
+                      ? "Session offline — reconnect below to continue"
+                      : hasPendingElicitation
+                        ? "Respond to the pending request above to continue"
+                        : disabled
+                          ? "Waiting for agents…"
+                          : isStreaming
+                            ? "Send a follow-up (queued) — Esc to stop"
+                            : "Send a message…"
             }
             rows={1}
-            disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
+            disabled={
+              disabled || isReadOnly || unreachable || hasPendingElicitation || composerLockedByBtw
+            }
             data-slash-command={composerIsCommand ? "true" : undefined}
             className={cn(
               "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
@@ -3774,7 +3798,7 @@ function ComposerImpl({
               size="icon"
               variant="ghost"
               className="size-9 md:size-8"
-              disabled={disabled || isReadOnly || hasPendingElicitation}
+              disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
               componentId="chat.composer.attach_files"
@@ -3784,7 +3808,7 @@ function ComposerImpl({
             </Button>
             <ComposerMicButton
               enableHotkey
-              disabled={disabled || isReadOnly || hasPendingElicitation}
+              disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
               onVoiceStart={() => {
                 voiceSnapshotRef.current = value;
               }}
