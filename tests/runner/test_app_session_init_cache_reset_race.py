@@ -293,8 +293,9 @@ async def test_session_init_does_not_reinstate_agent_binding_superseded_by_reset
         return _spec("v1")
 
     server_client = _SwitchableSnapshotServerClient(session_id, _AGENT_ID)
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        process_manager=process_manager,  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
         resource_registry=SessionResourceRegistry(terminal_registry=None),
@@ -328,14 +329,14 @@ async def test_session_init_does_not_reinstate_agent_binding_superseded_by_reset
             f"reset (bound {get_session_agent_id(session_id)!r})"
         )
 
-        # The read path must not 500 while the binding is fenced out: the
-        # session is live, so the runner GET serves the authoritative
-        # binding from the (post-switch) server snapshot instead.
-        get_resp = await client.get(f"/v1/sessions/{session_id}")
-        assert get_resp.status_code == 200, get_resp.text
-        assert get_resp.json()["agent_id"] == _NEW_AGENT_ID, (
-            "runner GET served neither the snapshot fallback nor the fresh "
-            f"agent after a raced init (got {get_resp.json()['agent_id']!r})"
+        # The reset could not release the harness (init had not registered
+        # it yet), and with the binding absent the next turn's prior-binding
+        # teardown would skip release, so a new agent sharing the harness
+        # and model would reuse the superseded spec's baked environment.
+        # Init itself must release the process it spawned mid-race.
+        assert process_manager.released == [session_id], (
+            "init did not release the harness spawned from the superseded "
+            f"spec after a raced reset (released: {process_manager.released})"
         )
 
         fallback_resp = await client.post(
@@ -366,8 +367,9 @@ async def test_session_init_memoizes_agent_binding_when_no_reset_intervenes() ->
         return _spec("v1")
 
     server_client = _SwitchableSnapshotServerClient(session_id, _AGENT_ID)
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        process_manager=process_manager,  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
         resource_registry=SessionResourceRegistry(terminal_registry=None),
@@ -383,6 +385,10 @@ async def test_session_init_memoizes_agent_binding_when_no_reset_intervenes() ->
             "uninterrupted init failed to memoize the agent-id binding: "
             "the fence was wrongly applied without a reset"
         )
+        assert process_manager.released == [], (
+            "uninterrupted init released the harness it just spawned: "
+            "the fence-fired release was wrongly applied without a reset"
+        )
 
         # Even if the snapshot were to disagree, the reset must be served
         # from the binding init memoized.
@@ -391,11 +397,22 @@ async def test_session_init_memoizes_agent_binding_when_no_reset_intervenes() ->
             f"/v1/sessions/{session_id}/agent-cache/reset",
             json={},
         )
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["agent_id"] == _AGENT_ID, (
+            "body-less reset ignored the binding memoized by an uninterrupted "
+            f"init (got {reset_resp.json()['agent_id']!r})"
+        )
 
-    assert reset_resp.status_code == 200
-    assert reset_resp.json()["agent_id"] == _AGENT_ID, (
-        "body-less reset ignored the binding memoized by an uninterrupted "
-        f"init (got {reset_resp.json()['agent_id']!r})"
+        # That reset retired the binding while the session (and its harness
+        # process) stays live. The runner GET must not 500 on the transiently
+        # unbound session: it serves the authoritative binding from the
+        # server snapshot instead.
+        get_resp = await client.get(f"/v1/sessions/{session_id}")
+
+    assert get_resp.status_code == 200, get_resp.text
+    assert get_resp.json()["agent_id"] == _NEW_AGENT_ID, (
+        "runner GET did not serve the server snapshot binding for a "
+        f"reset-unbound session (got {get_resp.json()['agent_id']!r})"
     )
 
 
@@ -464,8 +481,9 @@ async def test_session_init_fences_reset_during_legacy_context_load(
     # the legacy context load genuinely awaits the (blocked) network probe.
     monkeypatch.setattr("omnigent.runner.app._server_version", None)
 
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        process_manager=process_manager,  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
         resource_registry=SessionResourceRegistry(terminal_registry=None),
@@ -494,6 +512,11 @@ async def test_session_init_fences_reset_during_legacy_context_load(
         assert get_session_agent_id(session_id) is None, (
             "init reinstated the agent-id binding retired by a reset during "
             "the legacy context load"
+        )
+        assert process_manager.released == [session_id], (
+            "init did not release the harness spawned from the superseded "
+            f"spec after a reset during the legacy context load "
+            f"(released: {process_manager.released})"
         )
 
         skills_resp = await client.get(f"/v1/sessions/{session_id}/skills")

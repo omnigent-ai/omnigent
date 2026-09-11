@@ -3867,6 +3867,20 @@ def create_runner_app(
         # snapshot instead.
         if _session_cache_generation_is_current(session_id, spec_cache_generation):
             _session_agent_ids[session_id] = agent_id
+        else:
+            # The reset that fenced this binding ran before init registered
+            # the harness, so it could not release the subprocess spawned
+            # above with the superseded spec's environment baked in. With
+            # the binding left absent, the next turn's prior-binding teardown
+            # would skip release too, and a new agent sharing the harness and
+            # model would silently reuse the stale process. Release it now so
+            # the next turn respawns from the freshly resolved spec.
+            _logger.info(
+                "session init raced an agent-cache reset; releasing the "
+                "harness spawned from the superseded spec",
+                extra={"session_id": session_id},
+            )
+            await process_manager.release(session_id)
         if session_id not in _session_event_queues:
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
@@ -4348,12 +4362,16 @@ def create_runner_app(
         status = "running" if has_turn else "idle"
         agent_id = _session_agent_ids.get(session_id)
         if agent_id is None:
-            # A reset that raced session init retires the binding and fences
-            # init's re-write, so a live session can transiently lack it. The
-            # server snapshot is the authoritative binding; serve it rather
-            # than failing the read (the next turn dispatch re-memoizes).
+            # An agent-cache reset retires the binding while the session
+            # stays live, so a registered session can transiently lack it.
+            # The server snapshot is the authoritative binding; serve it
+            # rather than failing the read (the next turn re-memoizes).
             snapshot = await _session_snapshot(session_id)
-            if snapshot.ok:
+            if snapshot.ok and snapshot.agent_id is not None:
+                _logger.info(
+                    "session agent binding absent from cache; serving the server snapshot binding",
+                    extra={"session_id": session_id},
+                )
                 agent_id = snapshot.agent_id
         if agent_id is None:
             return JSONResponse(
