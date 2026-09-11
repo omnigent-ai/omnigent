@@ -59,6 +59,18 @@ def test_get_missing_returns_none(store: SqlAlchemyProjectStore) -> None:
     assert store.get(_uid("nope"), user_id="alice@example.com") is None
 
 
+def test_get_for_session_launch_uses_authoritative_row_without_caller_context(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """Background relaunch can resolve an already-authorized session project."""
+    store.create(_uid("p1"), "chatgpt-playground", "alice@example.com")
+
+    project = store.get_for_session_launch(_uid("p1"))
+
+    assert project is not None
+    assert project.name == "chatgpt-playground"
+
+
 def test_get_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     """A project owned by someone else reads back as not found."""
     store.create(_uid("p1"), "Alice Project", "alice@example.com")

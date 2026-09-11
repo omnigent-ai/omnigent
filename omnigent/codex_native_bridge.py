@@ -10,7 +10,7 @@ import re
 import secrets
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -20,6 +20,45 @@ import tomllib
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
+CODEX_LAUNCH_ROLE_ENV_VAR = "OMNIGENT_CODEX_LAUNCH_ROLE"
+OMNIGENT_RUNNER_PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
+
+
+class CodexLaunchRole(str, Enum):
+    """Declare whether Codex discovers models or serves a session."""
+
+    MODEL_DISCOVERY = "model-discovery"
+    SESSION_SERVING = "session-serving"
+
+
+def codex_launch_env(
+    environment: Mapping[str, str],
+    *,
+    role: CodexLaunchRole,
+) -> dict[str, str]:
+    """Return a Codex env with explicit role and unambiguous identity.
+
+    Discovery is deliberately sessionless even when its caller is a running
+    session. Serving is deliberately request-scoped and never falls back to
+    the runner process's parent-session marker.
+
+    :param environment: Filtered environment at the Codex launch site.
+    :param role: The process's declared launch role.
+    :returns: A normalized copy; *environment* is not mutated.
+    :raises ValueError: If serving lacks an exact request-session identity.
+    """
+    launch_env = dict(environment)
+    launch_env[CODEX_LAUNCH_ROLE_ENV_VAR] = role.value
+    launch_env.pop(OMNIGENT_RUNNER_PRIMARY_SESSION_ID_ENV_VAR, None)
+    if role is CodexLaunchRole.MODEL_DISCOVERY:
+        launch_env.pop(CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR, None)
+        return launch_env
+
+    request_session_id = launch_env.get(CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "")
+    if not request_session_id or request_session_id != request_session_id.strip():
+        raise ValueError("Codex serving app-server requires a request session identity")
+    return launch_env
+
 
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"

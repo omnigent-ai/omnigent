@@ -22,6 +22,7 @@ def test_features_default_off() -> None:
     assert flags.frontend_dict() == {
         "usage_page": False,
         "harness_install": False,
+        "docloop_notebook": False,
     }
 
 

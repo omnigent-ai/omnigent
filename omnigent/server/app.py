@@ -78,6 +78,7 @@ from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.projects import create_projects_router
+from omnigent.server.routes.quota_config import create_quota_config_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -1412,6 +1413,7 @@ def create_app(
                 tunnel_registry=tunnel_registry,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                project_store=project_store,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -1491,6 +1493,7 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.agent_store = agent_store
+    app.state.project_store = project_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
@@ -2487,6 +2490,7 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            docloop_notebook_enabled=app.state.feature_flags.enabled(Feature.DOCLOOP_NOTEBOOK),
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -2621,6 +2625,14 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sharing"],
+    )
+    app.include_router(
+        create_quota_config_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["quota"],
     )
 
     # First-class projects (owner-private session containers). Mounted only
@@ -3000,6 +3012,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                project_store=project_store,
                 feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",

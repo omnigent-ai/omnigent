@@ -323,6 +323,7 @@ def register_core_routes(
                 provider=sandbox_provider,
                 agent_store=agent_store,
                 agent_id=agent_id,
+                project_store=project_store,
             )
         )
         _managed_launch_tasks.add(launch_task)
@@ -534,6 +535,10 @@ def register_core_routes(
                     HostLaunchRunnerFrame,
                     encode_host_frame,
                 )
+                from omnigent.host.project_attribution import (
+                    ProjectAttributionError,
+                    resolve_launch_attribution,
+                )
                 from omnigent.runner.identity import token_bound_runner_id
                 from omnigent.server.routes._host_launch import resolve_host_launch
 
@@ -548,6 +553,17 @@ def register_core_routes(
                     permission_store=permission_store,
                 )
                 conn = target.conn
+                launch_attribution = None
+                if project_store is not None:
+                    try:
+                        launch_attribution = await asyncio.to_thread(
+                            resolve_launch_attribution,
+                            target.conv,
+                            harness=resp.harness,
+                            project_store=project_store,
+                        )
+                    except ProjectAttributionError as exc:
+                        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
                 binding_token = secrets.token_urlsafe(32)
                 runner_id = token_bound_runner_id(binding_token)
                 # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
@@ -587,6 +603,12 @@ def register_core_routes(
                         # spawning. None (agent not resolvable) skips the
                         # host-side check.
                         harness=resp.harness,
+                        quota_route=(
+                            launch_attribution.quota_route if launch_attribution else None
+                        ),
+                        project_enum=(
+                            launch_attribution.project_enum if launch_attribution else None
+                        ),
                     )
                 )
                 host_registry.send_text(conn, launch_frame)

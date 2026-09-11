@@ -911,6 +911,7 @@ class HostProcess:
         identity: HostIdentity,
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
+        require_quota_route: bool = True,
     ) -> None:
         """Initialize the host process.
 
@@ -919,9 +920,13 @@ class HostProcess:
         :param lifecycle_lock: Optional guard binding this daemon's lifetime
             to its registry record. When present, the daemon holds the lock
             and self-terminates once the record is deleted or reassigned.
+        :param require_quota_route: Refuse launch frames without trusted route
+            attribution. Production defaults to strict; compatibility tests
+            for older frame fixtures may opt out explicitly.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._require_quota_route = require_quota_route
         self._runners: dict[str, _RunnerHandle] = {}
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
@@ -1523,6 +1528,47 @@ class HostProcess:
             ``"harness_not_configured"`` when the harness check
             refuses the launch.
         """
+        from omnigent.host.project_attribution import (
+            PERSONAL_QUOTA_ROUTE,
+            PROJECT_ATTRIBUTION_ERROR_CODE,
+            PROJECT_ENUM_ENV_VAR,
+            QUOTA_ROUTE_ENV_VAR,
+            WORK_QUOTA_ROUTE,
+            is_allowed_project_enum,
+            is_allowed_quota_route,
+        )
+
+        if frame.quota_route is None and self._require_quota_route:
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="host launch requires a trusted quota route classification",
+                error_code=PROJECT_ATTRIBUTION_ERROR_CODE,
+            )
+        if frame.quota_route is not None and not is_allowed_quota_route(frame.quota_route):
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="launch frame contains an unsupported project classification",
+                error_code=PROJECT_ATTRIBUTION_ERROR_CODE,
+            )
+        if frame.quota_route == PERSONAL_QUOTA_ROUTE and not is_allowed_project_enum(
+            frame.project_enum
+        ):
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="personal host launch requires an allowed project classification",
+                error_code=PROJECT_ATTRIBUTION_ERROR_CODE,
+            )
+        if frame.quota_route == WORK_QUOTA_ROUTE and frame.project_enum is not None:
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="work host launch cannot carry a personal project classification",
+                error_code=PROJECT_ATTRIBUTION_ERROR_CODE,
+            )
+
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -1573,6 +1619,10 @@ class HostProcess:
         # pass it so runner-level log records can be attributed to that session.
         if frame.session_id:
             env[PRIMARY_SESSION_ID_ENV_VAR] = frame.session_id
+        if frame.project_enum is not None:
+            env[PROJECT_ENUM_ENV_VAR] = frame.project_enum
+        if frame.quota_route is not None:
+            env[QUOTA_ROUTE_ENV_VAR] = frame.quota_route
         # The runner is 1:1 with this host's owner (cross-owner co-location is
         # rejected server-side), so hand it our resolved owner for user_id
         # attribution of runner-level log records.

@@ -3416,6 +3416,27 @@ def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
     assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
 
 
+def test_clean_codex_env_preserves_personal_quota_launch_authority(monkeypatch) -> None:
+    """The app-server wrapper retains explicit role and child identity signals."""
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    expected = {
+        "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID": "b" * 32,
+        "LLMQ_AGENT_ID": "omnigent-r820-codex-session",
+        "OMNIGENT_CODEX_LAUNCH_ROLE": "session-serving",
+        "OMNIGENT_PROJECT_ENUM": "chatgpt-playground",
+        "OMNIGENT_QUOTA_ROUTE": "personal-llmq",
+        "OMNIGENT_RUNNER_LAUNCH_HARNESS": "codex-native",
+        "OMNIGENT_RUNNER_PRIMARY_SESSION_ID": "a" * 32,
+    }
+    for key, value in expected.items():
+        monkeypatch.setenv(key, value)
+
+    filtered = _clean_codex_env()
+
+    assert {key: filtered[key] for key in expected} == expected
+
+
 # ---------------------------------------------------------------------------
 # Tests for _to_codex_input_items — input_file → inline text conversion
 # ---------------------------------------------------------------------------

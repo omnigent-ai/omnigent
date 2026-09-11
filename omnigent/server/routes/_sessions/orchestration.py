@@ -55,6 +55,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
+from omnigent.host.project_attribution import PROJECT_ATTRIBUTION_ERROR_CODE
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -2800,6 +2801,7 @@ async def _run_managed_launch(
     provider: str | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
+    project_store: ProjectStore | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2897,6 +2899,7 @@ async def _run_managed_launch(
         host_store=host_store,
         host_registry=host_registry,
         tunnel_registry=tunnel_registry,
+        project_store=project_store,
     )
 
 
@@ -2910,6 +2913,7 @@ async def _bind_and_launch_managed_runner(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    project_store: ProjectStore | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -2973,6 +2977,7 @@ async def _bind_and_launch_managed_runner(
                 conversation_store,
                 host_registry,
                 host_conn,
+                project_store=project_store,
             )
             if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # The sandbox image should bake in the harness, but if the
@@ -2980,6 +2985,11 @@ async def _bind_and_launch_managed_runner(
                 # delete-during-provisioning path) rather than waiting out
                 # the connect timeout for a runner that will never appear.
                 reason = launch_attempt.error or "harness not configured on the sandbox host"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
+            if launch_attempt.error_code == PROJECT_ATTRIBUTION_ERROR_CODE:
+                reason = launch_attempt.error or "trusted project attribution is required"
                 tracker.fail(session_id, reason)
                 _publish_sandbox_status(session_id, "failed", reason)
                 return
@@ -3327,6 +3337,7 @@ async def ensure_runner_connected(
                 conversation_store,
                 host_registry,
                 host_conn,
+                project_store=getattr(app_state, "project_store", None),
             )
             # A harness-not-configured or workspace-missing refusal means the
             # runner will never appear — don't set relaunched_runner_id or the
@@ -3337,13 +3348,14 @@ async def ensure_runner_connected(
             _fatal_refusal = launch_attempt.error_code in (
                 _HARNESS_NOT_CONFIGURED_ERROR_CODE,
                 _WORKSPACE_MISSING_ERROR_CODE,
+                PROJECT_ATTRIBUTION_ERROR_CODE,
             )
             if _fatal_refusal and raise_host_refusal:
-                error_code = (
-                    ErrorCode.HARNESS_NOT_CONFIGURED
-                    if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
-                    else ErrorCode.WORKSPACE_MISSING
-                )
+                error_code = {
+                    _HARNESS_NOT_CONFIGURED_ERROR_CODE: ErrorCode.HARNESS_NOT_CONFIGURED,
+                    _WORKSPACE_MISSING_ERROR_CODE: ErrorCode.WORKSPACE_MISSING,
+                    PROJECT_ATTRIBUTION_ERROR_CODE: ErrorCode.PROJECT_ATTRIBUTION_REQUIRED,
+                }[cast(str, launch_attempt.error_code)]
                 raise OmnigentError(
                     launch_attempt.error
                     or (
@@ -3480,6 +3492,7 @@ def _kick_managed_relaunch(
             relaunch_host=host,
             agent_store=agent_store,
             agent_id=conv.agent_id,
+            project_store=getattr(app_state, "project_store", None),
         )
     )
     _managed_launch_tasks.add(relaunch_task)
@@ -3564,6 +3577,7 @@ def _kick_managed_wake_impl(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            project_store=getattr(app_state, "project_store", None),
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -3580,6 +3594,7 @@ async def _run_managed_wake(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    project_store: ProjectStore | None = None,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -3691,9 +3706,15 @@ async def _run_managed_wake(
                 conversation_store,
                 host_registry,
                 host_conn,
+                project_store=project_store,
             )
             if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 reason = launch_attempt.error or "harness not configured on the sandbox host"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
+            if launch_attempt.error_code == PROJECT_ATTRIBUTION_ERROR_CODE:
+                reason = launch_attempt.error or "trusted project attribution is required"
                 tracker.fail(session_id, reason)
                 _publish_sandbox_status(session_id, "failed", reason)
                 return

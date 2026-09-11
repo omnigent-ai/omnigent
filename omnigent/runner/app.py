@@ -2466,6 +2466,7 @@ def create_runner_app(
     mcp_manager: RunnerMcpManager | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    docloop_notebook_enabled: bool | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -2505,6 +2506,15 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+
+    from omnigent.server.feature_flags import Feature, resolve_feature_flags
+
+    if docloop_notebook_enabled is None:
+        docloop_notebook_enabled = resolve_feature_flags().enabled(Feature.DOCLOOP_NOTEBOOK)
+    if docloop_notebook_enabled:
+        from omnigent.runner.docloop import runner_notebook_router
+
+        app.include_router(runner_notebook_router(process_manager, auth_token))
 
     from omnigent.runtime import telemetry
 
@@ -2673,6 +2683,36 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _quota_wait_watcher: asyncio.Task[None] | None = None
+
+    @app.on_event("startup")
+    async def _start_quota_wait_watcher() -> None:
+        nonlocal _quota_wait_watcher
+        data_dir = os.environ.get("OMNIGENT_DATA_DIR")
+        runner_id = os.environ.get("OMNIGENT_RUNNER_ID")
+        if not data_dir or not runner_id:
+            return
+        from omnigent.runner.quota_wait import watch_quota_waits
+
+        _quota_wait_watcher = asyncio.create_task(
+            watch_quota_waits(
+                server_client,
+                Path(data_dir).expanduser().resolve() / "quota-waits",
+                runner_id=runner_id,
+            ),
+            name="quota-wait-status",
+        )
+        _background_tasks.add(_quota_wait_watcher)
+        _quota_wait_watcher.add_done_callback(_background_tasks.discard)
+
+    @app.on_event("shutdown")
+    async def _stop_quota_wait_watcher() -> None:
+        if _quota_wait_watcher is None:
+            return
+        _quota_wait_watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _quota_wait_watcher
+
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox
@@ -3384,6 +3424,7 @@ def create_runner_app(
             model_override=body.model_override,
             session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
             additional_instructions=body.additional_instructions,
+            request_session_id=conversation_id,
         )
         try:
             title = await run_background_title(context)

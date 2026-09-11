@@ -225,6 +225,16 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
+import {
+  QUOTA_BURST_FINITE_DEFAULT,
+  QUOTA_BURST_MAX,
+  QUOTA_BURST_MIN,
+  QUOTA_BURST_STEP,
+  getQuotaBurstControllerConfig,
+  readQuotaBurstConfig,
+  type QuotaBurstConfig,
+  writeQuotaBurstConfig,
+} from "@/lib/quotaBurstConfig";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -1313,7 +1323,131 @@ function GeneralSection() {
           </div>
         </div>
       </div>
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Quota pacing</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <QuotaBurstControl />
+        </div>
+      </div>
     </Section>
+  );
+}
+
+function QuotaBurstControl() {
+  const [config, setConfig] = useState<QuotaBurstConfig>(() => readQuotaBurstConfig());
+  const [lastFinite, setLastFinite] = useState(
+    () => config.maxBurstFactor ?? QUOTA_BURST_FINITE_DEFAULT,
+  );
+  const [error, setError] = useState<string | null>(null);
+  const updateSequence = useRef(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getQuotaBurstControllerConfig()
+      .then((authoritative) => {
+        if (cancelled) return;
+        setConfig(authoritative);
+        if (authoritative.maxBurstFactor !== null) setLastFinite(authoritative.maxBurstFactor);
+      })
+      .catch(() => {
+        if (!cancelled) setError("Quota controller unavailable; showing the last saved value.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const update = useCallback(
+    (next: QuotaBurstConfig) => {
+      const previous = config;
+      const sequence = ++updateSequence.current;
+      setConfig(next);
+      setError(null);
+      void writeQuotaBurstConfig(next).catch(() => {
+        if (updateSequence.current !== sequence) return;
+        setConfig(previous);
+        setError("The quota controller could not be updated; the previous value was restored.");
+      });
+    },
+    [config],
+  );
+
+  const unlimited = config.maxBurstFactor === null;
+  const sliderValue = config.maxBurstFactor ?? lastFinite;
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-ui font-medium">Maximum burst factor</span>
+          <span className="text-sm text-muted-foreground">
+            Caps short bursts above the rate that reaches the quota limit exactly at reset.
+          </span>
+        </div>
+        <div className="flex min-w-56 items-center gap-3">
+          <input
+            type="range"
+            aria-label="Maximum quota burst factor"
+            data-testid="quota-burst-factor-slider"
+            min={QUOTA_BURST_MIN}
+            max={QUOTA_BURST_MAX}
+            step={QUOTA_BURST_STEP}
+            disabled={unlimited}
+            value={sliderValue}
+            onChange={(event) => {
+              const value = Number(event.target.value);
+              setLastFinite(value);
+              update({ ...config, maxBurstFactor: value });
+            }}
+            className="min-w-36 flex-1 accent-primary disabled:opacity-40"
+          />
+          <span className="w-16 text-right text-sm tabular-nums">
+            {unlimited
+              ? "Unlimited"
+              : `${sliderValue.toFixed(2)}×${sliderValue > QUOTA_BURST_MAX ? "*" : ""}`}
+          </span>
+        </div>
+      </div>
+      {!unlimited && sliderValue > QUOTA_BURST_MAX && (
+        <p className="text-sm text-muted-foreground">
+          * Current controller value is above the slider’s {QUOTA_BURST_MAX}× selection range.
+        </p>
+      )}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-t border-border pt-4">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-ui font-medium">Unlimited ceiling</span>
+          <span className="text-sm text-muted-foreground">
+            Removes the configured cap; quota availability still controls the live rate.
+          </span>
+        </div>
+        <Switch
+          aria-label="Unlimited quota burst ceiling"
+          data-testid="quota-burst-unlimited-switch"
+          checked={unlimited}
+          onCheckedChange={(checked) =>
+            update({ ...config, maxBurstFactor: checked ? null : lastFinite })
+          }
+        />
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-t border-border pt-4">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-ui font-medium">Adapt to duty cycle</span>
+          <span className="text-sm text-muted-foreground">
+            Adjusts the effective default burst factor from observed active and idle periods.
+          </span>
+        </div>
+        <Switch
+          aria-label="Adapt quota burst factor to duty cycle"
+          data-testid="quota-burst-adaptive-switch"
+          checked={config.adaptiveBurstEnabled}
+          onCheckedChange={(checked) => update({ ...config, adaptiveBurstEnabled: checked })}
+        />
+      </div>
+      {error && (
+        <p role="status" className="text-sm text-muted-foreground">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 

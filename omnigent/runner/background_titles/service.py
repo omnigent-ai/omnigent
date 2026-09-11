@@ -130,7 +130,12 @@ class BackgroundTitleProcessManager(Protocol):
 
 @dataclass(frozen=True)
 class BackgroundTitleContext:
-    """Resolved inputs shared by all background-title generators."""
+    """Resolved inputs shared by all background-title generators.
+
+    ``request_session_id`` identifies inference to native launch admission.
+    It is explicit rather than recovered from ambient runner state because a
+    shared runner may generate titles for several sessions concurrently.
+    """
 
     prompt: str
     harness: str
@@ -143,6 +148,7 @@ class BackgroundTitleContext:
     # Set by the dispatch layer to pin the generation onto the harness's
     # economy tier; generators prefer it over every other model source.
     title_model: str | None = None
+    request_session_id: str | None = None
 
 
 class BackgroundTitleGenerator(Protocol):

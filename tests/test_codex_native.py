@@ -1465,6 +1465,7 @@ def test_build_codex_native_server_does_not_trust_project_by_default(
         model=None,
         profile=None,
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         codex_path="/opt/codex/bin/codex",
     )
 
@@ -7871,6 +7872,7 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
         )
 
     assert captured.get("developer_instructions") == "Be a concise, careful coding assistant."
+    assert captured.get("request_session_id") == "conv_fresh_di"
 
 
 def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fresh(

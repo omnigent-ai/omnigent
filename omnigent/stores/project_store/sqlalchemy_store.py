@@ -178,6 +178,12 @@ class SqlAlchemyProjectStore(ProjectStore):
                 return None
             return _to_entity(row)
 
+    def get_for_session_launch(self, project_id: str) -> Project | None:
+        """Resolve the project referenced by an already-authorized session."""
+        with self._session("select_project_for_session_launch") as session:
+            row = session.get(SqlProject, (current_workspace_id(), project_id))
+            return _to_entity(row) if row is not None else None
+
     def list(self, *, user_id: str | None) -> list[Project]:
         """List the owner's projects ordered by ``created_at ASC, id ASC``."""
         with self._session("list_projects") as session:

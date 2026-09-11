@@ -131,7 +131,11 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         # tiny JSON.
         body = await request.aread() if request.content else b""
         content_type = request.headers.get("content-type", "application/json")
-        body_str, encoding = encode_body(body, content_type) if body else (None, "utf-8")
+        body_str, encoding = (
+            encode_body(body, content_type, request.headers.get("content-encoding", "identity"))
+            if body
+            else (None, "utf-8")
+        )
 
         try:
             state = self._registry.open_request(self._runner_id, req_id)

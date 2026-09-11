@@ -127,6 +127,7 @@ class FireDeps:
     tunnel_registry: Any | None = None
     file_store: Any | None = None
     artifact_store: Any | None = None
+    project_store: Any | None = None
 
 
 def _prompt_event(prompt: str) -> SessionEventInput:
@@ -1001,11 +1002,15 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             permission_store=deps.permission_store,
         )
 
+        launch_kwargs = (
+            {"project_store": deps.project_store} if deps.project_store is not None else {}
+        )
         attempt = await _launch_runner_on_host(
             target.conv,
             deps.conversation_store,
             deps.host_registry,
             target.conn,
+            **launch_kwargs,
         )
         if attempt.error is not None:
             raise RuntimeError(f"host launch failed: {attempt.error}")

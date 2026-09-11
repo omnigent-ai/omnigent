@@ -1036,6 +1036,25 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
   });
 });
 
+describe("workingIndicatorLabel — quota delay", () => {
+  it("shows rate, burst, and distance from the linear schedule", () => {
+    expect(
+      workingIndicatorLabel(0, "quota availability", {
+        admissionDelaySeconds: 12.5,
+        currentRatePpmPerSecond: 2.25,
+        burstMultiplier: 1.5,
+        linearScheduleDeltaPpm: -420,
+      }),
+    ).toBe("Waiting 12.5s for quota · 0.81%/h (2.25 ppm/s) · 1.50× burst · 420 ppm below linear");
+  });
+
+  it("describes a positive delta as above linear", () => {
+    expect(workingIndicatorLabel(0, null, { linearScheduleDeltaPpm: 300 })).toBe(
+      "Waiting for quota · 300 ppm above linear",
+    );
+  });
+});
+
 describe("workingIndicatorLabel", () => {
   it("shows the plain Working label at the first tick", () => {
     expect(workingIndicatorLabel(0)).toBe("Working…");

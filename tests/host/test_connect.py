@@ -345,6 +345,7 @@ def _make_host_process() -> HostProcess:
     return HostProcess(
         identity=identity,
         server_url="http://localhost:8000",
+        require_quota_route=False,
     )
 
 
@@ -383,6 +384,8 @@ async def test_handle_launch_spawns_subprocess(
         request_id="req_001",
         binding_token="test_token_abc",
         workspace=str(workspace),
+        quota_route="personal-llmq",
+        project_enum="chatgpt-playground",
     )
 
     spawned_env: dict[str, str] = {}
@@ -427,6 +430,8 @@ async def test_handle_launch_spawns_subprocess(
     assert spawned_env.get("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN") == "test_token_abc"
     assert spawned_env.get(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR) == "host-bootstrap-bearer"
     assert spawned_env.get("OMNIGENT_RUNNER_WORKSPACE") == str(workspace)
+    assert spawned_env.get("OMNIGENT_PROJECT_ENUM") == "chatgpt-playground"
+    assert spawned_env.get("OMNIGENT_QUOTA_ROUTE") == "personal-llmq"
 
     # Runners must get a clean /dev/null stdin, not the daemon's inherited fd:
     # a long-lived (e.g. nohup'd) daemon can end up with a closed/recycled
@@ -447,6 +452,29 @@ async def test_handle_launch_spawns_subprocess(
 
     # Clean up the spawned sleep process (and its exit watcher).
     _cleanup_host(host)
+
+
+async def test_handle_launch_refuses_missing_route_classification(
+    tmp_path: Path,
+) -> None:
+    """A downgraded or stripped launch frame cannot bypass quota attribution."""
+    host = _make_host_process()
+    host._require_quota_route = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_missing_project",
+        binding_token="test_token_abc",
+        workspace=str(workspace),
+        harness="claude-sdk",
+    )
+
+    with patch("omnigent.host.connect.subprocess.Popen") as popen:
+        result = await host._handle_launch(frame)
+
+    assert result.status == "failed"
+    assert result.error_code == "project_attribution_required"
+    popen.assert_not_called()
 
 
 async def test_handle_launch_fails_for_bad_workspace() -> None:

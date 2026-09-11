@@ -40,6 +40,10 @@ from omnigent.host.frames import (
     encode_host_frame,
     optional_str_bool_map,
 )
+from omnigent.host.project_attribution import (
+    ProjectAttributionError,
+    resolve_launch_attribution,
+)
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
     ui_install_key,
@@ -60,6 +64,7 @@ from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
@@ -554,6 +559,7 @@ def create_hosts_router(
     permission_store: PermissionStore | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    project_store: ProjectStore | None = None,
     feature_flags: FeatureFlags | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
@@ -575,6 +581,9 @@ def create_hosts_router(
         :func:`omnigent.server.app.create_app` always supplies it.
     :param agent_cache: Agent-spec cache used to read the agent's
         ``os_env.cwd`` boundary. Paired with ``agent_store``.
+    :param project_store: Authoritative store used to classify every launch's
+        personal-LLMQ/work-Vertex route before a frame is sent. Production
+        supplies it.
     :param feature_flags: Immutable deployment release-feature snapshot.
         When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
     :returns: A FastAPI router with host endpoints.
@@ -919,6 +928,23 @@ def create_hosts_router(
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             await _rollback_worktree()
 
+        # Resolve trusted classification before mutating the session binding.
+        harness: str | None = None
+        if agent_store is not None and agent_cache is not None:
+            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
+        launch_attribution = None
+        if project_store is not None:
+            try:
+                launch_attribution = await asyncio.to_thread(
+                    resolve_launch_attribution,
+                    target.conv,
+                    harness=harness,
+                    project_store=project_store,
+                )
+            except ProjectAttributionError as exc:
+                await _rollback_worktree()
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
 
@@ -954,13 +980,6 @@ def create_hosts_router(
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
 
-        # Resolve the agent's harness so the host can refuse an
-        # unconfigured one before spawning (mirrors POST /v1/sessions).
-        # None — no agent cache wired, or no resolvable agent — skips
-        # the host-side check.
-        harness: str | None = None
-        if agent_store is not None and agent_cache is not None:
-            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -968,6 +987,8 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                quota_route=launch_attribution.quota_route if launch_attribution else None,
+                project_enum=launch_attribution.project_enum if launch_attribution else None,
             )
         )
         try:

@@ -179,6 +179,8 @@ async def post_external_session_status(
     background_task_count: int | None = None,
     background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
+    blocked_on: str | None = None,
+    quota_wait: dict[str, object] | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -219,6 +221,10 @@ async def post_external_session_status(
         data["background_tasks"] = background_tasks
     if response_id is not None:
         data["response_id"] = response_id
+    if blocked_on is not None:
+        data["blocked_on"] = blocked_on
+    if quota_wait is not None:
+        data["quota_wait"] = quota_wait
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

@@ -157,6 +157,18 @@ async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClien
     assert fetched["config"] == cfg
 
 
+async def test_create_rejects_client_owned_route_classification(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Public callers cannot mint personal/work launch authorization."""
+    resp = await project_client.post(
+        "/v1/projects",
+        json={"name": "tamper-route", "config": {"quota_route": "personal-llmq"}},
+    )
+    assert resp.status_code == 400
+    assert "server-owned" in resp.json()["error"]["message"]
+
+
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
     """PATCH with a new config replaces the stored one and stamps updated_at."""
     created = (
@@ -191,6 +203,41 @@ async def test_patch_empty_config_clears_it(project_client: httpx.AsyncClient) -
     ).json()
     resp = await project_client.patch(f"/v1/projects/{created['id']}", json={"config": {}})
     assert resp.json()["config"] == {}
+
+
+async def test_patch_preserves_and_cannot_override_server_owned_routing(
+    project_app: FastAPI,
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Client config replacement cannot erase or forge authoritative routing."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    store = project_app.state.project_store
+    store.update(
+        created["id"],
+        user_id=None,
+        config={
+            "quota_route": "personal-llmq",
+            "host_id": "old",
+        },
+    )
+
+    replaced = await project_client.patch(
+        f"/v1/projects/{created['id']}",
+        json={"config": {"host_id": "new"}},
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["config"] == {
+        "quota_route": "personal-llmq",
+        "host_id": "new",
+    }
+
+    tampered = await project_client.patch(
+        f"/v1/projects/{created['id']}",
+        json={"config": {"quota_route": "work-vertex"}},
+    )
+    assert tampered.status_code == 400
+    fetched = await project_client.get(f"/v1/projects/{created['id']}")
+    assert fetched.json()["config"]["quota_route"] == "personal-llmq"
 
 
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:

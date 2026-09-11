@@ -33,7 +33,12 @@ if TYPE_CHECKING:
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.codex_model_vocabulary import codex_spawn_model
-from omnigent.codex_native_bridge import write_policy_hook_config
+from omnigent.codex_native_bridge import (
+    CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    CodexLaunchRole,
+    codex_launch_env,
+    write_policy_hook_config,
+)
 from omnigent.codex_native_process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
@@ -75,7 +80,10 @@ CodexParams: TypeAlias = _JsonObject
 CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
-_CONNECT_TIMEOUT_SECONDS = 10.0
+# A managed quota overlay validates and trusts its command hooks with two
+# short-lived metadata app-servers before execing the real server. Leave room
+# for that reviewed startup path under load without weakening turn deadlines.
+_CONNECT_TIMEOUT_SECONDS = 45.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
@@ -762,7 +770,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
         codex_home.mkdir(mode=0o700)
         port = _allocate_loopback_port()
         listen_url = f"ws://127.0.0.1:{port}"
-        env = _clean_codex_env()
+        env = codex_launch_env(_clean_codex_env(), role=CodexLaunchRole.MODEL_DISCOVERY)
         for name in tuple(env):
             if name.startswith("OPENAI_") or name in {
                 "DATABRICKS_BEARER",
@@ -952,7 +960,7 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
         raise ImportError("Native Codex model probing requires the 'codex' CLI on PATH.")
     config_overrides = list(launch.config_overrides)
     pinned_model = launch.model
-    env = _clean_codex_env()
+    env = codex_launch_env(_clean_codex_env(), role=CodexLaunchRole.MODEL_DISCOVERY)
     if launch.profile is not None:
         databricks = await asyncio.to_thread(
             _databricks_launch_materialization, model=launch.model, profile=launch.profile
@@ -1106,6 +1114,8 @@ class CodexNativeAppServer:
         ``Path("~/.omnigent/codex-native/<hash>")``. The policy hook
         subprocess is pointed at it via ``--bridge-dir`` and reads the
         session id + Omnigent coordinates from it.
+    :param request_session_id: Serving session identity supplied explicitly by
+        the caller that owns the session.
     :param ap_server_url: Omnigent server base URL the policy hook POSTs tool
         calls to, e.g. ``"http://127.0.0.1:8787"``. ``None`` registers
         and trusts the hook but writes no Omnigent coordinates, so the hook
@@ -1153,6 +1163,7 @@ class CodexNativeAppServer:
     config_overrides: list[str]
     cwd: Path
     bridge_dir: Path
+    request_session_id: str
     developer_instructions: str | None = None
     ap_server_url: str | None = None
     ap_auth_headers: dict[str, str] | None = None
@@ -1177,6 +1188,11 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        explicit_env = {
+            **self.env,
+            CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR: self.request_session_id,
+        }
+        serving_env = codex_launch_env(explicit_env, role=CodexLaunchRole.SESSION_SERVING)
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -1202,7 +1218,7 @@ class CodexNativeAppServer:
         # than symlinked over. The runner advertises it for auto-harness Smart
         # Routing sessions only, so its presence is also this session class's
         # signature — see ``ensure_session_router_quietly``.
-        router_bridge_dir = codex_router_bridge_dir(self.env)
+        router_bridge_dir = codex_router_bridge_dir(serving_env)
         if router_bridge_dir is not None:
             # A CLI too old for the spawn gate gets no routing hooks at all, so
             # routing no-ops instead of blocking the launch. Everything keyed
@@ -1233,7 +1249,7 @@ class CodexNativeAppServer:
             self.codex_home,
             config_source,
             inject_hooks=self.router_hooks_registered,
-            extend_model_catalog=codex_extended_catalog_requested(self.env),
+            extend_model_catalog=codex_extended_catalog_requested(serving_env),
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
@@ -1280,7 +1296,7 @@ class CodexNativeAppServer:
                 self.bridge_dir,
                 self.python_executable,
                 router_bridge_dir=router_bridge_dir,
-                router_session_id=codex_router_session_id(self.env),
+                router_session_id=codex_router_session_id(serving_env),
                 user_hooks_source=config_source / _CODEX_HOOKS_FILE,
                 # The runner only advertises a route-turn endpoint for a
                 # session that launched with Smart Routing on, so its presence
@@ -1306,7 +1322,7 @@ class CodexNativeAppServer:
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
         )
-        proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
+        proc_env = {**serving_env, "CODEX_HOME": str(self.codex_home)}
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
             self.proc = await asyncio.create_subprocess_exec(
@@ -2243,6 +2259,7 @@ def build_codex_native_server(
     model: str | None,
     profile: str | None,
     bridge_dir: Path,
+    request_session_id: str,
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     python_executable: str | None = None,
@@ -2264,6 +2281,8 @@ def build_codex_native_server(
         ``"<your-profile>"``.
     :param bridge_dir: Native Codex bridge directory; the policy hook is
         pointed at it and reads the session id + Omnigent coordinates from it.
+    :param request_session_id: Exact session identity owned by the serving
+        caller. Ambient request or runner-primary identity is never used.
     :param ap_server_url: Omnigent server base URL the policy hook POSTs tool
         calls to, e.g. ``"http://127.0.0.1:8787"``. ``None`` registers
         the hook but writes no Omnigent coordinates (hook no-ops).
@@ -2309,6 +2328,8 @@ def build_codex_native_server(
             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
         )
     env = _clean_codex_env()
+    env[CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR] = request_session_id
+    env = codex_launch_env(env, role=CodexLaunchRole.SESSION_SERVING)
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
@@ -2352,6 +2373,7 @@ def build_codex_native_server(
         config_overrides=config_overrides,
         cwd=cwd,
         bridge_dir=bridge_dir,
+        request_session_id=request_session_id,
         developer_instructions=developer_instructions,
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,

@@ -5,7 +5,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -1801,6 +1801,48 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
+
+  it.each(["/c/conv_abc", "/settings"])(
+    "handles a docked-to-mobile sidebar transition on %s",
+    (path) => {
+      const desktop = Object.assign(new EventTarget(), { matches: true });
+      const originalMatchMedia = window.matchMedia;
+      const matchMediaSpy = vi
+        .spyOn(window, "matchMedia")
+        .mockImplementation((query) =>
+          query === "(min-width: 768px)"
+            ? (desktop as unknown as MediaQueryList)
+            : originalMatchMedia(query),
+        );
+      const resize = (matches: boolean) => {
+        desktop.matches = matches;
+        act(() => desktop.dispatchEvent(Object.assign(new Event("change"), { matches })));
+      };
+      try {
+        mockConversations([{ id: "conv_abc", permission_level: null }]);
+        const view = renderShell(path);
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+        resize(false);
+        if (path === "/settings") {
+          expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+        } else {
+          expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+          expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "false");
+          fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+          expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+          resize(true);
+          expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+          resize(false);
+          expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+        }
+        view.unmount();
+        resize(true);
+      } finally {
+        cleanup();
+        matchMediaSpy.mockRestore();
+      }
+    },
+  );
 
   it("pins the sidebar open on /settings so the Back row is reachable", () => {
     // The settings nav replaces the session list INSIDE the sidebar, and its

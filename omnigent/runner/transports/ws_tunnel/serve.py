@@ -227,11 +227,13 @@ async def dispatch_via_asgi(
                 # content-type header — utf-8 for text-shaped, base64
                 # otherwise (binary file downloads).
                 content_type = "application/octet-stream"
+                content_encoding = "identity"
                 for k, v in response_headers_raw:
                     if k.lower() == b"content-type":
                         content_type = v.decode("latin-1", errors="replace")
-                        break
-                body_str, encoding = encode_body(chunk, content_type)
+                    elif k.lower() == b"content-encoding":
+                        content_encoding = v.decode("latin-1")
+                body_str, encoding = encode_body(chunk, content_type, content_encoding)
                 await send_text(
                     encode_frame(
                         ResponseBodyFrame(

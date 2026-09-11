@@ -30,6 +30,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
+from omnigent.host.project_attribution import PROJECT_ATTRIBUTION_ERROR_CODE
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -204,6 +205,7 @@ from omnigent.server.schemas import (
     ElicitationRequestParams,
     ErrorDetail,
     McpServerStartup,
+    QuotaWaitInfo,
     SessionEventInput,
 )
 from omnigent.session_lifecycle import (
@@ -822,6 +824,7 @@ def register_events_routes(
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        project_store=getattr(_app_state, "project_store", None),
                     )
                     # A structured refusal (harness not configured / workspace
                     # missing) leaves no runner to compact against — treat as
@@ -1218,6 +1221,15 @@ def register_events_routes(
             blocked_on = (
                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
             )
+            raw_quota_wait = body.data.get("quota_wait")
+            try:
+                quota_wait = (
+                    QuotaWaitInfo.model_validate(raw_quota_wait)
+                    if isinstance(raw_quota_wait, dict)
+                    else None
+                )
+            except ValueError:
+                quota_wait = None
             # A background-task ``waiting`` marks an ended turn, so deliver it
             # as ``idle``: the session takes a new message now, and for a
             # sub-agent the terminal-delivery branch below must fire (otherwise
@@ -1269,6 +1281,7 @@ def register_events_routes(
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
+                quota_wait=quota_wait,
             )
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
@@ -1697,7 +1710,27 @@ def register_events_routes(
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        project_store=getattr(request.app.state, "project_store", None),
                     )
+                    if launch_attempt.error_code == PROJECT_ATTRIBUTION_ERROR_CODE:
+                        item_id = await _persist_native_terminal_failure(
+                            session_id,
+                            conv,
+                            body,
+                            conversation_store,
+                            ErrorData(
+                                source="execution",
+                                code=ErrorCode.PROJECT_ATTRIBUTION_REQUIRED,
+                                message=(
+                                    launch_attempt.error
+                                    or "This personal native session has no trusted project "
+                                    "classification. File it in an allowed project and retry."
+                                ),
+                            ),
+                            runner_router,
+                            created_by=created_by,
+                        )
+                        return {"queued": True, "item_id": item_id}
                     if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                         # The host refused: the agent's harness isn't
                         # configured there. This message was the real

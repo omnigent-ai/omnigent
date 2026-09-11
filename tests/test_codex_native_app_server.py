@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -43,10 +45,11 @@ from omnigent.inner.codex_executor import (
 async def test_discover_codex_model_options_strips_secrets_and_stops_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pre-launch discovery uses an empty home, no credentials, and clean teardown."""
+    """Concurrent discovery is explicit, sessionless, isolated, and cleaned up."""
     from omnigent import codex_native_app_server
 
-    captured_env: dict[str, str] = {}
+    captured_envs: list[dict[str, str]] = []
+    processes: list[_FakeProcess] = []
 
     class _FakeProcess:
         pid = None
@@ -64,8 +67,6 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
             self.returncode = 0 if self.returncode is None else self.returncode
             return self.returncode
 
-    process = _FakeProcess()
-
     async def _fake_start(
         *,
         codex_path: str,
@@ -73,11 +74,13 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
         env: dict[str, str],
         cwd: Path,
     ) -> _FakeProcess:
-        assert codex_path == "/test/codex"
+        assert codex_path in {"/test/codex-a", "/test/codex-b"}
         assert listen_url.startswith("ws://127.0.0.1:")
         assert cwd.is_dir()
         assert Path(env["CODEX_HOME"]).is_dir()
-        captured_env.update(env)
+        captured_envs.append(dict(env))
+        process = _FakeProcess()
+        processes.append(process)
         return process
 
     async def _fake_wait(process: _FakeProcess, port: int) -> None:
@@ -120,6 +123,8 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
         "_clean_codex_env",
         lambda: {
             "PATH": "/bin",
+            "OMNIGENT_RUNNER_PRIMARY_SESSION_ID": "a" * 32,
+            "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID": "b" * 32,
             "OPENAI_API_KEY": "openai-secret",
             "OPENAI_BASE_URL": "https://example.invalid/v1",
             "DATABRICKS_BEARER": "databricks-secret",
@@ -135,11 +140,21 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
     monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
     _model_discovery_cache.clear()
 
-    options = await discover_codex_model_options(codex_path="/test/codex")
+    options = await asyncio.gather(
+        discover_codex_model_options(codex_path="/test/codex-a"),
+        discover_codex_model_options(codex_path="/test/codex-b"),
+    )
 
-    assert options == [{"id": "coding-model", "model": "coding-model", "isDefault": True}]
-    assert captured_env == {"PATH": "/bin", "CODEX_HOME": captured_env["CODEX_HOME"]}
-    assert process.terminated is True
+    expected_options = [{"id": "coding-model", "model": "coding-model", "isDefault": True}]
+    assert options == [expected_options, expected_options]
+    assert len(captured_envs) == 2
+    for captured_env in captured_envs:
+        assert captured_env == {
+            "PATH": "/bin",
+            "CODEX_HOME": captured_env["CODEX_HOME"],
+            "OMNIGENT_CODEX_LAUNCH_ROLE": "model-discovery",
+        }
+    assert all(process.terminated for process in processes)
     _model_discovery_cache.clear()
 
 
@@ -415,7 +430,72 @@ def test_build_codex_native_server_profile_error_names_profile(
             bridge_dir=tmp_path / "bridge",
             ap_server_url=None,
             ap_auth_headers={},
+            request_session_id="b" * 32,
         )
+
+
+def test_build_server_uses_explicit_identity_without_ambient_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Factory identity comes from its caller, never the inherited parent."""
+    monkeypatch.setattr("omnigent.codex_native_app_server._find_codex_cli", lambda: "codex")
+    monkeypatch.delenv("HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "a" * 32)
+    request_session_id = "b" * 32
+
+    server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        request_session_id=request_session_id,
+    )
+
+    assert server.env["OMNIGENT_CODEX_LAUNCH_ROLE"] == "session-serving"
+    assert server.env["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"] == request_session_id
+    assert "OMNIGENT_RUNNER_PRIMARY_SESSION_ID" not in server.env
+    assert os.environ["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == "a" * 32
+
+
+async def test_build_servers_keep_simultaneous_session_identities_separate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent factories cannot share hostile ambient session identity."""
+    monkeypatch.setattr("omnigent.codex_native_app_server._find_codex_cli", lambda: "codex")
+    monkeypatch.setenv("HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID", "c" * 32)
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "d" * 32)
+
+    async def _build(request_session_id: str, suffix: str) -> CodexNativeAppServer:
+        return await asyncio.to_thread(
+            build_codex_native_server,
+            socket_path=tmp_path / f"codex-{suffix}.sock",
+            codex_home=tmp_path / f"codex-home-{suffix}",
+            cwd=tmp_path,
+            model=None,
+            profile=None,
+            bridge_dir=tmp_path / f"bridge-{suffix}",
+            request_session_id=request_session_id,
+        )
+
+    session_ids = ("a" * 32, "b" * 32)
+    servers = await asyncio.gather(
+        _build(session_ids[0], "a"),
+        _build(session_ids[1], "b"),
+    )
+
+    assert (
+        tuple(server.env["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"] for server in servers)
+        == session_ids
+    )
+    assert all(
+        server.env["OMNIGENT_CODEX_LAUNCH_ROLE"] == "session-serving"
+        and "OMNIGENT_RUNNER_PRIMARY_SESSION_ID" not in server.env
+        for server in servers
+    )
+    assert os.environ["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"] == "c" * 32
+    assert os.environ["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == "d" * 32
 
 
 def test_build_codex_native_server_uses_profile_host_without_static_token(
@@ -467,6 +547,7 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
         model="test-model",
         profile="oss",
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
     )
@@ -500,6 +581,7 @@ def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
         model=None,
         profile=None,
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
     )
@@ -536,6 +618,7 @@ def test_build_codex_native_server_bypass_emits_full_access_config(
         model=None,
         profile=None,
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
         bypass_sandbox=True,
@@ -594,6 +677,7 @@ def test_build_codex_native_server_pins_profile_resolved_model(
         model=model,
         profile="oss",
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
     )
@@ -656,6 +740,7 @@ def test_launch_argv_and_config_pin_name_the_same_model(
         model=model,
         profile=profile,
         bridge_dir=tmp_path / "bridge",
+        request_session_id="b" * 32,
         ap_server_url=None,
         ap_auth_headers={},
         extra_config_overrides=list(extra_overrides) if extra_overrides else None,
@@ -832,14 +917,17 @@ def _test_app_server(
         signals the session class is read from. ``None`` is a plain session.
     :returns: Configured app-server wrapper.
     """
+    process_env = {"HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID": "f" * 32}
+    process_env.update(env or {})
     return CodexNativeAppServer(
         codex_path=sys.executable,
         socket_path=tmp_path / "codex.sock",
         codex_home=codex_home,
-        env=dict(env or {}),
+        env=process_env,
         config_overrides=[],
         cwd=workspace,
         bridge_dir=bridge_dir,
+        request_session_id=process_env["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"],
         python_executable="/new/python",
     )
 
@@ -952,6 +1040,100 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
         ],
         "tools": _PLAIN_TOOL_APPROVALS,
     }
+
+
+async def test_serving_app_server_routes_with_child_request_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spawned serving process carries its child id, never its parent id."""
+    from omnigent import codex_native_app_server
+
+    class _FakeStderr:
+        async def readline(self) -> bytes:
+            return b""
+
+    class _FakeProcess:
+        pid = 424242
+        returncode: int | None = None
+        stderr = _FakeStderr()
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    captured_env: dict[str, str] = {}
+    process = _FakeProcess()
+
+    async def _fake_spawn(*args: str, **kwargs: Any) -> _FakeProcess:
+        del args
+        captured_env.update(kwargs["env"])
+        return process
+
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    _set_codex_version(monkeypatch, None)
+    monkeypatch.setattr(codex_native_app_server.asyncio, "create_subprocess_exec", _fake_spawn)
+    monkeypatch.setattr(
+        codex_native_app_server, "reconcile_codex_native_process_registry", lambda: None
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "acquire_codex_native_process_owner_lock", lambda: None
+    )
+    monkeypatch.setattr(codex_native_app_server, "_process_group_id", lambda proc: None)
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_terminate_process_tree",
+        lambda proc: setattr(proc, "returncode", 0),
+    )
+
+    child_session_id = "b" * 32
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+        env={
+            "OMNIGENT_RUNNER_PRIMARY_SESSION_ID": "a" * 32,
+            "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID": child_session_id,
+        },
+    )
+
+    await server.start()
+    await server.close()
+
+    assert captured_env["OMNIGENT_CODEX_LAUNCH_ROLE"] == "session-serving"
+    assert captured_env["HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"] == child_session_id
+    assert "OMNIGENT_RUNNER_PRIMARY_SESSION_ID" not in captured_env
+
+
+async def test_serving_app_server_rejects_parent_only_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A serving launch cannot silently attribute a child to its parent."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = CodexNativeAppServer(
+        codex_path=sys.executable,
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        env={"OMNIGENT_RUNNER_PRIMARY_SESSION_ID": "a" * 32},
+        config_overrides=[],
+        cwd=workspace,
+        bridge_dir=tmp_path / "bridge",
+        request_session_id="",
+        python_executable="/new/python",
+    )
+
+    with pytest.raises(ValueError, match="request session identity"):
+        await server.start()
 
 
 # ── The codex-native session classes ────────────────────────────────
@@ -1654,7 +1836,10 @@ async def test_old_codex_with_routing_armed_keeps_user_hooks(
     _set_codex_version(monkeypatch, (0, 128, 0))
 
     server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
-    server.env = {CODEX_ROUTER_DIR_ENV_VAR: str(router_dir)}
+    server.env = {
+        CODEX_ROUTER_DIR_ENV_VAR: str(router_dir),
+        "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID": "f" * 32,
+    }
     await server.start()
     try:
         hooks_path = codex_home / "hooks.json"
@@ -2185,7 +2370,15 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
             host="https://ws.example",
         ),
     )
-    monkeypatch.setattr(codex_native_app_server, "_clean_codex_env", lambda: {"PATH": "/bin"})
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_clean_codex_env",
+        lambda: {
+            "PATH": "/bin",
+            "OMNIGENT_RUNNER_PRIMARY_SESSION_ID": "a" * 32,
+            "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID": "b" * 32,
+        },
+    )
 
     captured: dict[str, object] = {}
 
@@ -2263,6 +2456,9 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["DATABRICKS_HOST"] == "https://ws.example"
+    assert env["OMNIGENT_CODEX_LAUNCH_ROLE"] == "model-discovery"
+    assert "OMNIGENT_RUNNER_PRIMARY_SESSION_ID" not in env
+    assert "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID" not in env
     # Persistent probe home under the omnigent cache, not a fresh temp dir.
     assert str(tmp_path / ".omnigent" / "cache" / "codex-model-probe") in env["CODEX_HOME"]
     assert Path(env["CODEX_HOME"]).is_dir()

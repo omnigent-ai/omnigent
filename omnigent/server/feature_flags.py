@@ -22,6 +22,7 @@ class Feature(StrEnum):
 
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    DOCLOOP_NOTEBOOK = "docloop_notebook"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,12 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.DOCLOOP_NOTEBOOK,
+        description="Edit a Docloop session's notebook beside native chat",
+        owner="harnesses",
+        review_by_release="0.13.0",
+    ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
         description="Web Usage page with cost timeline and breakdowns",

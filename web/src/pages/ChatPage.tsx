@@ -111,6 +111,7 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
+import type { QuotaWaitInfo } from "@/lib/events";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   composerAttachmentKey,
@@ -3125,7 +3126,40 @@ function useAgentTurnActive(): boolean {
  * `WORKING_MESSAGES` by wall-clock `tick`. Background-task counts belong to
  * `BackgroundTaskPill`, not this shimmer.
  */
-export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
+export function quotaWaitLabel(quota: QuotaWaitInfo): string {
+  const parts = [
+    quota.admissionDelaySeconds !== undefined
+      ? `Waiting ${quota.admissionDelaySeconds.toFixed(1)}s for quota`
+      : "Waiting for quota",
+  ];
+  if (quota.currentRatePpmPerSecond !== undefined) {
+    parts.push(
+      `${(quota.currentRatePpmPerSecond * 0.36).toFixed(2)}%/h ` +
+        `(${quota.currentRatePpmPerSecond.toFixed(2)} ppm/s)`,
+    );
+  }
+  if (quota.burstMultiplier !== undefined) {
+    parts.push(`${quota.burstMultiplier.toFixed(2)}× burst`);
+  }
+  if (quota.linearScheduleDeltaPpm !== undefined) {
+    const delta = quota.linearScheduleDeltaPpm;
+    parts.push(
+      delta === 0
+        ? "on linear schedule"
+        : `${Math.abs(delta).toLocaleString()} ppm ${delta > 0 ? "above" : "below"} linear`,
+    );
+  }
+  return parts.join(" · ");
+}
+
+export function workingIndicatorLabel(
+  tick = 0,
+  blockedOn: string | null = null,
+  quotaWait: QuotaWaitInfo | null = null,
+): string {
+  if (quotaWait) {
+    return quotaWaitLabel(quotaWait);
+  }
   if (blockedOn) {
     return `Blocked on: ${blockedOn}`;
   }
@@ -3135,13 +3169,14 @@ export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null)
 function WorkingIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const blockedOn = useChatStore((s) => s.blockedOn);
+  const quotaWait = useChatStore((s) => s.quotaWait);
   const agentWorking = useAgentTurnActive();
   const tick = useWorkingLabelTick();
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
   // the state and the shimmer stays off (it would misread as the agent still
   // thinking). While the turn is active the shimmer shows, with the pill beside it.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
-  const label = workingIndicatorLabel(tick, blockedOn);
+  const label = workingIndicatorLabel(tick, blockedOn, quotaWait);
   return (
     <>
       {/* Sole aria-live region for the working state. A stable "Working…" (not
@@ -3149,7 +3184,7 @@ function WorkingIndicator() {
           re-announcing every few seconds; the visible shimmer below stays
           aria-hidden. */}
       <span role="status" aria-live="polite" className="sr-only">
-        Working…
+        {quotaWait ? label : "Working…"}
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>

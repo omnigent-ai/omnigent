@@ -29,6 +29,16 @@ import {
 // not a real actor, so never used as an author label.
 const RESERVED_USER_LOCAL = "local";
 
+/** Probe the same cookie/proxy identity an iframe or native WebSocket will use. */
+export function fetchWithBrowserSession(path: string, signal?: AbortSignal): Promise<Response> {
+  if (getOmnigentHostConfig().fetcher) {
+    throw new Error(
+      "Open this session directly in Omnigent to use JupyterLab. Source and Chat are available here.",
+    );
+  }
+  return hostFetch(path, { signal, credentials: "same-origin", cache: "no-store" });
+}
+
 let currentUserId: string | null = null;
 
 // Replica-routing header, used when the server shards replicas by host. A

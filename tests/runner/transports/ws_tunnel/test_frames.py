@@ -279,8 +279,26 @@ def test_encode_body_picks_utf8_for_text() -> None:
 def test_encode_body_picks_base64_for_binary() -> None:
     body, encoding = encode_body(b"\x89PNG", "image/png")
     assert encoding == "base64"
-    # decode_body round-trips back to the same bytes.
     assert decode_body(body, encoding) == b"\x89PNG"
+
+
+@pytest.mark.parametrize(
+    "content_type", ["text/html", "application/javascript", "application/json"]
+)
+def test_compressed_text_round_trip(content_type: str) -> None:
+    import gzip
+
+    raw = gzip.compress("Jupyter notebook: αβγ".encode())
+    body, encoding = encode_body(raw, content_type, "gzip")
+    assert encoding == "base64"
+    assert decode_body(body, encoding) == raw
+
+
+def test_utf8_character_split_between_frames_is_lossless() -> None:
+    raw = "output: 🍋 complete".encode()
+    for boundary in range(len(raw) + 1):
+        chunks = [raw[:boundary], raw[boundary:]]
+        assert b"".join(decode_body(*encode_body(chunk, "text/plain")) for chunk in chunks) == raw
 
 
 def test_decode_body_round_trips_both_encodings() -> None:

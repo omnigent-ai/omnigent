@@ -518,6 +518,59 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
 
 
 @pytest.mark.asyncio
+async def test_teardown_all_opencode_native_servers_closes_every_session() -> None:
+    """Runner shutdown closes every registered ``opencode serve`` child."""
+    session_ids = [
+        "dddd3333dddd3333dddd3333dddd3333",
+        "eeee4444eeee4444eeee4444eeee4444",
+    ]
+    runs = [_ForwarderRun() for _ in session_ids]
+    closed: list[str] = []
+
+    def _make_parked(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    class _FakeServer:
+        def __init__(self, session_id: str) -> None:
+            self._session_id = session_id
+
+        async def close(self) -> None:
+            closed.append(self._session_id)
+
+    try:
+        for session_id, run in zip(session_ids, runs, strict=True):
+            task = asyncio.create_task(_make_parked(run)())
+            runner_app_mod._register_auto_forwarder_task(session_id, task)
+            runner_app_mod._AUTO_OPENCODE_SERVERS[session_id] = _FakeServer(session_id)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_all_opencode_native_servers()
+
+        assert sorted(closed) == sorted(session_ids)
+        assert all(
+            session_id not in runner_app_mod._AUTO_OPENCODE_SERVERS for session_id in session_ids
+        )
+        assert all(
+            session_id not in runner_app_mod._AUTO_FORWARDER_TASKS for session_id in session_ids
+        )
+        assert all(run.cancelled for run in runs)
+        await runner_app_mod.teardown_all_opencode_native_servers()
+    finally:
+        for session_id in session_ids:
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+            runner_app_mod._AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
 async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stale_evict() -> None:
     """
     Re-registration cancels the incumbent; its done-callback can't evict the successor.
