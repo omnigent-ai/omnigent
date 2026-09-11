@@ -1523,6 +1523,24 @@ describe("Composer shared visible controls", () => {
     vi.restoreAllMocks();
   });
 
+  it.each([
+    ["Session workspace", 0],
+    ["Session worktree", 1],
+  ])("wraps text inside the %s popover", (label, triggerIndex) => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const controls = screen.getByTestId("composer-workspace-controls");
+    fireEvent.keyDown(within(controls).getAllByRole("button")[triggerIndex], {
+      key: "ArrowDown",
+    });
+
+    const popover = screen.getByRole("menu");
+    expect(within(popover).getByText(label)).toBeVisible();
+    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,24rem)]");
+    expect(popover).not.toHaveClass("whitespace-nowrap");
+    expect(popover.querySelector("p")).toHaveClass("break-all");
+  });
+
   it("renders the same workspace, host, permission and model controls as landing", () => {
     useChatStore.setState({
       conversationId: "shared-controls",

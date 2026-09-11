@@ -3486,7 +3486,11 @@ function ComposerImpl({
                 title={composerWorkspace ?? "No workspace bound"}
               />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" side="top" className="max-w-[min(90vw,24rem)]">
+            <DropdownMenuContent
+              align="start"
+              side="top"
+              className="max-w-[min(90vw,24rem)] whitespace-normal"
+            >
               <DropdownMenuLabel>Session workspace</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
                 {composerWorkspace ?? "This session has no workspace binding."}
@@ -3504,7 +3508,11 @@ function ComposerImpl({
                 data-testid="composer-git-branch"
               />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" side="top" className="max-w-[min(90vw,24rem)]">
+            <DropdownMenuContent
+              align="start"
+              side="top"
+              className="max-w-[min(90vw,24rem)] whitespace-normal"
+            >
               <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
                 {composerBranch || "The runner has not reported a branch for this session."}
