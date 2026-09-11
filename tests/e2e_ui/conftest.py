@@ -571,7 +571,9 @@ def configure_mock_llm(
         ``error``, ``status_code``, ``delay``, ``truncate_after``
         (emit only N SSE events then end the stream, dropping the
         completion event — a mid-stream fault for exercising the SPA's
-        stream error/recovery UI).
+        stream error/recovery UI), ``stop_reason`` (override the terminal
+        Anthropic ``stop_reason``, e.g. ``"max_tokens"`` to script a
+        response that hit the model's output-token limit).
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
