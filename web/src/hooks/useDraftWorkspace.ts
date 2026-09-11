@@ -260,13 +260,18 @@ export async function fetchDraftTerminals(
 export async function createDraftTerminal(
   hostId: string,
   contextId: string,
+  sessionId: string | null,
 ): Promise<DraftTerminalInfo> {
   const response = await authenticatedFetch(
     `${contextBasePath(hostId, contextId)}/resources/terminals`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ terminal: "bash", session_key: `draft-${randomUUID()}` }),
+      body: JSON.stringify({
+        terminal: "bash",
+        session_key: `draft-${randomUUID()}`,
+        session_id: sessionId,
+      }),
     },
   );
   if (!response.ok) throw httpError("draft terminal create failed", response);
@@ -422,6 +427,13 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
     (next: DraftWorkspaceContext) => {
       if (activeStorageKeyRef.current !== storageKey) return false;
       if (tombstonesRef.current.has(next.id)) return false;
+      const current = contextsRef.current.find((row) => row.id === next.id);
+      const persisted = readPersistedContexts(storageKey).find((row) => row.id === next.id);
+      if (
+        (current?.session_id != null && current.session_id !== next.session_id) ||
+        (persisted?.sessionId != null && persisted.sessionId !== next.session_id)
+      )
+        return false;
       const updated = [...contextsRef.current.filter((row) => row.id !== next.id), next];
       contextsRef.current = updated;
       contextRef.current =
@@ -496,7 +508,7 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
         if (generation !== transitionGenerationRef.current) {
           throw new Error("Draft workspace selection changed");
         }
-        const active = contextsRef.current.find((row) => row.session_id === null) ?? null;
+        let active = contextsRef.current.find((row) => row.session_id === null) ?? null;
         if (active && contextMatchesTarget(active, hostId, workspace)) return active;
 
         const persisted = readPersistedContexts(storageKey).find(
@@ -509,7 +521,8 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
               throw new Error("Draft workspace selection changed");
             }
             if (!upsertContext(restored)) throw new Error("Draft workspace selection changed");
-            return restored;
+            if (restored.session_id === null) return restored;
+            if (active?.id === restored.id) active = null;
           } catch (restoreError) {
             if (restoreError instanceof DraftWorkspaceHttpError && restoreError.status === 404) {
               forgetContext(storageKey, persisted.id);
@@ -605,30 +618,59 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
 
   const createTerminal = useCallback(
     async (targetContext?: DraftWorkspaceContext): Promise<DraftTerminalInfo> => {
-      const active = targetContext ?? contextRef.current;
+      let active = targetContext ?? contextRef.current;
       if (active === null) throw noActiveContextError();
       const operationStorageKey = activeStorageKeyRef.current;
+      const operationSessionId = sessionIdRef.current ?? null;
+      const operationGeneration = transitionGenerationRef.current;
+      let completionGeneration = operationGeneration;
       const operationId = randomUUID();
       setPendingTerminalCreates((current) => new Set(current).add(operationId));
       try {
-        const terminal = await createDraftTerminal(active.hostId, active.id);
+        let terminal: DraftTerminalInfo;
+        try {
+          terminal = await createDraftTerminal(active.hostId, active.id, operationSessionId);
+        } catch (cause) {
+          if (
+            !(cause instanceof DraftWorkspaceHttpError) ||
+            cause.status !== 409 ||
+            operationSessionId !== null
+          )
+            throw cause;
+          const refreshed = await heartbeatDraftWorkspaceContext(active);
+          if (refreshed.session_id === null) throw cause;
+          if (
+            activeStorageKeyRef.current !== operationStorageKey ||
+            (sessionIdRef.current ?? null) !== operationSessionId ||
+            transitionGenerationRef.current !== operationGeneration ||
+            !upsertContext(refreshed)
+          )
+            throw new Error("Draft workspace selection changed", { cause });
+          const freshContext = ensureContext(active.hostId, active.workspace);
+          completionGeneration = transitionGenerationRef.current;
+          active = await freshContext;
+          terminal = await createDraftTerminal(active.hostId, active.id, null);
+        }
         if (
           activeStorageKeyRef.current !== operationStorageKey ||
+          (sessionIdRef.current ?? null) !== operationSessionId ||
+          transitionGenerationRef.current !== completionGeneration ||
           tombstonesRef.current.has(active.id)
         ) {
           await deleteDraftTerminal(active.hostId, active.id, terminal.id).catch(() => undefined);
-          await discardDraftWorkspaceContext(active.hostId, active.id).catch(() => undefined);
+          await discardContext(active).catch(() => undefined);
           throw new Error("Draft workspace selection changed");
         }
         terminalMutationGenerationRef.current.set(
           active.id,
           (terminalMutationGenerationRef.current.get(active.id) ?? 0) + 1,
         );
+        const activeId = active.id;
         setTerminalsByContext((current) => {
-          const terminals = current[active.id] ?? [];
+          const terminals = current[activeId] ?? [];
           return terminals.some((row) => row.id === terminal.id)
             ? current
-            : { ...current, [active.id]: [...terminals, terminal] };
+            : { ...current, [activeId]: [...terminals, terminal] };
         });
         setError(null);
         return terminal;
@@ -641,7 +683,7 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
         });
       }
     },
-    [],
+    [discardContext, ensureContext, upsertContext],
   );
 
   const deleteTerminal = useCallback(
@@ -736,10 +778,6 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
         rows.map(async (row) => {
           try {
             const refreshed = await heartbeatDraftWorkspaceContext(restoredContext(row));
-            // A handoff may complete while this request is in flight. Never let
-            // its older ownership snapshot replace the adopted context.
-            const current = contextsRef.current.find((stored) => stored.id === row.id);
-            if (current !== undefined && current.session_id !== row.sessionId) return;
             upsertContext(refreshed);
           } catch (cause) {
             if (cause instanceof DraftWorkspaceHttpError && cause.status === 404) {

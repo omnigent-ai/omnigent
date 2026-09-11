@@ -164,7 +164,7 @@ stop_demo_descendant_tree() {
   if [[ ! "$pid" =~ ^[0-9]+$ ]] || (( pid <= 1 )); then
     return
   fi
-  [[ "$(demo_process_parent "$pid")" == "$parent" ]] || return
+  [[ "$(demo_process_parent "$pid")" == "$parent" ]] || return 0
   children="$(pgrep -P "$pid" 2>/dev/null || true)"
   for child in $children; do
     stop_demo_descendant_tree "$child" "$pid"

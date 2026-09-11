@@ -12,8 +12,10 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
+import type { UseDraftWorkspaceResult } from "@/hooks/useDraftWorkspace";
 import { toast } from "sonner";
 import * as sessionHost from "@/lib/sessionHost";
+import { DraftTerminalSurface } from "@/shell/LandingWorkspacePanel";
 import type { ConnectionState } from "./TerminalSession";
 import {
   TerminalView,
@@ -805,6 +807,66 @@ describe("automatic reconnect", () => {
     expect(terminalSessionMock.instances).toHaveLength(RECONNECT_BACKOFF_MS.length + 1);
     expect(screen.getByText("Bridge closed: code 1006")).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-reconnecting")).toBeNull();
+  });
+
+  it("starts a fresh retry budget when the draft shell identity changes", async () => {
+    const deleteTerminal = vi.fn().mockResolvedValue(undefined);
+    const discard = vi.fn().mockResolvedValue(undefined);
+    const draft = (
+      hostId: string,
+      contextId: string,
+      terminalId: string,
+    ): UseDraftWorkspaceResult => ({
+      context: {
+        id: contextId,
+        hostId,
+        workspace: "/repo",
+        workspaceAliases: ["/repo"],
+        session_id: null,
+        lease_seconds: 600,
+      },
+      terminals: [{ id: terminalId, name: "bash", session: "draft", running: true }],
+      isLoading: false,
+      error: null,
+      ensureContext: vi.fn(),
+      refreshTerminals: vi.fn(),
+      createTerminal: vi.fn(),
+      deleteTerminal,
+      discard,
+      adopt: vi.fn(),
+    });
+    const { rerender } = render(
+      <DraftTerminalSurface
+        draft={draft("host-a", "context-a", "terminal-a")}
+        terminalKey="terminal:terminal-a"
+      />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
+      closeNewest(1006);
+      // oxlint-disable-next-line no-await-in-loop
+      await elapse(delay);
+    }
+    closeNewest(1006);
+    await elapse(60_000);
+    const exhausted = terminalSessionMock.instances.length;
+
+    rerender(
+      <DraftTerminalSurface
+        draft={draft("host-b", "context-b", "terminal-b")}
+        terminalKey="terminal:terminal-b"
+      />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+
+    closeNewest(1006);
+    await elapse(RECONNECT_BACKOFF_MS[0]);
+    expect(terminalSessionMock.instances).toHaveLength(exhausted + 2);
+    expect(deleteTerminal).not.toHaveBeenCalled();
+    expect(discard).not.toHaveBeenCalled();
   });
 
   it("restores the retry budget after a connection that stayed up past the stability window", async () => {

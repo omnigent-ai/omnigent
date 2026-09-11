@@ -173,6 +173,7 @@ export function DraftTerminalSurface({
   return terminal && draft.context ? (
     <Suspense fallback={<div>Connecting shell…</div>}>
       <TerminalView
+        key={JSON.stringify([draft.context.hostId, draft.context.id, terminal.id])}
         terminalId={terminal.id}
         hostId={draft.context.hostId}
         attachPath={buildDraftTerminalAttachPath(

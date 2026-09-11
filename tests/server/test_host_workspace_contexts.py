@@ -165,8 +165,16 @@ def test_create_and_terminal_lifecycle(setup: SimpleNamespace) -> None:
     )
     assert setup.client.post(f"{_CONTEXT}/heartbeat").status_code == 200
     assert setup.client.get(_TERMINALS).json()["data"] == [{"id": "terminal_test"}]
-    response = setup.client.post(_TERMINALS, json={"terminal": "bash", "session_key": "shell-2"})
+    response = setup.client.post(
+        _TERMINALS,
+        json={"terminal": "bash", "session_key": "shell-2", "session_id": None},
+    )
     assert response.json()["session_key"] == "shell-2"
+    assert setup.sent[-1].params == {
+        "terminal": "bash",
+        "session_key": "shell-2",
+        "session_id": None,
+    }
     assert setup.client.delete(f"{_TERMINALS}/terminal_test").status_code == 200
     assert setup.client.delete(_CONTEXT).status_code == 200
     assert not setup.conn.pending_workspace_contexts
@@ -183,8 +191,22 @@ def test_mutating_body_requires_json(setup: SimpleNamespace, suffix: str) -> Non
 
 
 def test_draft_terminal_rejects_agent_harness(setup: SimpleNamespace) -> None:
-    assert setup.client.post(_TERMINALS, json={"terminal": "codex"}).status_code == 422
+    assert (
+        setup.client.post(_TERMINALS, json={"terminal": "codex", "session_id": None}).status_code
+        == 422
+    )
     assert not setup.sent
+
+
+def test_terminal_creation_requires_owner_access_to_expected_session(
+    setup: SimpleNamespace,
+) -> None:
+    response = setup.client.post(
+        _TERMINALS,
+        json={"terminal": "bash", "session_key": "foreign", "session_id": "session-foreign"},
+    )
+    assert response.status_code == 404
+    assert setup.sent == []
 
 
 @pytest.mark.parametrize("level", [0, 1, 2, 3])
@@ -212,6 +234,27 @@ def test_handoff_checks_canonical_workspace_on_host(setup: SimpleNamespace) -> N
     assert setup.context["session_id"] is None
 
 
+def test_adopted_terminal_creation_forwards_expected_session(setup: SimpleNamespace) -> None:
+    assert (
+        setup.client.post(f"{_CONTEXT}/handoff", json={"session_id": "session_test"}).status_code
+        == 200
+    )
+    setup.sent.clear()
+
+    response = setup.client.post(
+        _TERMINALS,
+        json={"terminal": "bash", "session_key": "owned", "session_id": "session_test"},
+    )
+
+    assert response.status_code == 200
+    assert [frame.op for frame in setup.sent] == ["describe", "create_terminal"]
+    assert setup.sent[-1].params == {
+        "terminal": "bash",
+        "session_key": "owned",
+        "session_id": "session_test",
+    }
+
+
 @pytest.mark.parametrize(
     "method,suffix,body",
     [
@@ -219,6 +262,11 @@ def test_handoff_checks_canonical_workspace_on_host(setup: SimpleNamespace) -> N
         ("delete", "", None),
         ("get", "/resources/terminals", None),
         ("post", "/resources/terminals", {"terminal": "bash"}),
+        (
+            "post",
+            "/resources/terminals",
+            {"terminal": "bash", "session_id": "session_test"},
+        ),
         ("delete", "/resources/terminals/terminal_test", None),
     ],
 )
@@ -236,7 +284,8 @@ def test_adopted_context_checks_session_owner_on_every_access(
     setup.sent.clear()
     response = setup.client.request(method, _CONTEXT + suffix, json=body)
     assert response.status_code == 403
-    assert [frame.op for frame in setup.sent] == ["describe"]
+    expected_ops = [] if body and body.get("session_id") is not None else ["describe"]
+    assert [frame.op for frame in setup.sent] == expected_ops
 
 
 @pytest.mark.parametrize("status", [403, 404, 409, 429, 500])

@@ -52,6 +52,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   localStorage.clear();
 });
 
@@ -76,6 +77,183 @@ describe("buildDraftTerminalAttachPath", () => {
 });
 
 describe("useDraftWorkspace", () => {
+  it("acquires a fresh draft for a stale tab while permitting session-owned shell creation", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        { id: "shared", workspace: "/repo", hostId: "host_1", leaseSeconds: 600, sessionId: null },
+      ]),
+    );
+    let sharedSession: string | null = null;
+    const sharedShells = [terminal("original")];
+    const freshShells: ReturnType<typeof terminal>[] = [];
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/shared/heartbeat"))
+        return response(context("shared", "/repo", sharedSession));
+      if (url.endsWith("/shared/handoff")) {
+        sharedSession = "conv_1";
+        return response(context("shared", "/repo", sharedSession));
+      }
+      if (url === "/v1/hosts/host_1/workspace-contexts") return response(context("fresh", "/repo"));
+      if (url.endsWith("/resources/terminals")) {
+        const shared = url.includes("/shared/");
+        const shells = shared ? sharedShells : freshShells;
+        if (init?.method === "POST") {
+          const body = JSON.parse(String(init.body));
+          if (body.session_id !== (shared ? sharedSession : null)) return response({}, 409);
+          shells.push(terminal(shared ? "session_shell" : "draft_shell"));
+          return response(shells.at(-1));
+        }
+        return response({ object: "list", data: [...shells] });
+      }
+      throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+    });
+    const first = renderHook(
+      ({ sessionId }: { sessionId: string | null }) => useDraftWorkspace(sessionId),
+      { initialProps: { sessionId: null as string | null } },
+    );
+    const stale = renderHook(() => useDraftWorkspace(null));
+    await waitFor(() => expect(first.result.current.terminals).toHaveLength(1));
+    await waitFor(() => expect(stale.result.current.terminals).toHaveLength(1));
+    await act(async () => {
+      await first.result.current.adopt("conv_1");
+    });
+    first.rerender({ sessionId: "conv_1" });
+    expect(stale.result.current.context?.session_id).toBeNull();
+
+    await act(async () => {
+      const captured = await stale.result.current.ensureContext("host_1", "/repo");
+      expect((await stale.result.current.createTerminal(captured)).id).toBe("draft_shell");
+    });
+    expect(stale.result.current.context?.id).toBe("fresh");
+    expect(sharedShells.map((shell) => shell.id)).toEqual(["original"]);
+    await act(async () => {
+      expect((await first.result.current.createTerminal()).id).toBe("session_shell");
+    });
+    expect(sharedShells.map((shell) => shell.id)).toEqual(["original", "session_shell"]);
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "shared", sessionId: "conv_1" }),
+        expect.objectContaining({ id: "fresh", sessionId: null }),
+      ]),
+    );
+  });
+
+  it("cleans a retried shell when its initiating view changes before creation completes", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        { id: "shared", workspace: "/repo", hostId: "host_1", leaseSeconds: 600, sessionId: null },
+      ]),
+    );
+    let adopted = false;
+    let resolveCreate!: (value: Response) => void;
+    const creation = new Promise<Response>((resolve) => {
+      resolveCreate = resolve;
+    });
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/shared/heartbeat"))
+        return response(context("shared", "/repo", adopted ? "conv_1" : null));
+      if (url === "/v1/hosts/host_1/workspace-contexts") return response(context("fresh", "/repo"));
+      if (url.endsWith("/resources/terminals")) {
+        if (init?.method !== "POST") return response({ object: "list", data: [] });
+        return url.includes("/shared/") ? response({}, 409) : creation;
+      }
+      if (url.endsWith("/fresh/resources/terminals/late") && init?.method === "DELETE")
+        return response({ deleted: true });
+      if (url.endsWith("/fresh") && init?.method === "DELETE") return response({ deleted: true });
+      throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+    });
+    const { result, rerender } = renderHook(
+      ({ sessionId }: { sessionId: string | null }) => useDraftWorkspace(sessionId),
+      { initialProps: { sessionId: null as string | null } },
+    );
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    adopted = true;
+    let pending!: Promise<unknown>;
+    act(() => {
+      pending = result.current.createTerminal().catch((error: unknown) => error);
+    });
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/v1/hosts/host_1/workspace-contexts/fresh/resources/terminals",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    rerender({ sessionId: "conv_other" });
+    await act(async () => {
+      resolveCreate(response(terminal("late")));
+      expect(await pending).toEqual(new Error("Draft workspace selection changed"));
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/hosts/host_1/workspace-contexts/fresh/resources/terminals/late",
+      { method: "DELETE" },
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith("/v1/hosts/host_1/workspace-contexts/shared", {
+      method: "DELETE",
+    });
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)).toEqual([
+      expect.objectContaining({ id: "shared", sessionId: "conv_1" }),
+    ]);
+  });
+
+  it("reconciles a heartbeat after shared storage records another tab's adoption", async () => {
+    vi.useFakeTimers();
+    const persisted = {
+      id: "shared",
+      workspace: "/repo",
+      hostId: "host_1",
+      leaseSeconds: 600,
+      sessionId: null as string | null,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([persisted]));
+    let sharedSession: string | null = null;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/heartbeat")) return response(context("shared", "/repo", sharedSession));
+      if (url.endsWith("/resources/terminals"))
+        return response({ object: "list", data: [terminal()] });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    const { result } = renderHook(() => useDraftWorkspace(null));
+    await act(async () => {});
+    expect(result.current.context?.session_id).toBeNull();
+    sharedSession = "conv_1";
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([{ ...persisted, sessionId: sharedSession }]));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(result.current.context).toBeNull();
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)[0].sessionId).toBe("conv_1");
+  });
+
+  it("does not overwrite shared adoption with an older heartbeat response", async () => {
+    const persisted = {
+      id: "shared",
+      workspace: "/repo",
+      hostId: "host_1",
+      leaseSeconds: 600,
+      sessionId: null,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([persisted]));
+    let resolveHeartbeat!: (value: Response) => void;
+    const heartbeat = new Promise<Response>((resolve) => {
+      resolveHeartbeat = resolve;
+    });
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/heartbeat")) return heartbeat;
+      if (url.endsWith("/resources/terminals"))
+        return response({ object: "list", data: [terminal()] });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    renderHook(() => useDraftWorkspace(null));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([{ ...persisted, sessionId: "conv_1" }]));
+    await act(async () => {
+      resolveHeartbeat(response(context("shared", "/repo")));
+      await heartbeat;
+    });
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)[0].sessionId).toBe("conv_1");
+  });
+
   it("reconciles stale draft cleanup after another restored tab adopts the shell", async () => {
     localStorage.setItem(
       STORAGE_KEY,

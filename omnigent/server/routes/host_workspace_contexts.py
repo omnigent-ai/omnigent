@@ -48,6 +48,7 @@ class CreateWorkspaceTerminal(BaseModel):
 
     terminal: Literal["bash"] = "bash"
     session_key: str = Field(default="main", pattern=r"^[a-zA-Z0-9_-]{1,80}$")
+    session_id: str | None = Field(default=None, min_length=1)
 
 
 async def _request_context(
@@ -188,7 +189,20 @@ def create_host_workspace_contexts_router(
     async def create_terminal(
         request: Request, host_id: str, context_id: str, body: CreateWorkspaceTerminal
     ) -> dict[str, Any]:
-        return await operation(request, host_id, context_id, "create_terminal", body.model_dump())
+        conn, user_id = await resolve(request, host_id)
+        if body.session_id is not None:
+            await require_access(
+                user_id, body.session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+        await authorize_context(conn, user_id, context_id)
+        return await _request_context(
+            host_registry,
+            conn,
+            user_id,
+            "create_terminal",
+            context_id,
+            body.model_dump(),
+        )
 
     @router.delete("/{context_id}/resources/terminals/{terminal_id}")
     async def delete_terminal(

@@ -702,6 +702,113 @@ async def test_explicit_terminal_and_context_deletion_kill_processes(
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+async def test_terminal_creation_requires_current_context_ownership(tmp_path: Path) -> None:
+    """A stale draft view cannot add a shell after another view adopts its context."""
+
+    manager = WorkspaceContextManager()
+    try:
+        adopted_context_id = str(
+            _ok(await _request(manager, "create", params={"workspace": str(tmp_path)}))["id"]
+        )
+        original = _ok(
+            await _request(
+                manager,
+                "create_terminal",
+                context_id=adopted_context_id,
+                params={"terminal": "bash", "session_key": "original", "session_id": None},
+            )
+        )
+        original_instance = manager.registry.get(adopted_context_id, "bash", "original")
+        assert original_instance is not None
+        original_pid = original_instance.pane_pid_sync()
+        assert original_pid is not None
+
+        _ok(
+            await _request(
+                manager,
+                "handoff",
+                context_id=adopted_context_id,
+                params={"session_id": "session-one", "workspace": str(tmp_path)},
+            )
+        )
+        stale_create = await _request(
+            manager,
+            "create_terminal",
+            context_id=adopted_context_id,
+            params={"terminal": "bash", "session_key": "stale", "session_id": None},
+        )
+        assert (stale_create.status, stale_create.error_status) == ("error", 409)
+        assert manager.registry.get(adopted_context_id, "bash", "original") is original_instance
+        assert manager.registry.get(adopted_context_id, "bash", "stale") is None
+        assert await original_instance.is_alive()
+        wrong_session_create = await _request(
+            manager,
+            "create_terminal",
+            context_id=adopted_context_id,
+            params={
+                "terminal": "bash",
+                "session_key": "wrong-session",
+                "session_id": "session-two",
+            },
+        )
+        assert (wrong_session_create.status, wrong_session_create.error_status) == ("error", 409)
+        assert manager.registry.get(adopted_context_id, "bash", "wrong-session") is None
+
+        session_terminal = _ok(
+            await _request(
+                manager,
+                "create_terminal",
+                context_id=adopted_context_id,
+                params={
+                    "terminal": "bash",
+                    "session_key": "session-shell",
+                    "session_id": "session-one",
+                },
+            )
+        )
+        assert session_terminal["session_id"] == "session-one"
+
+        draft_context_id = str(
+            _ok(await _request(manager, "create", params={"workspace": str(tmp_path)}))["id"]
+        )
+        assert draft_context_id != adopted_context_id
+        draft_terminal = _ok(
+            await _request(
+                manager,
+                "create_terminal",
+                context_id=draft_context_id,
+                params={"terminal": "bash", "session_key": "new-draft", "session_id": None},
+            )
+        )
+        draft_instance = manager.registry.get(draft_context_id, "bash", "new-draft")
+        assert draft_instance is not None
+        draft_pid = draft_instance.pane_pid_sync()
+        assert draft_pid is not None
+        assert draft_pid != original_pid
+        assert draft_terminal["workspace_context_id"] == draft_context_id
+
+        _ok(
+            await _request(
+                manager,
+                "delete_terminal",
+                context_id=adopted_context_id,
+                params={"terminal_id": session_terminal["id"]},
+            )
+        )
+        _ok(
+            await _request(
+                manager,
+                "delete_terminal",
+                context_id=adopted_context_id,
+                params={"terminal_id": original["id"]},
+            )
+        )
+        _ok(await _request(manager, "delete", context_id=draft_context_id))
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 async def test_stale_view_cannot_delete_context_after_other_view_handoff(
     tmp_path: Path,
 ) -> None:

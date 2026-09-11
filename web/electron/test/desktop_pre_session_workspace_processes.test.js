@@ -249,6 +249,107 @@ describe("desktop pre-session demo processes", { skip: process.platform === "win
     assert.equal(fs.existsSync(stateFile), false);
   });
 
+  it("continues valid cleanup after a descendant is reparented", { timeout: 5000 }, async () => {
+    const tempRoot = makeTempRoot();
+    const root = demoRoot(tempRoot);
+    const stateFile = path.join(root, "processes.env");
+    const childPidFile = path.join(tempRoot, "child.pid");
+    const completedFile = path.join(tempRoot, "completed");
+    fs.mkdirSync(root, { mode: 0o700 });
+    const parentCode = [
+      "const{spawn}=require('node:child_process')",
+      "const{writeFileSync}=require('node:fs')",
+      "const child=spawn(process.execPath,['-e','setInterval(()=>{},1e3)'])",
+      "writeFileSync(process.env.CHILD_PID_FILE,String(child.pid))",
+      "setInterval(()=>{},1e3)",
+    ].join(";");
+    const idleCode = "setInterval(()=>{},1e3)";
+    const electronPrefix = `${process.execPath} -e ${parentCode} --`;
+    const mockPrefix = `${process.execPath} -e ${idleCode} --`;
+    const parent = spawn(
+      process.execPath,
+      [
+        "-e",
+        parentCode,
+        "--",
+        path.join(REPO_ROOT, "web/electron"),
+        `--user-data-dir=${path.join(root, "electron-profile")}`,
+      ],
+      { env: { ...process.env, CHILD_PID_FILE: childPidFile } },
+    );
+    const mockPort = 43121;
+    const mock = spawn(process.execPath, [
+      "-e",
+      idleCode,
+      "--",
+      path.join(REPO_ROOT, "tests/server/integration/mock_llm_server.py"),
+      String(mockPort),
+    ]);
+    children.push(parent, mock);
+    await Promise.all([once(parent, "spawn"), once(mock, "spawn")]);
+    await waitForPath(childPidFile, Date.now() + 2000);
+    const childPid = Number(fs.readFileSync(childPidFile, "utf8"));
+    childPids.push(childPid);
+    const mockStarted = startToken(mock.pid);
+    fs.writeFileSync(
+      stateFile,
+      [
+        `mock_pid=${mock.pid}`,
+        `mock_port=${mockPort}`,
+        `mock_started=${mockStarted}`,
+        `page_pid=${mock.pid}`,
+        "page_port=43122",
+        `page_started=${mockStarted}`,
+        `omnidev_pid=${mock.pid}`,
+        `omnidev_started=${mockStarted}`,
+        `electron_pid=${parent.pid}`,
+        `electron_started=${startToken(parent.pid)}`,
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    const parentExited = once(parent, "exit");
+    const mockExited = once(mock, "exit");
+
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        [
+          "set -e",
+          'source "$1"',
+          'demo_root="$2"',
+          'repo_root="$3"',
+          'electron="$4"',
+          'python="$5"',
+          'expect="$5"',
+          'load_demo_process_state "$6"',
+          'reparented_pid="$7"',
+          'demo_process_parent() { if [[ "$1" == "$reparented_pid" ]]; then printf "1\\n"; else ps -p "$1" -o ppid= 2>/dev/null | tr -d "[:space:]"; fi; }',
+          "stop_demo_processes",
+          'rm -f "$6"',
+          'printf "done\\n" > "$8"',
+        ].join("; "),
+        "test",
+        PROCESS_HELPER,
+        root,
+        REPO_ROOT,
+        electronPrefix,
+        mockPrefix,
+        stateFile,
+        String(childPid),
+        completedFile,
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    await Promise.all([parentExited, mockExited]);
+    assert.equal(fs.readFileSync(completedFile, "utf8"), "done\n");
+    assert.equal(fs.existsSync(stateFile), false);
+    assert.equal(process.kill(childPid, 0), true);
+  });
+
   it("reports both unavailable services after readiness is exhausted", () => {
     const result = spawnSync(
       "bash",
