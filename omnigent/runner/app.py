@@ -1815,6 +1815,10 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
     return sorted(entries, key=lambda entry: entry.created_at)
 
 
+# Harness whose sub-agents live as threads inside the parent's own app-server.
+_CODEX_NATIVE_HARNESS = "codex-native"
+
+
 def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
     """
     Whether a child's wrapper label marks it a codex-native sub-agent.
@@ -1828,7 +1832,7 @@ def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
     """
     if wrapper_label is None:
         return False
-    agent = native_coding_agent_for_harness("codex-native")
+    agent = native_coding_agent_for_harness(_CODEX_NATIVE_HARNESS)
     return agent is not None and wrapper_label == agent.subagent_wrapper_label
 
 
@@ -7121,8 +7125,12 @@ def create_runner_app(
         # A codex-native sub-agent (a /side side chat, or one codex spawned) is a
         # thread in the parent's own app-server, so its completion is not the
         # parent's to collect — waking the parent would inject an inbox notice
-        # into a chat the user is reading.
-        if is_codex_native_subagent_wrapper(entry.wrapper_label):
+        # into a chat the user is reading. The wrapper label is only set by the
+        # spawn-tool path, so a forwarder-registered child is caught by the
+        # parent's harness instead.
+        if is_codex_native_subagent_wrapper(entry.wrapper_label) or (
+            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
+        ):
             return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
