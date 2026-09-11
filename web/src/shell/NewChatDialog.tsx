@@ -5132,7 +5132,6 @@ export function NewChatLandingScreen() {
       label={worktreeHeader.repositoryLabel}
       aria-label={`Working directory: ${workspaceTrimmed || "Not selected"}`}
       title={workspaceTrimmed || "Working directory not selected"}
-      className="max-w-full"
       data-testid="new-chat-landing-workspace-chip"
     />
   );

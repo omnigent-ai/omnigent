@@ -1536,7 +1536,7 @@ describe("Composer shared visible controls", () => {
 
     const popover = screen.getByRole("menu");
     expect(within(popover).getByText(label)).toBeVisible();
-    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,24rem)]");
+    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,28rem)]");
     expect(popover).not.toHaveClass("whitespace-nowrap");
     expect(popover.querySelector("p")).toHaveClass("break-all");
   });

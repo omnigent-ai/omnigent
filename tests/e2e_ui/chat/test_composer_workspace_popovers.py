@@ -1,4 +1,4 @@
-"""Composer workspace and worktree details wrap without clipping text."""
+"""Composer workspace labels scale and their details wrap without clipping."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ _BRANCH = "feature/" + "long-branch-name-" * 5
 
 
 @pytest.mark.parametrize("viewport_width", [1440, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize("font_size", [13, 18], ids=["default-font", "large-font"])
 @pytest.mark.parametrize("has_binding", [True, False], ids=["long-label", "fallback"])
 @pytest.mark.parametrize("popover", ["workspace", "worktree"])
 def test_composer_details_wrap_without_clipping(
@@ -22,6 +23,7 @@ def test_composer_details_wrap_without_clipping(
     seeded_session: tuple[str, str],
     tmp_path: Path,
     viewport_width: int,
+    font_size: int,
     has_binding: bool,
     popover: str,
 ) -> None:
@@ -39,6 +41,7 @@ def test_composer_details_wrap_without_clipping(
         route.fulfill(response=response, json=snapshot)
 
     page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
+    page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
@@ -56,6 +59,7 @@ def test_composer_details_wrap_without_clipping(
         )
         explanation = "The current session keeps its workspace and worktree."
     expect(menu.locator("p")).to_have_text([detail, explanation])
+    menu.screenshot(path=tmp_path / f"{popover}-{viewport_width}.png", animations="disabled")
 
     dimensions = menu.evaluate(
         """menu => {
@@ -78,6 +82,9 @@ def test_composer_details_wrap_without_clipping(
     )
     assert dimensions["left"] >= 0
     assert dimensions["right"] <= dimensions["viewport"]
+    assert dimensions["right"] - dimensions["left"] <= min(dimensions["viewport"] * 0.9, 448) + 1
+    if has_binding and viewport_width == 1440:
+        assert dimensions["right"] - dimensions["left"] == pytest.approx(448, abs=1)
     assert dimensions["lines"]
     for line in dimensions["lines"]:
         assert line["left"] >= dimensions["left"] - 1
@@ -85,4 +92,83 @@ def test_composer_details_wrap_without_clipping(
         assert line["top"] >= dimensions["top"] - 1
         assert line["bottom"] <= dimensions["bottom"] + 1
 
-    menu.screenshot(path=tmp_path / f"{popover}-{viewport_width}.png")
+
+@pytest.mark.parametrize(
+    "viewport_width", [1440, 3200, 390], ids=["desktop", "ultrawide", "mobile"]
+)
+@pytest.mark.parametrize("font_size", [13, 18], ids=["default-font", "large-font"])
+@pytest.mark.parametrize("long_labels", [False, True], ids=["readable-name", "long-labels"])
+def test_composer_workspace_labels_use_available_width(
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    viewport_width: int,
+    font_size: int,
+    long_labels: bool,
+) -> None:
+    """Names fit wide bars while long labels truncate without crowding the other control."""
+    base_url, session_id = seeded_session
+    seed_committed_turn(session_id, prompt="Hello", reply="Inspect the workspace labels.")
+    name = "new-composer-width" * (8 if long_labels else 1)
+
+    def session_details(route: Route) -> None:
+        response = fetch_with_retry(route)
+        snapshot = response.json()
+        snapshot.update(workspace=f"/workspace/{name}", git_branch=name)
+        route.fulfill(response=response, json=snapshot)
+
+    page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
+    page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
+    page.set_viewport_size({"width": viewport_width, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    controls = page.get_by_test_id("composer-workspace-controls")
+    expect(controls).to_be_visible(timeout=30_000)
+    expect(controls.get_by_role("button")).to_have_count(2)
+    expect(controls.locator("span.truncate")).to_have_text([name, name])
+    controls.screenshot(path=tmp_path / f"labels-{viewport_width}-{font_size}.png")
+
+    dimensions = controls.evaluate(
+        """bar => {
+          const bounds = bar.getBoundingClientRect();
+          return {
+            left: bounds.left,
+            right: bounds.right,
+            bottom: bounds.bottom,
+            viewport: window.innerWidth,
+            buttons: [...bar.querySelectorAll('button')].map(button => {
+              const buttonBounds = button.getBoundingClientRect();
+              const label = button.querySelector('span.truncate');
+              return {
+                left: buttonBounds.left,
+                right: buttonBounds.right,
+                top: buttonBounds.top,
+                bottom: buttonBounds.bottom,
+                labelWidth: label.clientWidth,
+                textWidth: label.scrollWidth,
+                icons: [...button.querySelectorAll('svg')].map(icon => {
+                  const iconBounds = icon.getBoundingClientRect();
+                  return { left: iconBounds.left, right: iconBounds.right };
+                }),
+              };
+            }),
+          };
+        }"""
+    )
+    assert dimensions["left"] >= 0
+    assert dimensions["right"] <= dimensions["viewport"]
+    workspace, worktree = dimensions["buttons"]
+    assert workspace["right"] < worktree["left"]
+    assert workspace["top"] == pytest.approx(worktree["top"], abs=1)
+    for button in dimensions["buttons"]:
+        assert button["left"] >= dimensions["left"]
+        assert button["right"] <= dimensions["right"]
+        assert button["bottom"] <= dimensions["bottom"]
+        assert button["labelWidth"] > 0
+        if long_labels or viewport_width == 390:
+            assert button["textWidth"] > button["labelWidth"]
+        else:
+            assert button["textWidth"] <= button["labelWidth"] + 1
+        for icon in button["icons"]:
+            assert icon["right"] - icon["left"] >= 12
+            assert icon["left"] >= button["left"]
+            assert icon["right"] <= button["right"]

@@ -3489,7 +3489,7 @@ function ComposerImpl({
             <DropdownMenuContent
               align="start"
               side="top"
-              className="max-w-[min(90vw,24rem)] whitespace-normal"
+              className="max-w-[min(90vw,28rem)] whitespace-normal"
             >
               <DropdownMenuLabel>Session workspace</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
@@ -3511,7 +3511,7 @@ function ComposerImpl({
             <DropdownMenuContent
               align="start"
               side="top"
-              className="max-w-[min(90vw,24rem)] whitespace-normal"
+              className="max-w-[min(90vw,28rem)] whitespace-normal"
             >
               <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">

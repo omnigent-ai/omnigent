@@ -39,7 +39,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
       ref={ref}
       type="button"
       className={cn(
-        "relative inline-flex h-6 min-w-0 max-w-[180px] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50",
+        "relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50",
         className,
       )}
       {...props}
