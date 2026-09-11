@@ -4688,6 +4688,10 @@ function SessionHarnessPicker({
     setMenuOpen(next);
     onMenuOpenChange?.(next);
   };
+  // The trigger's own summary tooltip must not flash open over the menu, nor
+  // instantly reopen when closing the menu refocuses the trigger; see
+  // useMenuGuardedTooltip.
+  const gearTooltip = useMenuGuardedTooltip(menuOpen);
   useEffect(() => {
     updateMenuOpen(false);
     setConfigMenuOpen(false);
@@ -4818,9 +4822,9 @@ function SessionHarnessPicker({
         }}
       >
         <TooltipProvider>
-          <Tooltip>
+          <Tooltip open={gearTooltip.open} onOpenChange={gearTooltip.onOpenChange}>
             <TooltipTrigger asChild>
-              <span className="flex min-w-0">
+              <span className="flex min-w-0" {...gearTooltip.triggerProps}>
                 <DropdownMenuTrigger asChild>
                   <ComposerHarnessTrigger
                     label="Configure session"
@@ -5140,6 +5144,38 @@ function useResolvedComposerModel(
 }
 
 /** Compact, inspectable provenance beside the composer's model label. */
+/**
+ * Open state for a tooltip whose trigger contains (or is) a menu trigger.
+ *
+ * Keeps the tooltip closed while the menu is open: the menu portals inside
+ * the tooltip trigger's React tree, so its focus/pointer events bubble here
+ * and would instantly open the tooltip, painting it over the menu (equal
+ * z-index, later-mounted). Closing the menu hands focus back to the trigger,
+ * which would just as instantly reopen the tooltip, so the suppression also
+ * holds after close until the user shows fresh intent — the pointer
+ * re-enters the trigger, or focus leaves it.
+ */
+function useMenuGuardedTooltip(menuOpen: boolean) {
+  const [wantsOpen, setWantsOpen] = useState(false);
+  const [suppressed, setSuppressed] = useState(false);
+  useEffect(() => {
+    if (menuOpen) {
+      setWantsOpen(false);
+      setSuppressed(true);
+    }
+  }, [menuOpen]);
+  return {
+    open: wantsOpen && !menuOpen && !suppressed,
+    onOpenChange: (next: boolean) => setWantsOpen(next && !menuOpen && !suppressed),
+    triggerProps: {
+      onPointerEnter: () => setSuppressed(false),
+      onBlur: () => {
+        if (!menuOpen) setSuppressed(false);
+      },
+    },
+  } as const;
+}
+
 function ComposerModelSource({
   modelPickerKind,
   codexModelOptions,
@@ -5155,10 +5191,9 @@ function ComposerModelSource({
   children: ReactNode;
 }) {
   // Controlled so the tooltip stays closed while the selector popover is
-  // open: the popover portals inside this TooltipTrigger's React tree, so
-  // its focus/pointer events bubble here and would instantly open the
-  // tooltip, painting it over the popover (equal z-index, later-mounted).
-  const [tooltipOpen, setTooltipOpen] = useState(false);
+  // open (and until fresh hover/focus intent after it closes); see
+  // useMenuGuardedTooltip.
+  const tooltip = useMenuGuardedTooltip(pickerMenuOpen);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { effectiveModel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const source =
@@ -5170,12 +5205,10 @@ function ComposerModelSource({
   const rows = modelConfigurationSourceRows(source);
   return (
     <TooltipProvider>
-      <Tooltip
-        open={tooltipOpen && !pickerMenuOpen}
-        onOpenChange={(next) => setTooltipOpen(next && !pickerMenuOpen)}
-      >
+      <Tooltip open={tooltip.open} onOpenChange={tooltip.onOpenChange}>
         <TooltipTrigger asChild>
           <span
+            {...tooltip.triggerProps}
             tabIndex={0}
             data-testid="composer-model-source"
             // `flex` keeps the min-width chain flowing through this wrapper:

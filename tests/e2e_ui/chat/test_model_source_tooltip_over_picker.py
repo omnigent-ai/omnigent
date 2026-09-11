@@ -20,7 +20,10 @@ User journey covered:
    ``Model configuration`` tooltip surface),
 3. click the pill to open the selector popover,
 4. with the pointer still on the pill, the tooltip must not remain painted
-   over the popover.
+   over the popover,
+5. click away to close the popover: Radix hands focus back to the pill's
+   trigger, and that programmatic focus must not instantly reopen the
+   tooltips — they may only come back on fresh hover/focus intent.
 
 Timing note: a real user clicks the pill in one natural motion, well inside
 the tooltip's 600ms hover-open delay, so the tooltip that ends up over the
@@ -222,5 +225,21 @@ def test_pill_tooltip_does_not_obscure_open_selector(
             "expected it dismissed, suppressed, or layered below while the "
             "popover is open"
         )
+
+        # 5. click away to close the popover. The open menu is modal, so the
+        # outside pointerdown only dismisses it. Radix then returns focus to
+        # the pill's trigger; neither the model-source tooltip nor the
+        # trigger's own summary tooltip may instantly reopen on that
+        # programmatic focus (wait out the hover/animation window before
+        # probing).
+        page.mouse.click(cx, max(cy - 300, 10))
+        expect(menu).not_to_be_visible()
+        page.wait_for_timeout(1_200)
+        _screenshot(page, "pill-tooltips-after-clicking-away")
+        for tooltip_test_id in (
+            "composer-model-source-tooltip",
+            "composer-config-gear-tooltip",
+        ):
+            expect(page.get_by_test_id(tooltip_test_id)).not_to_be_visible()
     finally:
         page.unroute_all(behavior="ignoreErrors")

@@ -922,9 +922,22 @@ describe("Composer slash-command submit routing", () => {
     );
     expect(screen.queryByTestId("composer-model-source-tooltip")).toBeNull();
 
-    // Closing the popover releases the suppression: focus shows the tooltip.
+    // Closing the popover hands focus back to the trigger; that programmatic
+    // focus must NOT instantly reopen the tooltip.
     fireEvent.keyDown(menu, { key: "Escape" });
     await waitFor(() => expect(screen.queryByTestId("composer-agent-menu")).toBeNull());
+    fireEvent.focus(screen.getByTestId("composer-model-source"));
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-model-source-tooltip")).toBeNull();
+
+    // Fresh intent (the pointer re-entering the trigger) releases the
+    // suppression: the tooltip may open again.
+    fireEvent.pointerEnter(screen.getByTestId("composer-model-source"));
     fireEvent.focus(screen.getByTestId("composer-model-source"));
     expect(await screen.findByTestId("composer-model-source-tooltip")).toBeInTheDocument();
   });
