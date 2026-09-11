@@ -227,7 +227,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { ConfigRow, nativeModelLabel } from "@/components/HarnessConfigControls";
+import {
+  ConfigRow,
+  ModelMenuSearch,
+  nativeModelLabel,
+  useModelMenuFilter,
+} from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -4857,6 +4862,13 @@ function SessionHarnessPicker({
       )
         await store.setCostControlMode("off");
     });
+  const modelFilter = useModelMenuFilter(modelOptions);
+  // Reset the search when the menu closes: the picker survives warm
+  // conversation switches, and a filter left over from the last open would
+  // silently pre-filter the next conversation's catalog.
+  useEffect(() => {
+    if (!menuOpen) modelFilter.setQuery("");
+  }, [menuOpen, modelFilter]);
   const configContent = (
     <>
       {showModels && (
@@ -4864,6 +4876,7 @@ function SessionHarnessPicker({
           <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
             Models
           </DropdownMenuLabel>
+          {modelFilter.showSearch && <ModelMenuSearch filter={modelFilter} />}
           {!modelOptions.some((model) => model.isDefault) && (
             <DropdownMenuCheckboxItem
               checked={!routingOn && pickerSelectedModel === null}
@@ -4875,7 +4888,7 @@ function SessionHarnessPicker({
               Default
             </DropdownMenuCheckboxItem>
           )}
-          {modelOptions.map((model) => (
+          {modelFilter.filteredOptions.map((model) => (
             <DropdownMenuCheckboxItem
               key={model.id}
               disabled={busy || pendingModelChange !== null}
@@ -4893,6 +4906,9 @@ function SessionHarnessPicker({
               {nativeModelLabel(model)}
             </DropdownMenuCheckboxItem>
           ))}
+          {modelFilter.noResults && (
+            <div className="px-2 py-1 text-xs text-muted-foreground">No models found</div>
+          )}
           {pickerSelectedModel &&
             !modelOptions.some((model) => model.id === pickerSelectedModel) && (
               <DropdownMenuCheckboxItem

@@ -101,7 +101,7 @@ async def _drive_empty_pi_picker(base_url: str, session_id: str) -> None:
             await expect(models).to_contain_text("Models unavailable")
             await expect(models.get_by_role("menuitemcheckbox")).to_have_count(0)
             await expect(
-                page.get_by_test_id("new-chat-landing-agent-model-search")
+                page.get_by_test_id("composer-agent-models-search")
             ).to_be_visible()
             await expect(page.get_by_test_id("new-chat-landing-config-modal")).to_have_count(0)
         finally:

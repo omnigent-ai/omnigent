@@ -3598,6 +3598,75 @@ describe("Composer config gear", () => {
       );
     });
   });
+
+  describe("model search", () => {
+    function longOptions(count: number) {
+      return Array.from({ length: count }, (_, i) => ({
+        id: `model-${i}`,
+        displayName: `Model ${i}`,
+      }));
+    }
+
+    it("shows a search input only for long catalogs", async () => {
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: longOptions(15),
+          })}
+        />,
+      );
+      await openSessionModels();
+      expect(screen.queryByTestId("composer-agent-models-search")).toBeNull();
+    });
+
+    it("filters model items and keeps the Default row visible", async () => {
+      const options = [
+        { id: "alpha", displayName: "Alpha One" },
+        { id: "beta", displayName: "Beta Two" },
+        ...longOptions(14),
+      ];
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      const search = screen.getByTestId("composer-agent-models-search");
+      fireEvent.change(search, { target: { value: "alpha" } });
+      expect(screen.getByTestId("composer-agent-model-alpha")).toBeTruthy();
+      expect(screen.queryByTestId("composer-agent-model-beta")).toBeNull();
+      expect(screen.getByTestId("composer-agent-model-default")).toBeTruthy();
+    });
+
+    it("selects a filtered model", async () => {
+      const setModel = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ setModel });
+      const options = [{ id: "alpha", displayName: "Alpha One" }, ...longOptions(15)];
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      fireEvent.change(screen.getByTestId("composer-agent-models-search"), {
+        target: { value: "alpha" },
+      });
+      fireEvent.click(screen.getByTestId("composer-agent-model-alpha"));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith("alpha", { expectConfirmation: true }),
+      );
+    });
+  });
 });
 
 // The gear modal's "Subagent routing" row — the only in-session routing control,
