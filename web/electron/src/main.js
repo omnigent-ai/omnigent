@@ -45,6 +45,7 @@ const {
   normalizeSavedServerUrl,
   fetchServerManifest,
   isDatabricksManagedServerUrl,
+  databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
   LOCAL_HOSTS,
 } = require("./url");
@@ -2542,6 +2543,10 @@ function registerIpc() {
       saveSettings(settings);
     }
     if (win) {
+      // The window loads this URL. In SPOG mode the pre-auth below can resolve a
+      // different workspace than the user typed (they pick it in the browser), so
+      // this is reassigned to the picked workspace's UI URL before loadURL.
+      let loadTarget = target;
       // The user explicitly chose this server — it becomes the window's
       // trusted origin for privileged IPC and permission grants.
       pinWindow(win, new URL(target).origin);
@@ -2574,7 +2579,26 @@ function registerIpc() {
           }
         }
         try {
-          await ensureDatabricksSession(session.defaultSession, dbxOrigin, { forceLogin: strict });
+          const resolvedOrigin = await ensureDatabricksSession(session.defaultSession, dbxOrigin, {
+            forceLogin: strict,
+          });
+          // SPOG: the picked workspace differs from the entered SPOG/account
+          // host — re-point the window (and its trusted origin + saved URL) to
+          // the resolved workspace's /omnigent mount, where the DBAUTH cookie
+          // we just set is valid.
+          if (resolvedOrigin && resolvedOrigin !== dbxOrigin) {
+            loadTarget = databricksWorkspaceUiUrl(resolvedOrigin) ?? `${resolvedOrigin}/omnigent`;
+            console.log(
+              `[omnigent] databricks pre-auth: re-pointing window ${dbxOrigin} -> ${loadTarget}`,
+            );
+            pinWindow(win, resolvedOrigin);
+            setWindowServerUrl(win, loadTarget);
+            if (!ephemeral) {
+              const s = loadSettings();
+              s.server_url = loadTarget;
+              saveSettings(s);
+            }
+          }
         } catch (err) {
           console.warn(`[omnigent] databricks pre-auth failed: ${err.message}`);
           if (strict) {
@@ -2590,14 +2614,14 @@ function registerIpc() {
         }
       }
       win
-        .loadURL(target)
+        .loadURL(loadTarget)
         .then(() => {
           // Only a server that actually responded earns a recents slot —
           // a typo'd or unreachable URL must not show up in the
           // quick-pick list on the setup page.
           if (!ephemeral) {
             const settings = loadSettings();
-            rememberRecentServer(settings, target);
+            rememberRecentServer(settings, loadTarget);
             saveSettings(settings);
           }
           // The desktop does NOT auto-connect this machine as a runner on

@@ -16,6 +16,13 @@
 //                                             ephemerally — Databricks ignores it per RFC 8252 —
 //                                             unless you pin one, e.g. http://localhost:8020)
 //   OMNIGENT_DATABRICKS_OAUTH_SCOPES         (default "all-apis offline_access")
+//   OMNIGENT_DATABRICKS_OAUTH_SPOG=1         (single-pane-of-glass entry: route authorize through
+//                                             the login host so the user picks an account+workspace
+//                                             and the token comes back WORKSPACE-scoped. Off = the
+//                                             entered URL must already be a specific workspace.)
+//   OMNIGENT_DATABRICKS_LOGIN_URL            (login host for the SPOG picker; default
+//                                             https://login.databricks.com — set the staging host
+//                                             when testing against staging)
 
 "use strict";
 
@@ -28,10 +35,17 @@ const { shell, safeStorage } = require("electron");
 
 const DEFAULT_REDIRECT_BASE = "http://localhost";
 const DEFAULT_SCOPES = "all-apis offline_access";
+const DEFAULT_LOGIN_URL = "https://login.databricks.com";
 // Bound on how long we wait for the human to finish logging in in the browser.
 const AUTH_TIMEOUT_MS = 300_000;
 // Renew a little before real expiry so a mint isn't racing the clock.
 const EXPIRY_SKEW_SECONDS = 60;
+
+// Hostname suffixes that mark a trusted Databricks origin. The leading dot stops
+// look-alikes (evil-databricks.com, databricks.com.attacker.net) from matching.
+// Covers workspace hosts (…cloud.databricks.com, …gcp.databricks.com) and account
+// hosts (accounts.…databricks.com) since all end in one of these.
+const TRUSTED_HOST_SUFFIXES = [".databricks.com", ".azuredatabricks.net"];
 
 /** Read the OAuth config from the environment. */
 function config() {
@@ -40,7 +54,24 @@ function config() {
     clientSecret: (process.env.OMNIGENT_DATABRICKS_OAUTH_CLIENT_SECRET ?? "").trim(),
     redirectBase: (process.env.OMNIGENT_DATABRICKS_OAUTH_REDIRECT ?? DEFAULT_REDIRECT_BASE).trim(),
     scopes: (process.env.OMNIGENT_DATABRICKS_OAUTH_SCOPES ?? DEFAULT_SCOPES).trim(),
+    loginUrl: (process.env.OMNIGENT_DATABRICKS_LOGIN_URL ?? DEFAULT_LOGIN_URL).trim().replace(/\/+$/, ""),
+    spog: process.env.OMNIGENT_DATABRICKS_OAUTH_SPOG === "1",
   };
+}
+
+/**
+ * True when `url` is an https URL on a trusted Databricks host. The OAuth issuer
+ * (`iss`) is validated with this before we POST the code+verifier to it or adopt
+ * it as the workspace origin, so a spoofed redirect can't steer token traffic to
+ * an attacker host.
+ */
+function isTrustedDatabricksOrigin(url) {
+  try {
+    const { protocol, hostname } = new URL(url);
+    return protocol === "https:" && TRUSTED_HOST_SUFFIXES.some((s) => hostname.endsWith(s));
+  } catch {
+    return false;
+  }
 }
 
 /** Whether OAuth is configured enough to attempt (a client_id is the minimum). */
@@ -209,7 +240,7 @@ async function refreshTokens(origin, refreshToken) {
 // ── Interactive browser login (loopback redirect) ───────────────────────────
 
 async function runInteractiveLogin(origin) {
-  const { clientId, redirectBase, scopes } = config();
+  const { clientId, redirectBase, scopes, loginUrl, spog } = config();
   if (!clientId) throw new Error("OMNIGENT_DATABRICKS_OAUTH_CLIENT_ID is not set");
   const { verifier, challenge } = makePkce();
   const state = base64url(crypto.randomBytes(24));
@@ -222,7 +253,7 @@ async function runInteractiveLogin(origin) {
   const pathPart = base.pathname && base.pathname !== "/" ? base.pathname : "";
   let redirectUri;
 
-  const code = await new Promise((resolve, reject) => {
+  const callback = await new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       let reqUrl;
       try {
@@ -243,9 +274,17 @@ async function runInteractiveLogin(origin) {
       );
       const params = reqUrl.searchParams;
       cleanup();
+      // Full callback shape (code redacted) — the single most useful debug line:
+      // shows whether iss came back (SPOG) and whether the picker round-tripped.
+      console.log(
+        `[omnigent] databricks oauth: callback hasCode=${params.has("code")} ` +
+          `state=${params.get("state") === state ? "ok" : "MISMATCH"} ` +
+          `iss=${params.get("iss") ?? "(none)"} error=${params.get("error") ?? "(none)"}`,
+      );
       const err = params.get("error");
       if (err) {
-        reject(new Error(`authorization error: ${err}`));
+        const desc = params.get("error_description");
+        reject(new Error(`authorization error: ${err}${desc ? ` - ${desc}` : ""}`));
         return;
       }
       if (params.get("state") !== state) {
@@ -257,7 +296,7 @@ async function runInteractiveLogin(origin) {
         reject(new Error("no code in callback"));
         return;
       }
-      resolve(c);
+      resolve({ code: c, iss: params.get("iss") });
     });
 
     const timer = setTimeout(() => {
@@ -278,8 +317,10 @@ async function runInteractiveLogin(origin) {
     server.listen(fixedPort, base.hostname, () => {
       const port = server.address().port;
       redirectUri = `${base.protocol}//${base.hostname}:${port}${pathPart}`;
-      const authorize = new URL(`${origin}/oidc/v1/authorize`);
-      authorize.search = new URLSearchParams({
+      // Standard PKCE authorize request as a RELATIVE path — in SPOG mode this
+      // rides inside the login host's destination_url so the picker resolves a
+      // workspace before this authorize runs (yielding a workspace-scoped token).
+      const authQuery = new URLSearchParams({
         response_type: "code",
         client_id: clientId,
         redirect_uri: redirectUri,
@@ -288,31 +329,62 @@ async function runInteractiveLogin(origin) {
         code_challenge: challenge,
         code_challenge_method: "S256",
       }).toString();
-      void shell.openExternal(authorize.toString());
+      const authPath = `/oidc/v1/authorize?${authQuery}`;
+      // SPOG: login-host entry with the picker (NO isMobile — that would route
+      // through the /mobile-redirect bounce page; we want a direct loopback
+      // redirect). Otherwise authorize straight against the entered workspace.
+      const authorizeUrl = spog
+        ? `${loginUrl}/?destination_url=${encodeURIComponent(authPath)}`
+        : `${origin}${authPath}`;
       console.log(
-        `[omnigent] databricks oauth: opened system browser for ${origin}; waiting for login…`,
+        `[omnigent] databricks oauth: mode=${spog ? "SPOG(login-host+destination_url)" : "workspace-direct"} ` +
+          `entered=${origin} redirect_uri=${redirectUri}`,
       );
+      console.log(`[omnigent] databricks oauth: authorize URL = ${authorizeUrl}`);
+      void shell.openExternal(authorizeUrl);
+      console.log("[omnigent] databricks oauth: opened system browser; waiting for login…");
     });
   });
 
-  console.log("[omnigent] databricks oauth: authorization code received; exchanging for tokens");
-  return exchangeCode(origin, code, verifier, redirectUri);
+  // The workspace the token is scoped to comes from the issuer (iss, RFC 9207)
+  // when present — that's how SPOG conveys which workspace the user picked.
+  // Fall back to the entered origin for the workspace-direct flow.
+  let workspaceOrigin = origin;
+  if (callback.iss) {
+    if (!isTrustedDatabricksOrigin(callback.iss)) {
+      throw new Error(`authorization issuer is not a trusted Databricks origin: ${callback.iss}`);
+    }
+    workspaceOrigin = new URL(callback.iss).origin;
+    console.log(`[omnigent] databricks oauth: issuer=${callback.iss} -> workspace origin ${workspaceOrigin}`);
+  } else if (spog) {
+    console.warn(
+      `[omnigent] databricks oauth: SPOG mode but callback carried no iss; ` +
+        `falling back to entered origin ${origin} (token may be account-scoped)`,
+    );
+  }
+
+  console.log(`[omnigent] databricks oauth: exchanging code at ${workspaceOrigin}/oidc/v1/token`);
+  const tokens = await exchangeCode(workspaceOrigin, callback.code, verifier, redirectUri);
+  return { tokens, workspaceOrigin };
 }
 
 /**
- * Return a valid access token for a workspace origin, minting/refreshing as
- * needed. With ``interactive: false`` (the session-expiry path) it never opens a
- * browser — it uses a stored/refreshable token or throws, so a background reload
- * can fall back to the ordinary SSO gate.
+ * Return a valid access token plus the workspace origin it is scoped to, minting
+ * or refreshing as needed. In SPOG mode an interactive login can resolve a
+ * DIFFERENT workspace origin than the one entered (the user picks it), so callers
+ * must use the returned ``workspaceOrigin`` for the session-create call and the
+ * window load. With ``interactive: false`` (the session-expiry path) it never
+ * opens a browser — it uses a stored/refreshable token or throws.
  *
- * @param {string} origin e.g. ``"https://ws.databricks.com"``.
- * @param {{ interactive?: boolean }} [opts]
- * @returns {Promise<string>} A bearer access token.
+ * @param {string} origin The entered origin (SPOG/account host or workspace host).
+ * @param {{ interactive?: boolean, forceLogin?: boolean }} [opts]
+ * @returns {Promise<{ accessToken: string, workspaceOrigin: string }>}
  */
 async function getValidAccessToken(origin, { interactive = true, forceLogin = false } = {}) {
   if (forceLogin) {
     // Testing: skip any cached/refreshable token and run the full browser flow.
-    return (await runInteractiveLogin(origin)).access_token;
+    const { tokens, workspaceOrigin } = await runInteractiveLogin(origin);
+    return { accessToken: tokens.access_token, workspaceOrigin };
   }
   const stored = loadTokens(origin);
   const now = Math.floor(Date.now() / 1000);
@@ -322,11 +394,13 @@ async function getValidAccessToken(origin, { interactive = true, forceLogin = fa
     typeof stored.expires_at === "number" &&
     stored.expires_at > now
   ) {
-    return stored.access_token;
+    console.log(`[omnigent] databricks oauth: using cached token for ${origin}`);
+    return { accessToken: stored.access_token, workspaceOrigin: origin };
   }
   if (stored && typeof stored.refresh_token === "string" && stored.refresh_token) {
     try {
-      return (await refreshTokens(origin, stored.refresh_token)).access_token;
+      const t = await refreshTokens(origin, stored.refresh_token);
+      return { accessToken: t.access_token, workspaceOrigin: origin };
     } catch (e) {
       console.warn("[omnigent] databricks token refresh failed:", e.message);
       if (!interactive) throw e;
@@ -335,7 +409,8 @@ async function getValidAccessToken(origin, { interactive = true, forceLogin = fa
   if (!interactive) {
     throw new Error("no valid Databricks token and interactive login is disabled");
   }
-  return (await runInteractiveLogin(origin)).access_token;
+  const { tokens, workspaceOrigin } = await runInteractiveLogin(origin);
+  return { accessToken: tokens.access_token, workspaceOrigin };
 }
 
 module.exports = {

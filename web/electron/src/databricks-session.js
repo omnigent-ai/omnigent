@@ -22,15 +22,25 @@ const SESSION_CREATE_PATH = "/auth/session/create";
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin e.g. ``"https://ws.databricks.com"``.
  * @param {{ interactive?: boolean, nextPath?: string, forceLogin?: boolean }} [opts]
- * @returns {Promise<void>}
+ * @returns {Promise<string>} The workspace origin the session was created for
+ *   (may differ from ``origin`` in SPOG mode — the user's picked workspace).
  */
 async function ensureDatabricksSession(
   ses,
   origin,
   { interactive = true, nextPath = "/omnigent", forceLogin = false } = {},
 ) {
-  const accessToken = await getValidAccessToken(origin, { interactive, forceLogin });
-  await mintSessionCookie(ses, origin, accessToken, nextPath);
+  const { accessToken, workspaceOrigin } = await getValidAccessToken(origin, {
+    interactive,
+    forceLogin,
+  });
+  if (workspaceOrigin !== origin) {
+    console.log(
+      `[omnigent] databricks session: entered ${origin} resolved to workspace ${workspaceOrigin}`,
+    );
+  }
+  await mintSessionCookie(ses, workspaceOrigin, accessToken, nextPath);
+  return workspaceOrigin;
 }
 
 /**
