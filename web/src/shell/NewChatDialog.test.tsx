@@ -1159,6 +1159,7 @@ async function readCreateBody(): Promise<{ raw: string; body: Record<string, unk
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+  closeMenu();
 }
 
 /**
@@ -1173,6 +1174,7 @@ function selectUnconfiguredAgent(agentId: string): void {
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+  closeMenu();
 }
 
 /** Select <agentId>, open its config submenu, then open Advanced settings. */
@@ -1519,8 +1521,7 @@ describe("NewChatLandingScreen", () => {
       "max-h-[180px]",
       "overflow-y-auto",
       "p-0",
-      "text-[13px]",
-      "leading-[20.8px]",
+      "text-ui",
       "[scrollbar-width:none]",
       "[&::-webkit-scrollbar]:hidden",
     );
@@ -1530,8 +1531,7 @@ describe("NewChatLandingScreen", () => {
       "px-3",
       "pt-3",
       "pb-1",
-      "text-[13px]",
-      "leading-[20.8px]",
+      "text-ui",
     );
     const composer = screen.getByTestId("new-chat-landing-composer");
     const composerSurface = screen.getByTestId("new-chat-landing-composer-surface");
@@ -1752,12 +1752,12 @@ describe("NewChatLandingScreen", () => {
     expect(editConfig).toHaveAttribute("aria-label", "Edit Claude Code configuration");
     expect(editConfig).toHaveClass("composer-agent-edit");
     expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveClass("text-left");
-    expect(screen.getByTestId("new-chat-landing-agent-a1")).not.toContainElement(editConfig);
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toContainElement(editConfig);
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
     const menus = screen.getAllByRole("menu");
-    expect(menus).toHaveLength(1);
+    expect(menus).toHaveLength(2);
     expect(menus[0]).toBe(rootMenu);
-    expect(menus[0]).toHaveClass("w-[17.5rem]", "min-w-0", "composer-agent-config-menu");
+    expect(menus[1]).toHaveClass("w-[13.75rem]", "composer-agent-config-menu");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Sonnet 4.6");
     expect(screen.getByTestId("new-chat-landing-agent-models").textContent).not.toContain("`");
@@ -2068,23 +2068,45 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("opens Edit in place and keeps models reachable until returning to harnesses", () => {
+  it("opens harness configuration beside the list and keeps both menus visible", () => {
     renderLanding();
-    selectAgent("a2");
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     const menu = screen.getByRole("menu");
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a2"));
+    const harness = screen.getByTestId("new-chat-landing-agent-a2");
+    fireEvent.click(harness);
 
-    expect(screen.getAllByRole("menu")).toEqual([menu]);
-    expect(screen.queryByTestId("new-chat-landing-agent-a2")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("menu")).toHaveLength(2);
+    expect(menu).toContainElement(harness);
+    expect(harness).toHaveAttribute("data-state", "open");
+    expect(harness).toContainElement(screen.getByTestId("new-chat-landing-agent-config-a2"));
     const model = screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" });
     fireEvent.pointerMove(model, { pointerType: "mouse" });
     fireEvent.click(model);
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("GPT-5.6");
-    expect(screen.getByRole("menu")).toBe(menu);
-    fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
-    expect(screen.getByTestId("new-chat-landing-agent-config-a2")).toBeVisible();
+    expect(screen.getAllByRole("menu")).toHaveLength(2);
+    fireEvent.keyDown(model, { key: "ArrowLeft" });
     expect(screen.queryByTestId("new-chat-landing-agent-models")).not.toBeInTheDocument();
+    expect(screen.getByRole("menu")).toBe(menu);
+    expect(harness).toHaveFocus();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a2"));
+    expect(screen.getAllByRole("menu")).toHaveLength(2);
+  });
+
+  it("does not switch harnesses on hover and opens adjacent settings from the keyboard", async () => {
+    renderLanding();
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    fireEvent.keyDown(picker, { key: "ArrowDown" });
+    const codex = screen.getByTestId("new-chat-landing-agent-a2");
+    fireEvent.pointerMove(codex, { pointerType: "mouse" });
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+    expect(picker).toHaveAccessibleName(/^Claude Code/);
+    fireEvent.keyDown(codex, { key: "ArrowRight" });
+    expect(screen.getAllByRole("menu")).toHaveLength(2);
+    expect(picker).toHaveAccessibleName(/^Codex/);
+    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
+    fireEvent.keyDown(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" }), { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    await waitFor(() => expect(picker).toHaveFocus());
   });
 
   it("names the default Codex model once and preserves default-following selection", async () => {
@@ -5034,6 +5056,18 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
   function openPicker(): void {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   }
+
+  it("keeps harness configuration in one menu on narrow screens", () => {
+    renderLanding();
+    openPicker();
+    const menu = screen.getByRole("menu");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    expect(screen.getAllByRole("menu")).toEqual([menu]);
+    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-agent-a2")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
+    expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeVisible();
+  });
 
   it("drills into the Custom agents page in place and returns via Back", () => {
     // A custom (non-builtin) agent lands in the Custom agents group.

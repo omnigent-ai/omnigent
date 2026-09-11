@@ -1966,6 +1966,8 @@ describe("Composer slash-command highlight overlay", () => {
     expect(textarea().value).toBe(COMMAND_PROMPT);
     expect(tintedText()).toBe("/cross-review");
     expect(overlayText()).toBe(COMMAND_PROMPT);
+    expect(textarea()).toHaveClass("text-ui");
+    expect(screen.getByTestId("composer-highlight-overlay")).toHaveClass("text-ui");
   });
 
   it("renders no overlay for plain prose", () => {

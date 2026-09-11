@@ -1347,10 +1347,14 @@ export function AgentHarnessPicker({
 
   const isMobile = useIsMobileViewport();
   const [menuPage, setMenuPage] = useState<"more" | "custom" | "config" | null>(null);
+  const [configAgentId, setConfigAgentId] = useState<string | null>(null);
   // Reset to the main list whenever the menu closes so it never reopens on a
   // stale drill-in page.
   useEffect(() => {
-    if (!open) setMenuPage(null);
+    if (!open) {
+      setMenuPage(null);
+      setConfigAgentId(null);
+    }
   }, [open]);
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
@@ -1375,21 +1379,9 @@ export function AgentHarnessPicker({
         ? "opacity-100"
         : "opacity-0 group-hover/agent:opacity-100 group-focus-within/agent:opacity-100",
     );
-    const row = (
-      <div
-        className={cn(
-          "group/agent relative flex min-h-8 w-full items-center gap-1 rounded-lg pr-3 transition-colors hover:bg-muted focus-within:bg-muted",
-          active && "bg-muted",
-        )}
-        data-harness-menu-row=""
-        data-active={active ? "true" : undefined}
-      >
-        <DropdownMenuItem
-          data-testid={`new-chat-landing-agent-${agent.id}`}
-          data-active={active ? "true" : undefined}
-          onSelect={() => onSelectAgent(agent)}
-          className="composer-agent-choice min-w-0 flex-1 gap-2 rounded-lg py-1 pr-0 pl-2 text-[13px] leading-5 focus:bg-transparent"
-        >
+    const rowContent = (
+      <>
+        <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-0 pl-2 text-[13px] leading-5">
           <ComposerAgentIcon agent={agent} />
           <span
             className={cn("flex min-w-0 items-center gap-1 text-left", active && "font-medium")}
@@ -1442,24 +1434,77 @@ export function AgentHarnessPicker({
               {summary}
             </span>
           )}
-        </DropdownMenuItem>
+        </span>
         {editable && (
-          <DropdownMenuItem
+          <span
             aria-label={`Edit ${agent.display_name} configuration`}
             data-testid={`new-chat-landing-agent-config-${agent.id}`}
-            className={cn(editClassName, "cursor-pointer px-0", isMobile && "opacity-100")}
-            onSelect={(event) => {
-              event.preventDefault();
-              if (!active) onSelectAgent(agent);
-              setMenuPage("config");
-            }}
+            className={cn(
+              editClassName,
+              "flex cursor-pointer items-center px-0",
+              isMobile && "opacity-100",
+            )}
           >
             Edit
-          </DropdownMenuItem>
+          </span>
         )}
-      </div>
+      </>
     );
-    return <div key={agent.id}>{row}</div>;
+    const rowClassName = cn(
+      "composer-agent-row group/agent relative flex min-h-8 w-full items-center gap-1 rounded-lg pr-3 transition-colors hover:bg-muted focus:bg-muted [&>svg]:hidden",
+      active && "bg-muted",
+    );
+    if (editable && !isMobile) {
+      return (
+        <DropdownMenuSub
+          key={agent.id}
+          open={configAgentId === agent.id}
+          onOpenChange={(next) => {
+            if (next) {
+              if (!active) onSelectAgent(agent);
+              setConfigAgentId(agent.id);
+            } else {
+              setConfigAgentId((current) => (current === agent.id ? null : current));
+            }
+          }}
+        >
+          <DropdownMenuSubTrigger
+            data-testid={`new-chat-landing-agent-${agent.id}`}
+            data-harness-menu-row=""
+            data-active={active ? "true" : undefined}
+            className={rowClassName}
+            onPointerMove={(event) => event.preventDefault()}
+          >
+            {rowContent}
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent
+            className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] overflow-y-auto p-2"
+            sideOffset={16}
+            collisionPadding={12}
+          >
+            {active ? selectedConfigContent : null}
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+      );
+    }
+    return (
+      <DropdownMenuItem
+        key={agent.id}
+        data-testid={`new-chat-landing-agent-${agent.id}`}
+        data-harness-menu-row=""
+        data-active={active ? "true" : undefined}
+        className={rowClassName}
+        onSelect={(event) => {
+          onSelectAgent(agent);
+          if (editable) {
+            event.preventDefault();
+            setMenuPage("config");
+          }
+        }}
+      >
+        {rowContent}
+      </DropdownMenuItem>
+    );
   };
 
   // Opt-in "hide unconfigured harnesses" filter (Settings › Appearance). When
@@ -1553,7 +1598,7 @@ export function AgentHarnessPicker({
   );
   const showMore = isMobile && menuPage === "more" && moreHarnessEntries.length > 0;
   const showCustom = isMobile && menuPage === "custom" && hasCustomGroup;
-  const showConfig = menuPage === "config" && selectedConfigContent != null;
+  const showConfig = isMobile && menuPage === "config" && selectedConfigContent != null;
   // If the open page's group disappears (or the viewport grows to desktop),
   // fall back to the main list so a reopened menu never lands on an empty page.
   useEffect(() => {
@@ -5793,7 +5838,7 @@ export function NewChatLandingScreen() {
                   textarea; the pills themselves opt back in. */}
                     {pillSkills.length > 0 && message.length === 0 && (
                       <div className="pointer-events-none absolute inset-x-3 top-3 flex flex-wrap items-center gap-2">
-                        <span className="text-[13px] leading-[20.8px] text-muted-foreground">
+                        <span className="text-ui text-muted-foreground">
                           Describe a task, or try a skill
                         </span>
                         <SkillPills skills={pillSkills} onPick={applySkillPill} />
