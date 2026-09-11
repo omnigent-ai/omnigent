@@ -20,10 +20,9 @@
 //                                             the login host so the user picks an account+workspace
 //                                             and the token comes back WORKSPACE-scoped. Off = the
 //                                             entered URL must already be a specific workspace.)
-//   OMNIGENT_DATABRICKS_LOGIN_URL            (login host for the SPOG picker; defaults to the host
-//                                             you connected to. Set this only if the account/
-//                                             workspace picker lives on a different host, e.g.
-//                                             https://login.databricks.com)
+//   OMNIGENT_DATABRICKS_LOGIN_URL            (SISU login host for SPOG account-first login; default
+//                                             https://login.databricks.com. Set to a staging SISU
+//                                             host when testing SPOG on staging.)
 
 "use strict";
 
@@ -32,10 +31,13 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
-const { shell, safeStorage } = require("electron");
+const { app, shell, safeStorage } = require("electron");
 
 const DEFAULT_REDIRECT_BASE = "http://localhost";
 const DEFAULT_SCOPES = "all-apis offline_access";
+// SISU login host for the SPOG account-first picker (mirrors DB One). Prod; set
+// OMNIGENT_DATABRICKS_LOGIN_URL to a staging SISU host when testing on staging.
+const DEFAULT_LOGIN_URL = "https://login.databricks.com";
 // Bound on how long we wait for the human to finish logging in in the browser.
 const AUTH_TIMEOUT_MS = 300_000;
 // Renew a little before real expiry so a mint isn't racing the clock.
@@ -331,18 +333,21 @@ async function runInteractiveLogin(origin) {
         code_challenge_method: "S256",
       }).toString();
       const authPath = `/oidc/v1/authorize?${authQuery}`;
-      // SPOG: enter at the login host and let Databricks run its own account ->
-      // workspace selection, then run the authorize against the picked workspace
-      // and redirect back with a WORKSPACE-scoped code (the workspace comes back
-      // as the issuer, iss). Deliberately NO target=ACCOUNT — that flag skips the
-      // /select-workspace step and stops at an account-scoped token. NO isMobile
-      // either — that routes the redirect through the /mobile-redirect bounce
-      // page; desktop wants a direct loopback redirect. Login host defaults to the
-      // entered origin unless OMNIGENT_DATABRICKS_LOGIN_URL overrides it. Non-SPOG
-      // authorizes straight against the entered workspace.
-      const loginHost = loginUrl || origin;
+      // SPOG (account-first, mirrors genie-one-desktop accountSelector): enter at
+      // the SISU login host with target=ACCOUNT. That flag is what makes SISU
+      // resolve the account's cloud host and redirect the code back to our
+      // loopback — WITHOUT it SISU can't resolve the relative destination_url and
+      // never redirects (it just lands on the account console). The token comes
+      // back ACCOUNT-scoped (issuer = account host); the workspace is chosen
+      // afterward from the account workspaces API. NO isMobile — that routes
+      // through the /mobile-redirect bounce page; desktop wants a direct loopback
+      // redirect. Login host is login.databricks.com unless
+      // OMNIGENT_DATABRICKS_LOGIN_URL overrides it (e.g. a staging SISU host).
+      // Non-SPOG authorizes straight against the entered origin.
+      const loginHost = loginUrl || DEFAULT_LOGIN_URL;
       const authorizeUrl = spog
-        ? `${loginHost}/?destination_url=${encodeURIComponent(authPath)}`
+        ? `${loginHost}/?destination_url=${encodeURIComponent(authPath)}` +
+          `&target=ACCOUNT&l=${encodeURIComponent(app.getLocale())}`
         : `${origin}${authPath}`;
       console.log(
         `[omnigent] databricks oauth: mode=${spog ? `SPOG(login-host=${loginHost})` : "workspace-direct"} ` +

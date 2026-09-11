@@ -2494,6 +2494,45 @@ function browserRegistryForSender(event) {
   return windows.get(win)?.browserRegistry ?? null;
 }
 
+/**
+ * Choose which workspace to bridge an account-scoped (SPOG) Databricks token to.
+ *
+ * If OMNIGENT_DATABRICKS_WORKSPACE_ORIGIN names one of the account's workspaces,
+ * auto-pick it (deterministic testing — no prompt). Otherwise show a native
+ * chooser. This is an MVP picker via a message box; a polished list picker
+ * (like genie-one-desktop's WorkspacePicker) is a follow-up.
+ *
+ * @param {Electron.BrowserWindow} win
+ * @param {Array<{workspaceId: string, name: string, fqdn: string}>} workspaces
+ * @returns {Promise<{fqdn: string, name: string} | null>}
+ */
+async function pickWorkspaceForBridge(win, workspaces) {
+  const pref = (process.env.OMNIGENT_DATABRICKS_WORKSPACE_ORIGIN || "").trim();
+  if (pref) {
+    let host;
+    try {
+      host = new URL(pref).host;
+    } catch {
+      host = pref.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+    }
+    const match = workspaces.find((w) => w.fqdn === host);
+    if (match) {
+      console.log(`[omnigent] databricks workspace picker: auto-picked ${match.fqdn} from override`);
+      return match;
+    }
+    console.warn(`[omnigent] databricks workspace picker: override ${pref} not in the account's workspaces`);
+  }
+  const buttons = [...workspaces.map((w) => w.name), "Cancel"];
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    title: "Select a workspace",
+    message: "Choose a Databricks workspace to open in Omnigent",
+    buttons,
+    cancelId: buttons.length - 1,
+  });
+  return response >= 0 && response < workspaces.length ? workspaces[response] : null;
+}
+
 function registerIpc() {
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
@@ -2581,6 +2620,7 @@ function registerIpc() {
         try {
           const resolvedOrigin = await ensureDatabricksSession(session.defaultSession, dbxOrigin, {
             forceLogin: strict,
+            pickWorkspace: (workspaces) => pickWorkspaceForBridge(win, workspaces),
           });
           // SPOG: the picked workspace differs from the entered SPOG/account
           // host — re-point the window (and its trusted origin + saved URL) to

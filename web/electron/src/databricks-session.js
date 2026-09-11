@@ -12,6 +12,7 @@
 
 const { net } = require("electron");
 const { databricksOAuthConfigured, getValidAccessToken } = require("./databricks-oauth");
+const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
 
 const SESSION_CREATE_PATH = "/auth/session/create";
 
@@ -21,37 +22,56 @@ const SESSION_CREATE_PATH = "/auth/session/create";
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin e.g. ``"https://ws.databricks.com"``.
- * @param {{ interactive?: boolean, nextPath?: string, forceLogin?: boolean }} [opts]
+ * @param {{ interactive?: boolean, nextPath?: string, forceLogin?: boolean,
+ *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
+ *     => Promise<{fqdn: string, name: string} | null> }} [opts]
+ *   ``pickWorkspace`` is required for account-scoped (SPOG) logins — it chooses
+ *   which workspace to bridge the account token to.
  * @returns {Promise<string>} The workspace origin the session was created for
  *   (may differ from ``origin`` in SPOG mode — the user's picked workspace).
  */
 async function ensureDatabricksSession(
   ses,
   origin,
-  { interactive = true, nextPath = "/omnigent", forceLogin = false } = {},
+  { interactive = true, nextPath = "/omnigent", forceLogin = false, pickWorkspace } = {},
 ) {
-  // `issuerOrigin` is where the token was minted (its refresh/exchange host). For
-  // account-first (SPOG) login this is the ACCOUNT host and the token is
-  // account-scoped — the workspace session is bridged separately.
+  // `issuerOrigin` is where the token was minted (its refresh/exchange host).
   const { accessToken, workspaceOrigin: issuerOrigin } = await getValidAccessToken(origin, {
     interactive,
     forceLogin,
   });
-  // DB One bridges a workspace session by mounting {workspaceOrigin}/auth/session/create
-  // with the (account) bearer — the workspace's handler accepts it and mints a
-  // workspace DBAUTH cookie. Until the workspace picker exists,
-  // OMNIGENT_DATABRICKS_WORKSPACE_ORIGIN hardcodes which workspace to bridge to,
-  // so the account-token -> workspace-session bridge can be verified end to end.
-  const override = (process.env.OMNIGENT_DATABRICKS_WORKSPACE_ORIGIN || "").trim().replace(/\/+$/, "");
-  const bridgeOrigin = override || issuerOrigin;
-  if (override) {
+
+  // Decide which workspace host to bridge against. A workspace-scoped token
+  // bridges against its own origin. An ACCOUNT-scoped token (SPOG / account
+  // entry) cannot — the account host has no /auth/session/create — so resolve a
+  // workspace from the account workspaces API and let the caller pick one, then
+  // bridge the account token against that workspace's FQDN. Mirrors DB One.
+  let bridgeOrigin = issuerOrigin;
+  const account = parseAccountFromToken(accessToken);
+  if (account) {
     console.log(
-      `[omnigent] databricks session: WORKSPACE OVERRIDE — bridging token ` +
-        `(issuer ${issuerOrigin}) to workspace ${override}`,
+      `[omnigent] databricks session: account-scoped token (account ${account.accountId} @ ` +
+        `${account.accountOrigin}); resolving a workspace to bridge`,
     );
+    const workspaces = await listRunningWorkspaces(account, accessToken);
+    console.log(
+      `[omnigent] databricks session: account has ${workspaces.length} running workspace(s): ` +
+        workspaces.map((w) => w.fqdn).join(", "),
+    );
+    if (workspaces.length === 0) {
+      throw new Error("no running workspaces available for this account");
+    }
+    if (typeof pickWorkspace !== "function") {
+      throw new Error("account-scoped login requires a workspace picker");
+    }
+    const picked = await pickWorkspace(workspaces);
+    if (!picked) throw new Error("workspace selection cancelled");
+    bridgeOrigin = `https://${picked.fqdn}`;
+    console.log(`[omnigent] databricks session: picked workspace ${picked.name} -> ${bridgeOrigin}`);
   } else if (issuerOrigin !== origin) {
-    console.log(`[omnigent] databricks session: entered ${origin} resolved to ${issuerOrigin}`);
+    console.log(`[omnigent] databricks session: workspace-scoped token; entered ${origin} -> ${issuerOrigin}`);
   }
+
   await mintSessionCookie(ses, bridgeOrigin, accessToken, nextPath);
   return bridgeOrigin;
 }
