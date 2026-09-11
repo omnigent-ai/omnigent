@@ -693,6 +693,63 @@ async def test_edit_grant_blocked_from_stop_session_requires_owner(
     )
 
 
+async def test_share_workspace_files_requires_manage_and_reflects_in_snapshot(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Exposing the workspace to view-level collaborators is a sharing
+    decision, so PATCHing ``share_workspace_files`` needs manage — the same
+    tier that grants/revokes access. An editor is blocked; a manager can flip
+    it, and the value round-trips through the session snapshot (the contract
+    the share dialog and the file-rail gate both read).
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "user-a")
+    session_id = s1["id"]
+    # Fresh sessions are unshared: a read grant sees the conversation only.
+    assert s1.get("share_workspace_files") is False
+
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="editor", level=LEVEL_EDIT
+    )
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="manager", level=LEVEL_MANAGE
+    )
+
+    # An editor cannot decide who sees the workspace.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": True},
+        headers={"X-Forwarded-Email": "editor"},
+    )
+    assert resp.status_code == 403, (
+        f"An edit collaborator must not be able to expose the workspace to "
+        f"view-level users. Got {resp.status_code}: {resp.text}"
+    )
+
+    # A manager can, and the snapshot reflects it.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": True},
+        headers={"X-Forwarded-Email": "manager"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["share_workspace_files"] is True
+
+    snap = await auth_client.get(
+        f"/v1/sessions/{session_id}", headers={"X-Forwarded-Email": "manager"}
+    )
+    assert snap.json()["share_workspace_files"] is True
+
+    # Turning it back off round-trips too.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": False},
+        headers={"X-Forwarded-Email": "manager"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["share_workspace_files"] is False
+
+
 # ── Grant edit: can POST events but not manage permissions ───
 
 

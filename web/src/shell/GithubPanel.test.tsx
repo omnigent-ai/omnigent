@@ -2,7 +2,7 @@
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GithubChangedFile, GithubInfo } from "@/hooks/useGithub";
@@ -26,8 +26,8 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => state.info,
-  useGithubChangedFiles: () => state.changes,
+  useGithubInfo: vi.fn(() => state.info),
+  useGithubChangedFiles: vi.fn(() => state.changes),
   // One whole-PR patch; the panel parses it into per-file diffs.
   useGithubPrDiff: () => ({
     data: { object: "session.github.pr_diff", patch: "PATCH" },
@@ -36,6 +36,15 @@ vi.mock("@/hooks/useGithub", () => ({
     isFetching: false,
   }),
   fetchGithubFileContents: async () => ({ before: "old", after: "new" }),
+  // The account selector (shown in the repo-unresolved empty state) calls this;
+  // stub the mutation shape it reads.
+  useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useSetGithubPreference: () => ({
+    mutate: () => {},
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
 }));
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here
@@ -54,6 +63,15 @@ vi.mock("@pierre/diffs/react", () => ({
 vi.mock("@/components/theme/useResolvedThemeMode", () => ({
   useResolvedThemeMode: () => "light",
 }));
+// The Summary tab renders markdown via MessageResponse (Streamdown); stub it to
+// a passthrough so tests assert the text without the real renderer.
+vi.mock("@/components/ai-elements/message", () => ({
+  MessageResponse: ({ children }: { children: string }) => (
+    <div data-testid="markdown">{children}</div>
+  ),
+}));
+
+import { useGithubInfo, useGithubChangedFiles } from "@/hooks/useGithub";
 
 import { GithubPanel, deriveGithubPanelState } from "./GithubPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -77,11 +95,20 @@ function file(
 
 function renderPanel() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={client}>
-      <GithubPanel conversationId="conv_1" />
-    </QueryClientProvider>,
-  );
+  return render(<GithubPanel conversationId="conv_1" />, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+}
+
+/** Render, then switch to the Changes tab — Summary is the default, so the
+ *  diff view (and its toolbar) only exists after activating Changes. Radix
+ *  tabs select on pointer-down, so mouseDown (not click) flips the tab. */
+function renderChanges() {
+  const r = renderPanel();
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+  return r;
 }
 
 let scrollIntoView: ReturnType<typeof vi.fn>;
@@ -164,11 +191,12 @@ afterEach(() => {
 });
 
 describe("GithubPanel", () => {
-  it("shows the PR header with title and CI check pills", async () => {
+  it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
+    // Title + number live in the shared header (both tabs).
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();
-    // CI checks are on their own line as labeled pills (not a diffstat). A
+    // CI checks render on the Summary tab (the default) as labeled pills. A
     // zero bucket (pending) renders no pill.
     expect(screen.getByText("Checks")).toBeInTheDocument();
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
@@ -176,14 +204,66 @@ describe("GithubPanel", () => {
     expect(screen.queryByText(/pending/)).toBeNull();
   });
 
-  it("stacks a diff section per changed file", async () => {
+  it.each([
+    ["OPEN", "Open", "text-green-700"],
+    ["CLOSED", "Closed", "text-red-700"],
+    ["MERGED", "Merged", "text-brand-accent"],
+  ])("shows a %s status pill beside the PR title", (stateName, label, tone) => {
+    state.info!.data!.pr!.state = stateName;
     renderPanel();
+
+    const pill = screen.getByLabelText(`Pull request status: ${label}`);
+    expect(pill).toHaveTextContent(label);
+    expect(pill).toHaveClass(tone, "h-5", "rounded-full", "border", "text-xs");
+    expect(pill.parentElement).toHaveClass("flex-nowrap");
+    expect(screen.getByRole("link", { name: /chore: dummy PR/ })).not.toHaveClass("flex-1");
+  });
+
+  it("lands on the Summary tab, showing the PR description and comments", async () => {
+    state.info!.data!.pr!.body = "## Overview\nThis PR does the thing.";
+    state.info!.data!.pr!.comments = [
+      {
+        author: "octocat",
+        body: "Looks good to me!",
+        created_at: "2026-09-05T07:32:02Z",
+        url: "https://example.com/pr/6000#c1",
+      },
+    ];
+    renderPanel();
+    // Summary is the default — the diff sections aren't mounted yet.
+    expect(screen.queryByTestId("diff")).toBeNull();
+    expect(await screen.findByText(/This PR does the thing\./)).toBeInTheDocument();
+    expect(screen.getByText("Comments (1)")).toBeInTheDocument();
+    expect(screen.getByText("octocat")).toBeInTheDocument();
+    expect(screen.getByText("Looks good to me!")).toBeInTheDocument();
+  });
+
+  it("shows Summary empty states when the PR has no body or comments", () => {
+    // The default fixture carries neither a body nor comments.
+    renderPanel();
+    expect(screen.getByText("No description provided.")).toBeInTheDocument();
+    expect(screen.getByText("No comments yet.")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  it("reveals the stacked diff after switching to the Changes tab", async () => {
+    renderPanel();
+    expect(screen.queryByTestId("diff")).toBeNull();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    const diffs = await screen.findAllByTestId("diff");
+    expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
+    // Checks live on the Summary tab, so they're gone once Changes is active.
+    expect(screen.queryByText("Checks")).toBeNull();
+  });
+
+  it("stacks a diff section per changed file", async () => {
+    renderChanges();
     const diffs = await screen.findAllByTestId("diff");
     expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
   });
 
   it("jumps to a file's section when its sidebar row is clicked", async () => {
-    renderPanel();
+    renderChanges();
     await screen.findAllByTestId("diff");
     // Both the sidebar row and the section header are buttons matching the
     // name; the sidebar row (which scrolls) is first in the DOM.
@@ -193,7 +273,7 @@ describe("GithubPanel", () => {
   });
 
   it("collapses a file's diff when its section header is clicked", async () => {
-    renderPanel();
+    renderChanges();
     expect(await screen.findAllByTestId("diff")).toHaveLength(2);
     // The section header carries aria-expanded; the sidebar row doesn't.
     const header = screen.getByRole("button", { name: /app\.ts/, expanded: true });
@@ -204,7 +284,7 @@ describe("GithubPanel", () => {
   });
 
   it("collapses and expands every diff from the toolbar", async () => {
-    renderPanel();
+    renderChanges();
     expect(await screen.findAllByTestId("diff")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
     expect(screen.queryAllByTestId("diff")).toHaveLength(0);
@@ -214,7 +294,7 @@ describe("GithubPanel", () => {
   });
 
   it("hides and shows the file sidebar from the toolbar", async () => {
-    renderPanel();
+    renderChanges();
     await screen.findAllByTestId("diff");
     // hello.py appears as a sidebar jump row and as a section header.
     expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
@@ -226,7 +306,7 @@ describe("GithubPanel", () => {
   });
 
   it("toggles the diff layout between unified and split", async () => {
-    renderPanel();
+    renderChanges();
     await screen.findAllByTestId("diff");
     // Defaults to unified, so the toggle offers split; clicking flips its label.
     fireEvent.click(screen.getByRole("button", { name: "Switch to split view" }));
@@ -246,7 +326,7 @@ describe("GithubPanel", () => {
       error: null,
       isFetching: false,
     };
-    renderPanel();
+    renderChanges();
     // The lone omnigent → runner chain collapses to a single "omnigent/runner"
     // folder row (exact name; the diff section headers carry the full path).
     expect(await screen.findByRole("button", { name: "omnigent/runner" })).toBeInTheDocument();
@@ -265,7 +345,7 @@ describe("GithubPanel", () => {
       error: null,
       isFetching: false,
     };
-    renderPanel();
+    renderChanges();
     const folder = await screen.findByRole("button", { name: "omnigent/runner" });
     // Before collapse: the sidebar leaf + the diff section header both match.
     expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(2);
@@ -284,7 +364,7 @@ describe("GithubPanel", () => {
     state.parsedFiles = [
       { name: "omnigent/new_name.py", prevName: "omnigent/old_name.py", type: "rename-pure" },
     ];
-    renderPanel();
+    renderChanges();
     // No diff body for a 100%-similarity rename — a note instead.
     expect(await screen.findByText("File renamed without changes.")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
@@ -338,12 +418,70 @@ describe("GithubPanel", () => {
     expect(screen.queryByTestId("diff")).toBeNull();
   });
 
+  it.each([1, 2])("offers the stored PR in the empty state with %i GitHub accounts", (count) => {
+    const url = "https://github.com/acme/app/pull/6000";
+    const info = state.info!.data!;
+    info.pr = null;
+    info.repo = null;
+    info.tracking_available = true;
+    info.selected_pr_url = url;
+    info.prs = [
+      { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "created" },
+    ];
+    info.accounts = ["personal", "work"].slice(0, count).map((login) => ({
+      login,
+      active: login === "personal",
+      state: "success",
+      host: "github.com",
+    }));
+    info.selected_account = "personal";
+    renderPanel();
+    const emptyState = screen.getByText("Can’t reach the upstream repo").parentElement;
+    const link = screen.getByRole("link", { name: "Open the PR on GitHub" });
+    expect(emptyState).toContainElement(link);
+    expect(emptyState).toContainElement(screen.getByText("or", { exact: true }));
+    expect(link).toHaveAttribute("href", url);
+    expect(link).toHaveAttribute("target", "_blank");
+    const account = screen.queryByRole("combobox", { name: "GitHub account" });
+    if (count > 1) {
+      expect(emptyState).toContainElement(account);
+      expect(
+        account!.compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    } else {
+      expect(account).toBeNull();
+    }
+  });
+
   it("shows a no-open-PR empty state (naming the branch) and hides the diff", () => {
     state.info!.data!.pr = null;
     renderPanel();
     expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
     expect(screen.getByText("test/pr-view")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).not.toBeInTheDocument();
+  });
+
+  it("offers linking beneath the empty-state description when tracking is available", () => {
+    state.info!.data!.pr = null;
+    state.info!.data!.prs = [];
+    state.info!.data!.tracking_available = true;
+    renderPanel();
+    const description = screen.getByText(/Pull requests created in this session appear here/);
+    const link = screen.getByRole("button", { name: "Link a PR" });
+    expect(description.parentElement).toContainElement(link);
+    expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
+    fireEvent.click(link);
+    expect(description.parentElement).toContainElement(
+      screen.getByRole("textbox", { name: "Pull request URL" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
+    fireEvent.click(link);
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Pull request URL" }), {
+      key: "Escape",
+    });
+    expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
   });
 });
 
@@ -415,5 +553,114 @@ describe("deriveGithubPanelState", () => {
     const noPr = deriveGithubPanelState(q({ data: { ...ready, pr: null } }));
     expect(noPr).toEqual({ kind: "no-pr", branch: "feat/x" });
     expect(deriveGithubPanelState(q({ data: ready }))).toEqual({ kind: "ready" });
+  });
+});
+
+describe("session PR selection", () => {
+  it("keeps the selector and repository identity while PR details load or fail", async () => {
+    const one = "https://github.com/example/one/pull/42";
+    const two = "https://github.com/example/two/pull/42";
+    state.info = {
+      isLoading: false,
+      error: null,
+      isFetching: false,
+      data: {
+        ...state.info!.data!,
+        object: "session.github.info",
+        available: true,
+        gh_available: true,
+        authenticated: true,
+        tracking_available: true,
+        selected_pr_url: one,
+        pr: { ...state.info!.data!.pr!, url: one, number: 42, title: "First repository" },
+        prs: [
+          {
+            url: one,
+            host: "github.com",
+            repository: "example/one",
+            number: 42,
+            relationship: "created",
+          },
+          {
+            url: two,
+            host: "github.com",
+            repository: "example/two",
+            number: 42,
+            relationship: "created",
+          },
+        ],
+      },
+    };
+    const { rerender } = renderPanel();
+    const picker = screen.getByRole("combobox", { name: "Session pull request" });
+    expect(picker).toHaveTextContent("example/one #42");
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    fireEvent.click(picker);
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "example/one #42" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    fireEvent.click(screen.getByRole("option", { name: "example/two #42" }));
+    expect(picker).toHaveTextContent("example/two #42");
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
+
+    state.info = { isLoading: true, error: null, isFetching: true };
+    rerender(<GithubPanel conversationId="conv_1" />);
+    expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
+    expect(picker).toHaveTextContent("example/two #42");
+    expect(screen.getByText("Loading GitHub…")).toBeInTheDocument();
+    expect(screen.queryByText("First repository")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+    expect(screen.queryByRole("link", { name: "Open the PR on GitHub" })).toBeNull();
+
+    state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
+    rerender(<GithubPanel conversationId="conv_1" />);
+    expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
+    const errorMessage = screen.getByText(/Metadata unavailable/);
+    const fallback = screen.getByRole("link", { name: "Open the PR on GitHub" });
+    expect(errorMessage.parentElement).toContainElement(fallback);
+    expect(fallback).toHaveAttribute("href", two);
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("option", { name: "example/one #42" }));
+    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+
+    state.info = { isLoading: true, error: null, isFetching: true };
+    rerender(<GithubPanel conversationId="conv_other" />);
+    expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
+  });
+
+  it("passes the selected PR and revisions into file queries", () => {
+    const url = "https://github.com/example/two/pull/42";
+    state.info = {
+      isLoading: false,
+      error: null,
+      isFetching: false,
+      data: {
+        object: "session.github.info",
+        available: true,
+        gh_available: true,
+        authenticated: true,
+        selected_pr_url: url,
+        pr: {
+          number: 42,
+          title: "Second repo",
+          url,
+          state: "OPEN",
+          is_draft: false,
+          author: "user",
+          head_ref: "topic",
+          base_ref: "main",
+          head_sha: "head",
+          base_sha: "base",
+          checks: { passing: 0, failing: 0, pending: 0, total: 0, runs: [] },
+        },
+      },
+    };
+    renderPanel();
+    expect(useGithubChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
   });
 });

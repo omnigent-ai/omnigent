@@ -2,10 +2,33 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
+from omnigent_slack.events import HostType
 from omnigent_slack.models import SessionRecord, ThreadKey, UserConfig
+
+# Columns added to a table after it was first created, as
+# ``(table, column, definition)``. ``CREATE TABLE IF NOT EXISTS`` leaves an
+# existing table alone, so a database written by an earlier build keeps the old
+# shape and every query naming a newer column fails. ``initialize`` adds each
+# missing one in place. A definition must carry a default, since SQLite requires
+# one to add a NOT NULL column to a populated table.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("thread_sessions", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
+    ("user_configs", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
+)
+
+
+def _host_type(value: Any) -> HostType:
+    """Narrow a stored ``host_type`` to the literal, defaulting to external.
+
+    A row written before the column existed reads as its ``'external'``
+    default, and anything unrecognized would be a hand-edited database. Both
+    land on ``"external"`` — the behavior every pre-existing row had.
+    """
+    return "managed" if value == "managed" else "external"
 
 
 class SQLiteStore:
@@ -27,6 +50,7 @@ class SQLiteStore:
                     owner_user_id TEXT,
                     host_id TEXT,
                     workspace TEXT,
+                    host_type TEXT NOT NULL DEFAULT 'external',
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (team_id, channel_id, thread_ts)
@@ -51,19 +75,38 @@ class SQLiteStore:
                     workspace TEXT,
                     host_id TEXT,
                     host_name TEXT,
+                    host_type TEXT NOT NULL DEFAULT 'external',
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (team_id, user_id)
                 )
                 """
             )
+            await self._add_missing_columns(db)
             await db.commit()
+
+    @staticmethod
+    async def _add_missing_columns(db: aiosqlite.Connection) -> None:
+        """Bring an older database's tables up to the current column set.
+
+        SQLite has no ``ADD COLUMN IF NOT EXISTS``, so read each table's live
+        columns and add only what :data:`_ADDED_COLUMNS` says is missing. That
+        keeps ``initialize`` idempotent on a fresh file and on one written
+        before the column existed.
+        """
+        for table, column, definition in _ADDED_COLUMNS:
+            cursor = await db.execute(f"PRAGMA table_info({table})")
+            rows = await cursor.fetchall()
+            await cursor.close()
+            if any(row[1] == column for row in rows):
+                continue
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     async def get_session(self, key: ThreadKey) -> SessionRecord | None:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
                 """
-                SELECT omnigent_session_id, owner_user_id, host_id, workspace
+                SELECT omnigent_session_id, owner_user_id, host_id, workspace, host_type
                 FROM thread_sessions
                 WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
                 """,
@@ -78,6 +121,7 @@ class SQLiteStore:
             owner_user_id=str(row[1]) if row[1] is not None else None,
             host_id=str(row[2]) if row[2] is not None else None,
             workspace=str(row[3]) if row[3] is not None else None,
+            host_type=_host_type(row[4]),
         )
 
     async def upsert_session(
@@ -89,6 +133,7 @@ class SQLiteStore:
         owner_user_id: str | None = None,
         host_id: str | None = None,
         workspace: str | None = None,
+        host_type: HostType = "external",
     ) -> None:
         now = int(time.time())
         async with aiosqlite.connect(self._path) as db:
@@ -96,16 +141,17 @@ class SQLiteStore:
                 """
                 INSERT INTO thread_sessions (
                     team_id, channel_id, thread_ts, omnigent_session_id,
-                    title, owner_user_id, host_id, workspace,
+                    title, owner_user_id, host_id, workspace, host_type,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(team_id, channel_id, thread_ts) DO UPDATE SET
                     omnigent_session_id = excluded.omnigent_session_id,
                     title = excluded.title,
                     owner_user_id = excluded.owner_user_id,
                     host_id = excluded.host_id,
                     workspace = excluded.workspace,
+                    host_type = excluded.host_type,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -117,6 +163,7 @@ class SQLiteStore:
                     owner_user_id,
                     host_id,
                     workspace,
+                    host_type,
                     now,
                     now,
                 ),
@@ -127,7 +174,7 @@ class SQLiteStore:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
                 """
-                SELECT agent_id, agent_name, workspace, host_id, host_name
+                SELECT agent_id, agent_name, workspace, host_id, host_name, host_type
                 FROM user_configs
                 WHERE team_id = ? AND user_id = ?
                 """,
@@ -143,6 +190,7 @@ class SQLiteStore:
             workspace=str(row[2]) if row[2] is not None else "",
             host_id=str(row[3]) if row[3] is not None else None,
             host_name=str(row[4]) if row[4] is not None else None,
+            host_type=_host_type(row[5]),
         )
 
     async def upsert_user_config(self, team_id: str, user_id: str, config: UserConfig) -> None:
@@ -151,16 +199,17 @@ class SQLiteStore:
             await db.execute(
                 """
                 INSERT INTO user_configs (
-                    team_id, user_id, agent_id, agent_name,
-                    workspace, host_id, host_name, created_at, updated_at
+                    team_id, user_id, agent_id, agent_name, workspace,
+                    host_id, host_name, host_type, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(team_id, user_id) DO UPDATE SET
                     agent_id = excluded.agent_id,
                     agent_name = excluded.agent_name,
                     workspace = excluded.workspace,
                     host_id = excluded.host_id,
                     host_name = excluded.host_name,
+                    host_type = excluded.host_type,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -171,6 +220,7 @@ class SQLiteStore:
                     config.workspace,
                     config.host_id,
                     config.host_name,
+                    config.host_type,
                     now,
                     now,
                 ),

@@ -50,8 +50,8 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from omnigent import _native_forwarder_health as native_forwarder_health
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
@@ -394,6 +394,7 @@ class TurnContext:
         e.g. ``"resp_abc123"``. Surfaced on the SSE
         ``response.created`` envelope so Omnigent can correlate
         replays / heartbeat-event-seq tracking.
+    :param session_id: Omnigent session validated by the API path, independent of telemetry.
     :param event_queue: The :class:`asyncio.Queue` the SSE
         streaming response reads from. ``ctx.emit`` puts
         events onto this queue; the streaming response
@@ -409,7 +410,9 @@ class TurnContext:
         response_id: str,
         event_queue: asyncio.Queue[HarnessStreamEvent | None],
         cancelled: asyncio.Event,
+        session_id: str | None = None,
     ) -> None:
+        self.session_id = session_id
         self.response_id = response_id
         self._event_queue = event_queue
         self.cancelled = cancelled
@@ -1161,7 +1164,9 @@ class HarnessApp:
             return denied
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
-            return await self._start_or_inject_turn(body.to_create_request())
+            return await self._start_or_inject_turn(
+                body.to_create_request(), session_id=conversation_id
+            )
         if isinstance(body, InterruptEvent):
             return await self._handle_interrupt_event()
         if isinstance(body, ToolResultEvent):
@@ -1250,7 +1255,7 @@ class HarnessApp:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
-        self, request: CreateResponseRequest
+        self, request: CreateResponseRequest, *, session_id: str | None = None
     ) -> StreamingResponse | Response:
         """
         Start a new turn or inject into the in-flight one.
@@ -1316,6 +1321,7 @@ class HarnessApp:
                 response_id=response_id,
                 event_queue=event_queue,
                 cancelled=cancelled,
+                session_id=session_id,
             )
             self._in_flight[response_id] = ctx
             self._active_turn_ctx = ctx

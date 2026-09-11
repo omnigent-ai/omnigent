@@ -3,8 +3,8 @@
 Alongside the light/dark **mode** tiles, ``AppearanceSection``
 (``pages/SettingsPage.tsx``) renders a "Color theme" dropdown (a shadcn
 ``Select``) — one option per palette (Omnigent, Dracula, GitHub, Catppuccin,
-Gruvbox, Nord). Choosing one calls ``applyThemePalette`` (``lib/themePalette.ts``),
-which sets ``data-theme`` on ``<html>`` and persists the id to
+Gruvbox, Solarized, Nord). Choosing one calls ``applyThemePalette``
+(``lib/themePalette.ts``), which sets ``data-theme`` on ``<html>`` and persists the id to
 ``localStorage["omnigent:ui-theme-palette"]``. The default "Omnigent" palette
 carries no override, so choosing it removes the attribute and clears the key.
 
@@ -208,6 +208,36 @@ def test_color_palette_composes_with_dark_mode(
     # Both axes are live on <html> simultaneously.
     assert _data_theme(page) == "catppuccin", "palette override lost when switching to Dark"
     assert _html_has_dark(page), "dark class missing — the palette should compose with dark mode"
+
+
+def test_solarized_dark_uses_canonical_canvas(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Solarized is selectable and applies its canonical dark surface colors."""
+    page.emulate_media(color_scheme="light")
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+
+    _pick_palette(page, "Solarized")
+    dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
+    dark.click()
+    expect(dark).to_have_attribute("aria-checked", "true")
+
+    assert _data_theme(page) == "solarized"
+    assert _stored_palette(page) == '"solarized"'
+    tokens = page.evaluate(
+        "() => { const style = getComputedStyle(document.documentElement); "
+        "return Object.fromEntries(['background', 'card', 'primary'].map(name => "
+        "[name, style.getPropertyValue(`--${name}`).trim()])); }"
+    )
+    assert tokens == {
+        "background": "#002b36",
+        "card": "#073642",
+        "primary": "#268bd2",
+    }
+
+    page.reload()
+    expect(_color_theme_select(page)).to_contain_text("Solarized")
+    assert _data_theme(page) == "solarized"
+    assert _html_has_dark(page)
 
 
 def test_guided_custom_theme_applies_to_both_modes_and_persists(

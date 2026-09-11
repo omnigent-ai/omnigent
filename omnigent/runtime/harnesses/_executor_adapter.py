@@ -21,7 +21,8 @@ from typing import Any
 
 from fastapi import Response
 
-from omnigent.errors import ElicitationDeclinedError
+from omnigent.debug_logging import phase_scope
+from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -155,6 +156,7 @@ class ExecutorAdapter(HarnessApp):
         # reload. Dispatched calls never reach this — their ToolCallComplete
         # short-circuits — so it is observed-only.
         self._observed_tool_calls: dict[str, tuple[str, str]] = {}
+        self._pr_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """Drive the inner executor for one turn, translating its events to Omnigent SSE.
@@ -207,11 +209,12 @@ class ExecutorAdapter(HarnessApp):
         clean_exit = False
         self._dispatched_call_ids.clear()
         self._observed_tool_calls.clear()
+        self._pr_tool_calls.clear()
 
         tracing = is_tracing_enabled()
         from omnigent.runtime.telemetry import current_session_id, session_scope
 
-        turn_session_id = current_session_id() or self._session_key
+        turn_session_id = ctx.session_id or current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
             self._tracing_ctx = TracingContext(session_id=turn_session_id)
         tctx = self._tracing_ctx if tracing else None
@@ -236,7 +239,7 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            with session_scope(turn_session_id), trace_cm:
+            with session_scope(turn_session_id), phase_scope(ErrorPhase.TURN), trace_cm:
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
@@ -741,6 +744,7 @@ class ExecutorAdapter(HarnessApp):
             if tool_use_id is not None and event.metadata.get("internally_executed") is not True:
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
+            self._pr_tool_calls[call_id] = (event.name, event.args or {})
             bare_name = _strip_mcp_tool_prefix(event.name)
             arguments_json = _serialize_args(event.args)
             if event.metadata.get("observed_call_completed") is True:
@@ -787,6 +791,21 @@ class ExecutorAdapter(HarnessApp):
             # is what prevents a duplicate card. This mirrors how a dispatched call
             # re-emits completed once its dispatch resolves.
             observed = self._observed_tool_calls.pop(call_id, None)
+            pr_call = self._pr_tool_calls.pop(call_id, None)
+            if pr_call is not None:
+                from omnigent.runner.pr_observer import observe_tool_completion
+
+                session_id = ctx.session_id
+                if session_id:
+                    observe_tool_completion(
+                        session_id,
+                        tool_name=pr_call[0],
+                        arguments=pr_call[1],
+                        result=event.result,
+                        successful=event.status == "success",
+                        call_id=call_id,
+                        source="sdk",
+                    )
             if observed is not None:
                 observed_name, observed_args = observed
                 ctx.emit(

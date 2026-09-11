@@ -657,6 +657,67 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_uses_persisted_status_after_server_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recycled server keeps a native turn running from its durable status.
+
+    Native harness injection returns before the external turn completes, so the
+    runner's generic session endpoint can report ``idle`` while Codex is still
+    working. After a server restart clears the in-memory status cache, the
+    conversation row is the surviving relay truth and must win over that probe.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "bef42153ba7a4f2cb35350dc23b27c93"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_skills_cache.pop(session_id, None)
+
+    class _SkillsResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, list[Any]]:
+            return {"skills": []}
+
+    class _IdleRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _SkillsResponse()
+            raise AssertionError("persisted running status must avoid the idle runner probe")
+
+    runner_client = _IdleRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        live_status="running",
+    )
+
+    try:
+        snapshot = await _get_session_snapshot(
+            _ConversationStore([], conversations={session_id: conv}),  # type: ignore[arg-type]
+            session_id,
+        )
+        await _drain_runner_skills(session_id)
+    finally:
+        _mod._session_status_cache.pop(session_id, None)
+        _mod._runner_skills_cache.pop(session_id, None)
+
+    assert snapshot.status == "running"
+    status_calls = [url for url in runner_client.get_calls if not url.endswith("/skills")]
+    assert status_calls == []
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_defaults_idle_when_runner_unreachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

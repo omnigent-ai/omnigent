@@ -24,7 +24,7 @@ from ipaddress import ip_address
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 
 from omnigent.debug_logging import debug_event
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
@@ -751,11 +751,19 @@ async def _ping_loop(
         if elapsed is None:
             return
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
+            # Runner tunnel went silent past the liveness window: the runner or
+            # its network died, blocking sessions on it until it reconnects.
             _logger.warning(
                 "Runner %s missed %d ping intervals (%.0fs since last frame); declaring dead",
                 runner_id,
                 PING_MISS_THRESHOLD,
                 elapsed,
+                extra=debug_event(
+                    "runner_ping_timeout",
+                    error_category=ErrorCategory.RUNNER.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.UNKNOWN.value,
+                ),
             )
             try:
                 await ws.close(code=4003, reason="ping timeout")

@@ -129,6 +129,17 @@ _SANDBOX_CPU_LIMIT: str = "2"
 _SANDBOX_MEMORY_REQUEST: str = "1Gi"
 _SANDBOX_MEMORY_LIMIT: str = "4Gi"
 
+# Default ``sizeLimit`` on the writable-HOME emptyDir. An unbounded emptyDir
+# lives on the node's root filesystem (kubelet nodefs), so one sandbox that
+# fills its HOME (tool caches, clones, build output) pushes the whole node into
+# disk pressure and the kubelet then evicts by node-wide ranking — which can
+# kill a tiny, innocent Pod to reclaim space from the offender. With a
+# sizeLimit the kubelet evicts only the Pod that exceeded it. Overridable via
+# ``sandbox.kubernetes.home_size_limit`` (mirrored as a default in
+# omnigent.server.managed_hosts); an explicit ``null`` there restores the
+# unbounded behaviour.
+_HOME_SIZE_LIMIT_DEFAULT: str = "8Gi"
+
 # Labels stamped on every managed runner Pod + its token Secret, so an operator
 # (or a future reconciler) can select omnigent-managed objects for GC.
 _MANAGED_BY_LABEL: str = "app.kubernetes.io/managed-by"
@@ -383,7 +394,13 @@ def _resolve_pod_resources(resources: dict[str, object] | None) -> dict[str, dic
 
     Each tier and field is optional; an omitted field keeps the default. The
     config shape is validated at parse time, so this merge reads only the
-    recognized string fields.
+    recognized string fields: ``cpu``, ``memory`` and ``ephemeral-storage``.
+
+    ``ephemeral-storage`` has no built-in default: when it is not configured
+    the field is left unset so a namespace ``LimitRange`` can default it. When
+    it is set, the request lets the scheduler spread sandboxes by disk and the
+    limit makes the kubelet evict *only* a sandbox that exceeds it (an
+    unbounded Pod is otherwise evicted by node-wide ranking).
 
     :param resources: The configured block, or ``None`` for the defaults.
     :returns: A ``{"requests": {...}, "limits": {...}}`` mapping.
@@ -397,7 +414,7 @@ def _resolve_pod_resources(resources: dict[str, object] | None) -> dict[str, dic
     for tier in ("requests", "limits"):
         tier_cfg = resources.get(tier)
         if isinstance(tier_cfg, dict):
-            for field in ("cpu", "memory"):
+            for field in ("cpu", "memory", "ephemeral-storage"):
                 value = tier_cfg.get(field)
                 if value is not None:
                     resolved[tier][field] = str(value)
@@ -583,11 +600,13 @@ def build_job_manifest(
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     secret_mounts: Sequence[Mapping[str, object]] | None = None,
+    tolerations: Sequence[Mapping[str, object]] | None = None,
     agent_name: str | None = None,
     backoff_limit: int = _JOB_BACKOFF_LIMIT,
     active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
     ttl_seconds_after_finished: int = _JOB_TTL_SECONDS_AFTER_FINISHED,
     runtime_class: str | None = None,
+    home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
 ) -> dict[str, object]:
     """
     Build the sandbox Job manifest as a plain dict.
@@ -655,6 +674,10 @@ def build_job_manifest(
       the Pod onto a sandboxed container runtime the cluster provides via a
       ``RuntimeClass`` object (e.g. Kata Containers micro-VMs, gVisor). Unset
       keeps the cluster's default runtime — today's behaviour exactly.
+    - Operator *tolerations* become ``spec.tolerations`` verbatim, letting the
+      Pod land on a tainted NodePool dedicated to sandboxes. A toleration only
+      permits scheduling there — pair it with *node_selector* to also pin the
+      Pod to that pool, or it may just as well land anywhere else untainted.
 
     :param job_name: DNS-label-safe Job name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Job is created in.
@@ -689,6 +712,10 @@ def build_job_manifest(
     :param secret_mounts: Normalized Secret mounts (``{secret_name,
         mount_path}``) added as read-only ``secret`` volumes on the host
         container only, or ``None``.
+    :param tolerations: Normalized Toleration entries (``{key?, operator?,
+        value?, effect?, tolerationSeconds?}``) added to ``spec.tolerations``
+        verbatim, or ``None`` for none. Permits scheduling onto a tainted
+        NodePool; it does not by itself attract the Pod there.
     :param agent_name: Server-resolved built-in agent name the session runs,
         added as the ``omnigent.ai/agent`` classifier label. Stamped verbatim
         when it is already a valid label value, otherwise omitted (extending the
@@ -700,9 +727,16 @@ def build_job_manifest(
     :param active_deadline_seconds: Hard lifetime cap for the Job.
     :param runtime_class: ``RuntimeClass`` name set as ``spec.runtimeClassName``,
         or ``None`` to keep the cluster's default container runtime.
+    :param home_size_limit: ``sizeLimit`` quantity for the writable-HOME
+        ``emptyDir`` (default :data:`_HOME_SIZE_LIMIT_DEFAULT`), or ``None``
+        for an unbounded emptyDir. Bounding it makes the kubelet evict only a
+        sandbox that outgrows its HOME instead of ranking every Pod on the node.
     :returns: The Job manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
+    home_volume: dict[str, object] = {"name": "home", "emptyDir": {}}
+    if home_size_limit is not None:
+        home_volume["emptyDir"] = {"sizeLimit": home_size_limit}
     container_security = {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
@@ -851,7 +885,7 @@ def build_job_manifest(
             "fsGroupChangePolicy": "OnRootMismatch",
             "seccompProfile": {"type": "RuntimeDefault"},
         },
-        "volumes": [{"name": "home", "emptyDir": {}}, *pvc_volumes, *secret_volumes],
+        "volumes": [home_volume, *pvc_volumes, *secret_volumes],
         "initContainers": [init_container],
         "containers": [host_container],
     }
@@ -876,6 +910,10 @@ def build_job_manifest(
         # Opt-in only: an absent key (not an explicit None/null) keeps the
         # manifest byte-compatible with pre-runtime_class deployments.
         pod_spec["runtimeClassName"] = runtime_class
+    if tolerations:
+        # Opt-in only, same rationale as runtime_class above: an absent key
+        # keeps the manifest byte-compatible with pre-tolerations deployments.
+        pod_spec["tolerations"] = list(tolerations)
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1116,8 +1154,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
+        tolerations: Sequence[Mapping[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
+        home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1127,6 +1167,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         constructing the launcher is always safe (no cluster reachability
         required) and so tests can inject fakes before the real client is
         created.
+
+        :param home_size_limit: ``sizeLimit`` for the writable-HOME emptyDir
+            of every Pod, or ``None`` for an unbounded emptyDir (the caller
+            decides; ``sandbox.kubernetes.home_size_limit: null`` maps here).
         """
         self._image_ref = image
         self._namespace = namespace
@@ -1139,8 +1183,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
+        self._tolerations = list(tolerations) if tolerations else None
         self._pod_ready_timeout_s = pod_ready_timeout_s
         self._runtime_class = runtime_class
+        self._home_size_limit = home_size_limit
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
@@ -1431,8 +1477,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     resources=self._resources,
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
+                    tolerations=self._tolerations,
                     agent_name=agent_name,
                     runtime_class=self._runtime_class,
+                    home_size_limit=self._home_size_limit,
                 )
                 # Secret before Job so the Pod's secretKeyRef resolves
                 # immediately.

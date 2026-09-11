@@ -33,7 +33,7 @@ FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 # the (still-unbound) clone uses it to locate the source's local transcript
 # and clone it into the clone's OWN project dir under a freshly assigned
 # uuid (rewriting sessionId/cwd), then launch plain ``--resume <our_uuid>``
-# (see ``omnigent.claude_native._clone_claude_transcript`` and the
+# (see ``omnigent.harnesses.claude_native.main._clone_claude_transcript`` and the
 # fork-resume branch in ``omnigent.runner.app``), so the clone opens with
 # the prior history instead of a blank session. Once the clone captures its
 # OWN native session id (``external_session_id`` set on first launch), this
@@ -181,10 +181,18 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
 )
 
 # Source identity belongs only to the original imported session, and a fork is
-# born unarchived so it must not inherit its parent's archive time. Unlike
-# runtime instance labels, these survive an in-place agent switch but never a
-# fork.
-_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {ARCHIVED_AT_LABEL_KEY}
+# born unarchived so it must not inherit its parent's archive time. The sandbox
+# repository records what THIS session's sandbox was built from and a relaunch
+# re-clones from it, so a fork that asked for an empty sandbox would otherwise
+# have the source's repo re-cloned into it on the first relaunch; the fork's own
+# managed launch re-stamps whatever repository it resolves. The repo literal
+# mirrors the server's ``MANAGED_REPO_LABEL_KEY``; a store test cross-checks it
+# so a rename there fails loudly here. Unlike runtime instance labels, these
+# survive an in-place agent switch but never a fork.
+_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
+    ARCHIVED_AT_LABEL_KEY,
+    "omnigent.sandbox.repo",
+}
 
 
 @dataclass(frozen=True)
@@ -467,14 +475,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def find_imported_conversation(
+    def find_conversation_by_external_session_id(
         self,
-        source: str,
         external_session_id: str,
     ) -> Conversation | None:
-        """Find the original session imported from one external transcript.
+        """Find an existing conversation wrapping one external (harness) session id.
 
-        :param source: Import source key, e.g. ``"claude"``.
+        Both an imported transcript and a natively-run session record the
+        external id, so import dedup resolves against either through this one
+        lookup. When several rows share the id, the earliest-created wins.
+
         :param external_session_id: Source harness session id.
         :returns: The matching conversation, or ``None``.
         """
@@ -628,6 +638,12 @@ class ConversationStore(ABC):
         """
         Append items to a conversation. Assigns a globally unique
         ID and timestamp to each item.
+
+        An item carrying ``stable_id`` appends idempotently: its id is the
+        stable id, and when an item with that id already exists the stored
+        item is returned in its place — flagged ``deduplicated`` — instead
+        of inserting a duplicate. The existence check rides the append's
+        own transaction, so idempotency costs no extra query.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -816,6 +832,7 @@ class ConversationStore(ABC):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
@@ -862,6 +879,9 @@ class ConversationStore(ABC):
             variant — the override is set once at session create and
             immutable thereafter (the harness process is spawned on
             the first turn).
+        :param share_workspace_files: Whether view-level collaborators may
+            browse the workspace. ``True`` stores the share, ``False``
+            clears it (edit-only again), ``None`` leaves it unchanged.
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -1310,6 +1330,20 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        """
+        ...
+
+    @abstractmethod
+    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
+        """Atomically settle a stale running session to idle.
+
+        The update must require a bound runner, ``running``/``waiting`` live
+        status, and a missing or older ``runner_last_seen`` stamp. It must not
+        bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param stale_before: Runner stamps at or after this epoch are fresh.
+        :returns: Whether this call performed the transition.
         """
         ...
 

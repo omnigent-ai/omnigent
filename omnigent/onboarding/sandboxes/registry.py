@@ -37,6 +37,11 @@ class _WorkspaceHostLauncherFactory(Protocol):
         pass
 
 
+class _ServerUrlLauncherFactory(Protocol):
+    def __call__(self, *, server_url: str) -> SandboxHostLauncher:
+        pass
+
+
 class _ConfiguredLauncherFactory(Protocol):
     def __call__(self, *, config: object) -> SandboxHostLauncher:
         pass
@@ -152,6 +157,13 @@ def _builtin_contribution() -> SandboxProviderContribution:
             "boxlite": SandboxProviderMetadata(
                 name="boxlite",
                 launcher_class="omnigent.onboarding.sandboxes.boxlite:BoxliteSandboxLauncher",
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
+            "microsandbox": SandboxProviderMetadata(
+                name="microsandbox",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.microsandbox:MicrosandboxSandboxLauncher"
+                ),
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
             "cwsandbox": SandboxProviderMetadata(
@@ -300,6 +312,7 @@ def instantiate(
     name: str,
     *,
     workspace_host: str | None = None,
+    server_url: str | None = None,
     config: Mapping[str, object] | None = None,
 ) -> SandboxHostLauncher:
     """Import and instantiate a registered provider's launcher class.
@@ -307,6 +320,8 @@ def instantiate(
     :param name: Registered provider name.
     :param workspace_host: Optional Databricks workspace host passed
         to the Lakebox launcher constructor.
+    :param server_url: Optional CLI target passed to the microsandbox launcher
+        so it can scope guest-to-host access before provisioning.
     :param config: The provider's ``sandbox.<name>`` block, or ``None``.
         Only used when the provider declares a
         :attr:`SandboxProviderMetadata.config_model`: the block is
@@ -336,6 +351,9 @@ def instantiate(
     if name == "lakebox" and workspace_host is not None:
         launcher_factory = cast(_WorkspaceHostLauncherFactory, launcher_cls)
         return launcher_factory(workspace_host=workspace_host)
+    if name == "microsandbox" and server_url is not None:
+        launcher_factory = cast(_ServerUrlLauncherFactory, launcher_cls)
+        return launcher_factory(server_url=server_url)
     if meta.config_model is not None:
         # The docstring on `config_model` already describes it as validating
         # "the provider-specific `sandbox.<name>` config block"; this is the

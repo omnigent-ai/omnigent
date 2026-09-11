@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { Button } from "@/components/ui/button";
@@ -41,9 +42,12 @@ import {
   usePermissions,
   useRevokePermission,
 } from "@/hooks/usePermissions";
+import { useSession } from "@/hooks/useSession";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
+import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
@@ -59,22 +63,26 @@ const LEVEL_LABELS: Record<number, string> = {
 
 interface PermissionsModalProps {
   sessionId: string;
+  workspace?: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
-export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsModalProps) {
+export function PermissionsModal({
+  sessionId,
+  workspace,
+  open,
+  onOpenChange,
+}: PermissionsModalProps) {
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
   // server-side gate is the real enforcement point regardless.
   const info = useServerInfo();
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
-  // Both read-capped tiers present the read-only UI. Under
-  // "restricted_read_only" the server additionally blocks home/root-cwd
-  // sessions entirely; that per-session rule is enforced server-side and
-  // surfaces here as an error on the grant attempt.
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
+  const workspaceBlocked =
+    sharingMode === "restricted_read_only" && workspaceSharingBlocked(workspace);
   // Public (anyone-with-the-link) access is a separate server switch from the
   // sharing tiers; when off, hide the toggle (the server rejects the grant too).
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
@@ -90,6 +98,23 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
 
+  // Whether the owner shared the workspace files with view-level collaborators.
+  // Read from the (shared-cache) session snapshot; the toggle PATCHes it and
+  // invalidates the snapshot so the rail's file surfaces appear/disappear.
+  const { session } = useSession(open && !sharingOff ? sessionId : null);
+  const queryClient = useQueryClient();
+  const shareWorkspace = useMutation({
+    mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+  // Only a session with a workspace on disk has files to share; a plain
+  // chat agent has none, so the toggle would be inert — hide it there.
+  const hasWorkspace = !!session?.workspace;
+  const workspaceShared = session?.shareWorkspaceFiles ?? false;
+
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
   const isPublic = !!publicGrant;
@@ -97,7 +122,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
   function handleGrant(e: FormEvent) {
     e.preventDefault();
     const trimmed = newUserId.trim();
-    if (!trimmed) return;
+    if (!trimmed || workspaceBlocked) return;
     setError(null);
     grant.mutate(
       { userId: trimmed, level: parseInt(newLevel, 10) },
@@ -119,11 +144,13 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
   }
 
   function handleChangeLevel(userId: string, level: number) {
+    if (workspaceBlocked) return;
     setError(null);
     grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
   }
 
   function handlePublicToggle(checked: boolean) {
+    if (checked && workspaceBlocked) return;
     setError(null);
     if (checked) {
       grant.mutate({ userId: PUBLIC_USER, level: 1 }, { onError: (err) => setError(err.message) });
@@ -161,10 +188,20 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
-          <DialogDescription>
-            {sharingReadOnly
-              ? "This server allows read-only sharing — invite others to view this session."
-              : "Invite others to view or collaborate on this session."}
+          <DialogDescription asChild>
+            <div className="space-y-3">
+              <p>
+                {sharingReadOnly
+                  ? "This server allows read-only sharing — invite others to view this session."
+                  : "Invite others to view or collaborate on this session."}
+              </p>
+              {sharingReadOnly && (
+                <p>
+                  Please be careful when sharing. Read access will allow for reading of all session
+                  outputs.
+                </p>
+              )}
+            </div>
           </DialogDescription>
         </DialogHeader>
 
@@ -178,8 +215,35 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             <Switch
               checked={isPublic}
               onCheckedChange={handlePublicToggle}
-              disabled={grant.isPending || revoke.isPending}
+              disabled={grant.isPending || revoke.isPending || (workspaceBlocked && !isPublic)}
               componentId="diagnostics.permissions.public_toggle"
+            />
+          </div>
+        )}
+
+        {/* Workspace-files toggle — off by default so a view-only share never
+            leaks the session's files (which routinely hold secrets). Only the
+            file surfaces open up; edit collaborators already have them. Shown
+            only for sessions that actually have a workspace on disk. */}
+        {hasWorkspace && (
+          <div
+            className="flex items-center justify-between rounded-lg border px-3 py-2"
+            data-testid="share-workspace-files"
+          >
+            <div>
+              <p className="text-ui font-medium">Workspace files</p>
+              <p className="text-sm text-muted-foreground">
+                Let people with view access browse this session's files
+              </p>
+            </div>
+            <Switch
+              checked={workspaceShared}
+              onCheckedChange={(checked) => {
+                setError(null);
+                shareWorkspace.mutate(checked);
+              }}
+              disabled={shareWorkspace.isPending}
+              componentId="diagnostics.permissions.share_workspace_toggle"
             />
           </div>
         )}
@@ -259,6 +323,13 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             Grant
           </Button>
         </form>
+
+        {workspaceBlocked && (
+          <p className="text-sm text-destructive">
+            This session&apos;s working directory (a home or root directory) cannot be shared on
+            this Omnigent server.
+          </p>
+        )}
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 

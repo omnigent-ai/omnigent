@@ -860,6 +860,20 @@ Content-Type: application/json
   }
 }
 
+The encoded request-body limit is 10 MiB. The request may also be a top-level
+JSON array of 1-100 events:
+
+[
+  {"type": "external_conversation_item", "data": {"source_id": "record-1", ...}},
+  {"type": "external_conversation_item", "data": {"source_id": "record-2", ...}}
+]
+
+Batch entries are processed in order and each entry uses the same
+`SessionEventInput` contract described below. A batch response is a JSON array
+of acknowledgements in the corresponding order. Batch processing is not
+atomic: if a later event fails, earlier events may already have completed.
+Retrying source-keyed `external_conversation_item` events is idempotent.
+
 Request body matches `SessionEventInput`:
 
   type (string, required)
@@ -984,6 +998,7 @@ Request body matches `SessionEventInput`:
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
+[{"queued": false, "item_id": "item_..."}, ...] # top-level event array
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
 404 Not Found — no session with that id
@@ -1089,22 +1104,63 @@ Request body matches `SessionForkRequest`:
     source's full native transcript. When null or omitted, the full
     history is copied.
 
+  host_type (string, "external" | "managed", default "external")
+    How the fork's host is obtained. `"external"` (the default, and
+    the pre-existing behavior): the fork is created unbound and the
+    caller binds compute afterwards. `"managed"`: the SERVER
+    provisions a sandbox host for the fork from its `sandbox:`
+    config, exactly as a `host_type: "managed"` create does — same
+    background launch, same `host_id` / `workspace` null in this
+    response until the sandbox host registers. The sandbox is
+    registered to the FORKING caller, so it resolves that user's
+    credentials, never the source session owner's.
+
+  sandbox_provider (string | null, optional)
+    Which configured sandbox provider to provision (one of the
+    server's `sandbox_providers`); null takes the server's first.
+    Only valid with `host_type: "managed"` (422 otherwise).
+
+  workspace (string | null, optional)
+    Git repository URL, optionally `#<branch>`, cloned into the
+    fork's sandbox as its working directory. Omitting the field
+    inherits the repository the source session recorded, so cloning
+    a sandbox session lands the fork in the same checkout; an
+    explicit null gives the fork an empty sandbox. Only valid with
+    `host_type: "managed"` (422 otherwise) — an external fork's
+    directory is chosen when it binds a host.
+
+    The source's recorded-repository label is never copied onto the
+    fork: the fork records whichever repository it actually resolved
+    (none, for an empty sandbox or an external fork), so a later
+    sandbox relaunch re-clones the fork's own repository rather than
+    the source's.
+
 201 Created — body matches `SessionResponse` (status "idle",
   items are the deep-copied items from the source session).
 
 400 Bad Request — source session is a sub-agent session, has
-  no agent binding, or up_to_response_id names no response in
-  the source session
+  no agent binding, up_to_response_id names no response in
+  the source session, or a managed fork asks for a sandbox this
+  server has not configured
 404 Not Found — no session with that source_id, or the source's
   agent row is missing
+422 Unprocessable Entity — sandbox_provider / workspace without
+  `host_type: "managed"`, or a managed workspace that is not a
+  repository URL
 ```
 
 Creates a new session by deep-copying every item from the source
 session. The server also clones the source's agent (new agent ID,
 same bundle and config) so the fork can be reconfigured independently.
-The forked session is **not** bound to a runner — clients must
-`PATCH /v1/sessions/{id}` with `runner_id` before posting events,
-the same way they bind a runner after resuming an existing session.
+Unless `host_type: "managed"` is requested, the forked session is
+**not** bound to a runner — clients must `PATCH /v1/sessions/{id}`
+with `runner_id` before posting events, the same way they bind a
+runner after resuming an existing session.
+
+The fork's bound agent is always that session-scoped clone, never the
+built-in it derives from. A managed fork's runner therefore carries no
+built-in agent classifier, so an admission policy keyed on one does not
+match it.
 
 The response is a full `SessionResponse` snapshot of the fork — same
 shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
@@ -1214,12 +1270,18 @@ multiplexes them; the per-response stream emits them directly.
 | `response.client_task.cancel` | `ClientTaskCancelEvent` |
 | `response.heartbeat` | `HeartbeatEvent` |
 | `response.elicitation_request` | `ElicitationRequestEvent` |
+| `response.elicitation_resolved` | `ElicitationResolvedEvent` |
 
 See the per-class docstring in `omnigent/server/schemas.py` for
 the canonical wire shape and field types of each `response.*` event.
 When a child/sub-agent elicitation is mirrored into an ancestor stream,
 `response.elicitation_request.params.target_session_id` is the child
 session whose resolve endpoint must receive the verdict.
+`response.elicitation_resolved` carries `action` when a human verdict
+settled the prompt (answered in another tab, the inbox, or the approve
+page) and `reason: "unanswered"` when the hook stopped waiting before
+anyone answered; a clear with neither means the prompt was answered
+in the native terminal, where the verdict is not observable.
 
 ### Reconnect Contract
 

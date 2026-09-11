@@ -32,11 +32,10 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
 )
-from omnigent.env_credentials import expand_envvars_with_omnigent_prefix
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms import Client as LLMClient
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.onboarding.databricks_config import (
     get_workspace_url_for_profile,
 )
@@ -87,6 +86,7 @@ from omnigent.spec.types import (
     RetryPolicy,
 )
 from omnigent.stores import ConversationStore
+from omnigent.util.env_credentials import expand_envvars_with_omnigent_prefix
 
 # ── Module-level constants ────────────────────────────────────
 
@@ -564,7 +564,7 @@ def configure_agent_harness_with_provider(
         )
     if entry.kind == BEDROCK_KIND:
         # Bedrock mode is wired only into the native ``omnigent claude`` launch
-        # (:func:`omnigent.claude_native._bedrock_config_for_native_claude`),
+        # (:func:`omnigent.harnesses.claude_native.main._bedrock_config_for_native_claude`),
         # which sets CLAUDE_CODE_USE_BEDROCK + AWS_BEARER_TOKEN_BEDROCK directly.
         # The in-process / gateway harnesses have no Bedrock path, so emitting
         # the generic ``HARNESS_*_GATEWAY_*`` vars would silently point the
@@ -913,7 +913,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     (:func:`default_provider_for_harness`), so when that default is a
     ``cli-config`` Databricks AI Gateway, this path must route it rather than
     fail loud. We reuse the pi-native translation
-    (:func:`omnigent.pi_native_credentials._cli_config_pi_provider`) — which
+    (:func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`) — which
     reads the codex ``[model_providers.X]`` transport, rewrites the base URL to
     the gateway's Anthropic Messages surface (``/anthropic``) Pi speaks
     natively, and builds the per-request bearer-token ``!command`` apiKey — then
@@ -931,7 +931,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     """
     # Imported lazily: pi_native_credentials is on the runner's session-create
     # hot path and pulls onboarding-only deps; keep this off workflow import.
-    from omnigent.pi_native_credentials import _cli_config_pi_provider
+    from omnigent.harnesses.pi_native.credentials import _cli_config_pi_provider
 
     # The spec model (if any) is already in HARNESS_PI_MODEL; thread it so the
     # gateway translation honors an explicit override, else its default.
@@ -1529,6 +1529,7 @@ def _build_acp_cli_spawn_env(
     harness: str,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
 
@@ -1563,6 +1564,10 @@ def _build_acp_cli_spawn_env(
     env = {
         "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,
+        # Rows whose CLI doesn't yet support session-scoped MCP and ignores
+        # session/new mcpServers (e.g. jcode) opt out of advertising the
+        # Omnigent MCP server.
+        "HARNESS_ACP_OMNIGENT_MCP": "1" if row.omnigent_mcp else "0",
     }
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
@@ -1577,6 +1582,30 @@ def _build_acp_cli_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
+
+    # Managed-connect support for jcode: point it at a session-private JCODE_HOME
+    # (with a config.toml pinning the gateway provider) + a fresh broker bearer. A
+    # no-op when not connected (connect_jcode_gateway_env returns None), and — like the
+    # other connect harnesses — suppressed when the spec configures its own API key, so
+    # an explicit key is never silently rerouted through the owner's gateway.
+    if harness == "jcode":
+        from omnigent.host.databricks_credential import api_key_auth_precludes_broker
+        from omnigent.host.jcode_databricks import connect_jcode_gateway_env
+
+        gateway_env = (
+            None
+            if api_key_auth_precludes_broker(spec)
+            else connect_jcode_gateway_env(session_id=session_id)
+        )
+        if gateway_env is not None:
+            env.update(gateway_env)
+            # The ACP wrap forwards only passthrough-named vars to the jcode subprocess,
+            # so name every managed-connect var (JCODE_DBX_TOKEN / JCODE_HOME /
+            # JCODE_RUNTIME_DIR). Preserve any existing value, dedupe, and join.
+            existing = env.get("HARNESS_ACP_ENV_PASSTHROUGH", "").split(",")
+            names = {n.strip() for n in existing if n.strip()} | set(gateway_env)
+            env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(sorted(names))
+
     return env
 
 

@@ -1962,6 +1962,12 @@ class SessionResponse(BaseModel):
         a row created before this became explicit inherits nothing.
         Stamped ``"on"`` at create for Smart Routing sessions; also set
         via ``PATCH /v1/sessions/{id}``.
+    :param share_workspace_files: Whether the owner opted into letting
+        view-level collaborators browse the workspace (Files/Changes/GitHub
+        surfaces). ``False`` by default — read grants share the conversation
+        only. The web share dialog reads this to render the toggle, and the
+        rail reads it to decide whether to mount the file surfaces for a
+        view-only viewer.
     :param context_window: The model's context window size in tokens
         as looked up server-side from litellm's registry (or from the
         ``AP_CONTEXT_WINDOW_OVERRIDE`` env var), e.g. ``200_000``.
@@ -2118,6 +2124,7 @@ class SessionResponse(BaseModel):
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    share_workspace_files: bool = False
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -2224,6 +2231,13 @@ class UpdateSessionRequest(BaseModel):
         presence-is-the-clear-signal rule as
         ``cost_control_mode_override``). Effective on the next spawn, so
         it can be changed at any point in a session.
+    :param share_workspace_files: Opt-in that lets people with *view*
+        (read-only) access browse the session's workspace files. ``True``
+        turns sharing on, ``False`` turns it off (back to edit-only, the
+        default), ``None`` leaves it unchanged. Manage-gated — it sits with
+        the grant/revoke and public-access controls that decide who can see
+        the session. Never widens absolute-path browsing, which stays
+        owner-only.
     :param external_session_id: Runtime-native session id captured
         by a wrapper bridge (e.g. Claude Code's session uuid for
         ``omnigent claude`` sessions). Idempotent on same-value
@@ -2270,6 +2284,7 @@ class UpdateSessionRequest(BaseModel):
     approval_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    share_workspace_files: bool | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
@@ -2474,6 +2489,24 @@ class SessionForkRequest(BaseModel):
         stamps ``omnigent.codex_native.bypass_sandbox`` on the fork; ``False``
         / omitted leaves the fork in Codex's normal approval/sandbox stance.
         Only meaningful for a codex-native target; ignored otherwise.
+    :param host_type: How the fork's host is obtained — ``"external"``
+        (the default: the caller binds one afterwards, via
+        ``POST /v1/hosts/{host_id}/runners`` from the web dialog or
+        ``PATCH /v1/sessions/{id}`` from the REPL) or ``"managed"`` (the
+        server provisions a sandbox host for the fork, the same
+        background launch a ``host_type: "managed"`` create schedules).
+    :param sandbox_provider: Which configured sandbox provider to
+        provision on ``host_type: "managed"`` (one of the server's
+        ``sandbox_providers``); ``None`` takes the server's first. Only
+        valid with ``host_type: "managed"``.
+    :param workspace: Git repository URL (optionally ``#<branch>``) the
+        server clones into the fork's sandbox as its working directory,
+        e.g. ``"https://github.com/org/repo#release-1.2"``. **Omitting**
+        the field inherits the repository the source session recorded, so
+        cloning a sandbox session lands the fork in the same checkout; an
+        explicit value overrides it and an explicit ``null`` gives the
+        fork an empty sandbox. Only valid with ``host_type: "managed"`` —
+        an external fork's directory is chosen when it binds a host.
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -2483,8 +2516,57 @@ class SessionForkRequest(BaseModel):
     reasoning_effort: str | None = None
     terminal_launch_args: list[str] | None = None
     codex_bypass_sandbox: bool = False
+    host_type: Literal["external", "managed"] = "external"
+    sandbox_provider: str | None = None
+    workspace: str | None = None
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_managed_fork_fields(self) -> Self:
+        """
+        Enforce the per-``host_type`` contract for a fork.
+
+        Mirrors :meth:`_SessionCreateRequestBase._check_managed_host_fields`:
+        a managed fork's ``workspace``, when given, must be a git repository
+        URL (optionally ``#<branch>``) the server clones into the sandbox —
+        a filesystem path points at nothing in a sandbox that doesn't exist
+        yet. Both ``sandbox_provider`` and ``workspace`` are meaningless on
+        an external fork, which picks its host and directory afterwards.
+        Failing at validation returns a 422 with the field named instead of
+        silently ignoring the caller's intent.
+
+        :returns: The validated instance.
+        :raises ValueError: On a managed workspace that isn't a valid
+            repository URL, or ``sandbox_provider`` / ``workspace`` without
+            ``host_type: "managed"``.
+        """
+        # Lazy import: schemas is imported by nearly every module, so
+        # pulling the (FastAPI/click-importing) managed-hosts module in
+        # at module scope would risk import cycles.
+        from omnigent.server.managed_hosts import parse_repo_workspace
+
+        if self.host_type == "managed":
+            if self.workspace is not None:
+                try:
+                    parse_repo_workspace(self.workspace)
+                except ValueError as exc:
+                    raise ValueError(
+                        "host_type 'managed' takes a git repository URL "
+                        f"(optionally '#<branch>') as workspace: {exc}"
+                    ) from exc
+            return self
+        if self.sandbox_provider is not None:
+            raise ValueError(
+                "sandbox_provider only applies to host_type 'managed' — "
+                "external hosts are not server-provisioned"
+            )
+        if self.workspace is not None:
+            raise ValueError(
+                "workspace only applies to host_type 'managed' — an external "
+                "fork picks its directory when it binds a host"
+            )
+        return self
 
 
 class ReadStatePutRequest(BaseModel):
@@ -4049,11 +4131,18 @@ class ElicitationResolvedEvent(_SSEEventBase):
         without a verdict — timeout, severed wait, or a runner
         that predates verdict carriage — so consumers can say "no
         verdict was recorded" rather than guessing one.
+    :param reason: Why a verdict-less resolution happened, when
+        known. ``"unanswered"``: the hook stopped waiting (a severed
+        poll never re-parked, the ask timed out) before anyone
+        answered, so the prompt is gone rather than decided and the
+        UI can say so instead of implying it was resolved elsewhere.
+        ``None`` when a verdict is present or the reason is unknown.
     """
 
     type: Literal["response.elicitation_resolved"]
     elicitation_id: str
     action: Literal["accept", "decline", "cancel"] | None = None
+    reason: Literal["unanswered"] | None = None
 
 
 class PolicyDeniedEvent(_SSEEventBase):
@@ -4293,10 +4382,20 @@ class CompactionInProgressEvent(_SSEEventBase):
     compaction step runs so clients can render a "summarizing
     history…" indicator. Wire shape matches ``compaction.py:765``.
 
+    A long compaction is announced repeatedly (once per status poll), so
+    clients must treat every event carrying the same ``started_at`` as one
+    compaction — refreshing their indicator rather than stacking another.
+
     :param type: Always ``"response.compaction.in_progress"``.
+    :param started_at: Unix epoch timestamp (seconds) when this compaction
+        was first reported in progress. Stable across repeated progress
+        events for the same compaction, so clients can anchor an elapsed
+        counter to the true start — including after a page reload. ``None``
+        when the emitter does not track it.
     """
 
     type: Literal["response.compaction.in_progress"]
+    started_at: int | None = None
 
 
 class CompactionCompletedEvent(_SSEEventBase):

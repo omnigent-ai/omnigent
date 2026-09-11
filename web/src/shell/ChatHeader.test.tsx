@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -54,6 +55,8 @@ const mobileMenu = {
   onOpenChanges: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
+  githubPanelOpen: false,
+  onOpenGithub: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
@@ -69,14 +72,17 @@ function renderHeader(props: {
   boundAgent?: Agent;
   wrapperLabel?: string | null;
   canShare?: boolean;
+  canFork?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
   showFilesPanel?: boolean;
+  pending?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
+  onFork?: () => void;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -99,9 +105,11 @@ function renderHeader(props: {
             boundAgent={props.boundAgent}
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
+            canFork={props.canFork ?? false}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
+            onFork={props.onFork ?? (() => {})}
             hasAgentInfo={props.hasAgentInfo ?? false}
             onAgentInfo={() => {}}
             hasHeaderMenu={props.hasHeaderMenu ?? false}
@@ -109,6 +117,7 @@ function renderHeader(props: {
             hasRailContent={props.hasRailContent ?? true}
             rightPanelOpen={false}
             onToggleRightPanel={() => {}}
+            pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
           />
         </TooltipProvider>
@@ -166,6 +175,38 @@ describe("ChatHeader — deployed Share presentation", () => {
   });
 });
 
+describe("ChatHeader — pending session presentation", () => {
+  it("shows the full desktop control shell disabled while Workspace remains available", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "temp:12345678",
+      conversationTitle: "Inspect the workspace",
+      pending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Add to project" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Agent tools and policies" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Chat view" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Terminal view" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Share session" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeEnabled();
+  });
+
+  it("collapses pending controls into one disabled mobile actions button", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "temp:12345678",
+      conversationTitle: "Inspect the workspace",
+      pending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Session actions" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Share session" })).toBeNull();
+  });
+});
+
 describe("ChatHeader — workspace pane alignment", () => {
   it("uses the desktop workspace offset without changing the mobile inset", () => {
     const { container } = renderHeader({ sidebarOpen: true });
@@ -206,6 +247,41 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
       expect(onOpenSidebar).not.toHaveBeenCalledWith(true);
       fireEvent.click(toggle);
       expect(onOpenSidebar).toHaveBeenLastCalledWith(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("suppresses the hover tooltip once the dwell fires the peek", () => {
+    // The peek card fades in click-through, so the pointer keeps resting on the
+    // toggle past the tooltip's own delay. The peek is the intended hover
+    // reveal, so its "Open sidebar" tooltip must not also pop over the card.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.pointerEnter(toggle);
+      // Past the 400ms peek dwell and the tooltip's 600ms hover delay.
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.queryByRole("tooltip", { name: "Open sidebar" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still shows the tooltip on keyboard focus (no peek armed)", () => {
+    // Focus never arms a peek, so the tooltip stays available for a11y.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.focus(toggle);
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.getByRole("tooltip", { name: "Open sidebar" })).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
@@ -403,56 +479,44 @@ function makeTerminalFirstCtx(
  * mounts. QueryClientProvider covers AgentInfoButton's react-query hooks; it
  * self-hides here (no agent info), leaving the toggle as the asserted control.
  */
-function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
+function renderHeaderWithSession(
+  ctx: TerminalFirstContextValue | null,
+  overrides: Partial<ComponentProps<typeof ChatHeader>> = {},
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const header = (
+    <ChatHeader
+      sidebarOpen
+      onOpenSidebar={() => {}}
+      isChildSession={false}
+      conversationId="sess-1"
+      conversationTitle={null}
+      projectName={null}
+      boundAgent={undefined}
+      wrapperLabel={null}
+      canShare={false}
+      canFork={false}
+      onShare={() => {}}
+      onFork={() => {}}
+      hasAgentInfo={false}
+      onAgentInfo={() => {}}
+      hasHeaderMenu={false}
+      showFilesPanel={false}
+      hasRailContent={false}
+      rightPanelOpen={false}
+      onToggleRightPanel={() => {}}
+      mobileMenu={mobileMenu}
+      {...overrides}
+    />
+  );
   return render(
     <MemoryRouter initialEntries={["/c/sess-1"]}>
       <QueryClientProvider client={qc}>
         <TooltipProvider>
           {ctx ? (
-            <TerminalFirstContextProvider value={ctx}>
-              <ChatHeader
-                sidebarOpen
-                onOpenSidebar={() => {}}
-                isChildSession={false}
-                conversationId="sess-1"
-                conversationTitle={null}
-                projectName={null}
-                boundAgent={undefined}
-                wrapperLabel={null}
-                canShare={false}
-                onShare={() => {}}
-                hasAgentInfo={false}
-                onAgentInfo={() => {}}
-                hasHeaderMenu={false}
-                showFilesPanel={false}
-                hasRailContent={false}
-                rightPanelOpen={false}
-                onToggleRightPanel={() => {}}
-                mobileMenu={mobileMenu}
-              />
-            </TerminalFirstContextProvider>
+            <TerminalFirstContextProvider value={ctx}>{header}</TerminalFirstContextProvider>
           ) : (
-            <ChatHeader
-              sidebarOpen
-              onOpenSidebar={() => {}}
-              isChildSession={false}
-              conversationId="sess-1"
-              conversationTitle={null}
-              projectName={null}
-              boundAgent={undefined}
-              wrapperLabel={null}
-              canShare={false}
-              onShare={() => {}}
-              hasAgentInfo={false}
-              onAgentInfo={() => {}}
-              hasHeaderMenu={false}
-              showFilesPanel={false}
-              hasRailContent={false}
-              rightPanelOpen={false}
-              onToggleRightPanel={() => {}}
-              mobileMenu={mobileMenu}
-            />
+            header
           )}
         </TooltipProvider>
       </QueryClientProvider>
@@ -526,18 +590,23 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(toggle).toHaveClass("size-10");
   });
 
-  it("insets the pill's leading edge for the Chat/Terminal track", () => {
-    // The track paints its own background to its edge, so with the pill's
-    // zero padding it sat flush against the border while an icon-only
-    // neighbour cleared it by the slack in its 40px box. The inset is
-    // conditional: a lone kebab must stay the 40px circle asserted above.
+  it("folds the Chat/Terminal switch into the header kebab on mobile", () => {
+    // The narrow mobile header can't carry the segmented track beside the "…"
+    // menu, so the track is dropped and the switch rides inside the kebab.
     isMobileMock.mockReturnValue(true);
-    renderHeaderWithSession(makeTerminalFirstCtx());
+    renderHeaderWithSession(makeTerminalFirstCtx(), {
+      // terminalFirst surfaces the fallback kebab even without other actions.
+      mobileMenu: { ...mobileMenu, terminalFirst: true },
+    });
 
-    const cluster = screen.getByTestId("view-mode-toggle").parentElement;
-    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:pl-1.5");
-    // The guard keys off the track's own data-slot, so it has to be present.
-    expect(screen.getByTestId("view-mode-toggle")).toHaveAttribute("data-slot", "view-mode-toggle");
+    // The segmented track is gone on mobile.
+    expect(screen.queryByTestId("view-mode-toggle")).toBeNull();
+
+    // Opening the kebab reveals the Chat/Terminal entries.
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("session-actions-menu"));
+    expect(screen.getByTestId("view-mode-menu-chat")).toBeInTheDocument();
+    expect(screen.getByTestId("view-mode-menu-terminal")).toBeInTheDocument();
   });
 
   it("rounds the kebab's own background so no square shows inside the pill", () => {
@@ -700,6 +769,30 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getByTestId("session-actions-menu")).toBeInTheDocument();
   });
 
+  it("keeps the desktop fallback menu limited to Fork", () => {
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: null,
+      canFork: true,
+      hasAgentInfo: true,
+      hasRailContent: true,
+      showFilesPanel: true,
+      onFork,
+    });
+
+    const trigger = screen.getByTestId("desktop-fork-actions-menu");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Fork",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(onFork).toHaveBeenCalledOnce();
+  });
+
   it("folds the workspace-rail entries into the one mobile kebab", () => {
     // Previously a second `PanelRight` trigger sat beside the kebab; the rail
     // entries now ride in the same menu, so a phone has a single trigger.
@@ -718,13 +811,22 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
+    // textContent includes it but it's invisible; the labels are what matters.
+    const svgTitleText = (el: Element) =>
+      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
+    expect(
+      screen
+        .getAllByRole("menuitem")
+        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
+    ).toEqual([
       "Pin",
       "Rename",
       "Mark as unread",
       "Add to project",
       "Files",
       "Changes",
+      "GitHub",
       "Agents1",
       "Archive",
       "Delete",
