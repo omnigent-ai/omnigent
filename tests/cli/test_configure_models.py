@@ -53,6 +53,8 @@ from omnigent.onboarding.configure_models import (
     add_menu_options_for_family,
     build_bedrock_provider_entry,
     credential_label,
+    key_provider_endpoint,
+    key_providers,
     kind_glyph,
     provider_display_name,
 )
@@ -766,6 +768,16 @@ def test_provider_display_name_friendly(provider: str, expected: str) -> None:
     of "xAI").
     """
     assert provider_display_name(provider) == expected
+
+
+def test_atlascloud_is_an_openai_compatible_key_provider() -> None:
+    """Atlas appears in the key picker with its own Chat Completions route."""
+    assert "atlascloud" in key_providers()
+    assert provider_display_name("atlascloud") == "Atlas Cloud"
+    endpoint = key_provider_endpoint("atlascloud")
+    assert endpoint is not None
+    assert endpoint.base_url == "https://api.atlascloud.ai/v1"
+    assert endpoint.wire_api == "chat"
 
 
 def test_configure_models_add_subscription_via_flat_menu(isolated_config) -> None:
