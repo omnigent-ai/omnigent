@@ -474,15 +474,10 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     : children;
 
   return (
-    <div className={cn("relative", wrap && "chat-code-wrap")}>
+    <div className={cn("chat-code-block relative", wrap && "chat-code-wrap")}>
       {block}
-      {/* Overlay actions, anchored left of Streamdown's own download button
-          (which sits at the header's right edge). The py-1 padding plus a 1px
-          transparent top/bottom border match the height of Streamdown's action
-          pill (which has border + py-1) so our buttons land on the same line;
-          the border is y-only so it doesn't add horizontal width that would
-          push the row away from the pill. The -mr-1.5 pull tightens the gap so
-          the row reads as one continuous set of controls. */}
+      {/* Match Streamdown's action-pill height and reserve its rightmost slot
+          for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
