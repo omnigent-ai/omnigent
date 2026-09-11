@@ -6417,7 +6417,10 @@ export function NewChatLandingScreen() {
             />
           </form>
           <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
-            <DialogContent className="max-w-[min(64rem,calc(100vw-2rem))] border-0 bg-transparent p-0 shadow-none sm:max-w-[min(64rem,calc(100vw-2rem))]">
+            <DialogContent
+              showCloseButton={false}
+              className="max-w-[min(64rem,calc(100vw-2rem))] border-0 bg-transparent p-0 shadow-none sm:max-w-[min(64rem,calc(100vw-2rem))]"
+            >
               <DialogHeader className="sr-only">
                 <DialogTitle>Select working directory</DialogTitle>
                 <DialogDescription>Choose a folder for the new session.</DialogDescription>
