@@ -122,10 +122,16 @@ _POLL_S = 1.0
 # retried config fetch, then the tmux terminal + forwarder wiring; generous for CI.
 _LAUNCH_TIMEOUT_S = 180.0
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("tmux") is None,
-    reason="codex-native terminals run inside tmux; tmux not installed",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        shutil.which("tmux") is None,
+        reason="codex-native terminals run inside tmux; tmux not installed",
+    ),
+    pytest.mark.skipif(
+        shutil.which("codex") is None,
+        reason="the recovered launch starts the codex CLI; codex not installed",
+    ),
+]
 
 
 def _find_free_port() -> int:
