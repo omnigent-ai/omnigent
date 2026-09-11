@@ -1990,6 +1990,18 @@ async def _resolve_elicitation(
     # resolve when the canonical approval event reaches the runner.
     await _forward_approval_to_runner(session_id, data, runner_router)
 
+    # A dead sub-agent runner plus a server restart orphans the persisted
+    # pending count: the in-memory index is empty, so ``resolve`` above no-ops
+    # and ``_on_runner_connect`` never fires for a runner that never returns.
+    # With no runner reachable, persist the authoritative live count so
+    # answering clears the stuck "Needs response" badge; a reachable runner's
+    # own tunnel replica owns that write, so leave it untouched.
+    if isinstance(elicitation_id, str) and elicitation_id:
+        if await _get_runner_client(session_id, runner_router) is None:
+            session_live_state.persist_pending_count(
+                session_id, pending_elicitations.count_for(session_id)
+            )
+
 
 def _spawn_native_approval_popup_forward(
     session_id: str, elicitation_id: str, message: str, policy_name: str | None = None
