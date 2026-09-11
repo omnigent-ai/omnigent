@@ -2522,6 +2522,19 @@ async function pickWorkspaceForBridge(win, workspaces) {
     }
     console.warn(`[omnigent] databricks workspace picker: override ${pref} not in the account's workspaces`);
   }
+  // MVP picker: a native message box only works for a short list. A searchable
+  // list picker (like genie-one-desktop's WorkspacePicker) is the follow-up. For
+  // a long list, refuse rather than render hundreds of buttons — point the tester
+  // at the override instead.
+  const MAX_BUTTONS = 8;
+  if (workspaces.length > MAX_BUTTONS) {
+    const sample = workspaces.slice(0, 5).map((w) => w.fqdn);
+    throw new Error(
+      `${workspaces.length} workspaces is too many for the MVP picker. Set ` +
+        `OMNIGENT_DATABRICKS_WORKSPACE_ORIGIN to one, e.g. https://${sample[0]} ` +
+        `(sample: ${sample.join(", ")} …)`,
+    );
+  }
   const buttons = [...workspaces.map((w) => w.name), "Cancel"];
   const { response } = await dialog.showMessageBox(win, {
     type: "question",
