@@ -1482,7 +1482,7 @@ async def test_hosts_api_flags_hosts_older_than_the_server(
     the web notice never fires on a host that is up to date or unknown.
     """
     app, registry, _hs, _cs = host_api_app
-    _comm = await _connect_host(app, registry, version=version)
+    comm = await _connect_host(app, registry, version=version)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         listing = await client.get("/v1/hosts")
         single = await client.get(f"/v1/hosts/{_HOST_ID}")
@@ -1491,3 +1491,4 @@ async def test_hosts_api_flags_hosts_older_than_the_server(
     assert (row["version"], row["outdated"]) == (version, outdated)
     assert single.status_code == 200
     assert (single.json()["version"], single.json()["outdated"]) == (version, outdated)
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
