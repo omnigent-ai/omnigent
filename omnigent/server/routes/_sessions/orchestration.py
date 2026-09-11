@@ -6037,6 +6037,14 @@ async def _dispatch_session_event_to_runner_impl(
             if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
             else None
         )
+        # A codex /side command never reaches the main thread — the executor
+        # forks it into a side chat — so the transcript forwarder never mirrors
+        # it back and this bubble would sit in the parent chat forever.
+        from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
+
+        opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
+            _extract_user_text_for_routing(body)
+        )
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -6045,7 +6053,7 @@ async def _dispatch_session_event_to_runner_impl(
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
             )
-            if isinstance(content, list) and content
+            if isinstance(content, list) and content and not opens_side_chat
             else None
         )
         # ── Server-side routing for native terminal sessions ────────
