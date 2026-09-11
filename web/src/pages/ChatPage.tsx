@@ -4676,18 +4676,24 @@ function SessionHarnessPicker({
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
       : effortLevels;
-  useEffect(() => {
-    if (!openNonce || openNonce === appliedOpenNonce.current) return;
-    appliedOpenNonce.current = openNonce;
-    if (!disabled && configurable) {
-      setMenuOpen(true);
-      setConfigMenuOpen(true);
-    }
-  }, [openNonce, disabled, configurable]);
   const updateMenuOpen = (next: boolean) => {
     setMenuOpen(next);
     onMenuOpenChange?.(next);
   };
+  useEffect(() => {
+    if (!openNonce || openNonce === appliedOpenNonce.current) return;
+    appliedOpenNonce.current = openNonce;
+    if (!disabled && configurable) {
+      // Through updateMenuOpen, not setMenuOpen: the programmatic `/model`
+      // open must report the popover to the parent like every other open
+      // path, or the pill tooltips would not be suppressed over it.
+      updateMenuOpen(true);
+      setConfigMenuOpen(true);
+    }
+    // updateMenuOpen's identity changes per render; the nonce guard already
+    // limits this effect to one run per request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openNonce, disabled, configurable]);
   // The trigger's own summary tooltip must not flash open over the menu, nor
   // instantly reopen when closing the menu refocuses the trigger; see
   // useMenuGuardedTooltip.

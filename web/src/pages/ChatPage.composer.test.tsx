@@ -884,6 +884,48 @@ describe("Composer slash-command submit routing", () => {
     );
   });
 
+  it("suppresses the model-source tooltip when bare /model opens the picker", async () => {
+    // The programmatic openNonce path (bare `/model`) must report the
+    // popover to the parent exactly like the click/keyboard paths; if it
+    // does not, focus bubbling from the portalled menu paints the tooltip
+    // over the just-opened selector.
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    const menu = await screen.findByTestId("composer-agent-menu");
+
+    fireEvent.focus(menu);
+    fireEvent.focus(screen.getByTestId("composer-model-source"));
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-model-source-tooltip")).toBeNull();
+  });
+
   it("suppresses the model-source tooltip while the selector popover is open", async () => {
     useChatStore.setState({ llmModel: "sonnet" });
     const options = CLAUDE_MODEL_OPTIONS.map((option) => ({

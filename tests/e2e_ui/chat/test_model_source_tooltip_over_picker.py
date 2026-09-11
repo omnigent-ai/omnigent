@@ -23,7 +23,11 @@ User journey covered:
    over the popover,
 5. click away to close the popover: Radix hands focus back to the pill's
    trigger, and that programmatic focus must not instantly reopen the
-   tooltips — they may only come back on fresh hover/focus intent.
+   tooltips — they may only come back on fresh hover/focus intent,
+6. re-enter the pill with the menu closed: unmistakable hover intent, so
+   the tooltip must come back after its normal hover delay (this positive
+   baseline also proves the tooltip wrapper rendered at all, keeping the
+   suppression assertions above from passing vacuously).
 
 Timing note: a real user clicks the pill in one natural motion, well inside
 the tooltip's 600ms hover-open delay, so the tooltip that ends up over the
@@ -241,5 +245,12 @@ def test_pill_tooltip_does_not_obscure_open_selector(
             "composer-config-gear-tooltip",
         ):
             expect(page.get_by_test_id(tooltip_test_id)).not_to_be_visible()
+
+        # 6. fresh hover intent reopens: move back onto the pill and wait out
+        # the normal hover delay. Also the positive baseline proving the
+        # patched session rendered the composer-model-source wrapper.
+        page.mouse.move(cx, cy)
+        expect(page.get_by_test_id("composer-model-source-tooltip")).to_be_visible(timeout=5_000)
+        _screenshot(page, "pill-tooltip-back-on-fresh-hover")
     finally:
         page.unroute_all(behavior="ignoreErrors")
