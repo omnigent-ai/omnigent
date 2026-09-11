@@ -1,3 +1,4 @@
+import { selectionColors } from "./selectionColors.ts";
 // Persisted, app-global color-palette preference.
 //
 // The web UI has two independent appearance axes:
@@ -96,6 +97,8 @@ export interface PaletteTokens {
   sidebarActiveForeground: string;
   sidebarBackground: string;
   shellBackground: string;
+  selectionBackground: string;
+  selectionForeground: string;
 }
 
 export const PALETTE_TOKEN_CSS_NAMES = {
@@ -134,6 +137,8 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   sidebarActiveForeground: "sidebar-active-foreground",
   sidebarBackground: "sidebar-background",
   shellBackground: "shell-background",
+  selectionBackground: "selection-background",
+  selectionForeground: "selection-foreground",
 } as const satisfies Record<keyof PaletteTokens, string>;
 
 type PaletteTokenInput = Pick<
@@ -179,6 +184,11 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     sidebarActiveForeground: "var(--sidebar-foreground)",
     sidebarBackground: "var(--sidebar)",
     ...tokens,
+    ...selectionColors(
+      tokens.primary,
+      [tokens.background, tokens.cardSolid, tokens.codeBackground ?? tokens.cardSolid],
+      tokens.shellBackground,
+    ),
   };
 }
 

@@ -13,6 +13,18 @@ import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
 
+const channel = (hex: string, offset: number) => {
+  const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+};
+const luminance = (hex: string) =>
+  channel(hex, 1) * 0.2126 + channel(hex, 3) * 0.7152 + channel(hex, 5) * 0.0722;
+const ratio = (first: string, second: string) => {
+  const lighter = Math.max(luminance(first), luminance(second));
+  const darker = Math.min(luminance(first), luminance(second));
+  return (lighter + 0.05) / (darker + 0.05);
+};
+
 afterEach(() => {
   localStorage.clear();
   setEmbedScopeRoot(null);
@@ -165,19 +177,84 @@ describe("customTheme", () => {
     expect(variants.dark.shellBackground).toBe(PALETTES[0].tokens.dark.shellBackground);
   });
 
-  it("keeps muted helper text at WCAG AA contrast for every allowed contrast setting", () => {
-    const channel = (hex: string, offset: number) => {
-      const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
-      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
-    };
-    const luminance = (hex: string) =>
-      channel(hex, 1) * 0.2126 + channel(hex, 3) * 0.7152 + channel(hex, 5) * 0.0722;
-    const ratio = (first: string, second: string) => {
-      const lighter = Math.max(luminance(first), luminance(second));
-      const darker = Math.min(luminance(first), luminance(second));
-      return (lighter + 0.05) / (darker + 0.05);
-    };
+  it("uses each mode's accent without changing the stored accent", () => {
+    const theme = { ...DEFAULT_CUSTOM_THEME, accent: "#2563eb", darkAccent: "#ffcc00" };
+    writeCustomTheme(theme);
+    const variants = deriveCustomTheme(theme);
+    expect(variants.light.selectionBackground).toBe(theme.accent);
+    expect(variants.dark.selectionBackground).toBe(theme.darkAccent);
+    expect(readCustomTheme()).toEqual(theme);
+    expect(variants.light.primary).toBe(theme.accent);
+    expect(variants.dark.primary).toBe(theme.darkAccent);
+  });
 
+  it("recalculates selection against a changed dark tint even with an unchanged accent", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const original = deriveCustomTheme(theme).dark;
+    const adjusted = deriveCustomTheme({ ...theme, darkTint: "#eeeeee" }).dark;
+    expect(adjusted.primary).toBe(original.primary);
+    expect(adjusted.background).toBe("#eeeeee");
+    expect(adjusted.selectionBackground).not.toBe(original.selectionBackground);
+    expect(adjusted.selectionBackground).not.toBe(theme.darkAccent);
+    expect(adjusted.selectionForeground).toMatch(/^#(?:000000|ffffff)$/);
+  });
+
+  it("adjusts extreme accents for the final custom surfaces at every contrast setting", () => {
+    const palette = PALETTES.find((candidate) => candidate.id === "github")!;
+    for (const contrast of [0, 50, 100]) {
+      for (const darkTint of ["#000000", "#777777", "#ffffff"]) {
+        for (const accent of ["#000000", "#ffffff", "#ffff00", "#0000ff"]) {
+          const variants = deriveCustomTheme({
+            ...createCustomThemeFromPalette(palette),
+            accent,
+            darkAccent: accent,
+            darkTint,
+            contrast,
+          });
+          for (const variant of [variants.light, variants.dark]) {
+            expect(
+              ratio(variant.selectionBackground, variant.selectionForeground),
+            ).toBeGreaterThanOrEqual(4.5);
+            const canvas =
+              variant === variants.dark ? ["#0d1117", "#0a0e14"] : ["#fbfcfd", "#f6f8fa"];
+            const surfaces = [
+              variant.background,
+              variant.cardSolid,
+              variant.codeBackground,
+              ...canvas,
+            ];
+            const minimum = (color: string) =>
+              Math.min(...surfaces.map((surface) => ratio(color, surface)));
+            expect(minimum(variant.selectionBackground)).toBeGreaterThanOrEqual(minimum(accent));
+          }
+        }
+      }
+    }
+  });
+
+  it("balances a gray custom dark tint against the unchanged dark transcript canvas", () => {
+    const palette = PALETTES.find((candidate) => candidate.id === "github")!;
+    const theme = { ...createCustomThemeFromPalette(palette), darkTint: "#777777" };
+    const variant = deriveCustomTheme(theme).dark;
+    const surfaces = [
+      variant.background,
+      variant.cardSolid,
+      variant.codeBackground,
+      "#0d1117",
+      "#0a0e14",
+    ];
+    const minimum = (color: string) =>
+      Math.min(...surfaces.map((surface) => ratio(color, surface)));
+    expect(variant.shellBackground).toBe(palette.tokens.dark.shellBackground);
+    expect(minimum(variant.selectionBackground)).toBeGreaterThanOrEqual(minimum(theme.darkAccent));
+    expect(ratio(variant.selectionBackground, "#0d1117")).toBeGreaterThan(2);
+    expect(ratio(variant.selectionBackground, variant.selectionForeground)).toBeGreaterThanOrEqual(
+      4.5,
+    );
+    expect(minimum(variant.selectionBackground)).toBeGreaterThanOrEqual(3);
+  });
+
+  it("keeps muted helper text at WCAG AA contrast for every allowed contrast setting", () => {
     for (const contrast of [0, 50, 100]) {
       const variants = deriveCustomTheme({
         basePalette: "github",

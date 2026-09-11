@@ -16,6 +16,8 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { getThemeRoots } from "@/lib/host";
+import { selectionColors } from "@/lib/selectionColors";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -42,15 +44,20 @@ export const WS_CLOSE_WRONG_REPLICA = 4400;
 /**
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
  */
-export function terminalTheme(isDark: boolean): ITheme {
+export function terminalTheme(isDark: boolean, accent = isDark ? "#22d3ee" : "#0891b2"): ITheme {
   const bg = isDark ? CARD_DARK : CARD_LIGHT;
+  const selection = selectionColors(accent, [bg]);
+  const selectionTheme = {
+    ...selection,
+    selectionInactiveBackground: selection.selectionBackground,
+  };
   return isDark
     ? {
         background: bg,
         foreground: "#e4e4e7",
         cursor: "#22d3ee",
         cursorAccent: bg,
-        selectionBackground: "#22d3ee33",
+        ...selectionTheme,
         black: "#09090b",
         brightBlack: "#71717a",
       }
@@ -59,7 +66,7 @@ export function terminalTheme(isDark: boolean): ITheme {
         foreground: "#18181b",
         cursor: "#0891b2",
         cursorAccent: bg,
-        selectionBackground: "#0891b233",
+        ...selectionTheme,
         black: "#18181b",
         brightBlack: "#e4e4e7",
         // CLIs that assume a dark terminal paint primary text with ANSI
@@ -496,6 +503,9 @@ export class TerminalSession {
   private readonly ws: WebSocket;
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
+  private readonly themeObserver: MutationObserver;
+  private isDark: boolean;
+  private accent: string | undefined;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
   private readonly onClipboardRequest?: TerminalClipboardListener;
@@ -551,6 +561,8 @@ export class TerminalSession {
     onClipboardRequest?: TerminalClipboardListener,
     focusOnConnect = true,
   ) {
+    this.isDark = isDark;
+    this.accent = this.readThemeAccent();
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
     this.onClipboardRequest = onClipboardRequest;
@@ -562,7 +574,7 @@ export class TerminalSession {
       ...terminalFontOptions(readCodeFont()),
       scrollback: 20000,
       cursorBlink: true,
-      theme: terminalTheme(isDark),
+      theme: terminalTheme(isDark, this.accent),
       // 256-color indices (e.g. Claude Code's 38;5;231 white) can't be
       // remapped via ITheme (slots 0-15 only), so they vanish on the
       // light theme's white card. This WCAG AA contrast floor nudges a
@@ -724,6 +736,28 @@ export class TerminalSession {
     // size events server-side, so no throttle needed here.
     this.resizeObserver = new ResizeObserver(() => this.sendResize());
     this.resizeObserver.observe(container);
+
+    // Palette and custom-accent updates must repaint even an inactive attach.
+    this.themeObserver = new MutationObserver(() => {
+      const accent = this.readThemeAccent();
+      if (this.disposed || accent === this.accent) return;
+      this.accent = accent;
+      this.term.options.theme = terminalTheme(this.isDark, accent);
+    });
+    for (const root of getThemeRoots()) {
+      this.themeObserver.observe(root, {
+        attributes: true,
+        attributeFilter: ["class", "data-theme", "style"],
+      });
+    }
+  }
+
+  private readThemeAccent(): string | undefined {
+    // The inner embed root can override the scope root's light palette.
+    const root = getThemeRoots().at(-1);
+    return root
+      ? getComputedStyle(root).getPropertyValue("--primary").trim() || undefined
+      : undefined;
   }
 
   /**
@@ -731,7 +765,9 @@ export class TerminalSession {
    * Safe to call at any point after construction.
    */
   setTheme(isDark: boolean): void {
-    this.term.options.theme = terminalTheme(isDark);
+    this.isDark = isDark;
+    this.accent = this.readThemeAccent();
+    this.term.options.theme = terminalTheme(isDark, this.accent);
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */
@@ -777,6 +813,7 @@ export class TerminalSession {
     this.disposed = true;
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
+    this.themeObserver.disconnect();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
     try {

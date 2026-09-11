@@ -8,6 +8,7 @@
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setEmbedRoot, setEmbedScopeRoot } from "@/lib/host";
 import {
   SHIFT_ENTER_CSI_U,
   TerminalSession,
@@ -193,6 +194,29 @@ describe("terminalTheme", () => {
     expect(theme.white).toBe("#3f3f46");
     expect(theme.brightWhite).toBe("#18181b");
   });
+
+  it.each([false, true])(
+    "uses the active accent for focused and inactive selection (dark=%s)",
+    (isDark) => {
+      const theme = terminalTheme(isDark, "#a855f7");
+      expect(theme.selectionBackground).toBe("#a855f7");
+      expect(theme.selectionForeground).toBe("#000000");
+      expect(theme.selectionInactiveBackground).toBe(theme.selectionBackground);
+    },
+  );
+
+  it.each([
+    [false, "#ffffff"],
+    [true, "#000000"],
+  ] as const)(
+    "adjusts an accent that would disappear against the terminal (dark=%s)",
+    (isDark, accent) => {
+      const theme = terminalTheme(isDark, accent);
+      expect(theme.selectionBackground).not.toBe(accent);
+      expect(theme.selectionInactiveBackground).toBe(theme.selectionBackground);
+      expect(["#000000", "#ffffff"]).toContain(theme.selectionForeground);
+    },
+  );
 
   it("keeps dark mode terminal surfaces dark", () => {
     const theme = terminalTheme(true);
@@ -696,11 +720,77 @@ describe("TerminalSession", () => {
     // WHY: theme changes must not tear down the live WebSocket; the socket
     // stays the same instance after setTheme(true).
     const { socket, session } = makeSession();
-    const before = socket;
+    const { term } = session as unknown as { term: Terminal };
     session.setTheme(true);
-    expect(socket).toBe(before);
+    expect(term.options.theme).toEqual(terminalTheme(true));
+    expect(FakeWebSocket.instances).toEqual([socket]);
     expect(socket.closed).toBe(false);
     session.dispose();
+  });
+
+  it("updates the real terminal selection for live accent changes without reconnecting", async () => {
+    const root = document.documentElement;
+    const originalStyle = root.getAttribute("style");
+    root.style.setProperty("--primary", "#a855f7");
+    const { socket, session } = makeSession();
+    const { term } = session as unknown as { term: Terminal };
+    try {
+      expect(term.options.theme).toEqual(terminalTheme(false, "#a855f7"));
+      session.setTheme(true);
+      term.blur();
+      root.style.setProperty("--primary", "#f97316");
+      await Promise.resolve();
+      expect(term.options.theme).toEqual(terminalTheme(true, "#f97316"));
+      expect(term.options.theme?.background).toBe("#131517");
+      expect(term.options.theme?.selectionInactiveBackground).toBe("#f97316");
+      expect(FakeWebSocket.instances).toEqual([socket]);
+      expect(socket.closed).toBe(false);
+
+      const theme = term.options.theme;
+      root.style.setProperty("--unrelated-size", "12px");
+      await Promise.resolve();
+      expect(term.options.theme).toBe(theme);
+
+      session.dispose();
+      root.style.setProperty("--primary", "#22c55e");
+      await Promise.resolve();
+      expect(term.options.theme).toBe(theme);
+    } finally {
+      session.dispose();
+      if (originalStyle === null) root.removeAttribute("style");
+      else root.setAttribute("style", originalStyle);
+    }
+  });
+
+  it("follows the inner embed accent and observes palette class changes", async () => {
+    const scope = document.createElement("div");
+    const inner = document.createElement("div");
+    const style = document.createElement("style");
+    style.textContent =
+      ".terminal-test-palette { --primary: #a855f7; } .terminal-test-palette.dark { --primary: #f97316; }";
+    document.head.appendChild(style);
+    scope.style.setProperty("--primary", "#22c55e");
+    inner.className = "terminal-test-palette";
+    scope.appendChild(inner);
+    document.body.appendChild(scope);
+    setEmbedScopeRoot(scope);
+    setEmbedRoot(inner);
+    const { session, socket } = makeSession();
+    const { term } = session as unknown as { term: Terminal };
+    try {
+      expect(term.options.theme).toEqual(terminalTheme(false, "#a855f7"));
+      inner.classList.add("dark");
+      await Promise.resolve();
+      expect(term.options.theme).toEqual(terminalTheme(false, "#f97316"));
+      expect(FakeWebSocket.instances).toEqual([socket]);
+      expect(socket.closed).toBe(false);
+    } finally {
+      session.dispose();
+      setEmbedRoot(null);
+      setEmbedScopeRoot(null);
+      scope.remove();
+      style.remove();
+    }
   });
 
   it("setFont re-fonts + refits in place, tolerating a down socket, no reconnect", () => {

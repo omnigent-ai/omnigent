@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { deriveCustomTheme, createCustomThemeFromPalette } from "./customTheme";
+import { terminalTheme } from "../components/blocks/TerminalSession";
 import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 import {
   applyThemePalette,
@@ -126,5 +128,45 @@ describe("themePalette", () => {
     expect(solarized?.tokens.light.background).toBe("#fdf6e3");
     expect(solarized?.tokens.dark.background).toBe("#002b36");
     expect(solarized?.tokens.dark.shellBackground).toBe("#002b36");
+  });
+});
+
+function selectionContrast(background: string, foreground: string): number {
+  const luminance = (hex: string) => {
+    const channels = [1, 3, 5].map((offset) => {
+      const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+  };
+  expect(background).toMatch(/^#[0-9a-f]{6}$/i);
+  expect(foreground).toMatch(/^#[0-9a-f]{6}$/i);
+  const values = [luminance(background), luminance(foreground)];
+  return (Math.max(...values) + 0.05) / (Math.min(...values) + 0.05);
+}
+
+describe("selected text contrast", () => {
+  it.each(PALETTES)("keeps $label selections readable in both modes and Custom", (palette) => {
+    const custom = createCustomThemeFromPalette(palette);
+    const variants = [
+      palette.tokens,
+      ...[0, 50, 100].map((contrast) =>
+        deriveCustomTheme({ ...custom, contrast, accent: "#777777", darkAccent: "#777777" }),
+      ),
+    ];
+    for (const pair of variants) {
+      for (const tokens of [pair.light, pair.dark]) {
+        expect(
+          selectionContrast(tokens.selectionBackground, tokens.selectionForeground),
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it.each([false, true])("keeps terminal selected text readable (dark: %s)", (isDark) => {
+    const theme = terminalTheme(isDark);
+    expect(
+      selectionContrast(theme.selectionBackground!, theme.selectionForeground!),
+    ).toBeGreaterThanOrEqual(4.5);
   });
 });
