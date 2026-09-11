@@ -1267,9 +1267,11 @@ function visibleModelLabel(label: string): string {
   return label.replaceAll("`", "");
 }
 
-function compactHarnessTriggerValue(value: string): string {
-  const defaultModel = /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
-  return defaultModel.replace(/ \([^()]*context[^()]*\)$/i, "");
+// Unwrap the "Default (X)" sentinel to the model it resolves to, keeping the
+// catalog display name verbatim (including qualifiers like "(1M context)") so
+// every composer surface names one selection the same way.
+export function compactHarnessTriggerValue(value: string): string {
+  return /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
 }
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
