@@ -1,6 +1,8 @@
 """Minimal streamable-HTTP MCP server used by MCP transport e2e tests.
 
-Exposes a single ``echo`` tool that returns its ``text`` argument.
+Exposes an ``echo`` tool that returns its ``text`` argument, plus a
+``slow_echo`` variant that sleeps first so tests can inject a network
+fault while a request is in flight (response pending).
 Sibling of :mod:`tests.tools.fixtures.echo_stdio_mcp_server`, but
 served over the streamable-HTTP transport so tests can interpose a
 TCP proxy between client and server to simulate network faults.
@@ -14,6 +16,7 @@ Binds ``127.0.0.1:<port>`` and serves MCP at ``/mcp``.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 
 from mcp.server.fastmcp import FastMCP
@@ -35,6 +38,23 @@ def echo(text: str) -> str:
     :param text: The string to echo back, e.g. ``"hello"``.
     :returns: ``f"echo: {text}"``.
     """
+    return f"echo: {text}"
+
+
+@mcp.tool()
+async def slow_echo(text: str, delay_s: float) -> str:
+    """
+    Return ``f"echo: {text}"`` after sleeping *delay_s* seconds.
+
+    Gives e2e tests a window in which the request has been accepted
+    by the server but the response has not been sent, so a fault
+    injected during the sleep lands exactly on the response path.
+
+    :param text: The string to echo back, e.g. ``"hello"``.
+    :param delay_s: Seconds to sleep before responding, e.g. ``2.0``.
+    :returns: ``f"echo: {text}"``.
+    """
+    await asyncio.sleep(delay_s)
     return f"echo: {text}"
 
 

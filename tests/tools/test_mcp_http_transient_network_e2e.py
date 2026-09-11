@@ -10,8 +10,8 @@ retrying like the LLM retry path does for ``ConnectionError`` /
 The chain is real end to end: a FastMCP streamable-HTTP subprocess
 (``tests/tools/fixtures/echo_http_mcp_server.py``) is reached through
 an in-process TCP proxy that can inject a controllable outage
-("blip"): it hard-resets every live connection and refuses new ones
-for a short window, then recovers. The test drives a real
+("blip"): it severs every live connection mid-stream and refuses new
+ones for a short window, then recovers. The test drives a real
 :class:`omnigent.tools.mcp.McpServerConnection` through a warm call,
 injects a blip shorter than the retry budget, and asserts the next
 tool call still round-trips — which requires the connection layer to
@@ -25,7 +25,9 @@ the assertion fails. After the fix it must pass.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -56,6 +58,16 @@ _MCP_TIMEOUT_S = 8
 # Hard cap on the blipped call so a regression can't hang the suite.
 _CALL_DEADLINE_S = 60
 
+# How long the slow_echo tool sleeps in the mid-call test. Long
+# enough that the fault below reliably lands while the response is
+# pending; short enough to keep the retried call fast.
+_SLOW_TOOL_S = 2.0
+
+# Delay between starting the slow call and injecting the fault.
+# Plenty for a loopback POST to reach the server and start executing,
+# and well under _SLOW_TOOL_S so the response is still pending.
+_MID_CALL_FAULT_DELAY_S = 0.5
+
 
 def _free_port() -> int:
     """Reserve an ephemeral localhost port and return it."""
@@ -78,53 +90,70 @@ def _wait_for_listen(port: int, timeout_s: float = 30.0) -> None:
     raise TimeoutError(f"nothing listening on 127.0.0.1:{port} after {timeout_s}s")
 
 
-_LINGER_RST = b"\x01\x00\x00\x00\x00\x00\x00\x00"  # SO_LINGER(on, 0) → RST on close
+# SO_LINGER(onoff=1, linger=0) → RST on close. struct-packed so the
+# two-int layout is explicit and endianness-portable.
+_LINGER_RST = struct.pack("ii", 1, 0)
 
 
 class _BlipProxy:
     """TCP forwarder with a controllable transient outage.
 
-    Forwards ``127.0.0.1:listen_port`` → ``127.0.0.1:target_port``.
-    :meth:`blip` hard-resets every live connection (RST) and refuses
-    new ones for the given window, then recovers — the shape of a
-    real transient network failure (VPN flap, LB restart).
+    Forwards a port-0-assigned listen port (:attr:`port`) →
+    ``127.0.0.1:target_port``. :meth:`blip` severs every live
+    connection mid-stream and refuses new ones (RST) for the given
+    window, then recovers — the shape of a real transient network
+    failure (VPN flap, LB restart): in-flight responses are lost and
+    fresh connects fail until the network heals.
     """
 
-    def __init__(self, listen_port: int, target_port: int) -> None:
+    def __init__(self, target_port: int) -> None:
         self._target_port = target_port
         self._blip_until = 0.0
         self._active: list[socket.socket] = []
         self._lock = threading.Lock()
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._srv.bind(("127.0.0.1", listen_port))
+        # Bind port 0 and read the assigned port back — no
+        # reserve-then-reopen race under parallel test workers.
+        self._srv.bind(("127.0.0.1", 0))
+        self.port: int = self._srv.getsockname()[1]
         self._srv.listen(16)
         threading.Thread(target=self._accept_loop, daemon=True).start()
 
     def blip(self, seconds: float) -> None:
-        """Reset all live connections and refuse new ones for *seconds*."""
+        """Sever all live connections and refuse new ones for *seconds*.
+
+        Uses ``shutdown(SHUT_RDWR)`` rather than a linger-RST close:
+        the pipe threads are blocked in ``recv()`` on these same
+        sockets, and Linux defers a plain ``close()``'s teardown (and
+        its RST) until those in-flight syscalls return — the peers
+        would never notice the outage. ``shutdown`` takes effect
+        immediately: blocked reads wake, the peer gets a FIN
+        mid-chunked-response, and httpx surfaces the truncated
+        response as a network error — the lost-response failure shape
+        this proxy exists to inject. The woken pipe threads then close
+        the socket pair and drop it from ``_active``.
+        """
         self._blip_until = time.time() + seconds
         with self._lock:
             for s in self._active:
-                try:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _LINGER_RST)
-                    s.close()
-                except OSError:
-                    pass
-            self._active.clear()
+                # Best-effort sever: the peer (or a pipe thread) may
+                # have already shut this socket down.
+                with contextlib.suppress(OSError):
+                    s.shutdown(socket.SHUT_RDWR)
 
     def close(self) -> None:
         """Stop accepting and drop every connection."""
-        try:
+        # close() is idempotent best-effort teardown; the listener may
+        # already be closed by an earlier call.
+        with contextlib.suppress(OSError):
             self._srv.close()
-        except OSError:
-            pass
         with self._lock:
             for s in self._active:
-                try:
+                # Best-effort teardown: pipe threads or a blip may
+                # have already closed/severed this socket.
+                with contextlib.suppress(OSError):
                     s.close()
-                except OSError:
-                    pass
             self._active.clear()
 
     def _accept_loop(self) -> None:
@@ -151,8 +180,7 @@ class _BlipProxy:
         threading.Thread(target=self._pipe, args=(client, upstream), daemon=True).start()
         threading.Thread(target=self._pipe, args=(upstream, client), daemon=True).start()
 
-    @staticmethod
-    def _pipe(src: socket.socket, dst: socket.socket) -> None:
+    def _pipe(self, src: socket.socket, dst: socket.socket) -> None:
         try:
             while True:
                 data = src.recv(65536)
@@ -160,13 +188,21 @@ class _BlipProxy:
                     break
                 dst.sendall(data)
         except OSError:
+            # Expected during a blip or peer shutdown — the finally
+            # block below closes both ends of the pair.
             pass
         finally:
             for s in (src, dst):
-                try:
+                # Best-effort close: the other pipe thread or a blip
+                # may have already closed this socket.
+                with contextlib.suppress(OSError):
                     s.close()
-                except OSError:
-                    pass
+            # Drop the closed pair from the active list so sockets
+            # don't accumulate across many connections.
+            with self._lock:
+                for s in (src, dst):
+                    if s in self._active:
+                        self._active.remove(s)
 
 
 @pytest.fixture()
@@ -177,7 +213,14 @@ def _no_env_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     them even for 127.0.0.1, which would route the MCP traffic (and
     the injected blip) through the proxy and distort the failure mode.
     """
-    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+    for var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
@@ -192,7 +235,6 @@ def flaky_http_mcp(_no_env_proxy: None) -> Iterator[tuple[MCPServerConfig, _Blip
     ``proxy.blip(seconds)``.
     """
     server_port = _free_port()
-    proxy_port = _free_port()
     server = subprocess.Popen(
         [sys.executable, _ECHO_HTTP_SERVER, str(server_port)],
         stdout=subprocess.DEVNULL,
@@ -201,11 +243,11 @@ def flaky_http_mcp(_no_env_proxy: None) -> Iterator[tuple[MCPServerConfig, _Blip
     proxy: _BlipProxy | None = None
     try:
         _wait_for_listen(server_port)
-        proxy = _BlipProxy(proxy_port, server_port)
+        proxy = _BlipProxy(server_port)
         config = MCPServerConfig(
             name="flaky-http-echo",
             transport="http",
-            url=f"http://127.0.0.1:{proxy_port}/mcp",
+            url=f"http://127.0.0.1:{proxy.port}/mcp",
             # 3 retries with 0.5/1.0/2.0s backoff spans the 1.5s blip
             # with room to spare. jitter off for determinism.
             retry=RetryPolicy(
@@ -259,6 +301,50 @@ async def test_mcp_tool_call_survives_transient_network_blip(
         assert result == f"echo: {_PROBE}", (
             f"tool call did not survive a {_BLIP_SECONDS}s network blip "
             f"despite a retry budget that spans it; got: {result!r}"
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_call_survives_mid_call_connection_reset(
+    flaky_http_mcp: tuple[MCPServerConfig, _BlipProxy],
+) -> None:
+    """A reset landing AFTER the request was accepted must also retry.
+
+    Exercises the swallowed-error path that the blip-before-call test
+    cannot reach: the POST is accepted and the server is executing
+    the (slow) tool when every connection is hard-reset. With the
+    locked MCP SDK the response-stream failure is swallowed inside
+    the streamable-HTTP client, the ``ClientSession`` stays live, and
+    the pending request surfaces only as a request-timeout
+    ``McpError`` (408). The connection layer must recognize that 408
+    as a dead transport — via the httpx-level recorded network
+    failure, not session state — and reconnect-retry so the call
+    still succeeds.
+    """
+    config, proxy = flaky_http_mcp
+    conn = McpServerConnection(config)
+    try:
+        await conn.connect()
+
+        # Warm call proves the happy path works before the fault.
+        warm = await conn.call_tool("echo", {"text": "warm"})
+        assert warm == "echo: warm"
+
+        # Start a slow call, let the request reach the server, then
+        # reset every connection while the response is pending.
+        call = asyncio.ensure_future(
+            conn.call_tool("slow_echo", {"text": _PROBE, "delay_s": _SLOW_TOOL_S})
+        )
+        await asyncio.sleep(_MID_CALL_FAULT_DELAY_S)
+        assert not call.done(), "slow call finished before the fault was injected"
+        proxy.blip(_BLIP_SECONDS)
+
+        result = await asyncio.wait_for(call, timeout=_CALL_DEADLINE_S)
+        assert result == f"echo: {_PROBE}", (
+            "tool call did not survive a mid-call connection reset "
+            f"(swallowed-408 path); got: {result!r}"
         )
     finally:
         await conn.close()

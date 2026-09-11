@@ -20,7 +20,7 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -28,11 +28,11 @@ from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlparse
 
+import httpx
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
     MemoryObjectSendStream,
 )
-import httpx
 from cachetools import TTLCache
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
@@ -429,6 +429,85 @@ def clear_discovery_cache() -> None:
     _discovery_cache.clear()
 
 
+# Transport-level failures worth recording as an unhealthy-connection
+# signal. ``httpx.NetworkError`` covers connection reset/refused and
+# read/write errors; ``httpx.RemoteProtocolError`` covers the peer
+# closing the connection without a complete response. Timeouts are
+# deliberately excluded: a slow response is a slow server, not a dead
+# transport, and must not make a later request-timeout look retryable.
+_RECORDED_TRANSPORT_ERRORS = (httpx.NetworkError, httpx.RemoteProtocolError)
+
+
+class _TransportErrorRecordingStream(httpx.AsyncByteStream):
+    """
+    Response-body stream that reports network failures out of band.
+
+    The MCP SDK's streamable-HTTP client swallows exceptions raised
+    while it reads a response body (``mcp/client/streamable_http.py``:
+    the SSE path logs and returns when no resumable event id was seen;
+    the JSON path forwards the exception to a message handler that
+    drops it by default). A connection reset that lands *after* the
+    request was sent therefore leaves the ``ClientSession`` live while
+    the pending request can never complete — it later surfaces as a
+    request-timeout ``McpError`` indistinguishable from a slow tool.
+    Recording the failure at the httpx layer gives
+    :func:`_is_dead_session_timeout` an explicit unhealthy-transport
+    signal that does not depend on SDK internals.
+
+    :param inner: The wrapped httpx response stream.
+    :param on_error: Callback receiving the network failure, e.g.
+        :meth:`McpServerConnection._record_transport_error`.
+    """
+
+    def __init__(
+        self,
+        inner: httpx.AsyncByteStream,
+        on_error: Callable[[BaseException], None],
+    ) -> None:
+        self._inner = inner
+        self._on_error = on_error
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self._inner:
+                yield chunk
+        except _RECORDED_TRANSPORT_ERRORS as exc:
+            self._on_error(exc)
+            raise
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+class _TransportErrorRecordingTransport(httpx.AsyncHTTPTransport):
+    """
+    httpx transport that records network-level failures.
+
+    Wraps every response body in
+    :class:`_TransportErrorRecordingStream` and records failures of
+    the request itself (connection refused mid-outage, reset while
+    writing). See the stream class docstring for why the signal must
+    be captured at this layer.
+
+    :param on_error: Callback receiving the network failure.
+    """
+
+    def __init__(self, on_error: Callable[[BaseException], None]) -> None:
+        super().__init__()
+        self._on_error = on_error
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            response = await super().handle_async_request(request)
+        except _RECORDED_TRANSPORT_ERRORS as exc:
+            self._on_error(exc)
+            raise
+        stream = response.stream
+        if isinstance(stream, httpx.AsyncByteStream):  # pragma: no branch
+            response.stream = _TransportErrorRecordingStream(stream, self._on_error)
+        return response
+
+
 @dataclass
 class McpServerConnection:
     """
@@ -464,6 +543,15 @@ class McpServerConnection:
     # ``_call_lock`` so only one call is active at a time.
     _active_session_id: str | None = field(default=None, init=False, repr=False)
     _session: ClientSession | None = field(default=None, init=False, repr=False)
+    # Most recent network-level transport failure, recorded by
+    # ``_TransportErrorRecordingTransport``. The MCP SDK can swallow
+    # a mid-response network error entirely (leaving ``_session``
+    # live while the pending request is doomed to time out), so this
+    # is the explicit unhealthy-transport signal that
+    # ``_is_dead_session_timeout`` keys retry classification off.
+    # Cleared when a fresh session is established and whenever a
+    # tool call round-trips successfully.
+    _transport_error: BaseException | None = field(default=None, init=False, repr=False)
     # Long-lived task that owns the transport + session + their
     # AsyncExitStack. Must be the SAME task that runs the stack's
     # ``__aexit__`` — anyio's stdio_client / sse_client cancel
@@ -607,6 +695,12 @@ class McpServerConnection:
             self._active_session_id = session_id
             try:
                 result = await self._session.call_tool(name=name, arguments=arguments)
+                # A response arrived, so the transport is demonstrably
+                # healthy — drop any stale failure (e.g. from the SDK's
+                # server-initiated GET stream flapping) so a later
+                # genuine tool timeout is not misclassified as a dead
+                # connection and retried.
+                self._transport_error = None
             finally:
                 self._active_session_id = None
 
@@ -769,6 +863,9 @@ class McpServerConnection:
                 await stack.enter_async_context(session)
                 await session.initialize()
                 self._session = session
+                # Fresh transport — drop any unhealthy-transport
+                # signal recorded on the previous connection.
+                self._transport_error = None
                 discovered = await self._discover_or_use_cache()
                 ready.set_result(discovered)
                 # Hold transport + session open until close() signals.
@@ -881,6 +978,57 @@ class McpServerConnection:
         """
         key = _cache_key(self.config, self.cwd)
         _discovery_cache[key] = tools
+
+    def _record_transport_error(self, exc: BaseException) -> None:
+        """
+        Record *exc* as this connection's unhealthy-transport signal.
+
+        Called from the httpx layer
+        (:class:`_TransportErrorRecordingTransport`) when a request or
+        its response stream fails with a network error. Consumed by
+        :func:`_is_dead_session_timeout` to classify a subsequent
+        request-timeout ``McpError`` as a dead connection worth a
+        reconnect-retry.
+
+        :param exc: The network-level failure, e.g.
+            ``httpx.ReadError("connection reset by peer")``.
+        """
+        _logger.debug(
+            "MCP server %r: network-level transport failure recorded: %s",
+            self.config.name,
+            exc,
+        )
+        self._transport_error = exc
+
+    def _make_recording_httpx_client(
+        self,
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        """
+        Build an httpx client that records network failures.
+
+        Drop-in ``httpx_client_factory`` for the SDK's HTTP
+        transports. Mirrors the defaults of the SDK's
+        ``create_mcp_http_client`` (``follow_redirects=True``,
+        30s/300s timeouts when none are supplied) and adds
+        :class:`_TransportErrorRecordingTransport` so mid-response
+        network failures the SDK swallows still surface through
+        :attr:`_transport_error`.
+
+        :param headers: Headers forwarded by the SDK transport.
+        :param timeout: Timeout forwarded by the SDK transport.
+        :param auth: Auth forwarded by the SDK transport.
+        :returns: A configured ``httpx.AsyncClient``.
+        """
+        return httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=(timeout if timeout is not None else httpx.Timeout(30.0, read=300.0)),
+            headers=headers,
+            auth=auth,
+            transport=_TransportErrorRecordingTransport(self._record_transport_error),
+        )
 
     async def _open_transport(
         self,
@@ -1007,6 +1155,9 @@ class McpServerConnection:
                 headers=headers,
                 timeout=float(timeout) if timeout is not None else 30,
                 sse_read_timeout=float(timeout) if timeout is not None else 300,
+                # Record response-stream network failures the SDK
+                # would otherwise swallow — see _is_dead_session_timeout.
+                httpx_client_factory=self._make_recording_httpx_client,
             )
         )
         return read_stream, write_stream
@@ -1039,6 +1190,9 @@ class McpServerConnection:
                 timeout=float(timeout) if timeout is not None else 5,
                 # MCP SDK default: 300s (5 min) for SSE event read.
                 sse_read_timeout=float(timeout) if timeout is not None else 300,
+                # Record response-stream network failures the SDK
+                # would otherwise swallow — see _is_dead_session_timeout.
+                httpx_client_factory=self._make_recording_httpx_client,
             )
         )
         return read_stream, write_stream
@@ -1318,22 +1472,35 @@ def _is_dead_session_timeout(exc: BaseException, conn: McpServerConnection) -> b
     in-flight request then never receives a response and surfaces
     as the SDK's request-timeout ``McpError`` instead of the
     underlying network error. Distinguish that from a live-but-slow
-    server by the session state: the lifecycle task clears
-    ``_session`` when it dies, so a timeout with a dead session is
-    a connection failure worth a reconnect-retry, while a timeout
-    from a live session is a genuine tool timeout and must not be
-    retried.
+    server by two explicit signals, either of which classifies the
+    timeout as a connection failure worth a reconnect-retry:
+
+    - The lifecycle task died and cleared ``_session`` (e.g. the
+      transport task group crashed on a pre-response failure).
+    - A network-level failure was recorded at the httpx layer
+      (``_transport_error``). This is the common production shape:
+      with the locked MCP SDK, a reset that lands *after* the
+      request was sent is swallowed inside the streamable-HTTP
+      client (the SSE response path logs and returns without a
+      resumable event id; the JSON path forwards the exception to a
+      message handler that drops it by default), so the lifecycle
+      task stays alive and ``_session`` stays live while the
+      pending request can never complete.
+
+    A timeout with a live session and a clean transport is a
+    genuine tool timeout and must not be retried — MCP tools are
+    not guaranteed idempotent.
 
     :param exc: The exception raised by the tool invocation.
     :param conn: The connection the invocation ran on.
     :returns: ``True`` if the timeout is attributable to a dead
-        session.
+        transport.
     """
     if not isinstance(exc, McpError):
         return False
     if exc.error.code != _REQUEST_TIMEOUT_CODE:
         return False
-    return conn._session is None
+    return conn._session is None or conn._transport_error is not None
 
 
 def _backoff_delay(attempt: int, retry: RetryPolicy) -> float:

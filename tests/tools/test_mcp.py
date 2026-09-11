@@ -36,6 +36,7 @@ from omnigent.tools.mcp import (
     _is_connection_error,
     _is_dead_session_timeout,
     _normalize_input_schema,
+    _TransportErrorRecordingStream,
     clear_discovery_cache,
 )
 
@@ -914,13 +915,27 @@ def test_dead_session_timeout_detected_when_session_dead() -> None:
 
 def test_dead_session_timeout_not_detected_when_session_live() -> None:
     """
-    The same request-timeout with a live session is a genuinely
-    slow server — NOT retried, so a slow tool doesn't get invoked
-    multiple times.
+    The same request-timeout with a live session and a clean
+    transport is a genuinely slow server — NOT retried, so a slow
+    tool doesn't get invoked multiple times.
     """
     conn = McpServerConnection(config=_make_http_config())
     conn._session = MagicMock()
+    assert conn._transport_error is None
     assert _is_dead_session_timeout(_request_timeout_error(), conn) is False
+
+
+def test_dead_session_timeout_detected_when_transport_error_recorded() -> None:
+    """
+    A request-timeout with a live session but a recorded httpx-level
+    network failure means the SDK swallowed a mid-response transport
+    error (streamable-HTTP SSE/JSON response paths) — the response
+    can never arrive, so it is classified as reconnectable.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = MagicMock()
+    conn._transport_error = httpx.ReadError("connection reset by peer")
+    assert _is_dead_session_timeout(_request_timeout_error(), conn) is True
 
 
 def test_dead_session_timeout_ignores_other_mcp_errors() -> None:
@@ -933,6 +948,60 @@ def test_dead_session_timeout_ignores_other_mcp_errors() -> None:
     exc = McpError(ErrorData(code=-32602, message="Invalid params"))
     assert _is_dead_session_timeout(exc, conn) is False
     assert _is_dead_session_timeout(ValueError("bad"), conn) is False
+
+
+# ── _TransportErrorRecordingStream ─────────────────────────────
+
+
+class _ExplodingByteStream(httpx.AsyncByteStream):
+    """Yields one chunk, then raises the configured exception."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aiter__(self) -> Any:
+        yield b"partial"
+        raise self._exc
+
+    async def aclose(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio()
+async def test_recording_stream_records_network_error() -> None:
+    """
+    A network failure while reading a response body is reported to
+    the ``on_error`` callback and re-raised — the explicit
+    unhealthy-transport signal for the swallowed-408 case.
+    """
+    recorded: list[BaseException] = []
+    stream = _TransportErrorRecordingStream(
+        _ExplodingByteStream(httpx.ReadError("connection reset by peer")),
+        recorded.append,
+    )
+    with pytest.raises(httpx.ReadError):
+        async for _ in stream:
+            pass
+    assert len(recorded) == 1
+    assert isinstance(recorded[0], httpx.ReadError)
+
+
+@pytest.mark.asyncio()
+async def test_recording_stream_does_not_record_timeouts() -> None:
+    """
+    A read timeout is a slow server, not a dead transport — it must
+    not be recorded, or a later genuine tool timeout would be
+    misclassified as reconnectable and retried.
+    """
+    recorded: list[BaseException] = []
+    stream = _TransportErrorRecordingStream(
+        _ExplodingByteStream(httpx.ReadTimeout("slow")),
+        recorded.append,
+    )
+    with pytest.raises(httpx.ReadTimeout):
+        async for _ in stream:
+            pass
+    assert recorded == []
 
 
 # ── _backoff_delay ────────────────────────────────────────
@@ -1089,6 +1158,57 @@ async def test_call_tool_reconnects_on_dead_session_timeout() -> None:
 
 
 @pytest.mark.asyncio()
+async def test_call_tool_reconnects_on_swallowed_transport_error_timeout() -> None:
+    """
+    The locked MCP SDK can swallow a mid-response network failure
+    entirely (streamable-HTTP SSE/JSON response paths), leaving the
+    session live while the pending request times out. The httpx-level
+    recorded transport error must make that 408 reconnect-retry, and
+    the successful retry must clear the recorded error.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+
+        def _swallowed_reset(*args: object, **kwargs: object) -> MagicMock:
+            if not mock_session.call_tool.await_count > 1:
+                # The SDK swallowed the reset: session stays live,
+                # only the httpx-layer recording betrays the fault.
+                conn._transport_error = httpx.ReadError("connection reset by peer")
+                raise McpError(
+                    ErrorData(
+                        code=int(httpx.codes.REQUEST_TIMEOUT),
+                        message=(
+                            "Timed out while waiting for response to "
+                            "ClientRequest. Waited 8.0 seconds."
+                        ),
+                    )
+                )
+            return ok_result
+
+        mock_session.call_tool.side_effect = _swallowed_reset
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        mock_reconnect.assert_awaited_once()
+        # The successful round-trip proves the transport is healthy
+        # again, so the stale error must not linger to misclassify a
+        # future genuine tool timeout.
+        assert conn._transport_error is None
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
 async def test_call_tool_timeout_with_live_session_not_retried() -> None:
     """
     A request timeout while the session is still live is a slow
@@ -1105,8 +1225,7 @@ async def test_call_tool_timeout_with_live_session_not_retried() -> None:
             ErrorData(
                 code=int(httpx.codes.REQUEST_TIMEOUT),
                 message=(
-                    "Timed out while waiting for response to "
-                    "ClientRequest. Waited 8.0 seconds."
+                    "Timed out while waiting for response to ClientRequest. Waited 8.0 seconds."
                 ),
             )
         )
