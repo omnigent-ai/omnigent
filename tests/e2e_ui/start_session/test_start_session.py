@@ -489,6 +489,32 @@ async def _register_common_routes(
     await page.route(_SESSIONS_RE, handle_sessions)
 
 
+async def _open_entry_models(page, agent_id: str) -> None:
+    """Select a harness and open its primary model and effort picker."""
+    picker = page.get_by_test_id("new-chat-landing-agent-select")
+    await picker.click()
+    await expect(picker).to_have_attribute("aria-expanded", "true")
+    await expect(page.get_by_role("menu").first).to_be_visible()
+    row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
+    if await row.count() == 0:
+        await page.get_by_test_id("new-chat-landing-harness-more").click()
+    await (
+        page.get_by_test_id(f"new-chat-landing-agent-config-{agent_id}")
+        .get_by_text("Edit", exact=True)
+        .click()
+    )
+
+
+async def _close_entry_models(page) -> None:
+    """Dismiss the primary picker after immediate selection."""
+    await page.keyboard.press("Escape")
+    if (
+        await page.get_by_test_id("new-chat-landing-agent-select").get_attribute("aria-expanded")
+        == "true"
+    ):
+        await page.keyboard.press("Escape")
+
+
 async def _open_entry_config(page, agent_id: str) -> None:
     """Select a harness and open Edit > Advanced settings."""
     picker = page.get_by_test_id("new-chat-landing-agent-select")
@@ -1759,20 +1785,24 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             # effort selects sit at "Default" (unselected) — an untouched picker
             # omits the override and Claude Code uses its own configured model.
             # Verify the unselected defaults, then make an explicit pick.
-            await _open_entry_config(page, "ag_claude_e2e")
-            model = page.get_by_test_id("new-chat-landing-config-model")
-            effort = page.get_by_test_id("new-chat-landing-config-effort")
-            await expect(model).to_contain_text("Default")
+            await _open_entry_models(page, "ag_claude_e2e")
+            model = page.locator(
+                '[data-testid^="new-chat-landing-agent-model-"][aria-checked="true"]'
+            )
+            effort = page.locator(
+                '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
+            )
+            await expect(model).to_contain_text("Harness default")
             await expect(effort).to_contain_text("Default")
 
             # Pick model + effort in the same modal visit (each select commits to
             # a local draft; Save commits both at once). The model rows carry the
             # host catalog's live display names, not the static alias labels.
-            await _pick_config_select(page, "new-chat-landing-config-model", "Opus 4.8")
+            await page.get_by_role("menuitemcheckbox", name="Opus 4.8", exact=True).click()
             await expect(model).to_contain_text("Opus 4.8")
-            await _pick_config_select(page, "new-chat-landing-config-effort", "High")
+            await page.get_by_role("menuitemcheckbox", name="High", exact=True).click()
             await expect(effort).to_contain_text("High")
-            await _save_config(page)
+            await _close_entry_models(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -1787,13 +1817,15 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await _open_entry_config(page, "ag_claude_e2e")
-            await expect(page.get_by_test_id("new-chat-landing-config-model")).to_contain_text(
-                "Opus 4.8"
-            )
-            await expect(page.get_by_test_id("new-chat-landing-config-effort")).to_contain_text(
-                "High"
-            )
+            await _open_entry_models(page, "ag_claude_e2e")
+            await expect(
+                page.locator('[data-testid^="new-chat-landing-agent-model-"][aria-checked="true"]')
+            ).to_contain_text("Opus 4.8")
+            await expect(
+                page.locator(
+                    '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
+                )
+            ).to_contain_text("High")
         finally:
             await browser.close()
 
@@ -1858,15 +1890,17 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await _open_entry_config(page, "ag_codex_e2e")
-            model = page.get_by_test_id("new-chat-landing-config-model")
+            await _open_entry_models(page, "ag_codex_e2e")
+            model = page.locator(
+                '[data-testid^="new-chat-landing-agent-model-"][aria-checked="true"]'
+            )
             # The Default row names the catalog's default by its DISPLAY name —
             # the same shared labeling the in-session gear uses.
-            await expect(model).to_contain_text("Default (GPT Live Default)")
+            await expect(model).to_contain_text("GPT Live Default")
             # Codex options render decorated display names (same as claude),
             # so pick by the display name; the create still sends the id.
-            await _pick_config_select(page, "new-chat-landing-config-model", "GPT Live Fast")
-            await _save_config(page)
+            await page.get_by_role("menuitemcheckbox", name="GPT Live Fast", exact=True).click()
+            await _close_entry_models(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()

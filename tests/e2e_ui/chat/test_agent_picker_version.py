@@ -217,6 +217,8 @@ async def _drive(base_url: str, created_session_id: str) -> None:
 
             # Select Agent A, send, and assert the create POST bound the upload.
             await option(_UPLOAD_ID).click()
+            await page.keyboard.press("Escape")
+            await expect(page.get_by_role("menu")).to_have_count(0)
             await page.get_by_test_id("new-chat-landing-input").fill("which version are you?")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
