@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json as _json
+import logging
 import sqlite3 as _sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -483,6 +485,129 @@ async def test_supervise_transcript_debounces_autoapproved_call(
 
     assert not any("hooks/cursor-permission-request" in u for u, _ in posts), posts
     assert not any(j.get("type") == "external_elicitation_resolved" for _, j in posts), posts
+
+
+async def _await_log_count(
+    caplog: pytest.LogCaptureFixture, level: int, needle: str, count: int
+) -> None:
+    """Poll until *count* records at *level* containing *needle* exist (2s cap)."""
+
+    def _count() -> int:
+        return sum(1 for r in caplog.records if r.levelno == level and needle in r.getMessage())
+
+    for _ in range(200):
+        if _count() >= count:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail(f"expected {count} level-{level} records containing {needle!r}, got {_count()}")
+
+
+async def test_supervise_transcript_fd_exhaustion_warns_once_per_episode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Transient fd exhaustion is one WARNING per episode + an INFO on recovery.
+
+    The loop keeps retrying through the episode (never dies), emits NO
+    ERROR-level 'poll failed' records for it, and a later episode warns anew.
+    """
+    caplog.set_level(logging.DEBUG, logger=cnp.__name__)
+    state = {"faulting": True, "clean_passes": 0}
+    store = tmp_path / "store.db"
+
+    def _discover(*_a: object, **_k: object) -> Path:
+        if state["faulting"]:
+            raise OSError(errno.EMFILE, "Too many open files")
+        store.write_bytes(b"")
+        return store
+
+    monkeypatch.setattr(cnp, "_discover_store", _discover)
+
+    def _read(_s: Path) -> list[CursorPendingToolCall]:
+        state["clean_passes"] += 1
+        return []
+
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", _read)
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(object()))
+
+    task = asyncio.create_task(
+        cnp.supervise_cursor_transcript_elicitations(
+            base_url="http://x",
+            headers={},
+            session_id="conv_fd",
+            bridge_dir=tmp_path,
+            workspace="/ws",
+            launch_epoch_ms=0,
+            poll_interval_s=0.01,
+            settle_s=0.0,
+        )
+    )
+    try:
+        # Episode 1: the first faulting pass warns; further passes must not.
+        await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 1)
+        await asyncio.sleep(0.1)  # many more faulting passes
+        # Recovery: a clean pass logs the episode's end at INFO.
+        state["faulting"] = False
+        await _await_log_count(caplog, logging.INFO, "recovered from fd exhaustion", 1)
+        assert state["clean_passes"] >= 1
+        # Episode 2: a fresh episode warns again (per-episode state was reset).
+        store.unlink()  # unbind so the next pass re-enters discovery
+        state["faulting"] = True
+        await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 2)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not errors, [r.getMessage() for r in errors]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(OSError(errno.EACCES, "denied"), id="non-transient-oserror"),
+        pytest.param(RuntimeError("boom"), id="non-oserror"),
+    ],
+)
+async def test_supervise_transcript_non_transient_failures_still_log_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    exc: Exception,
+) -> None:
+    """Only fd exhaustion is demoted: any other poll failure keeps its ERROR."""
+    caplog.set_level(logging.DEBUG, logger=cnp.__name__)
+
+    def _discover(*_a: object, **_k: object) -> Path:
+        raise exc
+
+    monkeypatch.setattr(cnp, "_discover_store", _discover)
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(object()))
+
+    task = asyncio.create_task(
+        cnp.supervise_cursor_transcript_elicitations(
+            base_url="http://x",
+            headers={},
+            session_id="conv_err",
+            bridge_dir=tmp_path,
+            workspace="/ws",
+            launch_epoch_ms=0,
+            poll_interval_s=0.01,
+            settle_s=0.0,
+        )
+    )
+    try:
+        await _await_log_count(
+            caplog, logging.ERROR, "cursor transcript elicitation poll failed", 1
+        )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert not any("degraded by fd exhaustion" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize(
