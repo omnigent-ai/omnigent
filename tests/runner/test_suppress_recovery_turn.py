@@ -149,6 +149,7 @@ def _session_init_payload(
     return build_runner_session_init_payload(
         conv,
         server_version=server_version,
+        context_saver_available=True,
         suppress_recovery_turn=suppress_recovery_turn,
     )
 

@@ -190,7 +190,9 @@ rate_limit:
 
 #### `ask_on_os_tools`
 
-Requires user approval before any `sys_os_read`, `sys_os_write`, `sys_os_edit`, or `sys_os_shell` tool call. No parameters (direct callable).
+Requires user approval before any `sys_context_read`, `sys_os_read`, `sys_os_write`,
+`sys_os_edit`, or `sys_os_shell` tool call. Context Saver approvals show every
+requested path. No parameters (direct callable).
 
 ```yaml
 approve_file_ops:

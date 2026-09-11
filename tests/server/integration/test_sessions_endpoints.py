@@ -1925,6 +1925,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             "content": meta["content"],
             "agent_id": agent["id"],
             "model": "skill-agent",
+            "context_saver_available": True,
             "has_mcp_servers": False,
             # No renderer subscribes to the session stream in this test,
             # so the turn is stamped headless (browser tools stripped).

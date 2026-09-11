@@ -4029,6 +4029,7 @@ async def _ensure_runner_session_initialized(
                 json=build_runner_session_init_payload(
                     conv,
                     server_version=VERSION,
+                    context_saver_available=get_caps().context_saver_available,
                     suppress_recovery_turn=suppress_recovery_turn,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
@@ -5122,6 +5123,9 @@ async def _forward_event_to_runner(
         # model tags the ResponseObject for REPL rendering.
         # Use the human-readable agent name when available.
         "model": agent_name or conv.agent_id or "",
+        # RuntimeCaps belongs to the server process. Carry its operator-owned
+        # hard gate into the runner before it builds tool schemas or hooks.
+        "context_saver_available": get_caps().context_saver_available,
         # Signal to proxy_stream that it should initialise
         # ProxyMcpManager and fetch MCP tool schemas for this turn.
         # Only included (and only True) when the agent has MCP
@@ -9324,6 +9328,14 @@ async def _handle_mcp_tools_call(
 
     if not namespaced_name:
         return _mcp_error_response(rpc_id, -32000, "Missing tool name in tools/call params")
+    if namespaced_name == "sys_context_read" and not bool(
+        getattr(get_caps(), "context_saver_available", False)
+    ):
+        return _mcp_error_response(
+            rpc_id,
+            -32000,
+            "Context Saver is unavailable in this deployment",
+        )
 
     # Session → agent → spec (needed for policy evaluation on both paths).
     # All three reads — conversation row, agent row, and the cold-cache

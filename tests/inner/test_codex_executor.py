@@ -45,6 +45,7 @@ from omnigent.inner.executor import (
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runtime.prompt import CONTEXT_SAVER_INSTRUCTION
 
 
 def _run(coro):
@@ -567,6 +568,57 @@ class TestCodexExecutor(unittest.TestCase):
             params = thread_start_call.args[1]
             self.assertNotIn("shell_tool", params["config"]["features"])
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
+
+        _run(_t())
+
+    def test_app_server_run_turn_omits_degraded_context_saver(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._context_saver_requested = True
+            session.context_saver_enforced = False
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            _ = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[
+                        {"name": "sys_context_read", "description": "Focused read"},
+                        {"name": "other_tool", "description": "Other"},
+                    ],
+                    system_prompt=f"Base instructions.\n\n{CONTEXT_SAVER_INSTRUCTION}",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            params = session._request.await_args_list[0].args[1]
+            self.assertEqual(params["developerInstructions"], "Base instructions.")
+            self.assertEqual(
+                [tool["name"] for tool in params["dynamicTools"]],
+                ["other_tool"],
+            )
 
         _run(_t())
 
@@ -3351,6 +3403,62 @@ def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
     _run(_t())
 
 
+def test_untrusted_context_saver_hook_is_reported_as_degraded(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.runtime.context_saver import ContextSaverSettings
+
+    source = tmp_path / "codex-home"
+    source.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def _t() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo",
+            cwd=str(workspace),
+            env={},
+            tool_executor=None,
+        )
+        session._request = AsyncMock(return_value={"result": {}})
+        fake_proc = _FakeProcess()
+
+        with (
+            patch("omnigent.inner.codex_executor.populate_codex_skills_from_bundle"),
+            patch(
+                "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+                return_value=source,
+            ),
+            patch(
+                "omnigent.inner.codex_executor._effective_context_saver_settings",
+                return_value=ContextSaverSettings(enabled=True),
+            ),
+            patch(
+                "omnigent.inner.codex_executor._codex_cli_version",
+                new=AsyncMock(return_value=(0, 145, 0)),
+            ),
+            patch(
+                "omnigent.inner.codex_executor._create_subprocess_exec",
+                new=AsyncMock(return_value=fake_proc),
+            ),
+            patch.object(
+                app_server,
+                "trust_codex_context_saver_hooks",
+                new=AsyncMock(side_effect=RuntimeError("hook is untrusted")),
+            ),
+        ):
+            await session.start()
+            assert session.context_saver_enforced is False
+            assert session.context_saver_degraded_reason == "hook is untrusted"
+            await session.close()
+
+    with caplog.at_level("WARNING"):
+        _run(_t())
+    assert "Context Saver enforcement degraded for codex" in caplog.text
+
+
 def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) -> None:
     """If a config file already exists in the target (e.g. from a
     previous partial start), it is not replaced.
@@ -3502,6 +3610,16 @@ def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
     env = _clean_codex_env()
 
     assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
+
+
+def test_clean_codex_env_includes_context_saver_hard_gate(monkeypatch) -> None:
+    """The server hard-disable reaches Codex and its hook subprocesses."""
+    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.runtime.context_saver import CONTEXT_SAVER_AVAILABLE_ENV
+
+    monkeypatch.setenv(CONTEXT_SAVER_AVAILABLE_ENV, "0")
+
+    assert _clean_codex_env()[CONTEXT_SAVER_AVAILABLE_ENV] == "0"
 
 
 # ---------------------------------------------------------------------------

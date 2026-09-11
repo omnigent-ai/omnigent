@@ -8,7 +8,11 @@ import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData
 from omnigent.runner.app import _format_subagent_wake_notice
+from omnigent.runtime import _globals
+from omnigent.runtime.caps import RuntimeCaps
+from omnigent.runtime.context_saver import parse_context_saver_settings
 from omnigent.runtime.prompt import (
+    CONTEXT_SAVER_INSTRUCTION,
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
@@ -29,6 +33,7 @@ def _spec(
     agents: tuple[str, ...] = (),
     spawn: bool = False,
     builtins: tuple[str, ...] = (),
+    os_env: object | None = None,
 ) -> AgentSpec:
     """
     Stub only the AgentSpec fields the instruction builders read.
@@ -43,6 +48,8 @@ def _spec(
                 builtins=[SimpleNamespace(name=name) for name in builtins],
             ),
             spawn=spawn,
+            executor=SimpleNamespace(harness_kind="codex"),
+            os_env=os_env,
         ),
     )
 
@@ -278,6 +285,51 @@ def test_embedded_browser_guidance_included_for_every_agent() -> None:
     assert build_instructions(authored, None, []) == (
         f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
     )
+
+
+def test_context_saver_guidance_is_gated_by_runtime_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _globals,
+        "_caps",
+        RuntimeCaps(context_saver=parse_context_saver_settings({"enabled": True})),
+    )
+
+    result = build_instructions(_spec("Agent prompt", os_env=object()), None, [])
+
+    assert result.endswith(CONTEXT_SAVER_INSTRUCTION)
+
+
+def test_context_saver_guidance_requires_filesystem_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _globals,
+        "_caps",
+        RuntimeCaps(context_saver=parse_context_saver_settings({"enabled": True})),
+    )
+
+    result = build_instructions(_spec("Agent prompt"), None, [])
+
+    assert CONTEXT_SAVER_INSTRUCTION not in result
+
+
+def test_context_saver_guidance_requires_runtime_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _globals,
+        "_caps",
+        RuntimeCaps(
+            context_saver_available=False,
+            context_saver=parse_context_saver_settings({"enabled": True}),
+        ),
+    )
+
+    result = build_instructions(_spec("Agent prompt", os_env=object()), None, [])
+
+    assert CONTEXT_SAVER_INSTRUCTION not in result
 
 
 def test_embedded_browser_guidance_names_registered_tools() -> None:

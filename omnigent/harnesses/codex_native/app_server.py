@@ -44,6 +44,8 @@ from omnigent.harnesses.codex_native.process_registry import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _CODEX_CONTEXT_SAVER_HOOK_MIN_VERSION,
+    _CODEX_CONTEXT_SAVER_HOOK_MODULE,
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
@@ -2179,6 +2181,42 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
         ", ".join(sorted(str(h.get("eventName")) for h in ours)),
     )
     return []
+
+
+async def trust_codex_context_saver_hooks(request: CodexRequestFn, *, cwd: str) -> None:
+    """Persist and verify trust for the wrapped Codex Context Saver gate."""
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    ours = _our_hooks_from_list(listed, cwd, _CODEX_CONTEXT_SAVER_HOOK_MODULE)
+    if not ours:
+        raise RuntimeError(
+            f"Context Saver hook was not discovered for cwd {cwd!r}; "
+            f"{_hooks_list_diagnostics(listed, cwd)}"
+        )
+    untrusted = [h for h in ours if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
+    if not untrusted:
+        return
+    await _persist_hook_trust(request, untrusted)
+    relisted = await request("hooks/list", {"cwds": [cwd]})
+    still_untrusted = [
+        h
+        for h in _our_hooks_from_list(relisted, cwd, _CODEX_CONTEXT_SAVER_HOOK_MODULE)
+        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    ]
+    if not still_untrusted:
+        return
+    missing_protocol = any(
+        h.get("currentHash") is None or h.get("trustStatus") is None for h in still_untrusted
+    )
+    hint = (
+        " Upgrade codex to at least "
+        f"{_format_codex_version(_CODEX_CONTEXT_SAVER_HOOK_MIN_VERSION)}."
+        if missing_protocol
+        else ""
+    )
+    raise RuntimeError(
+        "Context Saver hook remained untrusted after config/batchWrite: "
+        f"{_untrusted_hook_detail(still_untrusted)}.{hint}"
+    )
 
 
 async def trust_all_codex_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:

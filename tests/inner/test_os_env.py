@@ -16,6 +16,7 @@ from omnigent.inner.os_env import (
     _child_shell_env,
     _project_root,
     _read_impl,
+    _read_metadata_impl,
     _shell_impl,
     build_helper_env,
     create_os_environment,
@@ -153,6 +154,156 @@ def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 _BINARY = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+
+
+def test_read_impl_without_text_byte_limit_preserves_legacy_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Ordinary text reads retain their result shape and avoid re-encoding."""
+    file_path = tmp_path / "source.txt"
+    content = "one\ntwo\n"
+    file_path.write_text(content, encoding="utf-8")
+
+    class _TextWithoutEncode(str):
+        def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+            del encoding, errors
+            raise AssertionError("ordinary reads must not re-encode text")
+
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *args, **kwargs: _TextWithoutEncode(content),
+    )
+
+    result = _read_impl(file_path, offset=1, limit=1)
+
+    assert result == {
+        "path": str(file_path),
+        "content": "one\n",
+        "encoding": "utf-8",
+        "offset": 1,
+        "limit": 1,
+        "returned_lines": 1,
+        "total_lines": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_lines"),
+    [
+        (b"", 0),
+        (b"one", 1),
+        (b"one\n", 1),
+        (b"one\r\ntwo\rthree", 3),
+        ("one\u2028two\x85three\v".encode(), 3),
+        (b"x" * (64 * 1024 - 1) + b"\r\nnext", 2),
+        (b"x" * (64 * 1024 - 1) + "\u20ac\n".encode(), 1),
+    ],
+)
+def test_read_metadata_impl_returns_exact_text_metadata(
+    tmp_path: Path,
+    content: bytes,
+    expected_lines: int,
+) -> None:
+    """Metadata byte and line counts match the complete UTF-8 file."""
+    file_path = tmp_path / "source.txt"
+    file_path.write_bytes(content)
+
+    result = _read_metadata_impl(file_path)
+
+    assert result == {
+        "path": str(file_path),
+        "encoding": "utf-8",
+        "total_lines": expected_lines,
+        "total_bytes": len(content),
+    }
+
+
+@pytest.mark.parametrize("content", [b"H\x00i", b"valid prefix\n" + b"x" * 9_000 + b"\xff"])
+def test_read_metadata_impl_returns_binary_metadata(
+    tmp_path: Path,
+    content: bytes,
+) -> None:
+    """NUL-laden and invalid UTF-8 files return size but no text metadata."""
+    file_path = tmp_path / "source.bin"
+    file_path.write_bytes(content)
+
+    result = _read_metadata_impl(file_path)
+
+    assert result == {
+        "path": str(file_path),
+        "encoding": "base64",
+        "total_bytes": len(content),
+    }
+
+
+def test_read_metadata_impl_streams_without_materializing_content(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Metadata reads retain only a fixed-size chunk for large text files."""
+    file_path = tmp_path / "large.txt"
+    chunk = b"x" * (64 * 1024 - 1) + b"\n"
+    chunk_count = 256
+    with file_path.open("wb") as file_handle:
+        for _ in range(chunk_count):
+            file_handle.write(chunk)
+
+    def _unexpected_read_text(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise AssertionError("metadata must not call Path.read_text")
+
+    monkeypatch.setattr(Path, "read_text", _unexpected_read_text)
+    tracemalloc.start()
+    try:
+        result = _read_metadata_impl(file_path)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result["total_bytes"] == len(chunk) * chunk_count
+    assert result["total_lines"] == chunk_count
+    assert peak < 2 * 1024 * 1024
+
+
+def test_read_metadata_uses_helper_transport(tmp_path: Path) -> None:
+    """The public operation reaches the sandbox helper and resolves its cwd."""
+    file_path = tmp_path / "source.txt"
+    file_path.write_text("one\ntwo\n", encoding="utf-8")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+    assert os_env is not None
+
+    try:
+        result = asyncio.run(os_env.read_metadata("source.txt"))
+    finally:
+        os_env.close()
+
+    assert result == {
+        "path": str(file_path),
+        "encoding": "utf-8",
+        "total_lines": 2,
+        "total_bytes": 8,
+    }
+
+
+def test_read_impl_enforces_text_byte_limit_before_full_allocation(tmp_path: Path) -> None:
+    """A bounded text read stops after one byte beyond its configured cap."""
+    file_path = tmp_path / "source.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    rejected = _read_impl(file_path, offset=1, limit=None, max_text_bytes=4)
+    accepted = _read_impl(file_path, offset=1, limit=None, max_text_bytes=5)
+
+    assert rejected == {"error": "text file exceeds the 4-byte read limit"}
+    assert accepted["content"] == "hello"
+    assert accepted["total_bytes"] == 5
 
 
 def test_read_impl_binary_descriptor_for_agent(tmp_path: Path) -> None:

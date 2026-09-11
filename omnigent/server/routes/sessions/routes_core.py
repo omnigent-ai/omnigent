@@ -46,6 +46,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
+    get_caps,
     pending_elicitations,
     user_session_stream,
 )
@@ -624,8 +625,13 @@ def register_core_routes(
             }
             if conv.agent_id is not None:
                 try:
-                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                    init_body = build_runner_session_init_payload(
+                        conv,
+                        server_version=VERSION,
+                        context_saver_available=get_caps().context_saver_available,
+                    )
                 except Exception:
+                    init_body["context_saver_available"] = get_caps().context_saver_available
                     # Must not fail the create, but the degradation loses the
                     # seeded override — surface it instead of silently
                     # downgrading (a bare ValueError catch would swallow a

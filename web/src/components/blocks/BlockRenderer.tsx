@@ -35,6 +35,7 @@ import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
+import { ContextSaverCard, parseContextSaverResult } from "./ContextSaverCard";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
@@ -721,12 +722,25 @@ function renderToolRunFragment(
 }
 
 const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
+const CONTEXT_SAVER_NAMES = new Set(["sys_context_read", "mcp__omnigent__sys_context_read"]);
 const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
+
+function usesContextSaverCard(item: RenderItem): boolean {
+  return (
+    item.kind === "tool" &&
+    CONTEXT_SAVER_NAMES.has(item.execution.name) &&
+    (item.output === null
+      ? item.state === "input-available"
+      : parseContextSaverResult(item.output) !== null)
+  );
+}
 
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) ||
+      usesContextSaverCard(item) ||
+      SESSION_SEND_NAMES.has(item.execution.name))
   );
 }
 
@@ -799,6 +813,9 @@ function renderItem(
             state={item.state}
           />
         );
+      }
+      if (usesContextSaverCard(item)) {
+        return <ContextSaverCard key={key} output={item.output} state={item.state} />;
       }
       return (
         <ToolCard

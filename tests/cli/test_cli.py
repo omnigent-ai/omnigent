@@ -5054,6 +5054,140 @@ def test_config_set_global_writes_auto_open_conversation_bool(
     assert _resolve_auto_open_conversation_from_config(cfg) is True
 
 
+def test_config_set_context_saver_preserves_technique_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The boolean CLI toggle deep-merges into the structured config block."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    _save_global_config(
+        {
+            "context_saver": {
+                "enabled": False,
+                "techniques": {"focused_read": {"min_lines": 500}},
+            }
+        }
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["config", "set", "--global", "context_saver=true"],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = _load_global_config()
+    assert cfg["context_saver"]["enabled"] is True
+    assert cfg["context_saver"]["techniques"]["focused_read"]["min_lines"] == 500
+
+
+def test_config_list_shows_context_saver_model_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+    _save_global_config({"context_saver": {"enabled": True}})
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Focused Read worker route (enabled in config): all primary models -> "
+        "databricks/context-saver-cheap"
+    ) in result.output
+    assert "Backing model is managed by Databricks AI Gateway" in result.output
+
+
+def test_config_list_marks_disabled_focused_read_route_inactive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+    _save_global_config(
+        {
+            "context_saver": {
+                "enabled": True,
+                "techniques": {"focused_read": {"enabled": False}},
+            }
+        }
+    )
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "Focused Read worker route (disabled in config)" in result.output
+
+
+def test_config_list_does_not_describe_custom_databricks_route_as_gateway_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+    _save_global_config(
+        {
+            "context_saver": {
+                "enabled": True,
+                "techniques": {"focused_read": {"worker_model": "databricks/custom-endpoint"}},
+            }
+        }
+    )
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "all primary models -> databricks/custom-endpoint" in result.output
+    assert "Backing model is managed by Databricks AI Gateway" not in result.output
+    assert "Non-Databricks source sharing" not in result.output
+
+
+def test_config_list_route_inherits_user_worker_through_project_tuning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    _save_global_config(
+        {
+            "context_saver": {
+                "enabled": False,
+                "techniques": {
+                    "focused_read": {
+                        "worker_model": "openai/gpt-4o-mini",
+                        "worker_provider": "team-cheap-worker",
+                        "allow_source_upload": True,
+                    }
+                },
+            }
+        }
+    )
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "context_saver:\n  enabled: true\n  techniques:\n    focused_read:\n      min_lines: 200\n"
+    )
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Focused Read worker route (enabled in config): all primary models -> openai/gpt-4o-mini"
+    ) in result.output
+    assert (
+        "Non-Databricks source sharing is allowed for this worker route (openai route provider)"
+    ) in result.output
+
+
 def test_config_set_global_writes_session_title_instructions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

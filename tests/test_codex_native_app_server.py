@@ -37,6 +37,7 @@ from omnigent.harnesses.codex_native.app_server import (
     discover_codex_model_options,
     framework_approved_tools,
     trust_all_codex_hooks,
+    trust_codex_context_saver_hooks,
     trust_codex_router_hooks,
     trust_native_policy_hooks,
 )
@@ -2274,6 +2275,49 @@ _ROUTER_GATE_COMMAND = (
     "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
     "route-subagent --bridge-dir /b --harness codex-native"
 )
+_CONTEXT_SAVER_GATE_COMMAND = (
+    "/venv/bin/python -I -m omnigent.inner.hook_scripts.codex_context_saver_hook "
+    "--min-lines 350 --focused-read-enabled"
+)
+
+
+async def test_context_saver_hooks_are_trusted_via_batchwrite() -> None:
+    client = _FakeCodexClient(
+        hooks=[
+            _hook(
+                "context-saver",
+                _CONTEXT_SAVER_GATE_COMMAND,
+                "untrusted",
+                "sha256:context-saver",
+            ),
+            _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
+        ]
+    )
+
+    await trust_codex_context_saver_hooks(client.request, cwd=_CWD)
+
+    assert _batchwrite_calls(client)[0].params["edits"][0]["value"] == {
+        "context-saver": {"trusted_hash": "sha256:context-saver"}
+    }
+
+
+async def test_context_saver_hook_trust_fails_loud_when_untrusted() -> None:
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("context-saver", _CONTEXT_SAVER_GATE_COMMAND, "untrusted"),
+        ],
+        flip_on_trust=False,
+    )
+
+    with pytest.raises(RuntimeError, match="remained untrusted"):
+        await trust_codex_context_saver_hooks(client.request, cwd=_CWD)
+
+
+async def test_context_saver_hook_trust_fails_when_hook_is_missing() -> None:
+    client = _FakeCodexClient(hooks=[_hook("theirs", _USER_COMMAND, "trusted")])
+
+    with pytest.raises(RuntimeError, match="was not discovered"):
+        await trust_codex_context_saver_hooks(client.request, cwd=_CWD)
 
 
 async def test_router_hooks_are_trusted_via_batchwrite() -> None:

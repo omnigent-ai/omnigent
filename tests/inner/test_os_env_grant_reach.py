@@ -91,6 +91,10 @@ def test_no_grants_blocks_outside_path_for_every_op(tmp_path: Path) -> None:
     assert "error" in read_res
     assert "outside the environment root" in read_res["error"]
 
+    metadata_res = _req("read_metadata", target, workspace, policy)
+    assert "error" in metadata_res
+    assert "outside the environment root" in metadata_res["error"]
+
     write_res = _req("write", target, workspace, policy, content="pwn")
     assert "error" in write_res
     assert "outside the environment root" in write_res["error"]
@@ -121,6 +125,10 @@ def test_read_grant_permits_read_but_denies_write_and_edit(tmp_path: Path) -> No
     read_res = _req("read", target, workspace, policy)
     assert "error" not in read_res
     assert read_res["content"] == "hello"
+
+    metadata_res = _req("read_metadata", target, workspace, policy)
+    assert metadata_res["total_lines"] == 1
+    assert metadata_res["total_bytes"] == 5
 
     write_res = _req("write", target, workspace, policy, content="x")
     assert "error" in write_res

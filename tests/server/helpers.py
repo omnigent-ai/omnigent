@@ -1103,6 +1103,7 @@ class FakeCaps:
     routing_client: Any = None  # type: ignore[explicit-any]
     routing_backends: Any = None  # type: ignore[explicit-any]
     routing_settings: Any = field(default_factory=RoutingSettings)  # type: ignore[explicit-any]
+    context_saver_available: bool = True
 
 
 def echo_runner_client() -> httpx.AsyncClient:

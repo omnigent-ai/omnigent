@@ -9770,6 +9770,40 @@ async def test_hook_evaluate_endpoint_allows(
 
 
 @pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_honors_context_saver_hard_disable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The relay fast path cannot revive server-disabled Context Saver."""
+    from omnigent.runtime import context_saver
+
+    settings = context_saver.parse_context_saver_settings(
+        {"enabled": True, "techniques": {"focused_read": {"min_lines": 5}}}
+    )
+    monkeypatch.setattr(context_saver, "load_context_saver_settings", lambda _path: settings)
+    monkeypatch.setenv(context_saver.CONTEXT_SAVER_AVAILABLE_ENV, "0")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    (tmp_path / "large.py").write_text("\n".join(f"line {i}" for i in range(10)))
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "cat large.py"},
+            },
+        )
+        assert body == ""
+        assert client.calls == 1
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
 async def test_hook_evaluate_endpoint_returns_deny_hook_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

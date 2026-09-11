@@ -79,6 +79,106 @@ describe("BlockRenderer dispatch", () => {
     expect(screen.getByText("effort")).toBeDefined();
   });
 
+  it("renders Context Saver routing metadata through its transparent card", () => {
+    const output = JSON.stringify({
+      technique: "focused_read",
+      model_routing: {
+        primary_models: "all",
+        worker_route: "databricks/context-saver-cheap",
+        worker_model_reported: null,
+        route_provider: "databricks",
+        non_databricks_source_sharing_allowed: false,
+      },
+      failure: null,
+    });
+    const items: RenderItem[] = [
+      {
+        kind: "tool",
+        itemId: "context_read_1",
+        execution: {
+          name: "sys_context_read",
+          arguments: { paths: ["large.py"], question: "Where is the target?" },
+          argsSummary: "large.py",
+          callId: "call_context_read_1",
+          agentName: "codex",
+          executedBy: "server",
+          output,
+        },
+        output,
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    expect(screen.getByTestId("context-saver-card")).toHaveTextContent(
+      "databricks/context-saver-cheap",
+    );
+  });
+
+  it("uses the generic tool card for Context Saver results recorded before route metadata", () => {
+    const output = JSON.stringify({
+      technique: "focused_read",
+      content: "Legacy result",
+      failure: null,
+    });
+    const items: RenderItem[] = [
+      {
+        kind: "tool",
+        itemId: "context_read_legacy",
+        execution: {
+          name: "sys_context_read",
+          arguments: { paths: ["large.py"], question: "Where is the target?" },
+          argsSummary: "large.py",
+          callId: "call_context_read_legacy",
+          agentName: "codex",
+          executedBy: "server",
+          output,
+        },
+        output,
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    expect(screen.queryByTestId("context-saver-card")).toBeNull();
+    expect(screen.getByRole("button")).toBeInTheDocument();
+  });
+
+  it.each(["cancelled", "no-output"] as const)(
+    "does not show a failed persistent Context Saver card for %s calls",
+    (state) => {
+      const items: RenderItem[] = [
+        {
+          kind: "tool",
+          itemId: `context_read_${state}`,
+          execution: {
+            name: "sys_context_read",
+            arguments: { paths: ["large.py"], question: "Where is the target?" },
+            argsSummary: "large.py",
+            callId: `call_context_read_${state}`,
+            agentName: "codex",
+            executedBy: "server",
+            output: null,
+          },
+          output: null,
+          state,
+          startedAt: null,
+          duration: undefined,
+        },
+      ];
+
+      render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+      expect(screen.queryByTestId("context-saver-card")).toBeNull();
+    },
+  );
+
   it("renders a terminal_command input RenderItem via TerminalCommandCard", () => {
     const items: RenderItem[] = [
       {

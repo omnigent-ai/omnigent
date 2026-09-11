@@ -41,6 +41,7 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     server_version: str
     session_id: str
     agent_id: str
+    context_saver_available: bool = True
     sub_agent_name: str | None = None
     snapshot: RunnerSessionInitSnapshot
     # When True the runner must skip crash-recovery turn detection on this
@@ -55,6 +56,7 @@ def build_runner_session_init_payload(
     conversation: Conversation,
     *,
     server_version: str,
+    context_saver_available: bool,
     suppress_recovery_turn: bool = False,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
@@ -65,6 +67,7 @@ def build_runner_session_init_payload(
         server_version=server_version,
         session_id=conversation.id,
         agent_id=conversation.agent_id,
+        context_saver_available=context_saver_available,
         sub_agent_name=conversation.sub_agent_name,
         suppress_recovery_turn=suppress_recovery_turn,
         snapshot=RunnerSessionInitSnapshot(
