@@ -290,6 +290,21 @@ describe("ErrorBanner", () => {
     expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
   });
 
+  it("headlines a runner-start failure instead of the generic fallback", () => {
+    // The creation-window failure persists this exact message with the
+    // runner_failed_to_start code; the collapsed pill must name the failure.
+    render(
+      <ErrorBanner
+        message="The runner for this session is not available — it may have failed to start. See the host logs."
+        source="execution"
+        code="runner_failed_to_start"
+      />,
+    );
+    const headline = screen.getByTestId("error-headline");
+    expect(headline).toHaveTextContent("The session's runner failed to start on the host.");
+    expect(headline).not.toHaveTextContent("Something went wrong");
+  });
+
   it("dismisses only the visible banner", () => {
     render(
       <div>
