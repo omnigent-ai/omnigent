@@ -1954,13 +1954,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // shimmer) but has no `sendLatchedAt`. Treat it as NOT-already-streaming so
     // this send arms the latch and owns the failure-settle — otherwise a failed
     // first turn would strand the conversation in "streaming" with no watchdog.
+    // A codex `/side` command is forked into its own side chat: it gets no
+    // bubble here, and this session must not latch into "Working…" either —
+    // nothing runs here, so nothing would ever arrive to clear it.
+    const opensSideChat = get().sessionHarness === "codex-native" && isSideChatCommand(text.trim());
+    if (opensSideChat) {
+      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
+    }
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
-    if (!alreadyStreaming) {
+    if (!alreadyStreaming && !opensSideChat) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
@@ -2000,13 +2007,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
     ];
     const selfAuthor = getCurrentAuthorId();
-    // A codex `/side` command is forked into its own side chat and never joins
-    // this transcript, so it gets no bubble here — one would sit unanswered
-    // forever, since nothing ever mirrors the message back.
-    const opensSideChat = get().sessionHarness === "codex-native" && isSideChatCommand(text.trim());
-    if (opensSideChat) {
-      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
-    }
     if (reuseTempId === null) {
       pinnedSetter((s) => ({
         pendingUserMessages: opensSideChat
