@@ -6868,20 +6868,29 @@ function failUnavailableStream(set: Setter, error: string): void {
 // within the connect-grace + relaunch window.
 const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
 
+// The server's bare default when it has no launch context to report (keep in
+// sync with the raise in omnigent/server/routes/sessions/routes_events.py).
+// Any other runner-unavailable detail names the failed phase (e.g. "launched
+// but never connected within 30s") and must reach the user verbatim.
+const RUNNER_UNAVAILABLE_TERSE_MESSAGE = "No runner bound for session";
+
 /**
  * Turn a thrown send failure into user-facing banner text + a code.
  *
- * The runner-unavailable 503 gets self-explanatory copy (and no raw code in
- * the banner title) so a slow/never-online runner reads as a clear, retryable
- * message rather than the server's terse "No runner bound for session". Other
- * failures fall back to the error's own message, carrying the machine code
- * when present for debuggability.
+ * The runner-unavailable 503 keeps its code (so the banner headline and the
+ * Retry affordance classify it) and surfaces the server's cause when it sent
+ * one; only the terse no-context default is replaced with friendly copy.
+ * Other failures fall back to the error's own message, carrying the machine
+ * code when present for debuggability.
  */
 function describeSendFailure(err: unknown): { message: string; code: string } {
   if (err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE) {
+    const informative = err.message && err.message !== RUNNER_UNAVAILABLE_TERSE_MESSAGE;
     return {
-      message: "The runner didn't come online in time. Please try again.",
-      code: "",
+      message: informative
+        ? err.message
+        : "The runner didn't come online in time. Please try again.",
+      code: RUNNER_UNAVAILABLE_CODE,
     };
   }
   if (err instanceof ApiError) {
