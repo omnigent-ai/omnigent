@@ -281,7 +281,7 @@ export function HostOutdatedNotice({
 }) {
   if (!host?.outdated || !host.version || !serverVersion) return null;
   return (
-    <div className={cn("mx-auto w-full px-6 pt-3", CHAT_COLUMN_WIDTH)}>
+    <div className={cn("mx-auto w-full px-6 pt-16 md:pt-14", CHAT_COLUMN_WIDTH)}>
       <div
         role="status"
         data-testid="host-outdated-notice"
