@@ -1,7 +1,7 @@
 // Cmd/Ctrl+] / [ steps next/prev with wrap; off-list ] enters at top, [ at
 // bottom; platform-aware (only ⌘ on macOS, only Ctrl elsewhere); fires while the
 // composer is focused but bails inside terminals / the code editor; ignores
-// Alt/bare brackets; a no-op step (same id) doesn't navigate.
+// Alt/Shift/bare brackets; a no-op step (same id) doesn't navigate.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -96,12 +96,10 @@ describe("useSessionSwitchHotkey", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("accepts Shift+bracket aliases using the physical key", () => {
+  it("ignores Shift+chord", () => {
     render(ids, "a");
     press("BracketRight", { metaKey: true, shiftKey: true });
-    expect(navigate).toHaveBeenLastCalledWith("/c/b");
-    press("BracketLeft", { metaKey: true, shiftKey: true });
-    expect(navigate).toHaveBeenLastCalledWith("/c/c");
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("ignores a bare bracket with no Cmd/Ctrl", () => {

@@ -76,9 +76,10 @@ export function useCommandPaletteHotkey(
       const sessionSearch =
         latest.current.onSessionSearch &&
         hasCommandModifier(e, isMac) &&
-        !e.altKey &&
+        e.altKey &&
         !e.shiftKey &&
-        e.key.toLowerCase() === "p";
+        !e.getModifierState("AltGraph") &&
+        e.code === "KeyS";
       if (!sessionSearch && !isCommandPaletteHotkey(e, isMac)) return;
       // Leave the chord to a surface that actually consumes it.
       if (focusOwnsHotkey(e)) return;

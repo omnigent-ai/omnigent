@@ -170,7 +170,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
-import { SessionHotkeyHint, SessionHotkeyHints } from "./SessionHotkeyHints";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
@@ -276,7 +275,6 @@ function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...a
 }
 
 function SidebarRowDataProvider({
-  hotkeyIds,
   projectNamesById,
   projectIconsById,
   hostsById,
@@ -286,7 +284,6 @@ function SidebarRowDataProvider({
   onActivate,
   children,
 }: {
-  hotkeyIds: readonly string[];
   projectNamesById: Map<string, string>;
   projectIconsById: Map<string, string>;
   hostsById: ReadonlyMap<string, Host>;
@@ -304,7 +301,7 @@ function SidebarRowDataProvider({
             <ViewerIdContext.Provider value={viewerId}>
               <ServerInfoContext.Provider value={serverInfo}>
                 <RowActivationContext.Provider value={onActivate}>
-                  <SessionHotkeyHints ids={hotkeyIds}>{children}</SessionHotkeyHints>
+                  {children}
                 </RowActivationContext.Provider>
               </ServerInfoContext.Provider>
             </ViewerIdContext.Provider>
@@ -2125,7 +2122,6 @@ function ConversationList({
   // rules between groups.
   return (
     <SidebarRowDataProvider
-      hotkeyIds={pinnedSessionIds}
       projectNamesById={projectNamesById}
       projectIconsById={projectIconsById}
       hostsById={hostsById}
@@ -3947,7 +3943,6 @@ function ConversationRowImpl({
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
-        {!selectionMode && <SessionHotkeyHint id={conversation.id} />}
       </div>
     </Link>
   );
