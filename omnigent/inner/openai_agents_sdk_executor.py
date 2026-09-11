@@ -954,35 +954,50 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     return client
 
 
+def _message_item_text(item: object) -> str:
+    """Visible text carried by a ``message_output_item``.
+
+    Reads the raw message's content parts directly (pydantic or
+    dict-shaped) so no SDK import is needed at module level; parts
+    without a ``text`` field (e.g. refusals, which this executor never
+    renders) contribute nothing.
+
+    :param item: A run item whose ``.type`` is ``"message_output_item"``.
+    :returns: The concatenated part text, ``""`` when the item has none.
+    """
+    raw = getattr(item, "raw_item", None)
+    content = getattr(raw, "content", None)
+    if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
 def _count_output_items(new_items: Sequence[object]) -> int:
     """Count run items that represent user-visible output.
 
     Excludes bookkeeping items (reasoning, compaction) per
-    :data:`_NON_OUTPUT_ITEM_TYPES` so a reasoning-only ghost turn
-    counts as zero output items.
+    :data:`_NON_OUTPUT_ITEM_TYPES` so a reasoning-only ghost turn counts
+    as zero, and message items that carry no text: a completed-but-empty
+    assistant message renders nothing, so counting it would let a silent
+    turn masquerade as output.
 
     :param new_items: ``RunResult.new_items`` for the completed run.
-    :returns: Number of items whose ``.type`` is not in
-        :data:`_NON_OUTPUT_ITEM_TYPES`.
+    :returns: Number of output-bearing items.
     """
-    return sum(
-        1 for item in new_items if getattr(item, "type", None) not in _NON_OUTPUT_ITEM_TYPES
-    )
-
-
-def _sum_output_tokens(raw_responses: Sequence[object] | None) -> int:
-    """Sum ``output_tokens`` across a run's raw model responses.
-
-    :param raw_responses: ``RunResult.raw_responses``; each element has a
-        ``.usage.output_tokens``. ``None`` or empty yields ``0``.
-    :returns: Total output tokens reported across all sub-turn responses.
-    """
-    if not raw_responses:
-        return 0
-    return sum(
-        getattr(getattr(response, "usage", None), "output_tokens", 0) or 0
-        for response in raw_responses
-    )
+    count = 0
+    for item in new_items:
+        item_type = getattr(item, "type", None)
+        if item_type in _NON_OUTPUT_ITEM_TYPES:
+            continue
+        if item_type == "message_output_item" and not _message_item_text(item):
+            continue
+        count += 1
+    return count
 
 
 def _is_empty_turn(
@@ -996,13 +1011,11 @@ def _is_empty_turn(
     output-bearing items. A turn that called tools but produced no text
     is NOT empty (tool activity is legitimate output).
 
-    Token usage is deliberately NOT part of this predicate: it must not
-    suppress a retry (gateway token accounting can be unreliable, and a
-    token quirk should not stop us from re-running an empty turn). The
-    fail-loud decision after the retry loop applies a *separate*,
-    narrower gate (``output_tokens == 0``) on top of this one — see the
-    call site for why an empty turn that still billed tokens is left to
-    complete silently rather than raised as an error.
+    Token usage is deliberately NOT part of this predicate: gateway
+    token accounting is unreliable, and a completed-but-empty response
+    often still bills tokens while giving the user nothing to see. An
+    empty turn is retried, then failed loud at the call site — never
+    completed silently.
 
     :param final_text: The assembled assistant text for the turn.
     :param saw_tool_activity: ``True`` if any tool call was streamed.
@@ -1174,7 +1187,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                     ) -> None:
                         try:
                             await super().run_compaction(args)
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             logger.debug(
                                 "Compaction call failed (endpoint may not support "
                                 "responses.compact), continuing without compaction",
@@ -1798,34 +1811,26 @@ class OpenAIAgentsSDKExecutor(Executor):
                 await self._rewind_sdk_session(state, current_item_count)
 
         # ``final_text`` / ``result`` are from the surfaced (last) attempt.
-        # If still empty AND the gateway reported zero output tokens, the
-        # turn is a gateway hiccup, not a deliberate empty answer (which
-        # still bills output tokens): surface a loud retryable error so
-        # the workflow's retry policy can reissue, rather than a silent
-        # empty turn.
-        #
-        # The zero-token condition deliberately narrows fail-loud to the
-        # signature we actually observed (status=completed,
-        # output=[], 0 output tokens). An empty turn that DID bill tokens
-        # falls through to the silent ``TurnComplete("")`` below — exactly
-        # today's behavior, so this change never makes a billed-but-empty
-        # turn worse. If a billed-but-empty gateway failure shows up later,
-        # widen the gate then, with that evidence in hand.
+        # If the turn is still empty after every retry, fail loud with a
+        # retryable error so the workflow's retry policy can reissue. A
+        # silent ``TurnComplete("")`` would end a turn the user watched
+        # start with no reply, no error, and no notice. Token usage plays
+        # no part: a completed-but-empty response often still bills
+        # tokens, and the user gets nothing to see either way.
         assert result is not None
         if _is_empty_turn(final_text, saw_tool_activity, result.new_items):
-            if _sum_output_tokens(getattr(result, "raw_responses", None)) == 0:
-                logger.error(
-                    "OpenAIAgentsSDKExecutor: empty completion after %d attempts",
-                    _EMPTY_TURN_MAX_ATTEMPTS,
-                )
-                yield ExecutorError(
-                    message=(
-                        "openai-agents returned an empty completion after "
-                        f"{_EMPTY_TURN_MAX_ATTEMPTS} attempts"
-                    ),
-                    retryable=True,
-                )
-                return
+            logger.error(
+                "OpenAIAgentsSDKExecutor: empty completion after %d attempts",
+                _EMPTY_TURN_MAX_ATTEMPTS,
+            )
+            yield ExecutorError(
+                message=(
+                    "openai-agents returned an empty completion after "
+                    f"{_EMPTY_TURN_MAX_ATTEMPTS} attempts"
+                ),
+                retryable=True,
+            )
+            return
 
         if not response_text and final_text:
             yield TextChunk(text=final_text)
@@ -1898,7 +1903,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                     _compacted: list[ReplayItem] | None = None
                     try:
                         _compacted = await state.sdk_session.get_items()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             "Failed to read compacted session items",
                             exc_info=True,

@@ -2706,11 +2706,13 @@ def test_turn_usage_cached_tokens_multi_call_sums_across_responses() -> None:
 
 
 # ── Empty-turn retry / fail-loud ────────────────────────────────────
-# The Databricks gateway occasionally returns a completed turn with no
-# text, no tool calls, and no output items. ``run_turn`` retries such a
-# turn once (``_EMPTY_TURN_MAX_ATTEMPTS``) and, if still empty AND the
-# gateway billed zero output tokens, surfaces a loud retryable
-# ``ExecutorError`` instead of a silent empty ``TurnComplete``.
+# The gateway occasionally returns a completed turn with nothing to
+# show: no text, no tool calls, and no output-bearing items (including
+# a message item whose content is empty). ``run_turn`` retries such a
+# turn once (``_EMPTY_TURN_MAX_ATTEMPTS``) and, if still empty,
+# surfaces a loud retryable ``ExecutorError`` instead of a silent empty
+# ``TurnComplete`` — a turn the user watched start must never end with
+# zero feedback.
 
 
 @dataclass
@@ -2725,15 +2727,27 @@ class _FakeReasoningItem:
 
 
 @dataclass
-class _FakeMessageOutputItem:
-    """A run item carrying assistant text. Counts as output.
-
-    :param text: The assistant text the item carries, e.g. ``"hello"``.
-    :param type: The SDK discriminator, always ``"message_output_item"``.
-    """
+class _FakeMessageTextPart:
+    """An ``output_text`` content part of a raw assistant message."""
 
     text: str = ""
-    type: str = "message_output_item"
+
+
+class _FakeMessageOutputItem:
+    """A run item shaped like the SDK's ``MessageOutputItem``.
+
+    Carries its text both on ``raw_item.content[].text`` (what the
+    executor's emptiness check reads) and as a plain ``text`` attribute
+    (what the fake ``ItemHelpers`` reads). Counts as output only when
+    the text is non-empty.
+
+    :param text: The assistant text the item carries, e.g. ``"hello"``.
+    """
+
+    def __init__(self, text: str = "") -> None:
+        self.type = "message_output_item"
+        self.text = text
+        self.raw_item = types.SimpleNamespace(content=[_FakeMessageTextPart(text=text)])
 
 
 def _empty_raw_response() -> _FakeRawResponse:
@@ -2972,21 +2986,21 @@ def test_reasoning_only_turn_is_treated_as_empty() -> None:
     _run(_t())
 
 
-def test_empty_turn_with_output_tokens_is_not_errored() -> None:
+def test_billed_but_empty_turn_still_fails_loud() -> None:
     """
-    A final empty turn that DID bill output tokens is a deliberate empty
-    answer, not a gateway hiccup: it completes silently as before, with
-    no ``ExecutorError``.
+    A final empty turn that DID bill output tokens fails loud all the
+    same: the user watched the turn start, so it must not end with a
+    silent empty ``TurnComplete``.
 
-    What breaks if this fails: a model that legitimately answers with an
-    empty string would be turned into a spurious retryable error.
+    What breaks if this fails: a completed-but-empty gateway response
+    that bills tokens (they usually do) would end the turn with no
+    reply, no error, and no notice — the silent-stop bug.
     """
 
     async def _t() -> None:
         _FakeRunner.last_calls = []
         _FakeRunner.next_result = None
-        # Both attempts empty of text/items, but output_tokens > 0 means
-        # the model ran and chose to emit nothing.
+        # Both attempts empty of text/items, but output_tokens > 0.
         _FakeRunner.next_results = [
             _FakeResult(events=[], final_output="", raw_responses=[_nonempty_raw_response()]),
             _FakeResult(events=[], final_output="", raw_responses=[_nonempty_raw_response()]),
@@ -3004,16 +3018,169 @@ def test_empty_turn_with_output_tokens_is_not_errored() -> None:
                 )
             )
 
-        # Retried once (both empty), then completed silently — the
-        # output-token gate suppresses the fail-loud error.
-        assert not any(isinstance(e, ExecutorError) for e in events), (
-            f"Empty-but-billed turn should NOT error, got {events!r}"
+        # Retried once (both empty), then failed loud — billed tokens do
+        # not buy a silent empty turn.
+        assert len(_FakeRunner.last_calls) == 2, (
+            f"Expected 2 run_streamed calls before fail-loud, got {len(_FakeRunner.last_calls)}"
+        )
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert len(errors) == 1, f"Expected exactly 1 ExecutorError, got {events!r}"
+        assert errors[0].retryable is True
+        assert not any(isinstance(e, TurnComplete) for e in events), (
+            f"No silent TurnComplete may mask the empty turn, got {events!r}"
+        )
+
+    _run(_t())
+
+
+def test_empty_message_item_turn_is_retried() -> None:
+    """
+    A turn whose only new item is a message with EMPTY content (the
+    completed-but-contentless gateway response) is treated as empty and
+    retried — the empty message item must not count as output.
+
+    What breaks if this fails: the empty message item masquerades as
+    output, so neither the retry nor the fail-loud gate fires and the
+    turn ends as a silent ``TurnComplete("")`` — the user watches the
+    turn start, then stop, with no reply, no error, and no notice.
+    """
+
+    async def _t() -> None:
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = None
+        _FakeRunner.next_results = [
+            # Attempt 1: a completed response whose only item is an empty
+            # message — billed tokens, nothing to show.
+            _FakeResult(
+                events=[],
+                final_output="",
+                new_items=[_FakeMessageOutputItem(text="")],
+                raw_responses=[_nonempty_raw_response()],
+            ),
+            # Attempt 2: real text.
+            _FakeResult(
+                events=[_FakeRawEvent(_FakeRawTextDelta("recovered"))],
+                final_output="recovered",
+                raw_responses=[_nonempty_raw_response()],
+            ),
+        ]
+        executor = _make_databricks_executor()
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "Be helpful.",
+                )
+            )
+
+        # Retry fired: the empty message item did not count as output.
+        assert len(_FakeRunner.last_calls) == 2, (
+            f"Expected 2 run_streamed calls (empty message retried), "
+            f"got {len(_FakeRunner.last_calls)}"
         )
         turn_completes = [e for e in events if isinstance(e, TurnComplete)]
-        # Completes silently with one empty TurnComplete (today's behavior
-        # for a deliberate empty answer), not an ExecutorError.
         assert len(turn_completes) == 1
-        assert turn_completes[0].response == ""
+        assert turn_completes[0].response == "recovered"
+        assert not any(isinstance(e, ExecutorError) for e in events)
+
+    _run(_t())
+
+
+def test_persistently_empty_message_turn_fails_loud() -> None:
+    """
+    When every attempt completes with only an empty message item (and
+    billed tokens), the executor fails loud instead of completing
+    silently — the end-to-end signature of the silent-stop bug.
+
+    What breaks if this fails: a persistent contentless-response fault
+    ends the turn with zero user feedback.
+    """
+
+    async def _t() -> None:
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = None
+        _FakeRunner.next_results = [
+            _FakeResult(
+                events=[],
+                final_output="",
+                new_items=[_FakeMessageOutputItem(text="")],
+                raw_responses=[_nonempty_raw_response()],
+            ),
+            _FakeResult(
+                events=[],
+                final_output="",
+                new_items=[_FakeMessageOutputItem(text="")],
+                raw_responses=[_nonempty_raw_response()],
+            ),
+        ]
+        executor = _make_databricks_executor()
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "Be helpful.",
+                )
+            )
+
+        assert len(_FakeRunner.last_calls) == 2
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert len(errors) == 1, f"Expected exactly 1 ExecutorError, got {events!r}"
+        assert errors[0].retryable is True
+        assert "empty completion" in errors[0].message
+        assert not any(isinstance(e, TurnComplete) for e in events)
+
+    _run(_t())
+
+
+def test_message_item_with_text_counts_as_output() -> None:
+    """
+    A message item that DOES carry text is output: no retry, and the
+    turn completes with that text.
+
+    What breaks if this fails: the emptiness check would over-trigger,
+    retrying (and eventually erroring) turns that produced a real reply.
+    """
+
+    async def _t() -> None:
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = None
+        _FakeRunner.next_results = [
+            _FakeResult(
+                events=[],
+                final_output=None,
+                new_items=[_FakeMessageOutputItem(text="a real reply")],
+                raw_responses=[_nonempty_raw_response()],
+            ),
+        ]
+        executor = _make_databricks_executor()
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "Be helpful.",
+                )
+            )
+
+        # Single attempt: the textful message item is real output.
+        assert len(_FakeRunner.last_calls) == 1, (
+            f"Expected 1 run_streamed call (no retry), got {len(_FakeRunner.last_calls)}"
+        )
+        turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_completes) == 1
+        assert turn_completes[0].response == "a real reply"
+        assert not any(isinstance(e, ExecutorError) for e in events)
 
     _run(_t())
 
