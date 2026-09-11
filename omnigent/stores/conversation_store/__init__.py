@@ -16,14 +16,15 @@ from omnigent.entities import (
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
-# Label set on a fork of a session that had a working directory. Its
-# value is the source session id. Presence marks the (unbound) clone as
-# needing a host + working directory before it can run, so the
-# online-dot reports it offline until bound and the UI opens the
-# directory picker instead of silently dropping the first message.
-# Forks of chat-only sources (no workspace) get no label and resume
-# in-process like a brand-new chat session. Canonical home is the store
-# layer; the server route and the SQLAlchemy store both import it.
+# Label set on a fork of a session that had a working directory, or a
+# runner-bound native session whose working-directory metadata was lost.
+# Its value is the source session id. Presence marks the (unbound) clone
+# as needing a host + working directory before it can run, so the
+# online-dot reports it offline until bound and the UI opens the directory
+# picker instead of silently dropping the first message. Forks of
+# chat-only sources get no label and resume in-process like a brand-new
+# chat session. Canonical home is the store layer; the server route and
+# the SQLAlchemy store both import it.
 FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 
 # One-shot fork directive: the SOURCE session's runtime-native session id
@@ -32,7 +33,7 @@ FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 # the (still-unbound) clone uses it to locate the source's local transcript
 # and clone it into the clone's OWN project dir under a freshly assigned
 # uuid (rewriting sessionId/cwd), then launch plain ``--resume <our_uuid>``
-# (see ``omnigent.claude_native._clone_claude_transcript`` and the
+# (see ``omnigent.harnesses.claude_native.main._clone_claude_transcript`` and the
 # fork-resume branch in ``omnigent.runner.app``), so the clone opens with
 # the prior history instead of a blank session. Once the clone captures its
 # OWN native session id (``external_session_id`` set on first launch), this
@@ -141,6 +142,14 @@ def pinned_label_key(user_id: str | None) -> str:
     return f"{PINNED_LABEL_KEY}.{suffix}"
 
 
+# Epoch-SECONDS time a session was archived, written on archive and deleted on
+# unarchive. A label rather than a ``conversations`` column, so ageing out old
+# archived sessions needs no schema migration; readers fall back to
+# ``updated_at`` when it is absent. Seconds, not the pin key's epoch-ms, to
+# match that fallback's unit.
+ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
+
+
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
 # agent switch (deleted from the switched session). Two distinct reasons
@@ -171,9 +180,25 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     }
 )
 
-# Source identity belongs only to the original imported session. Unlike runtime
+# Source identity belongs only to the original imported session, and a fork is
+# born unarchived so it must not inherit its parent's archive time. The sandbox
+# repository records what THIS session's sandbox was built from and a relaunch
+# re-clones from it, so a fork that asked for an empty sandbox would otherwise
+# have the source's repo re-cloned into it on the first relaunch; the fork's own
+# managed launch re-stamps whatever repository it resolves. Unlike runtime
 # instance labels, these survive an in-place agent switch but never a fork.
-_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS
+#
+# Recorded one label PER repo (``omnigent.sandbox.repo.<index>``), a
+# dynamic-suffix family like the per-user pins, so a fork drops the whole family
+# by prefix in ``fork_conversation`` (this bare base key still covers any legacy
+# single-label session). The literal mirrors the server's
+# ``MANAGED_REPO_LABEL_KEY``; a store test cross-checks it so a rename there
+# fails loudly here.
+_SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
+    ARCHIVED_AT_LABEL_KEY,
+    _SANDBOX_REPO_LABEL_KEY,
+}
 
 
 @dataclass(frozen=True)
@@ -374,6 +399,7 @@ class ConversationStore(ABC):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -455,14 +481,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def find_imported_conversation(
+    def find_conversation_by_external_session_id(
         self,
-        source: str,
         external_session_id: str,
     ) -> Conversation | None:
-        """Find the original session imported from one external transcript.
+        """Find an existing conversation wrapping one external (harness) session id.
 
-        :param source: Import source key, e.g. ``"claude"``.
+        Both an imported transcript and a natively-run session record the
+        external id, so import dedup resolves against either through this one
+        lookup. When several rows share the id, the earliest-created wins.
+
         :param external_session_id: Source harness session id.
         :returns: The matching conversation, or ``None``.
         """
@@ -617,6 +645,12 @@ class ConversationStore(ABC):
         Append items to a conversation. Assigns a globally unique
         ID and timestamp to each item.
 
+        An item carrying ``stable_id`` appends idempotently: its id is the
+        stable id, and when an item with that id already exists the stored
+        item is returned in its place — flagged ``deduplicated`` — instead
+        of inserting a duplicate. The existence check rides the append's
+        own transaction, so idempotency costs no extra query.
+
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
@@ -643,7 +677,9 @@ class ConversationStore(ABC):
         search_query: str | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
+        shared_only: bool = False,
         include_archived: bool = False,
+        archived_only: bool = False,
         project: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
@@ -802,6 +838,7 @@ class ConversationStore(ABC):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
@@ -848,6 +885,9 @@ class ConversationStore(ABC):
             variant — the override is set once at session create and
             immutable thereafter (the harness process is spawned on
             the first turn).
+        :param share_workspace_files: Whether view-level collaborators may
+            browse the workspace. ``True`` stores the share, ``False``
+            clears it (edit-only again), ``None`` leaves it unchanged.
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -859,6 +899,22 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def clear_model_override_if_matches(
+        self,
+        conversation_id: str,
+        expected_model_override: str,
+    ) -> bool:
+        """Clear a model selection only while the stored settings still match.
+
+        :param conversation_id: Conversation to update.
+        :param expected_model_override: Model selection that must still be stored.
+        :returns: ``True`` when cleared; ``False`` when missing, mismatched,
+            or any session override changed concurrently. Other settings and
+            metadata remain unchanged.
         """
         ...
 
@@ -1284,6 +1340,20 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
+        """Atomically settle a stale running session to idle.
+
+        The update must require a bound runner, ``running``/``waiting`` live
+        status, and a missing or older ``runner_last_seen`` stamp. It must not
+        bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param stale_before: Runner stamps at or after this epoch are fresh.
+        :returns: Whether this call performed the transition.
+        """
+        ...
+
+    @abstractmethod
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """
         Persist the outstanding elicitation count for one session.
@@ -1307,6 +1377,10 @@ class ConversationStore(ABC):
         method; internal sub-agent code also uses it to keep child
         conversations on the parent's current runner.
 
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
+
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param runner_id: Runner identifier to bind to,
@@ -1326,6 +1400,10 @@ class ConversationStore(ABC):
         Counterpart to :meth:`replace_runner_id` for the 1:1
         session↔runner invariant — /clear and /switch unbind the old
         session before binding the runner to the new one.
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1354,6 +1432,10 @@ class ConversationStore(ABC):
         ``workspace`` together never violates
         ``ck_conversations_workspace_required_for_host`` (workspace
         is only required while ``host_id`` is set).
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1400,6 +1482,10 @@ class ConversationStore(ABC):
         Used when the server asks a host to spawn a runner for
         an existing session. Last-write-wins semantics (like
         :meth:`replace_runner_id`).
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1473,6 +1559,8 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
+        host_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1511,6 +1599,9 @@ class ConversationStore(ABC):
         :param runner_id: Optional runner binding to persist at
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field.
+        :param host_id: Optional external host the session binds to,
+            e.g. ``"host_a1b2c3d4..."``. Requires a non-``None``
+            ``workspace``. ``None`` leaves the session unbound.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such

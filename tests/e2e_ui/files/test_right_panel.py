@@ -164,3 +164,54 @@ def test_right_panel_terminals_and_file_viewer(
     finally:
         if test_file.exists():
             test_file.unlink()
+
+
+def test_file_viewer_download_saves_the_complete_file(
+    page: Page,
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    """The viewer's "Download file" saves the whole file, past the read cap.
+
+    The viewer's JSON read truncates at the server's cap, and the download
+    used to reuse it, so anything larger came back cut off with no
+    warning. Drop a text file one byte over the cap into the workspace,
+    open it from the Files tree, download it through the real server and
+    runner, and compare every byte.
+    """
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    base_url, session_id = seeded_session
+    # Listing the root materializes a fresh session's workspace on the
+    # runner; on CI it does not exist on disk before that.
+    listing = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem"
+    )
+    assert listing.status == 200, listing.text()
+    target = Path(listing.json()["base"]) / "big-download.txt"
+    line = b"0123456789abcdef" * 4 + b"\n"
+    payload = (line * (_MAX_READ_BYTES // len(line) + 1))[: _MAX_READ_BYTES + 1]
+    target.write_bytes(payload)
+    request.addfinalizer(lambda: target.unlink(missing_ok=True))
+
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Files")).click()
+    # The row's open button carries the name as visible text; the icon-only
+    # copy-path button next to it carries it only in its label.
+    row = rail.get_by_role("button", name=re.compile(r"big-download\.txt")).filter(
+        has_text="big-download.txt"
+    )
+    expect(row).to_be_visible(timeout=30_000)
+    row.click()
+    expect(rail.get_by_test_id("file-viewer")).to_be_visible()
+    rail.get_by_role("button", name="View settings").click()
+    with page.expect_download() as download_info:
+        page.get_by_role("menuitem", name="Download file").click()
+    download = download_info.value
+    assert download.suggested_filename == "big-download.txt"
+    saved = tmp_path / "big-download.txt"
+    download.save_as(saved)
+    assert saved.read_bytes() == payload

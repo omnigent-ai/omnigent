@@ -63,6 +63,7 @@ describe("themePalette", () => {
     expect(isThemePalette("github")).toBe(true);
     expect(isThemePalette("omni")).toBe(true);
     expect(isThemePalette("nord")).toBe(true);
+    expect(isThemePalette("solarized")).toBe(true);
     expect(isThemePalette("nope")).toBe(false);
     expect(isThemePalette(undefined)).toBe(false);
     expect(isThemePalette(42)).toBe(false);
@@ -118,5 +119,12 @@ describe("themePalette", () => {
       expect(palette.tokens.light.shellBackground.length).toBeGreaterThan(0);
       expect(palette.tokens.dark.shellBackground.length).toBeGreaterThan(0);
     }
+  });
+
+  it("uses the canonical Solarized backgrounds", () => {
+    const solarized = PALETTES.find((palette) => palette.id === "solarized");
+    expect(solarized?.tokens.light.background).toBe("#fdf6e3");
+    expect(solarized?.tokens.dark.background).toBe("#002b36");
+    expect(solarized?.tokens.dark.shellBackground).toBe("#002b36");
   });
 });

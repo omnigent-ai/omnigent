@@ -138,6 +138,21 @@ rate_limit:
     limit: 50
 ```
 
+`factory_params` is equivalent to the inline `function: {path, arguments}`
+form, so the block above is the same as:
+
+```yaml
+rate_limit:
+  type: function
+  function:
+    path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+    arguments:
+      limit: 50
+```
+
+Supply arguments through one of the two — declaring both `factory_params`
+and `function.arguments` on the same policy is rejected.
+
 ---
 
 ## For session users

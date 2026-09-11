@@ -115,6 +115,47 @@ _FAKE_CATALOG: dict[str, dict] = {
             },
         },
     },
+    "moonshot": {
+        "schema_version": "1.0",
+        "models": {
+            "kimi-k3": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 262144, "max_output": 32768},
+                "pricing": {
+                    "input_per_million_tokens": 3.0,
+                    "output_per_million_tokens": 15.0,
+                    "cache_read_per_million_tokens": 0.3,
+                },
+            },
+            "kimi-k2.7-code": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 262144, "max_output": 32768},
+                "pricing": {
+                    "input_per_million_tokens": 0.95,
+                    "output_per_million_tokens": 4.0,
+                    "cache_read_per_million_tokens": 0.19,
+                },
+            },
+        },
+    },
+    "databricks": {
+        "schema_version": "1.0",
+        "models": {
+            "databricks-kimi-k3": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 1000000, "max_output": 1048576},
+                "pricing": {
+                    "input_per_million_tokens": 2.99999,
+                    "output_per_million_tokens": 15.00002,
+                    "cache_read_per_million_tokens": 0.30002,
+                    "cache_write_per_million_tokens": 2.99999,
+                },
+            },
+        },
+    },
 }
 
 _REAL_FETCH_PROVIDER_CATALOG = _providers_mod._fetch_provider_catalog
@@ -246,6 +287,17 @@ def test_get_models_preserves_context_and_cache_pricing_metadata() -> None:
         ("databricks-claude-opus-4-8", "anthropic", "claude-opus-4-8"),
         ("databricks/databricks-claude-opus-4-8", "anthropic", "claude-opus-4-8"),
         ("DATABRICKS-CLAUDE-OPUS-4-8", "anthropic", "claude-opus-4-8"),
+        ("anthropic.claude-opus-4-8-v1:0", "anthropic", "claude-opus-4-8"),
+        ("us.anthropic.claude-opus-4-8-v1:0", "anthropic", "claude-opus-4-8"),
+        ("anthropic.claude-opus-4-8", "anthropic", "claude-opus-4-8"),
+        ("kimi-k3", "moonshot", "kimi-k3"),
+        ("KIMI-K3", "moonshot", "kimi-k3"),
+        ("kimi-k2.7-code", "moonshot", "kimi-k2.7-code"),
+        ("moonshot/kimi-k3", "moonshot", "kimi-k3"),
+        ("system.ai.kimi-k3", "databricks", "databricks-kimi-k3"),
+        ("SYSTEM.AI.KIMI-K3", "databricks", "databricks-kimi-k3"),
+        ("system.ai.kimi-k2.7-code", "moonshot", "kimi-k2.7-code"),
+        ("kimi-k3-databricks", "moonshot", "kimi-k3"),
     ],
 )
 def test_find_catalog_models_resolves_provider_and_vendor_namespaces(
@@ -257,6 +309,34 @@ def test_find_catalog_models_resolves_provider_and_vendor_namespaces(
     matches = find_catalog_models(model_id)
 
     assert [(match.provider, match.name) for match in matches] == [(provider, name)]
+
+
+def test_kimi_native_forwarder_ids_price_and_size_from_the_catalog() -> None:
+    """The ids the kimi-native forwarder reports resolve through the catalog.
+
+    ``system.ai.kimi-k3`` (Databricks Unity Catalog system model) prices at
+    its ``databricks-kimi-k3`` serving row; a kimi CLI alias such as
+    ``kimi-k3-databricks`` resolves to the Moonshot family row.
+    """
+    from omnigent.llms.context_window import fetch_model_pricing, find_model_context_window
+
+    databricks = fetch_model_pricing("system.ai.kimi-k3")
+    assert databricks is not None
+    assert databricks.input_per_token == pytest.approx(2.99999e-6)
+    assert databricks.output_per_token == pytest.approx(15.00002e-6)
+    assert databricks.cache_read_per_token == pytest.approx(0.30002e-6)
+    assert databricks.cache_write_per_token == pytest.approx(2.99999e-6)
+    assert find_model_context_window("system.ai.kimi-k3") == 1_000_000
+
+    moonshot = fetch_model_pricing("kimi-k3-databricks")
+    assert moonshot is not None
+    assert moonshot.input_per_token == pytest.approx(3.0e-6)
+    assert moonshot.output_per_token == pytest.approx(15.0e-6)
+    assert moonshot.cache_read_per_token == pytest.approx(0.3e-6)
+    assert moonshot.cache_write_per_token is None
+    assert find_model_context_window("kimi-k3-databricks") == 262_144
+
+    assert fetch_model_pricing("system.ai.no-such-model") is None
 
 
 def test_find_catalog_models_matches_vendor_namespaced_families() -> None:

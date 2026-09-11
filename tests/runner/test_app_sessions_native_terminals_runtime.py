@@ -14,19 +14,17 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from omnigent import (
-    codex_native_bridge,
-    cursor_native_bridge,
-    kiro_native_bridge,
-)
-from omnigent.antigravity_native_bridge import (
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.antigravity_native.bridge import (
     is_placeholder_conversation_id as bridge_mod_is_placeholder,
 )
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
 )
-from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -158,6 +156,11 @@ async def test_create_session_threads_workspace_to_pi_cwd(
 ) -> None:
     """Pi pre-spawn receives the session workspace, not the bundle dir."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    # Isolate $HOME too: ambient provider detection reads ~/.databrickscfg,
+    # which on a multi-profile Databricks dev box otherwise 400s the create
+    # with "match <host>; use --profile" (issue #4279).
+    monkeypatch.setenv("HOME", str(tmp_path / "config-home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "config-home"))
     session_id = "18f39ab73f49285e4dab0c80ff7b8455"
     runner_workspace = tmp_path / "runner-workspace"
     runner_workspace.mkdir()
@@ -226,6 +229,11 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
 ) -> None:
     """Pi pre-spawn falls back to runner workspace when session workspace is empty."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    # Isolate $HOME too: ambient provider detection reads ~/.databrickscfg,
+    # which on a multi-profile Databricks dev box otherwise 400s the create
+    # with "match <host>; use --profile" (issue #4279).
+    monkeypatch.setenv("HOME", str(tmp_path / "config-home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "config-home"))
     session_id = "3f1d20a97a7d0ba93e02cf17aeb92367"
     runner_workspace = tmp_path / "runner-workspace"
     runner_workspace.mkdir()
@@ -325,6 +333,66 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
 
 
 @pytest.mark.asyncio
+async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocking builder dependency must not stop the runner's event loop."""
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+
+    loop = asyncio.get_running_loop()
+    lookup_started = asyncio.Event()
+    lookup_release = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def resolve_host(profile: str | None) -> None:
+        assert profile == "test-profile"
+        loop.call_soon_threadsafe(lookup_started.set)
+        loop_progressed.append(lookup_release.wait(timeout=1.0))
+
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda _bridge_dir: None,
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "codex")
+    monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "codex")
+    monkeypatch.setattr(codex_app_mod, "_clean_codex_env", dict)
+    monkeypatch.setattr(codex_app_mod, "_databricks_gateway_host", resolve_host)
+    monkeypatch.setattr(
+        codex_app_mod,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch([], model, "test-profile"),
+    )
+
+    task = asyncio.create_task(
+        _auto_create_codex_terminal(
+            uuid.uuid4().hex,
+            cast(SessionResourceRegistry, object()),
+            lambda _session_id, _event: None,
+            server_client=cast(httpx.AsyncClient, NullServerClient()),
+        )
+    )
+    try:
+        await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
+        lookup_release.set()
+        with pytest.raises(OSError, match="profile 'test-profile'"):
+            await task
+    finally:
+        lookup_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert loop_progressed == [True], "profile resolution blocked the runner's event loop"
+
+
+@pytest.mark.asyncio
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -344,7 +412,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
@@ -632,6 +700,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert bridge_state is not None
     assert bridge_state.thread_id == thread_id
     assert bridge_state.socket_path == app_server.listen_url
+    # The bridge state must carry the session workspace: without it the
+    # Codex executor starts turns with the runner process's own cwd, so
+    # web-driven shell tools run from the wrong directory.
+    assert bridge_state.cwd == str(tmp_path / "workspace")
 
 
 @pytest.mark.asyncio
@@ -653,9 +725,12 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
-    from omnigent import codex_native
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.harnesses.codex_native import main as codex_native
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
     from omnigent.runner import app as runner_app_mod
     from omnigent.stores.conversation_store import (
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -930,9 +1005,12 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     :param source_thread: Optional unavailable source Codex thread id.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
-    from omnigent import codex_native
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.harnesses.codex_native import main as codex_native
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
     from omnigent.runner import app as runner_app_mod
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
@@ -1195,7 +1273,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner import app as runner_app_mod
 
@@ -1455,7 +1533,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "de154ca6405fb8912623984a14a2b044"
@@ -1650,7 +1728,7 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     # The runner imports post_tools_changed from this module at call time, so
     # patching the module attribute is picked up by _ensure_comment_relay_started.
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.post_tools_changed",
+        "omnigent.harnesses.claude_native.bridge.post_tools_changed",
         _blocking_post_tools_changed,
     )
 
@@ -1781,10 +1859,10 @@ async def _run_antigravity_auto_create(
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
-    import omnigent.antigravity_native_launch as launch_mod
-    import omnigent.antigravity_native_reader as reader_mod
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+    import omnigent.harnesses.antigravity_native.reader as reader_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2015,10 +2093,10 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     as plain ``kimi``, and every risky tool call parks on an approval prompt
     no headless pane can answer.
     """
-    import omnigent.kimi_native as kimi_mod
-    import omnigent.kimi_native_credentials as kimi_creds_mod
-    import omnigent.kimi_native_forwarder as kimi_fwd_mod
-    from omnigent import kimi_native_bridge as kimi_bridge_mod
+    import omnigent.harnesses.kimi_native.credentials as kimi_creds_mod
+    import omnigent.harnesses.kimi_native.forwarder as kimi_fwd_mod
+    import omnigent.harnesses.kimi_native.main as kimi_mod
+    from omnigent.harnesses.kimi_native import bridge as kimi_bridge_mod
     from omnigent.runner import app as runner_app_mod
     from omnigent.runner.app import _auto_create_kimi_terminal
     from omnigent.runner.resource_registry import KIMI_NATIVE_TERMINAL_ROLE
@@ -2307,8 +2385,8 @@ async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_st
     early-return BEFORE probing for a port or calling ``StartCascade`` — so even a
     future caller that forgets the resume gate cannot cold-start over a real id.
     """
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2366,8 +2444,8 @@ async def test_cold_start_agy_conversation_waits_for_model_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """StartCascade runs only after models appear and the settling delay passes."""
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner.native import orchestration as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2441,8 +2519,8 @@ async def test_cold_start_agy_conversation_model_timeout_keeps_placeholder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bound RPC port without models never receives StartCascade."""
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner.native import orchestration as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2526,13 +2604,13 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
       with ``{elicitation_id, params}``, then — on the human verdict — delivers
       the answer to agy via ``handle_user_interaction`` (the bridge default).
     """
-    import omnigent.antigravity_native_launch as launch_mod
-    import omnigent.antigravity_native_reader as reader_mod
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
-    from omnigent import antigravity_native_interactions as interactions_mod
-    from omnigent.antigravity_native_interactions import agy_elicitation_id
-    from omnigent.antigravity_native_steps import pending_interaction
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+    import omnigent.harnesses.antigravity_native.reader as reader_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
+    from omnigent.harnesses.antigravity_native import interactions as interactions_mod
+    from omnigent.harnesses.antigravity_native.interactions import agy_elicitation_id
+    from omnigent.harnesses.antigravity_native.steps import pending_interaction
     from omnigent.runner import app as runner_app_mod
 
     session_id = "b68c3f1da613f48fb4126e965ab594a3"
@@ -2710,10 +2788,10 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
       env does not override ``HOME``, so agy keeps platform auth such as macOS
       Keychain but loads the bridge-scoped config.
     """
-    import omnigent.antigravity_native_launch as launch_mod
-    import omnigent.antigravity_native_reader as reader_mod
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+    import omnigent.harnesses.antigravity_native.reader as reader_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "1fd85439049bbfc88cbf04221bad5079"
@@ -2808,7 +2886,12 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     assert mcp_config.is_file()
     payload = json.loads(mcp_config.read_text(encoding="utf-8"))
     server = payload["mcpServers"]["omnigent"]
-    assert server["args"][:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
+    assert server["args"][:4] == [
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.bridge",
+        "serve-mcp",
+    ]
     assert str(bridge_dir) in server["args"]
     assert "sys_session_create" in server["enabledTools"]
     # The bridge token the shared relay needs was written into the bridge dir.
@@ -2847,10 +2930,10 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
     argv is preserved verbatim. This guards that invariant against a future change
     to the argv-composition line in ``_auto_create_antigravity_terminal``.
     """
-    import omnigent.antigravity_native_launch as launch_mod
-    import omnigent.antigravity_native_reader as reader_mod
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+    import omnigent.harnesses.antigravity_native.reader as reader_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "976793baf55bcdf96830aa376e394f80"
@@ -3032,7 +3115,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     Otherwise each failed host-spawned codex session orphans an app-server
     subprocess (and a dangling listener) for the runner's lifetime.
     """
-    from omnigent import codex_native_forwarder
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
     from omnigent.runner.app import (
         _AUTO_CODEX_APP_SERVERS,
         _codex_discover_thread_and_forward,
@@ -3063,6 +3146,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
             bridge_dir=tmp_path,
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
         )
@@ -3098,8 +3182,8 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     reads as "startup timed out", while a RuntimeError (TUI exited / event
     stream ended) must NOT be mislabeled as a timeout.
     """
-    from omnigent import codex_native_forwarder
-    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
     from omnigent.runner.app import (
         _AUTO_CODEX_APP_SERVERS,
         _codex_discover_thread_and_forward,
@@ -3126,6 +3210,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             bridge_dir=tmp_path,
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
         )
@@ -3139,6 +3224,69 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     # A RuntimeError must never be described as a timeout.
     if not isinstance(exc, TimeoutError):
         assert "timed out" not in recorded
+
+
+@pytest.mark.asyncio
+async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The fresh-session bridge state must carry the session workspace as ``cwd``.
+
+    A runner-owned codex-native session's shell tools run wherever
+    ``CodexNativeBridgeState.cwd`` points; when the discovery path writes the
+    state without it, the Codex executor falls back to the harness process's
+    own working directory (the runner service's cwd), so web-driven shell
+    commands run from the wrong directory instead of the selected workspace.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
+    workspace = tmp_path / "selected-workspace"
+
+    async def _fake_wait(*_args: object, **_kwargs: object) -> str:
+        return thread_id
+
+    async def _fake_supervise(**_kwargs: object) -> None:
+        return None
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(workspace),
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    state = codex_native_bridge.read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == thread_id
+    assert state.cwd == str(workspace)
 
 
 @pytest.mark.asyncio
@@ -3156,8 +3304,8 @@ async def test_cold_start_agy_conversation_rejects_a_foreign_agy_cascade(
     never arrive. Refusing leaves the placeholder, which the reader's own
     discovery later resolves correctly.
     """
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -3194,8 +3342,8 @@ async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The happy path still persists: our own agy wrote the conversation here."""
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
     from omnigent.runner.native import orchestration as orchestration_mod
 
@@ -3258,8 +3406,8 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     import os
     import time
 
-    import omnigent.codex_native_app_server as codex_app_mod
-    from omnigent import model_catalog_store
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.models import model_catalog_store
     from omnigent.runner import app as runner_app_mod
     from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
 
@@ -3283,14 +3431,19 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", REAL_CODEX_LAUNCH_CATALOG)
     refreshed = [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
 
-    async def _fake_probe(*, codex_path: str | None = None) -> list[dict[str, object]]:
+    async def _fake_probe(
+        *,
+        codex_path: str | None = None,
+        launch: codex_app_mod.NativeCodexLaunch | None = None,
+    ) -> list[dict[str, object]]:
         """
         Stand in for the real codex probe on the background refresh path.
 
         :param codex_path: Ignored executable override.
+        :param launch: Ignored provider launch shape.
         :returns: The refreshed catalog rows.
         """
-        del codex_path
+        del codex_path, launch
         return refreshed
 
     monkeypatch.setattr(codex_app_mod, "probe_codex_model_options", _fake_probe)
@@ -3486,3 +3639,212 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
             await task
         # The background re-probe healed the store for the next launch.
         assert model_catalog_store.read_catalog("codex-native", fingerprint) == refreshed
+
+
+@pytest.mark.asyncio
+async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A persisted override in the gateway spelling still resolves the catalog.
+
+    The override is stored as the servable id ``databricks-gpt-5-6-sol`` while
+    the catalog lists codex's own slug ``gpt-5.6-sol``. The launch translates
+    between the two, so the pre-launch check must match by codex's vocabulary,
+    not string equality — a raw membership test refuses a model this host serves.
+    """
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.models import model_catalog_store
+    from omnigent.runner import app as runner_app_mod
+    from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
+
+    session_id = "5b0c7e2a9d1f4c3b8e6a7d5f4c3b2a1e"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60937f"
+    override = "databricks-gpt-5-6-sol"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    monkeypatch.setattr(
+        codex_app_mod,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
+            config_overrides=[], model=model, profile=None
+        ),
+    )
+    monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", REAL_CODEX_LAUNCH_CATALOG)
+
+    async def _fake_probe(
+        *,
+        codex_path: str | None = None,
+        launch: codex_app_mod.NativeCodexLaunch | None = None,
+    ) -> list[dict[str, object]]:
+        """Stand in for the real codex probe; unused on a store hit."""
+        del codex_path, launch
+        return [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}]
+
+    monkeypatch.setattr(codex_app_mod, "probe_codex_model_options", _fake_probe)
+    fingerprint = codex_app_mod.codex_catalog_fingerprint(
+        codex_app_mod.resolve_native_codex_launch(model=None)
+    )
+    # A fresh catalog carrying codex's own slug, not the gateway spelling.
+    model_catalog_store.write_catalog(
+        "codex-native",
+        fingerprint,
+        [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}],
+    )
+
+    class _SnapshotServerClient:
+        """Server client returning a resume snapshot with the gateway override."""
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return the session snapshot / item history the helper reads.
+
+            :param url: Request path.
+            :param kwargs: Request keyword arguments.
+            :returns: HTTP 200 response.
+            """
+            del kwargs
+            if url == f"/v1/sessions/{session_id}/items":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "b1649a5cbfec3f92bec12275c14f4b61",
+                                "response_id": "codex_turn_1",
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "remember this"}],
+                            }
+                        ],
+                        "has_more": False,
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                json={"model_override": override, "external_session_id": thread_id},
+                request=httpx.Request("GET", url),
+            )
+
+    class _FakeCodexAppServer:
+        """Minimal app-server object used by ``codex_terminal_env``."""
+
+        codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
+
+        def __init__(self) -> None:
+            """Initialize the fake app-server state."""
+            self.env = {"OPENAI_API_KEY": "sk-test"}
+            self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.listen_url: str | None = None
+            self.started = False
+            self.config_overrides: list[str] = []
+
+        async def start(self) -> None:
+            """Mark the fake app-server started."""
+            self.started = True
+
+        async def close(self) -> None:
+            """No-op close."""
+
+    app_server = _FakeCodexAppServer()
+    build_calls: list[dict[str, Any]] = []
+
+    def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
+        """
+        Capture app-server construction.
+
+        :param kwargs: Keyword arguments passed by the runner helper.
+        :returns: Fake app-server.
+        """
+        build_calls.append(kwargs)
+        app_server.codex_home = kwargs["codex_home"]
+        return app_server
+
+    class _UnexpectedDiscoveryClient:
+        """App-server client that must not connect on a known-thread resume."""
+
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            """
+            :param ws_url: App-server WebSocket URL.
+            :param client_name: JSON-RPC client name.
+            """
+            self.ws_url = ws_url
+            self.client_name = client_name
+
+        async def connect(self) -> None:
+            """Fail if the resume path tries to discover a fresh thread."""
+            raise AssertionError("resume path must not connect discovery client")
+
+        async def close(self) -> None:
+            """No-op close."""
+
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
+        """Accept preloading of the known Codex thread."""
+        del transport, loaded_thread_id, terminal_launch_args
+
+    async def _fake_forward_known_thread(**kwargs: Any) -> None:
+        """Accept the known-thread forwarder invocation."""
+        del kwargs
+
+    class _FakeResourceRegistry:
+        """Resource registry that accepts the terminal launch."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Accept the terminal launch request."""
+            del terminal_name, session_key, spec, resource_role, parent_os_env
+            return SessionResourceView(
+                id="terminal_codex_main",
+                type="terminal",
+                session_id=session_id,
+                name="Codex",
+            )
+
+    monkeypatch.setattr(
+        codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
+    )
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
+    monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
+
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+    try:
+        await _auto_create_codex_terminal(
+            session_id,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            agent_spec=agent_spec,
+            server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0)
+    finally:
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # The gateway-spelled override was accepted (not refused) and passed
+    # through to the launch, which translates it to codex's slug downstream.
+    assert build_calls, "a servable override was refused as unknown"
+    assert build_calls[0]["model"] == override

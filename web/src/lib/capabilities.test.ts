@@ -21,6 +21,7 @@ function info(overrides: Partial<ServerInfo>): ServerInfo {
     managed_sandboxes_enabled: true,
     sandbox_provider: null,
     sandbox_providers: [],
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
@@ -133,6 +134,7 @@ describe("resolveServerInfo release features", () => {
     const parsed = await probe({});
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+    expect(isFeatureEnabled(parsed, "canvas")).toBe(false);
   });
 
   it("falls back to the legacy harness field from an older server", async () => {

@@ -27,6 +27,7 @@ from omnigent.runner.tool_dispatch import (
     _NATIVE_RELAY_BUILTIN_TOOLS,
     _execute_browser_tool,
     build_native_relay_tool_schemas,
+    strip_browser_tool_schemas,
 )
 from omnigent.spec.types import AgentSpec
 
@@ -246,7 +247,9 @@ def test_native_relay_includes_browser_for_bare_spec() -> None:
     ``browser_*`` schemas on the native relay — because ToolManager
     always registers them, the relay (which filters ToolManager's
     schemas by the union) always emits them. The desktop app runs native
-    sessions that see only the relay, so this is the load-bearing path.
+    sessions that see only the relay, so this is the load-bearing path. The
+    no-renderer mitigation does not dynamically rewrite this session-scoped
+    surface; native calls instead fail promptly when nobody claims them.
     """
     schemas = build_native_relay_tool_schemas(AgentSpec(spec_version=1))
     names = {s["name"] for s in schemas if s["name"].startswith("browser_")}
@@ -256,3 +259,35 @@ def test_native_relay_includes_browser_for_bare_spec() -> None:
         if schema["name"].startswith("browser_"):
             assert schema["description"]
             assert schema["parameters"]["type"] == "object"
+
+
+# ── Headless schema stripping ────────────────────────────────────────
+
+
+def test_strip_browser_tool_schemas_drops_nested_and_flat_shapes() -> None:
+    """
+    ``strip_browser_tool_schemas`` removes every ``browser_*`` schema in
+    both supported shapes (nested OpenAI ``{"function": {"name": ...}}``
+    and flat relay ``{"name": ...}``) and keeps everything else. This is
+    the per-turn filter applied to request-driven harnesses when the server
+    says no renderer is subscribed. Native harnesses use a session-scoped
+    relay and therefore retain their browser schemas.
+    """
+    nested_browser = {"type": "function", "function": {"name": "browser_navigate"}}
+    flat_browser = {"name": "browser_snapshot", "description": "", "parameters": {}}
+    nested_other = {"type": "function", "function": {"name": "sys_os_read"}}
+    flat_other = {"name": "load_skill", "description": "", "parameters": {}}
+    malformed = {"type": "function"}
+
+    kept = strip_browser_tool_schemas(
+        [nested_browser, flat_browser, nested_other, flat_other, malformed]
+    )
+    assert kept == [nested_other, flat_other, malformed]
+
+
+def test_strip_browser_tool_schemas_covers_every_browser_name() -> None:
+    """All five ``browser_*`` names are stripped, none survives."""
+    schemas = [{"type": "function", "function": {"name": n}} for n in sorted(_BROWSER_TOOLS)]
+    schemas.append({"type": "function", "function": {"name": "keepme"}})
+    kept = strip_browser_tool_schemas(schemas)
+    assert kept == [{"type": "function", "function": {"name": "keepme"}}]

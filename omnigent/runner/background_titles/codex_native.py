@@ -20,7 +20,7 @@ _logger = logging.getLogger("omnigent.runner.background_titles.codex_native")
 
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with an isolated native Codex exec process."""
-    from omnigent.codex_native_app_server import (
+    from omnigent.harnesses.codex_native.app_server import (
         build_codex_native_server,
         resolve_native_codex_launch,
     )
@@ -30,10 +30,14 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         _populate_codex_home_config,
         materialize_codex_provider_config,
     )
-    from omnigent.reasoning_effort import CODEX_NATIVE_EFFORTS
+    from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
 
-    model = context.model_override or _codex_native_model_from_spec(context.session_spec)
+    model = (
+        context.title_model
+        or context.model_override
+        or _codex_native_model_from_spec(context.session_spec)
+    )
     # Thread the spec so a title exec honors spec-level auth too (#2744).
     launch = resolve_native_codex_launch(model=model, spec=context.session_spec)
     with tempfile.TemporaryDirectory(prefix="omnigent-codex-title-") as temp_dir:
@@ -48,7 +52,9 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             minimal_config=True,
             supported_efforts=CODEX_NATIVE_EFFORTS,
         )
-        native_server = build_codex_native_server(
+        # Profile/model discovery can block in SDK initialization; keep the runner responsive.
+        native_server = await asyncio.to_thread(
+            build_codex_native_server,
             socket_path=temp_root / "unused.sock",
             codex_home=codex_home,
             cwd=title_workdir,
@@ -86,6 +92,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             "features.computer_use=false",
             "features.image_generation=false",
             "features.multi_agent=false",
+            "features.plugins=false",
             "features.tool_search=false",
         ):
             args.extend(("--config", override))
