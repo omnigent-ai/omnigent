@@ -1036,7 +1036,14 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     # (not symlinked), so drop the copy to re-read an edited source config.
     with contextlib.suppress(OSError):
         (home / "config.toml").unlink(missing_ok=True)
-    _populate_codex_home_config(home, _codex_home_config_source_from_env(), minimal_config=True)
+    # The probe drives the same native codex binary as a session launch, so
+    # keep the full native effort ladder instead of clamping max/ultra.
+    _populate_codex_home_config(
+        home,
+        _codex_home_config_source_from_env(),
+        minimal_config=True,
+        supported_efforts=CODEX_NATIVE_EFFORTS,
+    )
     return home
 
 
