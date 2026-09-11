@@ -23,9 +23,34 @@ const SESSION_CREATE_PATH = "/auth/session/create";
  * @param {{ interactive?: boolean, nextPath?: string }} [opts]
  * @returns {Promise<void>}
  */
-async function ensureDatabricksSession(ses, origin, { interactive = true, nextPath = "/omnigent" } = {}) {
-  const accessToken = await getValidAccessToken(origin, { interactive });
+async function ensureDatabricksSession(
+  ses,
+  origin,
+  { interactive = true, nextPath = "/omnigent", forceLogin = false } = {},
+) {
+  const accessToken = await getValidAccessToken(origin, { interactive, forceLogin });
   await mintSessionCookie(ses, origin, accessToken, nextPath);
+}
+
+/**
+ * Remove every cookie the given workspace origin would send. Strict test mode
+ * uses this to start unauthenticated so a stale workspace session can't silently
+ * sign the window in.
+ *
+ * @param {Electron.Session} ses
+ * @param {string} origin
+ * @returns {Promise<void>}
+ */
+async function clearWorkspaceCookies(ses, origin) {
+  const cookies = await ses.cookies.get({ url: origin });
+  await Promise.all(
+    cookies.map((c) => {
+      const scheme = c.secure ? "https" : "http";
+      const host =
+        c.domain && c.domain.startsWith(".") ? c.domain.slice(1) : c.domain || new URL(origin).hostname;
+      return ses.cookies.remove(`${scheme}://${host}${c.path || "/"}`, c.name);
+    }),
+  );
 }
 
 /**
@@ -169,4 +194,5 @@ async function applyCookie(ses, origin, c) {
 module.exports = {
   databricksOAuthConfigured,
   ensureDatabricksSession,
+  clearWorkspaceCookies,
 };

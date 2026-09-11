@@ -288,7 +288,11 @@ async function runInteractiveLogin(origin) {
  * @param {{ interactive?: boolean }} [opts]
  * @returns {Promise<string>} A bearer access token.
  */
-async function getValidAccessToken(origin, { interactive = true } = {}) {
+async function getValidAccessToken(origin, { interactive = true, forceLogin = false } = {}) {
+  if (forceLogin) {
+    // Testing: skip any cached/refreshable token and run the full browser flow.
+    return (await runInteractiveLogin(origin)).access_token;
+  }
   const stored = loadTokens(origin);
   const now = Math.floor(Date.now() / 1000);
   if (

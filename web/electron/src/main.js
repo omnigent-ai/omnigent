@@ -66,7 +66,11 @@ const arca = require("./arca");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
-const { ensureDatabricksSession, databricksOAuthConfigured } = require("./databricks-session");
+const {
+  ensureDatabricksSession,
+  databricksOAuthConfigured,
+  clearWorkspaceCookies,
+} = require("./databricks-session");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
   SETTINGS_PATH,
@@ -2555,14 +2559,34 @@ function registerIpc() {
       // runs the (now locked-down) login page itself. Best-effort — on any
       // failure fall through to a plain load and let the SSO gate handle it.
       if (databricksOAuthConfigured() && isDatabricksManagedServerUrl(target)) {
-        console.log(`[omnigent] databricks pre-auth: signing in to ${new URL(target).origin} before load`);
+        const dbxOrigin = new URL(target).origin;
+        // Testing switch: OMNIGENT_DATABRICKS_OAUTH_STRICT=1 clears the existing
+        // workspace session, forces a fresh browser login, and removes the
+        // fallback so a pre-auth failure is loud instead of dropping to the
+        // in-window SSO login.
+        const strict = process.env.OMNIGENT_DATABRICKS_OAUTH_STRICT === "1";
+        console.log(`[omnigent] databricks pre-auth: signing in to ${dbxOrigin} before load`);
+        if (strict) {
+          try {
+            await clearWorkspaceCookies(session.defaultSession, dbxOrigin);
+          } catch (err) {
+            console.warn("[omnigent] databricks pre-auth: cookie clear failed:", err.message);
+          }
+        }
         try {
-          await ensureDatabricksSession(session.defaultSession, new URL(target).origin);
+          await ensureDatabricksSession(session.defaultSession, dbxOrigin, { forceLogin: strict });
         } catch (err) {
-          console.warn(
-            "[omnigent] databricks pre-auth failed; loading without a pre-seeded session:",
-            err.message,
-          );
+          console.warn(`[omnigent] databricks pre-auth failed: ${err.message}`);
+          if (strict) {
+            console.error("[omnigent] databricks pre-auth STRICT: aborting load (no fallback)");
+            dialog.showErrorBox(
+              "Databricks sign-in failed (strict OAuth test mode)",
+              `${err.message}\n\nOMNIGENT_DATABRICKS_OAUTH_STRICT=1 is set, so the shell did not ` +
+                "fall back to in-window login.",
+            );
+            return;
+          }
+          console.warn("[omnigent] loading without a pre-seeded session (fallback)");
         }
       }
       win
