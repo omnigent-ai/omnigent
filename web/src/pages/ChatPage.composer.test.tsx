@@ -6,11 +6,17 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { ReactElement } from "react";
+import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
-import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
+import {
+  clearSessionDrafts,
+  getSessionDraft,
+  hasSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
@@ -93,9 +99,6 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     selectedAgentId: null,
     permissionLevel: null,
     readOnlyReason: null,
-    replyQuotes: [],
-    onRemoveQuote: vi.fn(),
-    onClearAllQuotes: vi.fn(),
     effortLevels: ["low", "medium", "high"] as const,
     showEffort: true,
     showModels: false,
@@ -1614,6 +1617,24 @@ describe("Composer shared visible controls", () => {
     vi.restoreAllMocks();
   });
 
+  it.each([
+    ["Session workspace", 0],
+    ["Session worktree", 1],
+  ])("wraps text inside the %s popover", (label, triggerIndex) => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const controls = screen.getByTestId("composer-workspace-controls");
+    fireEvent.keyDown(within(controls).getAllByRole("button")[triggerIndex], {
+      key: "ArrowDown",
+    });
+
+    const popover = screen.getByRole("menu");
+    expect(within(popover).getByText(label)).toBeVisible();
+    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,28rem)]");
+    expect(popover).not.toHaveClass("whitespace-nowrap");
+    expect(popover.querySelector("p")).toHaveClass("break-all");
+  });
+
   it("renders the same workspace, host, permission and model controls as landing", () => {
     useChatStore.setState({
       conversationId: "shared-controls",
@@ -2256,57 +2277,472 @@ describe("Composer pending elicitation", () => {
   });
 });
 
-// Clicking the floating "Reply" button adds a quote chip above the composer.
-// The caret must follow into the textarea so the user can type the reply
-// immediately — without this, the quote appears but focus stays on the page
-// and the user has to click the chat box first.
-describe("Composer reply-quote focus", () => {
+describe("Composer reply quotes", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      queuedMessages: [],
+    });
   });
 
   afterEach(() => {
     cleanup();
+    clearSessionDrafts();
     vi.restoreAllMocks();
   });
 
-  it("focuses the textarea when a reply quote is added", () => {
-    const { rerender } = render(<Composer {...composerProps({ replyQuotes: [] })} />);
-    const ta = textarea();
-    // The mount effect focuses on conversation bind; blur so the assertion
-    // proves the quote-add effect re-focused, not the leftover mount focus.
-    ta.blur();
-    expect(document.activeElement).not.toBe(ta);
+  it("appends reply quotes after the existing draft and sends them interleaved", () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...props} ref={ref} />);
 
-    rerender(
-      <Composer
-        {...composerProps({
-          replyQuotes: [{ id: "quote-1", text: "selected response text" }],
-        })}
-      />,
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    act(() => ref.current?.appendReplyQuote("First point"));
+    expect(textarea()).toHaveValue("");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(
+      screen.getByTestId("composer-reply-quote").querySelector("blockquote"),
+    ).toHaveTextContent("First point");
+    expect(screen.getByRole("button", { name: "Remove quote" })).toBeEnabled();
+
+    fireEvent.change(textarea(), {
+      target: { value: textarea().value + "My first answer" },
+    });
+    act(() => ref.current?.appendReplyQuote("Second point\nMore detail"));
+    expect(textarea()).toHaveValue("");
+    expect(screen.getByLabelText("Reply text before quote 2")).toHaveValue("My first answer");
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+    expect(
+      screen
+        .getAllByRole("textbox")
+        .every((input) => !(input as HTMLTextAreaElement).value.includes(">")),
+    ).toBe(true);
+
+    fireEvent.change(textarea(), {
+      target: { value: textarea().value + "My second answer" },
+    });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith(
+      "My introduction\n\n> First point\n\nMy first answer\n\n> Second point\n> More detail\n\nMy second answer",
+      undefined,
+      {
+        version: 1,
+        quotes: [
+          { before: "My introduction", text: "First point" },
+          { before: "My first answer", text: "Second point\nMore detail" },
+        ],
+        text: "My second answer",
+      },
     );
-    expect(document.activeElement).toBe(ta);
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(0);
   });
 
-  it("does not steal focus when a quote is removed", () => {
-    // Removing a chip (the X button) shrinks the count — the effect only
-    // fires when the count grows, so focus must stay put.
-    const { rerender } = render(
-      <Composer
-        {...composerProps({
-          replyQuotes: [
-            { id: "quote-1", text: "first" },
-            { id: "quote-2", text: "second" },
-          ],
-        })}
-      />,
-    );
+  it("focuses the textarea after the appended quote, even when the old caret was elsewhere", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
     const ta = textarea();
+    fireEvent.change(ta, { target: { value: "Existing draft" } });
+    ta.setSelectionRange(0, 8);
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    rerender(<Composer {...composerProps({ replyQuotes: [{ id: "quote-1", text: "first" }] })} />);
+    act(() => ref.current?.appendReplyQuote("selected response text"));
+    expect(ta).toHaveValue("");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("Existing draft");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("selected response text");
+    expect(document.activeElement).toBe(ta);
+    expect(ta.selectionStart).toBe(ta.value.length);
+    expect(ta.selectionEnd).toBe(ta.value.length);
+  });
+
+  it("appends on mobile without opening the software keyboard", () => {
+    const matchMedia = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...matchMedia(query),
+      matches: query.includes("max-width"),
+    }));
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    const ta = textarea();
     expect(document.activeElement).not.toBe(ta);
+
+    act(() => ref.current?.appendReplyQuote("Selected on mobile"));
+    expect(ta).toHaveValue("");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Selected on mobile");
+    expect(ta.selectionStart).toBe(ta.value.length);
+    expect(document.activeElement).not.toBe(ta);
+  });
+
+  it.each([
+    { disabled: true },
+    { permissionLevel: 1 },
+    { readOnlyReason: "Read-only session" },
+    { unreachable: true },
+  ])("does not insert into a disabled composer: %j", (overrides) => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps(overrides)} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("Not editable"));
+    expect(textarea()).toHaveValue("");
+    expect(hasSessionDraft("conv_test")).toBe(false);
+  });
+
+  it("removes a quote without stealing focus or reinserting it on rerender", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    const { rerender } = render(<Composer {...props} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("Original quote"));
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "Only my reply" } });
+    ta.blur();
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+
+    rerender(<Composer {...props} ref={ref} status="streaming" />);
+    expect(ta).toHaveValue("Only my reply");
+    expect(document.activeElement).not.toBe(ta);
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("Only my reply", undefined);
+  });
+
+  it("appends repeated selections once per click in StrictMode", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(
+      <StrictMode>
+        <Composer {...composerProps()} ref={ref} />
+      </StrictMode>,
+    );
+    act(() => {
+      ref.current?.appendReplyQuote("Same selection");
+      ref.current?.appendReplyQuote("Same selection");
+    });
+    expect(textarea()).toHaveValue("");
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+    expect(getSessionDraft("conv_test")?.text).toBe("> Same selection\n\n> Same selection");
+  });
+
+  it.each(["", "\n", "\n\n"])("reuses trailing line breaks (%j)", (trailing) => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: `Draft${trailing}` } });
+    act(() => ref.current?.appendReplyQuote("Quoted line\r\n\r\nAnother paragraph"));
+    expect(getSessionDraft("conv_test")?.text).toBe(
+      "Draft\n\n> Quoted line\n> \n> Another paragraph",
+    );
+    expect(screen.getByTestId("composer-reply-quote").querySelector("blockquote")).toHaveAttribute(
+      "title",
+      "Quoted line\n\nAnother paragraph",
+    );
+  });
+
+  it("can send a quote-only draft and does not carry it into the next message", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isWorking: true, status: "streaming" });
+    render(<Composer {...props} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("Quoted text"));
+    expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenLastCalledWith("> Quoted text", undefined, {
+      version: 1,
+      quotes: [{ before: "", text: "Quoted text" }],
+      text: "",
+    });
+    expect(textarea()).toHaveValue("");
+
+    fireEvent.change(textarea(), { target: { value: "Next message" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenLastCalledWith("Next message", undefined);
+  });
+
+  it("restores interleaved quotes only in their original session", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("First quote"));
+    fireEvent.change(textarea(), {
+      target: { value: textarea().value + "My answer" },
+    });
+    act(() => ref.current?.appendReplyQuote("Second quote"));
+    const draft = getSessionDraft("conv_test")?.text;
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(0);
+    act(() => ref.current?.appendReplyQuote("Other session's quote"));
+
+    act(() => useChatStore.setState({ conversationId: "conv_test" }));
+    expect(getSessionDraft("conv_test")?.text).toBe(draft);
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+    expect(screen.getByLabelText("Reply text before quote 2")).toHaveValue("My answer");
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Other session's quote");
+  });
+
+  it("keeps earlier replies editable, including replacing all their text", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    render(<Composer {...props} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("First quote"));
+    fireEvent.change(textarea(), { target: { value: "Original answer" } });
+    act(() => ref.current?.appendReplyQuote("Second quote"));
+    const earlier = screen.getByLabelText("Reply text before quote 2");
+    act(() => earlier.focus());
+    fireEvent.change(earlier, { target: { value: "" } });
+    expect(earlier).toBeInTheDocument();
+    expect(earlier).toHaveFocus();
+    fireEvent.change(earlier, { target: { value: "Rewritten answer" } });
+    fireEvent.keyDown(earlier, { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith(
+      "> First quote\n\nRewritten answer\n\n> Second quote",
+      undefined,
+      {
+        version: 1,
+        quotes: [
+          { before: "", text: "First quote" },
+          { before: "Rewritten answer", text: "Second quote" },
+        ],
+        text: "",
+      },
+    );
+    expect(textarea()).toHaveFocus();
+  });
+
+  it("appends after the entire draft when an earlier reply is focused", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("First quote"));
+    fireEvent.change(textarea(), { target: { value: "First answer" } });
+    act(() => ref.current?.appendReplyQuote("Second quote"));
+    fireEvent.change(textarea(), { target: { value: "Second answer" } });
+    act(() => screen.getByLabelText("Reply text before quote 2").focus());
+    act(() => ref.current?.appendReplyQuote("Third quote"));
+    expect(screen.getByLabelText("Reply text before quote 2")).toHaveValue("First answer");
+    expect(screen.getByLabelText("Reply text before quote 3")).toHaveValue("Second answer");
+    expect(textarea()).toHaveFocus();
+    expect(textarea()).toHaveValue("");
+  });
+
+  it("removes middle and final quote cards without deleting surrounding replies", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    render(<Composer {...props} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "Introduction" } });
+    act(() => ref.current?.appendReplyQuote("First quote"));
+    fireEvent.change(textarea(), { target: { value: "First answer" } });
+    act(() => ref.current?.appendReplyQuote("Second quote"));
+    fireEvent.change(textarea(), { target: { value: "Second answer" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[0]!);
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(
+      "Introduction\n\nFirst answer",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    expect(textarea()).toHaveValue("Introduction\n\nFirst answer\n\nSecond answer");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith(
+      "Introduction\n\nFirst answer\n\nSecond answer",
+      undefined,
+    );
+  });
+
+  it.each(["intro\n> quote\nreply", "> quoted\ncontinued", "\nNotes:\n\n> Example text\n\n"])(
+    "restores unannotated Markdown as editable text: %j",
+    (text) => {
+      setSessionDraft("conv_test", { text, files: [] });
+      const props = composerProps();
+      render(<Composer {...props} />);
+      expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(0);
+      expect(textarea()).toHaveValue(text);
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledWith(text.trim(), undefined);
+    },
+  );
+
+  it("restores only actual cards beside authored quotes and an unfinished code fence", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    const before = "Notes:\n> authored\ncontinued\n\n\n";
+    const tail = "~~~markdown\n> code example\n";
+    fireEvent.change(textarea(), { target: { value: before } });
+    act(() => ref.current?.appendReplyQuote("Actual Reply quote"));
+    fireEvent.change(textarea(), { target: { value: tail } });
+    act(() => ref.current?.appendReplyQuote("Quote after unfinished fence"));
+    const saved = getSessionDraft("conv_test");
+
+    act(() => useChatStore.setState({ conversationId: "other" }));
+    act(() => useChatStore.setState({ conversationId: "conv_test" }));
+    expect(getSessionDraft("conv_test")).toEqual(saved);
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(before);
+    expect(screen.getByLabelText("Reply text before quote 2")).toHaveValue(tail);
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[1]!);
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    expect(textarea()).toHaveValue(before + tail);
+  });
+
+  it("recalls actual cards from history without reclassifying authored Markdown", () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { unmount } = render(<Composer {...props} ref={ref} />);
+    const before = "Intro\n> authored\nlazy continuation\n\n";
+    fireEvent.change(textarea(), { target: { value: before } });
+    act(() => ref.current?.appendReplyQuote("Actual card"));
+    fireEvent.change(textarea(), { target: { value: "My answer\n\n\n" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const sent = vi.mocked(props.onSend).mock.calls[0]!;
+    unmount();
+
+    render(<Composer {...props} />);
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(before);
+    expect(textarea()).toHaveValue("My answer\n\n\n");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenLastCalledWith(...sent);
+  });
+
+  it("exits history recall when a quote card is removed", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Introduction", text: "Actual card" }],
+      text: "Answer to keep",
+    };
+    localStorage.setItem(
+      "omnigent:prompt-history:conv_test",
+      JSON.stringify([{ text: serializeReplyDraft(replyDraft), replyDraft }]),
+    );
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
+    textarea().setSelectionRange(0, 0);
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    const edited = "Introduction\n\nAnswer to keep";
+    expect(textarea()).toHaveValue(edited);
+    textarea().setSelectionRange(edited.length, edited.length);
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    expect(textarea()).toHaveValue(edited);
+    expect(getSessionDraft("conv_test")?.text).toBe(edited);
+  });
+
+  it("exits history recall on the first manual text edit", () => {
+    localStorage.setItem("omnigent:prompt-history:conv_test", JSON.stringify(["Older prompt"]));
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
+    textarea().setSelectionRange(0, 0);
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue("Older prompt");
+    const edited = "My edited prompt";
+    fireEvent.change(textarea(), { target: { value: edited } });
+    textarea().setSelectionRange(edited.length, edited.length);
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    expect(textarea()).toHaveValue(edited);
+  });
+
+  it.each([false, true])("restores failed sends using explicit metadata only: %s", (structured) => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "intro\n> authored\ncontinued", text: "Actual card" }],
+      text: "Answer",
+    };
+    const text = structured ? serializeReplyDraft(replyDraft) : "intro\n> authored\ncontinued";
+    const props = composerProps();
+    render(<Composer {...props} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text,
+          files: [],
+          ...(structured ? { replyDraft } : {}),
+        },
+      }),
+    );
+    expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(structured ? 1 : 0);
+    expect(textarea()).toHaveValue(structured ? "Answer" : text);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe(text);
+    if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
+  });
+
+  it.each([false, true])(
+    "edits and persists queued messages with explicit metadata only: %s",
+    (structured) => {
+      const replyDraft: StoredReplyDraft = {
+        version: 1,
+        quotes: [{ before: "intro\n> authored\ncontinued", text: "Actual card" }],
+        text: "Answer",
+      };
+      const text = structured ? serializeReplyDraft(replyDraft) : "intro\n> authored\ncontinued";
+      useChatStore.setState({
+        status: "streaming",
+        sessionStatus: "running",
+        queuedMessages: [
+          {
+            queueId: "q_reply",
+            conversationId: "conv_test",
+            text,
+            ...(structured ? { replyDraft } : {}),
+          },
+        ],
+      });
+      const props = composerProps({ status: "streaming", isWorking: true });
+      renderWithTooltips(<Composer {...props} />);
+      fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+      expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(structured ? 1 : 0);
+      expect(textarea()).toHaveValue(structured ? "Answer" : text);
+      expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+      expect(getSessionDraft("conv_test")?.text).toBe(text);
+      expect(getSessionDraft("conv_test")?.replyDraft).toEqual(structured ? replyDraft : undefined);
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe(text);
+      if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
+    },
+  );
+
+  it("keeps mention markers in the structured payload used to restore a failed send", () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    render(<Composer {...props} ref={ref} />);
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    act(() => ref.current?.appendReplyQuote("Actual card"));
+    fireEvent.change(textarea(), { target: { value: "My answer" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const [text, , replyDraft] = vi.mocked(props.onSend).mock.calls[0]!;
+    expect(text).toBe("[Attached file: src/example.ts]\n\n> Actual card\n\nMy answer");
+    expect(serializeReplyDraft(replyDraft!)).toBe(text);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text, files: [], replyDraft },
+      }),
+    );
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Actual card");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(
+      "[Attached file: src/example.ts]\n\n",
+    );
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toBe(text);
+  });
+
+  it("sends slash-command-looking replies as part of the quoted message", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    render(<Composer {...props} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("Explain /help"));
+    fireEvent.change(textarea(), { target: { value: "/help" } });
+    expect(activeRow()).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("> Explain /help\n\n/help", undefined, {
+      version: 1,
+      quotes: [{ before: "", text: "Explain /help" }],
+      text: "/help",
+    });
   });
 });
 

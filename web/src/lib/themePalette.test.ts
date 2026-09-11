@@ -127,4 +127,25 @@ describe("themePalette", () => {
     expect(solarized?.tokens.dark.background).toBe("#002b36");
     expect(solarized?.tokens.dark.shellBackground).toBe("#002b36");
   });
+
+  it.each(PALETTES)("keeps $label selected text opaque and readable in both modes", (palette) => {
+    const luminance = (hex: string) => {
+      const channels = [1, 3, 5].map((offset) => {
+        const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
+        return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+      });
+      return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+    };
+
+    for (const mode of ["light", "dark"] as const) {
+      const { selectionBackground, selectionForeground } = palette.tokens[mode];
+      expect(selectionBackground).toMatch(/^#[0-9a-f]{6}$/i);
+      expect(selectionForeground).toMatch(/^#[0-9a-f]{6}$/i);
+      const background = luminance(selectionBackground);
+      const foreground = luminance(selectionForeground);
+      const contrast =
+        (Math.max(background, foreground) + 0.05) / (Math.min(background, foreground) + 0.05);
+      expect(contrast, `${palette.label} ${mode}`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
 });

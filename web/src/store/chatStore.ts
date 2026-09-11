@@ -57,6 +57,7 @@ import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -143,8 +144,11 @@ import {
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import type { StoredReplyDraft } from "@/lib/replyDraft";
 
 export interface SendOptions {
+  /** Client-only quote provenance, retained if the composer needs to retry. */
+  replyDraft?: StoredReplyDraft;
   /**
    * Fires synchronously after `createSession` returns for a brand-new
    * session (before the first message is posted). Callers use this
@@ -443,6 +447,7 @@ export interface QueuedMessage {
   queueId: string;
   /** Fully-assembled message text (mentions/quotes already applied). */
   text: string;
+  replyDraft?: StoredReplyDraft;
   /** Attachments to send with the message. */
   files?: File[];
   /** Owning conversation, so a switch/idle only flushes its own queue. */
@@ -690,6 +695,7 @@ export interface ConversationState {
     text: string;
     files: File[];
     stableId?: string;
+    replyDraft?: StoredReplyDraft;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -936,7 +942,7 @@ export interface ChatActions {
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
-  enqueueMessage: (text: string, files?: File[]) => void;
+  enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1122,6 +1128,10 @@ let queryClient: QueryClient | null = null;
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+
+// Snapshot reconciliation must teach the already-running stream pump which
+// native preview messages have finalized, including warm session revisits.
+const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<string>>();
 
 /**
  * Evict a conversation from the live registry.
@@ -1669,7 +1679,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files) => {
+  enqueueMessage: (text, files, replyDraft) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
@@ -1685,6 +1695,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
+          ...(replyDraft ? { replyDraft } : {}),
         },
       ],
     }));
@@ -1736,7 +1747,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (target === undefined || agentId === null) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files);
+    void s.send(target.text, agentId, target.files, { replyDraft: target.replyDraft });
   },
 
   clearQueuedMessages: (conversationId) => {
@@ -1783,7 +1794,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (head === undefined) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, {
+      replyDraft: head.replyDraft,
+    });
   },
 
   flushBackgroundQueues: () => {
@@ -2106,7 +2119,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (draftSessionId !== null && (text.trim() !== "" || (files?.length ?? 0) > 0)) {
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [], stableId },
+          failedSendDraft: {
+            conversationId: draftSessionId,
+            text,
+            files: files ?? [],
+            stableId,
+            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          },
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
@@ -2422,7 +2441,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // controller too. Verify the instantly-painted transcript against the
       // committed snapshot in the background; item-id dedupe makes this a
       // no-op when the entry really is current.
-      void reconcileOnReconnect(conversationId, entrySetter(entry), entryGetter(entry));
+      const controller = entry.getState().abortController;
+      void reconcileOnReconnect(
+        conversationId,
+        entrySetter(entry),
+        entryGetter(entry),
+        controller === null ? undefined : nativePreviewTombstonesByController.get(controller),
+      );
       return;
     }
 
@@ -3516,6 +3541,8 @@ async function bindStream(
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
+  const ignoredNativeMessageIds = new Set<string>();
+  nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
@@ -3557,7 +3584,9 @@ async function bindStream(
 
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction).
-  void startStreamPump(id, controller, set, get).finally(() => releaseStreamSlot(id));
+  void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
+    releaseStreamSlot(id),
+  );
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
   // (browser throttling), so a pending ApprovalCard that was answered on
@@ -3603,6 +3632,8 @@ async function bindStream(
     ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;
+    const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
+    snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
     // Sticky-pref handoff for CLI-created sessions with no override.
     // Binding-derived fields (isNativeTerminalSession, bound agent,
@@ -3648,6 +3679,7 @@ async function bindStream(
     // inside the updater because it depends on the catalog bind race.
     let resolvedStickyModel: string | null = null;
     set((state) => {
+      const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
         bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
@@ -3655,14 +3687,14 @@ async function bindStream(
         ? { ...bindingPatch, codexModelOptions: racedOptions! }
         : bindingPatch;
       const seenItemIds = new Set(
-        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
       const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
       // Dedupe against any elicitation blocks already produced by
       // the live pump (the snapshot may race ahead of or behind
       // the SSE event — match by elicitationId).
       const seenElicitationIds = new Set(
-        state.blocks
+        currentBlocks
           .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
           .map((b) => b.elicitationId),
       );
@@ -3687,7 +3719,7 @@ async function bindStream(
       // re-binds.)
       const allBlocks = [
         ...unique,
-        ...withoutRebuiltUserInputCards(state.blocks, unique),
+        ...withoutRebuiltUserInputCards(currentBlocks, unique),
         ...uniquePendingElicitations,
       ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
@@ -4277,6 +4309,7 @@ async function rehydrateWindowOnReconnect(
   preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
   set: Setter,
   get: Getter,
+  ignoredNativeMessageIds: Set<string>,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -4287,11 +4320,14 @@ async function rehydrateWindowOnReconnect(
     return;
   }
   if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+  const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
+  snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-    const tail = s.blocks.filter((b) => {
+    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
+    const tail = currentBlocks.filter((b) => {
       if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
       // Elicitation/error blocks aren't items, so the fresh fetch can't recreate them.
       if (b.type === "elicitation" || b.type === "error") return true;
@@ -4350,7 +4386,12 @@ async function rehydrateWindowOnReconnect(
  * failure just means the next reconnect retries. All writes are
  * `historyGeneration`-guarded so a window reset mid-fetch voids them.
  */
-async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promise<void> {
+async function reconcileOnReconnect(
+  id: string,
+  set: Setter,
+  get: Getter,
+  ignoredNativeMessageIds: Set<string> = new Set<string>(),
+): Promise<void> {
   if (queryClient === null) return;
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
@@ -4410,16 +4451,27 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     if (older.items.length === 0) break; // no progress; avoid refetching the same cursor
   }
   /* oxlint-enable no-await-in-loop */
+  const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
+  snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   if (!covered) {
-    await rehydrateWindowOnReconnect(id, session, preGapIds, preGapElicitations, set, get);
+    await rehydrateWindowOnReconnect(
+      id,
+      session,
+      preGapIds,
+      preGapElicitations,
+      set,
+      get,
+      ignoredNativeMessageIds,
+    );
     return;
   }
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   set((s) => {
+    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
-      s.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+      currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s);
@@ -4431,7 +4483,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     if (recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
     }
-    let nextBlocks = s.blocks;
+    let nextBlocks = currentBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
       // replayed in-flight region (its itemId-less blocks, rebuilt by the
@@ -4442,7 +4494,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(s.blocks, unseen);
+      const kept = withoutRebuiltUserInputCards(currentBlocks, unseen);
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
@@ -4559,7 +4611,9 @@ export async function startStreamPump(
   controller: AbortController,
   set: Setter,
   get: Getter,
+  ignoredNativeMessageIds: Set<string> = new Set<string>(),
 ): Promise<void> {
+  nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   let failedOpens = 0;
   let statusReconcileInFlight = false;
   const statusReconcileTimer =
@@ -4719,9 +4773,17 @@ export async function startStreamPump(
         });
         // Start the pump, then reconcile the snapshot concurrently (race-safe
         // via itemId dedup) — mirrors bindStream's stream-then-snapshot order.
-        const pumpPromise = pumpStreamEvents(id, guardedBody, controller, set, get);
+        const pumpPromise = pumpStreamEvents(
+          id,
+          guardedBody,
+          controller,
+          set,
+          get,
+          undefined,
+          ignoredNativeMessageIds,
+        );
         if (reconnecting) {
-          await reconcileOnReconnect(id, set, get);
+          await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
         }
         let reason = await pumpPromise;
 
@@ -4851,6 +4913,40 @@ export type StreamEndReason = "aborted" | "switched" | "server_closed" | "droppe
 /** Whether a block is a provisional live-streaming text preview. */
 function isLiveProvisionalBlock(b: AnyBlock): boolean {
   return b.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false;
+}
+
+/** Suppress future chunks for a provisional preview that is no longer valid. */
+function ignoreLivePreview(block: AnyBlock | undefined, ignoredMessageIds: Set<string>): void {
+  const itemId = block?.ctx.itemId;
+  if (!itemId?.startsWith(LIVE_ITEM_PREFIX)) return;
+  ignoredMessageIds.add(itemId.slice(LIVE_ITEM_PREFIX.length));
+}
+
+/** Return persisted native preview ids finalized by assistant messages. */
+function nativeCompletedMessageIds(items: ConversationItem[]): Set<string> {
+  return new Set(
+    items
+      .filter(
+        (item): item is MessageItem =>
+          isMessageItem(item) &&
+          item.role === "assistant" &&
+          typeof item.stream_message_id === "string" &&
+          item.stream_message_id.length > 0,
+      )
+      .map((item) => item.stream_message_id!),
+  );
+}
+
+/** Remove provisional previews whose authoritative snapshot item is present. */
+function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): AnyBlock[] {
+  if (messageIds.size === 0) return blocks;
+  return blocks.filter((block) => {
+    const itemId = block.ctx.itemId;
+    return (
+      !itemId?.startsWith(LIVE_ITEM_PREFIX) ||
+      !messageIds.has(itemId.slice(LIVE_ITEM_PREFIX.length))
+    );
+  });
 }
 
 /**
@@ -4997,6 +5093,9 @@ async function* tapLiveDeltas(
   get: Getter,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
+    if (ev.type === "message_done" && ev.messageId !== undefined) {
+      ignored.add(ev.messageId);
+    }
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
       if (!isConversationDisposed(id) && !ignored.has(ev.messageId)) {
         // A scheduled wake streams its first deltas ahead of the batch
@@ -5114,6 +5213,7 @@ export async function pumpStreamEvents(
   set: Setter,
   get: Getter,
   scheduler: FrameScheduler = createRafScheduler(),
+  ignoredMessages: Set<string> = new Set<string>(),
 ): Promise<StreamEndReason> {
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
@@ -5128,9 +5228,8 @@ export async function pumpStreamEvents(
   // to the BlockStream reducer. The reducer is intentionally pure
   // (block factory) — session-scoped state lives on the store, not in
   // the reducer's internal state. See migration plan §5.3.
-  // A scheduled wake can stream before its new turn id arrives. Ignore the
-  // rest of that message so it cannot attach to the completed prior turn.
-  const ignoredWakeMessages = new Set<string>();
+  // Ignore the rest of messages whose previews are stale or already replaced
+  // by authoritative items, so late transport delivery cannot recreate them.
   const events = tapLiveDeltas(
     tapSessionEvents(rawEvents, id, (elicitationId) => {
       // A fast native approval can resolve in the few milliseconds between
@@ -5152,7 +5251,7 @@ export async function pumpStreamEvents(
       };
     }),
     id,
-    ignoredWakeMessages,
+    ignoredMessages,
     set,
     get,
   );
@@ -5240,6 +5339,7 @@ export async function pumpStreamEvents(
       ) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
+          ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
           flush();
           set((s) => {
             const at = s.blocks.findIndex(isLiveProvisionalBlock);
@@ -5323,6 +5423,7 @@ export async function pumpStreamEvents(
       if (block.type === "text_done" && get().isNativeTerminalSession) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
+          ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
           // The done item has no message id. Native messages are sequential,
           // so remove the oldest preview and let the committed item follow
           // the normal reducer path.
@@ -5370,6 +5471,7 @@ export async function pumpStreamEvents(
         // after this event, or a stream drop). Normal messages already
         // had their preview replaced when their `text_done` committed, so
         // this is usually a no-op.
+        get().blocks.forEach((candidate) => ignoreLivePreview(candidate, ignoredMessages));
         set((s) => ({
           status: "idle",
           blocks: s.blocks.some(isLiveProvisionalBlock)

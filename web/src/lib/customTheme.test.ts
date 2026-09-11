@@ -114,6 +114,23 @@ describe("customTheme", () => {
     expect(deriveCustomTheme({ ...theme, contrast: 50 })).toEqual(palette.tokens);
   });
 
+  it.each(PALETTES)("preserves $label selection contrast when customizing accents", (palette) => {
+    for (const accent of ["#000000", "#777777", "#ffffff"]) {
+      const variants = deriveCustomTheme({
+        ...createCustomThemeFromPalette(palette),
+        accent,
+        darkAccent: accent,
+        contrast: 100,
+        translucentSidebar: true,
+      });
+
+      for (const mode of ["light", "dark"] as const) {
+        expect(variants[mode].selectionBackground).toBe(palette.tokens[mode].selectionBackground);
+        expect(variants[mode].selectionForeground).toBe(palette.tokens[mode].selectionForeground);
+      }
+    }
+  });
+
   it("keeps Omnigent's selected-session colors after contrast changes", () => {
     const theme = createCustomThemeFromPalette(PALETTES[0]);
     const variants = deriveCustomTheme({ ...theme, contrast: 53 });

@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 import click
 import httpx
@@ -1881,16 +1881,18 @@ async def _ensure_local_codex_resume_rollout(
     terminal_launch_args: Sequence[str] | None = None,
 ) -> Path:
     """
-    Ensure Codex has a local rollout JSONL for cold resume.
+    Refresh Codex's local rollout JSONL for cold resume.
 
     Cross-machine resume has the Omnigent conversation and Codex thread id on
     the server, but not necessarily the app-server's local
     ``$CODEX_HOME/sessions/.../rollout-*-<thread>.jsonl`` file. Codex
     ``resume <thread>`` reads that local rollout, so before launching a
-    known-thread terminal we synthesize the rollout from committed AP
-    items when the local rollout is missing. Existing local rollout files
-    are left untouched because Codex treats them as append-only runtime
-    state, not a cache that Omnigent should rewrite.
+    known-thread terminal we rewrite it from committed Omnigent items. This
+    keeps the server transcript authoritative when a previous local rollout
+    has diverged. If server history is temporarily unavailable, a valid local
+    rollout remains a best-effort fallback. A successful server fetch wins
+    even when its committed history is empty or shorter than the local file;
+    local-only records are intentionally discarded.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -1913,21 +1915,33 @@ async def _ensure_local_codex_resume_rollout(
         rollout, but treats the value as informational, so a flaky probe
         must not cost the carried history.
     :param terminal_launch_args: Persisted Codex approval/sandbox launch args.
-    :returns: Path to the existing or written rollout.
-    :raises click.ClickException: If Omnigent history cannot be fetched or the
-        rollout cannot be written, or if the persisted Codex thread id is
-        unsafe for use in a rollout filename.
+    :returns: Path to the refreshed rollout, or to a valid local fallback when
+        server history is temporarily unavailable.
+    :raises click.ClickException: If Omnigent history cannot be fetched and no
+        valid local fallback exists, if the rollout cannot be written, or if
+        the persisted Codex thread id is unsafe for use in a rollout filename.
     """
     if not _CODEX_THREAD_ID_RE.fullmatch(external_session_id):
         raise click.ClickException(
             f"Cannot resume Codex session {session_id!r}: persisted thread id "
             f"{external_session_id!r} is not a safe Codex rollout id."
         )
-    existing = _find_codex_rollout(codex_home, external_session_id)
-    if existing is not None:
-        return existing
+    try:
+        items = await _fetch_all_session_items_for_codex_resume(client, session_id)
+    except _CodexResumeHistoryUnavailableError:
+        existing = _find_codex_rollout(codex_home, external_session_id)
+        if existing is not None and _is_resumable_codex_rollout(
+            existing, external_session_id=external_session_id
+        ):
+            _logger.warning(
+                "Could not fetch server history for %r; resuming from the "
+                "existing local Codex rollout %s",
+                session_id,
+                existing,
+            )
+            return existing
+        raise
     target = _codex_resume_rollout_path(codex_home, external_session_id)
-    items = await _fetch_all_session_items_for_codex_resume(client, session_id)
     cli_version = None
     if codex_path is not None:
         from omnigent.inner.codex_executor import _codex_cli_version
@@ -1945,19 +1959,37 @@ async def _ensure_local_codex_resume_rollout(
         terminal_launch_args=terminal_launch_args,
     )
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = target.with_suffix(".jsonl.tmp")
+    tmp: Path | None = None
     try:
-        with tmp.open("w", encoding="utf-8") as handle:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp = Path(handle.name)
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        assert tmp is not None
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(
             f"Failed to write Codex resume rollout {target}: {exc}"
         ) from exc
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
+        if tmp is not None:
+            with contextlib.suppress(FileNotFoundError):
+                tmp.unlink()
+    _logger.info(
+        "Refreshed Codex resume rollout from server history: "
+        "session=%s thread=%s items=%d target=%s",
+        session_id,
+        external_session_id,
+        len(items),
+        target,
+    )
     return target
 
 
@@ -1986,6 +2018,41 @@ def _codex_resume_rollout_path(codex_home: Path, external_session_id: str) -> Pa
     return partition / f"rollout-{stamp}-{external_session_id}.jsonl"
 
 
+def _is_resumable_codex_rollout(path: Path, *, external_session_id: str) -> bool:
+    """
+    Return whether *path* starts with matching Codex session metadata.
+
+    Codex rejects empty, binary, malformed, or mismatched rollouts on
+    ``resume``. Validate the local fallback before preferring it over a
+    temporarily unavailable server transcript.
+
+    :param path: Candidate ``rollout-*.jsonl`` path.
+    :param external_session_id: Expected Codex thread id.
+    :returns: ``True`` when the first non-empty record is matching
+        ``session_meta``.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    return False
+                if not isinstance(record, dict) or record.get("type") != "session_meta":
+                    return False
+                payload = record.get("payload")
+                return isinstance(payload, dict) and payload.get("id") == external_session_id
+    except (OSError, UnicodeDecodeError):
+        return False
+    return False
+
+
+class _CodexResumeHistoryUnavailableError(click.ClickException):
+    """Server history is temporarily unavailable for Codex cold resume."""
+
+
 async def _fetch_all_session_items_for_codex_resume(
     client: httpx.AsyncClient,
     session_id: str,
@@ -1997,8 +2064,10 @@ async def _fetch_all_session_items_for_codex_resume(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :returns: Flat API item dicts from
         ``GET /v1/sessions/{id}/items``.
-    :raises click.ClickException: If an item page cannot be fetched or
-        parsed.
+    :raises _CodexResumeHistoryUnavailableError: If transport or server errors
+        prevent fetching an item page.
+    :raises click.ClickException: If the server rejects the request or returns
+        an invalid page.
     """
     items: list[_JsonObject] = []
     after: str | None = None
@@ -2006,10 +2075,20 @@ async def _fetch_all_session_items_for_codex_resume(
         params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
         if after is not None:
             params["after"] = after
-        resp = await client.get(
-            f"/v1/sessions/{url_component(session_id)}/items",
-            params=params,
-        )
+        try:
+            resp = await client.get(
+                f"/v1/sessions/{url_component(session_id)}/items",
+                params=params,
+            )
+        except httpx.TransportError as exc:
+            raise _CodexResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r}: {exc}"
+            ) from exc
+        if resp.status_code >= 500:
+            raise _CodexResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r} "
+                f"({resp.status_code}): {error_text(resp)}"
+            )
         if resp.status_code >= 400:
             raise click.ClickException(
                 f"Failed to fetch history for {session_id!r} "
@@ -2026,9 +2105,13 @@ async def _fetch_all_session_items_for_codex_resume(
             raise click.ClickException(
                 f"History fetch for {session_id!r} returned an invalid item list."
             )
-        for item in data:
-            if isinstance(item, dict):
-                items.append(item)
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise click.ClickException(
+                    f"History fetch for {session_id!r} returned a non-object "
+                    f"item at index {index}."
+                )
+            items.append(item)
         if not payload.get("has_more"):
             return items
         last_id = payload.get("last_id")
@@ -2385,17 +2468,24 @@ def _codex_function_call_payload_from_session_item(
     Convert an Omnigent function call item into a Codex function call payload.
 
     :param item: Omnigent function call item.
-    :returns: Codex function call payload, or ``None`` when optional
-        routing fields are absent.
+    :returns: Codex function call payload.
     :raises click.ClickException: If the Omnigent item violates required tool
         history fields.
     """
     name = item.get("name")
     call_id = item.get("call_id")
     if not isinstance(name, str) or not name:
-        return None
+        item_id = item.get("id")
+        raise click.ClickException(
+            "Cannot synthesize Codex resume rollout: Omnigent function_call "
+            f"{item_id!r} has an invalid name."
+        )
     if not isinstance(call_id, str) or not call_id:
-        return None
+        item_id = item.get("id")
+        raise click.ClickException(
+            "Cannot synthesize Codex resume rollout: Omnigent function_call "
+            f"{item_id!r} has an invalid call_id."
+        )
     arguments = item.get("arguments")
     if not isinstance(arguments, str):
         item_id = item.get("id")
@@ -2418,14 +2508,17 @@ def _codex_function_call_output_payload_from_session_item(
     Convert an Omnigent function output item into a Codex function output payload.
 
     :param item: Omnigent function output item.
-    :returns: Codex function output payload, or ``None`` when optional
-        routing fields are absent.
+    :returns: Codex function output payload.
     :raises click.ClickException: If the Omnigent item violates required tool
         output fields.
     """
     call_id = item.get("call_id")
     if not isinstance(call_id, str) or not call_id:
-        return None
+        item_id = item.get("id")
+        raise click.ClickException(
+            "Cannot synthesize Codex resume rollout: Omnigent function_call_output "
+            f"{item_id!r} has an invalid call_id."
+        )
     output = item.get("output")
     if not isinstance(output, str):
         item_id = item.get("id")

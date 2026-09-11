@@ -6525,7 +6525,11 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
 _REST_HISTORY_CONTENT_SCENARIOS = [
     pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
     pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
-    pytest.param(13000, 50000, "R" * 12000 + " [truncated]", id="ceiling"),
+    # An explicit limit recovers one long item in full (a sub-agent
+    # handoff longer than the inbox delivery cap stays reachable).
+    pytest.param(13000, 50000, "R" * 13000, id="explicit-limit-recovers-long-item"),
+    # The total prompt budget still bounds a single read.
+    pytest.param(100050, 200000, "R" * 100000 + " [truncated]", id="budget-ceiling"),
     # No REST request is expected because validation rejects before the GET.
     pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
 ]
@@ -6589,6 +6593,86 @@ async def test_session_peek_rest_content_limit_scenario(
         assert payload["title"] == "auth"
         actual = payload["items"][0]["text"]
     assert actual == expected
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_offset_pages_through_long_item() -> None:
+    """
+    ``content_offset_chars`` pages through one long item on the REST path.
+
+    Stepping the offset by the window size reconstructs a content field
+    longer than one window, so a long sub-agent handoff stays reachable
+    from a runner-bound parent.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    text = "BEGIN|" + ("0123456789" * 2000) + "|END"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    window = 12000
+    windows: list[str] = []
+    async with _session_query_client(handler) as client:
+        for offset in (0, window):
+            payload = json.loads(
+                await _execute_session_query_tool(
+                    "sys_session_get_history",
+                    json.dumps(
+                        {
+                            "conversation_id": "conv_target",
+                            "tail_items": 1,
+                            "content_max_chars": window,
+                            "content_offset_chars": offset,
+                        }
+                    ),
+                    conversation_id="conv_caller",
+                    server_client=client,
+                )
+            )
+            windows.append(payload["items"][0]["text"])
+
+    assert windows[0] == text[:window] + " [truncated]"
+    # The second window reaches the true end: no marker, tail present.
+    assert windows[1] == text[window:]
+    assert windows[0].removesuffix(" [truncated]") + windows[1] == text
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_rejects_invalid_offset() -> None:
+    """An invalid offset is rejected before any REST request is made."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("REST request should not run for rejected arguments")
+
+    async with _session_query_client(handler) as client:
+        payload = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "content_offset_chars": -1}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert payload["error"] == "content_offset_chars must be >= 0"
 
 
 @pytest.mark.asyncio
@@ -8623,6 +8707,56 @@ def test_format_async_task_item_nonempty_subagent_completion_shows_output() -> N
     )
     assert "returned: review done: LGTM" in line
     assert "produced no output" not in line
+
+
+def test_format_async_task_item_truncated_subagent_output_names_retrieval_path() -> None:
+    """
+    A sub-agent handoff cut by the inbox delivery cap tells the parent how
+    to read the rest.
+
+    Delivery stays bounded (the wake prompt cannot grow without limit), but
+    the marker must name the child session and the retrieval tool — without
+    it the tail reads as silently lost.
+    """
+    from omnigent.runner.tool_dispatch import _INBOX_OUTPUT_MAX_CHARS, _format_async_task_item
+
+    long_output = "X" * (_INBOX_OUTPUT_MAX_CHARS + 8000)
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "conversation_id": "conv_child_long",
+            "handle_id": "conv_child_long",
+            "agent": "writer",
+            "title": "long-report",
+            "status": "completed",
+            "output": long_output,
+        }
+    )
+    assert "...[truncated 8000 chars" in line
+    assert "sys_session_get_history conversation_id=conv_child_long" in line
+    assert f"content_max_chars={len(long_output)}" in line
+
+
+def test_format_async_task_item_truncated_generic_task_keeps_plain_marker() -> None:
+    """
+    A truncated generic async-task output keeps the plain marker.
+
+    There is no session transcript to read a plain tool task's output back
+    from, so no retrieval hint must be fabricated.
+    """
+    from omnigent.runner.tool_dispatch import _INBOX_OUTPUT_MAX_CHARS, _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "async_tool",
+            "handle_id": "task_generic",
+            "tool_name": "sys_os_shell",
+            "status": "completed",
+            "output": "Y" * (_INBOX_OUTPUT_MAX_CHARS + 500),
+        }
+    )
+    assert "...[truncated 500 chars]" in line
+    assert "sys_session_get_history" not in line
 
 
 @pytest.mark.asyncio

@@ -1161,7 +1161,8 @@ async def test_external_subagent_start_mints_child_session(
     # with the same agent_type + description don't collide on the
     # ``(parent, title)`` unique index (the LLM routinely emits the
     # same description for parallel Task spawns).
-    assert child["tool"] == "Explore"
+    assert child["title"] == "Explore:a5c7effac5a9a35ab"
+    assert child["tool"] == "Trace the auth flow"
     assert child["session_name"] == "a5c7effac5a9a35ab"
     # Description is preserved on the row's labels for surfaces that
     # want it; the rail's row UI ignores ``session_name``.
@@ -1588,6 +1589,36 @@ async def test_external_subagent_start_handles_duplicate_agent_type_and_descript
     children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
     child_ids = {c["id"] for c in children}
     assert {first_id, second_id} <= child_ids
+    spawned = [c for c in children if c["id"] in {first_id, second_id}]
+    assert [c["tool"] for c in spawned] == ["Tell a joke", "Tell a joke"]
+    assert {c["session_name"] for c in spawned} == {"a03186614301289fb", "aefb9a13a81715740"}
+
+
+async def test_external_subagent_start_falls_back_to_the_bare_agent_type(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "claude-code-native-ui"}
+    )
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "a361e6a6aa05689cb",
+                "agent_type": "rpw-published:debug-lead",
+                "description": "",
+                "tool_use_id": "toolu_namespaced",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+    child_id = resp.json()["child_session_id"]
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["tool"] == "debug-lead"
+    assert child["session_name"] == "a361e6a6aa05689cb"
 
 
 async def test_external_subagent_start_is_idempotent_on_subagent_id(
@@ -4122,6 +4153,7 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
             "item_type": "message",
             "response_id": "resp_terminal_assistant",
             "source_id": "src_terminal_assistant_2",
+            "message_id": "codex:thread_1:turn_1:agentMessage:item_1",
             "item_data": {
                 "role": "assistant",
                 "agent": "claude-native-ui",
@@ -4191,6 +4223,7 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert published[1][1]["item"]["type"] == "function_call"
     assert published[2][1]["item"]["type"] == "function_call_output"
     assert published[3][1]["item"]["type"] == "message"
+    assert published[3][1]["message_id"] == "codex:thread_1:turn_1:agentMessage:item_1"
     assert published[4][1]["item"]["type"] == "terminal_command"
     assert published[5][1]["item"]["type"] == "terminal_command"
 
@@ -7910,10 +7943,11 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
     event type absent from the route's payload-validation passthrough 400s
     every POST, and one absent from ``ServerStreamEvent`` fails at the SSE
     boundary — both invisible to the forwarder, which logs post failures at
-    debug level. Drives ``_forward_permission_mode_from_pane`` itself rather
-    than a hand-rolled POST, so the mirror's own logic is on the path.
+    debug level. Drives ``_forward_pane_signals`` itself rather than a
+    hand-rolled POST, so the mirror's own logic is on the path.
     """
     from omnigent.harnesses.claude_native import forwarder as fwd
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
     from tests.server.helpers import start_session_stream_collector
 
     agent = await create_test_agent(client)
@@ -7922,21 +7956,21 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
 
     pane_mode = "default"
 
-    def _fake_read(_bridge_dir: Any) -> str | None:
-        """Serve the pane footer the forwarder would capture via tmux."""
-        return pane_mode
+    def _fake_read(_bridge_dir: Any) -> PaneSignals:
+        """Serve the pane signals the forwarder would capture via tmux."""
+        return PaneSignals(permission_mode=pane_mode)
 
     dedupe = fwd._ForwardDedupeState()
     collector = await start_session_stream_collector(session_id)
     try:
         with (
-            patch.object(fwd, "read_permission_mode", _fake_read),
-            patch.object(fwd, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0),
+            patch.object(fwd, "read_pane_signals", _fake_read),
+            patch.object(fwd, "_PANE_POLL_INTERVAL_S", 0.0),
         ):
 
             async def _poll() -> None:
-                """Run one real permission-mode mirror pass against the server."""
-                await fwd._forward_permission_mode_from_pane(
+                """Run one real pane-signal mirror pass against the server."""
+                await fwd._forward_pane_signals(
                     client=client,
                     session_id=session_id,
                     bridge_dir=Path("/tmp/omnigent/claude-native/e2e"),

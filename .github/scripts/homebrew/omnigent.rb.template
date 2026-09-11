@@ -51,6 +51,11 @@ class Omnigent < Formula
 __RESOURCES__
 
   def install
+    if Homebrew::EnvConfig.non_default_variable?(:HOMEBREW_PIP_INDEX_URL) &&
+       (pip_index_url = Homebrew::EnvConfig.pip_index_url.presence)
+      ENV["PIP_INDEX_URL"] = pip_index_url
+    end
+
     venv = virtualenv_create(libexec, "python3.14")
 
     # jiter, tiktoken and watchfiles are the only Rust builds left. Their
@@ -58,6 +63,18 @@ __RESOURCES__
     # names to the Cellar path during relocation (macOS only; the flag breaks
     # Linux ld). Everything else compiled is a prebuilt wheel.
     ENV.append_to_rustflags "-C link-args=-Wl,-headerpad_max_install_names" if OS.mac?
+
+    if (cargo_index = ENV.fetch("HOMEBREW_CARGO_INDEX_URL", nil).presence)
+      (buildpath/".cargo").mkpath
+      (buildpath/".cargo/config.toml").write <<~TOML
+        [source.crates-io]
+        replace-with = "mirror"
+
+        [source.mirror]
+        registry = "sparse+#{cargo_index}"
+      TOML
+      ENV["CARGO_HOME"] = buildpath/".cargo"
+    end
 
     # Pure-Python resources are sdists Homebrew builds in place. Every other
     # compiled extension is pinned to an upstream wheel (WHEEL_REQUIRED /

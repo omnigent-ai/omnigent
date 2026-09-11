@@ -2320,6 +2320,9 @@ def _subagent_delivery_not_confirmed_response(
     an untracked status remains a no-op unless the runner knows this session
     was created as a sub-agent. For known sub-agents, Omnigent must not receive a
     2xx acknowledgement unless the terminal payload is confirmed in the
+    parent's inbox — except a tracked entry whose parent is itself a
+    sub-agent, which ``post_session_events`` acknowledges before calling here;
+    the entry is retained and delivered only if this runner ever creates that
     parent's inbox.
 
     :param ack: Delivery acknowledgement returned by
@@ -5016,6 +5019,48 @@ def create_runner_app(
             title=snapshot.sub_agent_name or "",
         )
 
+    async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
+        """
+        Return whether an undelivered result's parent is itself a sub-agent.
+
+        A mirrored claude-native sub-agent never runs on this runner, so its
+        inbox never exists here and retrying its children's terminal status
+        every 30 s buys nothing. The inbox record is redundant for that
+        topology: the child's result reaches the parent natively inside the
+        Claude process. The status is acknowledged and the entry kept, so a
+        sub-agent parent that does run here later still receives it when its
+        inbox is created (``_deliver_retained_subagent_results``). An unreadable
+        parent snapshot reads as a top-level parent, so the retry contract still
+        covers a parent that lives elsewhere or is re-initializing after a
+        restart.
+
+        :param entry: Terminal work entry whose parent inbox was missing.
+        :returns: ``True`` when the parent's snapshot names its own parent.
+        """
+        snapshot = await _session_snapshot(entry.parent_session_id)
+        return snapshot.ok and snapshot.parent_session_id is not None
+
+    def _deliver_retained_subagent_results(parent_id: str) -> None:
+        """
+        Hand over results acknowledged while ``parent_id`` had no inbox here.
+
+        A terminal child whose sub-agent parent had no inbox here is
+        acknowledged with its entry kept undelivered. If that parent later
+        runs on this runner, creating its inbox delivers those entries and
+        wakes it, as the forwarder's pending retry used to the moment the inbox
+        appeared. A parent that never runs here keeps the entry undelivered;
+        for a claude-native mirror the result already reached it natively.
+        Idempotent: delivered entries are skipped.
+
+        :param parent_id: Parent whose inbox now exists, e.g. ``"conv_parent123"``.
+        :returns: None.
+        """
+        for entry in list_subagent_work(parent_id):
+            if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
+                continue
+            if _deliver_subagent_completion(entry).delivered_now:
+                _schedule_subagent_wake(entry)
+
     async def _recover_undrained_subagent_results(parent_id: str) -> None:
         """
         Re-queue terminal child results lost with a runner process restart.
@@ -5026,15 +5071,17 @@ def create_runner_app(
         before the next ``sys_read_inbox`` drain. The inbox is created here
         when missing: after a reconnect the server can dispatch a pending
         message before it re-initializes the session, and that turn's drain
-        must still see the recovered results.
+        must still see the recovered results. Results acknowledged while this
+        parent had no inbox here are handed over first, on every call.
 
         :param parent_id: Parent session whose inbox was recreated, e.g.
             ``"conv_parent123"``.
         :returns: None.
         """
+        _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        _deliver_retained_subagent_results(parent_id)
         if parent_id in _subagent_recovery_done:
             return
-        _session_inboxes.setdefault(parent_id, asyncio.Queue())
         lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
         async with lock:
             if parent_id in _subagent_recovery_done:
@@ -8828,6 +8875,15 @@ def create_runner_app(
                     output=output or "Error: native sub-agent turn failed",
                 )
             if delivery_ack is not None:
+                if (
+                    delivery_ack.entry is not None
+                    and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
+                    and await _parent_is_nested_subagent(delivery_ack.entry)
+                ):
+                    # Acknowledge instead of asking the forwarder to poll. The
+                    # entry stays terminal and undelivered; it is handed over
+                    # only if this runner ever creates the parent's inbox.
+                    return Response(status_code=204)
                 is_known = (
                     conversation_id in _session_sub_agent_names or recovered_entry is not None
                 )
