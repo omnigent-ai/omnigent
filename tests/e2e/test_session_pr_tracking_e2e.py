@@ -70,11 +70,21 @@ async def test_native_session_tracks_prs_across_repositories(
     try:
         shell_command = (
             "gh auth switch --user example-user; gh repo set-default example/one && "
-            "gh pr create -R example/one; gh config set pager cat"
+            + ("gh pr diff 42 -R example/read && " if harness == "claude_native" else "")
+            + "gh pr create -R example/one; gh config set pager cat"
         )
         output = subprocess.check_output(
             ["/bin/sh", "-c", shell_command], text=True, cwd=workspace
         )
+        shell_response: dict[str, object] = {"stdout": output, "exit_code": 0}
+        if harness == "claude_native":
+            # Claude retains creation metadata when a long diff truncates stdout.
+            url = "https://github.com/example/one/pull/42"
+            shell_response = {
+                "stdout": output[: output.index(url)],
+                "interrupted": False,
+                "gitOperation": {"pr": {"number": 42, "url": url, "action": "created"}},
+            }
         rest_command = (
             "gh auth switch --user example-user; "
             "printf 'HEAD SHA: fixture\\n' && gh api /repos/example/three/pulls \\\n"
@@ -101,7 +111,7 @@ async def test_native_session_tracks_prs_across_repositories(
             {
                 "tool_name": "Bash",
                 "tool_input": {"command": shell_command},
-                "tool_response": {"stdout": output, "exit_code": 0},
+                "tool_response": shell_response,
             },
             {
                 "tool_name": "Bash",

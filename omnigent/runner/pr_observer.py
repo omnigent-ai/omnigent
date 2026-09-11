@@ -437,6 +437,19 @@ def _content_only(tokens: list[str]) -> bool:
     )
 
 
+def _created_pr_metadata(result: object) -> PullRequestRef | None:
+    """Read Claude's creation identity from tool metadata, never rendered stdout."""
+    if not isinstance(result, dict):
+        return None
+    operation = result.get("gitOperation")
+    if not isinstance(operation, dict):
+        return None
+    pr = operation.get("pr")
+    if not isinstance(pr, dict) or pr.get("action") != "created":
+        return None
+    return _reference(pr.get("url"))
+
+
 def _mcp_prs(
     arguments: dict[str, object], result: object, *, created: bool
 ) -> list[PullRequestRef]:
@@ -494,10 +507,18 @@ def extract_prs(
         if not commands:
             return [], False
         text = _output_text(result)
-        if re.search(r"\[exit code: [1-9]|Process exited with code [1-9]", text):
+        if re.search(
+            r"(?:^|\n)(?:\[exit code: -?[1-9][0-9]*\]"
+            r"|Process exited with code -?[1-9][0-9]*)\s*\Z",
+            text,
+        ):
             return [], False
         created = all(_creates_pr(tokens) for tokens in commands)
         references = [ref for tokens in commands if (ref := _command_target(tokens))]
+        if any(_creates_pr(tokens) for tokens in commands) and (
+            ref := _created_pr_metadata(result)
+        ):
+            references.append(ref)
         # Shared stdout cannot attribute a result to a write when reads/comments also ran.
         if len(commands) == len(gh_commands) and (
             len(commands) > 1 or not _content_only(commands[0])

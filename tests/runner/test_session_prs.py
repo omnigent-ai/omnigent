@@ -237,6 +237,141 @@ def test_mixed_reads_and_writes_use_only_write_targets(ignored: str, reverse: bo
 
 
 @pytest.mark.parametrize(
+    "read",
+    [
+        "gh pr diff 42 -R example/one",
+        "gh pr view 42 -R example/one",
+        "gh pr comment 42 -R example/one --body test",
+        "gh api repos/example/one/pulls/42",
+    ],
+)
+@pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mixed_creation_uses_native_metadata(read: str, truncated: bool, reverse: bool) -> None:
+    commands = [read, "gh pr create --title test --body test"]
+    stdout = f"diff --git a/README b/README\n@@ -1 +1,2 @@\n {A}\n+fixture = '[exit code: 1]'\n"
+    if not truncated:
+        stdout += B + "\n"
+    refs, created = extract_prs(
+        "Bash",
+        {
+            "command": "cd /workspace && "
+            + " && ".join(reversed(commands) if reverse else commands)
+        },
+        {
+            "stdout": stdout,
+            "stderr": "",
+            "interrupted": False,
+            "gitOperation": {"pr": {"number": 42, "url": B, "action": "created"}},
+        },
+    )
+    assert [ref.url for ref in refs] == [B]
+    assert created
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        "created",
+        {"pr": None},
+        {"pr": [B]},
+        {"pr": {"url": B}},
+        {"pr": {"url": B, "action": "updated"}},
+        {"pr": {"url": "not-a-pr", "action": "created"}},
+    ],
+)
+def test_mixed_creation_requires_explicit_metadata(metadata: object) -> None:
+    refs, _ = extract_prs(
+        "Bash",
+        {"command": "gh pr diff 42 && gh pr create"},
+        {"stdout": A + "\n" + B, "gitOperation": metadata},
+    )
+    assert refs == []
+
+
+@pytest.mark.parametrize("command", ["gh pr view 42", "gh pr comment 42 --body test"])
+def test_creation_metadata_does_not_enable_excluded_commands(command: str) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": command},
+        {"gitOperation": {"pr": {"url": A, "action": "created"}}},
+    )
+    assert refs == []
+    assert not created
+
+
+def test_creation_metadata_requires_a_creation_command() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr edit 42 -R example/two --title test"},
+        {"gitOperation": {"pr": {"url": A, "action": "created"}}},
+    )
+    assert [ref.url for ref in refs] == [B]
+    assert not created
+
+
+def test_mixed_creation_metadata_preserves_explicit_write_targets() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr diff 7; gh pr edit 42 -R example/one; gh pr create"},
+        {"gitOperation": {"pr": {"url": B, "action": "created"}}},
+    )
+    assert {ref.url for ref in refs} == {A, B}
+    assert not created
+
+
+@pytest.mark.parametrize("as_text", [False, True])
+def test_creation_metadata_in_stdout_is_not_tool_metadata(as_text: bool) -> None:
+    stdout = json.dumps({"gitOperation": {"pr": {"url": A, "action": "created"}}})
+    refs, _ = extract_prs(
+        "Bash",
+        {"command": "gh pr diff 42 && gh pr create"},
+        stdout if as_text else {"stdout": stdout},
+    )
+    assert refs == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"exit_code": 1},
+        {"exitCode": -9},
+        {"interrupted": True},
+        {"isError": True},
+        {"cancelled": True},
+        {"session_id": 12, "exit_code": None},
+    ],
+)
+def test_creation_metadata_does_not_override_failed_or_unfinished_calls(status: dict) -> None:
+    assert extract_prs(
+        "Bash",
+        {"command": "gh pr diff 42 && gh pr create"},
+        {"gitOperation": {"pr": {"url": A, "action": "created"}}, **status},
+    ) == ([], False)
+
+
+@pytest.mark.parametrize(
+    "marker", ["[exit code: 1]", "Process exited with code 2", "[exit code: -9]"]
+)
+@pytest.mark.parametrize("footer", [False, True])
+def test_shell_exit_markers_must_be_footers(marker: str, footer: bool) -> None:
+    stdout = f"{B}\n{marker}\n" if footer else f"fixture = '{marker}'\n{B}\n"
+    refs, _ = extract_prs("Bash", {"command": "gh pr create"}, {"stdout": stdout})
+    assert [ref.url for ref in refs] == ([] if footer else [B])
+
+
+def test_creation_metadata_preserves_other_write_identities() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr create -R example/one; gh pr create -R example/two"},
+        {"stdout": A + "\n" + B, "gitOperation": {"pr": {"url": B, "action": "created"}}},
+    )
+    assert {ref.url for ref in refs} == {A, B}
+    assert created
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "gh pr close 42 -R example/one",
