@@ -1049,6 +1049,28 @@ async def test_response_hook_records_into_connection() -> None:
     assert isinstance(conn._transport_error, httpx.ReadError)
 
 
+@pytest.mark.asyncio()
+async def test_stale_attempt_transport_error_discarded() -> None:
+    """
+    The SDK never cancels the POST task of a timed-out request, so
+    its response body can keep reading — and fail — while a later
+    call is in flight. Such stale failures are attributed to the
+    attempt that opened the response and discarded, not recorded,
+    so they cannot flip the later call's genuine slow-tool timeout
+    into a retry of a non-idempotent tool.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    response = _make_hook_response("POST")
+    # Wrapped while attempt N was current...
+    await conn._record_response_stream(response)
+    # ...but the failure only fires after a later attempt started.
+    conn._call_serial += 1
+    with pytest.raises(httpx.ReadError):
+        async for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert conn._transport_error is None
+
+
 def test_recording_client_preserves_env_proxy_mounts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

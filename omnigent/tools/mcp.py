@@ -523,10 +523,22 @@ class McpServerConnection:
     # is the explicit unhealthy-transport signal that
     # ``_is_dead_session_timeout`` keys retry classification off.
     # Recorded only for POST responses (tool-call traffic, not the
-    # SDK's server-initiated GET stream) and cleared at the start of
-    # every tool-call attempt and when a fresh session is
-    # established, so the signal is scoped to the current attempt.
+    # SDK's server-initiated GET stream), only when the failure
+    # belongs to the current call attempt (see ``_call_serial``),
+    # and cleared at the start of every attempt and when a fresh
+    # session is established — so the signal is scoped to the
+    # attempt whose classification consumes it.
     _transport_error: BaseException | None = field(default=None, init=False, repr=False)
+    # Monotonic id of the current tool-call attempt, bumped under
+    # ``_call_lock`` at the start of every request the session
+    # sends. The SDK never cancels the POST task of a timed-out
+    # request, so its response body can keep reading — and fail —
+    # long after the call already raised; each wrapped response
+    # stream remembers the serial it was opened under, and failures
+    # from superseded attempts are discarded instead of recorded,
+    # preventing a stale lingering read from flipping a later
+    # genuine slow-tool timeout into a retry.
+    _call_serial: int = field(default=0, init=False, repr=False)
     # Long-lived task that owns the transport + session + their
     # AsyncExitStack. Must be the SAME task that runs the stack's
     # ``__aexit__`` — anyio's stdio_client / sse_client cancel
@@ -668,10 +680,12 @@ class McpServerConnection:
             raise RuntimeError("MCP session not initialized — call connect() first")
         async with self._call_lock:
             self._active_session_id = session_id
-            # Scope the unhealthy-transport signal to this attempt: a
-            # failure recorded by an earlier call (or between calls)
-            # is stale and must not flip this call's genuine slow-tool
-            # timeout into a retry.
+            # Scope the unhealthy-transport signal to this attempt:
+            # bumping the serial invalidates recordings from any
+            # still-lingering response stream of a previous timed-out
+            # call, and the fresh slot only accepts failures from
+            # responses opened during this attempt.
+            self._call_serial += 1
             self._transport_error = None
             try:
                 result = await self._session.call_tool(name=name, arguments=arguments)
@@ -731,6 +745,10 @@ class McpServerConnection:
 
         async with self._call_lock:
             self._active_session_id = session_id
+            # Same attempt scoping as _invoke_tool: invalidate stale
+            # recordings and start a clean slot for this request.
+            self._call_serial += 1
+            self._transport_error = None
             try:
                 result = await self._session.send_request(
                     ClientRequest(
@@ -985,13 +1003,37 @@ class McpServerConnection:
         reconnect flaps are unrelated to any in-flight tool call and
         must not flip a genuine slow-tool timeout into a retry.
 
+        The recorder is bound to the call attempt that was active
+        when this response was opened. The SDK runs every POST as a
+        detached task it never cancels, so a timed-out call's
+        response body can keep reading — and fail — while a later
+        call is in flight; such stale failures are discarded rather
+        than recorded so they cannot taint the later call's timeout
+        classification. ``_call_lock`` serializes attempts, so a
+        response opened while an attempt is in flight belongs to
+        that attempt.
+
         :param response: The response whose body is about to be read.
         """
         if response.request.method != "POST":
             return
         stream = response.stream
-        if isinstance(stream, httpx.AsyncByteStream):  # pragma: no branch
-            response.stream = _TransportErrorRecordingStream(stream, self._record_transport_error)
+        if not isinstance(stream, httpx.AsyncByteStream):  # pragma: no cover
+            return
+        wrap_serial = self._call_serial
+
+        def on_error(exc: BaseException) -> None:
+            if wrap_serial == self._call_serial:
+                self._record_transport_error(exc)
+            else:
+                _logger.debug(
+                    "MCP server %r: discarding transport failure from a "
+                    "superseded call attempt: %s",
+                    self.config.name,
+                    exc,
+                )
+
+        response.stream = _TransportErrorRecordingStream(stream, on_error)
 
     def _make_recording_httpx_client(
         self,
