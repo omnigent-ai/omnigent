@@ -1,17 +1,19 @@
 # Native terminal selection prototype
 
-This opt-in experiment changes **`omnigent claude` only**, including deployments
-that wrap that command. It does not change `omnigent cursor`, `omnigent codex`,
-or the web UI. Cursor here means the editor hosting your terminal, not the
-Cursor agent harness.
+This opt-in experiment selects the attachment transport independently of the
+agent. It supports the native Claude, Codex, Cursor, Antigravity, Pi, OpenCode,
+Goose, Kimi, Hermes, Qwen, and Kiro launchers, including deployments that wrap
+these commands. It does not change SDK harnesses or the web UI.
 
 ## Try it
 
 Run the CLI from this checkout after installing its development dependencies
-with `uv sync --frozen --extra all --group dev`:
+with `uv sync --frozen --extra all --group dev`. Choose the agent you normally use:
 
 ```bash
-OMNIGENT_EXPERIMENTAL_CLAUDE_CONTROL_MODE=1 uv run --no-sync omnigent claude
+OMNIGENT_EXPERIMENTAL_CONTROL_MODE_ATTACH=1 uv run --no-sync omnigent claude
+OMNIGENT_EXPERIMENTAL_CONTROL_MODE_ATTACH=1 uv run --no-sync omnigent codex
+OMNIGENT_EXPERIMENTAL_CONTROL_MODE_ATTACH=1 uv run --no-sync omnigent cursor
 ```
 
 Keep your usual authentication, model, server, and resume arguments. If you use
@@ -22,11 +24,12 @@ can tell whether the experiment is active.
 For comparison, run the same command without the variable:
 
 ```bash
-env -u OMNIGENT_EXPERIMENTAL_CLAUDE_CONTROL_MODE uv run --no-sync omnigent claude
+env -u OMNIGENT_EXPERIMENTAL_CONTROL_MODE_ATTACH uv run --no-sync omnigent claude
 ```
 
 Only the exact value `1` enables the experiment. No persistent configuration or
-tmux mouse bindings are changed.
+tmux mouse bindings are changed. This replaces the Claude-only toggle from the
+initial draft of the prototype.
 
 ## What changes
 
@@ -49,7 +52,7 @@ escape sequences or promise selection survives every application redraw.
 
 In Cursor's integrated terminal, and then in a standalone terminal:
 
-1. Ask Claude to print 100 numbered lines of sample text without running tools.
+1. Ask your agent to print 100 numbered lines of sample text without running tools.
 2. Drag over completed text **without Shift or Option**. Release the mouse,
    copy using the terminal's normal shortcut, and paste into an editor.
 3. Repeat while more output is arriving. Record separately whether selection
@@ -58,7 +61,7 @@ In Cursor's integrated terminal, and then in a standalone terminal:
    you should not need to exit tmux copy-mode first.
 5. Resize the terminal and verify the prompt remains usable. Open the same
    session in the web UI and verify input/output still reaches both clients.
-6. Exit Claude normally and verify your shell still echoes input correctly.
+6. Exit the agent normally and verify your shell still echoes input correctly.
    Reattach using your usual resume command with the variable set and check
    the restored screen and scrollback.
 
@@ -66,7 +69,9 @@ In Cursor's integrated terminal, and then in a standalone terminal:
 
 - Every input/output byte takes the existing WebSocket/server route, even when
   the runner is local. This can increase latency and depends on server/tunnel
-  availability. The existing reconnect behavior is reused.
+  availability. Claude, Codex, and Antigravity retain their existing reconnect
+  recovery and session-lifecycle handling. The other launchers use a single
+  WebSocket attachment; if the connection drops, rerun your resume command.
 - Tmux's status line, conversation link, copy-mode, and popups are absent.
   Keep the web UI available for approvals normally shown as tmux popups.
 - Terminal clipboard shortcuts are the intended copy path. The native

@@ -139,6 +139,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.native.terminal_attach import attach_native_terminal, control_mode_attach_enabled
 from omnigent.process_logging import log_info_once
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
@@ -3588,7 +3589,7 @@ def _tmux_profile_detail(prepared: PreparedClaudeTerminal) -> str:
     :returns: Human-readable attach-path detail, e.g.
         ``"direct-tmux target=main"`` or ``"websocket attach"``.
     """
-    if _experimental_control_mode_attach_enabled():
+    if control_mode_attach_enabled():
         return "websocket attach (experimental control mode)"
     if (
         isinstance(prepared.tmux_socket, Path)
@@ -3599,11 +3600,6 @@ def _tmux_profile_detail(prepared: PreparedClaudeTerminal) -> str:
     if prepared.tmux_socket is not None and prepared.tmux_target is not None:
         return "websocket attach (tmux socket not local)"
     return "websocket attach"
-
-
-def _experimental_control_mode_attach_enabled() -> bool:
-    """Opt into terminal-owned selection through the existing WebSocket bridge."""
-    return os.environ.get("OMNIGENT_EXPERIMENTAL_CLAUDE_CONTROL_MODE") == "1"
 
 
 class _AttachOutcome(Enum):
@@ -3813,8 +3809,27 @@ async def _attach_with_transcript_forwarder(
         startup_profiler.mark("transcript forwarder skipped")
     outcome = _AttachOutcome.EXITED
     try:
-        experimental_control_mode = _experimental_control_mode_attach_enabled()
-        if not experimental_control_mode and _can_attach_direct_tmux(prepared):
+
+        async def attach_websocket() -> _AttachOutcome:
+            """Preserve Claude's reconnect, session-transfer, and exit handling."""
+            startup_profiler.mark("opening websocket terminal attach")
+            return await _attach_with_reconnect(
+                attach=attach,
+                attach_url=attach_url,
+                headers=headers,
+                recover=recover,
+                session_name="Claude",
+                base_url=base_url,
+                session_id=prepared.session_id,
+                terminal_id=prepared.terminal_id,
+                bridge_dir=prepared.bridge_dir,
+                close_attach_on_terminal_gone=attach is attach_local_terminal,
+            )
+
+        async def attach_default() -> _AttachOutcome:
+            """Keep the existing local fast path and remote fallback unchanged."""
+            if not _can_attach_direct_tmux(prepared):
+                return await attach_websocket()
             # Same machine as the runner: attach straight to its tmux
             # pane for a lower-latency TTY than the WebSocket PTY relay.
             # Transcript forwarding is owned by whichever process launched
@@ -3829,31 +3844,15 @@ async def _attach_with_transcript_forwarder(
                 "opening direct tmux attach",
                 detail=f"target={prepared.tmux_target}",
             )
-            outcome = await _attach_direct_tmux(
+            return await _attach_direct_tmux(
                 prepared.tmux_socket,
                 prepared.tmux_target,
                 startup_profiler=startup_profiler,
             )
-        else:
-            if experimental_control_mode:
-                click.echo(
-                    "Experimental control-mode attach: using the WebSocket relay for "
-                    "terminal-native selection. Tmux status and popups are unavailable.",
-                    err=True,
-                )
-            startup_profiler.mark("opening websocket terminal attach")
-            outcome = await _attach_with_reconnect(
-                attach=attach,
-                attach_url=attach_url,
-                headers=headers,
-                recover=recover,
-                session_name="Claude",
-                base_url=base_url,
-                session_id=prepared.session_id,
-                terminal_id=prepared.terminal_id,
-                bridge_dir=prepared.bridge_dir,
-                close_attach_on_terminal_gone=attach is attach_local_terminal,
-            )
+
+        outcome = await attach_native_terminal(
+            default_attach=attach_default, control_mode_attach=attach_websocket
+        )
     finally:
         if forwarder is not None:
             forwarder.cancel()

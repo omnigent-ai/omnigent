@@ -150,6 +150,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.native.terminal_attach import attach_native_terminal
 
 _logger = logging.getLogger(__name__)
 
@@ -1149,12 +1150,10 @@ async def _attach_terminal(
         )
     outcome = _AttachOutcome.EXITED
     try:
-        if _can_attach_direct_tmux(prepared):
-            if prepared.tmux_socket is None or prepared.tmux_target is None:
-                raise click.ClickException("Antigravity tmux attach metadata was incomplete.")
-            outcome = await _attach_direct_tmux(prepared.tmux_socket, prepared.tmux_target)
-        else:
-            outcome = await _attach_with_reconnect(
+
+        async def attach_websocket() -> _AttachOutcome:
+            """Preserve Antigravity's reconnect and terminal-gone handling."""
+            return await _attach_with_reconnect(
                 attach=attach_local_terminal,
                 attach_url=_attach_url(base_url, prepared.session_id, prepared.terminal_id),
                 headers=headers,
@@ -1165,6 +1164,18 @@ async def _attach_terminal(
                 terminal_id=prepared.terminal_id,
                 close_attach_on_terminal_gone=True,
             )
+
+        async def attach_default() -> _AttachOutcome:
+            """Keep direct attach when the runner's tmux socket is local."""
+            if not _can_attach_direct_tmux(prepared):
+                return await attach_websocket()
+            if prepared.tmux_socket is None or prepared.tmux_target is None:
+                raise click.ClickException("Antigravity tmux attach metadata was incomplete.")
+            return await _attach_direct_tmux(prepared.tmux_socket, prepared.tmux_target)
+
+        outcome = await attach_native_terminal(
+            default_attach=attach_default, control_mode_attach=attach_websocket
+        )
     finally:
         for task in (cold_start, reader):
             if task is not None:
