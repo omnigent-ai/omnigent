@@ -2252,7 +2252,15 @@ async def _forward_one_subagent(
         and new_entry.last_activity_ts is not None
         and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
     ):
-        desired_status = "failed" if new_entry.delivery_error else "idle"
+        # A root child with a spawn id stays running until its Task
+        # evidence arrives; nested children, id-less entries, and
+        # delivery errors keep today's quiescence edge.
+        if not (
+            new_entry.delivery_error is None
+            and new_entry.parent_subagent_id is None
+            and new_entry.tool_use_id is not None
+        ):
+            desired_status = "failed" if new_entry.delivery_error else "idle"
     # Authoritative parent evidence overrides the quiescence guess; a
     # failed POST retries next tick since ``last_status`` moves on success.
     desired_output: str | None = None
