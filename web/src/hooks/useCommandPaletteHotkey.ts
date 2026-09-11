@@ -61,18 +61,25 @@ export function useCommandPaletteHotkey(
   onToggle: () => void,
   enabled = true,
   isMac = isMacPlatform(),
+  onSessionSearch?: () => void,
 ): void {
   // Held in a ref so the bound handler always calls the latest closure without
   // re-registering on every render.
-  const latest = useRef(onToggle);
-  latest.current = onToggle;
+  const latest = useRef({ onToggle, onSessionSearch });
+  latest.current = { onToggle, onSessionSearch };
 
   useEffect(() => {
     if (!enabled) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
       // Ignore auto-repeat: holding the chord would flap the palette.
-      if (e.repeat) return;
-      if (!isCommandPaletteHotkey(e, isMac)) return;
+      if (e.repeat || e.defaultPrevented) return;
+      const sessionSearch =
+        latest.current.onSessionSearch &&
+        hasCommandModifier(e, isMac) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "p";
+      if (!sessionSearch && !isCommandPaletteHotkey(e, isMac)) return;
       // Leave the chord to a surface that actually consumes it.
       if (focusOwnsHotkey(e)) return;
       // Claim the chord: preventDefault drops the browser default (Ctrl+K
@@ -80,7 +87,8 @@ export function useCommandPaletteHotkey(
       // hooks; no other listener binds ⌘K, so it's belt-and-suspenders.
       e.preventDefault();
       e.stopPropagation();
-      latest.current();
+      if (sessionSearch) latest.current.onSessionSearch?.();
+      else latest.current.onToggle();
     };
     // Capture phase: the desktop shell renders the embed build over a
     // CSS-hidden host page whose own ⌘K listener would otherwise also fire.

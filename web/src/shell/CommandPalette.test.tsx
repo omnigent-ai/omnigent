@@ -53,6 +53,67 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("CommandPalette — sessions", () => {
+  it("fuzzy-matches session names without showing unrelated actions", () => {
+    setSessions([
+      conv("parser", "Fix the parser"),
+      conv("deploy", "Deploy API"),
+      conv("content", "Unrelated", null, "Fix the parser"),
+    ]);
+    const { onOpenChange } = renderPalette({ sessionsOnly: true });
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "fxprs" } });
+    expect(screen.getByText("Fix the parser")).toBeTruthy();
+    expect(screen.queryByText("Deploy API")).toBeNull();
+    expect(screen.queryByText("Unrelated")).toBeNull();
+    expect(screen.queryByText("Go to Inbox")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/parser");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("loads later pages for fuzzy matching and stops loading while closed", () => {
+    const fetchNextPage = vi.fn();
+    useConversations.mockReturnValue({
+      data: { pages: [{ data: [] }] },
+      isFetching: false,
+      hasNextPage: true,
+      fetchNextPage,
+    });
+    const props = {
+      open: true,
+      sessionsOnly: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    useConversations.mockReturnValue({
+      data: { pages: [{ data: [] }, { data: [conv("older", "Older session")] }] },
+      isFetching: false,
+      hasNextPage: false,
+      fetchNextPage,
+    });
+    rerender(<CommandPalette {...props} />);
+    expect(screen.getByText("Older session")).toBeTruthy();
+    rerender(<CommandPalette {...props} open={false} />);
+    expect(useConversations).toHaveBeenLastCalledWith("", false, { enabled: false });
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it("does not retry a failed pagination request indefinitely", () => {
+    const fetchNextPage = vi.fn();
+    useConversations.mockReturnValue({
+      data: { pages: [] },
+      isFetching: false,
+      hasNextPage: true,
+      isFetchNextPageError: true,
+      fetchNextPage,
+    });
+    renderPalette({ sessionsOnly: true });
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    expect(screen.getByRole("status").textContent).toContain("Couldn't load");
+  });
   it("lists sessions by display label with their agent type", () => {
     setSessions([conv("c1", "Fix the parser", "research-agent"), conv("c2", null)]);
     renderPalette();
@@ -81,13 +142,13 @@ describe("CommandPalette — sessions", () => {
       renderPalette();
 
       // Empty query on mount → shares AppShell's `["conversations","",true]` entry.
-      expect(useConversations).toHaveBeenCalledWith("", true);
+      expect(useConversations).toHaveBeenCalledWith("", true, { enabled: true });
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
       });
       // Before the debounce elapses the query has NOT yet reached the hook.
-      expect(useConversations).not.toHaveBeenCalledWith("deploy", true);
+      expect(useConversations).not.toHaveBeenCalledWith("deploy", true, { enabled: true });
 
       act(() => {
         vi.advanceTimersByTime(300);
@@ -95,7 +156,7 @@ describe("CommandPalette — sessions", () => {
       // After the 300ms debounce, the typed query drives a server search with
       // archived rows included (filtered client-side) — proving the palette
       // searches the server, not a page.
-      expect(useConversations).toHaveBeenCalledWith("deploy", true);
+      expect(useConversations).toHaveBeenCalledWith("deploy", true, { enabled: true });
     } finally {
       vi.useRealTimers();
     }
@@ -284,7 +345,7 @@ describe("CommandPalette — mobile full-screen sheet", () => {
       act(() => {
         vi.advanceTimersByTime(300);
       });
-      expect(useConversations).toHaveBeenCalledWith("deploy", true);
+      expect(useConversations).toHaveBeenCalledWith("deploy", true, { enabled: true });
     } finally {
       vi.useRealTimers();
     }

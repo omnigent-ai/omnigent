@@ -12,6 +12,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useRecentSessionHotkeys } from "@/hooks/useRecentSessionHotkeys";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -452,6 +453,15 @@ export function AppShell() {
     if (!serverConversationId) return null;
     return allConversations?.find((c) => c.id === serverConversationId) ?? null;
   }, [serverConversationId, allConversations]);
+  const recentSessionIds = useMemo(
+    () =>
+      allConversations?.filter((session) => !session.archived).map((session) => session.id) ?? [],
+    [allConversations],
+  );
+  useRecentSessionHotkeys(
+    recentSessionIds,
+    activeConv?.archived ? undefined : serverConversationId,
+  );
   // A temporary row is display-only: it can supply optimistic breadcrumb
   // text, but must not participate in permissions, actions, or server hooks.
   const provisionalConv = useMemo(() => {
@@ -1408,6 +1418,7 @@ export function AppShell() {
   // embedded build we claim the chord ahead of any host-page ⌘K listener.
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [sessionSearch, setSessionSearch] = useState(false);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
@@ -1419,9 +1430,23 @@ export function AppShell() {
     setSidebarOpen(true);
     setSidebarPeek(false);
   }, []);
-  const handleOpenSearch = useCallback(() => setCommandPaletteOpen(true), []);
+  const handleOpenSearch = useCallback(() => {
+    setSessionSearch(false);
+    setCommandPaletteOpen(true);
+  }, []);
   const isEmbedded = useIsEmbedded();
-  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
+  useCommandPaletteHotkey(
+    () => {
+      setSessionSearch(false);
+      setCommandPaletteOpen((prev) => sessionSearch || !prev);
+    },
+    true,
+    undefined,
+    () => {
+      setSessionSearch(true);
+      setCommandPaletteOpen((prev) => !sessionSearch || !prev);
+    },
+  );
   useNewSessionHotkey(!isEmbedded);
 
   // Mobile back button: close the open file and return to the files/changes
@@ -2313,6 +2338,8 @@ export function AppShell() {
               there even though the ⌘K hotkey is disabled (it belongs to the
               host page). */}
           <CommandPalette
+            key={sessionSearch ? "sessions" : "commands"}
+            sessionsOnly={sessionSearch}
             open={commandPaletteOpen}
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}
