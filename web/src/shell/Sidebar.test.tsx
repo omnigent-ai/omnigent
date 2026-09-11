@@ -503,14 +503,20 @@ describe("Sidebar session list", () => {
     expect(error).not.toHaveClass("text-sm");
   });
 
-  it("keeps the session list scrollable without visible scrollbar chrome", () => {
+  it("shows a thin, theme-aware scrollbar for the session list", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
     const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
-    expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
-    expect(scroller.className).not.toContain("scrollbar-gutter");
+    expect(scroller).toHaveClass(
+      "overflow-y-auto",
+      "md:mr-1",
+      "[scrollbar-width:thin]",
+      "[scrollbar-color:var(--muted-foreground)_transparent]",
+      "[&::-webkit-scrollbar]:w-2",
+      "[&::-webkit-scrollbar-thumb]:bg-muted-foreground",
+    );
+    expect(scroller).not.toHaveClass("[scrollbar-width:none]", "[&::-webkit-scrollbar]:hidden");
   });
 
   it("shows a draft icon only beside sessions with unfinished composer content", () => {

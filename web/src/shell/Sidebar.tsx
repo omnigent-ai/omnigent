@@ -1226,13 +1226,11 @@ function SidebarImpl({
               <nav
                 ref={setScrollContainer}
                 onScroll={(event) => setHasScrolled(event.currentTarget.scrollTop > 0)}
-                // Keep wheel/touch scrolling without letting classic-scrollbar
-                // platforms reserve a wide, permanently visible Sidebar gutter.
                 // max-md:pb-14 is the floating Settings chip's clearance: the
                 // chip is a non-scrolling sibling pinned bottom-right, so
                 // without a gutter the last row's always-visible kebab parks
                 // underneath it and can't be tapped.
-                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-16 [&::-webkit-scrollbar]:hidden"
+                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-color:var(--muted-foreground)_transparent] [scrollbar-width:thin] max-md:pb-16 md:mr-1 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground [&::-webkit-scrollbar-track]:bg-transparent"
               >
                 <ConversationList
                   conversationsQuery={displayQuery}
