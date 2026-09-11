@@ -671,7 +671,7 @@ describe("NewChatLandingScreen create flow", () => {
     const unregister = landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
-      adopt: vi.fn(),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     try {
       renderLanding();
@@ -709,7 +709,7 @@ describe("NewChatLandingScreen create flow", () => {
     const unregister = landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
-      adopt: vi.fn(),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
 
@@ -748,7 +748,7 @@ describe("NewChatLandingScreen create flow", () => {
     );
     renderLanding();
     await waitForWorkspaceSeed();
-    const adopt = vi.fn().mockResolvedValue(undefined);
+    const adopt = vi.fn().mockResolvedValue(true);
     const unregister = landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard: vi.fn().mockResolvedValue(undefined),
@@ -809,7 +809,7 @@ describe("NewChatLandingScreen create flow", () => {
     const unregisterA = landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard: discardA,
-      adopt: vi.fn(),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     const namespaceA = landing.readLandingWorkspaceState().browserNamespace;
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
@@ -835,7 +835,7 @@ describe("NewChatLandingScreen create flow", () => {
       unregisterB = landing.registerLandingResourceLifecycle({
         hasTerminals: () => true,
         discard: discardB,
-        adopt: vi.fn(),
+        adopt: vi.fn().mockResolvedValue(true),
       });
       expect(discardA).not.toHaveBeenCalled();
       resolveCreate({

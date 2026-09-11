@@ -76,6 +76,104 @@ describe("buildDraftTerminalAttachPath", () => {
 });
 
 describe("useDraftWorkspace", () => {
+  it("reconciles stale draft cleanup after another restored tab adopts the shell", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        { id: "shared", workspace: "/repo", hostId: "host_1", leaseSeconds: 600, sessionId: null },
+      ]),
+    );
+    let adoptedSession: string | null = null;
+    let shellRunning = true;
+    let resolveDelete!: (value: Response) => void;
+    const deletion = new Promise<Response>((resolve) => {
+      resolveDelete = resolve;
+    });
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/shared/heartbeat")) {
+        return response(context("shared", "/repo", adoptedSession));
+      }
+      if (url.endsWith("/shared/handoff")) {
+        adoptedSession = "conv_1";
+        return response(context("shared", "/repo", adoptedSession));
+      }
+      if (url.endsWith("/shared/resources/terminals")) {
+        return response({ object: "list", data: shellRunning ? [terminal("shared_shell")] : [] });
+      }
+      if (url.endsWith("/shared") && init?.method === "DELETE") {
+        if (adoptedSession === null) shellRunning = false;
+        return deletion;
+      }
+      if (url === "/v1/hosts/host_1/workspace-contexts" && init?.method === "POST") {
+        return response(context("new_draft", "/other"));
+      }
+      if (url.endsWith("/new_draft/resources/terminals")) {
+        return response({ object: "list", data: [] });
+      }
+      throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+    });
+    const first = renderHook(
+      ({ sessionId }: { sessionId: string | null }) => useDraftWorkspace(sessionId),
+      { initialProps: { sessionId: null as string | null } },
+    );
+    const stale = renderHook(() => useDraftWorkspace(null));
+    await waitFor(() => expect(first.result.current.terminals).toHaveLength(1));
+    await waitFor(() => expect(stale.result.current.terminals).toHaveLength(1));
+    await act(async () => {
+      await first.result.current.adopt("conv_1");
+    });
+    first.rerender({ sessionId: "conv_1" });
+    expect(stale.result.current.context?.session_id).toBeNull();
+
+    let discard!: Promise<void>;
+    act(() => {
+      discard = stale.result.current.discard();
+    });
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)).toEqual([
+      expect.objectContaining({ id: "shared", sessionId: "conv_1" }),
+    ]);
+    await act(async () => {
+      resolveDelete(response({ ...context("shared", "/repo", "conv_1"), deleted: false }));
+      await discard;
+      await stale.result.current.ensureContext("host_1", "/other");
+    });
+
+    expect(shellRunning).toBe(true);
+    expect(first.result.current.terminals[0]?.id).toBe("shared_shell");
+    expect(stale.result.current.context?.workspace).toBe("/other");
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "shared", sessionId: "conv_1" }),
+        expect.objectContaining({ id: "new_draft", sessionId: null }),
+      ]),
+    );
+  });
+
+  it("forgets an empty context retired by handoff without failing Start", async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        { id: "empty", workspace: "/repo", hostId: "host_1", leaseSeconds: 600, sessionId: null },
+      ]),
+    );
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/heartbeat")) return response(context("empty", "/repo"));
+      if (url.endsWith("/resources/terminals")) return response({ object: "list", data: [] });
+      if (url.endsWith("/handoff")) {
+        return response({ ...context("empty", "/repo", "conv_1"), context_deleted: true });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    const { result } = renderHook(() => useDraftWorkspace(null));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await act(async () => {
+      expect(await result.current.adopt("conv_1")).toBeNull();
+    });
+    expect(result.current.context).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
   it("starts idle when there is no selected context", () => {
     const { result } = renderHook(() => useDraftWorkspace(null));
 

@@ -185,16 +185,14 @@ async def test_owner_handoff_and_validation(tmp_path: Path) -> None:
             )
         )
         assert adopted["session_id"] == "session-one"
+        assert adopted["context_deleted"] is True
         rebound = await _request(
             manager,
             "handoff",
             context_id=context_id,
             params={"session_id": "session-two", "workspace": str(alias)},
         )
-        assert (rebound.status, rebound.error_status) == ("error", 409)
-        assert _ok(await _request(manager, "describe", context_id=context_id))["session_id"] == (
-            "session-one"
-        )
+        assert (rebound.status, rebound.error_status) == ("error", 404)
     finally:
         await manager.shutdown()
 
@@ -704,10 +702,86 @@ async def test_explicit_terminal_and_context_deletion_kill_processes(
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
-async def test_repeated_adopted_terminal_deletion_does_not_exhaust_context_limit(
+async def test_stale_view_cannot_delete_context_after_other_view_handoff(
     tmp_path: Path,
 ) -> None:
-    """Deleting each adopted context's final terminal releases its quota slot."""
+    """A stale draft cleanup cannot remove another view's adopted shell."""
+
+    manager = WorkspaceContextManager()
+    adopting_view = object()
+    stale_view = object()
+    try:
+        context_id = str(
+            _ok(await _request(manager, "create", params={"workspace": str(tmp_path)}))["id"]
+        )
+        terminal = _ok(
+            await _request(
+                manager,
+                "create_terminal",
+                context_id=context_id,
+                params={"terminal": "bash", "session_key": "shared"},
+            )
+        )
+        instance = manager.registry.get(context_id, "bash", "shared")
+        assert instance is not None
+        pane_pid = instance.pane_pid_sync()
+        assert pane_pid is not None
+
+        adopted = _ok(
+            await _request(
+                manager,
+                "handoff",
+                context_id=context_id,
+                params={"session_id": "session-shared", "workspace": str(tmp_path)},
+                tunnel=adopting_view,
+            )
+        )
+        assert adopted["session_id"] == "session-shared"
+        rebound = await _request(
+            manager,
+            "handoff",
+            context_id=context_id,
+            params={"session_id": "session-other", "workspace": str(tmp_path)},
+            tunnel=adopting_view,
+        )
+        assert (rebound.status, rebound.error_status) == ("error", 409)
+        stale_delete = _ok(
+            await _request(
+                manager,
+                "delete",
+                context_id=context_id,
+                tunnel=stale_view,
+            )
+        )
+        assert stale_delete["deleted"] is False
+        assert stale_delete["session_id"] == "session-shared"
+        assert manager.registry.get(context_id, "bash", "shared") is instance
+        assert await instance.is_alive()
+
+        terminal_delete = _ok(
+            await _request(
+                manager,
+                "delete_terminal",
+                context_id=context_id,
+                params={"terminal_id": terminal["id"]},
+                tunnel=adopting_view,
+            )
+        )
+        assert terminal_delete["deleted"] is True
+        assert terminal_delete["context_deleted"] is True
+        await _wait_for_process_exit(pane_pid)
+        assert context_id not in manager._contexts  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.parametrize("delete_before_handoff", [False, True])
+async def test_repeated_adopted_terminal_deletion_does_not_exhaust_context_limit(
+    tmp_path: Path,
+    delete_before_handoff: bool,
+) -> None:
+    """Final-terminal cleanup around handoff releases its context quota slot."""
 
     manager = WorkspaceContextManager()
     try:
@@ -723,27 +797,48 @@ async def test_repeated_adopted_terminal_deletion_does_not_exhaust_context_limit
                     params={"terminal": "bash", "session_key": f"cycle-{index}"},
                 )
             )
-            _ok(
-                await _request(
-                    manager,
-                    "handoff",
-                    context_id=context_id,
-                    params={"session_id": f"session-{index}", "workspace": str(tmp_path)},
+            if delete_before_handoff:
+                deleted = _ok(
+                    await _request(
+                        manager,
+                        "delete_terminal",
+                        context_id=context_id,
+                        params={"terminal_id": terminal["id"]},
+                    )
                 )
-            )
-            deleted = _ok(
-                await _request(
-                    manager,
-                    "delete_terminal",
-                    context_id=context_id,
-                    params={"terminal_id": terminal["id"]},
+                assert deleted == {"id": terminal["id"], "deleted": True}
+                assert context_id in manager._contexts  # pyright: ignore[reportPrivateUsage]
+                handed_off = _ok(
+                    await _request(
+                        manager,
+                        "handoff",
+                        context_id=context_id,
+                        params={"session_id": f"session-{index}", "workspace": str(tmp_path)},
+                    )
                 )
-            )
-            assert deleted == {
-                "id": terminal["id"],
-                "deleted": True,
-                "context_deleted": True,
-            }
+                assert handed_off["context_deleted"] is True
+            else:
+                _ok(
+                    await _request(
+                        manager,
+                        "handoff",
+                        context_id=context_id,
+                        params={"session_id": f"session-{index}", "workspace": str(tmp_path)},
+                    )
+                )
+                deleted = _ok(
+                    await _request(
+                        manager,
+                        "delete_terminal",
+                        context_id=context_id,
+                        params={"terminal_id": terminal["id"]},
+                    )
+                )
+                assert deleted == {
+                    "id": terminal["id"],
+                    "deleted": True,
+                    "context_deleted": True,
+                }
             assert context_id not in manager._contexts  # pyright: ignore[reportPrivateUsage]
         assert manager._contexts == {}  # pyright: ignore[reportPrivateUsage]
     finally:

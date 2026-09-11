@@ -22,78 +22,188 @@ ensure_secure_demo_root() {
 load_demo_process_state() {
   local file="$1"
   local name
-  local pid
+  local value
   mock_pid=""
+  mock_port=""
+  mock_started=""
   page_pid=""
+  page_port=""
+  page_started=""
   omnidev_pid=""
+  omnidev_started=""
   electron_pid=""
+  electron_started=""
 
   if [[ -L "$file" || ! -f "$file" || ! -O "$file" ]]; then
     echo "Refusing unsafe demo process file: $file" >&2
     return 1
   fi
 
-  while IFS='=' read -r name pid; do
-    if [[ ! "$pid" =~ ^[0-9]+$ ]] || (( pid <= 1 )); then
-      echo "Invalid demo process file: $file" >&2
-      return 1
-    fi
+  while IFS='=' read -r name value; do
     case "$name" in
-      mock_pid)
-        [[ -z "$mock_pid" ]] || return 1
-        mock_pid="$pid"
+      *_pid)
+        [[ "$value" =~ ^[0-9]+$ ]] && (( value > 1 )) || {
+          echo "Invalid demo process file: $file" >&2
+          return 1
+        }
         ;;
-      page_pid)
-        [[ -z "$page_pid" ]] || return 1
-        page_pid="$pid"
+      *_port)
+        [[ "$value" =~ ^[0-9]+$ ]] && (( value > 1 && value <= 65535 )) || {
+          echo "Invalid demo process file: $file" >&2
+          return 1
+        }
         ;;
-      omnidev_pid)
-        [[ -z "$omnidev_pid" ]] || return 1
-        omnidev_pid="$pid"
-        ;;
-      electron_pid)
-        [[ -z "$electron_pid" ]] || return 1
-        electron_pid="$pid"
+      *_started)
+        [[ "$value" =~ ^[[:alnum:]]{10,40}$ ]] || {
+          echo "Invalid demo process file: $file" >&2
+          return 1
+        }
         ;;
       *)
         echo "Invalid demo process file: $file" >&2
         return 1
         ;;
     esac
+    case "$name" in
+      mock_pid)
+        [[ -z "$mock_pid" ]] || return 1
+        mock_pid="$value"
+        ;;
+      mock_port)
+        [[ -z "$mock_port" ]] || return 1
+        mock_port="$value"
+        ;;
+      mock_started)
+        [[ -z "$mock_started" ]] || return 1
+        mock_started="$value"
+        ;;
+      page_pid)
+        [[ -z "$page_pid" ]] || return 1
+        page_pid="$value"
+        ;;
+      page_port)
+        [[ -z "$page_port" ]] || return 1
+        page_port="$value"
+        ;;
+      page_started)
+        [[ -z "$page_started" ]] || return 1
+        page_started="$value"
+        ;;
+      omnidev_pid)
+        [[ -z "$omnidev_pid" ]] || return 1
+        omnidev_pid="$value"
+        ;;
+      omnidev_started)
+        [[ -z "$omnidev_started" ]] || return 1
+        omnidev_started="$value"
+        ;;
+      electron_pid)
+        [[ -z "$electron_pid" ]] || return 1
+        electron_pid="$value"
+        ;;
+      electron_started)
+        [[ -z "$electron_started" ]] || return 1
+        electron_started="$value"
+        ;;
+    esac
   done < "$file"
 
-  if [[ -z "$mock_pid" || -z "$page_pid" || -z "$omnidev_pid" || -z "$electron_pid" ]]; then
+  if [[ -z "$mock_pid" || -z "$mock_port" || -z "$mock_started" || -z "$page_pid" || \
+    -z "$page_port" || -z "$page_started" || -z "$omnidev_pid" || \
+    -z "$omnidev_started" || -z "$electron_pid" || -z "$electron_started" ]]; then
     echo "Incomplete demo process file: $file" >&2
     return 1
   fi
 }
 
-stop_demo_process_tree() {
+demo_process_start_token() {
+  LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | tr -cd '[:alnum:]'
+}
+
+demo_process_matches() {
+  local role="$1"
+  local pid="$2"
+  local command
+  local expected
+  command="$(ps -ww -p "$pid" -o args= 2>/dev/null || true)"
+  [[ -n "$command" ]] || return 1
+  case "$role" in
+    mock)
+      expected="$python $repo_root/tests/server/integration/mock_llm_server.py $mock_port"
+      [[ "$(demo_process_start_token "$pid")" == "$mock_started" && "$command" == "$expected" ]]
+      ;;
+    page)
+      expected="$python -m http.server $page_port --bind 127.0.0.1 --directory $demo_root/page"
+      [[ "$(demo_process_start_token "$pid")" == "$page_started" && "$command" == "$expected" ]]
+      ;;
+    omnidev)
+      expected="$expect $demo_root/omnidev.exp"
+      [[ "$(demo_process_start_token "$pid")" == "$omnidev_started" && \
+        "$command" == "$expected" ]]
+      ;;
+    electron)
+      expected="$electron $repo_root/web/electron --user-data-dir=$demo_root/electron-profile"
+      [[ "$(demo_process_start_token "$pid")" == "$electron_started" && \
+        "$command" == "$expected" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+demo_process_parent() {
+  ps -p "$1" -o ppid= 2>/dev/null | tr -d '[:space:]'
+}
+
+stop_demo_descendant_tree() {
   local pid="$1"
+  local parent="$2"
   local children
   local child
   if [[ ! "$pid" =~ ^[0-9]+$ ]] || (( pid <= 1 )); then
     return
   fi
+  [[ "$(demo_process_parent "$pid")" == "$parent" ]] || return
   children="$(pgrep -P "$pid" 2>/dev/null || true)"
   for child in $children; do
-    stop_demo_process_tree "$child"
+    stop_demo_descendant_tree "$child" "$pid"
   done
-  kill "$pid" 2>/dev/null || true
+  if [[ "$(demo_process_parent "$pid")" == "$parent" ]]; then
+    kill "$pid" 2>/dev/null || true
+  fi
+}
+
+stop_demo_process() {
+  local role="$1"
+  local pid="$2"
+  if demo_process_matches "$role" "$pid"; then
+    local children
+    local child
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+    for child in $children; do
+      stop_demo_descendant_tree "$child" "$pid"
+    done
+    if demo_process_matches "$role" "$pid"; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  elif kill -0 "$pid" 2>/dev/null; then
+    echo "Skipping stale $role PID $pid because its command does not match this demo." >&2
+  fi
 }
 
 stop_demo_processes() {
-  local pid
-  for pid in "$@"; do
-    stop_demo_process_tree "$pid"
-  done
+  stop_demo_process electron "$electron_pid"
+  stop_demo_process omnidev "$omnidev_pid"
+  stop_demo_process page "$page_pid"
+  stop_demo_process mock "$mock_pid"
 }
 
 cleanup_failed_demo_launch() {
   local status=$?
   trap - EXIT INT TERM
   if (( cleanup_owned )); then
-    stop_demo_processes "$electron_pid" "$omnidev_pid" "$page_pid" "$mock_pid"
+    stop_demo_processes
     [[ -z "$state_tmp" ]] || rm -f -- "$state_tmp"
     rmdir -- "$launch_lock" 2>/dev/null || true
   fi
@@ -102,10 +212,18 @@ cleanup_failed_demo_launch() {
 
 begin_demo_process_ownership() {
   launch_lock="$1"
+  demo_root="$2"
+  repo_root="$3"
   mock_pid=""
+  mock_port=""
+  mock_started=""
   page_pid=""
+  page_port=""
+  page_started=""
   omnidev_pid=""
+  omnidev_started=""
   electron_pid=""
+  electron_started=""
   state_tmp=""
   cleanup_owned=1
   trap cleanup_failed_demo_launch EXIT

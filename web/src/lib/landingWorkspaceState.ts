@@ -186,7 +186,7 @@ let resourceLifecycle: {
   hasTerminals: () => boolean;
   discard: () => Promise<void>;
   discardSnapshot?: () => Promise<void>;
-  adopt: (sessionId: string) => Promise<unknown>;
+  adopt: (sessionId: string) => Promise<boolean>;
 } | null = null;
 export function registerLandingResourceLifecycle(lifecycle: NonNullable<typeof resourceLifecycle>) {
   readLandingWorkspaceState();
@@ -298,15 +298,18 @@ export async function adoptLandingWorkspace(
     draft.selection.workspace !== workspace
   )
     return;
-  const transferredTerminals = snapshot.lifecycle?.hasTerminals() ?? false;
+  let transferredTerminals: boolean;
   try {
-    await snapshot.lifecycle?.adopt(sessionId);
+    transferredTerminals = (await snapshot.lifecycle?.adopt(sessionId)) ?? false;
   } catch (error) {
     throw new LandingWorkspaceAdoptionError(false, error);
   }
+  const sessionPanel = transferredTerminals
+    ? draft.panel
+    : { ...draft.panel, openTerminals: [], selectedTerminalKey: null };
   if (transferredTerminals)
     writeSessionWorkspaceState(sessionId, {
-      ...draft.panel,
+      ...sessionPanel,
       openBrowsers: [],
       selectedBrowserId: null,
     });
@@ -323,7 +326,7 @@ export async function adoptLandingWorkspace(
   } catch (error) {
     throw new LandingWorkspaceAdoptionError(transferredTerminals, error);
   }
-  writeSessionWorkspaceState(sessionId, draft.panel);
+  writeSessionWorkspaceState(sessionId, sessionPanel);
   if (readLandingWorkspaceState().browserNamespace !== draft.browserNamespace) return;
   publish({
     browserNamespace: `draft-workspace:${randomUUID()}`,

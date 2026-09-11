@@ -1,6 +1,7 @@
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");
+const { once } = require("node:events");
 const { afterEach, describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -17,10 +18,18 @@ const PROCESS_HELPER = path.join(
 describe("desktop pre-session demo processes", { skip: process.platform === "win32" }, () => {
   const tempRoots = [];
   const children = [];
+  const childPids = [];
 
   afterEach(() => {
     for (const child of children.splice(0)) {
       if (child.exitCode === null) child.kill("SIGKILL");
+    }
+    for (const pid of childPids.splice(0)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
     }
     for (const root of tempRoots.splice(0)) {
       fs.rmSync(root, { recursive: true, force: true });
@@ -35,6 +44,51 @@ describe("desktop pre-session demo processes", { skip: process.platform === "win
 
   function demoRoot(tempRoot) {
     return path.join(tempRoot, `omnigent-prechat-manual-demo-${process.getuid()}`);
+  }
+
+  function startToken(pid) {
+    const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.replaceAll(/[^a-z0-9]/gi, "");
+  }
+
+  async function waitForPath(filePath, deadline) {
+    if (fs.existsSync(filePath)) return;
+    if (Date.now() >= deadline) throw new Error(`${filePath} was not created`);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    await waitForPath(filePath, deadline);
+  }
+
+  function stopWithFixtureCommands(root, stateFile, commandPrefix) {
+    return spawnSync(
+      "bash",
+      [
+        "-c",
+        [
+          'source "$1"',
+          'demo_root="$2"',
+          'repo_root="$3"',
+          'python="$4"',
+          'expect="$4"',
+          'electron="$4"',
+          'load_demo_process_state "$5"',
+          "stop_demo_processes",
+          'rm -f "$5"',
+        ].join("; "),
+        "test",
+        PROCESS_HELPER,
+        root,
+        REPO_ROOT,
+        commandPrefix,
+        stateFile,
+      ],
+      { encoding: "utf8" },
+    );
   }
 
   it("rejects process state instead of executing it", () => {
@@ -77,36 +131,122 @@ describe("desktop pre-session demo processes", { skip: process.platform === "win
     assert.equal(fs.readFileSync(stateFile, "utf8"), state);
   });
 
-  it("stops every validated process in retained state", async () => {
+  it("stops every validated process in retained state", { timeout: 5000 }, async () => {
     const tempRoot = makeTempRoot();
     const root = demoRoot(tempRoot);
     fs.mkdirSync(root, { mode: 0o700 });
-    const exited = [];
-    for (let index = 0; index < 4; index += 1) {
-      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-      children.push(child);
-      exited.push(new Promise((resolve) => child.once("exit", resolve)));
-    }
+    const idleCode = "setInterval(()=>{},1e3)";
+    const commandPrefix = `${process.execPath} -e ${idleCode} --`;
+    const mockPort = 43121;
+    const pagePort = 43122;
+    const commands = [
+      [path.join(REPO_ROOT, "tests/server/integration/mock_llm_server.py"), String(mockPort)],
+      [
+        "-m",
+        "http.server",
+        String(pagePort),
+        "--bind",
+        "127.0.0.1",
+        "--directory",
+        path.join(root, "page"),
+      ],
+      [path.join(root, "omnidev.exp")],
+      [
+        path.join(REPO_ROOT, "web/electron"),
+        `--user-data-dir=${path.join(root, "electron-profile")}`,
+      ],
+    ];
+    const owned = commands.map((args) => spawn(process.execPath, ["-e", idleCode, "--", ...args]));
+    children.push(...owned);
+    await Promise.all(owned.map((child) => once(child, "spawn")));
+    const exited = owned.map(
+      (child) =>
+        new Promise((resolve) => {
+          child.once("exit", resolve);
+        }),
+    );
     fs.writeFileSync(
       path.join(root, "processes.env"),
       [
         `mock_pid=${children[0].pid}`,
+        `mock_port=${mockPort}`,
+        `mock_started=${startToken(children[0].pid)}`,
         `page_pid=${children[1].pid}`,
+        `page_port=${pagePort}`,
+        `page_started=${startToken(children[1].pid)}`,
         `omnidev_pid=${children[2].pid}`,
+        `omnidev_started=${startToken(children[2].pid)}`,
         `electron_pid=${children[3].pid}`,
+        `electron_started=${startToken(children[3].pid)}`,
         "",
       ].join("\n"),
       { mode: 0o600 },
     );
 
-    const result = spawnSync("bash", [STOP_SCRIPT], {
-      env: { ...process.env, TMPDIR: tempRoot },
-      encoding: "utf8",
-    });
+    const stateFile = path.join(root, "processes.env");
+    const result = stopWithFixtureCommands(root, stateFile, commandPrefix);
 
     assert.equal(result.status, 0, result.stderr);
     await Promise.all(exited);
     assert.equal(fs.existsSync(path.join(root, "processes.env")), false);
+  });
+
+  it("leaves a reused PID and its child untouched", { timeout: 5000 }, async () => {
+    const tempRoot = makeTempRoot();
+    const root = demoRoot(tempRoot);
+    const stateFile = path.join(root, "processes.env");
+    const childPidFile = path.join(tempRoot, "child.pid");
+    fs.mkdirSync(root, { mode: 0o700 });
+    const parentCode = [
+      "const{spawn}=require('node:child_process')",
+      "const{writeFileSync}=require('node:fs')",
+      "const child=spawn(process.execPath,['-e','setInterval(()=>{},1e3)'])",
+      "writeFileSync(process.env.CHILD_PID_FILE,String(child.pid))",
+      "setInterval(()=>{},1e3)",
+    ].join(";");
+    const commandPrefix = `${process.execPath} -e ${parentCode} --`;
+    const parent = spawn(
+      process.execPath,
+      [
+        "-e",
+        parentCode,
+        "--",
+        path.join(REPO_ROOT, "web/electron"),
+        `--user-data-dir=${path.join(root, "electron-profile")}`,
+      ],
+      { env: { ...process.env, CHILD_PID_FILE: childPidFile } },
+    );
+    children.push(parent);
+    await once(parent, "spawn");
+    await waitForPath(childPidFile, Date.now() + 2000);
+    const childPid = Number(fs.readFileSync(childPidFile, "utf8"));
+    childPids.push(childPid);
+    const currentStarted = startToken(parent.pid);
+    fs.writeFileSync(
+      stateFile,
+      [
+        `mock_pid=${parent.pid}`,
+        "mock_port=43121",
+        `mock_started=${currentStarted}`,
+        `page_pid=${parent.pid}`,
+        "page_port=43122",
+        `page_started=${currentStarted}`,
+        `omnidev_pid=${parent.pid}`,
+        `omnidev_started=${currentStarted}`,
+        `electron_pid=${parent.pid}`,
+        "electron_started=MonJan010000001990",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+
+    const result = stopWithFixtureCommands(root, stateFile, commandPrefix);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /Skipping stale electron PID/);
+    assert.equal(process.kill(parent.pid, 0), true);
+    assert.equal(process.kill(childPid, 0), true);
+    assert.equal(fs.existsSync(stateFile), false);
   });
 
   it("reports both unavailable services after readiness is exhausted", () => {
@@ -126,44 +266,61 @@ describe("desktop pre-session demo processes", { skip: process.platform === "win
     assert.match(result.stderr, /Mock model server did not become ready/);
   });
 
-  it("cleans tracked processes when setup exits before state transfer", async () => {
-    const tempRoot = makeTempRoot();
-    const pidFile = path.join(tempRoot, "pid");
-    const launcher = spawn(
-      "bash",
-      [
-        "-c",
+  it(
+    "cleans tracked processes when setup exits before state transfer",
+    { timeout: 5000 },
+    async () => {
+      const tempRoot = makeTempRoot();
+      const pidFile = path.join(tempRoot, "pid");
+      const launcher = spawn(
+        "bash",
         [
-          'source "$1"',
-          'mkdir "$2"',
-          'begin_demo_process_ownership "$2"',
-          "sleep 60 & mock_pid=$!",
-          'printf "%s\\n" "$mock_pid" > "$3"',
-          "exit 9",
-        ].join("; "),
-        "test",
-        PROCESS_HELPER,
-        path.join(tempRoot, "launch-lock"),
-        pidFile,
-      ],
-      { stdio: "ignore" },
-    );
+          "-c",
+          [
+            'source "$1"',
+            'mkdir "$2"',
+            'begin_demo_process_ownership "$2" "$3" "$4"',
+            'python="$5 -e $7 --"',
+            'expect="$python"',
+            'electron="$python"',
+            "mock_port=43121",
+            '"$5" -e "$7" -- "$4/tests/server/integration/mock_llm_server.py" "$mock_port" & mock_pid=$!',
+            'mock_started="$(demo_process_start_token "$mock_pid")"',
+            'printf "%s\\n" "$mock_pid" > "$6"',
+            "exit 9",
+          ].join("; "),
+          "test",
+          PROCESS_HELPER,
+          path.join(tempRoot, "launch-lock"),
+          demoRoot(tempRoot),
+          REPO_ROOT,
+          process.execPath,
+          pidFile,
+          "setInterval(()=>{},1e3)",
+        ],
+        { stdio: "ignore" },
+      );
+      children.push(launcher);
 
-    const [status] = await Promise.all([
-      new Promise((resolve) => launcher.once("exit", resolve)),
-      new Promise((resolve, reject) => {
-        const deadline = Date.now() + 2000;
-        const poll = () => {
-          if (fs.existsSync(pidFile)) resolve();
-          else if (Date.now() >= deadline) reject(new Error("tracked PID was not recorded"));
-          else setTimeout(poll, 10);
-        };
-        poll();
-      }),
-    ]);
+      const [status] = await Promise.all([
+        new Promise((resolve) => {
+          launcher.once("exit", resolve);
+        }),
+        new Promise((resolve, reject) => {
+          const deadline = Date.now() + 2000;
+          const poll = () => {
+            if (fs.existsSync(pidFile)) resolve();
+            else if (Date.now() >= deadline) reject(new Error("tracked PID was not recorded"));
+            else setTimeout(poll, 10);
+          };
+          poll();
+        }),
+      ]);
 
-    assert.equal(status, 9);
-    const pid = Number(fs.readFileSync(pidFile, "utf8"));
-    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
-  });
+      assert.equal(status, 9);
+      const pid = Number(fs.readFileSync(pidFile, "utf8"));
+      childPids.push(pid);
+      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+    },
+  );
 });

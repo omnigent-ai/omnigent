@@ -278,7 +278,8 @@ export function AppShell() {
       discardSnapshot: () =>
         draftWorkspace.context ? draftWorkspace.discard(draftWorkspace.context) : Promise.resolve(),
       adopt: async (sessionId) => {
-        if (draftWorkspace.context) await draftWorkspace.adopt(sessionId, draftWorkspace.context);
+        if (!draftWorkspace.context) return false;
+        return (await draftWorkspace.adopt(sessionId, draftWorkspace.context)) !== null;
       },
     });
   }, [draftWorkspace, landingRoute, landingWorkspace.browserNamespace]);

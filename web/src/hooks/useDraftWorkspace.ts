@@ -47,7 +47,10 @@ export interface UseDraftWorkspaceResult {
   createTerminal: (context?: DraftWorkspaceContext) => Promise<DraftTerminalInfo>;
   deleteTerminal: (terminalId: string, context?: DraftWorkspaceContext) => Promise<void>;
   discard: (context?: DraftWorkspaceContext | null) => Promise<void>;
-  adopt: (sessionId: string, context?: DraftWorkspaceContext) => Promise<DraftWorkspaceContext>;
+  adopt: (
+    sessionId: string,
+    context?: DraftWorkspaceContext,
+  ) => Promise<DraftWorkspaceContext | null>;
 }
 
 function contextBasePath(hostId: string, contextId: string): string {
@@ -155,10 +158,12 @@ function persistContext(storageKey: string, context: DraftWorkspaceContext): voi
   writePersistedContexts(storageKey, existing);
 }
 
-function forgetContext(storageKey: string, contextId: string): void {
+function forgetContext(storageKey: string, contextId: string, draftOnly = false): void {
   writePersistedContexts(
     storageKey,
-    readPersistedContexts(storageKey).filter((row) => row.id !== contextId),
+    readPersistedContexts(storageKey).filter(
+      (row) => row.id !== contextId || (draftOnly && row.sessionId !== null),
+    ),
   );
 }
 
@@ -297,19 +302,25 @@ export async function deleteDraftTerminal(
 export async function discardDraftWorkspaceContext(
   hostId: string,
   contextId: string,
-): Promise<void> {
+): Promise<DraftWorkspaceContext | null> {
   const response = await authenticatedFetch(contextBasePath(hostId, contextId), {
     method: "DELETE",
   });
   if (!response.ok && response.status !== 404) {
     throw httpError("draft workspace discard failed", response);
   }
+  if (response.status === 404) return null;
+  const body: unknown = await response.json();
+  if (isWorkspaceContextWire(body) && body.session_id !== null) {
+    return withHost(body, hostId);
+  }
+  return null;
 }
 
 export async function adoptDraftWorkspaceContext(
   context: DraftWorkspaceContext,
   sessionId: string,
-): Promise<DraftWorkspaceContext> {
+): Promise<DraftWorkspaceContext | null> {
   const response = await authenticatedFetch(
     `${contextBasePath(context.hostId, context.id)}/handoff`,
     {
@@ -323,6 +334,7 @@ export async function adoptDraftWorkspaceContext(
   if (!isWorkspaceContextWire(body)) {
     throw new Error("draft workspace handoff returned an unrecognized context shape");
   }
+  if ("context_deleted" in body && body.context_deleted === true) return null;
   return withHost(body, context.hostId, context.workspaceAliases);
 }
 
@@ -427,10 +439,10 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
   );
 
   const clearContext = useCallback(
-    (contextId: string) => {
+    (contextId: string, draftOnly = false) => {
       if (activeStorageKeyRef.current !== storageKey) return;
       tombstonesRef.current.add(contextId);
-      forgetContext(storageKey, contextId);
+      forgetContext(storageKey, contextId, draftOnly);
       const updated = contextsRef.current.filter((row) => row.id !== contextId);
       contextsRef.current = updated;
       contextRef.current =
@@ -452,8 +464,12 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
     (target: DraftWorkspaceContext): Promise<void> => {
       const existing = discardFlightsRef.current.get(target.id);
       if (existing) return existing;
-      clearContext(target.id);
-      const flight = discardDraftWorkspaceContext(target.hostId, target.id);
+      clearContext(target.id, true);
+      const flight = discardDraftWorkspaceContext(target.hostId, target.id).then((adopted) => {
+        if (adopted === null || activeStorageKeyRef.current !== storageKey) return;
+        tombstonesRef.current.delete(adopted.id);
+        upsertContext({ ...adopted, workspaceAliases: target.workspaceAliases });
+      });
       discardFlightsRef.current.set(target.id, flight);
       void flight.then(
         () => discardFlightsRef.current.delete(target.id),
@@ -461,7 +477,7 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
       );
       return flight;
     },
-    [clearContext],
+    [clearContext, storageKey, upsertContext],
   );
 
   const ensureContext = useCallback(
@@ -689,14 +705,18 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
     async (
       adoptSessionId: string,
       targetContext?: DraftWorkspaceContext,
-    ): Promise<DraftWorkspaceContext> => {
+    ): Promise<DraftWorkspaceContext | null> => {
       const active = targetContext ?? contextRef.current;
       if (active === null) throw noActiveContextError();
       const adopted = await adoptDraftWorkspaceContext(active, adoptSessionId);
+      if (adopted === null) {
+        clearContext(active.id);
+        return null;
+      }
       if (!upsertContext(adopted)) throw new Error("Draft workspace selection changed");
       return adopted;
     },
-    [upsertContext],
+    [clearContext, upsertContext],
   );
 
   useEffect(() => {

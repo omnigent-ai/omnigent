@@ -637,10 +637,12 @@ describe(
           const visibleOverlays = launched.window.locator(
             '[role="menu"]:visible, [role="dialog"]:visible',
           );
+          /* oxlint-disable no-await-in-loop */
           for (let attempt = 0; attempt < 4 && (await visibleOverlays.count()) > 0; attempt += 1) {
             await launched.window.keyboard.press("Escape");
             await launched.window.waitForTimeout(100);
           }
+          /* oxlint-enable no-await-in-loop */
           await launched.window.waitForFunction(
             () => getComputedStyle(document.body).pointerEvents !== "none",
           );

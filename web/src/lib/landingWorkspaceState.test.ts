@@ -146,7 +146,7 @@ describe("landingWorkspaceState", () => {
   it("gives concurrent Starts on one namespace exactly one resource owner", async () => {
     const landing = await loadLandingWorkspaceState();
     const sessions = await import("./sessionWorkspaceState");
-    const adopt = vi.fn().mockResolvedValue(undefined);
+    const adopt = vi.fn().mockResolvedValue(true);
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
     Object.defineProperty(window, "omnigentDesktop", {
       configurable: true,
@@ -229,7 +229,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => false,
       discard: discardA,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(false),
     });
     const first = landing.claimLandingWorkspaceStart();
 
@@ -244,7 +244,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => false,
       discard: discardB,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(false),
     });
     const second = landing.claimLandingWorkspaceStart();
 
@@ -333,7 +333,7 @@ describe("landingWorkspaceState", () => {
       contextId: "shared-context-id",
       hasTerminals: () => false,
       discard: vi.fn().mockResolvedValue(undefined),
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(false),
     });
     landing.claimLandingWorkspaceStart();
 
@@ -348,7 +348,7 @@ describe("landingWorkspaceState", () => {
       contextId: "shared-context-id",
       hasTerminals: () => false,
       discard: vi.fn().mockResolvedValue(undefined),
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(false),
     });
     const namespaceB = landing.readLandingWorkspaceState().browserNamespace;
 
@@ -373,7 +373,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard: discardA,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     vi.spyOn(window, "confirm").mockReturnValue(true);
     expect(landing.confirmLandingWorkspaceChange()).toBe(true);
@@ -389,7 +389,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard: discardB,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     });
 
     expect(landing.confirmLandingWorkspaceChange()).toBe(true);
@@ -417,7 +417,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals,
       discard,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(false),
     });
     const firstNamespace = landing.readLandingWorkspaceState().browserNamespace;
     browserClose.mockClear();
@@ -479,7 +479,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     const sourceNamespace = landing.readLandingWorkspaceState().browserNamespace;
     browserClose.mockClear();
@@ -523,7 +523,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => false,
       discard,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(false),
     });
     browserClose.mockClear();
     landing.writeLandingWorkspacePanel({
@@ -563,7 +563,7 @@ describe("landingWorkspaceState", () => {
     const lifecycleA = {
       hasTerminals: vi.fn(() => true),
       discard: vi.fn().mockResolvedValue(undefined),
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     };
     landing.registerLandingResourceLifecycle(lifecycleA);
     const snapshotA = landing.captureLandingWorkspace();
@@ -585,7 +585,7 @@ describe("landingWorkspaceState", () => {
     const lifecycleB = {
       hasTerminals: vi.fn(() => true),
       discard: vi.fn().mockResolvedValue(undefined),
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     };
     landing.registerLandingResourceLifecycle(lifecycleB);
     const workspaceB = landing.readLandingWorkspaceState();
@@ -617,7 +617,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     const beforeConfirm = landing.readLandingWorkspaceState();
     vi.spyOn(window, "confirm").mockReturnValue(false);
@@ -658,7 +658,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     const beforeChange = landing.readLandingWorkspaceState();
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
@@ -696,7 +696,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
@@ -719,7 +719,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
@@ -734,7 +734,7 @@ describe("landingWorkspaceState", () => {
   it("adopts the draft resources and browser namespace into the created session", async () => {
     const landing = await loadLandingWorkspaceState();
     const sessions = await import("./sessionWorkspaceState");
-    const adopt = vi.fn().mockResolvedValue(undefined);
+    const adopt = vi.fn().mockResolvedValue(true);
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
     Object.defineProperty(window, "omnigentDesktop", {
       configurable: true,
@@ -806,7 +806,7 @@ describe("landingWorkspaceState", () => {
     const lifecycleA = {
       hasTerminals: vi.fn(() => true),
       discard: vi.fn().mockResolvedValue(undefined),
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     };
     landing.registerLandingResourceLifecycle(lifecycleA);
     const snapshotA = landing.captureLandingWorkspace();
@@ -828,14 +828,14 @@ describe("landingWorkspaceState", () => {
     const lifecycleB = {
       hasTerminals: vi.fn(() => true),
       discard: vi.fn().mockResolvedValue(undefined),
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     };
     landing.registerLandingResourceLifecycle(lifecycleB);
     const workspaceB = landing.readLandingWorkspaceState();
 
     await landing.adoptLandingWorkspace("session-a", "host-a", "/workspace-a", snapshotA);
 
-    expect(lifecycleA.hasTerminals).toHaveBeenCalledTimes(2);
+    expect(lifecycleA.hasTerminals).toHaveBeenCalledOnce();
     expect(lifecycleA.adopt).toHaveBeenCalledWith("session-a");
     expect(lifecycleA.discard).not.toHaveBeenCalled();
     expect(lifecycleB.hasTerminals).not.toHaveBeenCalled();
@@ -856,7 +856,7 @@ describe("landingWorkspaceState", () => {
   it("keeps adopted shell metadata in the session when browser adoption fails", async () => {
     const landing = await loadLandingWorkspaceState();
     const sessions = await import("./sessionWorkspaceState");
-    const adopt = vi.fn().mockResolvedValue(undefined);
+    const adopt = vi.fn().mockResolvedValue(true);
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: false });
     Object.defineProperty(window, "omnigentDesktop", {
       configurable: true,
@@ -903,10 +903,10 @@ describe("landingWorkspaceState", () => {
     });
   });
 
-  it("leaves the session untouched when a browser-only draft fails to transfer", async () => {
+  it("treats a retired empty handoff as untransferred when browser adoption fails", async () => {
     const landing = await loadLandingWorkspaceState();
     const sessions = await import("./sessionWorkspaceState");
-    const adopt = vi.fn().mockResolvedValue(undefined);
+    const adopt = vi.fn().mockResolvedValue(false);
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: false });
     Object.defineProperty(window, "omnigentDesktop", {
       configurable: true,
@@ -919,21 +919,31 @@ describe("landingWorkspaceState", () => {
       reason: "",
     });
     landing.registerLandingResourceLifecycle({
-      hasTerminals: () => false,
+      hasTerminals: () => true,
       discard: vi.fn().mockResolvedValue(undefined),
       adopt,
     });
     landing.writeLandingWorkspacePanel({
       rightRailTab: "browser",
+      openTerminals: ["terminal:stale"],
+      selectedTerminalKey: "terminal:stale",
       openBrowsers: ["browser-draft"],
       selectedBrowserId: "browser-draft",
     });
     const beforeAdoption = landing.readLandingWorkspaceState();
 
-    await expect(
-      landing.adoptLandingWorkspace("session-created", "host-1", "/workspace"),
-    ).rejects.toThrow("Draft browser transfer failed");
+    let failure: unknown;
+    try {
+      await landing.adoptLandingWorkspace("session-created", "host-1", "/workspace");
+    } catch (error) {
+      failure = error;
+    }
 
+    expect(failure).toBeInstanceOf(landing.LandingWorkspaceAdoptionError);
+    expect(failure).toMatchObject({
+      terminalsTransferred: false,
+      message: "Draft browser transfer failed",
+    });
     expect(adopt).toHaveBeenCalledWith("session-created");
     expect(browserAdoptDraft).toHaveBeenCalledWith(
       beforeAdoption.browserNamespace,
@@ -942,6 +952,44 @@ describe("landingWorkspaceState", () => {
     expect(landing.readLandingWorkspaceState()).toEqual(beforeAdoption);
     expect(sessions.readSessionWorkspaceState("session-created")).toEqual({});
     expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+  });
+
+  it("drops stale terminal layout when an empty handoff transfers the browser", async () => {
+    const landing = await loadLandingWorkspaceState();
+    const sessions = await import("./sessionWorkspaceState");
+    const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: { browserAdoptDraft },
+    });
+    landing.publishLandingWorkspaceSelection({
+      hostId: "host-1",
+      workspace: "/workspace",
+      available: true,
+      reason: "",
+    });
+    landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(false),
+    });
+    landing.writeLandingWorkspacePanel({
+      rightRailTab: "browser",
+      openTerminals: ["terminal:stale"],
+      selectedTerminalKey: "terminal:stale",
+      openBrowsers: ["browser-draft"],
+      selectedBrowserId: "browser-draft",
+    });
+
+    await landing.adoptLandingWorkspace("session-created", "host-1", "/workspace");
+
+    expect(sessions.readSessionWorkspaceState("session-created")).toMatchObject({
+      rightRailTab: "browser",
+      openTerminals: [],
+      selectedTerminalKey: null,
+      openBrowsers: ["browser-draft"],
+      selectedBrowserId: "browser-draft",
+    });
   });
 
   it("does not clean an abandoned snapshot while it is still the current workspace", async () => {
@@ -963,7 +1011,7 @@ describe("landingWorkspaceState", () => {
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
-      adopt: vi.fn().mockResolvedValue(undefined),
+      adopt: vi.fn().mockResolvedValue(true),
     });
     const snapshot = landing.captureLandingWorkspace();
     const beforeCleanup = landing.readLandingWorkspaceState();
@@ -1040,7 +1088,7 @@ describe("landingWorkspaceState", () => {
   it("preserves adopted terminals when an obsolete browser transfer fails", async () => {
     const landing = await loadLandingWorkspaceState();
     const sessions = await import("./sessionWorkspaceState");
-    const adopt = vi.fn().mockResolvedValue(undefined);
+    const adopt = vi.fn().mockResolvedValue(true);
     const discard = vi.fn().mockResolvedValue(undefined);
     const browserAdoptDraft = vi.fn().mockRejectedValue(new Error("browser handoff failed"));
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
@@ -1110,7 +1158,7 @@ describe("landingWorkspaceState", () => {
 
   it("does not adopt draft resources into a session created for another target", async () => {
     const landing = await loadLandingWorkspaceState();
-    const adopt = vi.fn().mockResolvedValue(undefined);
+    const adopt = vi.fn().mockResolvedValue(true);
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
     Object.defineProperty(window, "omnigentDesktop", {
       configurable: true,

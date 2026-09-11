@@ -8,6 +8,7 @@ state_file="$demo_root/processes.env"
 python="$repo_root/.venv/bin/python"
 omnidev="$repo_root/dev/omnidev/target/release/omnidev"
 electron="$(cd "$repo_root/web/electron" && node -p "require('electron')")"
+expect="/usr/bin/expect"
 demo_model="$(PYTHONPATH="$repo_root" "$python" -c 'from omnigent.onboarding.providers import default_chat_model; model = default_chat_model("openai"); assert model; print(model)')"
 
 ensure_secure_demo_root "$demo_root"
@@ -20,7 +21,7 @@ if ! mkdir -- "$launch_lock" 2>/dev/null; then
   echo "Another desktop pre-session demo launch is already in progress." >&2
   exit 1
 fi
-begin_demo_process_ownership "$launch_lock"
+begin_demo_process_ownership "$launch_lock" "$demo_root" "$repo_root"
 
 free_port() {
   "$python" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
@@ -114,15 +115,18 @@ nohup env -u GH_TOKEN -u GITHUB_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_API_KEY -u 
   "$python" "$repo_root/tests/server/integration/mock_llm_server.py" "$mock_port" \
   > "$demo_root/mock.log" 2>&1 < /dev/null &
 mock_pid=$!
+mock_started="$(demo_process_start_token "$mock_pid")"
 nohup "$python" -m http.server "$page_port" --bind 127.0.0.1 --directory "$demo_root/page" \
   > "$demo_root/page.log" 2>&1 < /dev/null &
 page_pid=$!
+page_started="$(demo_process_start_token "$page_pid")"
 nohup env -u GH_TOKEN -u GITHUB_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_API_KEY -u CURSOR_API_KEY \
   OMNIGENT_CONFIG_HOME="$demo_root/seed-config" OMNIGENT_DATA_DIR="$demo_root/supervisor-data" \
   OMNIGENT_DISABLE_KEYRING=1 OMNIGENT_NO_UPDATE_CHECK=1 GH_CONFIG_DIR="$demo_root/gh-config" \
   OPENAI_BASE_URL="http://127.0.0.1:$mock_port/v1" OPENAI_API_KEY=mock-key \
-  /usr/bin/expect "$demo_root/omnidev.exp" > "$demo_root/omnidev.log" 2>&1 < /dev/null &
+  "$expect" "$demo_root/omnidev.exp" > "$demo_root/omnidev.log" 2>&1 < /dev/null &
 omnidev_pid=$!
+omnidev_started="$(demo_process_start_token "$omnidev_pid")"
 
 if ! wait_for_demo_services \
   "http://127.0.0.1:$server_port" \
@@ -141,13 +145,20 @@ nohup env OMNIGENT_DISABLE_KEYRING=1 OMNIGENT_DESKTOP_VERSION_OVERRIDE=999.0.0 \
   "$electron" "$repo_root/web/electron" --user-data-dir="$demo_root/electron-profile" \
   > "$demo_root/electron.log" 2>&1 < /dev/null &
 electron_pid=$!
+electron_started="$(demo_process_start_token "$electron_pid")"
 
 state_tmp="$demo_root/processes.env.$$"
 cat > "$state_tmp" <<STATE
 mock_pid=$mock_pid
+mock_port=$mock_port
+mock_started=$mock_started
 page_pid=$page_pid
+page_port=$page_port
+page_started=$page_started
 omnidev_pid=$omnidev_pid
+omnidev_started=$omnidev_started
 electron_pid=$electron_pid
+electron_started=$electron_started
 STATE
 chmod 600 "$state_tmp"
 mv -- "$state_tmp" "$state_file"

@@ -272,6 +272,10 @@ class WorkspaceContextManager:
             if frame.op in {"describe", "heartbeat"}:
                 return ctx.payload()
             if frame.op == "delete":
+                if ctx.session_id is not None:
+                    payload = ctx.payload()
+                    payload["deleted"] = False
+                    return payload
                 await self._delete(ctx)
                 return {"id": ctx.id, "deleted": True}
             if frame.op == "handoff":
@@ -286,7 +290,13 @@ class WorkspaceContextManager:
                         409, "Workspace context already belongs to a session"
                     )
                 ctx.session_id = session_id
-                for entry in self.registry.list_for_conversation(ctx.id):
+                entries = self.registry.list_for_conversation(ctx.id)
+                if not entries:
+                    payload = ctx.payload()
+                    await self._delete(ctx)
+                    payload["context_deleted"] = True
+                    return payload
+                for entry in entries:
                     with contextlib.suppress(RuntimeError):
                         await entry.instance.set_conversation_link(f"/c/{session_id}")
                 return ctx.payload()
