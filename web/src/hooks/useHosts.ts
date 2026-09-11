@@ -28,6 +28,17 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /**
+   * Omnigent version the host reported at its last connect, e.g.
+   * `"0.13.0.dev1"`. `null`/absent when never reported (older host or
+   * server build).
+   */
+  version?: string | null;
+  /**
+   * Server verdict: the host runs an older omnigent than the server does.
+   * Absent on older servers, which never flag anything.
+   */
+  outdated?: boolean;
 }
 
 interface HostsResponse {

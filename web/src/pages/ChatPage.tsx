@@ -197,7 +197,7 @@ import {
   hostBacksHarnessWithGateway,
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
-import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { type Host, useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import {
   Dialog,
   DialogContent,
@@ -244,7 +244,7 @@ import {
 } from "@/components/goal";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { ConnectionIndicator } from "./ChatIndicators";
+import { ConnectionIndicator, HostOutdatedNotice } from "./ChatIndicators";
 import { Transcript } from "@/components/chat/Transcript";
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
@@ -1058,6 +1058,8 @@ export function ChatPage() {
       showsWorking={showsWorking}
       runnerOnline={runnerOnline}
       liveness={liveness}
+      sessionHost={sessionHost}
+      serverVersion={serverInfo === "loading" ? null : serverInfo.server_version}
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
       onSend={onSend}
@@ -1291,6 +1293,10 @@ interface MainAgentSurfaceProps {
   runnerOnline: boolean | undefined;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
   liveness: SessionLiveness;
+  /** The session's host row, for the outdated-version notice; null when unbound or unknown. */
+  sessionHost: Host | null;
+  /** Server version from /v1/info; null while it loads. */
+  serverVersion: string | null;
   agentsError: unknown;
   disabled: boolean;
   onSend: (text: string, files?: File[]) => void;
@@ -1450,6 +1456,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   showsWorking,
   runnerOnline,
   liveness,
+  sessionHost,
+  serverVersion,
   agentsError,
   disabled,
   onSend,
@@ -1743,6 +1751,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       {terminalSurfaces}
       {!showTerminal && (
         <>
+          <HostOutdatedNotice host={sessionHost} serverVersion={serverVersion} />
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}

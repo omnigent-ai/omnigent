@@ -1423,3 +1423,74 @@ def test_start_opens_web_ui_when_interactive(
 
     assert result.exit_code == 0, result.output
     assert opened == ["http://127.0.0.1:6767"]
+
+
+def test_record_from_json_reads_version_when_present() -> None:
+    """
+    The daemon record's ``version`` round-trips, and its absence reads as unknown.
+
+    Records written by daemons that predate the field must still parse, or the
+    reuse check would refuse every daemon left running across an upgrade.
+    """
+    base = {"pid": 4242, "target": "local", "mode": "local", "started_at": 1}
+    with_version = cli_module._record_from_json({**base, "version": "0.13.0.dev1"})
+    assert with_version is not None and with_version.version == "0.13.0.dev1"
+    without_version = cli_module._record_from_json(base)
+    assert without_version is not None and without_version.version is None
+
+
+@pytest.mark.parametrize(
+    ("recorded_version", "expect_notice"),
+    [("0.0.1", True), (None, False), ("999.0.0", False)],
+)
+def test_ensure_host_daemon_notes_when_reused_daemon_is_outdated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recorded_version: str | None,
+    expect_notice: bool,
+) -> None:
+    """
+    Reusing a live daemon that runs an older omnigent prints a restart hint.
+
+    An upgrade rewrites the install on disk while the daemon keeps its imported
+    version, and nothing restarts it, so the hint is the only signal the user
+    gets. A record without a version (older daemon) or one at least as new as
+    this CLI stays silent.
+    """
+    from omnigent.cli import (
+        _LOCAL_DAEMON_MARKER,
+        _HostDaemonRecord,
+        _write_daemon_record,
+        server_config_signature,
+    )
+
+    _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    monkeypatch.setattr(
+        "omnigent.cli._pid_is_recorded_daemon",
+        lambda record: cli_module._pid_alive(record.pid),
+    )
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked in {4242, 5150})
+    _write_daemon_record(
+        _HostDaemonRecord(
+            pid=5150,
+            target=_LOCAL_DAEMON_MARKER,
+            mode="local",
+            server_url=None,
+            log_path=str(tmp_path / "existing.log"),
+            started_at=int(time.time()),
+            host_id=None,
+            config_sig=server_config_signature(),
+            version=recorded_version,
+        )
+    )
+
+    assert _ensure_host_daemon(None) is False
+
+    err = capsys.readouterr().err
+    if expect_notice:
+        assert f"Omnigent was updated ({recorded_version} -> " in err
+        assert "`omnigent host stop` then `omnigent host`" in err
+    else:
+        assert "Omnigent was updated" not in err

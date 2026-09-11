@@ -1,7 +1,8 @@
-import { Loader2Icon, WifiOffIcon } from "lucide-react";
+import { Loader2Icon, RefreshCwIcon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
+import type { Host } from "@/hooks/useHosts";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -261,5 +262,38 @@ export function McpStartupIndicator() {
         </span>
       </MessageContent>
     </Message>
+  );
+}
+
+/**
+ * Muted notice that the session's host runs an older omnigent than the
+ * server. The install on the host machine upgrades in place while the
+ * running host daemon keeps its old code, and nothing restarts it, so the
+ * remedy is a restart the user times themselves: it stops every session
+ * running on that host.
+ */
+export function HostOutdatedNotice({
+  host,
+  serverVersion,
+}: {
+  host: Host | null;
+  serverVersion: string | null;
+}) {
+  if (!host?.outdated || !host.version || !serverVersion) return null;
+  return (
+    <div className={cn("mx-auto w-full px-6 pt-3", CHAT_COLUMN_WIDTH)}>
+      <div
+        role="status"
+        data-testid="host-outdated-notice"
+        className="flex items-start gap-2 rounded-[12px] border border-border/60 bg-muted/40 px-4 py-2 text-sm text-muted-foreground"
+      >
+        <RefreshCwIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+        <span>
+          Host <span className="font-medium text-foreground">{host.name}</span> is running{" "}
+          {host.version}; {serverVersion} is current. Restart the Omnigent host on that machine when
+          you are between tasks.
+        </span>
+      </div>
+    </div>
   );
 }

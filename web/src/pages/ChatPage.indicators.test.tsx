@@ -6,6 +6,7 @@ import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { BubbleView } from "./ChatPage";
 import {
   ConnectionIndicator,
+  HostOutdatedNotice,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
 } from "./ChatIndicators";
@@ -420,5 +421,38 @@ describe("BubbleView dispatch", () => {
     expect(indicator).toHaveTextContent("Compacting conversation…");
     // Initially shows no elapsed time or (0s)
     // (timer ticks immediately on mount, so we can't reliably assert the exact initial state)
+  });
+});
+
+describe("HostOutdatedNotice", () => {
+  const host = {
+    host_id: "host_1",
+    name: "corey-laptop",
+    owner: "corey",
+    status: "online" as const,
+    version: "0.13.0.dev1",
+    outdated: true,
+  };
+
+  it("names the host, both versions and the restart remedy when the server flags it", () => {
+    render(<HostOutdatedNotice host={host} serverVersion="0.13.0.dev3" />);
+    const notice = screen.getByTestId("host-outdated-notice");
+    expect(notice).toHaveTextContent("corey-laptop is running 0.13.0.dev1; 0.13.0.dev3 is current");
+    expect(notice).toHaveTextContent("Restart the Omnigent host on that machine");
+  });
+
+  it("renders nothing for a current host, an unknown version, or no host", () => {
+    const { container: current } = render(
+      <HostOutdatedNotice host={{ ...host, outdated: false }} serverVersion="0.13.0.dev3" />,
+    );
+    expect(current).toBeEmptyDOMElement();
+    const { container: unknown } = render(
+      <HostOutdatedNotice host={{ ...host, version: null }} serverVersion="0.13.0.dev3" />,
+    );
+    expect(unknown).toBeEmptyDOMElement();
+    const { container: unbound } = render(
+      <HostOutdatedNotice host={null} serverVersion="0.13.0.dev3" />,
+    );
+    expect(unbound).toBeEmptyDOMElement();
   });
 });

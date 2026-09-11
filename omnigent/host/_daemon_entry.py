@@ -73,6 +73,7 @@ def main() -> None:
 
     try:
         from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
+        from omnigent.version import VERSION
 
         identity = load_or_create_host_identity(CONFIG_PATH)
         mode = "local" if args.local else "server"
@@ -85,6 +86,7 @@ def main() -> None:
             started_at=int(time.time()),
             host_id=identity.host_id,
             config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
+            version=VERSION,
         )
         write_daemon_record(record, update_legacy_pidfile=True)
 

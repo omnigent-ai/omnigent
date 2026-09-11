@@ -22,6 +22,7 @@ import secrets
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
@@ -63,8 +64,25 @@ from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+
+
+def _host_outdated(version: str | None) -> bool:
+    """
+    Whether a host runs an older omnigent than this server.
+
+    :param version: Version the host reported at connect, or ``None``.
+    :returns: ``True`` only when both versions parse and the host's is lower.
+    """
+    if not version:
+        return False
+    try:
+        return Version(version) < Version(VERSION)
+    except InvalidVersion:
+        return False
+
 
 _LAUNCH_RESULT_TIMEOUT_S = 30.0
 # Per-call timeout for host.list_dir round-trips. Listing is a single
@@ -629,6 +647,8 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    "version": host.version,
+                    "outdated": _host_outdated(host.version),
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
@@ -673,6 +693,8 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "version": host.version,
+            "outdated": _host_outdated(host.version),
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
