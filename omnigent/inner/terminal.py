@@ -1456,7 +1456,11 @@ class TerminalInstance:
                 consecutive_capture_failures += 1
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
-                logger.error(
+                # Without remain-on-exit the tmux session dies with a clean
+                # exit, so its disappearance is expected lifecycle; with
+                # remain-on-exit the server should have survived, so it isn't.
+                logger.log(
+                    logging.ERROR if self.keep_alive_after_exit else logging.INFO,
                     "tmux unavailable after %d consecutive probes for terminal %s:%s",
                     consecutive_capture_failures,
                     self.name,
@@ -1639,7 +1643,11 @@ class TerminalInstance:
                 consecutive_capture_failures += 1
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
-                logger.error(
+                # Without remain-on-exit the tmux session dies with a clean
+                # exit, so its disappearance is expected lifecycle; with
+                # remain-on-exit the server should have survived, so it isn't.
+                logger.log(
+                    logging.ERROR if self.keep_alive_after_exit else logging.INFO,
                     "tmux unavailable after %d consecutive probes for terminal %s:%s",
                     consecutive_capture_failures,
                     self.name,
