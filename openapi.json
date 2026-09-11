@@ -561,7 +561,7 @@
                 "type": "null"
               }
             ],
-            "description": "Agent type recorded on the latest task, e.g. `\"researcher\"`. Mirrors the `tool` prefix in `title` and is provided alongside it because the title is a denormalized string while `agent_name` is the durable per-task value.",
+            "description": "Name of the agent bound to the child, resolved from `agent_id` against the agent store, e.g. `\"researcher\"`. Provided alongside `title` because the title is a denormalized display string while `agent_name` is the durable name of the bound agent. `None` when the child has no `agent_id`, or the agent no longer exists.",
             "title": "Agent Name"
           },
           "busy": {
