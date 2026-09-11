@@ -40,7 +40,11 @@ whose content is just text sitting on screen — a summary slide, a narrated pag
 the reproduction test's own console output, or a hand-typed sentence "claiming"
 the bug reproduces. Those film your *assertion*, not the product, and a viewer
 learns nothing a written line wouldn't tell them better; describe the outcome in
-prose instead of manufacturing a video of it.
+prose instead of manufacturing a video of it. Conversely, an error *appearing*
+during a live journey — a status pill flashing mid-turn, a stream dying and the
+session recovering — is a screen changing, not static text: the moment is
+temporal and filmable, and the static-text escape does not apply just because
+the error's *text* is a fixed string.
 
 **One verdict-appropriate clip per facet — nothing else.** Every recording must
 correspond to a facet, and its `kind` must match that facet's verdict. Do **not**
@@ -52,10 +56,12 @@ Recording is **best-effort**: if the tooling below is missing, or a user-facing
 facet's state is genuinely unreachable in this harness, keep `recordings: []` for
 that facet and **name the specific blocker** in `recording_unavailable_reason` —
 an empty recordings list on a `web`/`mobile`/`terminal`/`cli`/`desktop` facet must
-always come with a concrete reason, never a silent skip. Never let recording block
-or distort the work itself, and never fabricate a hollow journey that doesn't
-reach the failure just to produce a video. Missing or rejected footage never
-blocks the verdict, fix, or PR.
+always come with a concrete reason, never a silent skip. A limit of the stock
+recording fixture is never that blocker by itself when the reproduction already
+runs its own live server — attempt the attach described below first. Never let
+recording block or distort the work itself, and never fabricate a hollow
+journey that doesn't reach the failure just to produce a video. Missing or
+rejected footage never blocks the verdict, fix, or PR.
 
 Every declared recording includes `capture_mode`, which records how the product
 surface was filmed. Use `playwright_ui` for browser-page capture, `electron` for
@@ -73,6 +79,36 @@ typically auth-gated (a Databricks Apps deployment bounces an unauthenticated
 Playwright to SSO), so the recorder can't drive it. Let the `tests/e2e_ui/`
 fixtures **spawn their own local server + runner** (the default when no
 `--ui-base-url` is passed).
+
+## A live server your reproduction built is a recording target
+
+The fixture spawn is the default lane, not the only one. Whenever your
+reproduction already stood up its own live server — for *any* reason the stock
+`tests/e2e_ui/` fixtures don't cover — that running server is itself a
+recording target. Do **not** declare the web lane unfilmable by citing the
+stock fixture's limits — attach the recorder to the server you already have
+running. Build the SPA first (next section): an
+`omnigent server` serves it from `omnigent/server/static/web-ui/`, so once the
+bundle exists the SPA is live on your stack's own URL. Then run the recorder
+against that URL:
+
+```bash
+OMNIGENT_E2E_RECORD_DIR="$PWD/recordings/<slug>/raw" \
+  pytest <test_path> --ui-base-url http://127.0.0.1:<port> \
+  --screenshot on --output recordings/<slug>
+```
+
+`--ui-base-url` skips the fixture's own SPA build and server spawn and drives
+the URL you give it. Its safety check refuses only the well-known dev ports
+(6767, 8000, 5173) unless `OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1`, so a stand-in
+stack on a random port passes as-is, and the suite spawns its own runner
+tunneled into your server for the runner-bound fixtures. If the authored test
+leans on fixtures that only exist against the fixture-owned server (direct DB
+peeks), fall back to a bare Playwright context pointed at your server's URL —
+`OMNIGENT_E2E_RECORD_DIR` films every context the test opens either way. Only
+an attach you actually attempted and that failed justifies skipping the lane:
+quote the failing command and its error in `recording_unavailable_reason`,
+never the stock fixture's limits.
 
 ## Build the SPA up front — before you run the recorder, not during it
 
