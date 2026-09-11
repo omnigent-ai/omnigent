@@ -3706,6 +3706,12 @@ def create_runner_app(
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
 
+        # Captured before init's first await: the legacy (no-envelope) context
+        # load below probes the server's version over the network, so a reset
+        # landing anywhere in init — including that probe — must fence the
+        # memoizing writes at the end of init.
+        spec_cache_generation = _session_cache_generation(session_id)
+
         try:
             init_context = await _load_session_init_context(
                 body,
@@ -3735,9 +3741,6 @@ def create_runner_app(
 
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
-        # Captured before the resolver await so a reset landing during init
-        # fences the memoizing write below.
-        spec_cache_generation = _session_cache_generation(session_id)
         if spec_resolver is not None:
             try:
                 spec_entry = await spec_resolver(agent_id, session_id)
@@ -4344,6 +4347,14 @@ def create_runner_app(
         has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
         status = "running" if has_turn else "idle"
         agent_id = _session_agent_ids.get(session_id)
+        if agent_id is None:
+            # A reset that raced session init retires the binding and fences
+            # init's re-write, so a live session can transiently lack it. The
+            # server snapshot is the authoritative binding; serve it rather
+            # than failing the read (the next turn dispatch re-memoizes).
+            snapshot = await _session_snapshot(session_id)
+            if snapshot.ok:
+                agent_id = snapshot.agent_id
         if agent_id is None:
             return JSONResponse(
                 status_code=500,

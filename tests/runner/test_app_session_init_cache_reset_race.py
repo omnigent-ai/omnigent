@@ -328,6 +328,16 @@ async def test_session_init_does_not_reinstate_agent_binding_superseded_by_reset
             f"reset (bound {get_session_agent_id(session_id)!r})"
         )
 
+        # The read path must not 500 while the binding is fenced out: the
+        # session is live, so the runner GET serves the authoritative
+        # binding from the (post-switch) server snapshot instead.
+        get_resp = await client.get(f"/v1/sessions/{session_id}")
+        assert get_resp.status_code == 200, get_resp.text
+        assert get_resp.json()["agent_id"] == _NEW_AGENT_ID, (
+            "runner GET served neither the snapshot fallback nor the fresh "
+            f"agent after a raced init (got {get_resp.json()['agent_id']!r})"
+        )
+
         fallback_resp = await client.post(
             f"/v1/sessions/{session_id}/agent-cache/reset",
             json={},
@@ -386,4 +396,117 @@ async def test_session_init_memoizes_agent_binding_when_no_reset_intervenes() ->
     assert reset_resp.json()["agent_id"] == _AGENT_ID, (
         "body-less reset ignored the binding memoized by an uninterrupted "
         f"init (got {reset_resp.json()['agent_id']!r})"
+    )
+
+
+class _BlockingVersionServerClient(_SwitchableSnapshotServerClient):
+    """Snapshot stub whose ``GET /api/version`` probe blocks until released.
+
+    The legacy (no-envelope) init path awaits the server-version probe before
+    the agent spec is ever resolved; holding that probe open exposes the
+    earliest await of init to a concurrent reset.
+    """
+
+    def __init__(self, session_id: str, agent_id: str) -> None:
+        super().__init__(session_id, agent_id)
+        self.version_probe_entered = asyncio.Event()
+        self.release_version_probe = asyncio.Event()
+
+    async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        """Block the version probe; defer everything else to the parent.
+
+        :param url: Request path, e.g. ``"/api/version"``.
+        :param kwargs: Extra keyword arguments (forwarded to the parent).
+        :returns: Empty 200 for the version probe (parsed as an unknown
+            version), snapshot/empty responses otherwise.
+        """
+        if url.split("?", 1)[0] == "/api/version":
+            self.version_probe_entered.set()
+            await self.release_version_probe.wait()
+        return await super().get(url, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_session_init_fences_reset_during_legacy_context_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reset landing during the legacy-init version probe is also fenced.
+
+    Init's first await on the no-envelope path is ``_get_server_version``'s
+    ``GET /api/version`` network probe, which runs *before* the agent spec is
+    resolved. The cache generation must therefore be captured before that
+    load: captured any later, a reset acknowledged during the probe bumps the
+    generation before the capture, the fence sees a "current" generation, and
+    init reinstates the superseded spec entry and agent binding after all.
+
+    Steps (over the runner's HTTP API):
+
+    1. ``POST /v1/sessions`` with no init envelope — init blocks inside the
+       ``/api/version`` probe, before the resolver is consulted.
+    2. ``POST /v1/sessions/{id}/agent-cache/reset`` — the invalidation lands
+       during that earliest await.
+    3. The probe releases; init resolves the pre-reset ("v1") spec and
+       finishes.
+    4. A spec-derived read must re-resolve and serve the post-reset ("v2")
+       spec, and the agent-id binding must not have been reinstated.
+    """
+    session_id = "cachelegacy_8d3f2a614b7c4e0f9a25c6d1e8b74f03"
+    resolver_calls = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolver_calls
+        del agent_id, session_id
+        resolver_calls += 1
+        return _spec("v1" if resolver_calls == 1 else "v2")
+
+    server_client = _BlockingVersionServerClient(session_id, _AGENT_ID)
+    # The version probe is module-memoized once it succeeds; force the miss so
+    # the legacy context load genuinely awaits the (blocked) network probe.
+    monkeypatch.setattr("omnigent.runner.app._server_version", None)
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+
+    async with _runner_client(app) as client:
+        init_task = asyncio.create_task(
+            client.post(
+                "/v1/sessions",
+                json={"session_id": session_id, "agent_id": _AGENT_ID},
+            )
+        )
+        await asyncio.wait_for(server_client.version_probe_entered.wait(), timeout=10)
+
+        reset_resp = await client.post(
+            f"/v1/sessions/{session_id}/agent-cache/reset",
+            json={"agent_id": _AGENT_ID},
+        )
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["reset"] is True
+
+        server_client.release_version_probe.set()
+        init_resp = await asyncio.wait_for(init_task, timeout=30)
+        assert init_resp.status_code == 201, init_resp.text
+
+        assert get_session_agent_id(session_id) is None, (
+            "init reinstated the agent-id binding retired by a reset during "
+            "the legacy context load"
+        )
+
+        skills_resp = await client.get(f"/v1/sessions/{session_id}/skills")
+
+    assert skills_resp.status_code == 200, skills_resp.text
+    names = {skill["name"] for skill in skills_resp.json()["skills"]}
+    assert resolver_calls == 2, (
+        "spec read after a reset acknowledged during the legacy context load "
+        "was served from the session spec cache: the generation was captured "
+        f"after init's first await (resolver consulted {resolver_calls} "
+        "time(s), expected 2)"
+    )
+    assert "marker-v2" in names, f"post-reset spec not served; skills = {sorted(names)}"
+    assert "marker-v1" not in names, (
+        f"superseded pre-reset spec still served after reset; skills = {sorted(names)}"
     )
