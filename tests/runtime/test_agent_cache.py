@@ -137,6 +137,84 @@ def test_load_disk_cache_hit(
     assert second.workdir == first.workdir
 
 
+def test_load_reextracts_when_disk_entry_lost_config(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """
+    A disk entry whose ``config.yaml`` was wiped (e.g. by a tmp
+    cleaner) is a cache miss: ``load()`` re-extracts the bundle from
+    the artifact store instead of raising ``FileNotFoundError`` on
+    every request that resolves the spec.
+    """
+    loc = "agent-wiped/abc123"
+    _store_bundle(artifact_store, loc)
+
+    # First cache instance populates the disk tier.
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-wiped", loc)
+
+    # The extracted entry loses config.yaml; a stale leftover remains.
+    workdir = cache_dir / "agent-wiped"
+    (workdir / "config.yaml").unlink()
+    (workdir / "stale-leftover").write_text("junk", encoding="utf-8")
+
+    # New cache instance simulates a server restart — empty memory tier,
+    # so the next load hits the poisoned disk tier.
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    loaded = cache_2.load("agent-wiped", loc)
+
+    assert loaded.spec.name == "test-agent"
+    assert (workdir / "config.yaml").is_file()
+    # The poisoned entry was replaced wholesale, not overlaid.
+    assert not (workdir / "stale-leftover").exists()
+
+
+def test_load_reextracts_when_disk_entry_config_corrupt(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """A disk entry with an unparseable ``config.yaml`` is also a miss."""
+    loc = "agent-corrupt/abc123"
+    _store_bundle(artifact_store, loc)
+
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-corrupt", loc)
+
+    # Truncated write leaves invalid YAML behind.
+    (cache_dir / "agent-corrupt" / "config.yaml").write_text(
+        "spec_version: [unclosed", encoding="utf-8"
+    )
+
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    loaded = cache_2.load("agent-corrupt", loc)
+
+    assert loaded.spec.name == "test-agent"
+
+
+def test_load_poisoned_disk_entry_with_missing_bundle_raises(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """
+    When the disk entry is poisoned AND the bundle is gone from the
+    artifact store, the store miss surfaces as ``KeyError`` — the
+    fallback never invents a spec.
+    """
+    loc = "agent-gone/abc123"
+    _store_bundle(artifact_store, loc)
+
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-gone", loc)
+
+    (cache_dir / "agent-gone" / "config.yaml").unlink()
+    artifact_store.delete(loc)
+
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    with pytest.raises(KeyError):
+        cache_2.load("agent-gone", loc)
+
+
 def test_load_missing_agent_raises_key_error(
     agent_cache: AgentCache,
 ) -> None:
