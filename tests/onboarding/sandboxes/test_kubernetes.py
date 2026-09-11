@@ -1398,6 +1398,79 @@ def test_crashloopbackoff_is_terminal(
         )
 
 
+def _crashloop_waiting(name, restart_count=2):
+    """A container status parked in CrashLoopBackOff (kubelet backing off)."""
+    return SimpleNamespace(
+        name=name,
+        restart_count=restart_count,
+        state=SimpleNamespace(
+            waiting=SimpleNamespace(
+                reason="CrashLoopBackOff",
+                message=f"back-off 20s restarting failed container={name}",
+            ),
+            terminated=None,
+        ),
+        last_state=SimpleNamespace(terminated=SimpleNamespace(exit_code=128, reason="Error")),
+    )
+
+
+def test_init_crashloopbackoff_pending_is_terminal(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash-looping init container fails the launch fast, not at the deadline.
+
+    The Pod sits in ``Pending`` while the kubelet restarts the workspace-prep
+    init container (e.g. its git clone keeps failing); the start wait must
+    detect the crash loop instead of polling out the pod-ready budget.
+    """
+    core, _batch = fake_clients
+    monkeypatch.setattr(k8s, "_POD_READY_TIMEOUT_S", 0.01)
+    crashloop_pod = _pod(
+        phase="Pending",
+        init_statuses=[_crashloop_waiting("workspace-prep")],
+    )
+    core.pod_list_items = [crashloop_pod]
+    core.read_default = crashloop_pod
+    with pytest.raises(click.ClickException) as excinfo:
+        _launcher().start_host(
+            "omnigent-job-init-crash",
+            token=_TOKEN,
+            host_id="host_init_crash",
+            host_name="managed-init-crash",
+            server_url="http://srv.example.com",
+        )
+    message = str(excinfo.value)
+    assert "init container 'workspace-prep' is crash-looping" in message
+    assert "did not start within" not in message
+
+
+def test_init_crashloopbackoff_failure_carries_init_log_tail(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The crash-loop failure carries the init container's own log tail."""
+    core, _batch = fake_clients
+    monkeypatch.setattr(k8s, "_POD_READY_TIMEOUT_S", 0.01)
+    clone_error = "fatal: could not resolve host: git.example.invalid"
+    core.logs["workspace-prep"] = clone_error + "\n"
+    crashloop_pod = _pod(
+        phase="Pending",
+        init_statuses=[_crashloop_waiting("workspace-prep")],
+    )
+    core.pod_list_items = [crashloop_pod]
+    core.read_default = crashloop_pod
+    with pytest.raises(click.ClickException) as excinfo:
+        _launcher().start_host(
+            "omnigent-job-init-log",
+            token=_TOKEN,
+            host_id="host_init_log",
+            host_name="managed-init-log",
+            server_url="http://srv.example.com",
+        )
+    assert clone_error in str(excinfo.value)
+
+
 def test_init_failure_pending_is_not_terminal(
     fake_clients: tuple[_FakeCore, _FakeBatch],
     monkeypatch: pytest.MonkeyPatch,
