@@ -939,6 +939,8 @@ def test_resolve_image_file_keeps_specific_mime(
         ("image/png", 50),
         ("image/jpeg", 50),
         ("image/webp", 50),
+        ("image/gif", 50),
+        ("image/svg+xml", 5),  # non-raster: not compressed, keeps the small cap
         ("application/pdf", 20),
         ("text/plain", 10),
         ("text/markdown", 10),
@@ -1078,6 +1080,43 @@ def test_compress_image_rejects_undecodable_over_budget() -> None:
     garbage = b"\x00" * (IMAGE_MODEL_BUDGET_BYTES + 1)
     with pytest.raises(ImageCompressionError):
         compress_image_attachment(garbage, "image/png")
+
+
+def test_compress_image_skips_non_raster_type() -> None:
+    """A non-raster image type (SVG) over the budget is passed through, not 413'd."""
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        compress_image_attachment,
+    )
+
+    svg = b"<svg xmlns='http://www.w3.org/2000/svg'>" + b" " * (IMAGE_MODEL_BUDGET_BYTES + 1)
+    result, content_type = compress_image_attachment(svg, "image/svg+xml")
+
+    assert result is svg
+    assert content_type == "image/svg+xml"
+
+
+def test_compress_image_rejects_oversized_animated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An animated image over the budget is rejected (can't be re-encoded)."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime import content_resolver as cr
+
+    # Tiny budget so a small animated GIF counts as oversized without building
+    # a multi-megabyte fixture.
+    monkeypatch.setattr(cr, "IMAGE_MODEL_BUDGET_BYTES", 50)
+    frames = [Image.new("RGB", (16, 16), (i * 40, 0, 0)) for i in range(4)]
+    buffer = BytesIO()
+    frames[0].save(
+        buffer, format="GIF", save_all=True, append_images=frames[1:], duration=80, loop=0
+    )
+    animated = buffer.getvalue()
+    assert len(animated) > 50
+
+    with pytest.raises(cr.ImageCompressionError):
+        cr.compress_image_attachment(animated, "image/gif")
 
 
 @pytest.mark.parametrize(

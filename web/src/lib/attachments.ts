@@ -13,15 +13,25 @@
 /**
  * Per-type upload size limits, in megabytes. Mirrors the server caps.
  *
- * Images accept a large upload — the server downscales/re-encodes an oversized
- * image under the provider's per-image limit before storing it, so screenshots
- * and retina captures no longer need to be shrunk by hand.
+ * Compressible raster images accept a large upload — the server
+ * downscales/re-encodes an oversized one under the provider's per-image limit
+ * before storing it, so screenshots and retina captures no longer need to be
+ * shrunk by hand. Other image types (SVG, …) can't be shrunk, so they keep the
+ * smaller `UNCOMPRESSED_IMAGE_LIMIT_MB` cap (see `validateAttachments`).
  */
 export const ATTACHMENT_SIZE_LIMITS_MB = {
   image: 50,
   pdf: 20,
   text: 10,
 } as const;
+
+// Raster image types the server can compress under the model limit; only these
+// get the large image cap. Mirrors _COMPRESSIBLE_IMAGE_MIMES on the server.
+const COMPRESSIBLE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+// Image types we don't compress (SVG, …) keep this smaller cap. Mirrors
+// IMAGE_UNCOMPRESSED_UPLOAD_BYTES on the server.
+const UNCOMPRESSED_IMAGE_LIMIT_MB = 5;
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
 
@@ -170,7 +180,12 @@ export function validateAttachments(files: File[]): AttachmentValidation {
       );
       continue;
     }
-    const limitMb = ATTACHMENT_SIZE_LIMITS_MB[category];
+    // Non-compressible images (SVG, …) can't be shrunk server-side, so they
+    // keep the smaller cap; compressible raster images get the large cap.
+    const limitMb =
+      category === "image" && !COMPRESSIBLE_IMAGE_MIMES.has(file.type || "")
+        ? UNCOMPRESSED_IMAGE_LIMIT_MB
+        : ATTACHMENT_SIZE_LIMITS_MB[category];
     if (file.size > limitMb * 1024 * 1024) {
       errors.push(`"${name}" is too large — the limit for ${category} files is ${limitMb} MB.`);
       continue;
