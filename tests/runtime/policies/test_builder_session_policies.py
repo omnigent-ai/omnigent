@@ -405,13 +405,13 @@ def test_subagent_inherits_root_session_policies(db_uri: str) -> None:
     assert names.index("root_guard") < names.index("__ask_on_add_policy")
 
 
-def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
-    """An identical policy on both root and child is evaluated once.
+def test_subagent_exact_duplicate_keeps_root_policy_order(db_uri: str) -> None:
+    """An identical child policy cannot move its root copy later.
 
     Root and child carry structurally identical policies (same name,
-    handler, params), so the root's copy is skipped to avoid
-    double-evaluation. Only exact duplicates are skipped — see the
-    same-name-different-policy tests below.
+    handler, params), so only the root copy should remain. Keeping its
+    original position prevents the child from moving the guardrail behind
+    a later root policy.
 
     :param db_uri: Per-test SQLite URI.
     """
@@ -425,13 +425,19 @@ def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
     )
 
     policy_store = SqlAlchemyPolicyStore(db_uri)
-    # Same-name policy on both root and child.
     policy_store.create(
         policy_id="c6de31de238a26c347a7c3d8d5a74c3a",
         session_id=root_conv.id,
         name="shared_guard",
         type="python",
         handler=handler,
+    )
+    policy_store.create(
+        policy_id="f4a8c2e6b0d1c3e5f7a9b2d4e6c8a0b1",
+        session_id=root_conv.id,
+        name="root_policy_after_guard",
+        type="python",
+        handler="tests.resources.examples._shared.tool_functions.block_division",
     )
     policy_store.create(
         policy_id="86507aab3e1f97f6b1bace6058204f1a",
@@ -449,9 +455,11 @@ def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:
     )
 
     names = [p.spec.name for p in engine.policies]
-    # "shared_guard" should appear exactly once (child's version).
     assert names.count("shared_guard") == 1, (
         f"expected exactly 1 'shared_guard', got {names.count('shared_guard')} in {names}"
+    )
+    assert names.index("shared_guard") < names.index("root_policy_after_guard"), (
+        f"expected the root guard to retain its original position; got {names}"
     )
 
 
