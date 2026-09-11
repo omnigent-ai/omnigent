@@ -5383,11 +5383,11 @@ def create_runner_app(
         # session — keeping the SHAPE's stored default (a session's own pin
         # must not become the host-wide default).
         asyncio.get_running_loop().create_task(
-            _write_back_codex_catalog([dict(row) for row in rows])
+            _write_back_codex_catalog(conv_id, [dict(row) for row in rows])
         )
         return marked
 
-    async def _write_back_codex_catalog(rows: list[_JsonObject]) -> None:
+    async def _write_back_codex_catalog(session_id: str, rows: list[_JsonObject]) -> None:
         try:
             from omnigent.harnesses.codex_native.app_server import (
                 codex_catalog_fingerprint,
@@ -5396,7 +5396,10 @@ def create_runner_app(
             )
             from omnigent.models import model_catalog_store
 
-            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+            spec = await _resolve_session_agent_spec(session_id)
+            if spec is None:
+                return
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None, spec=spec)
             fingerprint = codex_catalog_fingerprint(launch)
             stored = model_catalog_store.read_catalog("codex-native", fingerprint)
             stored_default = next(
@@ -5413,7 +5416,7 @@ def create_runner_app(
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
-                extra={"session_id": runner_primary_session_id()},
+                extra={"session_id": session_id},
             )
 
     async def _handle_pi_native_effort_change(
