@@ -40,11 +40,21 @@ export function parseReplyDraft(text: string): ReplyDraft {
   let fence: { marker: string; length: number } | null = null;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!;
-    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if (fenceMatch) {
       const marker = fenceMatch[1]!;
-      if (!fence) fence = { marker: marker[0]!, length: marker.length };
-      else if (marker[0] === fence.marker && marker.length >= fence.length) fence = null;
+      const info = fenceMatch[2]!;
+      if (!fence) {
+        if (marker[0] !== "`" || !info.includes("`")) {
+          fence = { marker: marker[0]!, length: marker.length };
+        }
+      } else if (
+        marker[0] === fence.marker &&
+        marker.length >= fence.length &&
+        /^[ \t]*$/.test(info)
+      ) {
+        fence = null;
+      }
     }
     if (!fence && /^>( |$)/.test(line)) {
       const quoted = [line.replace(/^> ?/, "")];

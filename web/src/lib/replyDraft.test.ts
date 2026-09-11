@@ -32,6 +32,26 @@ describe("reply drafts", () => {
     },
   );
 
+  it.each([
+    ["```", "```not a closing fence"],
+    ["~~~~", "~~~~not a closing fence"],
+    ["````", "```"],
+    ["```", "~~~"],
+  ])("keeps code quoted with %s inside an unclosed fence after %s", (fence, example) => {
+    const code = `${fence}markdown\n${example}\n> Still a code example\n${fence}`;
+    const text = `${code}\n\n> Real quote\n\nReply`;
+    const draft = parseReplyDraft(text);
+    expect(draft.quotes).toMatchObject([{ before: code, text: "Real quote" }]);
+    expect(serializeReplyDraft(draft)).toBe(text);
+  });
+
+  it("does not treat backticks in a fence's info string as a code fence", () => {
+    const text = "```invalid`info\n\n> Real quote\n\nReply";
+    const draft = parseReplyDraft(text);
+    expect(draft.quotes).toMatchObject([{ before: "```invalid`info", text: "Real quote" }]);
+    expect(serializeReplyDraft(draft)).toBe(text);
+  });
+
   it("preserves indentation in text before a quote", () => {
     const text = "    code example\n\n> Review it\n\nReply";
     expect(serializeReplyDraft(parseReplyDraft(text))).toBe(text);
