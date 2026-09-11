@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import os
 import shutil
 import tracemalloc
@@ -14,6 +15,7 @@ import pytest
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     _child_shell_env,
+    _HelperProcessClient,
     _project_root,
     _read_impl,
     _shell_impl,
@@ -401,3 +403,121 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+# ---------------------------------------------------------------------------
+# Helper-spawn failures: a helper that cannot start (e.g. fork EAGAIN when the
+# host is out of process capacity) must surface a structured error dict from
+# request(), never raise the bare OS errno to the caller.
+# ---------------------------------------------------------------------------
+
+
+_RAW_FORK_EAGAIN = str(BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN)))
+
+
+def _helper_client(tmp_path: Path) -> _HelperProcessClient:
+    """A helper client with an inactive sandbox rooted at *tmp_path*.
+
+    :param tmp_path: Workspace directory for the helper.
+    :returns: A client whose helper has not been spawned yet.
+    """
+    return _HelperProcessClient(
+        cwd=tmp_path,
+        shell_path="/bin/sh",
+        sandbox=_inactive_policy(),
+    )
+
+
+def test_helper_spawn_failure_surfaces_structured_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spawn-time fork ``EAGAIN`` returns a structured error, not a raise.
+
+    :param tmp_path: Helper workspace.
+    :param monkeypatch: Patches ``subprocess.Popen`` to raise fork-``EAGAIN``.
+    """
+    spawn_attempts = 0
+
+    def _fork_eagain(*args: object, **kwargs: object) -> object:
+        nonlocal spawn_attempts
+        spawn_attempts += 1
+        raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+
+    monkeypatch.setattr("omnigent.inner.os_env.subprocess.Popen", _fork_eagain)
+    client = _helper_client(tmp_path)
+    try:
+        result = client.request({"op": "read", "path": "README.md", "offset": 1})
+    finally:
+        client.close()
+
+    assert spawn_attempts >= 1
+    assert result == {"error": f"os_env helper failed to start: {_RAW_FORK_EAGAIN}"}
+
+
+class _ClosableStream:
+    """Minimal file-like stand-in for a helper pipe."""
+
+    def close(self) -> None:
+        pass
+
+    def read(self) -> str:
+        return ""
+
+    def readline(self) -> str:
+        return ""
+
+
+class _RaisingStdin(_ClosableStream):
+    """Helper stdin whose write fails like a dead pipe."""
+
+    def write(self, data: str) -> int:
+        raise OSError(errno.EPIPE, os.strerror(errno.EPIPE))
+
+    def flush(self) -> None:
+        pass
+
+
+class _BrokenPipeProc:
+    """A 'started' helper whose stdin write immediately fails."""
+
+    pid = 4321
+
+    def __init__(self) -> None:
+        self.stdin = _RaisingStdin()
+        self.stdout = _ClosableStream()
+        self.stderr = _ClosableStream()
+
+    def poll(self) -> int:
+        return 0
+
+
+def test_helper_respawn_failure_after_io_error_surfaces_structured_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A respawn that fails during the I/O retry also returns a structured error.
+
+    The first request reaches a started helper whose pipe write fails, so the
+    client stops it and retries; the retry's respawn hits fork ``EAGAIN``.
+    That second-chance spawn failure must also come back as an error dict.
+
+    :param tmp_path: Helper workspace.
+    :param monkeypatch: First ``Popen`` yields a broken-pipe helper, then raises.
+    """
+    spawn_attempts = 0
+
+    def _popen_then_eagain(*args: object, **kwargs: object) -> object:
+        nonlocal spawn_attempts
+        spawn_attempts += 1
+        if spawn_attempts == 1:
+            return _BrokenPipeProc()
+        raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+
+    monkeypatch.setattr("omnigent.inner.os_env.subprocess.Popen", _popen_then_eagain)
+    client = _helper_client(tmp_path)
+    try:
+        result = client.request({"op": "read", "path": "README.md", "offset": 1})
+    finally:
+        client.close()
+
+    assert spawn_attempts == 2
+    assert result == {"error": f"os_env helper failed to start: {_RAW_FORK_EAGAIN}"}
