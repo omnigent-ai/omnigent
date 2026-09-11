@@ -214,6 +214,23 @@ system-browser OIDC hop, the native setup screen).
 The surface picks the kind of test you author (Step 3) and the recorder that
 captures it (Step 4).
 
+**When the reported surface is a native one you cannot drive here, say so —
+never clear it.** This runner drives the web SPA (including at a phone
+viewport), the terminal/CLI, and the Electron desktop shell — it has **no**
+iOS/Android device and no native macOS chrome. So for a native-chrome-only bug
+(safe-area insets, the system-browser OIDC hop, the native setup screen, or any
+native mobile rendering the phone-viewport SPA does not exercise), the most you
+can drive is the web SPA **standing in** for the native app. That substitute is
+not the reported surface: a `not_reproduced` you reach on it says nothing about
+the native app, and reporting it as a plain verdict wrongly clears the ticket.
+When you could only drive a stand-in for the reported surface, set
+`environment_fidelity` to name both — e.g. `stand-in: web SPA at a phone
+profile — could not drive the native iOS app` — and say the same in `journey`
+and `evidence`. This applies to `not_reproduced` too: a negative on a stand-in
+is a stand-in verdict, and the workflow routes such a ticket to a human on the
+reported device rather than out of the reproduction queue. Set
+`environment_fidelity: real` when you did drive the surface the ticket reports.
+
 **Prefer a user-facing surface — reserve `api` for the genuinely invisible.**
 If a user encounters the failure on *any* interactive surface — a screen in the
 web SPA, a terminal/TUI pane, or a CLI command that prints the error — that is
@@ -432,6 +449,7 @@ choice:
      "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
   "recording_unavailable_reason": "",
+  "environment_fidelity": "real",
   "missing_information": [],
   "session_id": "dc59e331-...",
   "journey": "open model picker → select catalog → picker shows raw IDs",
@@ -462,6 +480,16 @@ Field meanings:
   behavior, or affected surface. Operational failures, incomplete work, and
   evidence you simply did not attempt to collect are invalid entries and must
   not produce this verdict.
+- `environment_fidelity` — which environment you actually drove. `real` when you
+  drove the surface the ticket reports (or the bug is environment-independent and
+  reproduced here). When you could only drive a **stand-in** for the reported
+  surface — most importantly a native surface this runner cannot drive (see the
+  Step 1 native-surface note), but also a substituted network/host — set
+  `stand-in: <what you drove> — could not drive <the reported surface>`, e.g.
+  `stand-in: web SPA at a phone profile — could not drive the native iOS app`.
+  Applies to **every** verdict, `not_reproduced` included: a negative reached on
+  a stand-in is a stand-in verdict, and naming the stand-in here is what stops
+  the workflow from clearing a native-surface ticket the runner never touched.
 - `session_id` — **this session** (in the app), from `sys_session_get_info`, so
   the fix step can replay how you reproduced it and you can browse it at
   `<server>/c/<session_id>`.

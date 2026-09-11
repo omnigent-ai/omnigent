@@ -8,8 +8,10 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
@@ -55,6 +57,7 @@ _MCP_CONFIG_FILE = "bridge.json"
 # whereas ``state.json`` mutates on every turn/thread change.
 _POLICY_HOOK_FILE = "policy_hook.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "codex-native"
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 def bridge_root() -> Path:
@@ -149,16 +152,68 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 
 def prune_orphaned_bridge_dirs() -> int:
     """
-    Remove codex-native bridge dirs whose owner process is provably dead.
+    Remove inactive codex-native bridge dirs whose owner is provably dead.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    A runner restart is a normal Codex resume boundary, so owner death alone
+    cannot imply that the local rollout is disposable. Keep the whole bridge
+    for 7 days after its latest bridge preparation or rollout activity, then
+    remove it intact.
+    Explicit session deletion remains immediate. The runner calls this via
+    ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
-    :returns: The number of orphaned bridge dirs removed.
+    :returns: The number of orphaned bridge dirs pruned.
     """
-    return native_bridge_common.prune_orphaned_dirs(bridge_root())
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(),
+        should_prune=_codex_orphan_retention_expired,
+    )
+
+
+def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Return whether a dead-owner Codex bridge has been inactive for 7 days."""
+    activity_cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
+    owner_marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
+    try:
+        if owner_marker.stat().st_mtime > activity_cutoff:
+            return False
+    except OSError:
+        return False
+
+    sessions_dir = bridge_dir / "codex-home" / "sessions"
+    try:
+        sessions_mode = sessions_dir.stat().st_mode
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISDIR(sessions_mode):
+        return False
+
+    scan_failed = False
+
+    def _record_scan_failure(_error: OSError) -> None:
+        nonlocal scan_failed
+        scan_failed = True
+
+    try:
+        for directory, _subdirs, filenames in os.walk(
+            sessions_dir,
+            onerror=_record_scan_failure,
+        ):
+            for filename in filenames:
+                if not filename.startswith("rollout-") or not filename.endswith(".jsonl"):
+                    continue
+                rollout = Path(directory) / filename
+                try:
+                    if rollout.stat().st_mtime > activity_cutoff:
+                        return False
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return False
+    except OSError:
+        return False
+    return not scan_failed
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
