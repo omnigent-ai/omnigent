@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from omnigent.runner.launch_failure import (
+    _FAILURE_CODE_DESCRIPTIONS,
     FailureDiagnosis,
     classify_terminal_failure,
     describe_failure_code,
@@ -117,8 +121,10 @@ def test_command_path_is_matched_by_basename() -> None:
         ("terminal_launch_failed", "couldn't be started"),
         ("runner_error", "setting up the turn"),
         ("runner_disconnected", "host dropped"),
+        ("runner_failed_to_start", "failed to start"),
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
+        ("workspace_missing", "workspace"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
@@ -130,3 +136,18 @@ def test_describe_failure_code_known(code: str, expected_substring: str) -> None
 @pytest.mark.parametrize("code", [None, "", "some_unknown_code"])
 def test_describe_failure_code_unknown(code: str | None) -> None:
     assert describe_failure_code(code) is None
+
+
+def test_failure_code_descriptions_match_frontend_mirror() -> None:
+    # The failure card renders client-side from a hand-mirrored copy of this
+    # map; a code present in only one copy silently degrades to the generic
+    # "Something went wrong" headline on the other side.
+    tsx_path = Path(__file__).resolve().parents[2] / "web/src/components/blocks/StatusBlocks.tsx"
+    match = re.search(
+        r"const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = \{(.*?)\n\};",
+        tsx_path.read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    assert match is not None, f"FAILURE_CODE_DESCRIPTIONS not found in {tsx_path}"
+    frontend_codes = set(re.findall(r"^\s*(\w+):", match.group(1), re.MULTILINE))
+    assert frontend_codes == set(_FAILURE_CODE_DESCRIPTIONS)
