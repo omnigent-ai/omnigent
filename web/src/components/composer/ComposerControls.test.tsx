@@ -54,6 +54,8 @@ describe("shared composer controls", () => {
     const trigger = screen.getByRole("button", { name: "Codex configuration" });
     expect(trigger).toHaveTextContent("GPT-5.6-Sol");
     expect(trigger).toHaveClass("w-auto");
+    expect(trigger).toHaveClass("px-2", "py-0", "border-0", "leading-5", "md:min-h-7");
+    expect(trigger).not.toHaveClass("pr-0");
     expect(trigger).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
     expect(trigger).toHaveTextContent("High");
     expect(screen.getByTestId("composer-agent-model-value")).not.toHaveClass("truncate");

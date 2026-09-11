@@ -198,7 +198,7 @@ export const ComposerHarnessTrigger = forwardRef<
       size="sm"
       aria-label={label}
       className={cn(
-        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg pl-2 pr-0 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
+        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg border-0 px-2 py-0 text-[13px] leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
         className,
       )}
       {...props}
@@ -217,7 +217,7 @@ export const ComposerHarnessTrigger = forwardRef<
       >
         {model && (
           <span
-            className="min-w-0 whitespace-normal break-words text-left text-ui font-medium text-foreground"
+            className="min-w-0 whitespace-normal break-words text-left text-[13px] leading-5 font-medium text-foreground"
             data-testid={`${testIdPrefix}-agent-model-value`}
           >
             {model}
@@ -225,7 +225,7 @@ export const ComposerHarnessTrigger = forwardRef<
         )}
         {effort && (
           <span
-            className="shrink-0 text-ui font-normal text-muted-foreground"
+            className="shrink-0 text-[13px] leading-5 font-normal text-muted-foreground"
             data-testid={`${testIdPrefix}-agent-effort-value`}
           >
             {effort}

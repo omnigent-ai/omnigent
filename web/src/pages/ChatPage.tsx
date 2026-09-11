@@ -1,4 +1,9 @@
 import {
+  HarnessPicker,
+  HarnessPickerEntry,
+  HarnessPickerConfigPage,
+} from "@/components/composer/HarnessPicker";
+import {
   type ForwardedRef,
   type ChangeEvent,
   type FormEvent,
@@ -15,7 +20,6 @@ import {
 } from "react";
 import {
   BotIcon,
-  CheckIcon,
   WandSparklesIcon,
   CornerUpLeftIcon,
   FileTextIcon,
@@ -44,7 +48,6 @@ import {
   ComposerWorkspaceBar,
   ComposerWorkspaceTrigger,
   ComposerPermissionPicker,
-  ComposerHarnessTrigger,
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import {
@@ -54,9 +57,6 @@ import {
   DropdownMenuCheckboxItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useAppName } from "@/lib/branding";
@@ -212,22 +212,8 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { ConfigRow, nativeModelLabel } from "@/components/HarnessConfigControls";
+import { nativeModelLabel } from "@/components/HarnessConfigControls";
+import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -2108,7 +2094,7 @@ export function formatStatusModelLabel(
   if (!raw) return null;
   const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
-  if (codexOption) return codexOption.displayName ?? codexOption.id;
+  if (codexOption) return nativeModelLabel(codexOption);
   // An alias-shaped id the session's catalog doesn't list (e.g. during
   // the pre-catalog window): render it friendly mechanically — "sonnet"
   // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
@@ -4323,238 +4309,6 @@ function formatEffortLabel(effort: string): string {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
-/** Gear-modal row governing the routing of sub-agents the session spawns. */
-const SUBAGENT_ROUTING_LABEL = "Subagent routing";
-const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session spawns";
-
-function SessionConfigModal({
-  open,
-  onOpenChange,
-  harnessLabel,
-  showClaudePermissionMode = false,
-  showCodexApprovalMode = false,
-  subagentRoutingEligible,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  harnessLabel: string | null;
-  showClaudePermissionMode?: boolean;
-  showCodexApprovalMode?: boolean;
-  subagentRoutingEligible: boolean;
-}) {
-  const claudePermissionMode = useChatStore((state) => state.claudePermissionMode);
-  const codexApprovalMode = useChatStore((state) => state.codexApprovalMode);
-  const subagentRoutingOverride = useChatStore((state) => state.subagentRoutingOverride);
-  const conversationId = useChatStore((state) => state.conversationId);
-  const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
-  const [draftApprovalMode, setDraftApprovalMode] = useState(codexApprovalMode);
-  // Unlike the other drafts (snapshot-on-open), the approval picker must track
-  // live store changes while the modal stays open — a /permissions change in
-  // the TUI republishes the mode via SSE. This flags a user pick so the resync
-  // effect below stops mirroring once they've started editing.
-  const approvalTouchedRef = useRef(false);
-  // The sub-agent row is stored as a PICK, not a pre-seeded draft:
-  // `undefined` means "untouched", so the row mirrors the live stored value for
-  // as long as the user hasn't chosen anything. A draft seeded once per open
-  // would keep showing the value the session had when the modal opened — and
-  // Save would write that stale value back — if the stored one changed
-  // underneath (a bind/refresh landing, or another client's PATCH).
-  const [pickedSubagentRouting, setPickedSubagentRouting] = useState<"on" | "off" | undefined>(
-    undefined,
-  );
-  useEffect(() => {
-    if (!open) return;
-    setDraftPermissionMode(claudePermissionMode);
-    setDraftApprovalMode(codexApprovalMode);
-    approvalTouchedRef.current = false;
-    setPickedSubagentRouting(undefined);
-    // Nothing pushes a routing-switch change to the client (no SSE event, and
-    // the session query never goes stale), so re-read them here — otherwise the
-    // switches show whatever they were at bind time.
-    void useChatStore.getState().refreshSessionOverrides();
-    // Seed once per open from the current live values, and re-seed if the bound
-    // session changes under an open modal (its drafts describe the old one).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, conversationId]);
-
-  // Follow live approval-mode changes while the modal is open (a TUI
-  // /permissions switch republishes via SSE), until the user picks here.
-  useEffect(() => {
-    if (open && !approvalTouchedRef.current) setDraftApprovalMode(codexApprovalMode);
-  }, [open, codexApprovalMode]);
-
-  // Two-state row. A row stored before the switch became explicit carries no
-  // value, and that reads as Default — the same thing "off" means — so the
-  // trigger never shows a third state. Untouched (`undefined`) reads through
-  // to the stored value, so what the row shows is always what is persisted.
-  const effectiveSubagentRouting =
-    pickedSubagentRouting === undefined ? subagentRoutingOverride : pickedSubagentRouting;
-  const subagentRoutingValue = effectiveSubagentRouting === "on" ? "on" : "off";
-
-  const save = () => {
-    void (async () => {
-      const store = useChatStore.getState();
-      try {
-        if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
-          await store.setClaudePermissionMode(draftPermissionMode);
-        // Codex approval switch drives Codex's own /permissions popup on the
-        // runner — same awaited sequence so it can't race the others.
-        if (showCodexApprovalMode && draftApprovalMode !== codexApprovalMode)
-          await store.setCodexApprovalMode(draftApprovalMode);
-        // Sub-agent routing is independent of this session's own model — a
-        // plain PATCH with no slash-command injection, so ordering is free.
-        // Only an explicit pick is written, and only when it still differs from
-        // what the session has now: an untouched row must never persist a value
-        // the user didn't choose, and an unset store value already means "off",
-        // so picking Default on such a session writes nothing.
-        if (
-          subagentRoutingEligible &&
-          pickedSubagentRouting !== undefined &&
-          pickedSubagentRouting !== (store.subagentRoutingOverride ?? "off")
-        )
-          await store.setSubagentRouting(pickedSubagentRouting);
-      } catch {
-        // Individual setters already roll back their optimistic state; a failed
-        // PATCH shouldn't wedge the modal open.
-      }
-    })();
-    onOpenChange(false);
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md" data-testid="composer-config-modal">
-        <DialogHeader>
-          <DialogTitle>Configure {harnessLabel ?? "session"}</DialogTitle>
-          <DialogDescription className="sr-only">
-            Change permissions, approvals, and sub-agent routing for this session.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="flex flex-col gap-5 py-1">
-          {showClaudePermissionMode && claudePermissionMode !== "" && (
-            <ConfigRow label="Permissions" description="How much Claude asks before acting">
-              <Select
-                value={draftPermissionMode}
-                onValueChange={setDraftPermissionMode}
-                componentId="chat.composer.permission_mode"
-                valueHasNoPii
-              >
-                <SelectTrigger
-                  className="w-full"
-                  data-testid="composer-config-permission-mode"
-                  aria-label="Permission mode"
-                >
-                  <SelectValue>{claudePermissionModeLabel(draftPermissionMode)}</SelectValue>
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
-                    <SelectItem
-                      key={mode.value}
-                      value={mode.value}
-                      data-permission-mode={mode.value}
-                    >
-                      <span className="flex flex-col items-start">
-                        <span>{mode.label}</span>
-                        <span className="text-muted-foreground text-xs">{mode.description}</span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </ConfigRow>
-          )}
-          {showCodexApprovalMode && (
-            <ConfigRow label="Approvals" description="How much Codex asks before acting">
-              {/* Drives Codex's own /permissions popup by keystroke injection,
-                  so the options mirror it exactly. An empty draft (no switch
-                  seen yet) reads as the placeholder rather than a guessed
-                  default. */}
-              <Select
-                value={draftApprovalMode}
-                onValueChange={(v) => {
-                  approvalTouchedRef.current = true;
-                  setDraftApprovalMode(v);
-                }}
-                componentId="chat.composer.codex_approval_mode"
-                valueHasNoPii
-              >
-                <SelectTrigger
-                  className="w-full"
-                  data-testid="composer-config-approval-mode"
-                  aria-label="Approval mode"
-                >
-                  <SelectValue placeholder="Set in Codex">
-                    {codexApprovalModeLabel(draftApprovalMode) || undefined}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.map((mode) => (
-                    <SelectItem key={mode.value} value={mode.value} data-approval-mode={mode.value}>
-                      <span className="flex flex-col items-start">
-                        <span>{mode.label}</span>
-                        <span className="text-muted-foreground text-xs">{mode.description}</span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </ConfigRow>
-          )}
-          {/* Sub-agent routing — the only in-session routing control, for a
-          native session whose launch installed the spawn-routing apparatus
-          (spawns route through the harness hook) and for SDK/bundle agents
-          (spawns route through the create path). Hidden where it would be
-          inert: pinned Codex, and any plain native session. A session's own
-          routing is a create-time choice. Two options — a session that started
-          on Smart Routing was stamped "on" at create, so an unset value is
-          Default and the trigger always shows what's stored. */}
-          {subagentRoutingEligible && (
-            <ConfigRow label={SUBAGENT_ROUTING_LABEL} description={SUBAGENT_ROUTING_DESCRIPTION}>
-              <Select
-                value={subagentRoutingValue}
-                onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
-                componentId="chat.composer.subagent_routing"
-                valueHasNoPii
-              >
-                <SelectTrigger
-                  className="w-full"
-                  data-testid="composer-config-subagent-routing"
-                  aria-label={SUBAGENT_ROUTING_LABEL}
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  <SelectItem value="on" data-subagent-routing="on">
-                    {SMART_ROUTING_LABEL}
-                  </SelectItem>
-                  <SelectItem value="off" data-subagent-routing="off">
-                    Default
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </ConfigRow>
-          )}
-        </div>
-
-        <DialogFooter className="border-t-0 bg-transparent">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            data-testid="composer-config-cancel"
-          >
-            Cancel
-          </Button>
-          <Button type="button" onClick={save} data-testid="composer-config-save">
-            Save
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 /**
  * Whether the session surfaces any run-config the gear modal can edit. Shared
  * render guard for the config gear and click-to-open gate for the model/effort
@@ -4564,9 +4318,6 @@ function hasSessionConfig({
   showModels,
   showEffort,
   costRoutingEligible,
-  subagentRoutingEligible,
-  showClaudePermissionMode,
-  showCodexApprovalMode,
 }: {
   showModels: boolean;
   showEffort: boolean;
@@ -4575,14 +4326,7 @@ function hasSessionConfig({
   showClaudePermissionMode: boolean;
   showCodexApprovalMode: boolean;
 }): boolean {
-  return (
-    showModels ||
-    showEffort ||
-    costRoutingEligible ||
-    subagentRoutingEligible ||
-    showClaudePermissionMode ||
-    showCodexApprovalMode
-  );
+  return showModels || showEffort || costRoutingEligible;
 }
 
 function SessionHarnessPicker({
@@ -4621,7 +4365,6 @@ function SessionHarnessPicker({
   openNonce?: number;
 }) {
   const isMobile = useIsMobileViewport();
-  const [open, setOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [configMenuOpen, setConfigMenuOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -4674,15 +4417,9 @@ function SessionHarnessPicker({
       setConfigMenuOpen(true);
     }
   }, [openNonce, disabled, configurable]);
-  // The pill's summary tooltip must not flash open over the menu, nor
-  // instantly reopen when closing the menu refocuses the trigger; see
-  // useMenuGuardedTooltip. Internal menuOpen covers every open path,
-  // including the programmatic /model (openNonce) one.
-  const gearTooltip = useMenuGuardedTooltip(menuOpen);
   useEffect(() => {
     setMenuOpen(false);
     setConfigMenuOpen(false);
-    setOpen(false);
     setError(null);
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
@@ -4798,170 +4535,91 @@ function SessionHarnessPicker({
   );
   return (
     <>
-      <DropdownMenu
+      <HarnessPicker
         open={menuOpen}
         onOpenChange={(next) => {
           if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
           if (!next) setConfigMenuOpen(false);
         }}
+        trigger={{
+          label: "Configure session",
+          model: label,
+          effort: effortLabel ?? undefined,
+          icon: <ComposerAgentIcon agent={iconAgent} />,
+          disabled: busy || !configurable,
+          "aria-disabled": disabled || busy || !configurable,
+          className: disabled ? "cursor-default opacity-50" : undefined,
+          testIdPrefix: "composer",
+          "data-testid": "composer-config-gear",
+          pending:
+            pendingModelChange !== null &&
+            (modelPickerKind === "claude" || modelPickerKind === "codex"),
+        }}
+        tooltip={<ComposerConfigTooltipRows rows={summary} />}
+        tooltipTestId="composer-config-gear-tooltip"
+        testId="composer-agent-menu"
+        configOpen={configMenuOpen}
       >
-        <TooltipProvider>
-          <Tooltip open={gearTooltip.open} onOpenChange={gearTooltip.onOpenChange}>
-            <TooltipTrigger asChild>
-              <span className="flex min-w-0" {...gearTooltip.triggerProps}>
-                <DropdownMenuTrigger asChild>
-                  <ComposerHarnessTrigger
-                    label="Configure session"
-                    model={label}
-                    effort={effortLabel ?? undefined}
-                    icon={<ComposerAgentIcon agent={iconAgent} />}
-                    disabled={busy || !configurable}
-                    aria-disabled={disabled || busy || !configurable}
-                    className={disabled ? "cursor-default opacity-50" : undefined}
-                    testIdPrefix="composer"
-                    data-testid="composer-config-gear"
-                    pending={
-                      pendingModelChange !== null &&
-                      (modelPickerKind === "claude" || modelPickerKind === "codex")
-                    }
-                  />
-                </DropdownMenuTrigger>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent
-              side="top"
-              className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
-              data-testid="composer-config-gear-tooltip"
-            >
-              <ComposerConfigTooltipRows rows={summary} />
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-        <DropdownMenuContent
-          side="top"
-          align="end"
-          collisionPadding={12}
-          className="composer-agent-menu w-[22rem] min-w-0 max-w-[calc(100vw-2rem)] max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-y-auto p-2"
-          data-testid="composer-agent-menu"
-          onPointerMoveCapture={(event) => {
-            if (configMenuOpen && event.currentTarget.contains(event.target as Node))
-              event.preventDefault();
-          }}
-        >
-          {isMobile && configMenuOpen ? (
-            <>
-              <DropdownMenuItem
-                data-testid="composer-agent-config-back"
-                onSelect={(event) => {
-                  event.preventDefault();
-                  setConfigMenuOpen(false);
-                }}
-              >
-                <CornerUpLeftIcon className="size-4" /> Back
-              </DropdownMenuItem>
-              <div data-testid="composer-agent-config-menu">{configContent}</div>
-            </>
-          ) : (
-            <>
-              <div
-                title={
-                  !costRoutingEligible || !showModels
-                    ? "Smart Routing is not available for this session."
-                    : undefined
-                }
-              >
-                <DropdownMenuItem
-                  disabled={
-                    busy || pendingModelChange !== null || !costRoutingEligible || !showModels
-                  }
-                  onSelect={() =>
-                    void apply(() =>
-                      useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"),
-                    )
-                  }
-                  data-selected={routingOn}
-                >
-                  <WandSparklesIcon className="size-4" />
-                  <span className="flex-1">{SMART_ROUTING_LABEL}</span>
-                  {routingOn && <CheckIcon className="size-4" />}
-                </DropdownMenuItem>
-              </div>
-              <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
-                {nativeAgent ? "Harnesses" : "Agents"}
-              </DropdownMenuLabel>
-              {isMobile ? (
-                <DropdownMenuItem
-                  className="gap-2"
-                  data-testid="composer-agent-edit"
-                  disabled={busy || pendingModelChange !== null}
-                  onSelect={(event) => {
-                    event.preventDefault();
-                    setConfigMenuOpen(true);
-                  }}
-                >
-                  <ComposerAgentIcon agent={iconAgent} />
-                  <span className="flex-1">{harnessLabel ?? "Session"}</span>
-                  <span className="min-w-0 flex-1 whitespace-normal break-words text-xs text-muted-foreground">
-                    {routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default")}
-                  </span>
-                  <span className="text-xs text-muted-foreground">Edit</span>
-                </DropdownMenuItem>
-              ) : (
-                <DropdownMenuSub open={configMenuOpen} onOpenChange={setConfigMenuOpen}>
-                  <DropdownMenuSubTrigger
-                    disabled={busy || pendingModelChange !== null}
-                    className="gap-2"
-                    data-testid="composer-agent-edit"
-                    onPointerMove={(event) => event.preventDefault()}
-                    onClick={() => setConfigMenuOpen(true)}
-                  >
-                    <ComposerAgentIcon agent={iconAgent} />
-                    <span className="flex-1">{harnessLabel ?? "Session"}</span>
-                    <span className="min-w-0 flex-1 whitespace-normal break-words text-xs text-muted-foreground">
-                      {routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default")}
-                    </span>
-                    <span className="text-xs text-muted-foreground">Edit</span>
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent
-                    className="composer-agent-menu composer-agent-config-menu w-[13.75rem] max-h-[var(--radix-dropdown-menu-content-available-height)] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
-                    data-testid="composer-agent-config-menu"
-                    onFocusOutside={(event) => {
-                      if (
-                        event.target instanceof Element &&
-                        event.target.getAttribute("role") === "menu"
-                      )
-                        event.preventDefault();
-                    }}
-                  >
-                    {configContent}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-              )}
-            </>
-          )}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            disabled={busy || pendingModelChange !== null}
-            onSelect={() => setOpen(true)}
-            data-testid="composer-advanced-settings"
+        {isMobile && configMenuOpen ? (
+          <HarnessPickerConfigPage
+            backTestId="composer-agent-config-back"
+            testId="composer-agent-config-menu"
+            onBack={() => setConfigMenuOpen(false)}
           >
-            Advanced settings…
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+            {configContent}
+          </HarnessPickerConfigPage>
+        ) : (
+          <>
+            <div
+              title={
+                !costRoutingEligible || !showModels
+                  ? "Smart Routing is not available for this session."
+                  : undefined
+              }
+            >
+              <DropdownMenuItem
+                disabled={
+                  busy || pendingModelChange !== null || !costRoutingEligible || !showModels
+                }
+                onSelect={() =>
+                  void apply(() =>
+                    useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"),
+                  )
+                }
+                data-active={routingOn ? "true" : undefined}
+                className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+              >
+                <WandSparklesIcon className="size-4" />
+                <span className="flex-1">{SMART_ROUTING_LABEL}</span>
+                <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
+                  Model
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </div>
+            <PickerSectionHeader>{nativeAgent ? "Harnesses" : "Agents"}</PickerSectionHeader>
+            <HarnessPickerEntry
+              open={configMenuOpen}
+              onOpenChange={setConfigMenuOpen}
+              icon={<ComposerAgentIcon agent={iconAgent} />}
+              label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+              summary={routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default")}
+              active={!routingOn}
+              isMobile={isMobile}
+              disabled={busy || pendingModelChange !== null}
+              summaryTestId="composer-agent-model-summary"
+              testId="composer-agent-edit"
+              configTestId="composer-agent-config-menu"
+              configContent={configContent}
+            />
+          </>
+        )}
+      </HarnessPicker>
       {error && (
         <span role="alert" className="max-w-40 text-xs text-destructive">
           {error}
         </span>
       )}
-      <SessionConfigModal
-        open={open}
-        onOpenChange={setOpen}
-        harnessLabel={harnessLabel}
-        showClaudePermissionMode={showClaudePermissionMode}
-        showCodexApprovalMode={showCodexApprovalMode}
-        subagentRoutingEligible={subagentRoutingEligible}
-      />
     </>
   );
 }
@@ -5061,6 +4719,7 @@ function useResolvedComposerModel(
     modelPickerKind === "opencode";
   const modelOptions: readonly {
     id: string;
+    model?: string;
     label?: string;
     displayName?: string;
     isDefault?: boolean;
@@ -5121,52 +4780,4 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
-}
-/**
- * How long after the menu closes tooltip open requests stay swallowed.
- * Radix hands focus back to the trigger on close in the same tick, so the
- * window only needs to outlive that programmatic focus (and any queued
- * focus/pointer fallout from the closing menu); 600ms — one hover-open
- * delay — is comfortably past it without being noticeable to a user who
- * genuinely re-engages the trigger later.
- */
-const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
-
-/**
- * Open state for a tooltip whose trigger contains (or is) a menu trigger.
- *
- * Keeps the tooltip closed while the menu is open: the menu trigger sits
- * inside the tooltip trigger's span, so the focus Radix gives it on open
- * bubbles to the tooltip trigger and would instantly open the tooltip,
- * painting it over the menu (equal z-index, later-mounted; the menu content
- * itself is a portalled React sibling whose events do not bubble here).
- * Closing the menu hands focus back to that same trigger, which would just
- * as instantly reopen the tooltip, so open requests stay blocked for a short
- * window after close — unless the pointer re-enters the trigger, which is
- * unmistakably fresh hover intent.
- */
-function useMenuGuardedTooltip(menuOpen: boolean) {
-  const [wantsOpen, setWantsOpen] = useState(false);
-  // Epoch millis until which open requests are ignored; Infinity while the
-  // menu is open. A ref, not state: it is only read when Radix requests an
-  // open, so changing it never needs a re-render.
-  const suppressedUntil = useRef(0);
-  useEffect(() => {
-    if (menuOpen) {
-      setWantsOpen(false);
-      suppressedUntil.current = Number.POSITIVE_INFINITY;
-    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
-      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
-    }
-  }, [menuOpen]);
-  return {
-    open: wantsOpen && !menuOpen,
-    onOpenChange: (next: boolean) =>
-      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
-    triggerProps: {
-      onPointerEnter: () => {
-        if (!menuOpen) suppressedUntil.current = 0;
-      },
-    },
-  } as const;
 }

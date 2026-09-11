@@ -32,13 +32,25 @@ export interface RoutingModelOption {
 /** The native-catalog fields the Model row's copy is built from. */
 interface NativeModelLabelFields {
   id: string;
+  model?: string;
   displayName?: string;
   isDefault?: boolean;
 }
 
 /** A catalog row's user-facing name: what the harness advertises, else its id. */
 export function nativeModelLabel(option: NativeModelLabelFields): string {
-  return option.displayName ?? option.id;
+  const label = option.displayName ?? option.id;
+  const model = option.model ?? option.id;
+  const resolved =
+    /^(?:system\.ai\.|databricks-)?claude-(opus|sonnet|haiku|fable)-(\d{1,2})(?:[-.](\d{1,2}))?(?:-\d{8})?(\[1m\])?$/i.exec(
+      model,
+    );
+  if (!resolved) return label;
+  const [, family, major, minor, context] = resolved;
+  const bareLabel = label.replace(/(?:\[1m\]| \(1M context\))$/i, "").replace(/^Claude /i, "");
+  if (bareLabel.toLowerCase() !== family!.toLowerCase() && label !== model) return label;
+  const familyLabel = family![0]!.toUpperCase() + family!.slice(1).toLowerCase();
+  return `${familyLabel} ${major}${minor ? `.${minor}` : ""}${context ? " (1M context)" : ""}`;
 }
 
 /**

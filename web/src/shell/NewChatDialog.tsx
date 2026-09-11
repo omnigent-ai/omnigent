@@ -1,3 +1,8 @@
+import {
+  HarnessPicker,
+  HarnessPickerEntry,
+  HarnessPickerConfigPage,
+} from "@/components/composer/HarnessPicker";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import {
@@ -5,10 +10,13 @@ import {
   ComposerWorkspaceTrigger,
   ComposerHostTrigger,
   ComposerPermissionPicker,
-  ComposerHarnessTrigger,
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import {
+  COMPOSER_HARNESS_MENU_SIZE,
+  PickerSectionHeader,
+} from "@/components/composer/HarnessMenuRow";
 import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
@@ -1206,14 +1214,6 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  * every required parameter. Hitting send POSTs /v1/sessions and
  * navigates to the new session — there is no modal.
  */
-/** Group / section header inside the picker dropdown (plain div, so Radix
- * doesn't claim roving focus for it — mirrors the in-session picker). */
-function PickerSectionHeader({ children }: { children: ReactNode }) {
-  return (
-    <div className="px-2 py-1 text-xs leading-5 font-normal text-muted-foreground">{children}</div>
-  );
-}
-
 const COMPOSER_HARNESS_ICONS: Record<string, { src: string; invertInDark: boolean }> = {
   claude: {
     src: "data:image/svg+xml,%3csvg%20width='24'%20height='24'%20viewBox='0%200%2024%2024'%20fill='none'%20xmlns='http://www.w3.org/2000/svg'%3e%3cpath%20d='M12.5088%200.00292969C12.6946%200.0286268%2012.9018%200.0283452%2013.0938%200.0478516C13.5758%200.0932324%2014.0549%200.167193%2014.5283%200.268555C17.3121%200.869188%2019.7921%202.43961%2021.5254%204.69922C22.7038%206.23717%2023.4925%208.03736%2023.8242%209.94629C23.878%2010.2575%2023.9197%2010.5713%2023.9492%2010.8857C23.9624%2011.0364%2023.9734%2011.354%2024%2011.4883V12.5215C23.9582%2012.7249%2023.9575%2013.0548%2023.9346%2013.2734C23.8842%2013.7421%2023.8058%2014.2075%2023.7012%2014.667C23.0305%2017.6081%2021.2775%2020.1889%2018.79%2021.8955C17.3676%2022.8709%2015.7518%2023.5292%2014.0527%2023.8262C13.7475%2023.8801%2013.4396%2023.9216%2013.1309%2023.9492C13.0311%2023.958%2012.6116%2023.9804%2012.5459%2024H11.4561C11.3898%2023.9811%2010.9218%2023.9534%2010.8164%2023.9434C10.4737%2023.9091%2010.1325%2023.8603%209.79395%2023.7969C7.83176%2023.4294%205.99231%2022.5782%204.44141%2021.3213C2.22749%2019.5256%200.724672%2017.0005%200.202148%2014.1982C0.128034%2013.7983%200.0735237%2013.3946%200.0390625%2012.9893C0.022862%2012.7876%200.0201573%2012.5562%200%2012.3623V11.6074C0.0182209%2011.4158%200.0234242%2011.2135%200.0390625%2011.0195C0.0666679%2010.692%200.106158%2010.3654%200.15918%2010.041C0.500533%207.9821%201.37255%206.04761%202.68848%204.42773C4.42465%202.29186%206.84293%200.81853%209.53711%200.254883C9.95703%200.166565%2010.3816%200.101085%2010.8086%200.0585938C11.0559%200.0342254%2011.3026%200.0249623%2011.5469%200H12.4883L12.5088%200.00292969ZM5.7002%207.10156L5.70117%2011.2637H3.59961L3.60059%2013.4326L5.7002%2013.4336C5.70026%2014.1276%205.68763%2014.8624%205.70117%2015.5527H6.74121V17.6016H7.80176V15.5527H8.84375L8.8418%2017.6016H9.90137V15.5527H14.0996C14.0996%2016.2309%2014.0923%2016.9248%2014.1006%2017.6016H15.1602V15.5527H16.2002C16.2002%2016.2206%2016.1864%2016.9382%2016.2012%2017.6016H17.2607V15.5527H18.3018V13.4336H20.4014V11.2637H18.2998V7.10156H5.7002ZM8.84277%209.27148V11.2617C8.52811%2011.2757%208.12327%2011.2638%207.80176%2011.2637V9.27051L8.84277%209.27148ZM16.2002%2011.2637H15.1562V9.27148L16.2002%209.27051V11.2637Z'%20fill='%23D87757'/%3e%3c/svg%3e",
@@ -1393,7 +1393,6 @@ export function AgentHarnessPicker({
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
-  const triggerRef = useRef<HTMLButtonElement>(null);
   const triggerModel = triggerDetails.find((detail) => detail.label === "Model");
   const triggerEffort = triggerDetails.find(
     (detail) => detail.label === "Effort" || detail.label === "Thinking level",
@@ -1438,142 +1437,44 @@ export function AgentHarnessPicker({
       harnessUnavailableReasonOnHost(agent.harness, host),
       collapsedBadge,
     );
-    const editClassName = cn(
-      "composer-agent-edit h-8 shrink-0 rounded-none py-0 text-xs leading-4 text-muted-foreground focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
-      active
-        ? "opacity-100"
-        : "opacity-0 group-hover/agent:opacity-100 group-focus-within/agent:opacity-100",
-    );
-    const rowContent = (
-      <>
-        <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-0 pl-2 text-[13px] leading-5">
-          <ComposerAgentIcon agent={agent} />
-          <span
-            className={cn("flex min-w-0 items-center gap-1 text-left", active && "font-medium")}
-          >
-            <span className="truncate">{agent.display_name}</span>
-            {unavailable && (
-              <span
-                title={warning}
-                aria-label={warning}
-                data-testid={`new-chat-landing-agent-warning-${agent.id}`}
-                className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
-              >
-                <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
-              </span>
-            )}
-          </span>
-          {blurb ? (
-            <span className="relative min-w-0 flex-1 text-xs leading-5 text-muted-foreground">
-              <span
-                className={cn(
-                  "block truncate",
-                  active
-                    ? "invisible"
-                    : "group-hover/agent:invisible group-focus-within/agent:invisible",
-                )}
-              >
-                {blurb}
-              </span>
-              <span
-                className={cn(
-                  "absolute inset-0 truncate text-left",
-                  active
-                    ? "opacity-100"
-                    : "opacity-0 group-hover/agent:opacity-100 group-focus-within/agent:opacity-100",
-                )}
-              >
-                {summary}
-              </span>
-            </span>
-          ) : (
-            <span
-              data-testid={`new-chat-landing-agent-summary-${agent.id}`}
-              className={cn(
-                "ml-auto min-w-0 flex-1 whitespace-normal break-words text-left text-xs leading-4 text-muted-foreground",
-                active
-                  ? "opacity-100"
-                  : "opacity-0 group-hover/agent:opacity-100 group-focus-within/agent:opacity-100",
-              )}
-            >
-              {summary}
-            </span>
-          )}
-        </span>
-        {editable && (
-          <span
-            aria-label={`Edit ${agent.display_name} configuration`}
-            data-testid={`new-chat-landing-agent-config-${agent.id}`}
-            className={cn(
-              editClassName,
-              "flex cursor-pointer items-center px-0",
-              isMobile && "opacity-100",
-            )}
-          >
-            Edit
-          </span>
-        )}
-      </>
-    );
-    const rowClassName = cn(
-      "composer-agent-row group/agent relative flex min-h-8 w-full items-center gap-1 rounded-lg pr-3 transition-colors hover:bg-muted focus:bg-muted [&>svg]:hidden",
-      active && "bg-muted",
-    );
-    if (editable && !isMobile) {
-      return (
-        <DropdownMenuSub
-          key={agent.id}
-          open={configAgentId === agent.id}
-          onOpenChange={(next) => {
-            if (next) {
-              onSelectAgent(agent);
-              setConfigAgentId(agent.id);
-            } else {
-              setConfigAgentId((current) => (current === agent.id ? null : current));
-            }
-          }}
-        >
-          <DropdownMenuSubTrigger
-            data-testid={`new-chat-landing-agent-${agent.id}`}
-            data-harness-menu-row=""
-            data-active={active ? "true" : undefined}
-            className={rowClassName}
-            onPointerMove={(event) => event.preventDefault()}
-          >
-            {rowContent}
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent
-            className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] overflow-y-auto p-2"
-            sideOffset={16}
-            collisionPadding={12}
-            onFocusOutside={(event) => {
-              if (event.target instanceof Element && event.target.getAttribute("role") === "menu") {
-                event.preventDefault();
-              }
-            }}
-          >
-            {active ? selectedConfigContent : null}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-      );
-    }
     return (
-      <DropdownMenuItem
+      <HarnessPickerEntry
         key={agent.id}
-        data-testid={`new-chat-landing-agent-${agent.id}`}
-        data-harness-menu-row=""
-        data-active={active ? "true" : undefined}
-        className={rowClassName}
-        onSelect={(event) => {
-          onSelectAgent(agent);
-          if (editable) {
-            event.preventDefault();
-            setMenuPage("config");
+        open={configAgentId === agent.id}
+        onOpenChange={(next) => {
+          if (next) {
+            onSelectAgent(agent);
+            setConfigAgentId(agent.id);
+            if (isMobile) setMenuPage("config");
+          } else {
+            setConfigAgentId((current) => (current === agent.id ? null : current));
           }
         }}
-      >
-        {rowContent}
-      </DropdownMenuItem>
+        onSelect={editable ? undefined : () => onSelectAgent(agent)}
+        configContent={active ? selectedConfigContent : null}
+        testId={`new-chat-landing-agent-${agent.id}`}
+        icon={<ComposerAgentIcon agent={agent} />}
+        label={agent.display_name}
+        summary={summary}
+        description={blurb}
+        active={active}
+        editable={editable}
+        isMobile={isMobile}
+        summaryTestId={`new-chat-landing-agent-summary-${agent.id}`}
+        editTestId={`new-chat-landing-agent-config-${agent.id}`}
+        warning={
+          unavailable && (
+            <span
+              title={warning}
+              aria-label={warning}
+              data-testid={`new-chat-landing-agent-warning-${agent.id}`}
+              className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
+            >
+              <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+            </span>
+          )
+        }
+      />
     );
   };
 
@@ -1677,25 +1578,6 @@ export function AgentHarnessPicker({
     if (menuPage === "config" && !showConfig) setMenuPage(null);
   }, [menuPage, showMore, showCustom, showConfig]);
 
-  const menuTrigger = (
-    <DropdownMenuTrigger asChild>
-      <ComposerHarnessTrigger
-        ref={triggerRef}
-        disabled={!hasAgents}
-        label={triggerAccessibleName}
-        model={
-          visibleModelText ||
-          (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "")
-        }
-        effort={visibleEffortText}
-        icon={triggerIcon}
-        className={triggerClassName}
-        labelClassName={triggerLabelClassName}
-        testIdPrefix="new-chat-landing"
-        data-testid="new-chat-landing-agent-select"
-      />
-    </DropdownMenuTrigger>
-  );
   // Structured rows (bold keys, like the session composer's pill) win over
   // prose; either renders as a real tooltip surface, never the unstyled
   // native `title` hover.
@@ -1706,7 +1588,7 @@ export function AgentHarnessPicker({
   );
 
   return (
-    <DropdownMenu
+    <HarnessPicker
       modal={dropdownModal}
       open={open}
       onOpenChange={(next) => {
@@ -1720,226 +1602,193 @@ export function AgentHarnessPicker({
           }
         }
       }}
+      trigger={{
+        disabled: !hasAgents,
+        label: triggerAccessibleName,
+        model:
+          visibleModelText ||
+          (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : ""),
+        effort: visibleEffortText,
+        icon: triggerIcon,
+        className: triggerClassName,
+        labelClassName: triggerLabelClassName,
+        testIdPrefix: "new-chat-landing",
+        "data-testid": "new-chat-landing-agent-select",
+      }}
+      tooltip={triggerTooltipContent}
+      tooltipTestId="new-chat-landing-agent-tooltip"
+      contentAlign={contentAlign}
+      contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
+      configOpen={configAgentId !== null}
     >
-      {triggerTooltipContent == null ? (
-        menuTrigger
+      {showConfig ? (
+        <HarnessPickerConfigPage
+          backTestId="new-chat-landing-page-back"
+          onBack={() => setMenuPage(null)}
+        >
+          {selectedConfigContent}
+        </HarnessPickerConfigPage>
+      ) : showMore ? (
+        // Mobile drill-in page for the "needs setup" harnesses.
+        <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+          <DropdownMenuItem
+            data-testid="new-chat-landing-page-back"
+            onSelect={(e) => {
+              e.preventDefault();
+              setMenuPage(null);
+            }}
+            className="items-center font-medium"
+          >
+            <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
+            <span className="truncate">Other...</span>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          {moreHarnessEntries.map(renderEntry)}
+        </div>
+      ) : showCustom ? (
+        // Mobile drill-in page for custom agents.
+        <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+          <DropdownMenuItem
+            data-testid="new-chat-landing-page-back"
+            onSelect={(e) => {
+              e.preventDefault();
+              setMenuPage(null);
+            }}
+            className="items-center font-medium"
+          >
+            <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
+            <span className="truncate">Custom agents</span>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          {customAgentsBody}
+        </div>
       ) : (
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              {/* `flex min-w-0` keeps the label's truncation chain flowing
-                  through this wrapper, like the session composer's pill. */}
-              <span className="flex min-w-0">{menuTrigger}</span>
-            </TooltipTrigger>
-            <TooltipContent
-              side="top"
-              className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
-              data-testid="new-chat-landing-agent-tooltip"
-            >
-              {triggerTooltipContent}
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-      )}
-      <DropdownMenuContent
-        align={contentAlign}
-        onPointerMoveCapture={(event) => {
-          if (configAgentId !== null && event.currentTarget.contains(event.target as Node)) {
-            event.preventDefault();
-          }
-        }}
-        // Keep the menu inside the viewport on short mobile screens: pad the
-        // collision box so the available-height cap leaves room below the
-        // status bar, and let it flip/scroll rather than run off the top.
-        collisionPadding={12}
-        avoidCollisions
-        // `contentClassName` (default undefined) lets an embedder tighten the
-        // height cap / pin a width; tailwind-merge lets the passed max-h/width
-        // override the defaults.
-        className={cn(
-          "composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[17.5rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2",
-          showConfig && "composer-agent-config-menu",
-          contentClassName,
-        )}
-      >
-        {showConfig ? (
-          <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
-            <DropdownMenuItem
-              data-testid="new-chat-landing-page-back"
-              onSelect={(event) => {
-                event.preventDefault();
-                setMenuPage(null);
-              }}
-              className="items-center font-medium"
-            >
-              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
-              <span className="truncate">{agentLabel}</span>
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            {selectedConfigContent}
-          </div>
-        ) : showMore ? (
-          // Mobile drill-in page for the "needs setup" harnesses.
-          <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
-            <DropdownMenuItem
-              data-testid="new-chat-landing-page-back"
-              onSelect={(e) => {
-                e.preventDefault();
-                setMenuPage(null);
-              }}
-              className="items-center font-medium"
-            >
-              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
-              <span className="truncate">Other...</span>
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            {moreHarnessEntries.map(renderEntry)}
-          </div>
-        ) : showCustom ? (
-          // Mobile drill-in page for custom agents.
-          <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
-            <DropdownMenuItem
-              data-testid="new-chat-landing-page-back"
-              onSelect={(e) => {
-                e.preventDefault();
-                setMenuPage(null);
-              }}
-              className="items-center font-medium"
-            >
-              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
-              <span className="truncate">Custom agents</span>
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            {customAgentsBody}
-          </div>
-        ) : (
-          <>
-            {/* Smart Routing sits in its own unlabeled group above the
+        <>
+          {/* Smart Routing sits in its own unlabeled group above the
             harnesses: it routes over them rather than being one of them. */}
-            {(autoHarnessAvailable || onSelectAutoHarness != null) && (
-              <div
-                title={
+          {(autoHarnessAvailable || onSelectAutoHarness != null) && (
+            <div
+              title={
+                !autoHarnessAvailable
+                  ? "Requires enabled routing, the workspace AI gateway router, and configured Claude Code and Codex harnesses."
+                  : undefined
+              }
+            >
+              <DropdownMenuItem
+                data-testid="new-chat-landing-harness-smart-routing"
+                data-active={autoHarnessActive ? "true" : undefined}
+                disabled={!autoHarnessAvailable}
+                aria-description={
                   !autoHarnessAvailable
                     ? "Requires enabled routing, the workspace AI gateway router, and configured Claude Code and Codex harnesses."
                     : undefined
                 }
+                onSelect={() => {
+                  if (!autoHarnessAvailable) return;
+                  onSelectAutoHarness?.();
+                  setOpen(false);
+                }}
+                className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
-                <DropdownMenuItem
-                  data-testid="new-chat-landing-harness-smart-routing"
-                  data-active={autoHarnessActive ? "true" : undefined}
-                  disabled={!autoHarnessAvailable}
-                  aria-description={
-                    !autoHarnessAvailable
-                      ? "Requires enabled routing, the workspace AI gateway router, and configured Claude Code and Codex harnesses."
-                      : undefined
-                  }
-                  onSelect={() => {
-                    if (!autoHarnessAvailable) return;
-                    onSelectAutoHarness?.();
-                    setOpen(false);
-                  }}
-                  className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
-                >
-                  <WandSparklesIcon className="size-4" aria-hidden="true" />
-                  <span className="min-w-0 flex-1 truncate text-left">{SMART_ROUTING_LABEL}</span>
-                  <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
-                    Harness + model
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-              </div>
-            )}
-            {/* Harnesses group — the native terminal CLIs (Claude Code is the
+                <WandSparklesIcon className="size-4" aria-hidden="true" />
+                <span className="min-w-0 flex-1 truncate text-left">{SMART_ROUTING_LABEL}</span>
+                <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
+                  Harness + model
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </div>
+          )}
+          {/* Harnesses group — the native terminal CLIs (Claude Code is the
             default), so the most-used picks lead. Ready-to-use harnesses list
             inline; "needs setup" ones fold into a "More" group. */}
-            {(readyHarnessEntries.length > 0 || moreHarnessEntries.length > 0) && (
-              <>
-                <PickerSectionHeader>Harnesses</PickerSectionHeader>
-                {readyHarnessEntries.map(renderEntry)}
-                {moreHarnessEntries.length > 0 &&
-                  (isMobile ? (
-                    // Touch: drill into a "More" page in place (with Back).
-                    <DropdownMenuItem
+          {(readyHarnessEntries.length > 0 || moreHarnessEntries.length > 0) && (
+            <>
+              <PickerSectionHeader>Harnesses</PickerSectionHeader>
+              {readyHarnessEntries.map(renderEntry)}
+              {moreHarnessEntries.length > 0 &&
+                (isMobile ? (
+                  // Touch: drill into a "More" page in place (with Back).
+                  <DropdownMenuItem
+                    data-testid="new-chat-landing-harness-more"
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      setMenuPage("more");
+                    }}
+                    className="items-center"
+                  >
+                    <span className="flex-1 text-left">{otherHarnessLabel}</span>
+                    <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
+                  </DropdownMenuItem>
+                ) : (
+                  // Desktop: hover flyout submenu.
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger
                       data-testid="new-chat-landing-harness-more"
-                      onSelect={(e) => {
-                        e.preventDefault();
-                        setMenuPage("more");
+                      className="cursor-pointer items-center"
+                      onPointerLeave={(event) => {
+                        const target = event.relatedTarget;
+                        if (
+                          target instanceof Element &&
+                          target.closest('[role="menu"]')?.getAttribute("aria-labelledby") ===
+                            event.currentTarget.id
+                        ) {
+                          event.preventDefault();
+                        }
                       }}
-                      className="items-center"
                     >
                       <span className="flex-1 text-left">{otherHarnessLabel}</span>
-                      <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
-                    </DropdownMenuItem>
-                  ) : (
-                    // Desktop: hover flyout submenu.
-                    <DropdownMenuSub>
-                      <DropdownMenuSubTrigger
-                        data-testid="new-chat-landing-harness-more"
-                        className="cursor-pointer items-center"
-                        onPointerLeave={(event) => {
-                          const target = event.relatedTarget;
-                          if (
-                            target instanceof Element &&
-                            target.closest('[role="menu"]')?.getAttribute("aria-labelledby") ===
-                              event.currentTarget.id
-                          ) {
-                            event.preventDefault();
-                          }
-                        }}
-                      >
-                        <span className="flex-1 text-left">{otherHarnessLabel}</span>
-                      </DropdownMenuSubTrigger>
-                      <DropdownMenuSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
-                        {moreHarnessEntries.map(renderEntry)}
-                      </DropdownMenuSubContent>
-                    </DropdownMenuSub>
-                  ))}
-                <DropdownMenuSeparator />
-              </>
-            )}
-            {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
-            <PickerSectionHeader>Agents</PickerSectionHeader>
-            {bundleEntries.map(renderEntry)}
-            {/* Existing custom agents fold into a "Custom agents" submenu (with
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
+                      {moreHarnessEntries.map(renderEntry)}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                ))}
+              <DropdownMenuSeparator />
+            </>
+          )}
+          {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
+          <PickerSectionHeader>Agents</PickerSectionHeader>
+          {bundleEntries.map(renderEntry)}
+          {/* Existing custom agents fold into a "Custom agents" submenu (with
             the pending upload and the create action). With no custom agents the
             submenu would hold only "Create custom agent", so we surface that as
             a top-level row instead — otherwise creation is invisible on a fresh
             server. A managed sandbox has no create path, so neither appears. */}
-            {hasCustomGroup &&
-              (isMobile ? (
-                // Touch: drill into a "Custom agents" page in place (with Back).
-                <DropdownMenuItem
+          {hasCustomGroup &&
+            (isMobile ? (
+              // Touch: drill into a "Custom agents" page in place (with Back).
+              <DropdownMenuItem
+                data-testid="new-chat-landing-custom-agents"
+                onSelect={(e) => {
+                  e.preventDefault();
+                  setMenuPage("custom");
+                }}
+                className="items-center"
+              >
+                <span className="flex-1 text-left">Other...</span>
+                <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
+              </DropdownMenuItem>
+            ) : (
+              // Desktop: hover flyout submenu.
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger
                   data-testid="new-chat-landing-custom-agents"
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    setMenuPage("custom");
-                  }}
-                  className="items-center"
+                  className="cursor-pointer items-center"
                 >
                   <span className="flex-1 text-left">Other...</span>
-                  <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
-                </DropdownMenuItem>
-              ) : (
-                // Desktop: hover flyout submenu.
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger
-                    data-testid="new-chat-landing-custom-agents"
-                    className="cursor-pointer items-center"
-                  >
-                    <span className="flex-1 text-left">Other...</span>
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
-                    {customAgentsBody}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-              ))}
-            {/* No custom agents to group: surface the create action directly so
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
+                  {customAgentsBody}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            ))}
+          {/* No custom agents to group: surface the create action directly so
             it stays discoverable instead of hiding behind an empty submenu. */}
-            {!hasCustomGroup && createAgentItem}
-          </>
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
+          {!hasCustomGroup && createAgentItem}
+        </>
+      )}
+    </HarnessPicker>
   );
 }
 
@@ -2597,7 +2446,8 @@ export function NewChatLandingScreen() {
           }))
         : (hostClaudeModelOptions ?? []).map((option) => ({
             id: option.id,
-            displayName: option.displayName ?? option.id,
+            model: option.model,
+            displayName: nativeModelLabel(option),
             // Keep the catalog's default marker: the Default row names the
             // model a bare launch truly runs, for claude exactly as codex.
             isDefault: option.isDefault,
@@ -6204,7 +6054,7 @@ export function NewChatLandingScreen() {
                         autoHarnessAvailable={smartRoutingHarnessAvailable}
                         autoHarnessActive={smartRoutingHarnessSelected}
                         onSelectAutoHarness={handleSelectSmartRoutingHarness}
-                        contentClassName="w-[22rem] min-w-0"
+                        contentClassName={COMPOSER_HARNESS_MENU_SIZE}
                         triggerClassName="text-[13px] leading-5"
                       />
                     </div>

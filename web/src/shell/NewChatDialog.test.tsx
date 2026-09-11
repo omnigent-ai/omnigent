@@ -1736,13 +1736,13 @@ describe("NewChatLandingScreen", () => {
       "max-w-full",
       "gap-1",
       "rounded-lg",
-      "pl-2",
-      "pr-0",
+      "px-2",
+      "py-0",
       "text-[13px]",
       "leading-5",
       "md:min-h-7",
     );
-    expect(harness).not.toHaveClass("px-2");
+    expect(harness).not.toHaveClass("pr-0");
     expect(voice).toHaveClass("size-8", "md:size-7");
     expect(submit).toHaveClass("size-8", "md:size-7");
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
@@ -1815,6 +1815,21 @@ describe("NewChatLandingScreen", () => {
     expect(worktree).toBeDisabled();
   });
 
+  it("resolves family-only host labels in the landing picker", () => {
+    mockClaudeModels([
+      { id: "opus", model: "system.ai.claude-opus-4-6", displayName: "Opus", isDefault: true },
+    ]);
+    renderLanding();
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.6, Effort Default");
+    fireEvent.pointerDown(picker, { button: 0 });
+    const summary = screen.getByTestId("new-chat-landing-agent-summary-a1");
+    expect(summary).toHaveTextContent("Opus 4.6");
+    expect(summary).toHaveClass("text-right");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.6");
+  });
+
   it("renders structured model and effort details in the harness picker", async () => {
     mockClaudeModels([
       {
@@ -1858,7 +1873,8 @@ describe("NewChatLandingScreen", () => {
       "min-w-0",
       "whitespace-normal",
       "break-words",
-      "text-ui",
+      "text-[13px]",
+      "leading-5",
       "font-medium",
       "text-foreground",
     );
@@ -1867,7 +1883,7 @@ describe("NewChatLandingScreen", () => {
 
     fireEvent.pointerDown(picker, { button: 0 });
     const [rootMenu] = screen.getAllByRole("menu");
-    expect(rootMenu).toHaveClass("w-[22rem]", "min-w-0", "composer-agent-menu");
+    expect(rootMenu).toHaveClass("w-[17.5rem]", "min-w-0", "composer-agent-menu");
     expect(screen.getByTestId("new-chat-landing-agent-a1").querySelector("img")).toHaveAttribute(
       "src",
       productIcon?.getAttribute("src"),
@@ -1876,7 +1892,7 @@ describe("NewChatLandingScreen", () => {
     expect(editConfig).toHaveTextContent(/^Edit$/);
     expect(editConfig).toHaveAttribute("aria-label", "Edit Claude Code configuration");
     expect(editConfig).toHaveClass("composer-agent-edit");
-    expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveClass("text-left");
+    expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveClass("text-right");
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toContainElement(editConfig);
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
     const menus = screen.getAllByRole("menu");
@@ -1895,7 +1911,8 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
       "shrink-0",
-      "text-ui",
+      "text-[13px]",
+      "leading-5",
       "font-normal",
       "text-muted-foreground",
     );
@@ -2021,9 +2038,9 @@ describe("NewChatLandingScreen", () => {
     const model = screen.getByTestId("new-chat-landing-agent-model-value");
     const voice = screen.getByRole("button", { name: "Voice dictation" });
     const submit = screen.getByTestId("new-chat-landing-submit");
-    expect(picker).toHaveClass("w-auto", "max-w-full", "pl-2", "pr-0");
+    expect(picker).toHaveClass("w-auto", "max-w-full", "px-2", "py-0");
     expect(picker).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
-    expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "px-2");
+    expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "pr-0");
     expect(model).toHaveClass("min-w-0", "whitespace-normal", "break-words");
     expect(model).not.toHaveClass("truncate");
     expect(model).toHaveTextContent("Extraordinarily Long Claude Model Name");
@@ -6178,6 +6195,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(chip.textContent).not.toContain("Claude Code");
     // The routing description rides the styled tooltip, not the native hover.
     expect(chip).not.toHaveAttribute("title");
+    fireEvent.pointerEnter(chip);
     fireEvent.focus(chip);
     const chipTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
     expect(chipTooltip).toHaveTextContent("Harness and model picked per task by smart routing");
