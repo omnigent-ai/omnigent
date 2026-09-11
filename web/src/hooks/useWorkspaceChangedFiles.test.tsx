@@ -1191,6 +1191,56 @@ describe("useWorkspaceFileExists", () => {
     );
     await waitFor(() => expect(results.at(-1)).toEqual({ exists: true, settled: true }));
   });
+
+  it("never settles a check it skipped (bare basename, untrusted)", async () => {
+    // Not path-shaped and not trusted → no listing ever runs. Skipped means
+    // "unknown", not "verified absent": reporting it settled turned real
+    // root-level files cited by bare basename (README.md, Makefile) into
+    // dead links with a false "not found" toast.
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="README.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await flushMicrotasks();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(results.at(-1)).toEqual({ exists: false, settled: false });
+  });
+
+  it("does not settle on a listing error", async () => {
+    // Only a listing that actually completed proves absence; a transient 500
+    // (or gateway/network failure) leaves the answer open rather than
+    // declaring an otherwise-openable file dead.
+    fetchMock.mockResolvedValue(jsonResponse({ error: {} }, 500));
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/notes.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await flushMicrotasks();
+    expect(results.at(-1)).toEqual({ exists: false, settled: false });
+  });
+
+  it("does not settle while the runner is unavailable", async () => {
+    // runner_unavailable 503 answers "couldn't check right now", not "the
+    // directory is empty" — a parked runner must not verify absence.
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/notes.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await flushMicrotasks();
+    expect(results.at(-1)).toEqual({ exists: false, settled: false });
+  });
 });
 
 describe("shouldRetryRunnerOffline", () => {

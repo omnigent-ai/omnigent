@@ -11,7 +11,7 @@
 // Both should instead open the FileViewer, exactly as an inline-code path does.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
@@ -70,7 +70,7 @@ const FILE_VIEWER = {
   openGithubTab: () => {},
   isChangedPath: (p: string) => changedPaths.includes(p),
   conversationId: undefined as string | undefined,
-  workspaceRoot: WORKSPACE,
+  workspaceRoot: WORKSPACE as string | null,
   workspaceHome: "/home/u",
 };
 
@@ -294,5 +294,61 @@ describe("dead file links give feedback instead of a silent no-op", () => {
     expect(screen.queryByRole("button", { name: "pending" })).toBeNull();
     expect(screen.getByText("pending")).toBeInTheDocument();
     expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a bare-basename link inert — a skipped check is not proof of absence", () => {
+    // `[README.md](README.md)` in a live session: the path-shape heuristic
+    // skips the listing (bare basename, untrusted resolution), so nothing
+    // was ever verified. The link must stay plain text — not grow the
+    // dead-link affordance and toast a false "not found" about a real,
+    // openable root-level file.
+    renderMarkdown("[README.md](README.md)", [], FILE_VIEWER_WITH_SESSION);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "README.md" })).toBeNull();
+    expect(screen.getByText("README.md")).toBeInTheDocument();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("stays inert when the parent listing errors — an error is not proof of absence", async () => {
+    // A transient 500 (or gateway/network failure) must degrade to plain
+    // text, not declare an otherwise-openable file permanently dead.
+    fetchMock.mockResolvedValue(jsonResponse({ error: {} }, 500));
+    renderMarkdown("[maybe](/outside/dir/file.txt)", [], FILE_VIEWER_WITH_SESSION);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "maybe" })).toBeNull();
+    expect(screen.getByText("maybe")).toBeInTheDocument();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("stays inert for an absolute link while the workspace root is still unknown", () => {
+    // Until the environment metadata loads, inside/outside the workspace
+    // can't be told apart. That window is "not verified yet", never "known
+    // dead" — the link self-heals once the root arrives.
+    renderMarkdown("[hosts](/etc/hosts)", [], {
+      ...FILE_VIEWER_WITH_SESSION,
+      workspaceRoot: null,
+    });
+
+    expect(screen.queryByRole("button", { name: "hosts" })).toBeNull();
+    expect(screen.getByText("hosts")).toBeInTheDocument();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("explains a hard-rejected path without claiming it wasn't found", async () => {
+    // Traversal segments are rejected by the resolver — the filesystem was
+    // never searched — so the feedback must say the path doesn't resolve,
+    // not assert the file is missing.
+    renderMarkdown(`[trap](${WORKSPACE}/../../etc/hosts)`, [], FILE_VIEWER_WITH_SESSION);
+
+    const dead = await screen.findByRole("button", { name: "trap" });
+    fireEvent.click(dead);
+    expect(openFile).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledTimes(1);
+    const message = String(toastMock.mock.calls[0][0]);
+    expect(message).toContain("doesn't resolve");
+    expect(message).not.toContain("wasn't found");
   });
 });

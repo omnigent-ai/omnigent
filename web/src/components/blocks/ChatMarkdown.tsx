@@ -47,11 +47,12 @@ interface WorkspaceFileOpener {
    */
   open: (() => void) | null;
   /**
-   * True when the path is *definitively* not openable — it failed to resolve,
-   * or the existence check settled without finding it. False while the check
-   * is still in flight (or can't run), so a link renderer can distinguish
-   * "known dead" (give the user feedback) from "not verified yet" (stay
-   * inert).
+   * True when the path is *definitively* not openable — resolution rejected
+   * it outright (traversal segments, the root itself, …), or a parent
+   * listing genuinely completed without finding it. False while the check is
+   * still in flight, skipped, errored, or waiting on the workspace root, so
+   * a link renderer can distinguish "known dead" (give the user feedback)
+   * from "not verified yet" (stay inert).
    */
   unopenable: boolean;
   /** The path resolution produced, for feedback messaging; "" when none. */
@@ -94,12 +95,17 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
   );
 
   if (!openFile || !linkPath || !(isChanged || exists)) {
+    // An absolute / "~"-relative citation is unjudgeable until the workspace
+    // root is known — resolution returning null then means "not yet", not
+    // "never"; it self-resolves once the environment metadata loads.
+    const rootPending = root === null && (cited.startsWith("/") || cited.startsWith("~"));
     return {
       open: null,
       // Without a FileViewer nothing could ever open, so "unopenable" would
-      // be noise; with one, a failed resolution is final immediately and a
-      // resolved path is final once its existence check settles.
-      unopenable: !!openFile && (linkPath === null || (settled && !exists)),
+      // be noise; with one, a hard-rejected resolution is final immediately
+      // and a resolved path is final once its existence check settles with a
+      // completed listing (skipped/pending/errored checks stay unverified).
+      unopenable: !!openFile && !rootPending && (linkPath === null || (settled && !exists)),
       resolvedPath: linkPath ?? "",
     };
   }
@@ -236,9 +242,15 @@ function WorkspaceFileLink({
     // why nothing opens — which is all the feedback a touch user can get,
     // where a silent non-link reads as "tapping does nothing".
     if (unopenable) {
-      const cited = resolvedPath || path;
+      // Two distinct dead ends: a path the resolver rejected outright was
+      // never searched (claiming it "wasn't found" would be false), while a
+      // resolved path genuinely came up absent from its parent listing.
       const explain = () =>
-        showToast(`Can't open ${cited}: it wasn't found in this session's reachable filesystem.`);
+        showToast(
+          resolvedPath
+            ? `Can't open ${resolvedPath}: it wasn't found in this session's reachable filesystem.`
+            : `Can't open ${path}: it doesn't resolve to an openable file path.`,
+        );
       return (
         <span
           role="button"

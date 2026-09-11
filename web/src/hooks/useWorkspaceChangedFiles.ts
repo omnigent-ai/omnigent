@@ -743,7 +743,7 @@ function hasUnsafeSegments(rel: string): boolean {
 async function fetchDirEntriesTolerant(
   conversationId: string,
   dirPath: string,
-): Promise<WorkspaceFile[]> {
+): Promise<WorkspaceFile[] | null> {
   // An empty dirPath is the workspace root — its listing lives at the bare
   // ``/filesystem`` endpoint, not ``/filesystem/`` (a root-level file like
   // ``foo.md`` resolves to a "" parent). A leading slash marks a
@@ -766,7 +766,10 @@ async function fetchDirEntriesTolerant(
   // for this caller that reads the same as "no such openable file". Degrade
   // both to "no entries" rather than surfacing an error.
   if (res.status === 404 || res.status === 403) return [];
-  if (await isRunnerUnavailable503(res)) return [];
+  // A parked/unavailable runner can't answer at all — that's "couldn't
+  // check" (null), not a verified-absent empty listing, so a dead-link
+  // affordance never grows out of a runner that's merely offline.
+  if (await isRunnerUnavailable503(res)) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // Relative listings echo full workspace-relative paths (kept as-is);
   // host-absolute listings echo names relative to the listed dir, so the
@@ -783,11 +786,13 @@ export interface WorkspaceFileExistence {
   /** True when the parent listing confirms `path` names an existing file. */
   exists: boolean;
   /**
-   * True once the answer is final for the current inputs: the listing query
-   * resolved (successfully or not), or no check will ever run because the
-   * candidate isn't path-shaped. False while the query is still loading or
-   * disabled (no conversation, workspace not serveable) — callers use this to
-   * tell "definitively absent" apart from "not verified yet".
+   * True only when a parent listing actually completed successfully for the
+   * current inputs, so `exists: false` means "verified absent". False while
+   * the query is loading, disabled (no conversation, workspace not
+   * serveable), errored, answered by an unavailable runner, or skipped
+   * because the candidate isn't path-shaped — in all of those the check
+   * never ran to completion, so nothing was *verified* and callers must not
+   * treat the file as known-missing.
    */
   settled: boolean;
 }
@@ -843,9 +848,14 @@ export function useWorkspaceFileExists(
     // path span, so a 30s cache keeps repeated mentions from re-listing.
     staleTime: 30_000,
   });
-  if (!candidate) return { exists: false, settled: true };
-  const exists = (query.data ?? []).some((e) => e.type === "file" && e.path === candidate);
-  return { exists, settled: query.isSuccess || query.isError };
+  // No candidate = the check was SKIPPED (not path-shaped and untrusted),
+  // not run-and-found-nothing — it must never read as "verified absent".
+  if (!candidate) return { exists: false, settled: false };
+  const entries = query.data ?? null;
+  const exists = !!entries?.some((e) => e.type === "file" && e.path === candidate);
+  // Only a listing that genuinely completed proves absence: errors and
+  // unavailable-runner responses (data === null) leave the answer open.
+  return { exists, settled: query.isSuccess && entries !== null };
 }
 
 // ── Default environment (working folder root) ─────────────────────────────────

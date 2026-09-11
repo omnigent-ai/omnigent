@@ -1816,9 +1816,13 @@ describe("BlockRenderer inline file-path linkification", () => {
     expect(fetchMock.mock.calls[0][0]).toContain("/filesystem/src?");
   });
 
-  it("leaves an absolute path OUTSIDE the workspace root as plain code (no fetch)", async () => {
-    // `/etc/hosts` is absolute but not under the root → unresolvable → must
-    // never linkify, and must not trigger an existence listing.
+  it("linkifies an absolute path OUTSIDE the workspace root via a base=host listing", async () => {
+    // `/etc/hosts` is absolute and not under the root. Previously that was
+    // unresolvable dead text; now it stays host-absolute, its ABSOLUTE parent
+    // is listed via base=host (the files panel's browse-anywhere plumbing —
+    // entries echo names relative to the listed dir, same wire shape as a
+    // root listing), and a confirmed file linkifies and opens host-absolute.
+    fetchMock.mockResolvedValue(rootListingResponse(["hosts"]));
     const openFile = vi.fn();
     renderMessage("Check `/etc/hosts` on the box.", {
       openFile,
@@ -1828,9 +1832,12 @@ describe("BlockRenderer inline file-path linkification", () => {
       workspaceHome: "/home/u",
     });
 
-    const span = await screen.findByText("/etc/hosts");
-    expect(span.tagName).toBe("CODE");
-    expect(screen.queryByRole("button", { name: "/etc/hosts" })).toBeNull();
-    expect(fetchMock).not.toHaveBeenCalled();
+    const link = await screen.findByRole("button", { name: "/etc/hosts" });
+    link.click();
+    expect(openFile).toHaveBeenCalledWith("/etc/hosts");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/filesystem/etc?");
+    expect(url).toContain("base=host");
   });
 });
