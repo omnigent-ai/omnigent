@@ -3588,6 +3588,8 @@ def _tmux_profile_detail(prepared: PreparedClaudeTerminal) -> str:
     :returns: Human-readable attach-path detail, e.g.
         ``"direct-tmux target=main"`` or ``"websocket attach"``.
     """
+    if _experimental_control_mode_attach_enabled():
+        return "websocket attach (experimental control mode)"
     if (
         isinstance(prepared.tmux_socket, Path)
         and prepared.tmux_target is not None
@@ -3597,6 +3599,11 @@ def _tmux_profile_detail(prepared: PreparedClaudeTerminal) -> str:
     if prepared.tmux_socket is not None and prepared.tmux_target is not None:
         return "websocket attach (tmux socket not local)"
     return "websocket attach"
+
+
+def _experimental_control_mode_attach_enabled() -> bool:
+    """Opt into terminal-owned selection through the existing WebSocket bridge."""
+    return os.environ.get("OMNIGENT_EXPERIMENTAL_CLAUDE_CONTROL_MODE") == "1"
 
 
 class _AttachOutcome(Enum):
@@ -3806,7 +3813,8 @@ async def _attach_with_transcript_forwarder(
         startup_profiler.mark("transcript forwarder skipped")
     outcome = _AttachOutcome.EXITED
     try:
-        if _can_attach_direct_tmux(prepared):
+        experimental_control_mode = _experimental_control_mode_attach_enabled()
+        if not experimental_control_mode and _can_attach_direct_tmux(prepared):
             # Same machine as the runner: attach straight to its tmux
             # pane for a lower-latency TTY than the WebSocket PTY relay.
             # Transcript forwarding is owned by whichever process launched
@@ -3827,6 +3835,12 @@ async def _attach_with_transcript_forwarder(
                 startup_profiler=startup_profiler,
             )
         else:
+            if experimental_control_mode:
+                click.echo(
+                    "Experimental control-mode attach: using the WebSocket relay for "
+                    "terminal-native selection. Tmux status and popups are unavailable.",
+                    err=True,
+                )
             startup_profiler.mark("opening websocket terminal attach")
             outcome = await _attach_with_reconnect(
                 attach=attach,

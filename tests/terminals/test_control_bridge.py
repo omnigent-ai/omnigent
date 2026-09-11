@@ -15,13 +15,18 @@ import base64
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 import pytest
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
+from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.inner.terminal import _tmux_command_sequence, _tmux_managed_option_commands
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
@@ -454,6 +459,103 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
 
     # Kill the server → the control client's stdout closes → bridge exits.
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.parametrize("application_mouse", [False, True])
+async def test_native_websocket_attach_preserves_only_application_mouse(
+    application_mouse: bool,
+) -> None:
+    """The native relay forwards application mouse modes, not tmux's mouse capture."""
+    inner = "printf '\\033[?1000h\\033[?1006h'; cat" if application_mouse else "cat"
+    sock, target = await _new_private_tmux(inner)
+    input_read, input_write = os.pipe()
+    output_read, output_write = os.pipe()
+    native_task: asyncio.Task[bool] | None = None
+
+    class BridgeSocket:
+        """Adapt a real WebSocket connection to the runner bridge interface."""
+
+        def __init__(self, connection: ServerConnection) -> None:
+            self.connection = connection
+
+        async def send_bytes(self, data: bytes) -> None:
+            await self.connection.send(data)
+
+        async def send_text(self, data: str) -> None:
+            await self.connection.send(data)
+
+        async def receive(self) -> dict[str, object]:
+            try:
+                data = await self.connection.recv()
+            except ConnectionClosed:
+                return {"type": "websocket.disconnect"}
+            key = "bytes" if isinstance(data, bytes) else "text"
+            return {"type": "websocket.receive", key: data}
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            await self.connection.close(code=code, reason=reason)
+
+    async def handler(connection: ServerConnection) -> None:
+        await bridge_tmux_control_to_websocket(
+            BridgeSocket(connection), socket_path=str(sock), tmux_target=target, read_only=False
+        )
+
+    try:
+        configured = await asyncio.create_subprocess_exec(
+            "tmux",
+            "-S",
+            str(sock),
+            *_tmux_command_sequence(_tmux_managed_option_commands(10000)),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await configured.communicate()
+        assert configured.returncode == 0, stderr.decode()
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            native_task = asyncio.create_task(
+                claude_native.attach_local_terminal(
+                    f"ws://127.0.0.1:{port}",
+                    headers={},
+                    stdin_fd=input_read,
+                    stdout_fd=output_write,
+                )
+            )
+            os.write(input_write, b"NATIVE-SELECTION-PROBE\r")
+            output = bytearray()
+            async with asyncio.timeout(10):
+                while b"NATIVE-SELECTION-PROBE" not in output:
+                    output.extend(await claude_native._read_fd(output_read))
+            mouse_enabled = re.search(rb"\x1b\[\?[\d;]*(?:1000|1002|1003)[\d;]*h", output)
+            assert bool(mouse_enabled) is application_mouse
+
+            pane = await asyncio.create_subprocess_exec(
+                "tmux",
+                "-S",
+                str(sock),
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{mouse}:#{pane_in_mode}:#{pane_width}:#{pane_height}",
+                stdout=asyncio.subprocess.PIPE,
+            )
+            state, _ = await pane.communicate()
+            assert state.strip() == b"1:0:80:24"
+            os.close(input_write)
+            input_write = -1
+            assert await asyncio.wait_for(native_task, timeout=10) is True
+    finally:
+        if native_task is not None and not native_task.done():
+            native_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await native_task
+        await _kill_tmux(sock)
+        for descriptor in (input_read, input_write, output_read, output_write):
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
