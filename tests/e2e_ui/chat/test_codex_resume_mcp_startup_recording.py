@@ -200,6 +200,7 @@ def test_record_codex_resume_mcp_startup_band_clears(
                     app_server_url=ws_url,
                     thread_id=thread_id,
                     client=None,
+                    thread_preloaded_for_resume=True,
                 )
             )
             # Let the forwarder connect and post its seed 'starting' round so the

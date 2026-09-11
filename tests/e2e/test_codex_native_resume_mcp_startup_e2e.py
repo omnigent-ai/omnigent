@@ -299,6 +299,9 @@ async def _run_scenario(
                 thread_id=thread_id,
                 client=fwd_client,
                 ap_transport=_capture_transport(posts),
+                # Mirrors the production callers: only the cold-resume path
+                # preloaded the thread (consuming its initial idle edge).
+                thread_preloaded_for_resume=scenario == "resume",
             )
         )
         try:

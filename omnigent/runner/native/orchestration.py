@@ -4957,6 +4957,9 @@ async def _codex_forward_known_thread(
             app_server_url=codex_ws_url,
             thread_id=thread_id,
             auth=_RunnerDatabricksAuth(auth_factory),
+            # This path runs only after preload_codex_thread_for_resume
+            # succeeded, whose temporary connection consumed the idle edge.
+            thread_preloaded_for_resume=True,
         )
     finally:
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)

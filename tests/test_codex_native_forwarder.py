@@ -3603,13 +3603,44 @@ def _mcp_startup_posts(client: _RecordingClient) -> list[dict]:
     ]
 
 
-async def test_persisted_thread_resume_settles_synthesized_mcp_startup(tmp_path: Path) -> None:
-    """A first-attempt resume success clears the pending MCP startup band.
+async def test_preloaded_resume_settles_synthesized_mcp_startup(tmp_path: Path) -> None:
+    """A flagged (preloaded) resume success clears the pending MCP startup band.
 
     On cold resume the initial idle edge goes to the preload's temporary
-    connection, never this one, so the forwarder's own successful
-    ``thread/resume`` of the persisted thread must settle the synthesized
-    ``starting`` round.
+    connection, never this one, so when the caller flags the preload the
+    forwarder's own successful ``thread/resume`` must settle the
+    synthesized ``starting`` round.
+    """
+    ap_client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "slowmcp", MCP_STARTUP_STARTING)
+    codex_client = _ScriptedCodexClient([{"result": {"thread": {"id": "thread_x", "turns": []}}}])
+    state = fwd._CodexForwarderState()
+
+    await fwd._subscribe_until_ready(
+        codex_client,  # type: ignore[arg-type]
+        ap_client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_x",
+        usage_coalescer=fwd._SessionUsageCoalescer(ap_client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        forwarder_state=state,
+        settle_mcp_startup_on_resume=True,
+    )
+
+    assert _mcp_startup_posts(ap_client) == [{}]
+    assert state.mcp_startup_settled is True
+    assert pending_mcp_servers(read_mcp_startup(tmp_path)) == []
+
+
+async def test_unflagged_first_attempt_resume_leaves_mcp_startup_pending(tmp_path: Path) -> None:
+    """An unflagged first-attempt resume success must not settle the band.
+
+    Resume success only proves the rollout existed. A fresh launch whose
+    injected first turn materializes the rollout before the first attempt
+    here, or a mid-session forwarder reconnect, both resume successfully
+    while MCP may genuinely still be starting — the round must keep
+    waiting for the idle/output/ready signals or the settle timer.
     """
     ap_client = _RecordingClient()
     update_mcp_server_startup(tmp_path, "slowmcp", MCP_STARTUP_STARTING)
@@ -3627,15 +3658,15 @@ async def test_persisted_thread_resume_settles_synthesized_mcp_startup(tmp_path:
         forwarder_state=state,
     )
 
-    assert _mcp_startup_posts(ap_client) == [{}]
-    assert state.mcp_startup_settled is True
-    assert pending_mcp_servers(read_mcp_startup(tmp_path)) == []
+    assert _mcp_startup_posts(ap_client) == []
+    assert state.mcp_startup_settled is False
+    assert pending_mcp_servers(read_mcp_startup(tmp_path)) == ["slowmcp"]
 
 
 async def test_fresh_thread_retry_resume_leaves_mcp_startup_pending(tmp_path: Path) -> None:
-    """A post-retry resume success must not settle the MCP startup band.
+    """An unflagged post-retry resume success must not settle the band.
 
-    A first attempt failing not-ready proves this launch created the
+    A first attempt failing not-ready means this launch created the
     thread; its later resume success lands mid-startup (first turn just
     accepted), so the round keeps waiting for idle/output/ready signals.
     """

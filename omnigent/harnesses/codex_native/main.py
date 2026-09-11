@@ -383,6 +383,9 @@ class PreparedCodexTerminal:
         Codex thread. Fresh sessions keep this listener open after it
         observes the TUI-created ``thread/started`` event.
     :param reattached: ``True`` when an existing terminal was reused.
+    :param thread_preloaded: ``True`` when this prepare resumed the thread
+        via ``preload_codex_thread_for_resume``, whose temporary connection
+        consumed the thread's initial idle edge.
     """
 
     session_id: str
@@ -395,6 +398,7 @@ class PreparedCodexTerminal:
     app_server: CodexNativeAppServer | None
     event_client: CodexAppServerClient | None
     reattached: bool
+    thread_preloaded: bool = False
 
 
 def _require_codex_app_server_url(prepared: PreparedCodexTerminal) -> str:
@@ -1325,6 +1329,8 @@ async def _prepare_codex_terminal(
         app_server=app_server,
         event_client=event_client,
         reattached=False,
+        # A known thread id took the resume branch above, which preloaded it.
+        thread_preloaded=thread_id is not None,
     )
 
 
@@ -1456,6 +1462,7 @@ def _start_codex_forwarder(
             thread_id=prepared.thread_id,
             client=prepared.event_client,
             auth=auth,
+            thread_preloaded_for_resume=prepared.thread_preloaded,
         ),
         name="codex-native-forwarder",
     )
