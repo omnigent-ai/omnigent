@@ -1476,6 +1476,18 @@
       "CreateWorkspaceTerminal": {
         "description": "Draft contexts only launch a plain shell, never an agent harness.",
         "properties": {
+          "session_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
           "session_key": {
             "default": "main",
             "pattern": "^[a-zA-Z0-9_-]{1,80}$",
@@ -10279,6 +10291,23 @@
             "schema": {
               "title": "Terminal Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
             }
           }
         ],
