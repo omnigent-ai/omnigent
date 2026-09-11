@@ -96,6 +96,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.native.transient_429 import send_with_transient_429_retry
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -1660,11 +1661,15 @@ async def _create_codex_session(
     }
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
-    resp = await client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("codex-native-ui.tar.gz", bundle, "application/gzip")},
-        timeout=120.0,
+    # A transient 429 throttle from the server/ingress is retried with
+    # bounded backoff instead of aborting startup.
+    resp = await send_with_transient_429_retry(
+        lambda: client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={"bundle": ("codex-native-ui.tar.gz", bundle, "application/gzip")},
+            timeout=120.0,
+        )
     )
     if resp.status_code >= 400:
         raise click.ClickException(

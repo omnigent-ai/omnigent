@@ -12161,3 +12161,49 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+@pytest.mark.asyncio
+async def test_create_codex_session_retries_transient_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transient 429 on ``POST /v1/sessions`` is retried instead of aborting.
+
+    A regression here makes ``omnigent codex`` startup exit on the first
+    throttle from the server/ingress even though the same POST would succeed
+    moments later.
+    """
+    from omnigent.native import transient_429
+
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(transient_429, "_sleep", _sleep)
+    calls: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if len(calls) == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "1"},
+                json={"error_code": "RESOURCE_EXHAUSTED"},
+            )
+        return httpx.Response(200, json={"session_id": "conv_new"})
+
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        session_id = await codex_native._create_codex_session(
+            client, b"bundle-bytes", bridge_id=None
+        )
+
+    assert session_id == "conv_new"
+    assert calls == ["POST /v1/sessions", "POST /v1/sessions"], (
+        "the throttled session-creation POST must be re-sent"
+    )
+    assert sleeps == [1.0]
