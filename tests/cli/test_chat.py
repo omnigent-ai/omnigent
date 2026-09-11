@@ -2032,8 +2032,8 @@ def test_apply_overrides_same_harness_keeps_pinned_model() -> None:
     """
     A harness override that matches the spec's own harness keeps the model.
 
-    #5101: ``omnigent run <agent>`` without ``--harness`` fills the
-    harness from ``harness.default`` in the global config. When that
+    ``omnigent run <agent>`` without ``--harness`` fills the harness
+    from ``harness.default`` in the global config. When that
     default equals the harness the spec already pins, the "drop the
     model" rule must not fire — the pin was written for exactly this
     harness, and dropping it made the run fail with an error telling

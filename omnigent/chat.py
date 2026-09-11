@@ -3369,7 +3369,7 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
         # a Claude-only ``executor.model``. An explicit ``--model``
         # (applied above) wins and is left alone.
         #
-        # Exception (#5101): when the override resolves to the harness the
+        # Exception: when the override resolves to the harness the
         # spec already pins, it is a no-op — e.g. the harness filled from
         # ``harness.default`` in the global config on ``omnigent run
         # <agent>`` with no ``--harness`` flag. Dropping the model there
