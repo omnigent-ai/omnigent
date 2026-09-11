@@ -437,6 +437,11 @@ def clear_discovery_cache() -> None:
 # transport, and must not make a later request-timeout look retryable.
 _RECORDED_TRANSPORT_ERRORS = (httpx.NetworkError, httpx.RemoteProtocolError)
 
+# ``httpx.Request.extensions`` key carrying the tool-call attempt
+# serial stamped at request-send time — see
+# ``McpServerConnection._stamp_request_serial``.
+_CALL_SERIAL_EXTENSION = "omnigent_mcp_call_serial"
+
 
 class _TransportErrorRecordingStream(httpx.AsyncByteStream):
     """
@@ -532,12 +537,13 @@ class McpServerConnection:
     # Monotonic id of the current tool-call attempt, bumped under
     # ``_call_lock`` at the start of every request the session
     # sends. The SDK never cancels the POST task of a timed-out
-    # request, so its response body can keep reading — and fail —
-    # long after the call already raised; each wrapped response
-    # stream remembers the serial it was opened under, and failures
-    # from superseded attempts are discarded instead of recorded,
-    # preventing a stale lingering read from flipping a later
-    # genuine slow-tool timeout into a retry.
+    # request, so its response — headers and body alike — can keep
+    # arriving and fail long after the call already raised. Every
+    # outgoing request is stamped with the serial current when it
+    # was SENT (``_stamp_request_serial``), and failures whose
+    # stamp no longer matches the current serial are discarded
+    # instead of recorded, preventing a stale lingering response
+    # from flipping a later genuine slow-tool timeout into a retry.
     _call_serial: int = field(default=0, init=False, repr=False)
     # Long-lived task that owns the transport + session + their
     # AsyncExitStack. Must be the SAME task that runs the stack's
@@ -992,26 +998,44 @@ class McpServerConnection:
         )
         self._transport_error = exc
 
+    async def _stamp_request_serial(self, request: httpx.Request) -> None:
+        """
+        httpx request event hook binding the attempt token at send.
+
+        Stamps the current call-attempt serial onto the outgoing
+        request. The stamp must be taken at request-*send* time, not
+        when response headers arrive: the SDK runs every POST as a
+        detached task it never cancels, so a timed-out call's
+        response headers can arrive only after a later attempt has
+        started — a header-arrival token would then carry the later
+        attempt's serial and misattribute the stale failure to it.
+        The send itself happens promptly while the issuing attempt
+        is current (``_call_lock`` is held and the caller yields to
+        the POST task immediately after enqueueing the request).
+
+        :param request: The request about to be sent.
+        """
+        request.extensions[_CALL_SERIAL_EXTENSION] = self._call_serial
+
     async def _record_response_stream(self, response: httpx.Response) -> None:
         """
         httpx response event hook installing the failure recorder.
 
-        Wraps the response body of every POST — the requests that
-        carry MCP tool calls and their responses — in
-        :class:`_TransportErrorRecordingStream`. The SDK's
+        Wraps the response body of every client POST in
+        :class:`_TransportErrorRecordingStream` — tool calls, but
+        also ``initialize``/discovery requests, which is harmless
+        because those run outside any attempt window and the slot is
+        reset when a session is established. The SDK's
         server-initiated GET stream is deliberately not wrapped: its
         reconnect flaps are unrelated to any in-flight tool call and
         must not flip a genuine slow-tool timeout into a retry.
 
-        The recorder is bound to the call attempt that was active
-        when this response was opened. The SDK runs every POST as a
-        detached task it never cancels, so a timed-out call's
-        response body can keep reading — and fail — while a later
-        call is in flight; such stale failures are discarded rather
-        than recorded so they cannot taint the later call's timeout
-        classification. ``_call_lock`` serializes attempts, so a
-        response opened while an attempt is in flight belongs to
-        that attempt.
+        Failures are attributed to the attempt whose serial was
+        stamped on the request at send time
+        (:meth:`_stamp_request_serial`); a failure from a request
+        sent by a superseded attempt is discarded rather than
+        recorded, so a lingering response of a timed-out call cannot
+        taint a later call's timeout classification.
 
         :param response: The response whose body is about to be read.
         """
@@ -1020,10 +1044,10 @@ class McpServerConnection:
         stream = response.stream
         if not isinstance(stream, httpx.AsyncByteStream):  # pragma: no cover
             return
-        wrap_serial = self._call_serial
+        sent_serial = response.request.extensions.get(_CALL_SERIAL_EXTENSION)
 
         def on_error(exc: BaseException) -> None:
-            if wrap_serial == self._call_serial:
+            if sent_serial == self._call_serial:
                 self._record_transport_error(exc)
             else:
                 _logger.debug(
@@ -1070,7 +1094,10 @@ class McpServerConnection:
             timeout=(timeout if timeout is not None else httpx.Timeout(30.0, read=300.0)),
             headers=headers,
             auth=auth,
-            event_hooks={"response": [self._record_response_stream]},
+            event_hooks={
+                "request": [self._stamp_request_serial],
+                "response": [self._record_response_stream],
+            },
         )
 
     async def _open_transport(

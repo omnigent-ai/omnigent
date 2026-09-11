@@ -1004,9 +1004,10 @@ async def test_recording_stream_does_not_record_timeouts() -> None:
     assert recorded == []
 
 
-def _make_hook_response(method: str) -> httpx.Response:
+def _make_hook_response(method: str, request: httpx.Request | None = None) -> httpx.Response:
     """Build a response attached to a request with the given method."""
-    request = httpx.Request(method, "http://127.0.0.1:9/mcp")
+    if request is None:
+        request = httpx.Request(method, "http://127.0.0.1:9/mcp")
     return httpx.Response(
         200,
         request=request,
@@ -1038,10 +1039,13 @@ async def test_response_hook_records_into_connection() -> None:
     """
     A network failure while reading a hooked POST response body lands
     in ``conn._transport_error`` — the end-to-end wiring of the
-    recorder.
+    recorder, with the request stamped at send time like the real
+    client's request hook does.
     """
     conn = McpServerConnection(config=_make_http_config())
-    response = _make_hook_response("POST")
+    request = httpx.Request("POST", "http://127.0.0.1:9/mcp")
+    await conn._stamp_request_serial(request)
+    response = _make_hook_response("POST", request)
     await conn._record_response_stream(response)
     with pytest.raises(httpx.ReadError):
         async for _ in response.stream:  # type: ignore[union-attr]
@@ -1055,16 +1059,44 @@ async def test_stale_attempt_transport_error_discarded() -> None:
     The SDK never cancels the POST task of a timed-out request, so
     its response body can keep reading — and fail — while a later
     call is in flight. Such stale failures are attributed to the
-    attempt that opened the response and discarded, not recorded,
-    so they cannot flip the later call's genuine slow-tool timeout
-    into a retry of a non-idempotent tool.
+    attempt that sent the request and discarded, not recorded, so
+    they cannot flip the later call's genuine slow-tool timeout into
+    a retry of a non-idempotent tool.
     """
     conn = McpServerConnection(config=_make_http_config())
-    response = _make_hook_response("POST")
-    # Wrapped while attempt N was current...
+    request = httpx.Request("POST", "http://127.0.0.1:9/mcp")
+    # Sent (and its response opened) while attempt N was current...
+    await conn._stamp_request_serial(request)
+    response = _make_hook_response("POST", request)
     await conn._record_response_stream(response)
     # ...but the failure only fires after a later attempt started.
     conn._call_serial += 1
+    with pytest.raises(httpx.ReadError):
+        async for _ in response.stream:  # type: ignore[union-attr]
+            pass
+    assert conn._transport_error is None
+
+
+@pytest.mark.asyncio()
+async def test_late_response_headers_do_not_steal_a_later_attempts_serial() -> None:
+    """
+    Regression for the send-vs-header-arrival race: attempt N's
+    request times out before its response headers arrive; attempt
+    N+1 starts; N's delayed headers only now reach the response
+    hook. The attempt token is bound at request-send time, so the
+    late response still carries N's serial and its subsequent body
+    failure is discarded — not attributed to attempt N+1.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    request = httpx.Request("POST", "http://127.0.0.1:9/mcp")
+    # Sent under attempt N.
+    await conn._stamp_request_serial(request)
+    # Attempt N+1 starts before N's response headers arrive.
+    conn._call_serial += 1
+    # N's late headers arrive during N+1's window; then the body
+    # fails with a network error.
+    response = _make_hook_response("POST", request)
+    await conn._record_response_stream(response)
     with pytest.raises(httpx.ReadError):
         async for _ in response.stream:  # type: ignore[union-attr]
             pass
@@ -1090,6 +1122,7 @@ def test_recording_client_preserves_env_proxy_mounts(
     client = conn._make_recording_httpx_client()
     proxy_mounts = [t for t in client._mounts.values() if t is not None]
     assert proxy_mounts, "env-proxy mounts were not created"
+    assert client._event_hooks["request"], "serial-stamping request hook is missing"
     assert client._event_hooks["response"], "recording response hook is missing"
 
 
