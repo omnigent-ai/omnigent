@@ -5145,32 +5145,47 @@ function useResolvedComposerModel(
 
 /** Compact, inspectable provenance beside the composer's model label. */
 /**
+ * How long after the menu closes tooltip open requests stay swallowed.
+ * Radix hands focus back to the trigger on close in the same tick, so the
+ * window only needs to outlive that programmatic focus (and any queued
+ * focus/pointer fallout from the closing menu); 600ms — one hover-open
+ * delay — is comfortably past it without being noticeable to a user who
+ * genuinely re-engages the trigger later.
+ */
+const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
+
+/**
  * Open state for a tooltip whose trigger contains (or is) a menu trigger.
  *
  * Keeps the tooltip closed while the menu is open: the menu portals inside
  * the tooltip trigger's React tree, so its focus/pointer events bubble here
  * and would instantly open the tooltip, painting it over the menu (equal
  * z-index, later-mounted). Closing the menu hands focus back to the trigger,
- * which would just as instantly reopen the tooltip, so the suppression also
- * holds after close until the user shows fresh intent — the pointer
- * re-enters the trigger, or focus leaves it.
+ * which would just as instantly reopen the tooltip, so open requests stay
+ * blocked for a short window after close — unless the pointer re-enters the
+ * trigger, which is unmistakably fresh hover intent.
  */
 function useMenuGuardedTooltip(menuOpen: boolean) {
   const [wantsOpen, setWantsOpen] = useState(false);
-  const [suppressed, setSuppressed] = useState(false);
+  // Epoch millis until which open requests are ignored; Infinity while the
+  // menu is open. A ref, not state: it is only read when Radix requests an
+  // open, so changing it never needs a re-render.
+  const suppressedUntil = useRef(0);
   useEffect(() => {
     if (menuOpen) {
       setWantsOpen(false);
-      setSuppressed(true);
+      suppressedUntil.current = Number.POSITIVE_INFINITY;
+    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
+      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
     }
   }, [menuOpen]);
   return {
-    open: wantsOpen && !menuOpen && !suppressed,
-    onOpenChange: (next: boolean) => setWantsOpen(next && !menuOpen && !suppressed),
+    open: wantsOpen && !menuOpen,
+    onOpenChange: (next: boolean) =>
+      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
     triggerProps: {
-      onPointerEnter: () => setSuppressed(false),
-      onBlur: () => {
-        if (!menuOpen) setSuppressed(false);
+      onPointerEnter: () => {
+        if (!menuOpen) suppressedUntil.current = 0;
       },
     },
   } as const;
