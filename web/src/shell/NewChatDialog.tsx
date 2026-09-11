@@ -4041,10 +4041,11 @@ export function NewChatLandingScreen() {
       !shouldCreateWorktree &&
       selectedHost?.status === "online" &&
       workspaceValid;
-    publishLandingWorkspaceSelection({
+    const accepted = publishLandingWorkspaceSelection({
       hostId: selectedHostId,
       workspace: normalizeWorkspacePath(workspaceTrimmed) ?? workspaceTrimmed,
       available,
+      project: projectParam,
       reason: sandboxSelected
         ? "The sandbox workspace becomes available after Start."
         : shouldCreateWorktree
@@ -4053,6 +4054,30 @@ export function NewChatLandingScreen() {
             ? "Choose a connected computer to browse its workspace."
             : "Choose a folder to browse its workspace.",
     });
+    if (!accepted) {
+      const retained = readLandingWorkspaceState().selection;
+      if (retained !== null) {
+        setSandboxSelected(false);
+        setSelectedHostId(retained.hostId);
+        setWorkspace(retained.workspace);
+        setBranchName("");
+        setAutoSeededBranch("");
+        setPrefilledBranch("");
+        const retainedProject = retained.project ?? "";
+        setSelectedProject(retainedProject);
+        setPrefill(initialPrefillState(retainedProject));
+        seededConfigSigRef.current = null;
+        workspaceFromConfigRef.current = false;
+        seededHostRef.current = retained.hostId;
+        worktreeSeededForRef.current = null;
+        if (retained.project !== undefined && retainedProject !== projectParam) {
+          const params = new URLSearchParams(searchParams);
+          if (retainedProject) params.set("project", retainedProject);
+          else params.delete("project");
+          navigate(`/?${params.toString()}`, { replace: true });
+        }
+      }
+    }
   }, [
     prefillSettled,
     hostsLoading,
@@ -4062,6 +4087,9 @@ export function NewChatLandingScreen() {
     selectedHostId,
     workspaceTrimmed,
     workspaceValid,
+    projectParam,
+    searchParams,
+    navigate,
   ]);
   // Auto-fill the base branch when a new-worktree branch is named, but only
   // until the user touches the base field — then their choice (including a

@@ -75,7 +75,8 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 # non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
 # both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
 _PR_VIEW_FIELDS = (
-    "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
+    "number,title,state,url,isDraft,author,baseRefName,headRefName,headRefOid,baseRefOid,"
+    "statusCheckRollup,body,comments"
 )
 
 
@@ -586,15 +587,18 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
     if data is not None:
         author = data.get("author")
         body = data.get("body")
+        pr_url = data.get("url")
         payload["pr"] = {
             "number": data.get("number"),
             "title": data.get("title"),
             "state": data.get("state"),
-            "url": data.get("url"),
+            "url": pr_url,
             "is_draft": data.get("isDraft", False),
             "author": author.get("login") if isinstance(author, dict) else None,
             "base_ref": data.get("baseRefName"),
             "head_ref": data.get("headRefName"),
+            "head_sha": data.get("headRefOid"),
+            "base_sha": data.get("baseRefOid"),
             "checks": _summarize_checks(data.get("statusCheckRollup")),
             # PR description + conversation comments feed the Summary tab; an
             # empty body is null so the UI shows its "no description" state.
@@ -603,7 +607,9 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         }
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
-        payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
+        payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(pr_url)}
+        if isinstance(pr_url, str):
+            payload["selected_pr_url"] = pr_url
         return payload
 
     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
@@ -640,7 +646,7 @@ def _selected_pr(session_id: str, pr_url: str) -> PullRequestRef:
 
 def _default_pr(session_id: str | None, pr_url: str | None) -> PullRequestRef | None:
     if session_id is None:
-        return None
+        return PullRequestRef.from_url(pr_url) if pr_url else None
     if pr_url:
         return _selected_pr(session_id, pr_url)
     entries = SessionPrRegistry(session_id).list()
@@ -692,7 +698,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info["selected_account"] = _config.github_account_preference(reference.repo_argument) or next(
         (a["login"] for a in info["accounts"] if a.get("active")), None
     )
-    data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
+    data = _pr_json(root, reference, _PR_VIEW_FIELDS)
     if data is None:
         return info
     author = data.get("author")
@@ -966,6 +972,8 @@ def github_file_diff(
         ``None`` for a deleted file).
     """
     reference = _default_pr(session_id, pr_url)
+    if reference is None and session_id is None:
+        reference = _workspace_pr_reference(root, token=_account_token_for(root))
     if reference:
         return _pr_file_contents(
             root,

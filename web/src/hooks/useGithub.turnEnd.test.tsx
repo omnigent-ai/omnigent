@@ -18,7 +18,12 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { fetchGithubFileContents, useGithubInfo } from "./useGithub";
+import {
+  fetchGithubFileContents,
+  useGithubChangedFiles,
+  useGithubInfo,
+  useGithubPrDiff,
+} from "./useGithub";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -54,6 +59,13 @@ function Probe({ id }: { id: string | undefined }) {
 
 function HostProbe({ workspace }: { workspace: string }) {
   useGithubInfo({ kind: "host", hostId: "host/a", workspace });
+  return null;
+}
+
+function RevisionProbe({ revision }: { revision: string }) {
+  const target = { kind: "host" as const, hostId: "host/a", workspace: "/repo" };
+  useGithubChangedFiles(target, true, "https://github.com/acme/repo/pull/1", revision);
+  useGithubPrDiff(target, true, "https://github.com/acme/repo/pull/1", revision);
   return null;
 }
 
@@ -116,6 +128,23 @@ describe("useGithubInfo turn-end invalidate", () => {
     expect(fetchMock.mock.calls[1][0]).toBe(
       "/v1/hosts/host%2Fa/workspace/resources/github?workspace=%2Frepo+two",
     );
+  });
+
+  it("refetches PR files and patch when the remote revision changes", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <QueryClientProvider client={qc}>
+        <RevisionProbe revision="base:head-one" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    rerender(
+      <QueryClientProvider client={qc}>
+        <RevisionProbe revision="base:head-two" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
   });
 
   it("refetches github info when the focused session goes running → idle", async () => {

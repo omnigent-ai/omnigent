@@ -318,6 +318,12 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     return g.registry.adoptDraft(args?.sourceId, args?.targetId);
   });
 
+  ipcMain.handle("omnigent:browser-renew-draft-lease", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.renewDraftLease(args?.workspaceId);
+  });
+
   // Attach the named conversation's view to the host window (detaching the
   // previous active one), or detach everything when conversationId is null.
   ipcMain.handle("omnigent:browser-set-active", (event, args) => {

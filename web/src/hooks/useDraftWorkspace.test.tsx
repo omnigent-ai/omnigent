@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as IdentityModule from "@/lib/identity";
 
+import { markHostKeyless, clearHostKeyless } from "@/lib/sessionHost";
 import { landingStorageKey } from "@/lib/landingStorage";
 import {
   buildDraftTerminalAttachPath,
@@ -59,6 +60,18 @@ describe("buildDraftTerminalAttachPath", () => {
     expect(buildDraftTerminalAttachPath("context /1", "terminal /1", true, "host /1")).toBe(
       "/v1/hosts/host%20%2F1/workspace-contexts/context%20%2F1/resources/terminals/terminal%20%2F1/attach?read_only=true&omnigent_slice_key=host+%2F1",
     );
+  });
+
+  it("preserves HTTP host demotion when building an attachment", () => {
+    markHostKeyless("draft_keyless");
+    try {
+      const path = buildDraftTerminalAttachPath("ctx", "term", true, "draft_keyless");
+      expect(path).toBe(
+        "/v1/hosts/draft_keyless/workspace-contexts/ctx/resources/terminals/term/attach?read_only=true",
+      );
+    } finally {
+      clearHostKeyless("draft_keyless");
+    }
   });
 });
 

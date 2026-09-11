@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { isHostKeyless } from "@/lib/sessionHost";
 import { landingStorageKey } from "@/lib/landingStorage";
 import { terminalInfoFromResource, type TerminalInfo } from "@/lib/terminals";
 import { randomUUID } from "@/lib/randomUUID";
@@ -330,7 +331,7 @@ export function buildDraftTerminalAttachPath(
     `${encodeURIComponent(terminalId)}/attach`;
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
-  params.set("omnigent_slice_key", hostId);
+  if (!isHostKeyless(hostId)) params.set("omnigent_slice_key", hostId);
   const query = params.toString();
   return query ? `${path}?${query}` : path;
 }

@@ -34,6 +34,8 @@ const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
 let searchParams = new URLSearchParams();
 let projects: { id: string | null; name: string }[] = [];
+let projectConfigs: Record<string, { host_id?: string; workspace?: string; agent_id?: string }> =
+  {};
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 // Prompt history is scoped per conversation; the landing composer writes under
@@ -122,7 +124,10 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: () => ({ data: projects }),
-  useProjectConfig: () => ({ data: null, isLoading: false }),
+  useProjectConfig: (id: string | null) => ({
+    data: id === null ? null : (projectConfigs[id] ?? null),
+    isLoading: false,
+  }),
   // Same reason as useProjects above: the landing reads useConversations for
   // hasNoSessions, so stub it to avoid an authenticatedFetch skewing calls[0].
   useConversations: () => ({ data: undefined }),
@@ -176,10 +181,7 @@ function setAgents(agents: AvailableAgent[]): void {
   >);
 }
 
-function renderLanding(
-  cachedSessionIds: string[] = [],
-  infoOverrides: Partial<ServerInfo> = {},
-): void {
+function renderLanding(cachedSessionIds: string[] = [], infoOverrides: Partial<ServerInfo> = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -226,7 +228,7 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return render(<NewChatLandingScreen />, { wrapper: Wrapper });
 }
 
 /**
@@ -326,6 +328,7 @@ beforeEach(() => {
   localStorage.clear();
   searchParams = new URLSearchParams();
   projects = [];
+  projectConfigs = {};
   vi.mocked(useHostModelOptions).mockReturnValue({
     data: [
       { id: "opus", displayName: "Opus" },
@@ -624,6 +627,59 @@ describe("NewChatLandingScreen create flow", () => {
       expect(landing.readLandingWorkspaceState().browserNamespace).toBe(namespace);
       expect(landing.readLandingWorkspaceState().panel.openBrowsers).toEqual(["restored-browser"]);
       expect(discard).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+
+  it("keeps the previous workspace when a remounted project change is cancelled", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    navigateMock.mockImplementation((to: string) => {
+      const query = to.split("?", 2)[1];
+      searchParams = new URLSearchParams(query ?? "");
+    });
+    searchParams = new URLSearchParams("project=Project A");
+    projects = [
+      { id: "project-a", name: "Project A" },
+      { id: "project-b", name: "Project B" },
+    ];
+    projectConfigs = {
+      "project-a": { host_id: "host_1", workspace: SEEDED_WORKSPACE },
+      "project-b": { host_id: "host_1", workspace: "/Users/corey/project-b" },
+    };
+    renderLanding();
+    await waitForWorkspaceSeed();
+    await waitFor(() =>
+      expect(landing.readLandingWorkspaceState().selection?.workspace).toBe(SEEDED_WORKSPACE),
+    );
+    const previous = landing.readLandingWorkspaceState();
+    const discard = vi.fn().mockResolvedValue(undefined);
+    const unregister = landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard,
+      adopt: vi.fn(),
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    try {
+      cleanup();
+      searchParams = new URLSearchParams("project=Project B");
+      const remounted = renderLanding();
+
+      await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+      );
+      expect(discard).not.toHaveBeenCalled();
+      expect(landing.readLandingWorkspaceState()).toEqual(previous);
+      expect(navigateMock).toHaveBeenCalledWith("/?project=Project+A", { replace: true });
+
+      searchParams = new URLSearchParams("project=Project A");
+      remounted.rerender(<NewChatLandingScreen />);
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+      );
+      expect(confirm).toHaveBeenCalledOnce();
     } finally {
       unregister();
     }

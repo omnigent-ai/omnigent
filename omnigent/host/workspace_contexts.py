@@ -110,6 +110,12 @@ class _ChannelSocket:
             self.task.cancel()
 
 
+@dataclass
+class _PendingChannel:
+    tunnel: object
+    cancelled: bool = False
+
+
 class _WorkspaceTerminalRegistry(TerminalRegistry):
     """Draft keys are registry namespaces, never conversation links."""
 
@@ -133,6 +139,7 @@ class WorkspaceContextManager:
         self._tunnel_is_live = tunnel_is_live or (lambda _tunnel: True)
         self._contexts: dict[str, _Context] = {}
         self._channels: dict[str, _ChannelSocket] = {}
+        self._pending_channels: dict[str, _PendingChannel] = {}
         self._reaper: asyncio.Task[None] | None = None
         self._closed = False
         self.subprocess_ownership = SubprocessOwnership()
@@ -154,9 +161,23 @@ class WorkspaceContextManager:
             )
         if self._reaper is None:
             self._reaper = asyncio.create_task(self._reap_loop(), name="workspace-context-leases")
+        pending: _PendingChannel | None = None
         try:
+            if frame.op == "attach" and frame.user_id:
+                ctx = self._contexts.get(frame.context_id)
+                if ctx is not None and ctx.user_id == frame.user_id:
+                    channel_id = frame.params.get("channel_id")
+                    if (
+                        not isinstance(channel_id, str)
+                        or not channel_id
+                        or channel_id in self._channels
+                        or channel_id in self._pending_channels
+                    ):
+                        raise WorkspaceContextError(400, "A unique channel id is required")
+                    pending = _PendingChannel(tunnel)
+                    self._pending_channels[channel_id] = pending
             with self.subprocess_ownership.scope():
-                payload = await self._operate(frame, send=send, tunnel=tunnel)
+                payload = await self._operate(frame, send=send, tunnel=tunnel, pending=pending)
             return HostWorkspaceContextResultFrame(frame.request_id, "ok", payload=payload)
         except WorkspaceContextError as exc:
             return HostWorkspaceContextResultFrame(
@@ -173,6 +194,14 @@ class WorkspaceContextManager:
                 error_status=500,
                 error="Host workspace operation failed",
             )
+        finally:
+            if pending is not None:
+                channel_id = frame.params.get("channel_id")
+                if (
+                    isinstance(channel_id, str)
+                    and self._pending_channels.get(channel_id) is pending
+                ):
+                    self._pending_channels.pop(channel_id)
 
     @staticmethod
     def _workspace(value: object) -> str:
@@ -210,6 +239,7 @@ class WorkspaceContextManager:
         *,
         send: StreamSender,
         tunnel: object,
+        pending: _PendingChannel | None,
     ) -> dict[str, Any]:
         if not frame.user_id:
             raise WorkspaceContextError(403, "Workspace context owner is required")
@@ -236,6 +266,8 @@ class WorkspaceContextManager:
             if not ctx.channels and self._clock() - ctx.touched_at >= LEASE_SECONDS:
                 await self._delete(ctx)
                 raise WorkspaceContextError(404, "Workspace context expired")
+            if pending is not None and pending.cancelled:
+                raise WorkspaceContextError(499, "Terminal attachment was cancelled")
             ctx.touched_at = self._clock()
             if frame.op in {"describe", "heartbeat"}:
                 return ctx.payload()
@@ -319,15 +351,19 @@ class WorkspaceContextManager:
                 if (
                     not isinstance(channel_id, str)
                     or not channel_id
-                    or channel_id in self._channels
+                    or pending is None
+                    or self._pending_channels.get(channel_id) is not pending
                 ):
                     raise WorkspaceContextError(400, "A unique channel id is required")
                 if len(ctx.channels) >= _MAX_CHANNELS_PER_CONTEXT:
                     raise WorkspaceContextError(429, "Too many terminal attachments")
-                if not entry.instance.running or not await entry.instance.is_alive():
+                is_alive = entry.instance.running and await entry.instance.is_alive()
+                if not is_alive:
                     raise WorkspaceContextError(404, "Terminal is no longer running")
                 if not self._tunnel_is_live(tunnel):
                     raise WorkspaceContextError(503, "Host tunnel disconnected during attachment")
+                if pending.cancelled:
+                    raise WorkspaceContextError(499, "Terminal attachment was cancelled")
                 socket = _ChannelSocket(channel_id, send, tunnel)
                 self._channels[channel_id] = socket
                 ctx.channels.add(channel_id)
@@ -367,7 +403,12 @@ class WorkspaceContextManager:
 
     def receive(self, frame: HostWorkspaceContextStreamFrame, *, tunnel: object) -> None:
         socket = self._channels.get(frame.channel_id)
-        if socket is None or socket.tunnel is not tunnel:
+        if socket is None:
+            pending = self._pending_channels.get(frame.channel_id)
+            if pending is not None and pending.tunnel is tunnel and frame.close_code is not None:
+                pending.cancelled = True
+            return
+        if socket.tunnel is not tunnel:
             return
         if frame.close_code is not None:
             socket.disconnect()
@@ -386,6 +427,9 @@ class WorkspaceContextManager:
 
     async def disconnect(self, tunnel: object) -> None:
         tasks = []
+        for pending in self._pending_channels.values():
+            if pending.tunnel is tunnel:
+                pending.cancelled = True
         for socket in list(self._channels.values()):
             if socket.tunnel is tunnel:
                 socket.disconnect()

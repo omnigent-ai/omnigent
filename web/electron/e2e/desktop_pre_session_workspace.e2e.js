@@ -25,6 +25,7 @@ const {
   launchDesktop,
   saveRecording,
 } = require("./desktopHarness");
+const { startWorkspaceFixtures } = require("./desktop_pre_session_workspace_setup");
 
 const deps = desktopDepsAvailable();
 const RECORD_DIR = path.join(__dirname, "recordings", "desktop-pre-session-workspace");
@@ -404,7 +405,10 @@ describe(
     before(async () => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-pre-session-"));
       fixtureRepo = createFixtureRepo(tmpDir);
-      [pod, demoPage] = await Promise.all([startIsolatedPod(tmpDir), startDemoPage()]);
+      ({ pod, demoPage } = await startWorkspaceFixtures(
+        () => startIsolatedPod(tmpDir),
+        startDemoPage,
+      ));
     });
 
     after(async () => {

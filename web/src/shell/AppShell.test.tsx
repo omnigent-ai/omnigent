@@ -3,6 +3,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
+import type * as UseDraftWorkspaceModule from "@/hooks/useDraftWorkspace";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -15,6 +16,7 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type ReactNode, useEffect } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -25,6 +27,25 @@ import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
 }));
+const draftWorkspaceState = vi.hoisted(() => ({
+  context: null as {
+    id: string;
+    workspace: string;
+    session_id: string | null;
+    lease_seconds: number;
+    hostId: string;
+    workspaceAliases: string[];
+  } | null,
+  terminals: [] as { id: string; name: string; session: string; running: boolean }[],
+  isLoading: false,
+  error: null as Error | null,
+  ensureContext: vi.fn(),
+  refreshTerminals: vi.fn(),
+  createTerminal: vi.fn(),
+  deleteTerminal: vi.fn(),
+  discard: vi.fn(),
+  adopt: vi.fn(),
+}));
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   // Keep the real provider component — only the per-session readers are
@@ -32,6 +53,11 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof RunnerHealthModule>()),
   useSessionRunnerOnline: () => runnerHealthState.runnerOnline,
   useSessionHostOnline: () => true,
+}));
+
+vi.mock("@/hooks/useDraftWorkspace", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseDraftWorkspaceModule>()),
+  useDraftWorkspace: () => draftWorkspaceState,
 }));
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
@@ -346,6 +372,13 @@ function NavProbe() {
       </button>
       <button
         type="button"
+        data-testid="nav-conversation"
+        onClick={() => navigate("/c/conv_after")}
+      >
+        to-conversation
+      </button>
+      <button
+        type="button"
         data-testid="nav-home-replace"
         onClick={() => navigate("/", { replace: true })}
       >
@@ -373,6 +406,11 @@ function NavProbe() {
 function PathDisplay() {
   const { pathname } = useLocation();
   return <div data-testid="url-pathname">{pathname}</div>;
+}
+
+function PassiveEffect({ run }: { run: () => void }) {
+  useEffect(run, [run]);
+  return <div>home</div>;
 }
 
 /**
@@ -413,7 +451,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
-function renderShell(path: string, info?: ServerInfo) {
+function renderShell(path: string, info?: ServerInfo, indexElement?: ReactNode) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -426,11 +464,13 @@ function renderShell(path: string, info?: ServerInfo) {
               <Route
                 index
                 element={
-                  <>
-                    <div>home</div>
-                    <NavProbe />
-                    <LocationDisplay />
-                  </>
+                  indexElement ?? (
+                    <>
+                      <div>home</div>
+                      <NavProbe />
+                      <LocationDisplay />
+                    </>
+                  )
                 }
               />
               <Route
@@ -581,6 +621,19 @@ beforeEach(() => {
     sessionStatus: "idle",
     status: "idle",
   });
+  draftWorkspaceState.context = null;
+  draftWorkspaceState.terminals = [];
+  draftWorkspaceState.isLoading = false;
+  draftWorkspaceState.error = null;
+  draftWorkspaceState.ensureContext.mockReset();
+  draftWorkspaceState.refreshTerminals.mockReset();
+  draftWorkspaceState.createTerminal.mockReset();
+  draftWorkspaceState.deleteTerminal.mockReset();
+  draftWorkspaceState.discard.mockReset();
+  draftWorkspaceState.adopt.mockReset();
+  draftWorkspaceState.refreshTerminals.mockResolvedValue([]);
+  draftWorkspaceState.deleteTerminal.mockResolvedValue(undefined);
+  draftWorkspaceState.discard.mockResolvedValue(undefined);
 });
 
 afterEach(cleanup);
@@ -4141,6 +4194,99 @@ describe("Terminal-first shells — opening a shell from the mobile drawer", () 
 });
 
 describe("new-chat workspace rail", () => {
+  it("registers retained shells before a remounted workspace publishes", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    landing.publishLandingWorkspaceSelection({
+      hostId: "host-a",
+      workspace: "/project-a",
+      available: true,
+      project: "Project A",
+      reason: "",
+    });
+    const beforeChange = landing.readLandingWorkspaceState();
+    draftWorkspaceState.context = {
+      id: "context-a",
+      workspace: "/project-a",
+      session_id: null,
+      lease_seconds: 600,
+      hostId: "host-a",
+      workspaceAliases: ["/project-a"],
+    };
+    draftWorkspaceState.isLoading = true;
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const publishProjectB = vi.fn(() => {
+      landing.publishLandingWorkspaceSelection({
+        hostId: "host-a",
+        workspace: "/project-b",
+        available: true,
+        project: "Project B",
+        reason: "",
+      });
+    });
+    mockConversations([]);
+
+    renderShell("/?project=Project%20B", undefined, <PassiveEffect run={publishProjectB} />);
+
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    expect(publishProjectB).toHaveBeenCalledOnce();
+    expect(draftWorkspaceState.discard).not.toHaveBeenCalled();
+    expect(landing.readLandingWorkspaceState().selection).toEqual(beforeChange.selection);
+    expect(landing.readLandingWorkspaceState().browserNamespace).toBe(
+      beforeChange.browserNamespace,
+    );
+  });
+
+  it("ignores a shell that finishes after navigation", async () => {
+    const { publishLandingWorkspaceSelection, readLandingWorkspaceState } =
+      await import("@/lib/landingWorkspaceState");
+    publishLandingWorkspaceSelection({
+      hostId: "host-a",
+      workspace: "/workspace-a",
+      available: true,
+      reason: "",
+    });
+    const context = {
+      id: "context-a",
+      workspace: "/workspace-a",
+      session_id: null,
+      lease_seconds: 600,
+      hostId: "host-a",
+      workspaceAliases: ["/workspace-a"],
+    };
+    let resolveTerminal!: (terminal: {
+      id: string;
+      name: string;
+      session: string;
+      running: boolean;
+    }) => void;
+    draftWorkspaceState.ensureContext.mockResolvedValue(context);
+    draftWorkspaceState.createTerminal.mockReturnValue(
+      new Promise((resolve) => {
+        resolveTerminal = resolve;
+      }),
+    );
+    writeSessionWorkspaceState("conv_after", { open: false });
+    mockConversations([{ id: "conv_after", permission_level: null }]);
+    renderShell("/");
+
+    const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+    fireEvent.keyDown(window, {
+      code: "KeyT",
+      altKey: true,
+      metaKey: isMac,
+      ctrlKey: !isMac,
+    });
+    await waitFor(() => expect(draftWorkspaceState.createTerminal).toHaveBeenCalledWith(context));
+    fireEvent.click(screen.getByTestId("nav-conversation"));
+    resolveTerminal({ id: "late", name: "bash", session: "late", running: true });
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(readLandingWorkspaceState().panel.selectedTerminalKey).not.toBe("terminal:late");
+  });
+
   it("starts collapsed despite an open saved draft and global preference, preserving draft tools", async () => {
     const { readLandingWorkspaceState, writeLandingWorkspacePanel } =
       await import("@/lib/landingWorkspaceState");

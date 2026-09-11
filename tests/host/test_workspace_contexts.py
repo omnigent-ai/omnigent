@@ -320,6 +320,130 @@ async def test_disconnect_during_attach_liveness_check_refuses_channel(
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+async def test_close_during_attach_liveness_check_refuses_channel_and_allows_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A close received during liveness probing cannot strand an attachment."""
+
+    now = [0.0]
+    manager = WorkspaceContextManager(clock=lambda: now[0])
+    tunnel = object()
+    liveness_started = asyncio.Event()
+    release_liveness = asyncio.Event()
+    try:
+        context_id = str(
+            _ok(await _request(manager, "create", params={"workspace": str(tmp_path)}))["id"]
+        )
+        terminal = _ok(
+            await _request(
+                manager,
+                "create_terminal",
+                context_id=context_id,
+                params={"terminal": "bash", "session_key": "one"},
+            )
+        )
+        instance = manager.registry.get(context_id, "bash", "one")
+        assert instance is not None
+
+        async def delayed_alive() -> bool:
+            liveness_started.set()
+            await release_liveness.wait()
+            return True
+
+        monkeypatch.setattr(instance, "is_alive", delayed_alive)
+        attach_task = asyncio.create_task(
+            _request(
+                manager,
+                "attach",
+                context_id=context_id,
+                params={"terminal_id": terminal["id"], "channel_id": "timed-out-channel"},
+                tunnel=tunnel,
+            )
+        )
+        await asyncio.wait_for(liveness_started.wait(), timeout=2)
+
+        manager.receive(
+            HostWorkspaceContextStreamFrame(channel_id="timed-out-channel", close_code=1000),
+            tunnel=object(),
+        )
+        assert not manager._pending_channels[  # pyright: ignore[reportPrivateUsage]
+            "timed-out-channel"
+        ].cancelled
+        manager.receive(
+            HostWorkspaceContextStreamFrame(channel_id="timed-out-channel", close_code=1000),
+            tunnel=tunnel,
+        )
+        release_liveness.set()
+        result = await asyncio.wait_for(attach_task, timeout=2)
+        assert (result.status, result.error_status) == ("error", 499)
+        assert manager._channels == {}  # pyright: ignore[reportPrivateUsage]
+        assert manager._pending_channels == {}  # pyright: ignore[reportPrivateUsage]
+        assert not manager._contexts[context_id].channels  # pyright: ignore[reportPrivateUsage]
+
+        now[0] = LEASE_SECONDS
+        await manager.reap_expired()
+        expired = await _request(manager, "describe", context_id=context_id)
+        assert (expired.status, expired.error_status) == ("error", 404)
+    finally:
+        release_liveness.set()
+        await manager.shutdown()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+async def test_close_while_attach_waits_for_context_lock_refuses_channel(
+    tmp_path: Path,
+) -> None:
+    """A close received while attachment is queued cannot be lost."""
+
+    manager = WorkspaceContextManager()
+    tunnel = object()
+    context_lock: asyncio.Lock | None = None
+    try:
+        context_id = str(
+            _ok(await _request(manager, "create", params={"workspace": str(tmp_path)}))["id"]
+        )
+        terminal = _ok(
+            await _request(
+                manager,
+                "create_terminal",
+                context_id=context_id,
+                params={"terminal": "bash", "session_key": "one"},
+            )
+        )
+        context_lock = manager._contexts[context_id].lock  # pyright: ignore[reportPrivateUsage]
+        await context_lock.acquire()
+        attach_task = asyncio.create_task(
+            _request(
+                manager,
+                "attach",
+                context_id=context_id,
+                params={"terminal_id": terminal["id"], "channel_id": "queued-channel"},
+                tunnel=tunnel,
+            )
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if "queued-channel" in manager._pending_channels:  # pyright: ignore[reportPrivateUsage]
+                break
+        assert "queued-channel" in manager._pending_channels  # pyright: ignore[reportPrivateUsage]
+
+        manager.receive(
+            HostWorkspaceContextStreamFrame(channel_id="queued-channel", close_code=1000),
+            tunnel=tunnel,
+        )
+        context_lock.release()
+        result = await asyncio.wait_for(attach_task, timeout=2)
+        assert (result.status, result.error_status) == ("error", 499)
+        assert manager._channels == {}  # pyright: ignore[reportPrivateUsage]
+        assert manager._pending_channels == {}  # pyright: ignore[reportPrivateUsage]
+        assert not manager._contexts[context_id].channels  # pyright: ignore[reportPrivateUsage]
+    finally:
+        if context_lock is not None and context_lock.locked():
+            context_lock.release()
+        await manager.shutdown()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 async def test_terminal_survives_reconnect_and_obeys_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2,17 +2,25 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-demo_root="/private/tmp/omnigent-prechat-manual-demo"
+source "$repo_root/web/electron/e2e/desktop_pre_session_workspace_processes.sh"
+demo_root="$(desktop_demo_root)"
 state_file="$demo_root/processes.env"
 python="$repo_root/.venv/bin/python"
 omnidev="$repo_root/dev/omnidev/target/release/omnidev"
 electron="$(cd "$repo_root/web/electron" && node -p "require('electron')")"
 demo_model="$(PYTHONPATH="$repo_root" "$python" -c 'from omnigent.onboarding.providers import default_chat_model; model = default_chat_model("openai"); assert model; print(model)')"
 
-if [[ -f "$state_file" ]]; then
+ensure_secure_demo_root "$demo_root"
+if [[ -e "$state_file" || -L "$state_file" ]]; then
   echo "Demo already has a process file. Run stop_desktop_pre_session_workspace.sh first." >&2
   exit 1
 fi
+launch_lock="$demo_root/launch.lock"
+if ! mkdir -- "$launch_lock" 2>/dev/null; then
+  echo "Another desktop pre-session demo launch is already in progress." >&2
+  exit 1
+fi
+begin_demo_process_ownership "$launch_lock"
 
 free_port() {
   "$python" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
@@ -116,13 +124,15 @@ nohup env -u GH_TOKEN -u GITHUB_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_API_KEY -u 
   /usr/bin/expect "$demo_root/omnidev.exp" > "$demo_root/omnidev.log" 2>&1 < /dev/null &
 omnidev_pid=$!
 
-for _ in {1..120}; do
-  if curl -fsS "http://127.0.0.1:$server_port/health" >/dev/null 2>&1 && \
-    curl -fsS "http://127.0.0.1:$server_port/v1/hosts" | grep -q '"online"'; then
-    break
-  fi
-  sleep 0.25
-done
+if ! wait_for_demo_services \
+  "http://127.0.0.1:$server_port" \
+  "http://127.0.0.1:$mock_port" \
+  120 \
+  0.25; then
+  tail -n 80 "$demo_root/omnidev.log" >&2 2>/dev/null || true
+  tail -n 80 "$demo_root/mock.log" >&2 2>/dev/null || true
+  exit 1
+fi
 curl -fsS -X POST "http://127.0.0.1:$mock_port/mock/set_fallback" \
   -H 'content-type: application/json' \
   --data-binary "$(printf '{\"key\":\"%s\",\"text\":\"DESKTOP_HANDOFF_OK\"}' "$demo_model")" >/dev/null
@@ -132,12 +142,17 @@ nohup env OMNIGENT_DISABLE_KEYRING=1 OMNIGENT_DESKTOP_VERSION_OVERRIDE=999.0.0 \
   > "$demo_root/electron.log" 2>&1 < /dev/null &
 electron_pid=$!
 
-cat > "$state_file" <<STATE
+state_tmp="$demo_root/processes.env.$$"
+cat > "$state_tmp" <<STATE
 mock_pid=$mock_pid
 page_pid=$page_pid
 omnidev_pid=$omnidev_pid
 electron_pid=$electron_pid
 STATE
+chmod 600 "$state_tmp"
+mv -- "$state_tmp" "$state_file"
+state_tmp=""
+transfer_demo_process_ownership
 
 echo "Electron demo launched"
 echo "Server: http://127.0.0.1:$server_port"

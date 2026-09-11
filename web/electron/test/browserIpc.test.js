@@ -126,6 +126,7 @@ function makeRegistry(conversationId, webContents) {
       return { ok: true };
     },
     close: () => ({ ok: true, removed: true }),
+    renewDraftLease: () => ({ ok: true, renewed: false }),
     suppressedCalls,
   };
 }
@@ -170,6 +171,7 @@ describe("browserIpc — trust gate", () => {
     const channels = ipcMain.channels();
     for (const ch of [
       "omnigent:browser-open-or-navigate",
+      "omnigent:browser-renew-draft-lease",
       "omnigent:browser-set-active",
       "omnigent:browser-set-suppressed",
       "omnigent:browser-resize",
@@ -222,6 +224,32 @@ describe("browserIpc — overlay suppression (#3980)", () => {
     const r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: true });
     assert.equal(r.ok, false);
     assert.match(r.error, /connected server's page/);
+  });
+});
+
+describe("browserIpc — draft lease renewal", () => {
+  it("gates renewal and forwards the owning draft namespace", async () => {
+    const blocked = setup({ pinned: false });
+    const denied = await blocked.ipcMain.invoke(
+      "omnigent:browser-renew-draft-lease",
+      blocked.event,
+      { workspaceId: "draft-workspace:1234" },
+    );
+    assert.equal(denied.ok, false);
+
+    const { ipcMain, registry, event } = setup();
+    let renewed = null;
+    registry.renewDraftLease = (workspaceId) => {
+      renewed = workspaceId;
+      return { ok: true, renewed: true };
+    };
+    assert.deepEqual(
+      await ipcMain.invoke("omnigent:browser-renew-draft-lease", event, {
+        workspaceId: "draft-workspace:1234",
+      }),
+      { ok: true, renewed: true },
+    );
+    assert.equal(renewed, "draft-workspace:1234");
   });
 });
 

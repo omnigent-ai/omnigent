@@ -13,13 +13,30 @@
  *    background agent's view isn't blanked by panel mounts). Creation goes only
  *    through `getOrCreate` / `openOrNavigate`, both cap-enforcing and non-throwing.
  *  - The old active entry is detached before the new one attaches. Inactive
- *    entries stay alive (JS + agent IPCs still run), just not painting; they're
- *    detached on hide and destroyed only on explicit close.
+ *    entries stay alive (JS + agent IPCs still run), just not painting. Draft
+ *    entries expire ten minutes after their renderer heartbeat stops.
  */
 
 const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
+const DEFAULT_DRAFT_LEASE_MS = 10 * 60 * 1000;
+const DRAFT_WORKSPACE_PATTERN = /^draft-workspace:[a-zA-Z0-9-]+$/;
+
+function draftWorkspaceIdFor(conversationId) {
+  if (typeof conversationId !== "string") return null;
+  if (DRAFT_WORKSPACE_PATTERN.test(conversationId)) return conversationId;
+  const prefix = "browser-tab:";
+  if (!conversationId.startsWith(prefix)) return null;
+  const separator = conversationId.indexOf(":", prefix.length);
+  if (separator === -1) return null;
+  try {
+    const workspaceId = decodeURIComponent(conversationId.slice(prefix.length, separator));
+    return DRAFT_WORKSPACE_PATTERN.test(workspaceId) ? workspaceId : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Storage partition for one conversation's browser view. Every view MUST get
@@ -66,17 +83,73 @@ function createBrowserViewRegistry({
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   cap = DEFAULT_CAP,
+  draftLeaseMs = DEFAULT_DRAFT_LEASE_MS,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
+  const draftLeaseTimers = new Map();
+  const expiringDrafts = new Set();
   let activeConversationId = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
   // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
   // layer, which always paints above the renderer regardless of z-index. Sticky
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
+
+  function clearDraftLease(workspaceId) {
+    const timer = draftLeaseTimers.get(workspaceId);
+    if (timer === undefined) return;
+    clearTimeoutFn(timer);
+    draftLeaseTimers.delete(workspaceId);
+  }
+
+  function hasDraftEntries(workspaceId) {
+    for (const conversationId of entries.keys()) {
+      if (draftWorkspaceIdFor(conversationId) === workspaceId) return true;
+    }
+    return false;
+  }
+
+  function ensureDraftLease(workspaceId) {
+    if (!workspaceId || expiringDrafts.has(workspaceId)) return;
+    if (!hasDraftEntries(workspaceId)) {
+      clearDraftLease(workspaceId);
+      return;
+    }
+    if (draftLeaseTimers.has(workspaceId)) return;
+    const timer = setTimeoutFn(() => {
+      draftLeaseTimers.delete(workspaceId);
+      expiringDrafts.add(workspaceId);
+      try {
+        for (const conversationId of [...entries.keys()]) {
+          if (draftWorkspaceIdFor(conversationId) === workspaceId) {
+            close(conversationId, "draft-lease-expired");
+          }
+        }
+      } finally {
+        expiringDrafts.delete(workspaceId);
+      }
+    }, draftLeaseMs);
+    timer?.unref?.();
+    draftLeaseTimers.set(workspaceId, timer);
+  }
+
+  function renewDraftLease(workspaceId) {
+    if (typeof workspaceId !== "string" || !DRAFT_WORKSPACE_PATTERN.test(workspaceId)) {
+      return { ok: false, error: "Invalid draft workspace id" };
+    }
+    if (!hasDraftEntries(workspaceId)) {
+      clearDraftLease(workspaceId);
+      return { ok: true, renewed: false };
+    }
+    clearDraftLease(workspaceId);
+    ensureDraftLease(workspaceId);
+    return { ok: true, renewed: true };
+  }
 
   // Apply the current suppress flag to the active view (no-op with none active).
   function applyActiveVisibility() {
@@ -159,6 +232,7 @@ function createBrowserViewRegistry({
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
     attachAgentNavGuard(entry);
+    ensureDraftLease(draftWorkspaceIdFor(conversationId));
     return { ok: true, entry, created: true };
   }
 
@@ -394,6 +468,7 @@ function createBrowserViewRegistry({
   function close(conversationId, reason) {
     const entry = entries.get(conversationId);
     if (!entry) return { ok: true, removed: false };
+    const draftWorkspaceId = draftWorkspaceIdFor(conversationId);
     if (activeConversationId === conversationId) {
       try {
         detachFromHost(entry.view);
@@ -430,6 +505,7 @@ function createBrowserViewRegistry({
       /* already destroyed */
     }
     entries.delete(conversationId);
+    ensureDraftLease(draftWorkspaceId);
     sendToRenderer("browser-view-closed", { conversationId, reason: reason || null });
     return { ok: true, removed: true };
   }
@@ -437,7 +513,7 @@ function createBrowserViewRegistry({
   function adoptDraft(sourceId, targetId) {
     if (
       typeof sourceId !== "string" ||
-      !/^draft-workspace:[a-zA-Z0-9-]+$/.test(sourceId) ||
+      !DRAFT_WORKSPACE_PATTERN.test(sourceId) ||
       typeof targetId !== "string" ||
       !/^[a-zA-Z0-9_-]+$/.test(targetId)
     ) {
@@ -467,6 +543,7 @@ function createBrowserViewRegistry({
       if (activeConversationId === id) activeConversationId = nextId;
       sendToRenderer("browser-view-created", { conversationId: nextId });
     }
+    clearDraftLease(sourceId);
     if (transfers.length) {
       sendToRenderer("browser-host-active-changed", { conversationId: activeConversationId });
     }
@@ -489,6 +566,7 @@ function createBrowserViewRegistry({
     close,
     closeAll,
     adoptDraft,
+    renewDraftLease,
     // Introspection
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,

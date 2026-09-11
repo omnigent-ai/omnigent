@@ -12,6 +12,7 @@ export interface LandingWorkspaceSelection {
   workspace: string;
   available: boolean;
   reason: string;
+  project?: string;
 }
 interface LandingWorkspaceState {
   browserNamespace: string;
@@ -123,13 +124,15 @@ export async function discardAbandonedLandingWorkspace(
   const failure = results.find((result) => result.status === "rejected");
   if (failure?.status === "rejected") throw failure.reason;
 }
-export function publishLandingWorkspaceSelection(selection: LandingWorkspaceSelection) {
+export function publishLandingWorkspaceSelection(selection: LandingWorkspaceSelection): boolean {
   readLandingWorkspaceState();
-  if (JSON.stringify(state.selection) === JSON.stringify(selection)) return;
+  if (JSON.stringify(state.selection) === JSON.stringify(selection)) return true;
   const changed =
     state.selection?.hostId !== selection.hostId ||
     state.selection?.workspace !== selection.workspace;
   const claimed = claimedNamespaces.has(state.browserNamespace);
+  if (state.selection !== null && changed && !claimed && !confirmLandingWorkspaceChange())
+    return false;
   if (
     changed &&
     !claimed &&
@@ -160,6 +163,7 @@ export function publishLandingWorkspaceSelection(selection: LandingWorkspaceSele
         }
       : state.panel,
   });
+  return true;
 }
 export function landingResourceTarget(
   selection: LandingWorkspaceSelection | null,

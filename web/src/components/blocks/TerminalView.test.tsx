@@ -156,13 +156,14 @@ describe("explicit attach path", () => {
     render(
       <TerminalView
         terminalId="terminal_bash_draft"
+        hostId="host_1"
         attachPath="/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach"
       />,
     );
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
 
     expect(terminalSessionMock.instances[0].url).toBe(
-      `ws://${window.location.host}/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach`,
+      `ws://${window.location.host}/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach?omnigent_slice_key=host_1`,
     );
     expect(getSessionHost).not.toHaveBeenCalled();
   });
@@ -171,6 +172,7 @@ describe("explicit attach path", () => {
     render(
       <TerminalView
         terminalId="terminal_bash_draft"
+        hostId="host_1"
         attachPath="/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach?omnigent_slice_key=host_1"
         readOnly
       />,
@@ -180,6 +182,107 @@ describe("explicit attach path", () => {
     const url = terminalSessionMock.instances[0].url;
     expect(url).toContain("omnigent_slice_key=host_1&read_only=true");
     expect(url.match(/read_only=true/g)).toHaveLength(1);
+  });
+
+  it("removes a stale routing key for a host already demoted by HTTP", async () => {
+    sessionHost.markHostKeyless("draft_keyless");
+    try {
+      render(
+        <TerminalView
+          terminalId="terminal_bash_draft"
+          hostId="draft_keyless"
+          attachPath="/v1/hosts/draft_keyless/workspace-contexts/ctx/resources/terminals/term/attach?omnigent_slice_key=draft_keyless"
+          readOnly
+        />,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const url = new URL(terminalSessionMock.instances[0].url);
+      expect(url.searchParams.has("omnigent_slice_key")).toBe(false);
+      expect(url.searchParams.get("read_only")).toBe("true");
+    } finally {
+      sessionHost.clearHostKeyless("draft_keyless");
+    }
+  });
+
+  it("redials a draft attachment keyless once after a wrong-replica close", async () => {
+    try {
+      render(
+        <TerminalView
+          terminalId="terminal_bash_draft"
+          hostId="draft_retry"
+          attachPath="/v1/hosts/draft_retry/workspace-contexts/ctx/resources/terminals/term/attach?omnigent_slice_key=draft_retry&read_only=true"
+          readOnly
+        />,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      expect(
+        new URL(terminalSessionMock.instances[0].url).searchParams.get("omnigent_slice_key"),
+      ).toBe("draft_retry");
+      act(() =>
+        terminalSessionMock.instances[0].onState({
+          kind: "closed",
+          reason: "wrong replica",
+          code: 4400,
+        }),
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+      const retryUrl = new URL(terminalSessionMock.instances[1].url);
+      expect(retryUrl.searchParams.has("omnigent_slice_key")).toBe(false);
+      expect(retryUrl.searchParams.get("read_only")).toBe("true");
+      expect(sessionHost.isHostKeyless("draft_retry")).toBe(true);
+      act(() =>
+        terminalSessionMock.instances[1].onState({
+          kind: "closed",
+          reason: "wrong replica",
+          code: 4400,
+        }),
+      );
+      expect(terminalSessionMock.instances).toHaveLength(2);
+      expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalled();
+    } finally {
+      sessionHost.clearHostKeyless("draft_retry");
+    }
+  });
+
+  it("redials a stale keyless draft attachment with a routing key once", async () => {
+    sessionHost.markHostKeyless("draft_stale");
+    try {
+      render(
+        <TerminalView
+          terminalId="terminal_bash_draft"
+          hostId="draft_stale"
+          attachPath="/v1/hosts/draft_stale/workspace-contexts/ctx/resources/terminals/term/attach"
+        />,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      expect(
+        new URL(terminalSessionMock.instances[0].url).searchParams.has("omnigent_slice_key"),
+      ).toBe(false);
+
+      act(() =>
+        terminalSessionMock.instances[0].onState({
+          kind: "closed",
+          reason: "wrong replica",
+          code: 4400,
+        }),
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+      expect(
+        new URL(terminalSessionMock.instances[1].url).searchParams.get("omnigent_slice_key"),
+      ).toBe("draft_stale");
+      expect(sessionHost.isHostKeyless("draft_stale")).toBe(false);
+
+      act(() =>
+        terminalSessionMock.instances[1].onState({
+          kind: "closed",
+          reason: "wrong replica",
+          code: 4400,
+        }),
+      );
+      expect(terminalSessionMock.instances).toHaveLength(2);
+    } finally {
+      sessionHost.clearHostKeyless("draft_stale");
+    }
   });
 });
 

@@ -127,6 +127,7 @@ import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDi
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { resolveDefaultShell } from "./preferredShell";
 import { useDraftWorkspace } from "@/hooks/useDraftWorkspace";
+import { useDraftBrowserLease } from "@/hooks/useDraftBrowserLease";
 import {
   readLandingWorkspaceState,
   useLandingWorkspaceState,
@@ -248,14 +249,19 @@ export function AppShell() {
   // create window (or on a stale temp reload, before ChatPage redirects).
   const location = useLocation();
   const navigationType = useNavigationType();
+  const workspaceNavigationGenerationRef = useRef(0);
+  useLayoutEffect(() => {
+    workspaceNavigationGenerationRef.current += 1;
+  }, [location.pathname, location.search, location.key]);
   const landingRoute = location.pathname === "/";
   const landingWorkspace = useLandingWorkspaceState();
+  useDraftBrowserLease(landingWorkspace.browserNamespace, landingRoute);
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
   const draftWorkspace = useDraftWorkspace(serverConversationId);
   useEffect(() => {
     setLandingWorkspaceBusy(landingRoute && draftWorkspace.isLoading);
   }, [landingRoute, draftWorkspace.isLoading]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (
       !landingRoute ||
       landingContextClaimedElsewhere(draftWorkspace.context?.id, landingWorkspace.browserNamespace)
@@ -1669,11 +1675,15 @@ export function AppShell() {
     )
       return;
     landingShellCreating.current = true;
+    const navigationGeneration = workspaceNavigationGenerationRef.current;
     void (async () => {
       try {
         const context = await draftWorkspace.ensureContext(selection.hostId!, selection.workspace);
         const terminal = await draftWorkspace.createTerminal(context);
-        if (readLandingWorkspaceState().browserNamespace !== landingWorkspace.browserNamespace)
+        if (
+          workspaceNavigationGenerationRef.current !== navigationGeneration ||
+          readLandingWorkspaceState().browserNamespace !== landingWorkspace.browserNamespace
+        )
           return;
         writeLandingWorkspacePanel({
           open: true,

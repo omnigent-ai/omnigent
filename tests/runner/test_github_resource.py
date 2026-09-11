@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from base64 import b64encode
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -129,6 +130,8 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
         "author": {"login": "alice"},
         "baseRefName": "main",
         "headRefName": "alice/feature",
+        "headRefOid": "head-42",
+        "baseRefOid": "base-42",
         "statusCheckRollup": [],
     }
     calls: list[tuple[str, ...]] = []
@@ -152,7 +155,10 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
     info = github_info(str(repo))
     assert info["pr"]["number"] == 42
     assert info["pr"]["head_ref"] == "alice/feature"
+    assert info["pr"]["head_sha"] == "head-42"
+    assert info["pr"]["base_sha"] == "base-42"
     assert info["pr"]["is_draft"] is True
+    assert info["selected_pr_url"] == "https://github.com/acme/repo/pull/42"
     assert info["base_ref"] == "main"
     assert any(c[:2] == ("pr", "view") for c in calls)
     assert not any(c[:2] == ("pr", "list") for c in calls)
@@ -555,6 +561,63 @@ def test_github_file_diff_deleted(repo: Path) -> None:
     diff = github_file_diff(str(repo), "main", "fileB.py")
     assert diff["before"] == "B base"
     assert diff["after"] is None
+
+
+@pytest.mark.parametrize("pr_url", [None, "https://github.com/acme/repo/pull/42"])
+def test_workspace_github_file_diff_reads_remote_pr_revisions(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, pr_url: str | None
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def encoded(value: str) -> str:
+        return b64encode(value.encode()).decode()
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (
+                0,
+                json.dumps({"number": 42, "url": "https://github.com/acme/repo/pull/42"}),
+                "",
+            )
+        endpoint = argv[-1]
+        if endpoint == "repos/acme/repo/pulls/42":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "head": {"sha": "remote-head", "repo": {"full_name": "alice/repo"}},
+                        "base": {"sha": "remote-base"},
+                    }
+                ),
+                "",
+            )
+        if endpoint == "repos/acme/repo/compare/remote-base...remote-head":
+            return (0, json.dumps({"merge_base_commit": {"sha": "merge-base"}}), "")
+        if endpoint == "repos/acme/repo/contents/fileA.py?ref=merge-base":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("remote base")}), "")
+        if endpoint == "repos/alice/repo/contents/fileA.py?ref=remote-head":
+            return (0, json.dumps({"encoding": "base64", "content": encoded("remote head")}), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_account_token_for", lambda _root: None)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda _root, _reference: None)
+
+    diff = github_file_diff(
+        str(repo),
+        "main",
+        "fileA.py",
+        pr_url=pr_url,
+        head_sha="remote-head",
+        base_sha="remote-base",
+    )
+
+    assert diff["before"] == "remote base"
+    assert diff["after"] == "remote head"
+    assert any(call[-1] == "repos/acme/repo/pulls/42" for call in calls)
 
 
 @pytest.mark.parametrize("pr_url", [None, "https://github.com/upstream/repo/pull/42"])

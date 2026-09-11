@@ -453,7 +453,7 @@ describe("landingWorkspaceState", () => {
       },
     });
     expect(landing.readLandingWorkspaceState().browserNamespace).not.toBe(firstNamespace);
-    expect(hasTerminals).not.toHaveBeenCalled();
+    expect(hasTerminals).toHaveBeenCalledOnce();
     expect(discard).toHaveBeenCalledOnce();
     expect(browserClose.mock.calls).toEqual([
       [firstNamespace],
@@ -567,6 +567,7 @@ describe("landingWorkspaceState", () => {
     };
     landing.registerLandingResourceLifecycle(lifecycleA);
     const snapshotA = landing.captureLandingWorkspace();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
 
     landing.publishLandingWorkspaceSelection({
       hostId: "host-b",
@@ -630,6 +631,51 @@ describe("landingWorkspaceState", () => {
       hostId: "host-1",
       workspace: "/current",
     });
+  });
+
+  it("rejects a remounted workspace publisher when running terminals stay open", async () => {
+    const landing = await loadLandingWorkspaceState();
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: { browserClose },
+    });
+    landing.publishLandingWorkspaceSelection({
+      hostId: "host-a",
+      workspace: "/project-a",
+      available: true,
+      reason: "",
+    });
+    landing.writeLandingWorkspacePanel({
+      openFiles: ["project-a.ts"],
+      selectedFilePath: "project-a.ts",
+      selectedTerminalKey: "terminal:project-a",
+      openBrowsers: ["browser-a"],
+      selectedBrowserId: "browser-a",
+    });
+    browserClose.mockClear();
+    const discard = vi.fn().mockResolvedValue(undefined);
+    landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard,
+      adopt: vi.fn().mockResolvedValue(undefined),
+    });
+    const beforeChange = landing.readLandingWorkspaceState();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    const accepted = landing.publishLandingWorkspaceSelection({
+      hostId: "host-b",
+      workspace: "/project-b",
+      available: true,
+      reason: "",
+    });
+    await Promise.resolve();
+
+    expect(accepted).toBe(false);
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(discard).not.toHaveBeenCalled();
+    expect(browserClose).not.toHaveBeenCalled();
+    expect(landing.readLandingWorkspaceState()).toEqual(beforeChange);
   });
 
   it("does not discard the same context twice while confirmed cleanup is still running", async () => {
@@ -764,6 +810,7 @@ describe("landingWorkspaceState", () => {
     };
     landing.registerLandingResourceLifecycle(lifecycleA);
     const snapshotA = landing.captureLandingWorkspace();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
 
     landing.publishLandingWorkspaceSelection({
       hostId: "host-b",
@@ -788,7 +835,7 @@ describe("landingWorkspaceState", () => {
 
     await landing.adoptLandingWorkspace("session-a", "host-a", "/workspace-a", snapshotA);
 
-    expect(lifecycleA.hasTerminals).toHaveBeenCalledOnce();
+    expect(lifecycleA.hasTerminals).toHaveBeenCalledTimes(2);
     expect(lifecycleA.adopt).toHaveBeenCalledWith("session-a");
     expect(lifecycleA.discard).not.toHaveBeenCalled();
     expect(lifecycleB.hasTerminals).not.toHaveBeenCalled();
