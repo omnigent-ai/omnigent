@@ -724,6 +724,7 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param notification_message: Notification title and message, when present.
     """
 
     event_cursor: int
@@ -744,6 +745,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    notification_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1924,6 +1926,7 @@ def build_hook_settings(
         "SessionStart": [{"hooks": [session_start_hook]}],
         "Stop": [{"hooks": [hook]}],
         "StopFailure": [{"hooks": [hook]}],
+        "Notification": [{"hooks": [hook]}],
         # ``UserPromptSubmit`` is the symmetric counterpart to
         # ``Stop`` — fires when a new user prompt reaches Claude
         # (web-UI message via tmux send-keys, or direct keystrokes
@@ -3491,7 +3494,23 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        notification_message=_notification_message(payload)
+        if event_name == "Notification"
+        else None,
     )
+
+
+def _notification_message(payload: object) -> str | None:
+    """Keep notification text and title, not unrelated hook metadata."""
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return None
+    title = payload.get("title")
+    if isinstance(title, str) and title.strip():
+        return f"{title.strip()}\n\n{message.strip()}"
+    return message.strip()
 
 
 def _read_complete_jsonl_records(
@@ -4224,10 +4243,12 @@ class PaneSignals:
         ``"auto"``, or ``None`` when no mode footer is visible.
     :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
         when none is shown / it is still generating.
+    :param terminal_message: Visible numbered dialog text, or ``None``.
     """
 
     permission_mode: str | None = None
     btw_overlay: BtwOverlay | None = None
+    terminal_message: str | None = None
 
 
 def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
@@ -6541,9 +6562,12 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return PaneSignals()
     pane = _capture_pane(socket_path, tmux_target)
+    from omnigent.harnesses.claude_native.tui_messages import terminal_message_from_pane
+
     return PaneSignals(
         permission_mode=_permission_mode_from_pane(pane),
         btw_overlay=_btw_overlay_from_pane(pane),
+        terminal_message=terminal_message_from_pane(pane),
     )
 
 
