@@ -672,6 +672,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
+    assert launched.tmux_start_on_browser_ready is True
     assert launched.tmux_allow_passthrough is True
     assert preload_calls == [
         (

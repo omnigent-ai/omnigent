@@ -498,6 +498,7 @@ export class TerminalSession {
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
+  private readonly paletteQueryDisposables: { dispose: () => void }[];
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
@@ -575,6 +576,9 @@ export class TerminalSession {
     // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
     // writes can only arrive through validated tmux `clipboard-write` frames.
     this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
+    this.paletteQueryDisposables = [10, 11].map((slot) =>
+      this.term.parser.registerOscHandler(slot, (data) => data === "?"),
+    );
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links. Without
@@ -625,6 +629,7 @@ export class TerminalSession {
         // dimensions before the user sees the default 80×24 followed
         // by a reflow.
         this.sendResize();
+        this.sendTheme();
         if (this.focusOnConnect) this.term.focus();
         onState({ kind: "connected" });
       },
@@ -732,6 +737,13 @@ export class TerminalSession {
    */
   setTheme(isDark: boolean): void {
     this.term.options.theme = terminalTheme(isDark);
+    this.sendTheme();
+  }
+
+  private sendTheme(): void {
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    const { foreground, background } = this.term.options.theme ?? {};
+    this.ws.send(JSON.stringify({ type: "init", foreground, background }));
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */
@@ -779,6 +791,7 @@ export class TerminalSession {
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
+    this.paletteQueryDisposables.forEach((disposable) => disposable.dispose());
     try {
       this.ws.close();
     } catch {

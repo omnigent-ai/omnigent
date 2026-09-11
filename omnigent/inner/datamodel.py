@@ -800,6 +800,9 @@ class TerminalEnvSpec:
     :param tmux_start_on_attach: Delay the terminal command until the
         first tmux client attaches. Used for TUIs that must query the
         real attached terminal during startup.
+    :param tmux_start_on_browser_ready: Give a browser two seconds to configure
+        terminal colors before startup; otherwise start detached. Runner-owned
+        opt-in, mutually exclusive with ``tmux_start_on_attach``.
     :param keep_alive_after_exit: Keep the private tmux server alive after
         the pane's inner process exits (``remain-on-exit`` / ``exit-empty
         off``), so a single CLI exit no longer reaps the server and cascades
@@ -821,6 +824,7 @@ class TerminalEnvSpec:
     session_prefix: str = "omni_"
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
+    tmux_start_on_browser_ready: bool = False
     keep_alive_after_exit: bool = False
 
 

@@ -566,6 +566,38 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("reports its palette after sizing, using the theme selected before open", () => {
+    const { socket, session } = makeSession();
+    session.setTheme(true);
+    expect(socket.sent).toEqual([]);
+    socket.open();
+    const controls = socket.sent
+      .filter((frame): frame is string => typeof frame === "string")
+      .map((frame) => JSON.parse(frame));
+    expect(controls[0].type).toBe("resize");
+    expect(controls[1]).toEqual({ type: "init", foreground: "#e4e4e7", background: "#131517" });
+    session.setTheme(false);
+    expect(JSON.parse(socket.sent.at(-1) as string)).toEqual({
+      type: "init",
+      foreground: "#18181b",
+      background: "#ffffff",
+    });
+    session.dispose();
+  });
+
+  it("does not send duplicate default-color replies or count queries as user input", async () => {
+    const onInput = vi.fn();
+    const { socket, session } = makeSession(undefined, onInput);
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    await new Promise<void>((resolve) => {
+      term.write("\x1b]10;?\x07\x1b]11;?\x1b\\", resolve);
+    });
+    expect(socket.sent.every((frame) => typeof frame === "string")).toBe(true);
+    expect(onInput).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
   it("does not grab focus on open when focusOnConnect is false", () => {
     // WHY: the workspace-rail shell connects in the background on a session
     // switch — it must not yank focus off the chat composer.

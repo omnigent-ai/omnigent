@@ -4613,16 +4613,7 @@ async def _auto_create_codex_terminal(
                 # Enable tmux passthrough so the Codex TUI's escape sequences
                 # reach the web xterm.
                 tmux_allow_passthrough=True,
-                # Start the TUI at creation rather than on first attach,
-                # mirroring claude-native. Deferring to attach (the local CLI
-                # default) means the full-screen TUI cold-starts the instant
-                # the web UI attaches over the runner tunnel; that initial
-                # render burst starves the tunnel ping/pong and the host
-                # recycles the unresponsive runner (the "runner
-                # death on terminal attach" class). Starting now lets the TUI settle
-                # in the detached tmux pane (no tunnel traffic) and create its
-                # thread before anyone attaches.
-                tmux_start_on_attach=False,
+                tmux_start_on_browser_ready=True,
             ),
         )
         publish_event(

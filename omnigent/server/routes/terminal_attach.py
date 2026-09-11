@@ -40,6 +40,9 @@ Wire protocol on the WebSocket
     - **Text frames** are JSON control messages such as
       ``{"type": "resize", "cols": N, "rows": M}``. Unknown shapes are
       ignored for forward compatibility.
+    - Owners may send ``{"type": "init", "foreground": "#18181b", "background":
+      "#ffffff"}`` after sizing to configure tmux's default colors and release
+      a waiting terminal. Read-only viewers cannot initialize the palette.
     - **Binary frames** are raw input bytes forwarded to tmux. xterm.js's
       ``onData`` callback emits these for keystrokes, pasted text, and mouse
       reports.

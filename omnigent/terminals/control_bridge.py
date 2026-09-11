@@ -27,9 +27,14 @@ Design notes learned from the protocol (see ``control_bridge`` spike):
   chars, and UTF-8 multibyte alike.
 
 The browser-facing stream uses binary frames for raw pane bytes, text JSON
-frames for resize controls, and binary frames for input. A typed text JSON
+frames for resize/palette controls, and binary frames for input. A typed text JSON
 frame carries tmux clipboard updates because outer-client OSC 52 is absent from
 ``%output``.
+
+An owner sends ``init`` with the renderer's foreground/background after sizing.
+The bridge sets tmux's default colors before releasing a browser-ready startup
+gate. Read-only viewers cannot set colors or release it. Xterm suppresses the
+duplicate OSC 10/11 query replies because tmux answers those probes itself.
 
 Tmux's own overlays (``display-popup``, copy-mode, status line) are not delivered
 to control clients. The native cost-approval popup remains available to users
@@ -62,6 +67,7 @@ from omnigent.terminals.ws_common import (
     _monotonic,
     _tmux_session_alive,
 )
+from omnigent.util.terminal_browser_ready import browser_ready_commands
 
 _logger = logging.getLogger(__name__)
 
@@ -754,6 +760,12 @@ async def bridge_tmux_control_to_websocket(
                         except (KeyError, TypeError, ValueError):
                             continue
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
+                    elif isinstance(ctl, dict) and ctl.get("type") == "init" and not read_only:
+                        commands = browser_ready_commands(
+                            tmux_target, ctl.get("foreground"), ctl.get("background")
+                        )
+                        if commands is not None:
+                            await _send_command(commands)
                 elif data is not None and not read_only:
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.

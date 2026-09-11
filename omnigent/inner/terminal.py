@@ -24,6 +24,12 @@ from typing import Any, TypeAlias
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.util.terminal_browser_ready import (
+    BROWSER_READY_CHANNEL,
+    BROWSER_READY_OPTION,
+    BROWSER_READY_RELEASE,
+    BROWSER_READY_TIMEOUT_SECONDS,
+)
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 from . import _proc
@@ -867,6 +873,8 @@ class TerminalInstance:
         tmux passthrough escapes to query/control the attached terminal.
     :param tmux_start_on_attach: Whether to delay command startup until
         the first tmux client attaches to the session.
+    :param tmux_start_on_browser_ready: Wait briefly for a browser palette,
+        then start detached if no browser arrives.
     :param running: Whether the tmux server is currently expected to
         be alive.
     """
@@ -899,6 +907,7 @@ class TerminalInstance:
     scrollback: int = 10000
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
+    tmux_start_on_browser_ready: bool = False
     # Keep the private tmux server alive after the pane's inner process exits
     # (``remain-on-exit`` / ``exit-empty off``). Opt-in per terminal because it
     # changes the ``has-session``-means-alive contract: with it on, liveness is
@@ -1047,6 +1056,8 @@ class TerminalInstance:
         """Start the tmux session."""
         if self.running:
             return
+        if self.tmux_start_on_attach and self.tmux_start_on_browser_ready:
+            raise ValueError("Terminal startup can wait for attach or browser readiness, not both")
         effective_cwd = str(cwd or self.private_dir)
 
         # Do NOT advertise the tmux control socket path to the
@@ -1112,6 +1123,8 @@ class TerminalInstance:
         inner_str = " ".join(_shell_quote(c) for c in inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
+        elif self.tmux_start_on_browser_ready:
+            inner_str = f"tmux wait-for {BROWSER_READY_CHANNEL}; exec {inner_str}"
 
         option_commands = [
             *_tmux_managed_option_commands(
@@ -1144,6 +1157,21 @@ class TerminalInstance:
             if self.keep_alive_after_exit
             else []
         )
+        browser_ready_commands = (
+            [
+                ["set-option", "-g", BROWSER_READY_OPTION, "pending"],
+                [
+                    "run-shell",
+                    "-b",
+                    "-C",
+                    "-d",
+                    str(BROWSER_READY_TIMEOUT_SECONDS),
+                    BROWSER_READY_RELEASE,
+                ],
+            ]
+            if self.tmux_start_on_browser_ready
+            else []
+        )
         cmd = [
             *self._tmux_base_cmd(),
             *_tmux_command_sequence(
@@ -1167,6 +1195,7 @@ class TerminalInstance:
                         inner_str,
                     ],
                     *pane_died_hook,
+                    *browser_ready_commands,
                 ]
             ),
         ]
@@ -2117,6 +2146,7 @@ def create_terminal_instance(
         scrollback=spec.scrollback,
         tmux_allow_passthrough=spec.tmux_allow_passthrough,
         tmux_start_on_attach=spec.tmux_start_on_attach,
+        tmux_start_on_browser_ready=spec.tmux_start_on_browser_ready,
         keep_alive_after_exit=spec.keep_alive_after_exit,
     )
 
