@@ -1184,6 +1184,14 @@ aside[aria-label="Workspace"][data-maximized] {
   text-indent: -2.5rem;
 }
 
+/* Our own mermaid fullscreen button (see ChatMermaidBlock in message.tsx)
+ * sits in a pill at the block's top-right. Nudge Streamdown's mermaid action
+ * bar left by that pill's footprint so the two rows sit side by side rather
+ * than overlapping. */
+.chat-mermaid [data-streamdown="mermaid-block-actions"] {
+  margin-right: 2.75rem;
+}
+
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
