@@ -24,7 +24,7 @@ from ipaddress import ip_address
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 
 from omnigent.debug_logging import debug_event
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
@@ -36,7 +36,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -751,11 +751,19 @@ async def _ping_loop(
         if elapsed is None:
             return
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
+            # Runner tunnel went silent past the liveness window: the runner or
+            # its network died, blocking sessions on it until it reconnects.
             _logger.warning(
                 "Runner %s missed %d ping intervals (%.0fs since last frame); declaring dead",
                 runner_id,
                 PING_MISS_THRESHOLD,
                 elapsed,
+                extra=debug_event(
+                    "runner_ping_timeout",
+                    error_category=ErrorCategory.RUNNER.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.UNKNOWN.value,
+                ),
             )
             try:
                 await ws.close(code=4003, reason="ping timeout")
@@ -767,6 +775,9 @@ async def _ping_loop(
         # Best-effort and deduplicated inside the chokepoint; the enqueue
         # inherits this handler's workspace scope via copy_context.
         session_live_state.touch_runner_liveness([runner_id])
+        # A live runner tunnel is also the signal that this sandbox is still
+        # in use; rate-limited inside, so calling it per ping is fine.
+        managed_host_keepalive.touch(runner_id)
         try:
             await registry.send_text(
                 session,

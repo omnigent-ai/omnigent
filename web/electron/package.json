@@ -1,7 +1,7 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Omnigent desktop shell (Electron edition) \u2014 a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
@@ -139,7 +139,7 @@
       ]
     },
     "linux": {
-      "icon": "icons/icon.png",
+      "icon": "icons/icon.svg",
       "category": "Development",
       "maintainer": "Databricks, Inc. <support@omnigent.ai>",
       "target": [
@@ -170,6 +170,6 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "electron-updater": "^6.3.9",
-    "js-yaml": "^4.3.0"
+    "js-yaml": "^4.3.2"
   }
 }

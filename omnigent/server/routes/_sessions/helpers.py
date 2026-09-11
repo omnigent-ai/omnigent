@@ -39,10 +39,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
-from omnigent.cost_plan import (
-    COST_CONTROL_LABEL_NAMESPACE,
-    reserved_cost_control_keys,
-)
+from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.db.utils import generate_task_id
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
@@ -65,15 +62,12 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
-from omnigent.native_coding_agents import (
+from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
 from omnigent.policies.types import EvaluationContext
-from omnigent.reasoning_effort import (
-    EFFORT_VALUES,
-    validate_effort,
-)
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
@@ -149,6 +143,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_HARNESS,
@@ -244,7 +239,9 @@ from omnigent.server.schemas import (
     ResponseObject,
     RetryErrorDetail,
     SandboxStatus,
+    SessionBtwSidechatEvent,
     SessionChildSessionUpdatedEvent,
+    SessionCodexApprovalModeEvent,
     SessionCollaborationModeEvent,
     SessionCreatedEvent,
     SessionCreateMetadata,
@@ -272,10 +269,6 @@ from omnigent.server.schemas import (
     SkillSummary,
     ToolOutputDeltaEvent,
 )
-from omnigent.session_lifecycle import (
-    labels_with_closed_status,
-    title_without_closed_marker,
-)
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -291,6 +284,18 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.util.cost_plan import (
+    COST_CONTROL_LABEL_NAMESPACE,
+    reserved_cost_control_keys,
+)
+from omnigent.util.reasoning_effort import (
+    EFFORT_VALUES,
+    validate_effort,
+)
+from omnigent.util.session_lifecycle import (
+    labels_with_closed_status,
+    title_without_closed_marker,
+)
 
 
 def _codex_plan_mode_enabled(mode: str) -> bool:
@@ -338,6 +343,22 @@ def _publish_permission_mode(session_id: str, mode: str) -> None:
     session_stream.publish(session_id, event.model_dump())
 
 
+def _publish_codex_approval_mode(session_id: str, mode: str) -> None:
+    """
+    Publish the live codex-native approval/sandbox mode for a session.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param mode: The active approval mode, e.g. ``"read-only"``.
+    :returns: None.
+    """
+    event = SessionCodexApprovalModeEvent(
+        type="session.codex_approval_mode",
+        conversation_id=session_id,
+        approval_mode=mode,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
 def _publish_policy_denied(session_id: str, reason: str, phase: str) -> None:
     """
     Publish a native policy-DENY signal on the session stream.
@@ -359,6 +380,25 @@ def _publish_policy_denied(session_id: str, reason: str, phase: str) -> None:
         phase=phase,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _allow_auto_mode_eligible(tool_name: str, permission_mode: str | None) -> bool:
+    """
+    Whether a regular Claude permission prompt may offer a session-scoped auto-mode switch.
+
+    Reuses the remember-ineligible set on purpose: those are exactly the
+    bespoke-card tools (ExitPlanMode, AskUserQuestion) with their own
+    approval flows, where a generic auto-mode button never belongs.
+
+    :param tool_name: The gated tool from Claude's PermissionRequest payload.
+    :param permission_mode: Claude's current permission mode, or None when absent.
+    :returns: True for tool approvals outside planning and already-automatic modes.
+    """
+    return tool_name not in _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS and permission_mode in (
+        None,
+        "default",
+        "acceptEdits",
+    )
 
 
 def _allow_all_edits_eligible(tool_name: str, permission_mode: str | None) -> bool:
@@ -579,6 +619,21 @@ def announce_hosts_changed(user_id: str | None) -> None:
         single-user mode.
     """
     user_session_stream.publish(_discovery_key(user_id), {"type": "hosts_changed"})
+
+
+def announce_projects_changed(user_id: str | None) -> None:
+    """
+    Push a ``projects_changed`` event to a user's session-updates streams.
+
+    Called after one of ``user_id``'s projects is created, updated (renamed,
+    config change), or deleted, so that user's other connected clients refresh
+    their projects cache instead of showing the stale name until a reload. A
+    no-op when the user has no stream connected.
+
+    :param user_id: Owner of the project that changed, or ``None`` in
+        single-user mode.
+    """
+    user_session_stream.publish(_discovery_key(user_id), {"type": "projects_changed"})
 
 
 def _native_ask_gate_lock(conversation_id: str, deciding_policy: str) -> asyncio.Lock:
@@ -1013,6 +1068,7 @@ def _client_supplied_hook_elicitation_id(
 def _consume_pre_resolved_harness_elicitation(
     session_id: str,
     elicitation_id: str,
+    request_fingerprint: str | None = None,
 ) -> _PreResolvedHarnessElicitation | None:
     """
     Consume a resolution that arrived before the hook wait registered.
@@ -1020,6 +1076,16 @@ def _consume_pre_resolved_harness_elicitation(
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
     :param elicitation_id: Harness elicitation id, e.g.
         ``"elicit_codex_abc123"``.
+    :param request_fingerprint: Digest of the consuming re-park's request
+        params, e.g. a sha256 hex string. A verdict-carrying tombstone
+        is adopted ONLY on a proven same-question match: both sides
+        must carry a fingerprint and they must be equal. Any other
+        combination (either side ``None``, or a mismatch) fails closed
+        — the tombstone is dropped and the prompt is re-published — so
+        a stale approval can never gate a DIFFERENT question that
+        reused this id. Terminal-side tombstones (``result is None``)
+        skip the check: adopting one only fail-asks, and their producer
+        has no params to fingerprint.
     :returns: The consumed tombstone when one matched this session
         (its ``result`` carries the web verdict to honor, or ``None``
         for a terminal-side resolution), or ``None`` when nothing was
@@ -1029,10 +1095,23 @@ def _consume_pre_resolved_harness_elicitation(
     tombstone = _harness_pre_resolved_elicitations.pop(elicitation_id, None)
     if tombstone is None:
         return None
-    if tombstone.session_id == session_id:
-        return tombstone
-    _harness_pre_resolved_elicitations[elicitation_id] = tombstone
-    return None
+    if tombstone.session_id != session_id:
+        _harness_pre_resolved_elicitations[elicitation_id] = tombstone
+        return None
+    if tombstone.result is not None and (
+        tombstone.request_fingerprint is None
+        or request_fingerprint is None
+        or tombstone.request_fingerprint != request_fingerprint
+    ):
+        # A verdict is replayed only on a proven same-question match.
+        # A differing fingerprint means the id was reused by a LATER,
+        # different question; a missing fingerprint on either side
+        # means the match cannot be proven (e.g. the gap path found no
+        # valid pending prompt to digest). Both fail closed: drop the
+        # tombstone and let the new prompt be published — the safe cost
+        # is one re-ask, never a stale approval gating a new question.
+        return None
+    return tombstone
 
 
 def _prune_pre_resolved_harness_elicitations(now: float | None = None) -> None:
@@ -1437,6 +1516,7 @@ def _publish_elicitation_resolved_to_ancestors(
     session_id: str,
     elicitation_id: str,
     action: str | None = None,
+    reason: str | None = None,
 ) -> None:
     """
     Mirror an elicitation-resolved event into each ancestor stream.
@@ -1448,9 +1528,11 @@ def _publish_elicitation_resolved_to_ancestors(
         ``"elicit_abc123"``.
     :param action: Optional MCP verdict carried through to the
         mirrors; see :func:`_publish_elicitation_resolved`.
+    :param reason: Optional no-verdict reason carried through to the
+        mirrors; see :func:`_publish_elicitation_resolved`.
     """
     for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action)
+        _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action, reason=reason)
 
 
 def _descendant_sessions(
@@ -1555,9 +1637,13 @@ def _publish_input_consumed(
         web message mirrored back from the transcript), that entry's
         id, e.g. ``"pending_a1b2c3"`` — so clients drop the optimistic
         bubble by id. ``None`` when nothing was drained.
+
+    Hidden context items (``is_meta``, e.g. injected skill text or a
+    Claude background-task notification) are published too, flagged in
+    ``data.is_meta``: subscribers hide or re-label them, and the web UI
+    shows the task notification as a system marker so the turn Claude
+    resumes on it starts a new bubble.
     """
-    if item.type == "message" and isinstance(item.data, MessageData) and item.data.is_meta:
-        return
     event = SessionInputConsumedEvent(
         type="session.input.consumed",
         data=SessionInputConsumedPayload(
@@ -1571,16 +1657,28 @@ def _publish_input_consumed(
     session_stream.publish(session_id, event.model_dump())
 
 
+# Wall-clock start of each session's in-flight compaction. A long compaction
+# re-announces in_progress on every status poll; carrying one stable
+# started_at lets clients anchor their elapsed counter to the true start,
+# even across a page reload (the live stream has no replay).
+_compaction_started_at: dict[str, int] = {}
+
+
 def _publish_compaction_in_progress(session_id: str) -> None:
     """
     Publish the standard compaction progress event to a session stream.
 
+    Repeated calls while the same compaction runs reuse the ``started_at``
+    recorded on the first call; ``completed``/``failed`` clear it so the
+    next compaction starts a fresh clock.
+
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     """
+    started_at = _compaction_started_at.setdefault(session_id, int(time.time()))
     session_stream.publish(
         session_id,
-        {"type": "response.compaction.in_progress"},
+        {"type": "response.compaction.in_progress", "started_at": started_at},
     )
 
 
@@ -1598,6 +1696,7 @@ def _publish_compaction_completed(session_id: str, total_tokens: int | None) -> 
     :param total_tokens: Tiktoken estimate of the post-compaction
         context size, e.g. ``8421``. ``None`` when unavailable.
     """
+    _compaction_started_at.pop(session_id, None)
     payload: dict[str, object] = {"type": "response.compaction.completed"}
     if total_tokens is not None:
         payload["total_tokens"] = total_tokens
@@ -1617,6 +1716,7 @@ def _publish_compaction_failed(session_id: str) -> None:
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     """
+    _compaction_started_at.pop(session_id, None)
     session_stream.publish(session_id, {"type": "response.compaction.failed"})
 
 
@@ -2195,8 +2295,8 @@ async def _persist_external_model_change(
             "external_model_change requires data.model to be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
-    model = raw_model.strip()
-    if conv.reported_model == model:
+    model = concrete_reported_model(raw_model)
+    if model is None or conv.reported_model == model:
         return
     await asyncio.to_thread(
         conversation_store.update_conversation,
@@ -2533,30 +2633,62 @@ async def _persist_external_codex_approval_mode_change(
     body: SessionEventInput,
     conversation_store: ConversationStore,
 ) -> None:
-    """Merge Codex's terminal-observed permission launch args."""
+    """Persist a Codex-observed approval change (from a TUI ``/permissions`` switch).
+
+    The forwarder posts two things it saw in ``thread/settings/updated``:
+    ``terminal_launch_args`` (the create/fork/resume vocabulary, merged into the
+    row) and ``approval_mode`` (the runtime ``/permissions`` preset, stamped on
+    the read-back label + published live so the web picker tracks the TUI). Both
+    are optional but at least one must be present.
+    """
     raw_args = body.data.get("terminal_launch_args")
-    if not isinstance(raw_args, list):
+    raw_mode = body.data.get("approval_mode")
+    if raw_args is None and raw_mode is None:
         raise OmnigentError(
-            "external_codex_approval_mode_change requires data.terminal_launch_args list",
+            "external_codex_approval_mode_change requires data.terminal_launch_args "
+            "or data.approval_mode",
             code=ErrorCode.INVALID_INPUT,
         )
-    try:
-        permission_args = _validate_terminal_launch_args(raw_args)
-        terminal_launch_args = _validate_terminal_launch_args(
-            _merge_codex_permission_launch_args(conv.terminal_launch_args, permission_args or [])
-        )
-    except ValueError as exc:
+    if raw_args is not None:
+        if not isinstance(raw_args, list):
+            raise OmnigentError(
+                "external_codex_approval_mode_change data.terminal_launch_args must be a list",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            permission_args = _validate_terminal_launch_args(raw_args)
+            terminal_launch_args = _validate_terminal_launch_args(
+                _merge_codex_permission_launch_args(
+                    conv.terminal_launch_args, permission_args or []
+                )
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if conv.terminal_launch_args != terminal_launch_args:
+            await asyncio.to_thread(
+                conversation_store.update_conversation,
+                session_id,
+                terminal_launch_args=terminal_launch_args,
+            )
+    if raw_mode is None:
+        return
+    if raw_mode not in CODEX_NATIVE_PERMISSION_VALUES:
         raise OmnigentError(
-            f"invalid terminal_launch_args: {exc}",
+            "external_codex_approval_mode_change data.approval_mode must be one of "
+            f"{sorted(CODEX_NATIVE_PERMISSION_VALUES)}; got {raw_mode!r}",
             code=ErrorCode.INVALID_INPUT,
-        ) from exc
-    if conv.terminal_launch_args == terminal_launch_args:
+        )
+    if conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY) == raw_mode:
         return
     await asyncio.to_thread(
-        conversation_store.update_conversation,
+        conversation_store.set_labels,
         session_id,
-        terminal_launch_args=terminal_launch_args,
+        {_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY: raw_mode},
     )
+    _publish_codex_approval_mode(session_id, raw_mode)
 
 
 def _merge_codex_permission_launch_args(
@@ -2717,11 +2849,14 @@ def _publish_external_conversation_item(
         item before append.
     :returns: None.
     """
-    if item.type == "message" and isinstance(item.data, MessageData) and item.data.is_meta:
-        return
-    if item.type == "message" and isinstance(item.data, MessageData) and item.data.role == "user":
-        _publish_input_consumed(session_id, item, cleared_pending_id=cleared_pending_id)
-        return
+    if item.type == "message" and isinstance(item.data, MessageData):
+        if item.data.role == "user":
+            _publish_input_consumed(session_id, item, cleared_pending_id=cleared_pending_id)
+            return
+        if item.data.is_meta:
+            # Hidden context on a non-user message has no live rendering
+            # path that filters on the flag, so keep it off the stream.
+            return
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
     session_stream.publish(session_id, event.model_dump())
 
@@ -2856,12 +2991,17 @@ def _publish_external_output_reasoning_delta(session_id: str, body: SessionEvent
 
 
 _VALID_ELICITATION_ACTIONS: tuple[str, ...] = ("accept", "decline", "cancel")
+# Why a resolved event carries no verdict. ``"unanswered"``: the hook stopped
+# waiting (a severed poll never re-parked, or the ask timed out) before anyone
+# answered, so the prompt is gone rather than decided.
+_VALID_ELICITATION_RESOLVED_REASONS: tuple[str, ...] = ("unanswered",)
 
 
 def _publish_elicitation_resolved(
     session_id: str,
     elicitation_id: str,
     action: str | None = None,
+    reason: str | None = None,
 ) -> None:
     """
     Universal "approval done" signal — single publish drives both
@@ -2877,6 +3017,12 @@ def _publish_elicitation_resolved(
         state how the gate was answered instead of leaving agents to
         guess. Omitted from the payload when unknown or not one of
         the three MCP actions.
+    :param reason: Why there is no verdict, e.g. ``"unanswered"`` when
+        the hook stopped waiting before anyone answered, so the card
+        can say the prompt expired instead of implying someone resolved
+        it. Omitted when unknown, not a recognised reason, or when a
+        verdict is present — a verdict and a no-verdict reason are
+        mutually exclusive on the wire.
     """
     payload: dict[str, Any] = {
         "type": "response.elicitation_resolved",
@@ -2884,6 +3030,8 @@ def _publish_elicitation_resolved(
     }
     if action in _VALID_ELICITATION_ACTIONS:
         payload["action"] = action
+    elif reason in _VALID_ELICITATION_RESOLVED_REASONS:
+        payload["reason"] = reason
     session_stream.publish(session_id, payload)
 
 
@@ -3035,11 +3183,12 @@ def _parse_external_conversation_item(
             "external_conversation_item data.response_id must be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
-    # NOTE: external conversation items are persisted with a random
-    # primary key like any other item — there is no server-side dedup.
-    # Producers (the claude-native / codex-native forwarders) are
-    # responsible for not re-posting records they have already sent;
-    # they no longer emit a ``source_id`` dedup key to the server.
+    # NOTE: producers that can re-post (the native transcript forwarders
+    # retry timed-out POSTs whose disposition they cannot know) send a
+    # ``data.source_id`` dedup key; the persist path derives the item's
+    # stable id from it so the append is idempotent (see
+    # ``_persist_external_conversation_item``). Items without one keep the
+    # store-assigned random id and no server-side dedup.
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
@@ -3397,18 +3546,19 @@ async def _persist_external_subagent_start(
         return existing.id
 
     # Title format mirrors omnigent-spawned children
-    # (``"{tool}:{session_name}"``) so the rail's split-on-colon
-    # parser surfaces the same ``tool`` shape. The ``session_name``
-    # half must be unique per parent because the conversation store
-    # has a ``(parent_conversation_id, title)`` unique index — using
-    # the description here would collide whenever Claude's LLM
-    # passes the same agentType + description for parallel
-    # sub-agents (which the Task tool does routinely). The
-    # ``subagent_id`` is the only stable per-sub-agent identifier
-    # in the meta file, so it goes here. The human-readable
-    # description is stored as a label below for downstream surfaces
-    # that want it; the rail's ``SubagentsPanel`` already hides the
-    # ``session_name`` half so the user only sees ``agent_type``.
+    # (``"{tool}:{session_name}"``). The ``session_name`` half must be
+    # unique per parent because the conversation store has a
+    # ``(parent_conversation_id, title)`` unique index — using the
+    # description here would collide whenever Claude's LLM passes the
+    # same agentType + description for parallel sub-agents (which the
+    # Task tool does routinely). The ``subagent_id`` is the only stable
+    # per-sub-agent identifier in the meta file, so it goes here.
+    #
+    # The title is therefore a uniqueness key, not a display string:
+    # nothing user-facing should render it. The human-readable
+    # description goes on a label below, and
+    # ``_claude_subagent_display_tool`` turns that label into the
+    # rail's row label.
     title = f"{agent_type}:{subagent_id}"
     labels = {
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -3611,6 +3761,47 @@ def _codex_subagent_display_tool(labels: dict[str, str]) -> str:
     if role:
         return role
     return _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK
+
+
+def _claude_subagent_display_tool(conv: Conversation, labels: dict[str, str]) -> str | None:
+    """
+    Return the UI-facing label for a Claude Code sub-agent child.
+
+    The Task tool's free-form ``description`` ("wave-worker-696") is
+    the only part a human recognises, so it wins. Without one, fall
+    back to the agent type's trailing segment: plugin-namespaced types
+    arrive as ``"rpw-published:debug-lead"`` and only the agent name
+    carries meaning. The row's title is a uniqueness key built from the
+    opaque ``subagent_id``, so it is never a display candidate.
+
+    :param conv: Claude-native sub-agent child row; its
+        ``sub_agent_name`` holds the Claude ``agentType``.
+    :param labels: Conversation labels from that row.
+    :returns: Display label, e.g. ``"wave-worker-696"`` or
+        ``"debug-lead"``; ``None`` when the row carries neither.
+    """
+    description = " ".join((labels.get(_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY) or "").split())
+    if description:
+        return description
+    agent_type = (conv.sub_agent_name or "").strip()
+    if agent_type:
+        return agent_type.rpartition(":")[2] or agent_type
+    return None
+
+
+def _is_claude_native_subagent(conv: Conversation) -> bool:
+    """
+    Return whether a child conversation tracks a Claude Code sub-agent.
+
+    :param conv: Conversation row to inspect.
+    :returns: ``True`` when the row carries the claude-native sub-agent
+        wrapper label.
+    """
+    return (
+        conv.kind == "sub_agent"
+        and conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        == _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
+    )
 
 
 def _is_codex_native_subagent(conv: Conversation) -> bool:
@@ -4144,6 +4335,50 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
     session_live_state.submit("child_status_fanout", _fan_out)
 
 
+def _require_codex_approval_mode_forward(
+    session_id: str,
+    mode: str,
+    runner_result: _RunnerForwardResult | None,
+) -> None:
+    """
+    Fail when a live codex approval-mode switch wasn't applied by the runner.
+
+    The runner applies the mode by driving Codex's own ``/permissions`` popup
+    and only returns 2xx once it confirms Codex echoed the switch. Persisting the
+    label without a confirmed forward would let the picker claim a mode the TUI
+    isn't in, so an explicit switch requires a reachable runner that confirmed it.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param mode: Requested approval mode, e.g. ``"read-only"``.
+    :param runner_result: HTTP result returned by the runner, or ``None`` when
+        no runner could be reached.
+    :returns: None.
+    :raises OmnigentError: If no runner was reachable or the runner rejected the
+        live approval-mode update.
+    """
+    if runner_result is None:
+        raise OmnigentError(
+            f"Could not switch to {mode} approval mode: no live Codex runner is "
+            f"available for session {session_id!r}. Reconnect the session and try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    if not 200 <= runner_result.status_code < 300:
+        # The runner's body carries why the switch failed (e.g. the codex
+        # terminal isn't running, or Codex never echoed the switch); surface it
+        # so the UI banner explains the failure instead of a bare status code.
+        detail = ""
+        try:
+            payload = json.loads(runner_result.body)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = f" {payload['detail']}"
+        raise OmnigentError(
+            f"Could not switch to {mode} approval mode for session {session_id!r}.{detail}",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+
+
 def _publish_status(
     session_id: str,
     status: str,
@@ -4152,6 +4387,8 @@ def _publish_status(
     background_task_count: int | None = None,
     background_tasks: list[BackgroundTaskInfo] | None = None,
     blocked_on: str | None = None,
+    persist_live_status: bool = True,
+    scheduled_run_outcome: Literal["auto", "failed"] = "auto",
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4205,7 +4442,8 @@ def _publish_status(
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
-    session_live_state.persist_live_status(session_id, status)
+    if persist_live_status:
+        session_live_state.persist_live_status(session_id, status)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
     # still-``running`` scheduled_task_run to succeeded/failed. This is the
@@ -4216,7 +4454,14 @@ def _publish_status(
     # the common case: interactive (non-scheduled) conversations have no
     # running run, and the reverse lookup cheaply returns None. running/waiting
     # edges are skipped entirely so the hot path pays nothing mid-turn.
-    if status == "idle":
+    if scheduled_run_outcome == "failed":
+        session_live_state.persist_scheduled_run_completion(
+            session_id,
+            "failed",
+            error_code="incomplete",
+            error="runner disappeared before the turn reached a terminal state",
+        )
+    elif status == "idle":
         session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
     elif status == "failed":
         # Canonical server-side broken-turn signal: every server-originated
@@ -4293,6 +4538,46 @@ def _publish_status(
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
+
+
+def reconcile_orphaned_running_status(
+    session_id: str,
+    conversation_store: ConversationStore,
+    stale_before: int,
+) -> bool:
+    """
+    Settle a session that reads ``running`` but whose runner is
+    confirmed gone down to a non-running resting state.
+
+    A ``running`` live-status is only meaningful while a runner is
+    actually executing the turn. When the runner (and its host) have
+    dropped past the liveness window — a server replica that restarted
+    and outlived the runner, a crashed host, a graceful disconnect
+    mid-turn — the persisted ``running`` is stale: no executor will
+    ever emit the terminal edge that would clear it, so it sticks
+    forever. The sidebar then shows a turn that isn't happening, and
+    ``stop_session`` reports a success it never delivered.
+
+    This is the lazy-on-read backstop for that stale state. The store performs
+    one conditional transition so a fresh liveness stamp or terminal status
+    written by another replica wins the race. A successful transition updates
+    the local cache and stream without issuing a second status write, and
+    classifies any associated scheduled run as failed/incomplete.
+
+    :param session_id: Session/conversation identifier to settle.
+    :param conversation_store: Store performing the conditional transition.
+    :param stale_before: Runner stamps at or after this epoch are fresh.
+    :returns: Whether this call performed the transition.
+    """
+    if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
+        return False
+    _publish_status(
+        session_id,
+        "idle",
+        persist_live_status=False,
+        scheduled_run_outcome="failed",
+    )
+    return True
 
 
 def _truncate_label(value: str) -> str:
@@ -4705,6 +4990,55 @@ def _publish_session_superseded(session_id: str, target_conversation_id: str) ->
         _logger.info(
             "Discarded %d unconsumed pending input(s) on superseded session %s",
             discarded,
+            session_id,
+            extra={"session_id": session_id},
+        )
+
+
+def _publish_btw_sidechat(
+    session_id: str,
+    *,
+    question: str,
+    answer: str,
+    truncated: bool,
+) -> None:
+    """
+    Publish a transient ``session.btw_sidechat`` overlay to the live stream.
+
+    Emitted when the claude-native forwarder scrapes a settled ``/btw``
+    side-chat from the pane (see ``_relay_btw_overlay`` in the
+    claude-native forwarder). Broadcast-only: nothing is written to the
+    conversation store, so the ephemeral exchange never lands in the main
+    transcript. Live viewers render a dismissable overlay; a client that
+    connects later never sees it (no SSE replay), matching the terminal
+    overlay's Escape-to-close, leave-no-history behavior.
+
+    The oldest pending input is also discarded so a web composer's
+    optimistic ``/btw`` bubble does not linger as a stuck "queued" message —
+    the same reconciliation ``_publish_session_superseded`` performs.
+    ``/btw`` is never committed as a user turn (no ``session.input.consumed``
+    is emitted); the overlay carries the request text instead.
+
+    :param session_id: Conversation id whose stream receives the event.
+    :param question: The ``/btw`` request line as typed.
+    :param answer: The side-chat answer text.
+    :param truncated: True when the pane clipped a longer answer.
+    """
+    event = SessionBtwSidechatEvent(
+        type="session.btw_sidechat",
+        conversation_id=session_id,
+        question=question,
+        answer=answer,
+        truncated=truncated,
+    )
+    session_stream.publish(session_id, event.model_dump())
+    # Drop the optimistic ``/btw`` bubble (the oldest unconsumed input) so it
+    # does not spin forever — ``/btw`` never round-trips through the transcript
+    # to earn a ``session.input.consumed``. Only the oldest is resolved so a
+    # follow-up the user queued after ``/btw`` is left intact.
+    if pending_inputs.resolve_oldest(session_id) is not None:
+        _logger.info(
+            "Discarded the pending /btw input on session %s",
             session_id,
             extra={"session_id": session_id},
         )
@@ -5229,7 +5563,7 @@ async def _provision_managed_sandbox(
     session_id: str,
     owner: str,
     sandbox_config: ManagedSandboxDeployment,
-    repo: RepoWorkspace | None,
+    repos: Sequence[RepoWorkspace],
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
@@ -5247,7 +5581,7 @@ async def _provision_managed_sandbox(
     :param session_id: Session/conversation identifier.
     :param owner: User the managed host acts for.
     :param sandbox_config: The deployment's sandbox config.
-    :param repo: Repository workspace to clone, or ``None``.
+    :param repos: Repository workspaces to clone (empty for none).
     :param tracker: The app's launch tracker (failed here on error).
     :param host_store: Persistent host registrations.
     :param relaunch_host: Existing host row for a relaunch, or
@@ -5281,7 +5615,7 @@ async def _provision_managed_sandbox(
                 config=sandbox_config,
                 host=relaunch_host,
                 host_store=host_store,
-                repo=repo,
+                repos=repos,
                 agent_name=agent_name,
                 on_stage=_on_stage,
             )
@@ -5289,7 +5623,7 @@ async def _provision_managed_sandbox(
             config=sandbox_config,
             owner=owner,
             host_store=host_store,
-            repo=repo,
+            repos=repos,
             provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
@@ -6235,10 +6569,17 @@ def _build_new_item(
     """
     Construct a :class:`NewConversationItem` from a POSTed event.
 
-    Validates the data payload via ``parse_item_data`` (the same
-    validator the route boundary already invoked) and wraps the
+    Validates the data payload via ``parse_item_data`` and wraps the
     result with the response_id linkage required by the conversation
     store.
+
+    The item *type* is checked at the route boundary, but ``data`` is a
+    free-form dict there, so a caller can name a known type and omit the
+    fields it requires — ``{"type": "message"}`` with no ``role`` or
+    ``content`` is the shape seen in production. That is bad input, so the
+    raised ``ValidationError`` becomes an
+    :class:`~omnigent.errors.OmnigentError` the caller can act on rather
+    than escaping as an unhandled 500.
 
     :param body: Validated event input — guaranteed to be a known
         item type (the route checked ``_ALLOWED_EVENT_TYPES``).
@@ -6250,8 +6591,16 @@ def _build_new_item(
         single-user mode.
     :returns: A :class:`NewConversationItem` ready for delivery
         or persistence.
+    :raises OmnigentError: When ``body.data`` does not satisfy the
+        payload schema for ``body.type``.
     """
-    data = parse_item_data(body.type, {"type": body.type, **body.data})
+    try:
+        data = parse_item_data(body.type, {"type": body.type, **body.data})
+    except ValidationError as exc:
+        raise OmnigentError(
+            f"invalid data for {body.type!r} item: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
     return NewConversationItem(
         type=body.type,
         response_id=response_id,
@@ -7118,12 +7467,90 @@ async def _relay_persist(
         )
 
 
+async def _relay_response_policy_deny_reason(
+    conversation_store: ConversationStore,
+    session_id: str,
+    text: str,
+) -> str | None:
+    """
+    Evaluate *text* against the session's OUTPUT (RESPONSE) phase policies.
+
+    Runner-relayed (scaffold) harnesses never POST the assistant message
+    back through ``POST /v1/sessions/{id}/events``, so the
+    ``Phase.RESPONSE`` evaluator there is unreachable for them. The relay's
+    terminal text flush is their single persist point, so this evaluates the
+    same output policies over the final assistant text right before it
+    becomes durable — making a spec's ``response``-phase policy enforceable
+    in the runner topology.
+
+    Fails OPEN (returns ``None``) on any evaluation error, matching the LLM
+    phases' advisory default: a policy-engine hiccup must not destroy the
+    narration the user already watched.
+
+    :param conversation_store: Store for the conversation/labels lookup.
+    :param session_id: Session/conversation identifier.
+    :param text: The joined assistant text segment about to persist.
+    :returns: The deny reason when an output policy DENYs, else ``None``.
+    """
+    from omnigent.runtime._globals import _agent_store
+
+    if _agent_store is None:
+        # Fail open, but loudly: a mis-initialized runtime would otherwise
+        # silently disable RESPONSE-phase gating for every relayed session.
+        _logger.warning(
+            "Relay: agent store not initialized; skipping RESPONSE-phase "
+            "policy evaluation for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return None
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or conv.agent_id is None:
+            return None
+        body = SessionEventInput(
+            type="message",
+            data={
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        )
+        # The relay has no HTTP caller; the acting principal is the
+        # turn-initiating human persisted at forward time (same label the
+        # policy-evaluate route falls back to), so per-user policies gate
+        # on the correct actor.
+        turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
+        verdict = await _evaluate_output_policy(
+            session_id,
+            conv,
+            body,
+            conversation_store,
+            _agent_store,
+            None,
+            actor=_build_actor(turn_actor),
+        )
+    except Exception:  # noqa: BLE001 — fail open: output phases are advisory on error
+        _logger.exception(
+            "Relay: RESPONSE-phase policy evaluation failed for session=%s; "
+            "persisting the text unmodified",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return None
+    if verdict is None:
+        return None
+    return str(verdict.get("reason") or "Denied by policy")
+
+
 async def _flush_relay_text(
     conversation_store: ConversationStore | None,
     session_id: str,
     text_acc: list[str],
     response_id: str | None,
     model_id: str | None,
+    *,
+    deny_reason: str | None = None,
+    evaluate_response_phase: bool = False,
 ) -> None:
     """
     Persist buffered assistant text as a message item and clear the buffer.
@@ -7158,12 +7585,32 @@ async def _flush_relay_text(
     permanently. On failure the buffers are left intact so the text still
     replays and is retried at the next flush / ``response.completed``.
 
+    On an OUTPUT-phase DENY the denied text must never become a durable
+    assistant message. Two deny sources feed this (both persist the same
+    ``[Denied by policy: ...]`` sentinel the ``_evaluate_output_policy``
+    route path uses):
+
+    - *deny_reason*: the ``PHASE_LLM_RESPONSE`` DENY the policy-evaluate
+      route recorded for this session's in-flight turn — the harness only
+      errors the turn after the text already streamed, so the relay is
+      the last gate before the denied content persists.
+    - *evaluate_response_phase*: evaluate the joined text against the
+      spec's ``Phase.RESPONSE`` policies right here. Runner-relayed
+      harnesses never POST the assistant message back through
+      ``POST .../events``, so this flush is the only place the
+      ``response`` phase can fire in this topology.
+
     :param conversation_store: Store to append to, or ``None`` to skip
         persistence (test parsing path).
     :param session_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param text_acc: Accumulated delta strings; cleared in place on success.
     :param response_id: Turn id so the segment groups with its tool calls.
     :param model_id: Assistant agent label for the message.
+    :param deny_reason: When set, an output policy already denied this
+        turn's assistant text; persist the deny sentinel instead of it.
+    :param evaluate_response_phase: When ``True`` (terminal flush), gate
+        the text through the spec's RESPONSE-phase policies before
+        persisting.
     """
     if not text_acc:
         return
@@ -7177,6 +7624,27 @@ async def _flush_relay_text(
     if conversation_store is None:
         text_acc.clear()
         return
+    if deny_reason is None and evaluate_response_phase:
+        deny_reason = await _relay_response_policy_deny_reason(
+            conversation_store, session_id, text
+        )
+    if deny_reason is not None:
+        # Substitute the sentinel for the denied content — same Option-B
+        # shape as the ``_evaluate_output_policy`` route path, so follow-up
+        # turns and the items API see a consistent deny record. Publish the
+        # sentinel delta too: live clients already rendered the denied text
+        # from the stream (that flash is the residual gap full buffering
+        # would close), so without a visible sentinel the deny would only
+        # be discoverable after a reload.
+        text = f"{_DENY_SENTINEL_PREFIX}{deny_reason}]"
+        # Commit the substitution into the retry buffer itself: a failed
+        # persist below leaves ``text_acc`` for the next flush, and that
+        # retry must carry the sentinel, never the denied content. Without
+        # this, a RESPONSE-phase deny would be re-evaluated from scratch on
+        # retry — and a stateful policy whose labels moved on the first
+        # DENY could flip to ALLOW and leak the original text.
+        text_acc[:] = [text]
+        _publish_policy_deny(session_id, deny_reason)
     import uuid
 
     try:
@@ -8335,6 +8803,15 @@ async def _create_session_worktree(
         raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
 
 
+# Opt-in ``?delete_branch=true`` cannot reach git when the host tunnel
+# is down (users typically see this as ``runner_online: false``). Refuse
+# the delete instead of 404'ing or silently skipping cleanup.
+_DELETE_WORKTREE_OFFLINE_MESSAGE = (
+    "Cannot delete worktree — runner offline. "
+    "Delete session only (delete_branch=false) or wait for the runner to reconnect."
+)
+
+
 async def _remove_session_worktree_best_effort(
     *,
     host_id: str,
@@ -8345,13 +8822,17 @@ async def _remove_session_worktree_best_effort(
     reason: str,
     conversation_store: ConversationStore | None = None,
     exclude_conversation_id: str | None = None,
+    fail_if_unavailable: bool = False,
 ) -> None:
     """
     Best-effort removal of a session's git worktree.
 
     Used for create-rollback (orphan cleanup) and opt-in session-delete
-    cleanup. Never raises — a failure is logged so the caller's primary
-    operation still completes.
+    cleanup. Host-reported git failures are logged so the caller's
+    primary operation still completes. When ``fail_if_unavailable`` is
+    set, an unreachable host raises ``CONFLICT`` instead of skipping —
+    the session is left in place so the caller can retry without
+    worktree cleanup.
 
     :param host_id: Host that owns the worktree, e.g.
         ``"host_a1b2c3d4..."``.
@@ -8371,32 +8852,22 @@ async def _remove_session_worktree_best_effort(
     :param exclude_conversation_id: The conversation whose delete triggered
         this removal, excluded from that check. Required with
         *conversation_store*.
+    :param fail_if_unavailable: When ``True``, raise ``CONFLICT`` if the
+        host cannot be reached to run git. Create-rollback leaves this
+        ``False`` so a failed create still surfaces its original error.
     """
     from omnigent.server.routes._host_worktree import (
+        WorktreeHostUnavailableError,
         WorktreeProxyError,
         remove_worktree_on_host,
     )
 
-    # Host reachability first: both checks below end in "skip", and this one
-    # is an in-memory lookup, so an unreachable host costs no DB work.
-    host_registry = getattr(request.app.state, "host_registry", None)
-    if host_registry is None:
-        return
-    host_conn = host_registry.get(host_id)
-    if host_conn is None:
-        _logger.warning(
-            "Skipping worktree removal (%s) for %s: host %s offline",
-            reason,
-            worktree_path,
-            host_id,
-        )
-        return
-
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
     # leaves their runners on a deleted directory, so leave a shared worktree
-    # alone and let the last session out clean it up. Only a skip is logged;
-    # the caller still deletes its own row.
+    # alone and let the last session out clean it up. Checked before host
+    # reachability so an offline host does not 409 a delete that would not
+    # have touched the directory anyway.
     if conversation_store is not None and exclude_conversation_id is not None:
         shared = await asyncio.to_thread(
             conversation_store.has_other_live_session_in_workspace,
@@ -8411,6 +8882,29 @@ async def _remove_session_worktree_best_effort(
                 reason,
             )
             return
+
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if host_registry is None:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                "host registry is not configured; cannot delete a worktree",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        return
+    host_conn = host_registry.get(host_id)
+    if host_conn is None:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                _DELETE_WORKTREE_OFFLINE_MESSAGE,
+                code=ErrorCode.CONFLICT,
+            )
+        _logger.warning(
+            "Skipping worktree removal (%s) for %s: host %s offline",
+            reason,
+            worktree_path,
+            host_id,
+        )
+        return
     try:
         await remove_worktree_on_host(
             host_registry=host_registry,
@@ -8418,6 +8912,18 @@ async def _remove_session_worktree_best_effort(
             worktree_path=worktree_path,
             branch=branch,
             delete_branch=delete_branch,
+        )
+    except WorktreeHostUnavailableError as exc:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                _DELETE_WORKTREE_OFFLINE_MESSAGE,
+                code=ErrorCode.CONFLICT,
+            ) from exc
+        _logger.warning(
+            "Best-effort worktree removal (%s) failed for %s: host %s unavailable",
+            reason,
+            worktree_path,
+            host_id,
         )
     except WorktreeProxyError:
         _logger.warning(
@@ -8572,7 +9078,32 @@ def _spec_config_flag_explicitly_disabled(spec: AgentSpec, key: str) -> bool:
     return isinstance(value, str) and value.strip().lower() == "false"
 
 
-def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | None:
+def _spec_config_flag_explicitly_enabled(spec: AgentSpec, key: str) -> bool:
+    """
+    Return whether an ``executor.config`` flag is explicitly set true.
+
+    The mirror of :func:`_spec_config_flag_explicitly_disabled`, used for
+    opt-IN semantics: the flag defaults to off and only an intentional
+    ``true`` / ``True`` enables it. Enabling values are matched without
+    whitespace tolerance (the value-matching policy of
+    :func:`_derive_terminal_launch_args_from_spec`), so ``" true"`` does
+    not enable.
+
+    :param spec: A parsed agent / sub-agent spec.
+    :param key: The ``executor.config`` key to read, e.g. ``"yolo"``.
+    :returns: ``True`` only when the value is the boolean ``True`` or the
+        case-insensitive string ``"true"``; ``False`` otherwise (including
+        when the key is absent).
+    """
+    value = spec.executor.config.get(key)
+    if isinstance(value, bool):
+        return value is True
+    return isinstance(value, str) and value.lower() == "true"
+
+
+def _derive_terminal_launch_args_from_spec(
+    spec: AgentSpec, *, headless_defaults: bool = True
+) -> list[str] | None:
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
@@ -8622,7 +9153,7 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     (``permission_mode``) are matched exactly, mirroring claude-native's
     verbatim pass-through and the runner's exact ``bypassPermissions``
     comparison (``should_skip_permissions`` in
-    :mod:`omnigent.antigravity_native_launch`). A present-but-unrecognized
+    :mod:`omnigent.harnesses.antigravity_native.launch`). A present-but-unrecognized
     value logs at debug and leaves args unset.
 
     Only those native harnesses are translated; for any other harness
@@ -8631,16 +9162,31 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     this returns ``None`` so no terminal args are set. ``None`` is also
     returned when the relevant field is absent / falsey.
 
-    :param sub_spec: The trusted child sub-agent spec, resolved from the
-        server-loaded parent bundle via :func:`_resolve_subagent_spec`.
+    ``headless_defaults`` selects the stance for a spec that declares
+    nothing: named-worker / bundled-child creates keep the headless
+    default above (codex-native / cursor-native bypass by DEFAULT, because
+    nobody can answer their prompts). Top-level and self-resolved-agent
+    creates pass ``headless_defaults=False``: those sessions are
+    interactive — a human can answer an ApprovalCard — so only the spec's
+    EXPLICIT declarations are honored (``yolo: true``, a
+    ``permission_mode`` / ``exec_mode`` value) and an undeclared spec
+    keeps the harness's own default approval stance.
+
+    :param spec: A trusted, server-loaded spec: a named worker's sub-spec
+        (via :func:`_resolve_subagent_spec`), a bundled child's spec, or —
+        with ``headless_defaults=False`` — the session's own agent spec.
+    :param headless_defaults: Whether an undeclared codex-native /
+        cursor-native spec falls back to the headless full-bypass default.
+        ``True`` for headless worker creates; ``False`` for top-level /
+        self-resolved creates, where only explicit opt-ins translate.
     :returns: A flat CLI-arg list to store as the child session's
         ``terminal_launch_args``, or ``None`` when nothing should be set.
     :raises ValueError: If a spec-derived argument violates the same
         bounds enforced for request-supplied ``terminal_launch_args``.
     """
-    harness = _spec_harness(sub_spec)
+    harness = _spec_harness(spec)
     if harness == _CLAUDE_NATIVE_HARNESS:
-        permission_mode = sub_spec.executor.config.get("permission_mode")
+        permission_mode = spec.executor.config.get("permission_mode")
         if permission_mode:
             return _validate_terminal_launch_args(["--permission-mode", str(permission_mode)])
         return None
@@ -8653,7 +9199,9 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         # approval/sandbox). Without the flag the thread is created at
         # codex's on-request + own-sandbox default and a headless worker
         # stalls. An explicit ``yolo: false`` is the opt-out. See #171.
-        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+        if _spec_config_flag_explicitly_disabled(spec, "yolo"):
+            return None
+        if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
     if harness == _CURSOR_NATIVE_HARNESS:
@@ -8662,27 +9210,29 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         # by default so headless polly workers don't stall on mirrored
         # approval cards. ``yolo: false`` is the keep-prompting opt-out.
         mode = (
-            sub_spec.executor.config.get("permission_mode")
-            or sub_spec.executor.config.get("exec_mode")
+            spec.executor.config.get("permission_mode")
+            or spec.executor.config.get("exec_mode")
             or ""
         )
         mode_norm = str(mode).strip().lower()
         if mode_norm in ("auto", "auto-review"):
             return _validate_terminal_launch_args(["--auto-review"])
-        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+        if _spec_config_flag_explicitly_disabled(spec, "yolo"):
+            return None
+        if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--yolo"])
     if harness == _KIMI_NATIVE_HARNESS:
         # Opt-IN (unlike codex/cursor's headless default-bypass). The bool
         # arm covers programmatically built specs; the string arm covers the
         # parser's stringified ``"True"`` (see the value-matching policy).
-        yolo = sub_spec.executor.config.get("yolo")
+        yolo = spec.executor.config.get("yolo")
         if yolo is True or (isinstance(yolo, str) and yolo.lower() == "true"):
             return _validate_terminal_launch_args(["--yolo"])
         if (
             yolo is not None
             and yolo is not False
-            and not _spec_config_flag_explicitly_disabled(sub_spec, "yolo")
+            and not _spec_config_flag_explicitly_disabled(spec, "yolo")
         ):
             _logger.debug(
                 "kimi-native sub-spec has unrecognized yolo=%r; launching without --yolo.",
@@ -8692,7 +9242,7 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     if harness == _ANTIGRAVITY_NATIVE_HARNESS:
         # Opt-IN, matched exactly like the runner's should_skip_permissions;
         # other modes have no agy analogue and leave args unset.
-        mode = sub_spec.executor.config.get("permission_mode")
+        mode = spec.executor.config.get("permission_mode")
         if isinstance(mode, str):
             if mode == "bypassPermissions":
                 return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
@@ -8958,6 +9508,7 @@ def _persist_stored_session_bundle(
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
             project_id=metadata.project_id,
+            host_id=metadata.host_id,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)
@@ -9251,6 +9802,10 @@ def _child_session_summary_from_conversation(
     the raw title and ``session_name`` is ``None`` — the row is still
     surfaced so debug views can investigate.
 
+    Native-harness children are the exception: their titles are
+    uniqueness keys built from opaque runtime ids, so Codex and Claude
+    rows take ``tool`` from their labels instead of the title.
+
     ``busy`` is derived from the relay-fed ``_session_status_cache``
     (the tasks table has been removed). ``agent_id`` and ``agent_name``
     are read from the conversation row directly.
@@ -9286,6 +9841,14 @@ def _child_session_summary_from_conversation(
         # ``tool`` and the raw thread id as ``session_name`` for correlation.
         tool = _codex_subagent_display_tool(labels)
         session_name = labels.get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
+    elif _is_claude_native_subagent(conv):
+        # Claude-native child: the title is "{agentType}:{subagent_id}" — an
+        # opaque uniqueness key whose halves are both unreadable once the
+        # agent type is plugin-namespaced. Surface the Task description (or
+        # the bare agent name) as ``tool`` and keep the raw Claude id as
+        # ``session_name`` for correlation.
+        tool = _claude_subagent_display_tool(conv, labels)
+        session_name = labels.get(_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY)
     elif display_title and ":" in display_title:
         head, _, tail = display_title.partition(":")
         if head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail:
@@ -9407,7 +9970,7 @@ async def _handle_advise_models_mcp(
     if routing_client is None:
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
-    from omnigent.model_catalog import spec_harness
+    from omnigent.models.model_catalog import spec_harness
     from omnigent.server.smart_routing import _WORKER_NAME_TO_HARNESS, fetch_runner_models
 
     # Fetch live model catalog from the runner once; used below to populate
@@ -10127,6 +10690,7 @@ __all__ = [
     "_child_session_current_task_status_from_cached_status",
     "_child_session_summary_from_conversation",
     "_claude_native_remember_host",
+    "_claude_subagent_display_tool",
     "_client_supplied_hook_elicitation_id",
     "_codex_plan_mode_enabled",
     "_codex_subagent_display_tool",
@@ -10166,6 +10730,7 @@ __all__ = [
     "_host_model_options_via_registry",
     "_if_none_match_matches",
     "_invalidate_runner_backed_snapshot_state",
+    "_is_claude_native_subagent",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
     "_last_task_error_from_labels",
@@ -10224,7 +10789,9 @@ __all__ = [
     "_prune_pre_resolved_harness_elicitations",
     "_prune_session_read_state",
     "_publish_and_persist_resource_event",
+    "_publish_btw_sidechat",
     "_publish_changed_files_invalidated",
+    "_publish_codex_approval_mode",
     "_publish_collaboration_mode",
     "_publish_compaction_completed",
     "_publish_compaction_failed",
@@ -10264,6 +10831,7 @@ __all__ = [
     "_remove_session_worktree_best_effort",
     "_repl_terminal_ui_labels",
     "_replace_text_in_message_body",
+    "_require_codex_approval_mode_forward",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",
     "_require_declared_subagent",

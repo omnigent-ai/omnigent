@@ -898,9 +898,10 @@ describe("index.css mobile sidebar glass chip opacity", () => {
 describe("index.css text selection colors", () => {
   const selectionRule = cssSource.match(/::selection\s*\{([^}]*)\}/)?.[1];
 
-  it("matches the active sidebar item in every color mode", () => {
-    expect(selectionRule).toContain("background: var(--sidebar-active)");
-    expect(selectionRule).toContain("color: var(--sidebar-active-foreground)");
+  it("uses dedicated selection tokens instead of subtle sidebar shading", () => {
+    expect(selectionRule).toContain("background: var(--selection-background)");
+    expect(selectionRule).toContain("color: var(--selection-foreground)");
+    expect(selectionRule).not.toContain("--sidebar-active");
     expect(selectionRule).not.toContain("--brand-accent");
     expect(cssSource).not.toContain(".dark ::selection");
   });

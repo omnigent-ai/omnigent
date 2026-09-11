@@ -162,6 +162,111 @@ def test_runner_env_preserves_claude_tool_search_flags() -> None:
     assert {name: env.get(name) for name in _CLAUDE_TOOL_SEARCH_ENV} == _CLAUDE_TOOL_SEARCH_ENV
 
 
+# The gcloud ADC auth selectors the Antigravity CLI (agy) reads. Non-secret
+# selectors/paths (the ADC file *contains* the credential; the vars just point
+# at it), so they ride the allowlists like KUBECONFIG rather than the
+# credential passthrough. The CLOUDSDK_ entries are exact names on purpose:
+# gcloud's CLOUDSDK_AUTH_* vars carry live tokens and must stay stripped.
+_GCLOUD_ADC_ENV: Final = {
+    "AGY_ADC_AUTH": "true",
+    "GOOGLE_APPLICATION_CREDENTIALS": "/home/alice/.config/gcloud/adc.json",
+    "GOOGLE_CLOUD_PROJECT": "acme-dev",
+    "GOOGLE_CLOUD_QUOTA_PROJECT": "acme-quota",
+    "CLOUDSDK_CONFIG": "/home/alice/.config/gcloud",
+    "CLOUDSDK_ACTIVE_CONFIG_NAME": "alt",
+}
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_gcloud_adc_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """The gcloud ADC selectors survive the CLI→daemon strip in both modes.
+
+    Without them the detached daemon loses the user's gcloud login, so every
+    antigravity-native pane it (transitively) spawns blocks at agy's
+    interactive "Select login method" menu.
+    """
+    # Given
+    for name, value in _GCLOUD_ADC_ENV.items():
+        monkeypatch.setenv(name, value)
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then
+    assert {name: env.get(name) for name in _GCLOUD_ADC_ENV} == _GCLOUD_ADC_ENV
+
+
+def test_runner_env_preserves_gcloud_adc_selectors() -> None:
+    """The gcloud ADC selectors survive the daemon→runner strip.
+
+    The runner env is what the antigravity-native pane ultimately inherits,
+    so this hop is where a drop turns into agy's login menu.
+    """
+    # Given
+    base_env = {"PATH": "/usr/bin", **_GCLOUD_ADC_ENV}
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_adc",
+        binding_token="binding-adc",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert {name: env.get(name) for name in _GCLOUD_ADC_ENV} == _GCLOUD_ADC_ENV
+
+
+# gcloud vars that hold live credentials, not selectors. They must NOT ride
+# the allowlists: a CLOUDSDK_ prefix entry would hand usable GCP tokens to the
+# runner (and transitively the agent-controlled harness).
+_GCLOUD_TOKEN_ENV: Final = {
+    "CLOUDSDK_AUTH_ACCESS_TOKEN": "ya29.fake-access-token",
+    "CLOUDSDK_AUTH_REFRESH_TOKEN": "1//fake-refresh-token",
+}
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_strips_gcloud_auth_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """gcloud CLOUDSDK_AUTH_* bearer/refresh tokens do NOT reach the daemon."""
+    # Given
+    for name, value in _GCLOUD_TOKEN_ENV.items():
+        monkeypatch.setenv(name, value)
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then
+    assert not set(_GCLOUD_TOKEN_ENV) & set(env)
+
+
+def test_runner_env_strips_gcloud_auth_tokens() -> None:
+    """gcloud CLOUDSDK_AUTH_* bearer/refresh tokens do NOT reach the runner."""
+    # Given
+    base_env = {"PATH": "/usr/bin", **_GCLOUD_TOKEN_ENV}
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_adc_tokens",
+        binding_token="binding-adc-tokens",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert not set(_GCLOUD_TOKEN_ENV) & set(env)
+
+
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 def test_host_daemon_env_preserves_claude_telemetry_opt_in(
     monkeypatch: pytest.MonkeyPatch,

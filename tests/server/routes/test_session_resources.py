@@ -16,6 +16,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import HostHelloFrame
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
     session_stream,
@@ -24,6 +26,7 @@ from omnigent.runtime import (
     set_runner_router,
 )
 from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
@@ -469,7 +472,9 @@ def app(runner_globals_reset: None) -> FastAPI:
     del runner_globals_reset
     app = FastAPI()
     conversation_store = _ConversationStore()
+    host_registry = HostRegistry()
     app.state.test_conversation_store = conversation_store
+    app.state.test_host_registry = host_registry
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -496,6 +501,7 @@ def app(runner_globals_reset: None) -> FastAPI:
         create_sessions_router(
             conversation_store,  # type: ignore[arg-type]
             _StubAgentStore(),  # type: ignore[arg-type]
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -1290,6 +1296,40 @@ def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture
+def bash_only_native_host(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind the canned session to a native spec on a bash-only host."""
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.spec.types import AgentSpec
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    conv = app.state.test_conversation_store._conversations[session_id]
+    conv.host_id = "host_bash_only"
+    conv.workspace = "/workspace"
+    app.state.test_host_registry.register(
+        conv.host_id,
+        object(),  # type: ignore[arg-type]
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="bash-only",
+            interactive_shells=["bash"],
+        ),
+        owner=None,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals={"zsh": TerminalEnvSpec(command="zsh")},
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: spec,
+    )
+
+
 @pytest.mark.asyncio
 async def test_create_terminal_proxies_to_runner(
     client: httpx.AsyncClient,
@@ -1322,6 +1362,58 @@ async def test_create_terminal_proxies_to_runner(
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_uses_native_host_shell_inventory(
+    client: httpx.AsyncClient,
+    bash_only_native_host: None,
+) -> None:
+    """A native host shell is allowed even when the baked spec differs."""
+    terminal_resource = {
+        "id": "terminal_bash_s1",
+        "object": "session.resource",
+        "type": "terminal",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+        "name": "bash:s1",
+        "environment": DEFAULT_ENVIRONMENT_ID,
+        "metadata": {
+            "terminal_name": "bash",
+            "session_key": "s1",
+            "running": True,
+        },
+    }
+    fake_runner = _FakeRunnerClient(payload=terminal_resource)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "bash", "session_key": "s1"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert fake_runner.calls == [
+        ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_rejects_shell_absent_from_native_host(
+    client: httpx.AsyncClient,
+    bash_only_native_host: None,
+) -> None:
+    """A shell baked on the server cannot be launched on a host lacking it."""
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "zsh", "session_key": "s1"},
+    )
+
+    assert resp.status_code == 400
+    assert "bash" in resp.json()["error"]["message"]
+    assert fake_runner.calls == []
 
 
 @pytest.mark.asyncio
@@ -4273,6 +4365,127 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
 
 
 @pytest.mark.asyncio
+async def test_kiro_skipped_entries_persist_before_the_matched_item() -> None:
+    """Failed Kiro prompts must precede the accepted prompt in stored order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    for text in ("first failed", "second failed", "tell me a joke"):
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        # Stored order mirrors the live broadcast: both skipped web inputs
+        # (each a user message + error pair) precede the accepted prompt.
+        assert [i.type for i in store.appended_items] == [
+            "message",
+            "error",
+            "message",
+            "error",
+            "message",
+        ]
+        first_user, _err1, second_user, _err2, matched_user = store.appended_items
+        assert first_user.data.content == [{"type": "input_text", "text": "first failed"}]
+        assert second_user.data.content == [{"type": "input_text", "text": "second failed"}]
+        assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> None:
+    """A duplicate re-post restores skipped drains instead of persisting them."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    class _DedupingStore(_ConversationStore):
+        """Store whose matched item is already persisted: every append dedupes."""
+
+        def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+            result = [
+                ConversationItem(
+                    id=item.stable_id or f"item_{i}",
+                    type=item.type,
+                    status="completed",
+                    response_id=item.response_id,
+                    created_at=1,
+                    data=item.data,
+                    deduplicated=True,
+                )
+                for i, item in enumerate(items)
+            ]
+            self.appended_items.extend(result)
+            return result
+
+    pending_inputs.reset_for_tests()
+    store = _DedupingStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    recorded = [
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+        for text in ("first failed", "second failed", "tell me a joke")
+    ]
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        # The batch was submitted but all items came back deduplicated (retry
+        # of an already-committed message); skipped drains are restored.
+        assert all(item.deduplicated for item in store.appended_items)
+        snapshot = pending_inputs.snapshot_for(sid)
+        assert [entry["pending_id"] for entry in snapshot] == recorded
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
     """Opaque framework 500 bodies become explicit ensure errors.
 
@@ -4605,8 +4818,10 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_type", ["response.completed", "response.failed"])
+@pytest.mark.parametrize("reported_model", ["claude-opus-4-8", "<synthetic>"])
 async def test_relay_persists_harness_reported_model(
     terminal_type: str,
+    reported_model: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """SDK terminal usage records the concrete model on the session snapshot."""
@@ -4631,7 +4846,7 @@ async def test_relay_persists_harness_reported_model(
                             "input_tokens": 0,
                             "output_tokens": 0,
                             "total_tokens": 0,
-                            "model": "claude-opus-4-8",
+                            "model": reported_model,
                         },
                     },
                 }
@@ -4642,15 +4857,20 @@ async def test_relay_persists_harness_reported_model(
 
     await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
 
-    assert store.get_conversation(session_id).reported_model == "claude-opus-4-8"  # type: ignore[union-attr]
+    expected = None if reported_model == "<synthetic>" else reported_model
+    assert store.get_conversation(session_id).reported_model == expected  # type: ignore[union-attr]
     model_events = [event for event in published if event.get("type") == "session.model"]
-    assert model_events == [
-        {
-            "type": "session.model",
-            "conversation_id": session_id,
-            "model": "claude-opus-4-8",
-        }
-    ]
+    assert model_events == (
+        []
+        if expected is None
+        else [
+            {
+                "type": "session.model",
+                "conversation_id": session_id,
+                "model": "claude-opus-4-8",
+            }
+        ]
+    )
 
 
 @pytest.mark.asyncio
@@ -5619,6 +5839,10 @@ class _OfflineRunnerClient:
         del params, timeout
         raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
 
+    async def post(self, url: str, *, json: Any = None, timeout: float | None = None) -> Any:
+        del json, timeout
+        raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
+
 
 @pytest.fixture
 def offline_env_app(
@@ -5798,6 +6022,49 @@ async def test_github_diff_falls_back_to_host_when_runner_offline(
     assert resp.json()["after"] == "changed"
     assert captured["op"] == "github_diff"
     assert captured["params"] == {"base": "main", "path": "app.py"}
+
+
+@pytest.mark.asyncio
+async def test_github_set_preference_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preference WRITE is served over the host tunnel when the runner is offline.
+
+    Proves the POST endpoint's runner-offline branch routes to the host write op
+    with the selection params, and returns the refreshed info.
+    """
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_write(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id
+        captured["op"] = op
+        captured["workspace"] = workspace
+        captured["params"] = params
+        return {"object": "session.github.info", "available": True, "selected_account": "octocat"}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", _fake_write)
+
+    resp = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/preferences",
+        json={"account": "octocat"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["selected_account"] == "octocat"
+    assert captured["op"] == "github_set_preference"
+    assert captured["workspace"] == _OFFLINE_WORKSPACE
+    assert captured["params"] == {"account": "octocat", "remote": None}
 
 
 # ── Workspace-file gzip (GZipFileContentRoute) ───────────────────
@@ -6153,3 +6420,60 @@ async def test_sibling_environment_routes_are_not_gzipped(
 
     assert resp.status_code == 200
     assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.parametrize(
+    "resource,op",
+    [
+        ("", "github_info"),
+        ("/changes", "github_changes"),
+        ("/diff", "github_pr_diff"),
+        ("/diff/new.py", "github_diff"),
+    ],
+)
+async def test_selected_pr_reaches_offline_host(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    op: str,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"object": "session.github.info"}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params={"pr_url": url}
+    )
+    assert response.status_code == 200
+    assert captured["op"] == op
+    assert captured["session_id"] == _OFFLINE_SESSION
+    assert captured["params"]["pr_url"] == url
+
+
+async def test_pr_attachment_uses_bound_session_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"object": "session.github.info", "prs": []}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/prs",
+        json={"url": url, "action": "attach", "session_id": "untrusted"},
+    )
+    assert response.status_code == 200, response.text
+    assert captured["op"] == "github_prs_update"
+    assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.13.0.dev0"
+version = "0.14.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,8 +26,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.13.0.dev0",
-    "omnigent-ui-sdk==0.13.0.dev0",
+    "omnigent-client==0.14.0.dev0",
+    "omnigent-ui-sdk==0.14.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     # OpenClaw stores its wrapped acpx registry as JSON5.
@@ -70,6 +70,7 @@ dependencies = [
     "alembic>=1.0,<2",
     "anyio>=4.0,<5",
     "cachetools>=5.0,<7",
+    "filelock>=3.0",
     # _HostGroup (omnigent/cli.py) rewrites a leading positional server URL
     # into `--server` before Click parses it, so it no longer depends on
     # Click's internal `protected_args` (made read-only in click 8.2, slated
@@ -138,6 +139,10 @@ dependencies = [
 # working; the underlying packages are now default deps above.
 claude-sdk = []
 openai-agents = []
+cockroachdb = [
+    "psycopg[binary]>=3.1,<4",
+    "sqlalchemy-cockroachdb>=2.0,<3",
+]
 # `all` carries dependencies moved out of the default install that internal
 # CI / dev workflows still exercise.
 all = [
@@ -177,6 +182,9 @@ blaxel = ["blaxel>=0.4.1,<0.5"]
 # pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
 # minor.
 boxlite = ["boxlite>=0.9.5,<1"]
+# Microsandbox launcher: local libkrun microVMs with an optional embedded SDK.
+# Require 0.6.9 for upstream bug fixes and pin the beta SDK's minor version.
+microsandbox = ["microsandbox>=0.6.9,<0.7"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
@@ -274,14 +282,24 @@ nimble = ["nimble-python>=1.2.0,<2"]
 # (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
 # `[project].version` in `integrations/slack/pyproject.toml`.
 slack = [
-    "omnigent-slack==0.13.0.dev0",
+    "omnigent-slack==0.14.0.dev0",
 ]
+# PostgreSQL storage backend. The server builds a psycopg engine whenever
+# the database URI is Postgres (``OMNIGENT_DATABASE_URI=postgresql+psycopg://…``
+# / ``--database-uri``). That is a general-purpose escape hatch — any
+# standalone Postgres deployment needs the driver, not only Databricks — so it
+# gets its own extra rather than being reachable only via `databricks`.
+# ``_create_engine`` raises an actionable "install omnigent[postgres]" error
+# when the URI is Postgres but this driver is absent.
+postgres = ["psycopg[binary]>=3.1,<4"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
     "databricks-sdk>=0.56.0,<1",
     "opentelemetry-distro>=0,<1",
-    "psycopg[binary]>=3.1,<4",
+    # Databricks uses a Postgres control plane (Lakebase); reuse the single
+    # psycopg pin from the `postgres` extra so the two never drift.
+    "omnigent[postgres]",
     "pymysql>=1.1,<2",
     # Databricks-specific MCP servers. Not imported by core Omnigent
     # code, so it is opt-in here rather than a default dependency. Floored
@@ -645,7 +663,7 @@ known-first-party = ["omnigent"]
 # top-level catch is a deliberate, documented boundary catch — BLE001 is
 # waived for these top-level antigravity_native modules (see the inline
 # comments at each catch site).
-"omnigent/antigravity_native*.py" = ["BLE001"]
+"omnigent/harnesses/antigravity_native/*.py" = ["BLE001"]
 # Telemetry modules intentionally catch all exceptions at every boundary —
 # telemetry must never disrupt the application under any circumstances.
 "omnigent/telemetry/*.py" = ["BLE001", "SIM105"]

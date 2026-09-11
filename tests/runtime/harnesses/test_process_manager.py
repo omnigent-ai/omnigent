@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 import signal
@@ -264,6 +265,35 @@ async def test_get_client_spawns_and_serves(
         # the contract; verify the round-trip works.
         cid_resp = await client.get("/conversation-id")
         assert cid_resp.json() == {"conversation_id": "conv_a"}
+    finally:
+        await manager.shutdown()
+
+
+async def test_get_client_emits_harness_started_event(
+    manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful spawn emits one ``harness_started`` debug event.
+
+    This is the observable "harness bound and ready" edge used to measure
+    startup latency; the row carries the spawn->ready time and, for the
+    first spawn on a cold runner, the manager-start-relative time.
+    """
+    await manager.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runtime.harnesses.process_manager"):
+            await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        started = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "harness_started"
+        ]
+        assert len(started) == 1
+        record = started[0]
+        assert record.session_id == "conv_a"
+        attrs = record.attributes
+        assert attrs["harness"] == _TEST_HARNESS_NAME
+        assert isinstance(attrs["pid"], int)
+        assert attrs["spawn_ms"] >= 0
+        assert attrs["since_manager_start_ms"] >= 0
     finally:
         await manager.shutdown()
 
@@ -811,9 +841,19 @@ async def test_native_activity_refresh_prevents_idle_reaping(tmp_path: Path) -> 
 
 
 class _FakeReapProc:
-    """Minimal process stand-in recording whether the reaper killed it."""
+    """Minimal process stand-in recording whether the reaper killed it.
+
+    Implements the full ``_proc._ProcessLike`` protocol (``pid``/``returncode``/
+    ``terminate``/``kill``) because teardown is tree-aware. ``pid`` is ``None``
+    on purpose: it routes ``_proc.terminate_tree`` / ``kill_tree`` down their
+    no-pid branch, which signals this object directly and makes no OS calls at
+    all. A made-up integer pid would be actively dangerous here — the helpers
+    would resolve it against the real process table, and a pid that happened to
+    exist would get a live process group signalled by the test suite.
+    """
 
     def __init__(self) -> None:
+        self.pid: int | None = None
         self.returncode: int | None = None
         self.killed = False
         self._done = asyncio.Event()
@@ -822,6 +862,9 @@ class _FakeReapProc:
         self.killed = True
         self.returncode = -15
         self._done.set()
+
+    def terminate(self) -> None:
+        self.send_signal(signal.SIGTERM)
 
     def kill(self) -> None:
         self.killed = True

@@ -117,4 +117,6 @@ never echoed into a channel (it may carry stack traces / internal paths — see
 Related failure surfaces the bot also handles: server unreachable (prompts
 `/omnigent`), no online host (`HostUnavailableError` → how to bring one online),
 and harness-not-configured on the host (`HarnessNotConfiguredError`, 412 —
-surfaces the server's actionable message).
+surfaces the server's actionable message). A setup submission that Slack cannot
+attribute to a workspace/account gets a terminal screen (`setup_failed_modal`),
+not a modal that closes like a save.

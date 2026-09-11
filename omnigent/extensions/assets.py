@@ -9,9 +9,11 @@ from __future__ import annotations
 import hashlib
 import importlib.resources
 import importlib.util
+import json
 import logging
 import re
 import stat
+import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.resources.abc import Traversable
@@ -107,11 +109,16 @@ def _read_traversable_asset(root: Traversable, parts: tuple[str, ...], max_bytes
 def _resource_root(package: str) -> Traversable:
     try:
         spec = importlib.util.find_spec(package)
-        if spec is None or spec.origin is None:
-            raise ExtensionAssetError("extension asset root must be a regular package")
-        root = importlib.resources.files(package)
-    except (ImportError, ModuleNotFoundError) as exc:
+    except (ImportError, ModuleNotFoundError, TypeError, ValueError) as exc:
         raise ExtensionAssetError(f"extension asset package {package!r} is unavailable") from exc
+    if spec is None or spec.origin is None:
+        raise ExtensionAssetError("extension asset root must be a regular package")
+    try:
+        root = importlib.resources.files(package)
+    except (ImportError, ModuleNotFoundError, TypeError, ValueError) as exc:
+        raise ExtensionAssetError(f"extension asset package {package!r} is unavailable") from exc
+    if not isinstance(root, (Path, zipfile.Path)):
+        raise ExtensionAssetError("extension asset root uses an unsupported package loader")
     return root
 
 
@@ -173,6 +180,30 @@ def resolve_bundle(
         digest=bundle_digest,
         assets=MappingProxyType(assets),
     )
+
+
+def parse_dev_bundle_overrides(raw: str) -> dict[str, Path]:
+    """Parse an operator-only JSON map of extension IDs to absolute bundle roots."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ExtensionAssetError("development bundle overrides must be valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ExtensionAssetError("development bundle overrides must be a JSON object")
+    overrides: dict[str, Path] = {}
+    for extension_id, root in value.items():
+        if not isinstance(extension_id, str) or not isinstance(root, str):
+            raise ExtensionAssetError(
+                "development bundle override keys and values must be strings"
+            )
+        path = Path(root).expanduser()
+        if not path.is_absolute() or not path.is_dir():
+            raise ExtensionAssetError(
+                f"development bundle root for {extension_id!r} must be an existing "
+                "absolute directory"
+            )
+        overrides[extension_id] = path
+    return overrides
 
 
 def build_asset_index(

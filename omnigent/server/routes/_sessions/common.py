@@ -18,10 +18,12 @@ import cachetools
 import httpx
 from pydantic import TypeAdapter
 
+from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -92,6 +94,14 @@ _EXTERNAL_SESSION_INTERRUPTED_TYPE: str = "external_session_interrupted"
 
 
 _EXTERNAL_SESSION_SUPERSEDED_TYPE: str = "external_session_superseded"
+# Transient /btw side-chat overlay: the claude-native forwarder scrapes a
+# settled ``/btw`` exchange from the pane and posts it here to be broadcast
+# (never persisted) so the web UI shows the ephemeral overlay.
+_EXTERNAL_BTW_SIDECHAT_TYPE: str = "external_btw_sidechat"
+# Transient /btw overlay dismiss: the web UI posts this when the reader closes
+# the side-chat overlay (Escape / ✕), and the server forwards an Escape to the
+# pane so the terminal's own ``/btw`` overlay closes in lockstep.
+_EXTERNAL_BTW_DISMISS_TYPE: str = "external_btw_dismiss"
 
 
 _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
@@ -197,6 +207,12 @@ _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 
 
 _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+
+
+# Current approval/sandbox mode of a live codex-native session. ``terminal_launch_args``
+# carries the persisted CLI form; this label is the read-back the web picker prefers,
+# mirroring ``_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY``.
+_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_native.approval_mode"
 
 
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE: str = "external_codex_collaboration_mode_change"
@@ -420,7 +436,12 @@ _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = 300.0
 _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 
 
-_HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
+# How long a severed elicitation's card survives before it is cleared, giving a
+# hook retry time to re-park the same id. Wide enough to absorb a slow re-POST
+# (a lapsed token costs a re-mint round trip) so a still-blocked prompt is not
+# flipped to "Resolved elsewhere" between polls; a hook that died for real just
+# leaves the card up this much longer.
+_HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
 
 
 _HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
@@ -458,6 +479,8 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+    _EXTERNAL_BTW_SIDECHAT_TYPE,
+    _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
@@ -651,6 +674,21 @@ _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = 
 _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 
+# Sessions whose in-flight turn's assistant output a PHASE_LLM_RESPONSE
+# policy denied, mapped to the deny reason. Set by the policy-evaluate
+# route when it returns the DENY (the harness only errors the turn AFTER
+# the denied text already streamed and filled the relay's persistence
+# buffer), consumed by the relay's terminal text flush so the buffered
+# text persists as the deny sentinel instead of the denied content.
+# A plain dict, NOT an evicting cache: this is an enforcement decision,
+# and a silent eviction would downgrade a DENY into normal persistence.
+# Leak-safety comes from lifetime, not bounding — writes are gated on an
+# active relay for the session (routes_hooks), and the entry is popped at
+# every consume point, on each new turn, and when the relay task ends
+# (the relay's done-callback), so an entry can never outlive its relay.
+_llm_response_denied_turns: dict[str, str] = {}
+
+
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -812,6 +850,25 @@ def get_server_runner_router() -> RunnerRouter | None:
 _server_host_registry: HostRegistry | None = None
 
 
+def host_interactive_shells_for_request(
+    host_id: str,
+    *,
+    host_registry: HostRegistry,
+    runner_router: RunnerRouter | None,
+) -> list[str]:
+    """Return this replica's host shells or signal a misrouted request."""
+    if (
+        host_registry.get(host_id) is None
+        and runner_router is not None
+        and runner_router.host_is_on_another_replica(host_id)
+    ):
+        raise OmnigentError(
+            "host shell inventory is on another replica",
+            code=ErrorCode.WRONG_REPLICA,
+        )
+    return normalize_interactive_shells(host_registry.interactive_shells(host_id))
+
+
 def set_server_host_registry(host_registry: HostRegistry | None) -> None:
     """Stash the live host registry for asleep-session catalog refills.
 
@@ -866,6 +923,7 @@ __all__ = [
     "_CLAUDE_NATIVE_UI_LABEL_VALUE",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_KEY",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY",
     "_CODEX_NATIVE_COLLABORATION_MODES",
     "_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY",
     "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
@@ -889,6 +947,8 @@ __all__ = [
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
+    "_EXTERNAL_BTW_DISMISS_TYPE",
+    "_EXTERNAL_BTW_SIDECHAT_TYPE",
     "_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE",
     "_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE",
     "_EXTERNAL_CODEX_SUBAGENT_START_TYPE",
@@ -981,6 +1041,7 @@ __all__ = [
     "_deferred_elicitation_clear_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
+    "_llm_response_denied_turns",
     "_logger",
     "_managed_launch_tasks",
     "_model_options_cache",
@@ -1009,6 +1070,7 @@ __all__ = [
     "_session_todos_cache",
     "get_server_host_registry",
     "get_server_runner_router",
+    "host_interactive_shells_for_request",
     "set_server_host_registry",
     "set_server_runner_router",
 ]

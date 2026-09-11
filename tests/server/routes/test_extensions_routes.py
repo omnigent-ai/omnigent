@@ -45,7 +45,13 @@ def _manifest(extension_id: str = "acme.review") -> ExtensionManifest:
             browser="dist/extension.js",
             browser_css="dist/extension.css",
         ),
-        permissions=frozenset({ExtensionPermission.NAVIGATION, ExtensionPermission.STORAGE_USER}),
+        permissions=frozenset(
+            {
+                ExtensionPermission.NAVIGATION,
+                ExtensionPermission.SESSIONS_READ,
+                ExtensionPermission.STORAGE_USER,
+            }
+        ),
         pages=(
             PageContribution(
                 id=page_id,
@@ -137,7 +143,7 @@ async def test_catalog_serializes_only_public_v1_contributions(catalog_app: Fast
                 "version": "1.2.0",
                 "extension_api": 1,
                 "status": "unavailable",
-                "permissions": ["navigation", "storage.user"],
+                "permissions": ["navigation", "sessions.read", "storage.user"],
                 "pages": [],
                 "primary_navigation": [],
                 "browser": {
@@ -328,6 +334,32 @@ async def test_registry_is_resolved_once_at_app_construction(
         assert (await client.get("/v1/extensions")).status_code == 200
 
     assert calls == 1
+
+
+def test_development_bundle_overrides_are_explicit_and_loud(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    state = ExtensionPluginState(manifests=())
+    captured = None
+
+    def build_index(_state, *, overrides=None):
+        nonlocal captured
+        captured = overrides
+        return {}, {}
+
+    monkeypatch.setenv(
+        "OMNIGENT_EXTENSION_DEV_BUNDLES",
+        f'{{"acme.review": "{tmp_path}"}}',
+    )
+    monkeypatch.setattr(app_module, "build_asset_index", build_index)
+
+    with caplog.at_level("WARNING"):
+        app_module._resolve_extension_assets(state)
+
+    assert captured == {"acme.review": tmp_path}
+    assert "using development extension bundle overrides" in caplog.text
 
 
 async def test_global_discovery_failure_does_not_stop_server(

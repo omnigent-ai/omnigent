@@ -19,7 +19,7 @@ import pytest
 from fastapi import FastAPI, Request
 from PIL import Image
 
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
     ANTIGRAVITY_NATIVE_AGENT_NAME,
     QWEN_NATIVE_AGENT_NAME,
 )
@@ -829,6 +829,52 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     assert sessions[chat_fork.id]["runner_online"] is True
 
 
+def test_generic_credentials_route_does_not_shadow_detected(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """The generic ``/hosts/{id}/credentials/{provider}`` route must not shadow
+    the literal ``/hosts/{id}/credentials/detected`` owned by ``create_hosts_router``.
+
+    Regression guard for the mount order: the credentials router carries a
+    ``{provider}`` path param, and Starlette matches routes in registration order
+    with no literal-over-parameter priority. If the credentials router is
+    registered before the hosts router, ``…/credentials/detected`` resolves to the
+    generic handler and the credential-adoption endpoint breaks.
+    """
+    from starlette.routing import Match
+
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    def endpoint_for(path: str) -> str | None:
+        scope = {"type": "http", "method": "GET", "path": path}
+        for route in app.router.routes:
+            match, _ = route.matches(scope)
+            if match == Match.FULL:
+                return getattr(getattr(route, "endpoint", None), "__name__", None)
+        return None
+
+    # The literal wins over the generic {provider} param, and github still routes
+    # to the generic broker handler.
+    assert endpoint_for("/v1/hosts/h1/credentials/detected") == "detect_host_credentials"
+    assert endpoint_for("/v1/hosts/h1/credentials/github") == "host_credential"
+
+
 @pytest.mark.asyncio
 async def test_health_unbound_imported_session_reads_offline(
     db_uri: str,
@@ -1049,7 +1095,7 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
     the loop — or seeded under the wrong name/id — is caught here.
     """
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     server_app._ensure_default_native_agents(
         seed_stores.agent_store,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate maintainer approval, including trusted bot authors and commits."""
+"""Evaluate maintainer approval, including trusted bot authors and pushes."""
 
 from __future__ import annotations
 
@@ -46,9 +46,16 @@ def approval_decision(
     trusted_successors: set[str],
     reviews: list[dict[str, Any]],
     commits: list[dict[str, Any]],
+    pushers: Callable[[str], set[str]],
     timeline: list[dict[str, Any]] | None = None,
 ) -> ApprovalDecision:
-    """Accept trusted authors, current approval, or trusted successor commits."""
+    """
+    Accept trusted authors, current approval, or trusted successor pushes.
+
+    ``pushers`` maps a commit SHA to the logins GitHub authenticated as pushing
+    it. Commit author/committer logins are derived from the commit email, which
+    anyone who can push to the head branch can set to the bot's address.
+    """
     maintainers = {login.casefold() for login in maintainers}
     trusted_authors = {login.casefold() for login in trusted_authors}
     trusted_successors = {login.casefold() for login in trusted_successors}
@@ -60,9 +67,6 @@ def approval_decision(
     commit_positions = {
         str(commit.get("sha") or ""): index for index, commit in enumerate(commits)
     }
-    head_scope = (
-        "same-repository" if head_repository.casefold() == repository.casefold() else "fork"
-    )
     failures: list[str] = []
     for login, review in latest_decisive_reviews(reviews).items():
         if login.casefold() not in maintainers:
@@ -73,6 +77,14 @@ def approval_decision(
         approved_sha = str(review.get("commit_id") or "")
         if review_state == "APPROVED" and approved_sha == head_sha:
             return ApprovalDecision(True, f"Current head approved by maintainer @{login}.")
+        # Only the contributor can push a fork head, so nothing there is
+        # attributable to trusted automation.
+        if head_repository.casefold() != repository.casefold():
+            failures.append(
+                f"@{login}'s approval predates commits on a fork head; "
+                f"a maintainer must approve {head_sha[:9]}"
+            )
+            continue
         position = commit_positions.get(approved_sha)
         if position is None:
             failures.append(f"@{login}'s approved commit is no longer in PR history")
@@ -83,29 +95,39 @@ def approval_decision(
             continue
         untrusted = []
         for commit in successors:
+            sha = str(commit.get("sha") or "")
             author_login = str((commit.get("author") or {}).get("login") or "").casefold()
             committer_login = str((commit.get("committer") or {}).get("login") or "").casefold()
-            if author_login not in trusted_successors or committer_login not in trusted_successors:
-                untrusted.append(str(commit.get("sha") or "")[:9])
-        if not untrusted:
-            if review_state == "DISMISSED" and not trusted_automatic_dismissal(
-                review=review,
-                successor_commits={str(commit.get("sha") or ""): commit for commit in successors},
-                trusted_successors=trusted_successors,
-                timeline=timeline or [],
+            actors = {actor.casefold() for actor in pushers(sha)}
+            if (
+                author_login not in trusted_successors
+                or committer_login not in trusted_successors
+                or actors - trusted_successors
             ):
-                failures.append(
-                    f"@{login}'s approval was not auto-dismissed by trusted automation"
-                )
-                continue
-            return ApprovalDecision(
-                True,
-                f"Maintainer @{login} approved {approved_sha[:9]}; only trusted "
-                f"automation committed on the {head_scope} head through "
-                f"{head_sha[:9]}.",
+                untrusted.append(sha[:9])
+        if untrusted:
+            failures.append(
+                f"@{login}'s approval predates untrusted commit(s): {', '.join(untrusted)}"
             )
-        failures.append(
-            f"@{login}'s approval predates untrusted commit(s): {', '.join(untrusted)}"
+            continue
+        if not {actor.casefold() for actor in pushers(head_sha)} & trusted_successors:
+            failures.append(
+                f"@{login}'s approval predates {head_sha[:9]}, which has no push "
+                "recorded from trusted automation"
+            )
+            continue
+        if review_state == "DISMISSED" and not trusted_automatic_dismissal(
+            review=review,
+            successor_shas={str(commit.get("sha") or "") for commit in successors},
+            trusted_successors=trusted_successors,
+            timeline=timeline or [],
+        ):
+            failures.append(f"@{login}'s approval was not auto-dismissed by trusted automation")
+            continue
+        return ApprovalDecision(
+            True,
+            f"Maintainer @{login} approved {approved_sha[:9]}; only trusted "
+            f"automation pushed and committed through {head_sha[:9]}.",
         )
 
     reason = "; ".join(failures) if failures else "awaiting approval from a maintainer"
@@ -115,7 +137,7 @@ def approval_decision(
 def trusted_automatic_dismissal(
     *,
     review: dict[str, Any],
-    successor_commits: dict[str, dict[str, Any]],
+    successor_shas: set[str],
     trusted_successors: set[str],
     timeline: list[dict[str, Any]],
 ) -> bool:
@@ -130,14 +152,11 @@ def trusted_automatic_dismissal(
             continue
         if dismissed.get("dismissal_message") not in {None, ""}:
             continue
-        dismissal_commit = successor_commits.get(str(dismissed.get("dismissal_commit_id") or ""))
-        if dismissal_commit is None:
+        # GitHub records the authenticated pusher as the actor of a stale-review
+        # dismissal.
+        if str((event.get("actor") or {}).get("login") or "").casefold() not in trusted_successors:
             continue
-        author_login = str((dismissal_commit.get("author") or {}).get("login") or "").casefold()
-        committer_login = str(
-            (dismissal_commit.get("committer") or {}).get("login") or ""
-        ).casefold()
-        if author_login in trusted_successors and committer_login in trusted_successors:
+        if str(dismissed.get("dismissal_commit_id") or "") in successor_shas:
             return True
     return False
 
@@ -159,6 +178,37 @@ def paginated(endpoint: str, request: Callable[[list[str]], Any] = gh_json) -> l
         if len(value) < 100:
             return items
         page += 1
+
+
+def pull_request_target_pushers(
+    repository: str, request: Callable[[list[str]], Any] = gh_json
+) -> Callable[[str], set[str]]:
+    """Map a head SHA to the logins GitHub authenticated as triggering its runs."""
+    cache: dict[str, set[str]] = {}
+
+    def pushers(sha: str) -> set[str]:
+        if sha not in cache:
+            actors: set[str] = set()
+            page = 1
+            while True:
+                runs = request(
+                    [
+                        "api",
+                        f"repos/{repository}/actions/runs?head_sha={sha}"
+                        f"&event=pull_request_target&per_page=100&page={page}",
+                    ]
+                )
+                page_runs = runs.get("workflow_runs") or []
+                # `actor` is the original pusher; `triggering_actor` becomes whoever
+                # re-ran the check, e.g. the approval relay.
+                actors |= {str((run.get("actor") or {}).get("login") or "") for run in page_runs}
+                if len(page_runs) < 100:
+                    break
+                page += 1
+            cache[sha] = actors - {""}
+        return cache[sha]
+
+    return pushers
 
 
 def maintainers(repository: str) -> set[str]:
@@ -194,6 +244,7 @@ def main() -> int:
         trusted_successors=set(args.trusted_successor),
         reviews=reviews,
         commits=commits,
+        pushers=pull_request_target_pushers(args.repository),
         timeline=timeline,
     )
     if decision.approved:

@@ -33,6 +33,7 @@ export const themePalettes = [
   "github",
   "catppuccin",
   "gruvbox",
+  "solarized",
   "nord",
 ] as const;
 
@@ -70,6 +71,8 @@ export interface PaletteTokens {
   popoverForeground: string;
   primary: string;
   primaryForeground: string;
+  selectionBackground: string;
+  selectionForeground: string;
   secondary: string;
   secondaryForeground: string;
   muted: string;
@@ -108,6 +111,8 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   popoverForeground: "popover-foreground",
   primary: "primary",
   primaryForeground: "primary-foreground",
+  selectionBackground: "selection-background",
+  selectionForeground: "selection-foreground",
   secondary: "secondary",
   secondaryForeground: "secondary-foreground",
   muted: "muted",
@@ -159,6 +164,8 @@ type PaletteTokenInput = Pick<
 
 function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
   return {
+    selectionBackground: tokens.primary,
+    selectionForeground: tokens.primaryForeground,
     cardForeground: tokens.foreground,
     tray: tokens.card,
     popover: tokens.cardSolid,
@@ -373,6 +380,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         popover: "rgba(22, 27, 34, 0.9)",
         primary: "#238636",
         primaryForeground: "#ffffff",
+        selectionBackground: "#3fb950",
+        selectionForeground: "#0d1117",
         secondary: "#21262d",
         muted: "#21262d",
         mutedForeground: "#8b949e",
@@ -464,6 +473,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#fffdf2",
         primary: "#d65d0e",
         primaryForeground: "#ffffff",
+        selectionBackground: "#af3a03",
         secondary: "#ebdbb2",
         muted: "#ebdbb2",
         mutedForeground: "#7c6f64",
@@ -500,6 +510,72 @@ export const PALETTES: readonly PaletteMeta[] = [
     },
   },
   {
+    id: "solarized",
+    label: "Solarized",
+    blurb: "Precision colors in Solarized Light & Dark.",
+    light: {
+      bg: "#fdf6e3",
+      card: "#eee8d5",
+      accent: "#268bd2",
+      border: "#93a1a1",
+      text: "#657b83",
+    },
+    dark: {
+      bg: "#002b36",
+      card: "#073642",
+      accent: "#268bd2",
+      border: "#586e75",
+      text: "#839496",
+    },
+    tokens: {
+      light: paletteTokens({
+        background: "#fdf6e3",
+        foreground: "#657b83",
+        card: "#eee8d5",
+        cardSolid: "#eee8d5",
+        primary: "#268bd2",
+        primaryForeground: "#fdf6e3",
+        selectionBackground: "#00659a",
+        secondary: "#eee8d5",
+        muted: "#eee8d5",
+        mutedForeground: "#586e75",
+        codeBackground: "#eee8d5",
+        accent: "#eee8d5",
+        accentForeground: "#268bd2",
+        border: "#93a1a1",
+        borderStrong: "#839496",
+        ring: "#268bd2",
+        brandAccent: "#6c71c4",
+        sidebar: "#eee8d5",
+        shellBackground: "#fdf6e3",
+      }),
+      dark: paletteTokens({
+        background: "#002b36",
+        foreground: "#839496",
+        card: "#073642",
+        cardSolid: "#073642",
+        popover: "#073642",
+        primary: "#268bd2",
+        primaryForeground: "#fdf6e3",
+        selectionBackground: "#65b5ed",
+        selectionForeground: "#002b36",
+        secondary: "#073642",
+        muted: "#073642",
+        mutedForeground: "#93a1a1",
+        codeBackground: "#073642",
+        accent: "#073642",
+        accentForeground: "#2aa198",
+        border: "#586e75",
+        borderStrong: "#657b83",
+        ring: "#268bd2",
+        brandAccent: "#6c71c4",
+        sidebar: "#073642",
+        sidebarPrimaryForeground: "#fdf6e3",
+        shellBackground: "#002b36",
+      }),
+    },
+  },
+  {
     id: "nord",
     label: "Nord",
     blurb: "Arctic frost blues over polar-night neutrals.",
@@ -519,6 +595,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#e5e9f0",
         primary: "#5e81ac",
         primaryForeground: "#eceff4",
+        selectionBackground: "#466a94",
         secondary: "#d8dee9",
         muted: "#d8dee9",
         mutedForeground: "#4c566a",

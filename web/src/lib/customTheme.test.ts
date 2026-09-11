@@ -114,6 +114,23 @@ describe("customTheme", () => {
     expect(deriveCustomTheme({ ...theme, contrast: 50 })).toEqual(palette.tokens);
   });
 
+  it.each(PALETTES)("preserves $label selection contrast when customizing accents", (palette) => {
+    for (const accent of ["#000000", "#777777", "#ffffff"]) {
+      const variants = deriveCustomTheme({
+        ...createCustomThemeFromPalette(palette),
+        accent,
+        darkAccent: accent,
+        contrast: 100,
+        translucentSidebar: true,
+      });
+
+      for (const mode of ["light", "dark"] as const) {
+        expect(variants[mode].selectionBackground).toBe(palette.tokens[mode].selectionBackground);
+        expect(variants[mode].selectionForeground).toBe(palette.tokens[mode].selectionForeground);
+      }
+    }
+  });
+
   it("keeps Omnigent's selected-session colors after contrast changes", () => {
     const theme = createCustomThemeFromPalette(PALETTES[0]);
     const variants = deriveCustomTheme({ ...theme, contrast: 53 });
@@ -122,6 +139,25 @@ describe("customTheme", () => {
     expect(variants.light.sidebarActiveForeground).toBe("#651249");
     expect(variants.dark.sidebarActive).toBe("rgba(240, 1, 150, 0.15)");
     expect(variants.dark.sidebarActiveForeground).toBe("#f472b6");
+  });
+
+  it("tints the sidebar active highlight with a custom accent", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({
+      ...theme,
+      accent: "#2563eb",
+      darkAccent: "#f59e0b",
+    });
+
+    // Background tracks the accent at low alpha, in both modes.
+    expect(variants.light.sidebarActive).toBe("rgba(37, 99, 235, 0.12)");
+    expect(variants.dark.sidebarActive).toBe("rgba(245, 158, 11, 0.12)");
+
+    // Foreground reuses the rebased sidebar foreground (the default token
+    // model's `var(--sidebar-foreground)`), so it stays legible whatever
+    // format the base sidebar uses — not a hex-only-parser white fallback.
+    expect(variants.light.sidebarActiveForeground).toBe(variants.light.sidebarForeground);
+    expect(variants.dark.sidebarActiveForeground).toBe(variants.dark.sidebarForeground);
   });
 
   it.each(PALETTES)("keeps the exact $label preview at contrast 50", (palette) => {

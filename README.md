@@ -47,7 +47,8 @@ Omnigent lets you:
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
-  [Boxlite](https://github.com/boxlite-ai/boxlite), or
+  [Boxlite](https://github.com/boxlite-ai/boxlite),
+  [microsandbox](https://github.com/superradcompany/microsandbox), or
   [Databricks](https://www.databricks.com) sandboxes, launched from the
   CLI or provisioned by the server per session (*managed hosts*).
 
@@ -81,8 +82,8 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 Available user-facing extras include:
 
 - **Model providers:** `databricks`, `bedrock`, `vertex`
-- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `cwsandbox`, `e2b`,
-  `openshell`, `kubernetes`
+- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `microsandbox`,
+  `cwsandbox`, `e2b`, `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`
 
@@ -108,6 +109,20 @@ Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
 ```bash
 brew install omnigent-ai/tap/omnigent
 ```
+
+For source builds on networks that require package mirrors, replace these example
+URLs with your mirrors:
+
+```bash
+HOMEBREW_PIP_INDEX_URL='https://pypi.example.com/simple' \
+HOMEBREW_CARGO_INDEX_URL='https://cargo.example.com/index/' \
+  brew install --build-from-source omnigent-ai/tap/omnigent
+```
+
+The PyPI setting also routes pip's isolated build dependencies through the mirror.
+The Cargo setting takes a sparse registry index URL ending in `/`, without the
+`sparse+` prefix. Both overrides are optional and do not affect prebuilt-bottle
+installs.
 
 Or install straight from the repo:
 

@@ -26,10 +26,15 @@ class _Distribution:
         name: str,
         version: str | None = None,
         files: tuple[str, ...] | None = None,
+        top_level: str | None = None,
     ) -> None:
         self.name = name
         self.version = version
         self.files = files
+        self._top_level = top_level
+
+    def read_text(self, filename: str) -> str | None:
+        return self._top_level if filename == "top_level.txt" else None
 
 
 class _EntryPoint:
@@ -42,12 +47,15 @@ class _EntryPoint:
         version: str | None = None,
         module: str | None = None,
         files: tuple[str, ...] | None = None,
+        top_level: str | None = None,
     ) -> None:
         self.name = name
         self._loader = loader
         self.module = module
         self.value = f"{module}:get_manifest" if module else ""
-        self.dist = _Distribution(distribution, version, files) if distribution else None
+        self.dist = (
+            _Distribution(distribution, version, files, top_level) if distribution else None
+        )
 
     def load(self) -> Callable[[], ExtensionManifest] | object:
         return self._loader
@@ -135,6 +143,19 @@ def test_modern_entry_point_discovery_selects_extension_group(
     assert registry._entry_points() == (expected,)
 
 
+def test_extension_permission_values_include_read_only_sessions() -> None:
+    assert {permission.value for permission in ExtensionPermission} == {
+        "navigation",
+        "projects.read",
+        "projects.write",
+        "sessions.read",
+        "storage.user",
+    }
+    registry.validate_manifest(
+        replace(_manifest(), permissions=frozenset({ExtensionPermission.SESSIONS_READ}))
+    )
+
+
 def test_discovers_and_caches_valid_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
 
@@ -212,6 +233,25 @@ def test_records_verified_asset_package(monkeypatch: pytest.MonkeyPatch) -> None
     state = registry.plugin_state()
 
     assert state.asset_package(manifest.id) == "acme_review"
+
+
+def test_records_editable_asset_package_from_top_level_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest()
+    _install_entry_points(
+        monkeypatch,
+        _EntryPoint(
+            "review",
+            manifest,
+            distribution=manifest.distribution,
+            module="acme_review.plugin",
+            files=("__editable__.acme_review.pth",),
+            top_level="acme_review\n",
+        ),
+    )
+
+    assert registry.plugin_state().asset_package(manifest.id) == "acme_review"
 
 
 def test_does_not_record_unverified_or_core_asset_package(
@@ -465,12 +505,20 @@ def test_requires_css_suffix_for_browser_styles(monkeypatch: pytest.MonkeyPatch)
     )
 
 
+def test_rejects_multi_segment_page_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = replace(_manifest().pages[0], route="reports/daily")
+    manifest = replace(_manifest(), pages=(page,))
+    _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
+
+    assert "exactly one segment" in registry.plugin_state().load_errors["review"]
+
+
 def test_rejects_unsafe_or_dynamic_route(monkeypatch: pytest.MonkeyPatch) -> None:
     page = replace(_manifest().pages[0], route="dashboard/:section")
     manifest = replace(_manifest(), pages=(page,))
     _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
 
-    assert "unsupported route segment" in registry.plugin_state().load_errors["review"]
+    assert "exactly one segment" in registry.plugin_state().load_errors["review"]
 
 
 def test_rejects_contribution_outside_extension_namespace(

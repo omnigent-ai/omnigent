@@ -2,7 +2,7 @@
 // query-invalidation contract of the stop mutation hook.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
@@ -16,6 +16,7 @@ import {
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useBulkStopSessions,
+  undoArchiveConversations,
   useConversations,
   useDeleteProject,
   useProjects,
@@ -29,7 +30,7 @@ import {
   useStopSession,
   useTogglePinnedConversation,
   fetchPinnedConversations,
-  unmarkSessionsDeleting,
+  clearSessionTombstones,
   markRecentlyCreated,
   clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
@@ -60,10 +61,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  // Optimistic delete hides ids from every list fetch until the delete
-  // settles, in module-level state that would otherwise leak into the next
-  // test (which reuses the same ids against a fresh cache).
-  unmarkSessionsDeleting();
+  clearSessionTombstones();
   // Same for the recently-created keep-alive.
   clearRecentlyCreated();
 });
@@ -109,6 +107,24 @@ describe("renameConversation", () => {
   it("throws on non-2xx", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
     await expect(renameConversation("missing", "x")).rejects.toThrow(/404/);
+  });
+
+  it("surfaces the backend's rejection message, not the bare status line", async () => {
+    // A storage backend that restricts title characters rejects the PATCH
+    // with a structured envelope; that reason must reach the caller so the
+    // failure toast can show it.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        {
+          error_code: "INVALID_PARAMETER_VALUE",
+          message: "Workspace items cannot contain the '/' character",
+        },
+        { ok: false, status: 400 },
+      ),
+    );
+    await expect(renameConversation("conv_x", "release notes/2026-09")).rejects.toThrow(
+      "Workspace items cannot contain the '/' character",
+    );
   });
 });
 
@@ -462,6 +478,22 @@ describe("deleteConversation", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
     await expect(deleteConversation("missing")).rejects.toThrow(/404/);
   });
+
+  it("surfaces the server error message instead of a bare 404 status line", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        {
+          error: {
+            code: "conflict",
+            message:
+              "Cannot delete worktree — runner offline. Delete session only (delete_branch=false) or wait for the runner to reconnect.",
+          },
+        },
+        { ok: false, status: 409 },
+      ),
+    );
+    await expect(deleteConversation("conv_abc", true)).rejects.toThrow(/runner offline/);
+  });
 });
 
 describe("useStopAndDeleteConversation stops the running session first", () => {
@@ -771,6 +803,34 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The per-session caches survive a failed delete — the session is still
     // there to open.
     expect(queryClient.getQueryData(["session", "conv_x"])).toBeDefined();
+  });
+
+  it("puts the runner-offline worktree message on the restore toast, not a 404", async () => {
+    const { rendered } = seedAndDelete(
+      mockResponse(
+        {
+          error: {
+            code: "conflict",
+            message:
+              "Cannot delete worktree — runner offline. Delete session only (delete_branch=false) or wait for the runner to reconnect.",
+          },
+        },
+        { ok: false, status: 409 },
+      ),
+    );
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+
+    rendered.result.current.mutate({ id: "conv_x", deleteBranch: true });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toContain("Couldn't delete Old name — it's back in the sidebar.");
+    expect(toasts[0]).toContain("runner offline");
+    expect(toasts[0]).toContain("delete_branch=false");
+    expect(toasts[0]).not.toMatch(/\b404\b/);
   });
 
   it("does not refetch the conversations list, but does refresh the project list", async () => {
@@ -1118,6 +1178,62 @@ describe("useRenameConversation cache patching", () => {
     expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("Old name");
     const backfill = queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_x"]);
     expect(backfill!.title).toBe("Old name");
+  });
+
+  function renameAgainstFailure(response: Response) {
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValueOnce(response);
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useRenameConversation(), { wrapper });
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+    return { rendered, toasts };
+  }
+
+  it("toasts when the rename fails, so the rollback isn't silent", async () => {
+    const { rendered, toasts } = renameAgainstFailure(
+      mockResponse({ error: "boom" }, { ok: false, status: 500 }),
+    );
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    // The inline editor unmounted on commit, so without a toast the row
+    // just flickers back to the old name with no explanation at all.
+    // Named with the attempted title; the bare status line is dropped.
+    expect(toasts).toEqual([
+      'Couldn\'t rename the session to "New name" — its previous name is back.',
+    ]);
+  });
+
+  it("puts the storage backend's rejection on the toast, not a bare 400", async () => {
+    const { rendered, toasts } = renameAgainstFailure(
+      mockResponse(
+        {
+          error_code: "INVALID_PARAMETER_VALUE",
+          message: "Workspace items cannot contain the '/' character",
+        },
+        { ok: false, status: 400 },
+      ),
+    );
+
+    rendered.result.current.mutate({ id: "conv_x", title: "release notes/2026-09" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toContain('rename the session to "release notes/2026-09"');
+    expect(toasts[0]).toContain("Workspace items cannot contain the '/' character");
+    expect(toasts[0]).not.toMatch(/\b400\b/);
   });
 
   it("re-renders a subscribed list component with the new title before the PATCH resolves", async () => {
@@ -2323,6 +2439,14 @@ describe("useMoveToProject", () => {
 });
 
 describe("useArchiveConversation", () => {
+  const staleListPage = {
+    object: "list",
+    data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 5 }],
+    first_id: "conv_a",
+    last_id: "conv_a",
+    has_more: true,
+  };
+
   it("PATCHes archived, overlays the flag optimistically, and doesn't race the reindex", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
@@ -2431,6 +2555,100 @@ describe("useArchiveConversation", () => {
     expect(rows[0].archived).toBe(false);
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
+
+  it("does not restore a row with a concurrent delete in flight", async () => {
+    let settleArchive = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleArchive = resolve;
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+    const del = renderHook(() => useStopAndDeleteConversation(), { wrapper });
+    const cachedRow = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((row) => row.id === "conv_a");
+
+    archive.result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    let settleDelete = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleDelete = resolve;
+        }),
+    );
+    del.result.current.mutate({ id: "conv_a" });
+    await waitFor(() => expect(cachedRow()).toBeUndefined());
+
+    settleArchive(mockResponse({ error: "late" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(archive.result.current.isError).toBe(true));
+    expect(cachedRow()).toBeUndefined();
+
+    settleDelete(mockResponse({ id: "conv_a", deleted: true }));
+    await waitFor(() => expect(del.result.current.isSuccess).toBe(true));
+  });
+
+  it("filters stale refetches without stopping pagination", async () => {
+    let settlePatch = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settlePatch = resolve;
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const seeded = infinitePage([conversation({ id: "conv_a" })]);
+    seeded.pages[0].has_more = true;
+    queryClient.setQueryData(["conversations", "", false], seeded);
+    const cancelSpy = vi.spyOn(queryClient, "cancelQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const list = renderHook(() => useConversations("", false), { wrapper });
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+
+    archive.result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", false] }));
+    const first = list.result.current.data!.pages[0];
+    expect(first.data).toEqual([]);
+    expect(first.last_id).toBe("conv_a");
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [conversation({ id: "conv_other" })],
+        first_id: "conv_other",
+        last_id: "conv_other",
+        has_more: false,
+      }),
+    );
+    await act(() => list.result.current.fetchNextPage());
+    expect(fetchMock.mock.calls[2][0]).toContain("after=conv_a");
+
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    const archivedList = renderHook(() => useConversations("", true), { wrapper });
+    await waitFor(() => expect(archivedList.result.current.data).toBeDefined());
+    expect(archivedList.result.current.data!.pages[0].data[0].archived).toBe(true);
+
+    settlePatch(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    await waitFor(() => expect(archive.result.current.isSuccess).toBe(true));
+  });
 });
 
 describe("useDeleteProject", () => {
@@ -2537,5 +2755,52 @@ describe("useDeleteProject", () => {
       succeeded: ["conv_a"],
       total: 2,
     });
+  });
+});
+
+describe("undoArchiveConversations optimistic restore", () => {
+  it("re-injects evicted rows into cached lists before the unarchive PATCH settles", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // A refetch already evicted the archived row from the sidebar list, so the
+    // flag-flip overlay has nothing to un-hide — this exercises the injection.
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_keep" })]),
+    );
+    // Search lists have server-owned membership; the row must not land there.
+    queryClient.setQueryData(["conversations", "term", false], infinitePage([]));
+    // Hold the unarchive PATCH in flight so the assertions below can only be
+    // satisfied by the synchronous cache write, never the network round-trip.
+    let resolvePatch!: (value: Response) => void;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvePatch = resolve;
+        }),
+    );
+
+    const undo = undoArchiveConversations(queryClient, [
+      conversation({ id: "conv_a", archived: true }),
+    ]);
+
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      expect(data?.pages[0].data.map((c) => c.id)).toEqual(["conv_a", "conv_keep"]);
+    });
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data?.pages[0].data[0].archived).toBe(false);
+    const search = queryClient.getQueryData<ConversationsInfiniteData>([
+      "conversations",
+      "term",
+      false,
+    ]);
+    expect(search?.pages[0].data).toEqual([]);
+
+    resolvePatch(mockResponse(conversation({ id: "conv_a", archived: false, updated_at: 101 })));
+    await undo;
   });
 });

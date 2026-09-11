@@ -10,6 +10,7 @@ from omnigent.extensions.api import (
     PageContribution,
     PrimaryNavigationContribution,
 )
+from omnigent.extensions.conformance import check_extension_package
 from omnigent.extensions.registry import (
     ENTRY_POINT_GROUP,
     SUPPORTED_EXTENSION_API_VERSIONS,
@@ -32,6 +33,7 @@ __all__ = [
     "ExtensionValidationError",
     "PageContribution",
     "PrimaryNavigationContribution",
+    "check_extension_package",
     "extension_manifest",
     "extension_manifests",
     "plugin_state",

@@ -11,10 +11,12 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
+import { toast } from "sonner";
 import {
   type CSSProperties,
   type ReactElement,
   lazy,
+  memo,
   Suspense,
   useCallback,
   useEffect,
@@ -34,8 +36,10 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
+import { useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
@@ -118,6 +122,7 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
 function NewTabMenu({
   conversationId,
   onOpenTerminal,
+  onOpenBrowser,
   onCreateStart,
   onCreateError,
   triggerClassName,
@@ -126,6 +131,7 @@ function NewTabMenu({
   conversationId: string;
   /** Open a freshly-created terminal as a rail tab by its tab key. */
   onOpenTerminal: (key: string) => void;
+  onOpenBrowser?: () => void;
   /** Called when a shell create is initiated (before the POST resolves), so
    *  the shell can be focused as soon as its tab appears in the list. */
   onCreateStart?: () => void;
@@ -151,9 +157,7 @@ function NewTabMenu({
   // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
-  // Nothing to offer → no "+" button at all. (The embedded browser is one view
-  // per conversation, reached via its own pinned tab, so it's not offered here.)
-  if (!canOpenShell) return null;
+  if (!canOpenShell && !onOpenBrowser) return null;
 
   // The default launched by the primary segment: the remembered pick when it
   // is still a declared type, else the first declared name. Non-null here since
@@ -240,50 +244,57 @@ function NewTabMenu({
             paint over the dropdown (#3980). Only this rail menu needs it. */}
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
-        {multipleShells ? (
-          // Several types → a single "Shell (default)" row that launches the
-          // default on click and reveals a flyout of the OTHER types on hover.
-          // The sub-trigger's built-in chevron is hidden ([&>svg:last-child]) to
-          // keep the row clean. The click handler guards on ``shellDisabled``
-          // itself because Radix runs a sub-trigger's onClick before its own
-          // disabled check — without the guard an offline session would still
-          // fire a create.
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger
-              disabled={shellDisabled}
-              onClick={() => {
-                if (!shellDisabled) launchShell(defaultShell);
-              }}
-              className="cursor-pointer [&>svg:last-child]:hidden"
-            >
-              {shellItemContent}
-            </DropdownMenuSubTrigger>
-            {/* min-w-0 drops the default 96px floor so the box hugs the shell
-                name (e.g. "bash") instead of padding it out. */}
-            <DropdownMenuSubContent className="min-w-0">
-              <DropdownMenuLabel>Other shells</DropdownMenuLabel>
-              {otherShells.map((name) => (
-                <DropdownMenuItem
-                  key={name}
-                  onSelect={() => pickShell(name)}
-                  disabled={shellDisabled}
-                  className="cursor-pointer"
-                >
-                  {name}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-        ) : (
-          // Single type → a plain launch item.
-          <DropdownMenuItem
-            onSelect={() => launchShell(defaultShell)}
-            disabled={shellDisabled}
-            className="cursor-pointer"
-          >
-            {shellItemContent}
+        {onOpenBrowser && (
+          <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
+            <GlobeIcon className="size-4" />
+            Browser
           </DropdownMenuItem>
         )}
+        {canOpenShell &&
+          (multipleShells ? (
+            // Several types → a single "Shell (default)" row that launches the
+            // default on click and reveals a flyout of the OTHER types on hover.
+            // The sub-trigger's built-in chevron is hidden ([&>svg:last-child]) to
+            // keep the row clean. The click handler guards on ``shellDisabled``
+            // itself because Radix runs a sub-trigger's onClick before its own
+            // disabled check — without the guard an offline session would still
+            // fire a create.
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger
+                disabled={shellDisabled}
+                onClick={() => {
+                  if (!shellDisabled) launchShell(defaultShell);
+                }}
+                className="cursor-pointer [&>svg:last-child]:hidden"
+              >
+                {shellItemContent}
+              </DropdownMenuSubTrigger>
+              {/* min-w-0 drops the default 96px floor so the box hugs the shell
+                  name (e.g. "bash") instead of padding it out. */}
+              <DropdownMenuSubContent className="min-w-0">
+                <DropdownMenuLabel>Other shells</DropdownMenuLabel>
+                {otherShells.map((name) => (
+                  <DropdownMenuItem
+                    key={name}
+                    onSelect={() => pickShell(name)}
+                    disabled={shellDisabled}
+                    className="cursor-pointer"
+                  >
+                    {name}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          ) : (
+            // Single type → a plain launch item.
+            <DropdownMenuItem
+              onSelect={() => launchShell(defaultShell)}
+              disabled={shellDisabled}
+              className="cursor-pointer"
+            >
+              {shellItemContent}
+            </DropdownMenuItem>
+          ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -554,6 +565,8 @@ function RailTerminalView({
 interface WorkspacePanelProps {
   /** Active session id — panels read the workspace against it. */
   conversationId: string;
+  /** Show inert panel chrome while the server session id is still pending. */
+  pending?: boolean;
   /** Current rail width (px), driven by the resize handle. */
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
@@ -664,8 +677,9 @@ interface WorkspacePanelProps {
  * right side) lives in AppShell — this component assumes it should
  * render when mounted.
  */
-export function WorkspacePanel({
+function WorkspacePanelImpl({
   conversationId,
+  pending = false,
   width,
   handleProps,
   inert,
@@ -701,6 +715,23 @@ export function WorkspacePanel({
   onShellCreateStart,
   onShellCreateFailed,
 }: WorkspacePanelProps) {
+  const browsers = useBrowserTabs(conversationId);
+  const closeBrowserTab = async (tabId: string) => {
+    const closed = await browsers.close(tabId);
+    if (!closed) toast.error("Couldn't close browser tab. Try again.");
+  };
+  const activeBrowserRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    activeBrowserRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [browsers.selected, rightRailTab]);
+  const browserSelected =
+    rightRailTab === "browser" && selectedFilePath === null && selectedTerminalKey === null;
+  const addBrowser = showBrowserTab
+    ? () => {
+        browsers.add();
+        onRightRailTabChange("browser");
+      }
+    : undefined;
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
@@ -718,6 +749,25 @@ export function WorkspacePanel({
     },
     [terminals],
   );
+  const showOpenTabs =
+    !pending &&
+    (openFiles.length > 0 ||
+      openTerminals.length > 0 ||
+      (showBrowserTab && browsers.tabs.length > 0));
+  const showEmptyNewTab =
+    !pending &&
+    openFiles.length === 0 &&
+    openTerminals.length === 0 &&
+    (!showBrowserTab || browsers.tabs.length === 0);
+  const effectiveHandleProps = pending
+    ? {
+        ...handleProps,
+        onMouseDown: undefined,
+        onKeyDown: undefined,
+        "aria-disabled": true,
+        tabIndex: -1,
+      }
+    : handleProps;
   return (
     <aside
       aria-label="Workspace"
@@ -757,8 +807,11 @@ export function WorkspacePanel({
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
       {!maximized && (
         <div
-          {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          {...effectiveHandleProps}
+          className={cn(
+            "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
+            pending && "cursor-default hover:bg-transparent active:bg-transparent",
+          )}
         />
       )}
       {/* Tab strip, in display order Files · Changes · Agents.
@@ -788,20 +841,27 @@ export function WorkspacePanel({
           // content slot below): a sticky selection whose terminal is gone shows
           // the fallback nav view, so its nav tab must highlight, not "__tab__".
           value={
-            selectedFilePath !== null ||
-            (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
-              ? "__tab__"
-              : rightRailTab
+            pending
+              ? "__pending__"
+              : selectedFilePath !== null ||
+                  (browserSelected && browsers.selected !== null) ||
+                  (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
+                ? "__tab__"
+                : rightRailTab
           }
-          onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
+          onValueChange={(value) => {
+            if (value === "browser") browsers.select(null);
+            onRightRailTabChange(value as RightRailTab);
+          }}
           componentId="chat.right_rail.tabs"
         >
           <TabsList variant="pill" className="gap-1">
-            {showFilesPanel && (
+            {(pending || showFilesPanel) && (
               <WorkspaceTabTooltip label="Files">
                 <TabsTrigger
                   value="files"
                   aria-label="Files"
+                  disabled={pending}
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
                   <FolderTreeIcon />
@@ -809,11 +869,12 @@ export function WorkspacePanel({
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
-            {showFilesPanel && (
+            {(pending || showFilesPanel) && (
               <WorkspaceTabTooltip label="Changes">
                 <TabsTrigger
                   value="changes"
                   aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
+                  disabled={pending}
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
                   <FileDiffIcon />
@@ -822,11 +883,12 @@ export function WorkspacePanel({
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
-            {showGithubTab && (
+            {(pending || showGithubTab) && (
               <WorkspaceTabTooltip label="GitHub">
                 <TabsTrigger
                   value="github"
                   aria-label="GitHub"
+                  disabled={pending}
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
                   <GithubMono size={16} />
@@ -837,6 +899,7 @@ export function WorkspacePanel({
             <WorkspaceTabTooltip label="Agents">
               <TabsTrigger
                 value="subagents"
+                disabled={pending}
                 aria-label={
                   subagentsWorking > 0
                     ? `Agents ${subagentsWorking}/${agentCount}`
@@ -862,6 +925,7 @@ export function WorkspacePanel({
                 <TabsTrigger
                   value="browser"
                   aria-label="Browser"
+                  disabled={pending}
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
                   <GlobeIcon />
@@ -875,7 +939,7 @@ export function WorkspacePanel({
                 Pinned (outside the scrolling file-tabs region), so it stays put
                 at every rail width while the tabs scroll past it. */}
         <div aria-hidden className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong" />
-        {(openFiles.length > 0 || openTerminals.length > 0) && (
+        {showOpenTabs && (
           <>
             {/* Open-tabs region (file tabs + shell tabs) — the horizontal
                 scroller. It sizes to its content and shrinks+scrolls only when
@@ -899,6 +963,47 @@ export function WorkspacePanel({
                 onSelect={openTerminalTab}
                 onClose={onCloseTerminal}
               />
+              {showBrowserTab &&
+                browsers.tabs.map((tabId, index) => (
+                  <div
+                    key={tabId}
+                    ref={browserSelected && browsers.selected === tabId ? activeBrowserRef : null}
+                    className={cn(
+                      "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                      browserSelected && browsers.selected === tabId
+                        ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                        : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+                    )}
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={browserSelected && browsers.selected === tabId}
+                      className="flex items-center gap-1"
+                      onAuxClick={(event) => {
+                        if (event.button === 1) {
+                          event.preventDefault();
+                          void closeBrowserTab(tabId);
+                        }
+                      }}
+                      onClick={() => {
+                        browsers.select(tabId);
+                        onRightRailTabChange("browser");
+                      }}
+                    >
+                      <GlobeIcon className="size-4" />
+                      Browser {index + 1}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Close Browser ${index + 1}`}
+                      className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                      onClick={() => void closeBrowserTab(tabId)}
+                    >
+                      <XIcon className="size-3" />
+                    </button>
+                  </div>
+                ))}
             </div>
             {/* "+" trails the last tab but sits OUTSIDE the scroller, so it
                 stays pinned (never scrolls under / overlaps the tabs) when they
@@ -906,6 +1011,7 @@ export function WorkspacePanel({
                 same gap the scroller's gap-0.5 gives between tabs. */}
             <NewTabMenu
               conversationId={conversationId}
+              onOpenBrowser={addBrowser}
               onCreateError={onShellCreateFailed}
               onOpenTerminal={openTerminalTab}
               onCreateStart={onShellCreateStart}
@@ -918,9 +1024,10 @@ export function WorkspacePanel({
             after the nav tabs (next to Shells); once tabs exist it moves into
             the open-tabs region to trail the last tab (see above). Self-gates
             to nothing when the agent has no terminal access. */}
-        {openFiles.length === 0 && openTerminals.length === 0 && (
+        {showEmptyNewTab && (
           <NewTabMenu
             conversationId={conversationId}
+            onOpenBrowser={addBrowser}
             onOpenTerminal={openTerminalTab}
             onCreateStart={onShellCreateStart}
             onCreateError={onShellCreateFailed}
@@ -941,6 +1048,7 @@ export function WorkspacePanel({
             aria-label={maximized ? "Exit full screen" : "Full screen"}
             aria-pressed={maximized}
             onClick={onToggleMaximized}
+            disabled={pending}
             size="icon-xs"
             className="flex size-6"
           >
@@ -953,7 +1061,12 @@ export function WorkspacePanel({
           (tree vs changed-only list); Subagents lists the root's children +
           a "main" link back to the parent. */}
       <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
+        {pending ? (
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+            <Spinner />
+            <span className="text-ui">Starting workspace…</span>
+          </div>
+        ) : selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
           // Show the selected shell's xterm only while its terminal is actually
           // present. The selection is sticky (AppShell never prunes it off the
           // list), so during a transient terminals-list churn this falls back to
@@ -980,7 +1093,12 @@ export function WorkspacePanel({
         ) : rightRailTab === "browser" && showBrowserTab ? (
           // Embedded browser (Electron only) — BrowserPane self-gates and
           // measures this rail slot to position the native view over it.
-          <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
+          <BrowserPane
+            key={browsers.viewId}
+            conversationId={browsers.viewId}
+            agentBrowser={browsers.selected === null}
+            className="min-h-0 flex-1"
+          />
         ) : rightRailTab === "github" && showGithubTab ? (
           <GithubPanel conversationId={conversationId} />
         ) : rightRailTab === "subagents" && rootSessionId ? (
@@ -1002,3 +1120,5 @@ export function WorkspacePanel({
     </aside>
   );
 }
+
+export const WorkspacePanel = memo(WorkspacePanelImpl);

@@ -137,7 +137,7 @@ def _python() -> str:
 
 def _wrapper_bundle() -> bytes:
     """Bundle the exact terminal-first spec ``omnigent claude`` ships."""
-    from omnigent.claude_native import _materialize_claude_agent_spec
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
