@@ -2663,6 +2663,35 @@ _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
 _SESSION_INIT_ENVELOPE_TTL_SECONDS = 60.0
 
 
+def _log_session_ready(
+    session_id: str,
+    *,
+    status: str,
+    harness: str | None,
+    init_elapsed_ms: int,
+) -> None:
+    """Emit the session-readiness lifecycle marker for the launch funnel.
+
+    One non-ERROR, session-attributed record per successful session init.
+    Without it, readiness is only observable through turn-driven or
+    native-terminal-only logs, so a connected session that has not yet
+    received a turn looks like a failed launch to launch-to-ready telemetry.
+
+    :param session_id: The initialized session's conversation id.
+    :param status: Session status at the end of init (``idle``/``running``).
+    :param harness: Canonical harness name serving the session.
+    :param init_elapsed_ms: Wall time from init start to ready.
+    """
+    _logger.info(
+        "Session %s ready to serve (status=%s, harness=%s, init_elapsed_ms=%d)",
+        session_id,
+        status,
+        harness,
+        init_elapsed_ms,
+        extra={"session_id": session_id},
+    )
+
+
 class _BodyRequest:
     """Minimal stand-in for a Starlette ``Request`` exposing only ``json()``.
 
@@ -3723,6 +3752,7 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
+        init_started = time.monotonic()
         if process_manager is None:
             return JSONResponse(
                 status_code=501,
@@ -4284,6 +4314,12 @@ def create_runner_app(
                 _background_tasks.add(_turn_task)
 
         status = "running" if session_id in _active_turns else "idle"
+        _log_session_ready(
+            session_id,
+            status=status,
+            harness=harness_name,
+            init_elapsed_ms=int((time.monotonic() - init_started) * 1000),
+        )
         return JSONResponse(
             status_code=201,
             content={
