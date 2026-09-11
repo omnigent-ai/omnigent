@@ -15,7 +15,6 @@ chat in an ``<iframe sandbox>`` that grants scripts/network/forms but not
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterator
 
 import httpx
@@ -29,9 +28,6 @@ _LINK_LABEL = "server health"
 # cookies, forms) but the host does not grant popup creation, so
 # `target="_blank"` / `window.open` cannot open a new tab or window.
 _POPUP_BLOCKED_SANDBOX = "allow-scripts allow-same-origin allow-forms"
-
-# How long a working navigation gets to land before the click is judged dead.
-_NAVIGATION_DEADLINE_S = 10.0
 
 
 @pytest.fixture
@@ -56,9 +52,11 @@ def embedded_link_session(
     yield (base_url, session_id, link_url)
 
 
+@pytest.mark.parametrize("activation", ["click", "keyboard"])
 def test_chat_link_click_navigates_in_popup_blocked_host(
     page: Page,
     embedded_link_session: tuple[str, str, str],
+    activation: str,
 ) -> None:
     """A clicked chat link navigates even when the host blocks popups.
 
@@ -91,21 +89,16 @@ def test_chat_link_click_navigates_in_popup_blocked_host(
     expect(link).to_be_visible(timeout=30_000)
     expect(link).to_have_attribute("href", link_url)
 
-    link.click()
+    with page.expect_request(link_url) as request_info:
+        if activation == "keyboard":
+            link.focus()
+            link.press("Enter")
+        else:
+            link.click()
 
-    # The host denies popups, so the click must fall back to a working
-    # same-tab navigation: the embedded frame leaves the chat for the link.
-    embed = page.locator("#embed")
-    deadline = time.monotonic() + _NAVIGATION_DEADLINE_S
-    frame_href = embed.evaluate("el => el.contentWindow.location.href")
-    while time.monotonic() < deadline and frame_href.split("#", 1)[0] != link_url:
-        page.wait_for_timeout(250)
-        frame_href = embed.evaluate("el => el.contentWindow.location.href")
-
-    assert frame_href.split("#", 1)[0] == link_url, (
-        "clicking the chat hyperlink performed no navigation in a popup-blocked "
-        f"host: the embedded frame is still on {frame_href!r} instead of "
-        f'{link_url!r}. Chat links carry only target="_blank", so where the '
-        "host withholds popup creation a plain click does nothing; a same-tab "
-        "navigation fallback is required."
-    )
+    expect(frame.locator("body")).to_contain_text('"status":"ok"', timeout=10_000)
+    assert page.locator("#embed").evaluate("el => el.contentWindow.location.href") == link_url
+    assert frame.locator("body").evaluate("el => el.ownerDocument.referrer") == ""
+    assert "referer" not in request_info.value.all_headers()
+    expect(page).to_have_url(host_url)
+    assert len(page.context.pages) == 1

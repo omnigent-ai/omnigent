@@ -7,8 +7,8 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
-import type * as NativeBridge from "@/lib/nativeBridge";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as NativeBridge from "@/lib/nativeBridge";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
@@ -21,21 +21,14 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 
 const LINK_URL = "https://example.com/page";
 
-let assignedUrls: string[];
-let originalLocation: Location;
+let followedLinks: HTMLAnchorElement[];
 
 beforeEach(() => {
-  assignedUrls = [];
-  originalLocation = window.location;
-  // Capture same-tab navigations without jsdom trying to perform them.
-  Object.defineProperty(window, "location", {
-    configurable: true,
-    value: {
-      ...originalLocation,
-      assign: (url: string) => {
-        assignedUrls.push(url);
-      },
-    },
+  followedLinks = [];
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    followedLinks.push(this);
   });
 });
 
@@ -43,32 +36,29 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   nativeShell.native = false;
-  Object.defineProperty(window, "location", {
-    configurable: true,
-    value: originalLocation,
-  });
 });
 
 const FILE_VIEWER = {
   openFile: () => {},
+  openGithubTab: () => {},
   isChangedPath: () => false,
   conversationId: undefined,
   workspaceRoot: "/home/u/ws",
   workspaceHome: "/home/u",
 };
 
-function renderExternalLink(): HTMLElement {
+function renderExternalLink(href = LINK_URL): HTMLElement {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
   });
   render(
     <QueryClientProvider client={client}>
       <FileViewerContext.Provider value={FILE_VIEWER}>
-        <FilePathAwareMessageResponse>{`[docs](${LINK_URL})`}</FilePathAwareMessageResponse>
+        <FilePathAwareMessageResponse>{`[docs](${href})`}</FilePathAwareMessageResponse>
       </FileViewerContext.Provider>
     </QueryClientProvider>,
   );
-  return screen.getByRole("link", { name: "docs" });
+  return screen.getByText(/^docs(?: \[blocked\])?$/);
 }
 
 function click(link: HTMLElement, init: MouseEventInit = {}): MouseEvent {
@@ -86,16 +76,20 @@ describe("external chat link clicks", () => {
   });
 
   it("opens a new tab on a plain click where popups are granted", () => {
-    const popup = { opener: window } as Window;
+    const popupDocument = document.implementation.createHTMLDocument();
+    const popup = { opener: window, document: popupDocument } as Window;
     const openSpy = vi.spyOn(window, "open").mockReturnValue(popup);
 
     const event = click(renderExternalLink());
 
     expect(event.defaultPrevented).toBe(true);
-    expect(openSpy).toHaveBeenCalledWith(LINK_URL, "_blank");
-    // The rel="noreferrer" a native _blank click applies must not be lost.
+    expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank");
     expect(popup.opener).toBeNull();
-    expect(assignedUrls).toEqual([]);
+    expect(followedLinks).toHaveLength(1);
+    expect(followedLinks[0].ownerDocument).toBe(popupDocument);
+    expect(followedLinks[0].href).toBe(LINK_URL);
+    expect(followedLinks[0].target).toBe("_self");
+    expect(followedLinks[0].rel).toBe("noopener noreferrer");
   });
 
   it("falls back to a same-tab navigation where popup creation is withheld", () => {
@@ -104,7 +98,11 @@ describe("external chat link clicks", () => {
     const event = click(renderExternalLink());
 
     expect(event.defaultPrevented).toBe(true);
-    expect(assignedUrls).toEqual([LINK_URL]);
+    expect(followedLinks).toHaveLength(1);
+    expect(followedLinks[0].ownerDocument).toBe(document);
+    expect(followedLinks[0].href).toBe(LINK_URL);
+    expect(followedLinks[0].target).toBe("_self");
+    expect(followedLinks[0].rel).toBe("noopener noreferrer");
   });
 
   it.each([
@@ -120,7 +118,7 @@ describe("external chat link clicks", () => {
 
     expect(event.defaultPrevented).toBe(false);
     expect(openSpy).not.toHaveBeenCalled();
-    expect(assignedUrls).toEqual([]);
+    expect(followedLinks).toEqual([]);
   });
 
   it("leaves native shells on their own window-open policy", () => {
@@ -133,6 +131,40 @@ describe("external chat link clicks", () => {
 
     expect(event.defaultPrevented).toBe(false);
     expect(openSpy).not.toHaveBeenCalled();
-    expect(assignedUrls).toEqual([]);
+    expect(followedLinks).toEqual([]);
   });
+
+  it("does not follow an already-cancelled click", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const link = renderExternalLink();
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    event.preventDefault();
+    link.dispatchEvent(event);
+
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(followedLinks).toEqual([]);
+  });
+
+  it("leaves mail links to the browser without opening an empty tab", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    const event = click(renderExternalLink("mailto:docs@example.com"));
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(followedLinks).toEqual([]);
+  });
+
+  it.each(["javascript:invalid", "data:text/plain,invalid", "vbscript:invalid"])(
+    "never follows a sanitized %s URL",
+    (href) => {
+      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+      click(renderExternalLink(href));
+
+      expect(screen.queryByRole("link")).not.toBeInTheDocument();
+      expect(openSpy).not.toHaveBeenCalled();
+      expect(followedLinks).toEqual([]);
+    },
+  );
 });

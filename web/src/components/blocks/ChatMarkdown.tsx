@@ -177,15 +177,17 @@ function followLinkWithPopupFallback(
   if (event.defaultPrevented || event.button !== 0) return;
   if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   if (isNativeShell()) return;
+  if (!/^(?:https?:)?\/\//i.test(href)) return;
   event.preventDefault();
-  const popup = window.open(href, "_blank");
+  const popup = window.open("about:blank", "_blank");
   if (popup) {
-    // Preserve the noopener protection the anchor's rel gives a native click.
     popup.opener = null;
-    return;
   }
-  // Popup creation is unavailable here; a click must still do something.
-  window.location.assign(href);
+  const link = (popup?.document ?? document).createElement("a");
+  link.href = href;
+  link.target = "_self";
+  link.rel = "noopener noreferrer";
+  link.click();
 }
 
 /**
@@ -224,7 +226,10 @@ function WorkspaceFileLink({
         onClick={
           blankHref === null
             ? props.onClick
-            : (event) => followLinkWithPopupFallback(event, blankHref)
+            : (event) => {
+                props.onClick?.(event);
+                followLinkWithPopupFallback(event, blankHref);
+              }
         }
       >
         {children}
