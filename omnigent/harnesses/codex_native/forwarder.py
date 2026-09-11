@@ -121,7 +121,7 @@ _CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
 # How often the forwarder claims pending ``/side`` questions from the bridge dir.
 # The executor writes one and returns, so this is the delay before the side chat
 # starts; a fork is cheap, so poll fast enough to feel immediate.
-_SIDE_CHAT_POLL_SECONDS = 0.25
+_SIDE_CHAT_POLL_SECONDS = 0.05
 # Transient reasoning (chain-of-thought) delta — the reasoning analogue of
 # ``external_output_text_delta``. Nothing is persisted; it publishes
 # ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
