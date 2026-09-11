@@ -1553,6 +1553,8 @@ describe("Composer model/effort label", () => {
           modelPickerKind: "claude",
           showModels: true,
           codexModelOptions: CLAUDE_MODEL_OPTIONS,
+          // An applicable dialog row, so the Advanced entry is offered.
+          subagentRoutingEligible: true,
         })}
       />,
     );
@@ -1824,6 +1826,37 @@ describe("Composer Codex Plan-mode control", () => {
   });
 });
 
+describe("Composer advanced settings availability", () => {
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ claudePermissionMode: "", codexApprovalMode: "" });
+  });
+
+  it("does not offer Advanced settings when no dialog row applies", () => {
+    // A pi-native session reaches this state: the menu has model/effort
+    // quick-switch entries, but none of the dialog's rows (Claude
+    // permissions, Codex approvals, sub-agent routing) apply, so offering
+    // the entry would open an empty dialog.
+    useChatStore.setState({ conversationId: "conv_test" });
+
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+
+    expect(screen.getByTestId("composer-agent-menu")).toBeTruthy();
+    expect(screen.queryByTestId("composer-advanced-settings")).toBeNull();
+  });
+
+  it("offers Advanced settings when only the sub-agent routing row applies", async () => {
+    useChatStore.setState({ conversationId: "conv_test" });
+
+    renderWithTooltips(<Composer {...composerProps({ subagentRoutingEligible: true })} />);
+    openSessionConfig();
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-subagent-routing")).toBeTruthy();
+  });
+});
+
 describe("Composer claude-native permission mode", () => {
   afterEach(() => {
     cleanup();
@@ -1844,16 +1877,18 @@ describe("Composer claude-native permission mode", () => {
     expect(row).not.toHaveTextContent("classifier");
   });
 
-  it("omits the Permissions row when the mode could not be determined", async () => {
+  it("does not offer Advanced settings while the mode is unknown", () => {
     // Claude only renders its mode footer in some pane states (a todo list
-    // displaces it), so an unknown mode must not be shown as a guess.
+    // displaces it), so an unknown mode must not be shown as a guess — and
+    // with no other row applying, the dialog would open empty, so the menu
+    // withholds the entry until the mode is known.
     useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "" });
 
     renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
-    openSessionConfig();
+    fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
 
-    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
-    expect(screen.queryByTestId("composer-config-permission-mode")).toBeNull();
+    expect(screen.getByTestId("composer-agent-menu")).toBeTruthy();
+    expect(screen.queryByTestId("composer-advanced-settings")).toBeNull();
   });
 
   it("keeps the gear reachable when the mode is the only config row", () => {
@@ -3016,7 +3051,9 @@ describe("Composer config gear", () => {
     // Asleep/starting/unknown sessions accept sends (which wake the runner),
     // and a config PATCH persists server-side and applies on the next
     // wake/turn — so the gear stays live wherever the composer does.
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
+    renderWithTooltips(
+      <Composer {...composerProps({ showEffort: true, subagentRoutingEligible: true })} />,
+    );
     expect(gear()).toHaveAttribute("aria-disabled", "false");
     openSessionConfig();
     expect(screen.queryByTestId("composer-config-modal")).not.toBeNull();
@@ -3101,7 +3138,13 @@ describe("Composer config gear", () => {
   it("keeps Advanced settings free of duplicate model and effort controls", async () => {
     renderWithTooltips(
       <Composer
-        {...composerProps({ showEffort: true, showModels: true, modelPickerKind: "claude" })}
+        {...composerProps({
+          showEffort: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          // An applicable dialog row, so the Advanced entry is offered.
+          subagentRoutingEligible: true,
+        })}
       />,
     );
     openSessionConfig();
@@ -3154,6 +3197,8 @@ describe("Composer config gear", () => {
           modelPickerKind: "claude",
           codexModelOptions: CLAUDE_MODEL_OPTIONS,
           effortLevels: ["low", "medium", "high", "xhigh", "max"],
+          // An applicable dialog row, so the Advanced entry is offered.
+          subagentRoutingEligible: true,
         })}
       />,
     );
@@ -3447,7 +3492,13 @@ describe("Composer config gear", () => {
     useChatStore.setState({ setModel, setEffort, selectedEffort: "medium" });
     renderWithTooltips(
       <Composer
-        {...composerProps({ showEffort: true, showModels: true, modelPickerKind: "claude" })}
+        {...composerProps({
+          showEffort: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          // An applicable dialog row, so the Advanced entry is offered.
+          subagentRoutingEligible: true,
+        })}
       />,
     );
     openSessionConfig();
@@ -3517,6 +3568,8 @@ describe("Composer config gear", () => {
           modelPickerKind: "claude",
           costRoutingEligible: true,
           codexModelOptions: options,
+          // An applicable dialog row, so the Advanced entry is offered.
+          subagentRoutingEligible: true,
         })}
       />,
     );
@@ -3646,7 +3699,10 @@ describe("Composer config gear — subagent routing", () => {
       />,
     );
     openSessionConfig();
-    await screen.findByTestId("composer-config-modal");
+    // A session no dialog row applies to gets no Advanced entry, and so no
+    // modal (and no row) to find.
+    if (screen.queryByTestId("composer-advanced-settings"))
+      await screen.findByTestId("composer-config-modal");
   }
 
   it("renders the row when the session is subagent-routing eligible", async () => {
@@ -3656,6 +3712,9 @@ describe("Composer config gear — subagent routing", () => {
 
   it("hides the row when the session is not eligible (routing disabled or wrong harness)", async () => {
     await openNativeModal({ subagentRoutingEligible: false });
+    // With no other row applying either, the Advanced entry itself is
+    // withheld rather than opening an empty dialog.
+    expect(screen.queryByTestId("composer-advanced-settings")).toBeNull();
     expect(row()).toBeNull();
   });
 

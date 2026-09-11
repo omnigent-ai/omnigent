@@ -4585,6 +4585,30 @@ function hasSessionConfig({
   );
 }
 
+/**
+ * Whether the Advanced settings dialog would render at least one row. Gates
+ * the composer menu's "Advanced settings…" entry so a session none of the
+ * rows apply to (e.g. pi-native) is never offered a dialog that opens empty.
+ * Mirrors the row conditions in SessionConfigModal.
+ */
+export function hasAdvancedSessionSettings({
+  showClaudePermissionMode,
+  claudePermissionMode,
+  showCodexApprovalMode,
+  subagentRoutingEligible,
+}: {
+  showClaudePermissionMode: boolean;
+  claudePermissionMode: string;
+  showCodexApprovalMode: boolean;
+  subagentRoutingEligible: boolean;
+}): boolean {
+  return (
+    (showClaudePermissionMode && claudePermissionMode !== "") ||
+    showCodexApprovalMode ||
+    subagentRoutingEligible
+  );
+}
+
 function SessionHarnessPicker({
   busy,
   busyRef,
@@ -4630,6 +4654,7 @@ function SessionHarnessPicker({
   const sessionHarness = useChatStore((state) => state.sessionHarness);
   const subAgentName = useChatStore((state) => state.subAgentName);
   const pendingModelChange = useChatStore((state) => state.pendingModelChange);
+  const claudePermissionMode = useChatStore((state) => state.claudePermissionMode);
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
@@ -4657,6 +4682,12 @@ function SessionHarnessPicker({
     subagentRoutingEligible,
     showClaudePermissionMode,
     showCodexApprovalMode,
+  });
+  const showAdvancedSettings = hasAdvancedSessionSettings({
+    showClaudePermissionMode,
+    claudePermissionMode,
+    showCodexApprovalMode,
+    subagentRoutingEligible,
   });
   const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
   const label = routingOn
@@ -4939,14 +4970,18 @@ function SessionHarnessPicker({
               )}
             </>
           )}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            disabled={busy || pendingModelChange !== null}
-            onSelect={() => setOpen(true)}
-            data-testid="composer-advanced-settings"
-          >
-            Advanced settings…
-          </DropdownMenuItem>
+          {showAdvancedSettings && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={busy || pendingModelChange !== null}
+                onSelect={() => setOpen(true)}
+                data-testid="composer-advanced-settings"
+              >
+                Advanced settings…
+              </DropdownMenuItem>
+            </>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
       {error && (
