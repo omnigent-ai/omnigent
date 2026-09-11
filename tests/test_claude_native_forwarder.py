@@ -28,6 +28,7 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
+    ClaudeTaskNotification,
     ClaudeTranscriptItem,
     TranscriptReadResult,
     TranscriptRecordItems,
@@ -10323,3 +10324,424 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+_RESUME_TS = "2026-09-10T13:23:13.274Z"
+_EVIDENCE_TS = "2026-09-10T13:22:05.710Z"
+_COORD_TEXT = "The coordinator sent a message while you were working: Keep going."
+
+
+def _terminal_row(
+    task_id: str,
+    tool_use_id: str,
+    status: str,
+    result: str | None = "notified result",
+    timestamp: str = _RESUME_TS,
+) -> dict[str, Any]:
+    """Build a parent user row carrying one terminal notification."""
+    result_tag = f"<result>{result}</result>\n" if result is not None else ""
+    return {
+        "type": "user",
+        "timestamp": timestamp,
+        "message": {
+            "role": "user",
+            "content": (
+                "<task-notification>\n"
+                f"<task-id>{task_id}</task-id>\n"
+                f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                f"<status>{status}</status>\n{result_tag}</task-notification>"
+            ),
+        },
+    }
+
+
+def _seed_worker(
+    transcript_path: Path,
+    subagent_id: str,
+    tool_use_id: str,
+    spawn_transcript_path: Path | None = None,
+) -> Path:
+    """Seed one Explore child on disk reusing the shared spawn helper."""
+    return _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id=subagent_id,
+        agent_type="Explore",
+        description="Trace the auth flow",
+        tool_use_id=tool_use_id,
+        spawn_transcript_path=spawn_transcript_path,
+    )
+
+
+async def _tick_subagents(
+    tmp_path: Path,
+    parent_rows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    state: forwarder.SubagentForwardState | None = None,
+    *,
+    fail_status_times: int = 0,
+) -> forwarder.SubagentForwardState:
+    """Append parent rows and run one sub-agent tick against a mock server."""
+    state = state or forwarder.SubagentForwardState(subagents={})
+    transcript_path = tmp_path / "session.jsonl"
+    if parent_rows:
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(json.dumps(row) + "\n" for row in parent_rows)
+    attempts = {"status": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": f"item-{i}"} for i, _ in enumerate(body)])
+        if body.get("type") == "external_subagent_start":
+            sid = body["data"]["subagent_id"]
+            return httpx.Response(202, json={"queued": False, "child_session_id": f"conv_{sid}"})
+        if body.get("type") == "external_session_status":
+            attempts["status"] += 1
+            if attempts["status"] <= fail_status_times:
+                return httpx.Response(500, json={})
+            events.append(body["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        return await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=tmp_path / "bridge",
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "post_status", "output", "result_text"),
+    [
+        ("completed", "idle", "notified result", "notified result"),
+        ("failed", "failed", "notified result", "notified result"),
+        ("stopped", "failed", "notified result", "notified result"),
+        ("killed", "failed", forwarder._SUBAGENT_FAILED_NO_RESULT_OUTPUT, None),
+    ],
+)
+async def test_subagent_terminal_notification_posts_by_task_id(
+    tmp_path: Path, status: str, post_status: str, output: str, result_text: str | None
+) -> None:
+    """A notification takes a child terminal even with a new tool-use id."""
+    transcript_path = tmp_path / "session.jsonl"
+    _seed_worker(transcript_path, "a-worker", "toolu_A")
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("a-worker", "toolu_B", status, result_text)]
+    state = await _tick_subagents(tmp_path, rows, events)
+
+    assert events == [{"status": post_status, "output": output}]
+    assert state.subagents["a-worker"].tool_use_id == "toolu_A"
+    assert state.subagents["a-worker"].terminal_status == status
+    assert state.pending_terminal_notifications == {}
+
+
+def _evidence(
+    task_id: str | None = None, tool_use_id: str | None = None, result: str = "r"
+) -> ClaudeTaskNotification:
+    """Build parsed terminal evidence without touching the transcript."""
+    return ClaudeTaskNotification(
+        task_id=task_id,
+        tool_use_id=tool_use_id,
+        status="completed",
+        result=result,
+        timestamp="2026-09-10T13:23:13.274Z",
+    )
+
+
+def test_apply_terminal_notification_match_order_and_parking() -> None:
+    """Evidence applies by task id, then tool-use id, else parks newer-wins."""
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "a-worker": forwarder.SubagentEntry(
+                subagent_id="a-worker",
+                child_conversation_id="conv_a-worker",
+                tool_use_id="toolu_A",
+            )
+        }
+    )
+    empty = forwarder.SubagentForwardState(subagents={})
+
+    by_task = forwarder._apply_terminal_notification(state, _evidence("a-worker", "toolu_x"))
+    by_tool = forwarder._apply_terminal_notification(state, _evidence("unknown", "toolu_A"))
+    parked = forwarder._apply_terminal_notification(empty, _evidence("late", "toolu_C"))
+    newer = replace(_evidence("late", "toolu_C", "new"), timestamp="2026-09-10T13:24:00.000Z")
+    parked = forwarder._apply_terminal_notification(parked, newer)
+    stale = forwarder._apply_terminal_notification(parked, _evidence("late", "toolu_C", "old"))
+
+    assert by_task.subagents["a-worker"].terminal_status == "completed"
+    assert by_tool.subagents["a-worker"].terminal_status == "completed"
+    assert parked.pending_terminal_notifications == {
+        "late": ("completed", "new", "2026-09-10T13:24:00.000Z")
+    }
+    assert stale.pending_terminal_notifications == parked.pending_terminal_notifications
+
+
+async def test_subagent_terminal_notification_parks_until_registration(
+    tmp_path: Path,
+) -> None:
+    """Evidence for an unknown child parks, then drains on registration."""
+    transcript_path = tmp_path / "session.jsonl"
+    (transcript_path.parent / "session" / "subagents").mkdir(parents=True, exist_ok=True)
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("late-child", "toolu_C", "completed")]
+    state = await _tick_subagents(tmp_path, rows, events)
+
+    assert events == []
+    parked = state.pending_terminal_notifications
+    assert parked == {"late-child": ("completed", "notified result", "2026-09-10T13:23:13.274Z")}
+    _seed_worker(transcript_path, "late-child", "toolu_C")
+    state = await _tick_subagents(tmp_path, [], events, state)
+
+    assert events == [{"status": "idle", "output": "notified result"}]
+    assert state.pending_terminal_notifications == {}
+    assert state.subagents["late-child"].terminal_status == "completed"
+
+
+def test_subagent_state_loads_old_format_rows(tmp_path: Path) -> None:
+    """State files written before the terminal fields still load."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    row = {"subagents": {"a-worker": {"child_conversation_id": "conv_child"}}}
+    (bridge_dir / "subagent_forwarder.json").write_text(json.dumps(row), encoding="utf-8")
+
+    state = forwarder._read_subagent_forward_state(bridge_dir)
+
+    assert state.subagents["a-worker"].tool_use_id is None
+    assert state.subagents["a-worker"].terminal_status is None
+    assert state.parent_byte_offset == 0
+    assert state.pending_terminal_notifications == {}
+
+
+async def test_subagent_terminal_status_post_retries_after_failure(
+    tmp_path: Path,
+) -> None:
+    """A failed terminal POST is retried on the next tick, exactly once."""
+    transcript_path = tmp_path / "session.jsonl"
+    _seed_worker(transcript_path, "a-worker", "toolu_A")
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("a-worker", "toolu_A", "completed")]
+    state = await _tick_subagents(tmp_path, rows, events, fail_status_times=99)
+
+    assert events == []
+    assert state.subagents["a-worker"].last_status is None
+    state = await _tick_subagents(tmp_path, [], events, state)
+
+    assert events == [{"status": "idle", "output": "notified result"}]
+    assert state.subagents["a-worker"].last_status == "idle"
+
+
+async def test_subagent_registration_stores_tool_use_id_for_nested(
+    tmp_path: Path,
+) -> None:
+    """Nested children register with spawn ids under their live parent."""
+    transcript_path = tmp_path / "session.jsonl"
+    root_jsonl = _seed_worker(transcript_path, "root-child", "toolu_root")
+    _seed_worker(transcript_path, "nested-child", "toolu_nested", spawn_transcript_path=root_jsonl)
+    state = await _tick_subagents(tmp_path, [], [])
+
+    assert state.subagents["root-child"].tool_use_id == "toolu_root"
+    assert state.subagents["nested-child"].tool_use_id == "toolu_nested"
+
+
+def _child_text_row(uuid: str, text: str) -> dict[str, Any]:
+    """Build one assistant text row for a child transcript."""
+    return {
+        "isSidechain": True,
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def _backdate_all(state: forwarder.SubagentForwardState) -> forwarder.SubagentForwardState:
+    """Move every entry's activity timestamp into the quiet past."""
+    old = time.time() - 60.0
+    return replace(
+        state,
+        subagents={
+            sid: replace(entry, last_activity_ts=old) for sid, entry in state.subagents.items()
+        },
+    )
+
+
+async def test_root_child_stays_running_until_evidence(tmp_path: Path) -> None:
+    """A quiet root child posts nothing until its Task evidence arrives."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    child_jsonl.write_text(json.dumps(_child_text_row("r1", "work")) + "\n", encoding="utf-8")
+    events: list[dict[str, Any]] = []
+    state = await _tick_subagents(tmp_path, [], events)
+    assert [e["status"] for e in events] == ["running"]
+    state = await _tick_subagents(tmp_path, [], events, _backdate_all(state))
+    assert [e["status"] for e in events] == ["running"]
+    rows = [_terminal_row("a-worker", "toolu_B", "completed")]
+    state = await _tick_subagents(tmp_path, rows, events, state)
+    assert [e["status"] for e in events] == ["running", "idle"]
+    state = await _tick_subagents(tmp_path, [], events, state)
+    assert [e["status"] for e in events] == ["running", "idle"]
+    assert state.subagents["a-worker"].last_status == "idle"
+
+
+async def test_nested_child_keeps_quiescence_idle(tmp_path: Path) -> None:
+    """A quiet nested child still goes idle without evidence."""
+    transcript_path = tmp_path / "session.jsonl"
+    root_jsonl = _seed_worker(transcript_path, "root-child", "toolu_root")
+    nested_jsonl = _seed_worker(transcript_path, "nested-child", "toolu_nested", root_jsonl)
+    nested_jsonl.write_text(json.dumps(_child_text_row("n1", "work")) + "\n", encoding="utf-8")
+    first: list[dict[str, Any]] = []
+    state = await _tick_subagents(tmp_path, [], first)
+    assert [e["status"] for e in first].count("running") == 2
+    events: list[dict[str, Any]] = []
+    state = await _tick_subagents(tmp_path, [], events, _backdate_all(state))
+
+    assert events == [{"status": "idle"}]
+
+
+@pytest.mark.parametrize(
+    ("delivery_error", "tool_use_id", "event"),
+    [
+        (
+            forwarder._SUBAGENT_DROPPED_ITEM_REASON,
+            "toolu_A",
+            {"status": "failed", "output": forwarder._SUBAGENT_DROPPED_ITEM_REASON},
+        ),
+        (None, None, {"status": "idle"}),
+    ],
+)
+async def test_quiescence_edge_for_ungated_children(
+    tmp_path: Path, delivery_error: str | None, tool_use_id: str | None, event: dict[str, Any]
+) -> None:
+    """Delivery errors and id-less entries keep today's quiescence edge."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    child_jsonl.write_text(json.dumps(_child_text_row("r1", "work")) + "\n", encoding="utf-8")
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "a-worker": forwarder.SubagentEntry(
+                subagent_id="a-worker",
+                child_conversation_id="conv_a-worker",
+                tool_use_id=tool_use_id,
+                byte_offset=child_jsonl.stat().st_size,
+                last_activity_ts=time.time() - 60.0,
+                delivery_error=delivery_error,
+            )
+        }
+    )
+    events: list[dict[str, Any]] = []
+    await _tick_subagents(tmp_path, [], events, state)
+
+    assert events == [event]
+
+
+def _child_row(uuid: str, text: str, ts: str, kind: str = "prompt") -> dict[str, Any]:
+    """Build one child row; kind selects the prompt/resume/assistant/meta shape."""
+    row: dict[str, Any] = {
+        "isSidechain": True,
+        "type": "assistant" if kind == "assistant" else "user",
+        "uuid": uuid,
+        "timestamp": ts,
+    }
+    if kind == "assistant":
+        row["message"] = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+    else:
+        row["message"] = {"role": "user", "content": text}
+    if kind in ("resume", "meta"):
+        row["isMeta"] = True
+    if kind == "resume":
+        row["origin"] = {"kind": "coordinator"}
+    return row
+
+
+def _append_child_rows(child_jsonl: Path, rows: list[dict[str, Any]]) -> None:
+    """Append decoded rows to a child transcript."""
+    with child_jsonl.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+
+def test_record_timestamp_ordering() -> None:
+    """Record timestamps order by instant, never by raw string."""
+    newer = "2026-09-10T13:23:13.274Z"
+    older = "2026-09-10T13:22:05.710Z"
+    assert forwarder._record_timestamp_is_newer(newer, older)
+    assert not forwarder._record_timestamp_is_newer(older, newer)
+    assert not forwarder._record_timestamp_is_newer("2026-09-10T13:22:05.710000Z", older)
+    assert not forwarder._record_timestamp_is_newer(older, "2026-09-10T13:22:05.710000Z")
+    assert not forwarder._record_timestamp_is_newer("not-a-timestamp", older)
+    assert not forwarder._record_timestamp_is_newer(None, older)
+
+
+async def test_terminal_child_reopens_on_coordinator_resume(tmp_path: Path) -> None:
+    """A newer coordinator prompt reopens a child; new evidence closes it."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("a-worker", "toolu_A", "completed", "first done", _EVIDENCE_TS)]
+    state = await _tick_subagents(tmp_path, rows, events)
+    assert [e["status"] for e in events] == ["idle"]
+    _append_child_rows(
+        child_jsonl, [_child_row("resume-1", _COORD_TEXT, _RESUME_TS, kind="resume")]
+    )
+    state = await _tick_subagents(tmp_path, [], events, state)
+    assert [e["status"] for e in events] == ["idle", "running"]
+    assert events[1] == {"status": "running"}
+    assert state.subagents["a-worker"].terminal_status is None
+    assert state.subagents["a-worker"].last_status == "running"
+    rows = [
+        _terminal_row("a-worker", "toolu_C2", "completed", "second done", "2026-09-10T13:24:00Z")
+    ]
+    state = await _tick_subagents(tmp_path, rows, events, state)
+    assert [e["status"] for e in events] == ["idle", "running", "idle"]
+    assert events[2] == {"status": "idle", "output": "second done"}
+    assert state.subagents["a-worker"].terminal_status == "completed"
+
+
+async def test_terminal_child_ignores_non_resume_records(tmp_path: Path) -> None:
+    """Assistant output, meta bubbles, and stale prompts never reopen a child."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("a-worker", "toolu_A", "completed", "first done", _EVIDENCE_TS)]
+    state = await _tick_subagents(tmp_path, rows, events)
+    _append_child_rows(
+        child_jsonl,
+        [
+            _child_row("a1", "still thinking", _RESUME_TS, kind="assistant"),
+            _child_row("m1", "cli scaffolding", _RESUME_TS, kind="meta"),
+            _child_row("r1", _COORD_TEXT, "not-a-timestamp", kind="resume"),
+            _child_row("p1", "original spawn prompt", "2026-09-10T13:21:00.000Z"),
+        ],
+    )
+    state = await _tick_subagents(tmp_path, [], events, state)
+
+    assert [e["status"] for e in events] == ["idle"]
+    assert state.subagents["a-worker"].terminal_status == "completed"
+
+
+async def test_reopened_running_post_retries_after_failure(tmp_path: Path) -> None:
+    """A reopened child's failed running POST is retried on the next tick."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("a-worker", "toolu_A", "completed", "first done", _EVIDENCE_TS)]
+    state = await _tick_subagents(tmp_path, rows, events)
+    _append_child_rows(
+        child_jsonl, [_child_row("resume-1", _COORD_TEXT, _RESUME_TS, kind="resume")]
+    )
+    state = await _tick_subagents(tmp_path, [], events, state, fail_status_times=1)
+
+    assert [e["status"] for e in events] == ["idle"]
+    assert state.subagents["a-worker"].terminal_status is None
+    assert state.subagents["a-worker"].last_status is None
+    assert state.subagents["a-worker"].status_reconcile_pending is True
+    state = await _tick_subagents(tmp_path, [], events, state)
+
+    assert [e["status"] for e in events] == ["idle", "running"]

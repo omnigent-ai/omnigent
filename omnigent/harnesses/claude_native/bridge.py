@@ -594,6 +594,11 @@ class ClaudeTranscriptItem:
         source=compact`` completion signal follows; the forwarder uses this
         flag to dismiss the stranded "Compacting…" spinner. Never rendered
         as a bubble. Defaults to ``False``.
+    :param is_coordinator_resume: ``True`` when this item was parsed
+        from a coordinator SendMessage resume record (``isMeta`` with
+        ``origin.kind == "coordinator"``) — a real user-visible prompt
+        the child must show, and the signal that reopens a finished
+        sub-agent. Never sent to the server; defaults to ``False``.
     """
 
     source_id: str
@@ -602,6 +607,7 @@ class ClaudeTranscriptItem:
     response_id: str
     is_compact_summary: bool = False
     is_compact_noop: bool = False
+    is_coordinator_resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -611,10 +617,28 @@ class TranscriptRecordItems:
     ``next_byte_offset`` is safe to persist only after every item in
     ``items`` has been accepted by the server. Records that produce no visible
     items are included so a forwarder can advance past them without rescanning.
+    ``timestamp`` is the record's ``timestamp``, ordering resumes vs evidence.
     """
 
     next_byte_offset: int
     items: tuple[ClaudeTranscriptItem, ...]
+    timestamp: str | None = None
+
+
+@dataclass(frozen=True)
+class ClaudeTaskNotification:
+    """One sub-agent lifecycle record parsed from a Claude transcript.
+
+    ``<task-notification>`` records (background stops) and foreground
+    ``tool_result`` records with terminal ``toolUseResult`` both land
+    here; only correlation and result fields are kept.
+    """
+
+    task_id: str | None
+    tool_use_id: str | None
+    status: str | None
+    result: str | None
+    timestamp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -645,6 +669,8 @@ class TranscriptReadResult:
     :param record_items: Parsed items grouped by their complete source JSONL
         record, with the byte offset immediately after each record. Native
         child-transcript batching uses these boundaries for partial checkpoints.
+    :param task_notifications: Sub-agent lifecycle records parsed from
+        the complete records after the caller's cursor (parsing only).
     """
 
     line_cursor: int
@@ -655,6 +681,7 @@ class TranscriptReadResult:
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: tuple[TranscriptRecordItems, ...] = ()
+    task_notifications: tuple[ClaudeTaskNotification, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2826,6 +2853,7 @@ def read_transcript_items_since_with_position(
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: list[TranscriptRecordItems] = []
+    task_notifications: list[ClaudeTaskNotification] = []
     for record in read_result.records:
         parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
@@ -2845,6 +2873,7 @@ def read_transcript_items_since_with_position(
                 TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
             )
             continue
+        task_notifications.extend(_task_notifications_from_entry(entry))
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2872,6 +2901,7 @@ def read_transcript_items_since_with_position(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
+                timestamp=_record_timestamp(entry),
             )
         )
     items = _dedupe_compact_noop_echo(items)
@@ -2880,6 +2910,7 @@ def read_transcript_items_since_with_position(
         TranscriptRecordItems(
             next_byte_offset=record.next_byte_offset,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+            timestamp=record.timestamp,
         )
         for record in record_items
     ]
@@ -2892,6 +2923,7 @@ def read_transcript_items_since_with_position(
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
         record_items=tuple(record_items),
+        task_notifications=_dedupe_task_notifications(task_notifications),
     )
 
 
@@ -2946,6 +2978,7 @@ def read_transcript_items_from_offset(
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: list[TranscriptRecordItems] = []
+    task_notifications: list[ClaudeTaskNotification] = []
     for record in read_result.records:
         parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
@@ -2965,6 +2998,7 @@ def read_transcript_items_from_offset(
                 TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
             )
             continue
+        task_notifications.extend(_task_notifications_from_entry(entry))
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2993,6 +3027,7 @@ def read_transcript_items_from_offset(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
+                timestamp=_record_timestamp(entry),
             )
         )
     items = _dedupe_compact_noop_echo(items)
@@ -3001,6 +3036,7 @@ def read_transcript_items_from_offset(
         TranscriptRecordItems(
             next_byte_offset=record.next_byte_offset,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+            timestamp=record.timestamp,
         )
         for record in record_items
     ]
@@ -3013,6 +3049,7 @@ def read_transcript_items_from_offset(
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
         record_items=tuple(record_items),
+        task_notifications=_dedupe_task_notifications(task_notifications),
     )
 
 
@@ -6913,6 +6950,190 @@ def _is_task_notification_text(text: str) -> bool:
     )
 
 
+# Lifecycle statuses a ``toolUseResult`` / ``<task-notification>`` status
+# field may carry when the agent actually stopped. ``async_launched``
+# (and any unknown value) means the agent is still running.
+_TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"completed", "failed", "stopped", "killed"})
+
+# A notification ``<result>`` can hold a full agent report; cap what we
+# retain so one record cannot bloat the forwarder state or status POST.
+_TASK_NOTIFICATION_RESULT_MAX_CHARS = 4000
+
+
+def _task_notification_field(text: str, field: str) -> str | None:
+    """Return one ``<field>…</field>`` value from notification markup."""
+    match = re.search(
+        rf"<{re.escape(field)}>(.*?)</{re.escape(field)}>",
+        text,
+        re.DOTALL,
+    )
+    if match is None:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+def _record_timestamp(entry: _JsonObject) -> str | None:
+    """Return the record's top-level ``timestamp`` string, if it carries one."""
+    timestamp = entry.get("timestamp")
+    return timestamp if isinstance(timestamp, str) and timestamp else None
+
+
+def _is_coordinator_resume_entry(entry: _JsonObject) -> bool:
+    """Return True for a coordinator SendMessage resume in a child transcript."""
+    origin = entry.get("origin")
+    return (
+        entry.get("isMeta") is True
+        and isinstance(origin, dict)
+        and origin.get("kind") == "coordinator"
+    )
+
+
+def _coordinator_resume_items_from_entry(
+    entry: _JsonObject,
+    *,
+    line_number: int,
+    record_offset: int | None,
+    current_response_id: str | None,
+) -> tuple[str | None, list[ClaudeTranscriptItem]]:
+    """Surface a coordinator resume record as one flagged user message."""
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [
+            text
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance((text := block.get("text")), str)
+        ]
+    else:
+        texts = []
+    if not (texts := [text for text in texts if text]):
+        return current_response_id, []
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    return None, [
+        ClaudeTranscriptItem(
+            source_id=_source_id(source_key, 0, "message"),
+            item_type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": text} for text in texts],
+            },
+            response_id=_response_id_from_source(source_key),
+            is_coordinator_resume=True,
+        )
+    ]
+
+
+def _capped_notification_result(value: object) -> str | None:
+    """Return *value* capped for notification retention, if it is usable text."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:_TASK_NOTIFICATION_RESULT_MAX_CHARS]
+
+
+def _task_notification_from_text(
+    text: str, *, timestamp: str | None = None
+) -> ClaudeTaskNotification | None:
+    """Parse correlation/result fields from one ``<task-notification>`` blob."""
+    if not _is_task_notification_text(text):
+        return None
+    task_id = _task_notification_field(text, "task-id")
+    tool_use_id = _task_notification_field(text, "tool-use-id")
+    if task_id is None and tool_use_id is None:
+        return None
+    result = _task_notification_field(text, "result")
+    if result is None:
+        # Failed stops carry no ``<result>``; keep the ``<summary>`` instead.
+        result = _task_notification_field(text, "summary")
+    return ClaudeTaskNotification(
+        task_id=task_id,
+        tool_use_id=tool_use_id,
+        status=_task_notification_field(text, "status"),
+        result=_capped_notification_result(result),
+        timestamp=timestamp,
+    )
+
+
+def _tool_result_task_notification(entry: _JsonObject) -> ClaudeTaskNotification | None:
+    """Parse a foreground Agent result whose ``toolUseResult`` stopped."""
+    tool_use_result = entry.get("toolUseResult")
+    if not isinstance(tool_use_result, dict):
+        return None
+    status = tool_use_result.get("status")
+    if not isinstance(status, str) or status not in _TERMINAL_TASK_STATUSES:
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    agent_id = tool_use_result.get("agentId")
+    task_id = agent_id if isinstance(agent_id, str) and agent_id else None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id")
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            continue
+        return ClaudeTaskNotification(
+            task_id=task_id,
+            tool_use_id=tool_use_id,
+            status=status,
+            result=_capped_notification_result(_tool_result_output(entry, block)),
+            timestamp=_record_timestamp(entry),
+        )
+    return None
+
+
+def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotification]:
+    """Extract sub-agent lifecycle records without touching item parsing."""
+    notifications: list[ClaudeTaskNotification] = []
+    record_timestamp = _record_timestamp(entry)
+    texts: list[str] = []
+    message = entry.get("message")
+    if isinstance(message, dict) and message.get("role") == "user":
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(
+                text
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance((text := block.get("text")), str)
+            )
+    attachment = entry.get("attachment")
+    if (
+        entry.get("type") == "attachment"
+        and isinstance(attachment, dict)
+        and attachment.get("type") == "queued_command"
+        and attachment.get("commandMode") == "task-notification"
+        and isinstance(attachment.get("prompt"), str)
+    ):
+        texts.append(attachment["prompt"])
+    for text in texts:
+        parsed = _task_notification_from_text(text, timestamp=record_timestamp)
+        if parsed is not None:
+            notifications.append(parsed)
+    tool_result_notification = _tool_result_task_notification(entry)
+    if tool_result_notification is not None:
+        notifications.append(tool_result_notification)
+    return notifications
+
+
+def _dedupe_task_notifications(
+    notifications: list[ClaudeTaskNotification],
+) -> tuple[ClaudeTaskNotification, ...]:
+    """Collapse exact repeats while preserving distinct runs and their order."""
+    return tuple(dict.fromkeys(notifications))
+
+
 def _local_command_transcript_items_from_entry(
     entry: _JsonObject,
     *,
@@ -7065,8 +7286,16 @@ def _user_transcript_items_from_entry(
         items.
     """
     # ``isMeta=true`` carries CLI scaffolding like
-    # ``<local-command-caveat>``; no user-visible content.
+    # ``<local-command-caveat>``; no user-visible content — except a
+    # coordinator resume, which is a real prompt the child must show.
     if entry.get("isMeta") is True:
+        if _is_coordinator_resume_entry(entry):
+            return _coordinator_resume_items_from_entry(
+                entry,
+                line_number=line_number,
+                record_offset=record_offset,
+                current_response_id=current_response_id,
+            )
         return current_response_id, []
     message = entry["message"]
     content = message.get("content") if isinstance(message, dict) else None

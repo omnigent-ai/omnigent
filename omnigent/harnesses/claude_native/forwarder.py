@@ -12,7 +12,8 @@ import os
 import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -23,6 +24,7 @@ from omnigent.harnesses.claude_native.bridge import (
     OBSERVER_HOOK_STDERR_FILE,
     ClaudeHookRecord,
     ClaudeMessageDelta,
+    ClaudeTaskNotification,
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptReadResult,
@@ -93,6 +95,18 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # flickering the badge. Phase B will replace this with an authoritative
 # hook signal and drop the heuristic.
 _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+
+# Authoritative stop vocabulary mapped to its ``external_session_status``.
+# The task id survives a resume; the spawn tool-use id is the fallback key.
+_SUBAGENT_TERMINAL_STATUS_POSTS: dict[str, str] = {
+    "completed": "idle",
+    "failed": "failed",
+    "stopped": "failed",
+    "killed": "failed",
+}
+
+# Output of a failed edge that carries no result text.
+_SUBAGENT_FAILED_NO_RESULT_OUTPUT = "Sub-agent ended without reporting a result."
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -533,6 +547,12 @@ class SubagentEntry:
         means no status has been posted yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. Its quiescence edge is ``failed`` instead of ``idle``.
+    :param tool_use_id: Spawn tool-call id (``None`` when unknown).
+    :param terminal_status: Authoritative stop status (``None`` pending evidence).
+    :param terminal_output: Result text from that evidence.
+    :param terminal_observed_at: Notifying record's ``timestamp``.
+    :param resume_observed_at: Latest accepted user prompt's record timestamp.
+    :param status_reconcile_pending: A status correction still awaiting acknowledgement.
     """
 
     subagent_id: str
@@ -543,6 +563,14 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    tool_use_id: str | None = None
+    terminal_status: str | None = None
+    terminal_output: str | None = None
+    terminal_observed_at: str | None = None
+    resume_observed_at: str | None = None
+    terminal_evidence_pending: bool = False
+    tool_use_id_pending: bool = False
+    status_reconcile_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -559,9 +587,21 @@ class SubagentForwardState:
         per-sub-agent entry. New sub-agents discovered on disk are
         inserted here after the Omnigent server returns a child
         Conversation id.
+    :param parent_byte_offset: Parent bytes scanned for task evidence.
+    :param parent_line_cursor: Complete parent records scanned.
+    :param pending_terminal_notifications: Terminal evidence keyed by task id.
+    :param pending_terminal_tool_use_ids: Spawn-id aliases retained with parked evidence.
+    :param terminal_evidence_version: Version of the accepted-prompt ordering repair.
     """
 
     subagents: dict[str, SubagentEntry]
+    parent_byte_offset: int = 0
+    parent_line_cursor: int = 0
+    pending_terminal_notifications: dict[str, tuple[str, str | None, str | None]] = field(
+        default_factory=dict
+    )
+    pending_terminal_tool_use_ids: dict[str, str] = field(default_factory=dict)
+    terminal_evidence_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -571,6 +611,7 @@ class _PendingSubagentItem:
     item: ClaudeTranscriptItem
     checkpoint_after: int | None = None
     drop_reason: str | None = None
+    record_timestamp: str | None = None
 
 
 @dataclass
@@ -596,8 +637,9 @@ class _SubagentStateCheckpoint:
     async def put(self, entry: SubagentEntry) -> None:
         """Merge and durably write one child cursor without losing peers."""
         async with self._lock:
-            self._state = SubagentForwardState(
-                subagents={**self._state.subagents, entry.subagent_id: entry}
+            self._state = replace(
+                self._state,
+                subagents={**self._state.subagents, entry.subagent_id: entry},
             )
             await _write_subagent_forward_state_async(self._bridge_dir, self._state)
 
@@ -1451,8 +1493,69 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
+            tool_use_id=(
+                row.get("tool_use_id") if isinstance(row.get("tool_use_id"), str) else None
+            ),
+            terminal_status=(
+                row.get("terminal_status") if isinstance(row.get("terminal_status"), str) else None
+            ),
+            terminal_output=(
+                row.get("terminal_output") if isinstance(row.get("terminal_output"), str) else None
+            ),
+            terminal_evidence_pending=row.get("terminal_evidence_pending") is True,
+            tool_use_id_pending=row.get(
+                "tool_use_id_pending", not isinstance(row.get("tool_use_id"), str)
+            )
+            is True,
+            resume_observed_at=(
+                row.get("resume_observed_at")
+                if isinstance(row.get("resume_observed_at"), str)
+                else None
+            ),
+            status_reconcile_pending=row.get("status_reconcile_pending") is True,
+            terminal_observed_at=(
+                row.get("terminal_observed_at")
+                if isinstance(row.get("terminal_observed_at"), str)
+                else None
+            ),
         )
-    return SubagentForwardState(subagents=entries)
+    parent_byte_offset = raw.get("parent_byte_offset", 0)
+    if not isinstance(parent_byte_offset, int) or parent_byte_offset < 0:
+        parent_byte_offset = 0
+    parent_line_cursor = raw.get("parent_line_cursor", 0)
+    if not isinstance(parent_line_cursor, int) or parent_line_cursor < 0:
+        parent_line_cursor = 0
+    pending: dict[str, tuple[str, str | None, str | None]] = {}
+    pending_raw = raw.get("pending_terminal_notifications", {})
+    if isinstance(pending_raw, dict):
+        for task_id, notification_row in pending_raw.items():
+            if not isinstance(task_id, str) or not (
+                isinstance(notification_row, list) and len(notification_row) == 3
+            ):
+                continue
+            status, output, observed_at = notification_row
+            if not isinstance(status, str):
+                continue
+            if (output is not None and not isinstance(output, str)) or (
+                observed_at is not None and not isinstance(observed_at, str)
+            ):
+                continue
+            pending[task_id] = (status, output, observed_at)
+    aliases = raw.get("pending_terminal_tool_use_ids", {})
+    aliases = (
+        {k: v for k, v in aliases.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(aliases, dict)
+        else {}
+    )
+    version = raw.get("terminal_evidence_version", 0)
+    return SubagentForwardState(
+        pending_terminal_tool_use_ids=aliases,
+        terminal_evidence_version=version if isinstance(version, int) else 0,
+        subagents=entries,
+        parent_byte_offset=parent_byte_offset,
+        parent_line_cursor=parent_line_cursor,
+        pending_terminal_notifications=pending,
+    )
 
 
 def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState) -> None:
@@ -1474,8 +1577,28 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "tool_use_id": entry.tool_use_id,
+                "terminal_status": entry.terminal_status,
+                "terminal_output": entry.terminal_output,
+                "terminal_observed_at": entry.terminal_observed_at,
+                "resume_observed_at": entry.resume_observed_at,
+                "terminal_evidence_pending": entry.terminal_evidence_pending,
+                "tool_use_id_pending": entry.tool_use_id_pending,
+                "status_reconcile_pending": entry.status_reconcile_pending,
             }
             for entry in state.subagents.values()
+        },
+        "parent_byte_offset": state.parent_byte_offset,
+        "parent_line_cursor": state.parent_line_cursor,
+        "pending_terminal_tool_use_ids": state.pending_terminal_tool_use_ids,
+        "terminal_evidence_version": state.terminal_evidence_version,
+        "pending_terminal_notifications": {
+            task_id: [status, output, observed_at]
+            for task_id, (
+                status,
+                output,
+                observed_at,
+            ) in state.pending_terminal_notifications.items()
         },
         "updated_at": time.time(),
     }
@@ -1796,7 +1919,10 @@ def _pending_items_from_records(
     for record in result.record_items:
         unseen = [item for item in record.items if item.source_id not in seen]
         if unseen:
-            pending.extend(_PendingSubagentItem(item=item) for item in unseen)
+            pending.extend(
+                _PendingSubagentItem(item=item, record_timestamp=record.timestamp)
+                for item in unseen
+            )
             pending[-1] = replace(pending[-1], checkpoint_after=record.next_byte_offset)
         elif pending:
             pending[-1] = replace(pending[-1], checkpoint_after=record.next_byte_offset)
@@ -1893,6 +2019,8 @@ async def _forward_one_subagent(
     batch_capability: _SessionEventBatchCapability,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
+    if entry.terminal_evidence_pending:
+        return
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
     if not jsonl_path.exists():
         return
@@ -1931,6 +2059,7 @@ async def _forward_one_subagent(
             break
         drop_reason = batch[0].drop_reason if len(batch) == 1 else None
         completed_items: list[_PendingSubagentItem] = []
+        delivered_now: list[_PendingSubagentItem] = []
         delivered = False
         stop_after_batch = False
         if drop_reason is not None:
@@ -2034,6 +2163,7 @@ async def _forward_one_subagent(
                     retry_individually = True
             else:
                 completed_items.extend(batch)
+                delivered_now.extend(batch)
                 delivered = True
                 item_retry_tracker.clear(retry_key)
         if retry_individually and drop_reason is None:
@@ -2097,6 +2227,7 @@ async def _forward_one_subagent(
                     )
                 else:
                     item_retry_tracker.clear(item_retry_key)
+                    delivered_now.append(pending_item)
                     delivered = True
                 completed_items.append(pending_item)
         had_item = had_item or delivered
@@ -2109,6 +2240,10 @@ async def _forward_one_subagent(
             for pending_item in completed_items
             if pending_item.checkpoint_after is not None
         ]
+        for delivered_item in delivered_now:
+            new_entry = _observe_resume(
+                new_entry, delivered_item.item, delivered_item.record_timestamp
+            )
         new_entry = replace(
             new_entry,
             byte_offset=max(completed_offsets, default=new_entry.byte_offset),
@@ -2121,15 +2256,36 @@ async def _forward_one_subagent(
 
     delivery_pending = any(item.item.source_id not in seen for item in pending)
     desired_status: str | None = None
-    if had_item:
+    if had_item or (new_entry.terminal_status is None and new_entry.status_reconcile_pending):
         desired_status = "running"
     elif (
         not delivery_pending
         and new_entry.last_activity_ts is not None
         and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
     ):
-        desired_status = "failed" if new_entry.delivery_error else "idle"
-    if desired_status is None or desired_status == new_entry.last_status:
+        # A root child with a spawn id stays running until its Task
+        # evidence arrives; nested children, id-less entries, and
+        # delivery errors keep today's quiescence edge.
+        if not (
+            new_entry.delivery_error is None
+            and new_entry.parent_subagent_id is None
+            and new_entry.tool_use_id is not None
+        ):
+            desired_status = "failed" if new_entry.delivery_error else "idle"
+    # Authoritative parent evidence overrides the quiescence guess; a
+    # failed POST retries next tick since ``last_status`` moves on success.
+    desired_output: str | None = None
+    terminal_post = _SUBAGENT_TERMINAL_STATUS_POSTS.get(new_entry.terminal_status or "")
+    if terminal_post is not None:
+        desired_status = terminal_post
+        desired_output = new_entry.terminal_output or (
+            _SUBAGENT_FAILED_NO_RESULT_OUTPUT if terminal_post == "failed" else None
+        )
+    elif desired_status == "failed":
+        desired_output = new_entry.delivery_error
+    if desired_status is None or (
+        desired_status == new_entry.last_status and not new_entry.status_reconcile_pending
+    ):
         return
     retry_key = f"subagent_status:{entry.child_conversation_id}"
     if status_retry_tracker.retry_delay_s(retry_key) is not None:
@@ -2139,7 +2295,7 @@ async def _forward_one_subagent(
             client,
             session_id=entry.child_conversation_id,
             status=desired_status,
-            output=new_entry.delivery_error if desired_status == "failed" else None,
+            output=desired_output,
         )
     except httpx.HTTPError as exc:
         decision = status_retry_tracker.record_failure(retry_key, exc)
@@ -2156,7 +2312,9 @@ async def _forward_one_subagent(
         )
         return
     status_retry_tracker.clear(retry_key)
-    await checkpoint.put(replace(new_entry, last_status=desired_status))
+    await checkpoint.put(
+        replace(new_entry, last_status=desired_status, status_reconcile_pending=False)
+    )
 
 
 def _tool_use_ids_in_transcript(
@@ -2242,6 +2400,224 @@ def _subagent_parents_by_tool_use(
     for tool_use_id in ambiguous:
         owners.pop(tool_use_id, None)
     return owners
+
+
+def _with_entry(state: SubagentForwardState, entry: SubagentEntry) -> SubagentForwardState:
+    """Return state with one entry inserted, preserving cursor/parked rows."""
+    return replace(state, subagents={**state.subagents, entry.subagent_id: entry})
+
+
+def _parse_record_timestamp(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 record timestamp into an aware UTC datetime.
+
+    Raw strings are never compared: precisions vary, so this
+    normalizes to UTC first. ``None`` when unparsable.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _record_timestamp_is_newer(candidate: str | None, baseline: str | None) -> bool:
+    """Return True only when both timestamps parse and candidate is later."""
+    if candidate is None or baseline is None:
+        return False
+    parsed = (_parse_record_timestamp(candidate), _parse_record_timestamp(baseline))
+    return parsed[0] is not None and parsed[1] is not None and parsed[0] > parsed[1]
+
+
+def _terminal_is_current(entry: SubagentEntry, observed_at: str | None) -> bool:
+    """Reject terminal evidence from before the latest accepted user prompt."""
+    if entry.resume_observed_at is not None and not _record_timestamp_is_newer(
+        observed_at, entry.resume_observed_at
+    ):
+        return False
+    baseline = _parse_record_timestamp(entry.terminal_observed_at)
+    candidate = _parse_record_timestamp(observed_at)
+    return baseline is None or (candidate is not None and candidate >= baseline)
+
+
+def _observe_resume(
+    entry: SubagentEntry, item: ClaudeTranscriptItem, timestamp: str | None
+) -> SubagentEntry:
+    """Persist accepted prompt order even when its preceding completion is late."""
+    if not _is_user_resume_item(item) or _parse_record_timestamp(timestamp) is None:
+        return entry
+    if entry.resume_observed_at is not None and not _record_timestamp_is_newer(
+        timestamp, entry.resume_observed_at
+    ):
+        return entry
+    entry = replace(entry, resume_observed_at=timestamp)
+    if entry.terminal_status is not None and _record_timestamp_is_newer(
+        timestamp, entry.terminal_observed_at
+    ):
+        entry = replace(
+            entry,
+            terminal_status=None,
+            terminal_output=None,
+            terminal_observed_at=None,
+            last_status=None,
+            status_reconcile_pending=True,
+        )
+    return entry
+
+
+async def _repair_terminal_evidence_order(
+    state: SubagentForwardState,
+    *,
+    subagents_dir: Path,
+    transcript_path: Path,
+    bridge_dir: Path,
+    agent_name: str,
+) -> SubagentForwardState:
+    """Repair each old child independently, preserving settled replay acknowledgements."""
+    initial = state.terminal_evidence_version < 1
+    if not initial and not any(
+        entry.terminal_evidence_pending for entry in state.subagents.values()
+    ):
+        return state
+    try:
+        with transcript_path.open("rb") as stream:
+            stream.read(1)
+    except OSError:
+        return state
+    entries = dict(state.subagents)
+    for sid, entry in entries.items():
+        if not initial and not entry.terminal_evidence_pending:
+            continue
+        # A cursor includes deduplicated history. It cannot reopen an already
+        # acknowledged terminal; only new delivery can establish that intent.
+        if not entry.child_conversation_id or (
+            entry.terminal_status is not None and entry.last_status in {"idle", "failed"}
+        ):
+            entries[sid] = replace(entry, terminal_evidence_pending=False)
+            continue
+        if entry.byte_offset or entry.seen_source_ids:
+            path = subagents_dir / f"agent-{sid}.jsonl"
+            try:
+                with path.open("rb") as stream:
+                    stream.read(1)
+                result = await asyncio.to_thread(
+                    read_transcript_items_from_offset,
+                    path,
+                    0,
+                    start_line=0,
+                    agent_name=agent_name,
+                    include_sidechains=True,
+                )
+            except (OSError, ValueError):
+                entries[sid] = replace(entry, terminal_evidence_pending=True)
+                continue
+            for record in result.record_items:
+                for item in record.items:
+                    if (
+                        record.next_byte_offset <= entry.byte_offset
+                        or item.source_id in entry.seen_source_ids
+                    ):
+                        entry = _observe_resume(entry, item, record.timestamp)
+        entries[sid] = replace(entry, terminal_evidence_pending=False)
+    state = replace(
+        state,
+        subagents=entries,
+        parent_byte_offset=0 if initial else state.parent_byte_offset,
+        parent_line_cursor=0 if initial else state.parent_line_cursor,
+        terminal_evidence_version=1,
+    )
+    await _write_subagent_forward_state_async(bridge_dir, state)
+    return state
+
+
+def _is_user_resume_item(item: ClaudeTranscriptItem) -> bool:
+    """Return True for a delivered user prompt that may resume a stopped child."""
+    if (
+        item.item_type != "message"
+        or item.is_compact_summary
+        or item.is_compact_noop
+        or item.data.get("role") != "user"
+    ):
+        return False
+    if item.data.get("is_meta") is True and not item.is_coordinator_resume:
+        return False
+    content = item.data.get("content")
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "input_text" for block in content
+    )
+
+
+def _apply_terminal_notification(
+    state: SubagentForwardState,
+    notification: ClaudeTaskNotification,
+) -> SubagentForwardState:
+    """Fold terminal evidence into an entry (task id, then tool-use id) or park it."""
+    status = notification.status
+    if status not in _SUBAGENT_TERMINAL_STATUS_POSTS:
+        return state
+    park_key = notification.task_id or notification.tool_use_id
+    if (
+        park_key is not None
+        and notification.tool_use_id is not None
+        and state.pending_terminal_notifications.get(park_key)
+        == (status, notification.result, notification.timestamp)
+        and park_key not in state.pending_terminal_tool_use_ids
+    ):
+        state = replace(
+            state,
+            pending_terminal_tool_use_ids={
+                **state.pending_terminal_tool_use_ids,
+                park_key: notification.tool_use_id,
+            },
+        )
+    entry = state.subagents.get(notification.task_id or "")
+    if entry is None and notification.tool_use_id is not None:
+        for candidate in state.subagents.values():
+            if candidate.tool_use_id == notification.tool_use_id:
+                entry = candidate
+                break
+    if entry is not None and not entry.terminal_evidence_pending:
+        if not _terminal_is_current(entry, notification.timestamp):
+            return state
+        return _with_entry(
+            state,
+            replace(
+                entry,
+                terminal_status=status,
+                terminal_output=notification.result,
+                terminal_observed_at=notification.timestamp,
+                status_reconcile_pending=entry.status_reconcile_pending
+                or (entry.terminal_status, entry.terminal_output, entry.terminal_observed_at)
+                != (status, notification.result, notification.timestamp),
+            ),
+        )
+    key = notification.task_id or notification.tool_use_id
+    if key is None:
+        return state
+    current = state.pending_terminal_notifications.get(key)
+    candidate = notification.timestamp
+    baseline = current[2] if current is not None else None
+    if _parse_record_timestamp(baseline) is not None and not _record_timestamp_is_newer(
+        candidate, baseline
+    ):
+        return state
+    return replace(
+        state,
+        pending_terminal_tool_use_ids={
+            **state.pending_terminal_tool_use_ids,
+            **({key: notification.tool_use_id} if notification.tool_use_id else {}),
+        },
+        pending_terminal_notifications={
+            **state.pending_terminal_notifications,
+            key: (status, notification.result, candidate),
+        },
+    )
 
 
 async def _forward_available_subagents(
@@ -2367,15 +2743,13 @@ async def _forward_available_subagents(
                             subagent_id,
                             parent_subagent_id,
                         )
-                        updated = SubagentForwardState(
-                            subagents={
-                                **updated.subagents,
-                                subagent_id: SubagentEntry(
-                                    subagent_id=subagent_id,
-                                    child_conversation_id="",
-                                    parent_subagent_id=parent_subagent_id,
-                                ),
-                            }
+                        updated = _with_entry(
+                            updated,
+                            SubagentEntry(
+                                subagent_id=subagent_id,
+                                child_conversation_id="",
+                                parent_subagent_id=parent_subagent_id,
+                            ),
                         )
                         await _write_subagent_forward_state_async(bridge_dir, updated)
                         made_progress = True
@@ -2416,15 +2790,13 @@ async def _forward_available_subagents(
                         delivered_ambiguous=False,
                         http_status=_http_status_for_log(exc),
                     )
-                    updated = SubagentForwardState(
-                        subagents={
-                            **updated.subagents,
-                            subagent_id: SubagentEntry(
-                                subagent_id=subagent_id,
-                                child_conversation_id="",
-                                parent_subagent_id=parent_subagent_id,
-                            ),
-                        }
+                    updated = _with_entry(
+                        updated,
+                        SubagentEntry(
+                            subagent_id=subagent_id,
+                            child_conversation_id="",
+                            parent_subagent_id=parent_subagent_id,
+                        ),
                     )
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
@@ -2443,16 +2815,13 @@ async def _forward_available_subagents(
                 )
                 continue
             start_retry_tracker.clear(retry_key)
-            updated = SubagentForwardState(
-                subagents={
-                    **updated.subagents,
-                    subagent_id: SubagentEntry(
-                        subagent_id=subagent_id,
-                        child_conversation_id=child_id,
-                        parent_subagent_id=parent_subagent_id,
-                    ),
-                }
+            entry = SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id=child_id,
+                parent_subagent_id=parent_subagent_id,
+                tool_use_id=meta["toolUseId"],
             )
+            updated = _with_entry(updated, entry)
             await _write_subagent_forward_state_async(bridge_dir, updated)
             made_progress = True
         if not made_progress:
@@ -2468,6 +2837,94 @@ async def _forward_available_subagents(
                 )
             break
         pending = deferred
+
+    # Upgrade older entries that predate persistent spawn identifiers.
+    for sid, entry in updated.subagents.items():
+        if entry.tool_use_id is None and (
+            entry.tool_use_id_pending or updated.terminal_evidence_version < 1
+        ):
+            meta = await asyncio.to_thread(
+                _read_subagent_meta, subagents_dir / f"agent-{sid}.meta.json"
+            )
+            if meta is not None:
+                updated = _with_entry(
+                    updated,
+                    replace(entry, tool_use_id=meta["toolUseId"], tool_use_id_pending=False),
+                )
+            elif not entry.tool_use_id_pending:
+                updated = _with_entry(updated, replace(entry, tool_use_id_pending=True))
+    updated = await _repair_terminal_evidence_order(
+        updated,
+        subagents_dir=subagents_dir,
+        transcript_path=transcript_path,
+        bridge_dir=bridge_dir,
+        agent_name=agent_name,
+    )
+
+    # ── Drain parent task evidence ────────────────────────
+    # Notifications apply by task id, then spawn tool-use id, else park.
+    parent_result = await asyncio.to_thread(
+        read_transcript_items_from_offset,
+        transcript_path,
+        updated.parent_byte_offset,
+        start_line=updated.parent_line_cursor,
+        agent_name=agent_name,
+        include_sidechains=False,
+    )
+    pre_drain = updated
+    for notification in parent_result.task_notifications:
+        updated = _apply_terminal_notification(updated, notification)
+    pending_rows = dict(updated.pending_terminal_notifications)
+    aliases = dict(updated.pending_terminal_tool_use_ids)
+    for sid, entry in updated.subagents.items():
+        if entry.terminal_evidence_pending:
+            continue
+        keys = [
+            key
+            for key in pending_rows
+            if key == sid
+            or (
+                entry.tool_use_id is not None
+                and (key == entry.tool_use_id or aliases.get(key) == entry.tool_use_id)
+            )
+        ]
+        selected = (
+            sid
+            if sid in keys
+            else max(
+                keys,
+                key=lambda key: (
+                    _parse_record_timestamp(pending_rows[key][2])
+                    or datetime.min.replace(tzinfo=timezone.utc)
+                ),
+                default=None,
+            )
+        )
+        if selected is not None:
+            status, output, observed_at = pending_rows[selected]
+            updated = _apply_terminal_notification(
+                updated,
+                ClaudeTaskNotification(
+                    task_id=sid,
+                    tool_use_id=entry.tool_use_id,
+                    status=status,
+                    result=output,
+                    timestamp=observed_at,
+                ),
+            )
+        for key in keys:
+            pending_rows.pop(key)
+            aliases.pop(key, None)
+    updated = replace(
+        updated, pending_terminal_notifications=pending_rows, pending_terminal_tool_use_ids=aliases
+    )
+    updated = replace(
+        updated,
+        parent_byte_offset=parent_result.byte_offset,
+        parent_line_cursor=parent_result.line_cursor,
+    )
+    if updated != pre_drain:
+        await _write_subagent_forward_state_async(bridge_dir, updated)
 
     checkpoint = _SubagentStateCheckpoint(bridge_dir, updated)
     semaphore = asyncio.Semaphore(_SUBAGENT_FORWARD_CONCURRENCY)
