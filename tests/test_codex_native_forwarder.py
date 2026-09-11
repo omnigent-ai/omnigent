@@ -1168,6 +1168,65 @@ def test_classify_codex_error_auth_vs_generic() -> None:
     assert fwd._classify_codex_error({"codexErrorInfo": "Other"}, "disk full") == generic
 
 
+def test_classify_codex_error_zero_quota_rejection_is_generic() -> None:
+    """A quota-provisioning 403 is generic, not auth.
+
+    The gateway rejects a zero-quota user or endpoint with ``403
+    PERMISSION_DENIED`` naming the rate limit; the 403 status and the
+    ``"403"`` message fragment would otherwise classify it as auth, appending
+    a ``codex login`` remediation that cannot mint quota.
+    """
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    user_variant = (
+        'unexpected status 403 Forbidden: {"error_code": "PERMISSION_DENIED", '
+        '"message": "This user\'s rate limit is set to 0."}, '
+        "url: https://workspace.example.com/ai-gateway/codex/v1/responses"
+    )
+    endpoint_variant = (
+        'unexpected status 403 Forbidden: {"error_code": "PERMISSION_DENIED", '
+        '"message": "Endpoint system.ai.gpt-6-astra has a rate limit set to 0."}'
+    )
+    # The message-fragment fallback ("403") must not win over the quota body.
+    assert fwd._classify_codex_error({}, user_variant) == generic
+    assert fwd._classify_codex_error({}, endpoint_variant) == generic
+    # Neither may a structured 403 httpStatusCode.
+    info = {"codexErrorInfo": {"httpStatusCode": 403}}
+    assert fwd._classify_codex_error(info, user_variant) == generic
+    # A 403 without a quota body still classifies as auth.
+    plain_403 = "unexpected status 403 Forbidden: token expired"
+    assert fwd._classify_codex_error(info, plain_403) == fwd._CODEX_ERROR_KIND_AUTH
+    assert fwd._classify_codex_error({}, plain_403) == fwd._CODEX_ERROR_KIND_AUTH
+
+
+def test_terminal_error_from_turn_zero_quota_carries_no_reauth() -> None:
+    """A failed turn carrying the zero-quota 403 must not demand re-auth.
+
+    Pins the turn-level path the live edge builder uses: the classified error
+    reports ``is_auth False``, so ``_post_turn_status_edge`` neither appends
+    the re-auth hint nor flags ``reauth_required``.
+    """
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {
+                "message": (
+                    'unexpected status 403 Forbidden: {"error_code": '
+                    '"PERMISSION_DENIED", "message": "This user\'s rate limit '
+                    'is set to 0."}'
+                ),
+                "codexErrorInfo": {"httpStatusCode": 403},
+            },
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.kind == fwd._CODEX_ERROR_KIND_GENERIC
+    assert error.is_auth is False
+
+
 def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
     """``_terminal_error_from_turn`` returns the classified ``turn.error``.
 

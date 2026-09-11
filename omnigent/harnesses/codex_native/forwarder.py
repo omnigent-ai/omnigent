@@ -217,7 +217,8 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
 #
 # ``codexErrorInfo`` is the app-server's structured classification (e.g.
 # ``unauthorized``, ``usage_limit_exceeded``); auth-class values get a re-auth
-# hint. httpStatusCode 401/403 is treated as auth too. Values are stored and
+# hint. httpStatusCode 401/403 is treated as auth too, except quota
+# rejections (see ``_is_quota_provisioning_error``). Values are stored and
 # compared case-insensitively: the app-server enum serializes as lowercase
 # snake_case (``unauthorized``), but older/alternate spellings (``Unauthorized``)
 # are matched too.
@@ -249,6 +250,12 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
+# Quota-provisioning rejections arrive as 403 PERMISSION_DENIED bodies ("This
+# user's rate limit is set to 0.", "Endpoint <name> has a rate limit set to
+# 0."), which the 401/403 and fragment heuristics would misread as auth. A
+# login cannot mint quota, so these stay generic (no re-auth hint/flag).
+_CODEX_QUOTA_MESSAGE_FRAGMENT = "rate limit"
+_CODEX_QUOTA_CONFIRMING_FRAGMENTS = ("permission_denied", "set to 0")
 
 
 @dataclass
@@ -942,11 +949,30 @@ class _CodexTerminalError:
         return self.kind == _CODEX_ERROR_KIND_AUTH
 
 
+def _is_quota_provisioning_error(message: str) -> bool:
+    """
+    Whether an error message names a quota/rate-limit provisioning rejection.
+
+    The gateway rejects a zero-quota user or endpoint with ``403
+    PERMISSION_DENIED`` and a body naming the rate limit, so the message must
+    mention a rate limit plus a confirming provisioning marker.
+
+    :param message: The extracted error text.
+    :returns: ``True`` for a provisioning rejection a re-auth cannot fix.
+    """
+    lowered = message.lower()
+    if _CODEX_QUOTA_MESSAGE_FRAGMENT not in lowered:
+        return False
+    return any(fragment in lowered for fragment in _CODEX_QUOTA_CONFIRMING_FRAGMENTS)
+
+
 def _classify_codex_error(error: _JsonObject, message: str) -> str:
     """
     Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
 
-    Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
+    A quota-provisioning rejection is always generic: it arrives as a 403 the
+    auth heuristics would misread, and a login cannot fix it. Otherwise
+    prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
     case-insensitive, or an httpStatusCode of 401/403); falls back to substring
     matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
     that omit it.
@@ -956,6 +982,8 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
+    if _is_quota_provisioning_error(message):
+        return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
     variant: str | None = None
     http_status: object = None
