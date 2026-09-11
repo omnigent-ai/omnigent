@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import stat
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,16 +12,24 @@ import httpx
 import pytest
 
 from omnigent.harnesses.pi_native import credentials as creds
+from omnigent.models import model_catalog
 
 
 @pytest.fixture(autouse=True)
-def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # The picker now reads the provider's live listing through the shared
+    # catalog, which caches per provider identity — clear it around every test
+    # so a cached listing never leaks between the live-listing and degradation
+    # cases, which deliberately share a provider identity.
+    model_catalog.clear_model_catalog_cache()
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
     )
+    yield
+    model_catalog.clear_model_catalog_cache()
 
 
 def _databricks_config() -> dict[str, object]:

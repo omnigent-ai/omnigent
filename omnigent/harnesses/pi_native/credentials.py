@@ -53,7 +53,6 @@ from omnigent.models.pi_model_compatibility import (
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import (
-    ANTHROPIC_FAMILY,
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
@@ -1320,38 +1319,26 @@ def _live_family_model_entries(
     """Enumerate a key/gateway endpoint's models for the pre-launch picker.
 
     The rendered ``models.json`` otherwise carries only the configured default,
-    so the picker offered one row while the endpoint served several. Ask the
-    endpoint's own listing through the shared model-catalog fetchers — the lane
-    the Databricks paths already use — and keep the configured default first:
-    it still launches when the listing is unreachable.
+    so the picker offered one row while the endpoint served several. Go through
+    the shared, cached catalog listing (:func:`model_catalog.listing_for_provider`)
+    — the same lane the Databricks paths use, so repeated picker opens replay
+    from its TTL cache instead of re-hitting the endpoint, and the kind/family
+    routing lives in one place. Keep the configured default first: it still
+    launches when the listing is unreachable.
 
     :param provider: The resolved provider; its ``listing_provider`` names the
         endpoint to list and ``extra_models`` holds the configured default.
     :param transport: Optional httpx transport override for tests.
     :returns: The configured entries followed by every live model id, deduped;
-        unchanged when the listing fails.
+        unchanged when the listing is unreachable.
     """
     listing_provider = provider.listing_provider
     if listing_provider is None:
         return list(provider.extra_models)
-    try:
-        # Mirror the catalog's routing: only a real Anthropic key speaks the
-        # Anthropic models API; a gateway's family endpoint proxies messages,
-        # so its inventory comes from the OpenAI-compatible listing.
-        if listing_provider.kind == KEY_KIND and listing_provider.family == ANTHROPIC_FAMILY:
-            listing = model_catalog._fetch_anthropic_listing(listing_provider, transport=transport)
-        else:
-            listing = model_catalog._fetch_openai_compatible_listing(
-                listing_provider, transport=transport
-            )
-    except Exception:  # noqa: BLE001 — an unreachable listing must not break the picker
-        _LOGGER.info(
-            "pi-native: could not list models for provider %s; offering only the "
-            "configured default",
-            listing_provider.detail or listing_provider.kind,
-            exc_info=True,
-        )
-        return list(provider.extra_models)
+    # listing_for_provider swallows fetch failures into an unverified, empty
+    # listing (and caches successes), so an unreachable endpoint degrades to
+    # just the configured default rather than breaking the picker.
+    listing = model_catalog.listing_for_provider(listing_provider, transport=transport)
 
     entries = list(provider.extra_models)
     seen = {entry.get("id") for entry in entries}
