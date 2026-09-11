@@ -11,6 +11,7 @@ Four scripts:
 - ``"tool_call"``: a ToolCallRequest, then a ToolCallComplete
   with a result, then a TurnComplete (no further text).
 - ``"error"``: an ExecutorError event.
+- ``"notice"``: a TurnNotice followed by a clean TurnComplete.
 - ``"cancelled"``: a TurnCancelled event.
 - ``"capture_messages"``: writes the received messages list as
   JSON to the path in ``MOCK_EXECUTOR_CAPTURE_PATH``, then
@@ -42,6 +43,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnCancelled,
     TurnComplete,
+    TurnNotice,
 )
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
@@ -178,6 +180,30 @@ def _build_error_with_usage() -> Executor:
     return executor
 
 
+def _build_notice() -> Executor:
+    """
+    MockExecutor scripted with a :class:`TurnNotice` + clean completion.
+
+    Mirrors a native executor answering an intercepted command with
+    guidance: the adapter must surface the notice as an info-level error
+    item and let the turn end with ``response.completed`` — never
+    ``response.failed``.
+
+    :returns: A configured :class:`MockExecutor` instance.
+    """
+    executor = MockExecutor()
+    executor._turns.append(
+        [
+            TurnNotice(
+                message="Run omni setup on the host to sign in again.",
+                code="mock_notice",
+            ),
+            TurnComplete(response=None),
+        ]
+    )
+    return executor
+
+
 def _build_cancelled() -> Executor:
     """
     MockExecutor scripted with a provider-side :class:`TurnCancelled`.
@@ -230,6 +256,7 @@ _SCRIPTS: dict[str, Callable[[], Executor]] = {
     "tool_call": _build_tool_call,
     "error": _build_error,
     "error_with_usage": _build_error_with_usage,
+    "notice": _build_notice,
     "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
 }

@@ -161,6 +161,12 @@ def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_notice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields a TurnNotice followed by TurnComplete."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "notice")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -442,6 +448,49 @@ async def test_executor_error_usage_reaches_response_failed(
     # The failure is still a failure — the error detail must not be
     # displaced by the usage payload.
     assert events[-1].data["response"]["error"] is not None
+
+
+async def test_turn_notice_emits_info_error_item_and_completes(
+    use_notice: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """TurnNotice → info-level error item + response.completed.
+
+    A user-remediable answer (e.g. an intercepted ``/login`` on a native
+    harness) must reach the user as a neutral notice WITHOUT the turn
+    being classified failed. Pre-fix, the only channel for such guidance
+    was ExecutorError — which the adapter re-raises, so the scaffold ends
+    the turn with ``response.failed`` and the runner counts it in the
+    failed-turn KPI.
+    """
+    conv_id = "conv_notice"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    # The turn ends cleanly — a notice is not a failure.
+    assert events[-1].event == "response.completed"
+    assert "response.failed" not in [e.event for e in events]
+
+    # The notice rides as a durable error item with level="info" (the
+    # neutral-notice wire shape the web renders as a non-destructive pill).
+    notice_items = [
+        e.data["item"]
+        for e in events
+        if e.event == "response.output_item.done"
+        and isinstance(e.data.get("item"), dict)
+        and e.data["item"].get("type") == "error"
+    ]
+    assert len(notice_items) == 1
+    item = notice_items[0]
+    assert item["level"] == "info"
+    assert item["source"] == "harness"
+    assert item["code"] == "mock_notice"
+    assert "omni setup" in item["message"]
 
 
 async def test_turn_cancelled_terminates_with_response_cancelled(

@@ -17,7 +17,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete, TurnNotice
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -214,14 +214,18 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
     command: str,
 ) -> None:
     """
-    ``/login`` must not be typed into the pane as a prompt.
+    ``/login`` must not be typed into the pane — and must not fail the turn.
 
     Claude Code's sign-in is an interactive TUI handoff the bridge
     cannot drive, so the bridge escapes ``/login`` into plain text and
     the CLI answers it as an ordinary message. On an expired login that
     answer is "Login expired · Please run /login" — the instruction the
     user just followed, so the turn is wasted and the session is stuck.
-    Fail the turn with the host command that does re-authenticate.
+    Answer with the host command that does re-authenticate — as a
+    :class:`TurnNotice` (a user-remediable answer) followed by a clean
+    :class:`TurnComplete`, never as an :class:`ExecutorError`: an error
+    here surfaces to the user as a destructive failed-turn pill and
+    pollutes the failed-turn KPI with an expected dead end.
     """
 
     def fail_inject_user_message(
@@ -257,9 +261,14 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
         )
     ]
 
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
+    # A notice + a clean completion — not an ExecutorError (which would
+    # surface as a failed turn with a destructive error pill).
+    assert len(events) == 2
+    assert isinstance(events[0], TurnNotice)
     assert "omni setup" in events[0].message
+    assert events[0].code == "claude_native_auth_command"
+    assert isinstance(events[1], TurnComplete)
+    assert not any(isinstance(event, ExecutorError) for event in events)
 
 
 @pytest.mark.asyncio

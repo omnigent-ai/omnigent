@@ -32,6 +32,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    TurnNotice,
     describe_exception,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
@@ -147,7 +148,8 @@ class ClaudeNativeExecutor(Executor):
             ``config.model``) and the switch is applied inline, before the
             message — see the ``/model`` handling below.
         :yields: :class:`TurnComplete` after the input was injected,
-            or :class:`ExecutorError` on bridge failure.
+            :class:`TurnNotice` + :class:`TurnComplete` for an intercepted
+            auth slash command, or :class:`ExecutorError` on bridge failure.
         """
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
@@ -171,13 +173,17 @@ class ClaudeNativeExecutor(Executor):
             # `omni setup` covers both directions: its harness menu signs in
             # (`claude auth login --claudeai`) and signs out (`claude auth
             # logout`), so one pointer serves /login and /logout alike.
-            yield ExecutorError(
+            # A notice, not an error: this is an expected, user-remediable
+            # dead end, so the turn completes instead of surfacing as failed.
+            yield TurnNotice(
                 message=(
                     "Claude Code's sign-in runs in its own terminal, so /login and "
                     "/logout do nothing from the web chat. Run omni setup on the host "
                     "to sign in again — or to sign out — then retry."
-                )
+                ),
+                code="claude_native_auth_command",
             )
+            yield TurnComplete(response=None)
             return
         from omnigent.runtime import telemetry
 
