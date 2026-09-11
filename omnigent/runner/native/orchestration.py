@@ -52,6 +52,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.native_coding_agents import (
@@ -6228,6 +6229,29 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         their safe message directly; other causes point to the runner log.
     """
     error_id = f"err_{uuid.uuid4().hex}"
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
+        # Expected session-lifecycle condition: the session's agent was deleted
+        # or rebound, so its bundle no longer resolves. This is not a
+        # terminal-startup defect — log it without a stack and surface a
+        # distinct code plus a client-safe message (never the internal
+        # resolver text) so KPI/error attribution reflects the lifecycle event
+        # rather than a generic runner startup fault.
+        _logger.warning(
+            "Native %s terminal skipped; session agent unavailable; error_id=%s: %s",
+            runtime_name,
+            error_id,
+            exc,
+            extra={"session_id": runner_primary_session_id(), "error_id": error_id},
+        )
+        return {
+            "code": ErrorCode.SESSION_AGENT_MISSING,
+            "error_id": error_id,
+            "message": (
+                "This session's agent is no longer available; it was deleted "
+                "or replaced. Recreate the agent or start a new session, then "
+                f"retry. Error ID: {error_id}."
+            ),
+        }
     _logger.warning(
         "Native %s terminal start failed; error_id=%s: %s",
         runtime_name,
@@ -8297,12 +8321,24 @@ async def _ensure_native_terminal(
                 ctx = await build_context(ctx)
             view = await adapter(ctx)
         except Exception as exc:
-            _logger.exception(
-                "%s terminal ensure failed for session=%s",
-                agent.display_name,
-                ctx.session_id,
-                extra={"session_id": ctx.session_id},
-            )
+            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
+                # Expected lifecycle event (agent deleted/rebound), not an
+                # ensure defect: log without a stack so it stays out of the
+                # terminal-startup error signal.
+                _logger.warning(
+                    "%s terminal ensure skipped; session %s agent unavailable: %s",
+                    agent.display_name,
+                    ctx.session_id,
+                    exc,
+                    extra={"session_id": ctx.session_id},
+                )
+            else:
+                _logger.exception(
+                    "%s terminal ensure failed for session=%s",
+                    agent.display_name,
+                    ctx.session_id,
+                    extra={"session_id": ctx.session_id},
+                )
             return _native_terminal_start_error_response(exc, agent.display_name)
         return respond(view)
 
