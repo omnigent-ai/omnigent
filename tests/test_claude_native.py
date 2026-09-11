@@ -2774,7 +2774,7 @@ async def test_ensure_local_claude_resume_transcript_uses_workspace_dir(
     nothing.
     """
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     workspace = Path("/work/some-repo")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2830,7 +2830,7 @@ async def test_ensure_local_claude_resume_transcript_returns_none_when_no_record
     leave an empty ``<sid>.jsonl`` behind for a later launch to trip over.
     """
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     workspace = Path("/work/some-repo")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2989,7 +2989,7 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
     resuming from it beats silently launching a blank session.
     """
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     workspace = Path("/work/some-repo")
     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
     target_dir.mkdir(parents=True)
@@ -3028,7 +3028,7 @@ async def test_resume_transcript_ignores_corrupt_local_file(
     failure.
     """
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     workspace = Path("/work/some-repo")
     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
     target_dir.mkdir(parents=True)
@@ -3062,7 +3062,7 @@ async def test_resume_transcript_ignores_binary_local_file(
     ``UnicodeDecodeError`` out of the fallback path.
     """
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     workspace = Path("/work/some-repo")
     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
     target_dir.mkdir(parents=True)
@@ -3097,7 +3097,7 @@ async def test_resume_transcript_ignores_local_file_on_4xx(
     local transcript exists.
     """
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     workspace = Path("/work/some-repo")
     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
     target_dir.mkdir(parents=True)
@@ -3125,7 +3125,7 @@ async def test_resume_transcript_raises_when_history_unfetchable_and_no_local_fi
 ) -> None:
     """No server history and no local transcript → the failure surfaces."""
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
@@ -3212,7 +3212,7 @@ async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
     from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     bridge_dir = tmp_path / "bridge"
     monkeypatch.setattr(
         claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
@@ -3262,7 +3262,7 @@ async def test_ensure_local_claude_resume_transcript_marks_unresolvable_attachme
     from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     bridge_dir = tmp_path / "bridge"
     monkeypatch.setattr(
         claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
@@ -3307,7 +3307,7 @@ async def test_ensure_local_claude_resume_transcript_survives_malformed_file_met
     from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 
     projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     bridge_dir = tmp_path / "bridge"
     monkeypatch.setattr(
         claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
@@ -5127,7 +5127,7 @@ async def test_resolve_cold_resume_args_injects_external_session_id(
     :param tmp_path: Temporary directory used to isolate Claude
         project state from the developer's real ``~/.claude`` tree.
     """
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: tmp_path / "projects")
     client = await _httpx_client_with_canned_response(
         _conversation_response_body(
             labels={"omnigent.wrapper": "claude-code-native-ui"},
@@ -5160,7 +5160,7 @@ async def test_resolve_cold_resume_args_declines_resume_when_no_history(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Temporary directory isolating Claude project state.
     """
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: tmp_path / "projects")
     client = await _httpx_client_with_canned_response(
         _conversation_response_body(
             labels={"omnigent.wrapper": "claude-code-native-ui"},
@@ -5263,7 +5263,7 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
@@ -5387,7 +5387,7 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
@@ -5459,7 +5459,7 @@ async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_im
         del request
         return httpx.Response(200, json=_items_response_body([image_item]))
 
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects)
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         written = await claude_native._ensure_local_claude_resume_transcript(
@@ -6817,7 +6817,7 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         "",
     ]
     source.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
     monkeypatch.setattr(
         claude_native,
         "_fetch_external_session_id_for_redirect",
@@ -6897,7 +6897,7 @@ def test_align_working_directory_redirect_replaces_stale_target(
     target_dir.mkdir(parents=True)
     target = target_dir / f"{external_session_id}.jsonl"
     target.write_text('{"cwd":"do-not-overwrite"}\n', encoding="utf-8")
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
     monkeypatch.setattr(
         claude_native,
         "_fetch_external_session_id_for_redirect",
@@ -6972,7 +6972,7 @@ def test_align_working_directory_redirect_works_when_recorded_path_missing(
         )
         return "move"
 
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
     monkeypatch.setattr(
         claude_native,
         "_fetch_external_session_id_for_redirect",
@@ -7070,7 +7070,7 @@ def test_clone_claude_transcript_rewrites_session_and_cwd_into_clone_project_dir
         "",
     ]
     source_path.write_text("\n".join(source_lines) + "\n", encoding="utf-8")
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
 
     result = claude_native._clone_claude_transcript(
         source_external_session_id=source_uuid,
@@ -7132,7 +7132,7 @@ def test_clone_claude_transcript_returns_none_when_source_missing(
     projects_dir.mkdir(parents=True)
     clone_workspace = tmp_path / "clone"
     clone_workspace.mkdir()
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
 
     result = claude_native._clone_claude_transcript(
         source_external_session_id="00000000-0000-0000-0000-000000000000",
@@ -7241,7 +7241,7 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     source_text = source_path.read_text(encoding="utf-8")
     assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
     assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
 
     result = claude_native._clone_claude_transcript(
         source_external_session_id=source_uuid,
@@ -7337,7 +7337,7 @@ def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
         "toolUseResult": json.dumps(fake_text),
     }
     source_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
 
     result = claude_native._clone_claude_transcript(
         source_external_session_id=source_uuid,
@@ -7698,7 +7698,7 @@ def test_clone_and_cwd_copy_paths_both_collapse_a_dropped_payload(
     source_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     source_text = source_path.read_text(encoding="utf-8")
     assert source_text.count(payload) == 2, "pre-repair wedged state"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
 
     cloned = claude_native._clone_claude_transcript(
         source_external_session_id=source_uuid,
@@ -7744,7 +7744,7 @@ def test_clone_claude_transcript_repairs_progressive_jpeg_duplication(
     b64 = _TINY_PROGRESSIVE_JPEG_BASE64
     source_path.write_text(json.dumps(_stale_duplicated_jpeg_record(b64)) + "\n", encoding="utf-8")
     assert source_path.read_text(encoding="utf-8").count(b64) == 2, "pre-fix wedged state"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: projects_dir)
 
     result = claude_native._clone_claude_transcript(
         source_external_session_id=source_uuid,
@@ -11329,3 +11329,30 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
     dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
 
     assert claude_native.resolve_native_claude_config(spec=spec, refresh_models=False) is None
+
+
+def test_find_claude_transcript_searches_the_configured_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transcripts are found in ``$CLAUDE_CONFIG_DIR/projects``, where Claude writes them."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    profile = tmp_path / "work-profile"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    session_id = "02857840-6362-408f-b41f-309e396ed7c6"
+    transcript = profile / "projects" / "-work-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+
+    assert claude_native._find_claude_transcript(session_id) == transcript
+
+
+def test_claude_project_dir_for_cwd_uses_the_configured_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A moved transcript lands where the configured profile's Claude will look for it."""
+    profile = tmp_path / "work-profile"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+    assert claude_native._claude_project_dir_for_cwd(Path("/work/repo")) == (
+        profile / "projects" / "-work-repo"
+    )

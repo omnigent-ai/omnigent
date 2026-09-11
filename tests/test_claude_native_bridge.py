@@ -6637,7 +6637,7 @@ def test_read_user_status_line_command_returns_string(
         json.dumps({"statusLine": {"type": "command", "command": "bun run hud"}}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
 
     assert claude_native_bridge.read_user_status_line_command() == "bun run hud"
 
@@ -6648,7 +6648,7 @@ def test_read_user_status_line_command_returns_none_when_unset(
     """No global statusLine → chain is omitted; wrapper prints nothing extra."""
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
     assert claude_native_bridge.read_user_status_line_command() is None
 
 
@@ -6659,7 +6659,7 @@ def test_read_user_effort_level_returns_configured_level(
     """A recognized ``effortLevel`` is returned, to stamp on the session row."""
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": effort}), encoding="utf-8")
-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
     assert claude_native_bridge.read_user_effort_level() == effort
 
 
@@ -6669,7 +6669,7 @@ def test_read_user_effort_level_returns_none_when_unset(
     """No ``effortLevel`` → None, so creation omits reasoning_effort entirely."""
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
     assert claude_native_bridge.read_user_effort_level() is None
 
 
@@ -6679,7 +6679,7 @@ def test_read_user_effort_level_rejects_unrecognized_value(
     """An unrecognized value is treated as unset (fail-soft, so launch never 400s)."""
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": "ultra"}), encoding="utf-8")
-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: settings)
     assert claude_native_bridge.read_user_effort_level() is None
 
 
@@ -6688,7 +6688,7 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
 ) -> None:
     """Missing settings.json → None; absence of config must not raise."""
     missing = tmp_path / "does-not-exist" / "settings.json"
-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", missing)
+    monkeypatch.setattr(claude_native_bridge, "_user_claude_settings_path", lambda: missing)
     assert claude_native_bridge.read_user_effort_level() is None
 
 
@@ -10453,3 +10453,37 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+def test_ensure_trusted_writes_into_the_configured_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Trust lands in the ``.claude.json`` the configured profile's Claude reads."""
+    home_config = _redirect_home(monkeypatch, tmp_path / "home")
+    profile = tmp_path / "work-profile"
+    profile.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    ensure_claude_workspace_trusted(workspace)
+
+    assert not home_config.exists()
+    data = json.loads((profile / ".claude.json").read_text(encoding="utf-8"))
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+
+
+def test_read_user_status_line_command_reads_the_configured_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User settings come from ``$CLAUDE_CONFIG_DIR/settings.json`` when it is set."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    profile = tmp_path / "work-profile"
+    profile.mkdir()
+    (profile / "settings.json").write_text(
+        json.dumps({"statusLine": {"type": "command", "command": "work-profile-hud"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+    assert claude_native_bridge.read_user_status_line_command() == "work-profile-hud"

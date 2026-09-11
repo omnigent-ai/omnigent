@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Any, cast
 from urllib import request
 
 from omnigent._platform import is_wsl, stable_user_id
+from omnigent.claude_paths import claude_config_dir, claude_json_path
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
@@ -141,7 +142,6 @@ _TOOL_RELAY_ENV_FILE = "tool_relay.env"
 _TMUX_FILE = "tmux.json"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
-_USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 # Tools-changed: harness POSTs to the bridge MCP server's localhost
@@ -1508,7 +1508,7 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
 
     Claude Code blocks on two TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
-    top-level ``hasCompletedOnboarding`` key in ``~/.claude.json``, and a
+    top-level ``hasCompletedOnboarding`` key in Claude's ``.claude.json``, and a
     per-directory "Do you trust the files in this folder?" dialog gated
     by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
@@ -1518,7 +1518,7 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     therefore untrusted — directory on every session.
 
     Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other ``~/.claude.json`` state (the
+    those two keys are written; all other ``.claude.json`` state (the
     user's own onboarding choices, project history, MCP config, OAuth
     account) is preserved, and the file is left untouched when both keys
     are already set. This deliberately does NOT skip per-tool permission
@@ -1537,14 +1537,14 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
         ``Path("/home/user/repo-worktrees/feature-x")``. Resolved to an
         absolute path to match Claude's ``projects`` key convention.
     :returns: None.
-    :raises ValueError: If an existing ``~/.claude.json`` (or its
+    :raises ValueError: If an existing ``.claude.json`` (or its
         ``projects`` map / target project entry) is not a JSON object.
         Surfaced rather than silently overwritten so a corrupt or
         unexpected user config is never clobbered (fail loud).
-    :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is
+    :raises json.JSONDecodeError: If an existing ``.claude.json`` is
         not valid JSON, for the same reason.
     """
-    config_path = Path.home() / ".claude.json"
+    config_path = claude_json_path()
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -6603,6 +6603,11 @@ def read_claude_status_model(bridge_dir: Path) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def _user_claude_settings_path() -> Path:
+    """Return the user's Claude Code ``settings.json`` for the active profile."""
+    return claude_config_dir() / "settings.json"
+
+
 def read_user_status_line_command() -> str | None:
     """
     Return the user's globally-configured statusLine shell command, if any.
@@ -6613,11 +6618,11 @@ def read_user_status_line_command() -> str | None:
     to whatever they had configured globally.
 
     :returns: The command string from
-        ``~/.claude/settings.json``'s ``statusLine.command``, or
+        the user's ``settings.json``'s ``statusLine.command``, or
         ``None`` when no global statusLine is configured / readable.
     """
     try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
+        raw = _user_claude_settings_path().read_text(encoding="utf-8")
     except OSError:
         return None
     try:
@@ -6639,14 +6644,14 @@ def read_user_effort_level() -> str | None:
     """
     Return the user's configured Claude Code effort level, if any.
 
-    Read client-side from ``effortLevel`` in ``~/.claude/settings.json`` —
+    Read client-side from ``effortLevel`` in the user's ``settings.json`` —
     the level the wrapped ``claude`` actually runs at (we pass no ``--effort``).
 
     :returns: A recognized effort, e.g. ``"medium"``; ``None`` when unset,
         unreadable, or not a valid Claude effort (fail-soft, never blocks launch).
     """
     try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
+        raw = _user_claude_settings_path().read_text(encoding="utf-8")
     except OSError:
         return None
     try:

@@ -584,6 +584,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # which turns off MCP tool search and loads every tool schema eagerly.
         "CLAUDE_CODE_USE_GATEWAY",
         "ENABLE_TOOL_SEARCH",
+        # Claude Code's profile selector: a directory path, not a secret, same class
+        # as KUBECONFIG. Without it a background host's claude-native panes run on
+        # the default ~/.claude profile instead of the one the user selected.
+        "CLAUDE_CONFIG_DIR",
         # Kubernetes config path. A filesystem path (typically
         # ``~/.kube/config``), not a bearer secret — the file *contains*
         # cluster certs/tokens but the env var is just a path string,
