@@ -816,6 +816,36 @@ def test_codex_command_bare_resume_requests_picker(
     assert captured["resume_picker"] is True
 
 
+@pytest.mark.parametrize("flag", ["--model", "--model-id"])
+def test_codex_explicit_id_is_distinct_from_legacy_model_resolution(
+    flag: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+    result = CliRunner().invoke(cli, ["codex", flag, "provider/gpt-test"])
+    assert result.exit_code == 0, result.output
+    assert captured["model"] == "provider/gpt-test"
+    assert isinstance(captured["model"], ExactCodexModel) is (flag == "--model-id")
+
+
+def test_codex_model_id_rejects_ambiguous_flags_before_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend", lambda *_: pytest.fail("must reject before startup")
+    )
+    result = CliRunner().invoke(cli, ["codex", "--model", "alias", "--model-id", "id"])
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+
+
 def test_codex_command_session_legacy_alias_routes_to_session_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

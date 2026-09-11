@@ -173,6 +173,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
+import { selectedCodexModelId } from "@/lib/codexModelSelection";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
@@ -4875,6 +4876,12 @@ export function NewChatLandingScreen() {
               (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
               pickedModel
                 ? pickedModel
+                : undefined,
+            model_override_id:
+              !smartRoutingHarnessSelected &&
+              !routingOwnsModel &&
+              nativeAgent?.harness === "codex-native"
+                ? selectedCodexModelId(pickedModel, codexModelOptions)
                 : undefined,
             reasoning_effort:
               !smartRoutingHarnessSelected &&

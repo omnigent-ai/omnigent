@@ -766,6 +766,7 @@ export async function forkSession(
     upToResponseId?: string;
     config?: {
       modelOverride?: string;
+      modelOverrideId?: string;
       reasoningEffort?: string;
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
@@ -779,6 +780,7 @@ export async function forkSession(
     agent_id?: string;
     up_to_response_id?: string;
     model_override?: string;
+    model_override_id?: string;
     reasoning_effort?: string;
     terminal_launch_args?: string[];
     codex_bypass_sandbox?: boolean;
@@ -797,6 +799,9 @@ export async function forkSession(
   }
   if (config?.modelOverride !== undefined) {
     body.model_override = config.modelOverride;
+  }
+  if (config?.modelOverrideId !== undefined) {
+    body.model_override_id = config.modelOverrideId;
   }
   if (config?.reasoningEffort !== undefined) {
     body.reasoning_effort = config.reasoningEffort;
@@ -958,6 +963,7 @@ export async function updateSession(
   updates: {
     reasoningEffort?: string | null;
     modelOverride?: string | null;
+    modelOverrideId?: string;
     codexPlanMode?: boolean;
     /**
      * Claude-native permission mode to switch a RUNNING session to, e.g.
@@ -994,6 +1000,9 @@ export async function updateSession(
   }
   if ("modelOverride" in updates) {
     body.model_override = updates.modelOverride ?? "default";
+  }
+  if (updates.modelOverrideId !== undefined) {
+    body.model_override_id = updates.modelOverrideId;
   }
   if (updates.codexPlanMode !== undefined) {
     body.collaboration_mode = updates.codexPlanMode ? "plan" : "default";

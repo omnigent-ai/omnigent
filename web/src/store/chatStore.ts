@@ -54,6 +54,7 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
+import { selectedCodexModelId } from "@/lib/codexModelSelection";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
@@ -2587,7 +2588,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       let session;
       try {
-        session = await updateSession(conversationId, { modelOverride: model });
+        const modelId =
+          get().sessionHarness === "codex-native"
+            ? selectedCodexModelId(model, get().codexModelOptions)
+            : undefined;
+        session = await updateSession(conversationId, {
+          modelOverride: model,
+          ...(modelId ? { modelOverrideId: modelId } : {}),
+        });
       } catch (err) {
         // The ask never reached the server — nothing will confirm it.
         if (expectConfirmation) {

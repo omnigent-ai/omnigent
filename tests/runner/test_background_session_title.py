@@ -673,9 +673,13 @@ async def test_claude_native_title_kills_process_when_cancelled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exact", [False, True])
 async def test_background_title_uses_native_codex_without_spawning_headless_harness(
     monkeypatch: pytest.MonkeyPatch,
+    exact: bool,
 ) -> None:
+    from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
     resolver_calls: list[tuple[str | None, str | None]] = []
@@ -686,6 +690,7 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
         return "codex-native", None
 
     async def generate_codex_title(context: BackgroundTitleContext) -> str:
+        assert isinstance(context.model_override, ExactCodexModel) is exact
         cli_calls.append((context.prompt, context.model_override))
         return "Debug authentication timeout"
 
@@ -708,6 +713,7 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
             json={
                 "prompt": "please investigate the authentication timeout",
                 "model_override": "gpt-5.4-mini",
+                **({"model_override_id": "provider/model-id"} if exact else {}),
             },
         )
 
@@ -720,7 +726,7 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
     assert cli_calls == [
         (
             "please investigate the authentication timeout",
-            "gpt-5.4-mini",
+            "provider/model-id" if exact else "gpt-5.4-mini",
         )
     ]
     assert process_manager.get_client_calls == []

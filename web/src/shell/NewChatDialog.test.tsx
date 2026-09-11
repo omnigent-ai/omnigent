@@ -257,6 +257,7 @@ const CODEX_MODEL_OPTIONS_RESULT = {
   data: [
     {
       id: "databricks-gpt-5-5",
+      model: "system.ai.gpt-5-5",
       displayName: "GPT-5.5",
       isDefault: true,
       // Codex's catalog advertises a per-model effort ladder; the config
@@ -269,6 +270,7 @@ const CODEX_MODEL_OPTIONS_RESULT = {
     },
     {
       id: "databricks-gpt-5-6",
+      model: "system.ai.gpt-5-6",
       displayName: "GPT-5.6",
       // A deliberately different ladder so tests can observe the row follow
       // the drafted model (xhigh only here; low only on 5.5).
@@ -1854,6 +1856,7 @@ describe("NewChatLandingScreen", () => {
     const { body } = await submitAndReadBody();
     expect(body.reasoning_effort).toBe("high");
     expect(body.model_override).toBe("databricks-gpt-5-6");
+    expect(body.model_override_id).toBe("system.ai.gpt-5-6");
   });
 
   it("clears incompatible Codex effort when switching models in the adjacent selector", async () => {

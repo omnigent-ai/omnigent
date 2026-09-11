@@ -507,9 +507,11 @@ def test_build_codex_native_server_profile_error_names_profile(
         )
 
 
+@pytest.mark.parametrize("exact", [False, True])
 def test_build_codex_native_server_uses_profile_host_without_static_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    exact: bool,
 ) -> None:
     """
     Native Codex accepts Databricks CLI OAuth profiles without static tokens.
@@ -536,12 +538,16 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
         encoding="utf-8",
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("DATABRICKS_HOST", "https://wrong-workspace.example")
 
     # This test exercises the profile-host base URL + auth command, not model
     # resolution. Force live codex discovery offline so the build makes no
     # model-services network call for the profile host; the explicit
     # ``model="test-model"`` is then used as-is.
+    discovery_calls: list[str | None] = []
+
     def _discovery_offline(_profile: str | None) -> object:
+        discovery_calls.append(_profile)
         raise RuntimeError("model discovery is offline in this test")
 
     monkeypatch.setattr(
@@ -549,11 +555,13 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
         _discovery_offline,
     )
 
+    from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
     app_server = build_codex_native_server(
         socket_path=tmp_path / "codex.sock",
         codex_home=tmp_path / "codex-home",
         cwd=tmp_path,
-        model="test-model",
+        model=ExactCodexModel("test-model") if exact else "test-model",
         profile="oss",
         bridge_dir=tmp_path / "bridge",
         ap_server_url=None,
@@ -563,6 +571,8 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     overrides = "\n".join(app_server.config_overrides)
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
+    assert discovery_calls == ([] if exact else ["oss"])
+    assert "wrong-workspace" not in overrides
 
 
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
@@ -2913,6 +2923,40 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
         )
         assert ambient_fingerprint != fingerprint
         assert model_catalog_store.read_catalog("codex-native", ambient_fingerprint) is None
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["system.ai.gpt-test", "custom-provider/model-v2", "bare-model", "databricks-model"],
+)
+def test_exact_databricks_codex_model_needs_no_discovery(
+    model_id: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicitly selected ID needs neither credentials nor a cached listing."""
+    from unittest.mock import Mock
+
+    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+    from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+    credentials = Mock(side_effect=AssertionError("unexpected discovery credentials"))
+    discovery = Mock(side_effect=AssertionError("unexpected model discovery"))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
+    )
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models", discovery
+    )
+
+    assert (
+        _resolve_databricks_codex_model(
+            "https://workspace.example", "test", ExactCodexModel(model_id)
+        )
+        == model_id
+    )
+    credentials.assert_not_called()
+    discovery.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_resolve_databricks_codex_model_matches_servable_ids() -> None:

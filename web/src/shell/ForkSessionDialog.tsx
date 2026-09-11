@@ -84,6 +84,7 @@ import {
   useResolvedHostHome,
 } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
+import { selectedCodexModelId } from "@/lib/codexModelSelection";
 import {
   ConnectHostInstructions,
   SANDBOX_REPO_LABEL_KEY,
@@ -187,6 +188,7 @@ function ForkConfigRow({ label, children }: { label: string; children: ReactNode
  */
 export interface ForkRunConfigValue {
   modelOverride?: string;
+  modelOverrideId?: string;
   reasoningEffort?: string;
   terminalLaunchArgs?: string[];
   /**
@@ -413,6 +415,10 @@ function ForkRunConfig({
     const value: ForkRunConfigValue = {};
     if (showModel && touched.model) {
       value.modelOverride = model === MODEL_SELECT_DEFAULT ? "default" : model;
+      if (isCodex && model !== MODEL_SELECT_DEFAULT) {
+        const modelId = selectedCodexModelId(model, hostModelOptions ?? []);
+        if (modelId) value.modelOverrideId = modelId;
+      }
     }
     if (hasPermission) {
       if (touched.effort) {
@@ -447,6 +453,7 @@ function ForkRunConfig({
     hasCursor,
     hasAgySkip,
     isCodex,
+    hostModelOptions,
     model,
     effort,
     permission,

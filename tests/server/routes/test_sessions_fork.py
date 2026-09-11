@@ -166,6 +166,7 @@ class _ConversationStore:
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
         override_model_override: str | None = None,
+        override_model_override_id: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
         override_reasoning_effort_set: bool = False,
@@ -241,6 +242,8 @@ class _ConversationStore:
                 "project_id": project_id,
             }
         )
+        if override_model_override_id is not None:
+            self.fork_calls[-1]["override_model_override_id"] = override_model_override_id
         src = self._convs.get(source_conversation_id)
         if src is None:
             raise LookupError(f"not found: {source_conversation_id}")

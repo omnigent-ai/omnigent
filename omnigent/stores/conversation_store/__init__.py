@@ -836,6 +836,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        model_override_id: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -860,6 +861,8 @@ class ConversationStore(ABC):
             ``reasoning_effort`` param value.
         :param model_override: Per-session LLM model override,
             e.g. ``"claude-opus-4-7"``. ``None`` leaves unchanged.
+        :param model_override_id: Exact provider ID stored with a new
+            ``model_override``. Replacing the choice without an ID clears it.
         :param _unset_model_override: When ``True``, set
             ``model_override`` to ``None`` regardless of the
             ``model_override`` param value.
@@ -1617,6 +1620,7 @@ class ConversationStore(ABC):
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
         override_model_override: str | None = None,
+        override_model_override_id: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
         override_reasoning_effort_set: bool = False,
@@ -1676,6 +1680,8 @@ class ConversationStore(ABC):
         :param override_model_override: Explicit ``model_override`` for the
             fork, applied only when ``override_model_override_set`` — then it
             supersedes the ``copy_model_settings`` copy.
+        :param override_model_override_id: Exact provider ID accompanying
+            the explicit fork model; otherwise inherited with model settings.
         :param override_model_override_set: Whether the caller chose an
             explicit ``model_override`` (fork dialog's model picker).
         :param override_reasoning_effort: Explicit ``reasoning_effort`` for

@@ -123,6 +123,8 @@ class Conversation:
         ``reasoning_effort`` so the web UI and the TUI stay
         in sync — both read it from the session snapshot and
         write it through the same PATCH endpoint.
+    :param model_override_id: Exact provider ID behind the user's model
+        choice. Absent for old saved aliases and unselected defaults.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session, and
@@ -242,6 +244,7 @@ class Conversation:
     session_usage: dict[str, Any] = field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    model_override_id: str | None = None
     reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None

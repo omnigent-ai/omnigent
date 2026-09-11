@@ -137,6 +137,7 @@ class _RowCountResult(Protocol):
 _SESSION_OVERRIDE_KEYS = (
     "reasoning_effort",
     "model_override",
+    "model_override_id",
     "reported_model",
     "cost_control_mode_override",
     "subagent_routing_override",
@@ -232,6 +233,7 @@ def _to_conversation(
         session_usage=session_usage,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
+        model_override_id=overrides["model_override_id"],
         reported_model=overrides["reported_model"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
@@ -2948,6 +2950,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        model_override_id: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -2964,6 +2967,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             leaves unchanged.
         :param _unset_model_override: When ``True``, clear
             ``model_override`` to ``None``.
+        :param model_override_id: Exact provider ID behind ``model_override``.
+            Stored atomically with the choice; omitted IDs keep alias resolution.
         :param reported_model: The model the harness last reported the
             session is actually on, verbatim, e.g.
             ``"claude-opus-4-8[1m]"``. ``None`` leaves unchanged.
@@ -2996,6 +3001,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
+        if model_override_id is not None and model_override is None:
+            raise ValueError("model_override_id requires model_override")
         now = now_epoch()
         encoded_terminal_launch_args = (
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -3031,9 +3038,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             if _unset_model_override:
                 overrides["model_override"] = None
+                overrides["model_override_id"] = None
                 overrides_changed = True
             elif model_override is not None:
                 overrides["model_override"] = model_override
+                overrides["model_override_id"] = model_override_id
                 overrides_changed = True
             if reported_model is not None:
                 overrides["reported_model"] = reported_model
@@ -3151,6 +3160,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if overrides.get("model_override") != expected_model_override:
                 return False
             del overrides["model_override"]
+            overrides.pop("model_override_id", None)
             encoded = json.dumps(overrides, separators=(",", ":")) if overrides else None
             unchanged = SqlConversation.session_overrides == original
             if self._conv_engine.dialect.name == "mysql":
@@ -3885,6 +3895,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
         override_model_override: str | None = None,
+        override_model_override_id: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
         override_reasoning_effort_set: bool = False,
@@ -3952,6 +3963,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork, applied only when ``override_model_override_set`` is
             ``True`` — then it supersedes the ``copy_model_settings`` copy
             (a value pins that model; ``None`` clears to the agent default).
+        :param override_model_override_id: Exact provider ID accompanying
+            the explicit fork model; otherwise inherited with model settings.
         :param override_model_override_set: Whether the caller chose an
             explicit ``model_override`` (the fork dialog's model picker).
             ``False`` (default) inherits per ``copy_model_settings``.
@@ -4033,6 +4046,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             copy_model_settings=copy_model_settings,
             copy_terminal_launch_args=copy_terminal_launch_args,
             override_model_override=override_model_override,
+            override_model_override_id=override_model_override_id,
             override_model_override_set=override_model_override_set,
             override_reasoning_effort=override_reasoning_effort,
             override_reasoning_effort_set=override_reasoning_effort_set,
@@ -4060,6 +4074,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
         override_model_override: str | None = None,
+        override_model_override_id: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
         override_reasoning_effort_set: bool = False,
@@ -4126,6 +4141,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 {
                     "reasoning_effort": fork_effort,
                     "model_override": fork_model,
+                    "model_override_id": (
+                        override_model_override_id
+                        if override_model_override_set and fork_model is not None
+                        else (
+                            source_overrides["model_override_id"]
+                            if not override_model_override_set and copy_model_settings
+                            else None
+                        )
+                    ),
                     "harness_override": (
                         source_overrides["harness_override"] if copy_model_settings else None
                     ),
@@ -4508,6 +4532,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             overrides = _decode_session_overrides(row.session_overrides)
             if not copy_model_settings:
                 overrides["model_override"] = None
+                overrides["model_override_id"] = None
                 overrides["reasoning_effort"] = None
             # The brain-harness override never survives a rebind.
             overrides["harness_override"] = None

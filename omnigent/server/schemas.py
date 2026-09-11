@@ -1341,7 +1341,34 @@ class SessionGitOptions(BaseModel):
         return self
 
 
-class _SessionCreateRequestBase(BaseModel):
+class _ExactModelSelectionRequest(BaseModel):
+    """Optional provider ID accompanying a model-picker choice."""
+
+    model_override_id: str | None = Field(
+        default=None,
+        description=(
+            "Exact provider model ID behind model_override; skips native Codex alias discovery."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_model_override_id(self) -> Self:
+        if self.model_override_id is not None:
+            from omnigent.models.model_override import validate_model_override
+
+            model = getattr(self, "model_override", None)
+            if not isinstance(model, str) or model.strip().lower() in {
+                "",
+                "default",
+                "off",
+                "reset",
+            }:
+                raise ValueError("model_override_id requires a non-default model_override")
+            self.model_override_id = validate_model_override(self.model_override_id)
+        return self
+
+
+class _SessionCreateRequestBase(_ExactModelSelectionRequest):
     """
     JSON request body for ``POST /v1/sessions``.
 
@@ -2122,6 +2149,7 @@ class SessionResponse(BaseModel):
     llm_model: str | None = None
     harness: str | None = None
     model_override: str | None = None
+    model_override_id: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     share_workspace_files: bool = False
@@ -2163,7 +2191,7 @@ class SessionResponse(BaseModel):
     project_id: str | None = None
 
 
-class UpdateSessionRequest(BaseModel):
+class UpdateSessionRequest(_ExactModelSelectionRequest):
     """
     Request body for ``PATCH /v1/sessions/{id}``.
 
@@ -2324,7 +2352,7 @@ class ResetSessionModelOverrideResponse(BaseModel):
     reset: bool
 
 
-class BackgroundSessionTitleRequest(BaseModel):
+class BackgroundSessionTitleRequest(_ExactModelSelectionRequest):
     """Private runner request for isolated background title inference."""
 
     prompt: str = Field(min_length=1, max_length=20_000)
@@ -2441,7 +2469,7 @@ class ClearCodexGoalResponse(BaseModel):
     cleared: bool
 
 
-class SessionForkRequest(BaseModel):
+class SessionForkRequest(_ExactModelSelectionRequest):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.
 

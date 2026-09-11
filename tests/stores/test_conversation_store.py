@@ -419,6 +419,58 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
     )
 
 
+@pytest.mark.parametrize("replacement", ["another-choice", "same-choice", None])
+def test_exact_model_id_is_coupled_to_the_selection(
+    conversation_store: SqlAlchemyConversationStore, replacement: str | None
+) -> None:
+    conv = conversation_store.create_conversation()
+    selected = conversation_store.update_conversation(
+        conv.id, model_override="same-choice", model_override_id="provider/exact-id"
+    )
+    assert selected is not None and selected.model_override_id == "provider/exact-id"
+    reported = conversation_store.update_conversation(conv.id, reported_model="native-spelling")
+    assert reported is not None and reported.model_override_id == "provider/exact-id"
+
+    inherited = conversation_store.fork_conversation(conv.id)
+    assert inherited.model_override == "same-choice"
+    assert inherited.model_override_id == "provider/exact-id"
+    switched = conversation_store.fork_conversation(conv.id, copy_model_settings=False)
+    assert switched.model_override_id is None
+    replaced = conversation_store.fork_conversation(
+        conv.id, override_model_override="other", override_model_override_set=True
+    )
+    assert replaced.model_override_id is None
+    exact_fork = conversation_store.fork_conversation(
+        conv.id,
+        override_model_override="other",
+        override_model_override_id="provider/other-id",
+        override_model_override_set=True,
+    )
+    assert exact_fork.model_override_id == "provider/other-id"
+
+    updated = conversation_store.update_conversation(
+        conv.id, model_override=replacement, _unset_model_override=replacement is None
+    )
+    assert updated is not None
+    assert updated.model_override == replacement
+    assert updated.model_override_id is None
+    reloaded = conversation_store.get_conversation(conv.id)
+    assert reloaded is not None and reloaded.model_override_id is None
+
+
+def test_reset_exact_model_clears_both_fields(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(
+        conv.id, model_override="pick", model_override_id="exact"
+    )
+    assert not conversation_store.clear_model_override_if_matches(conv.id, "other")
+    assert conversation_store.clear_model_override_if_matches(conv.id, "pick")
+    reset = conversation_store.get_conversation(conv.id)
+    assert reset is not None and reset.model_override_id is None
+
+
 def test_reported_model_round_trips_beside_the_request(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

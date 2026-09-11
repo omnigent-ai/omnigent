@@ -270,6 +270,10 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+For an exact Codex provider model ID, use `omnigent codex --model-id ID` to
+skip model discovery at launch. `--model` keeps alias resolution. See
+[Codex model selection](docs/codex-model-selection.md) for specs and API calls.
+
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 

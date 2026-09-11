@@ -51,6 +51,7 @@ class BackgroundTitleRequest:
     agent_id: str | None = None
     harness_override: str | None = None
     model_override: str | None = None
+    model_override_id: str | None = None
     sub_agent_name: str | None = None
     additional_instructions: str | None = None
 
@@ -102,6 +103,8 @@ class RunnerBackgroundTitleGenerator:
             "model_override": request.model_override,
             "sub_agent_name": request.sub_agent_name,
         }
+        if request.model_override_id is not None:
+            body["model_override_id"] = request.model_override_id
         custom = request.additional_instructions.strip() if request.additional_instructions else ""
         body["additional_instructions"] = (
             f"{custom}\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
@@ -155,6 +158,7 @@ class BackgroundSessionTitleCoordinator:
         agent_id: str | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
+        model_override_id: str | None = None,
         sub_agent_name: str | None = None,
     ) -> None:
         """Schedule at most one title attempt and return without awaiting it."""
@@ -169,6 +173,7 @@ class BackgroundSessionTitleCoordinator:
                     agent_id=agent_id,
                     harness_override=harness_override,
                     model_override=model_override,
+                    model_override_id=model_override_id,
                     sub_agent_name=sub_agent_name,
                     additional_instructions=self._additional_instructions,
                 ),
@@ -401,6 +406,7 @@ class PendingBackgroundSessionTitle:
             agent_id=self.request.agent_id,
             harness_override=self.request.harness_override,
             model_override=self.request.model_override,
+            model_override_id=self.request.model_override_id,
             sub_agent_name=self.request.sub_agent_name,
         )
 
@@ -434,6 +440,7 @@ def prepare_background_session_title(
             agent_id=conversation.agent_id,
             harness_override=conversation.harness_override,
             model_override=conversation.model_override,
+            model_override_id=conversation.model_override_id,
             sub_agent_name=conversation.sub_agent_name,
         ),
     )

@@ -637,6 +637,28 @@ describe("ForkSessionDialog", () => {
     });
   });
 
+  it("carries the provider ID when choosing a Codex model for a fork", async () => {
+    forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+      ReturnType<typeof forkSession>
+    >);
+    useHostModelOptionsMock.mockReturnValue({
+      data: [{ id: "gpt-picker", model: "provider/gpt-exact", displayName: "Custom Codex" }],
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    renderDialog();
+    openAgentSelect();
+    fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_codex_native"));
+    fireEvent.click(screen.getByTestId("fork-session-config-model"));
+    fireEvent.click(screen.getByRole("option", { name: "Custom Codex" }));
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({
+      modelOverride: "gpt-picker",
+      modelOverrideId: "provider/gpt-exact",
+    });
+  });
+
   it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",

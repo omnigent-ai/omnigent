@@ -521,6 +521,41 @@ class _FakeRunnerRouter:
         return _FakeRoutedRunner(self.client)
 
 
+async def test_background_title_preserves_exact_codex_selection(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(kind="default")
+    conversation = store.update_conversation(
+        conversation.id,
+        harness_override="codex-native",
+        model_override="picker-choice",
+        model_override_id="provider/model-id",
+    )
+    assert conversation is not None
+    client = _FakeRunnerClient()
+    generator = RunnerBackgroundTitleGenerator(_FakeRunnerRouter(client))  # type: ignore[arg-type]
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    pending = prepare_background_session_title(
+        coordinator=coordinator,
+        conversation=conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Investigate startup"}],
+            },
+        ),
+    )
+    assert pending is not None
+    store.update_conversation(conversation.id, title="Investigate startup")
+    pending.schedule(expected_seed_title="Investigate startup")
+    await coordinator.wait_for_idle()
+
+    [(url, body)] = client.requests
+    assert url == f"/v1/sessions/{conversation.id}/background-title"
+    assert body["model_override"] == "picker-choice"
+    assert body["model_override_id"] == "provider/model-id"
+
+
 async def test_runner_generator_posts_session_configuration() -> None:
     client = _FakeRunnerClient()
     router = _FakeRunnerRouter(client)

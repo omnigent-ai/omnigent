@@ -628,6 +628,26 @@ describe("runner binding", () => {
     expect(session.modelOverride).toBe("claude-opus-4-7");
   });
 
+  it.each(["update", "fork"])("carries the exact model ID through %s", async (operation) => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+      }),
+    );
+    const selection = { modelOverride: "picker", modelOverrideId: "provider/exact" };
+    if (operation === "update") await updateSession("conv_abc", selection);
+    else await forkSession("conv_abc", { config: selection });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      model_override: "picker",
+      model_override_id: "provider/exact",
+    });
+  });
+
   it("PATCHes model_override='default' when modelOverride is null (matches REPL /model semantics)", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

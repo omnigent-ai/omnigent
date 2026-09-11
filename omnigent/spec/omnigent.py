@@ -1762,6 +1762,8 @@ def _translate_executor_from_def(
             config["reasoning_item_id_policy"] = raw_executor["reasoning_item_id_policy"]
         if "acp_agent" in raw_executor:
             config["acp_agent"] = raw_executor["acp_agent"]
+        if "model_resolution" in raw_executor:
+            config["model_resolution"] = raw_executor["model_resolution"]
     # ``auth`` is now parsed by the loader into OmniExecutorSpec.auth;
     # fall back to raw_executor for the top-level agent path that still
     # goes through _translate_executor_from_def(raw_executor=...).

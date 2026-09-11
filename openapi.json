@@ -5165,6 +5165,18 @@
             "description": "Per-session LLM model override to apply to the fork, e.g. `\"claude-opus-4-7\"`. **Omitting** the field inherits the source's model (same as today, within the same provider family); an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets the fork to the bound agent's default. Validated against a conservative model-id charset. Set by the web fork dialog's model picker.",
             "title": "Model Override"
           },
+          "model_override_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact provider model ID behind model_override; skips native Codex alias discovery.",
+            "title": "Model Override Id"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -6581,6 +6593,17 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. `None` means no override is active (the agent's `llm_model` applies). Set via `PATCH /v1/sessions/{id}` or the REPL's `/model` command; both write the same column so the web UI and the TUI stay in sync.",
             "title": "Model Override"
+          },
+          "model_override_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Override Id"
           },
           "parent_session_id": {
             "anyOf": [
@@ -8234,6 +8257,18 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
+          },
+          "model_override_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact provider model ID behind model_override; skips native Codex alias discovery.",
+            "title": "Model Override Id"
           },
           "permission_mode": {
             "anyOf": [

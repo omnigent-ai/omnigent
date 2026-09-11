@@ -50,6 +50,7 @@ import json
 import re
 import threading
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any
 
 from playwright.async_api import Request, Route, async_playwright, expect
@@ -1830,13 +1831,15 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_start_session_select_codex_model(seeded_session: tuple[str, str]) -> None:
+def test_start_session_select_codex_model(seeded_session: tuple[str, str], tmp_path: Path) -> None:
     """The host-resolved Codex model reaches the create request."""
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_codex_model(base_url, session_id))
+    _run_in_fresh_loop(
+        _drive_codex_model(base_url, session_id, tmp_path / "codex-model-selection.png")
+    )
 
 
-async def _drive_codex_model(base_url: str, session_id: str) -> None:
+async def _drive_codex_model(base_url: str, session_id: str, screenshot_path: Path) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -1868,7 +1871,11 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
                                     "displayName": "GPT Live Default",
                                     "isDefault": True,
                                 },
-                                {"id": "gpt-live-fast", "displayName": "GPT Live Fast"},
+                                {
+                                    "id": "gpt-live-fast",
+                                    "model": "provider/gpt-fast",
+                                    "displayName": "GPT Live Fast",
+                                },
                             ]
                         }
                     ),
@@ -1903,12 +1910,14 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
             await _close_entry_models(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.screenshot(path=str(screenshot_path), animations="disabled")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
             await _wait_until(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body.get("model_override") == "gpt-live-fast", body
+            assert body.get("model_override_id") == "provider/gpt-fast", body
             assert body.get("reasoning_effort") is None, body
         finally:
             await browser.close()

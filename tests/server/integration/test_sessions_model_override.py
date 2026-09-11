@@ -40,6 +40,37 @@ async def _create_session(
     return resp.json()
 
 
+async def test_exact_model_selection_create_patch_fork_and_clear(
+    client: httpx.AsyncClient,
+) -> None:
+    """The picker ID and provider ID travel together through real session storage."""
+    agent = await create_test_agent(client)
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "model_override": "picker",
+            "model_override_id": "provider/model",
+        },
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["id"]
+    snapshot = await client.get(f"/v1/sessions/{sid}")
+    assert snapshot.json()["model_override_id"] == "provider/model"
+    patched = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": "other-picker", "model_override_id": "provider/other"},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["model_override_id"] == "provider/other"
+    forked = await client.post(f"/v1/sessions/{sid}/fork", json={})
+    assert forked.status_code == 201, forked.text
+    assert forked.json()["model_override_id"] == "provider/other"
+    cleared = await client.patch(f"/v1/sessions/{sid}", json={"model_override": "default"})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["model_override_id"] is None
+
+
 async def test_patch_model_override_round_trips_through_snapshot(
     client: httpx.AsyncClient,
 ) -> None:

@@ -333,6 +333,113 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["picker", "spec"])
+async def test_exact_codex_startup_skips_every_discovery_path(
+    source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold real-builder launches carry an exact ID without consulting either catalog."""
+    from unittest.mock import AsyncMock, Mock
+
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+    model_id = "provider/gpt-test"
+    session_id = uuid.uuid4().hex
+    captured: list[codex_app_mod.CodexNativeAppServer] = []
+    routing_started = asyncio.Event()
+    routing_release = threading.Event()
+    loop = asyncio.get_running_loop()
+    loop_progressed: list[bool] = []
+
+    class LaunchBuilt(RuntimeError):
+        pass
+
+    class SnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            if url == f"/v1/sessions/{session_id}":
+                snapshot = (
+                    {"model_override": "picker-gpt-test", "model_override_id": model_id}
+                    if source == "picker"
+                    else {}
+                )
+                return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+            return await super().get(url, **kwargs)
+
+    def resolve_launch(
+        *, model: str | None, spec: AgentSpec | None = None
+    ) -> codex_app_mod.NativeCodexLaunch:
+        assert isinstance(model, ExactCodexModel)
+        loop.call_soon_threadsafe(routing_started.set)
+        loop_progressed.append(routing_release.wait(timeout=1.0))
+        return codex_app_mod.NativeCodexLaunch([], model, "test-profile")
+
+    async def start(server: codex_app_mod.CodexNativeAppServer) -> None:
+        captured.append(server)
+        raise LaunchBuilt
+
+    credentials = Mock(side_effect=AssertionError("unexpected credential acquisition"))
+    discovery = Mock(side_effect=AssertionError("unexpected workspace discovery"))
+    catalog = AsyncMock(side_effect=AssertionError("unexpected launch catalog lookup"))
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda _bridge_dir: None,
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "/test/codex")
+    monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "/test/codex")
+    monkeypatch.setattr(codex_app_mod, "_clean_codex_env", dict)
+    monkeypatch.setattr(
+        codex_app_mod, "_databricks_gateway_host", lambda _profile: "https://profile.example"
+    )
+    monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", resolve_launch)
+    monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", catalog)
+    monkeypatch.setattr(codex_app_mod.CodexNativeAppServer, "start", start)
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
+    )
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models", discovery
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(
+            type="omnigent",
+            model=model_id if source == "spec" else None,
+            config={"harness": "codex-native", "model_resolution": "exact"},
+        ),
+    )
+    task = asyncio.create_task(
+        _auto_create_codex_terminal(
+            session_id,
+            cast(SessionResourceRegistry, object()),
+            lambda _session_id, _event: None,
+            agent_spec=spec,
+            server_client=cast(httpx.AsyncClient, SnapshotClient()),
+        )
+    )
+    try:
+        await asyncio.wait_for(routing_started.wait(), timeout=2.0)
+        routing_release.set()
+        with pytest.raises(LaunchBuilt):
+            await task
+    finally:
+        routing_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    credentials.assert_not_called()
+    discovery.assert_not_called()
+    catalog.assert_not_called()
+    assert loop_progressed == [True]
+    assert len(captured) == 1
+    assert f'model="{model_id}"' in captured[0].config_overrides
+    assert captured[0].env["DATABRICKS_HOST"] == "https://profile.example"
+    assert "test-profile" in " ".join(captured[0].config_overrides)
+
+
+@pytest.mark.asyncio
 async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

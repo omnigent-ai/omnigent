@@ -2262,6 +2262,7 @@ def register_core_routes(
             reasoning_effort=None if clear_effort else effort,
             _unset_reasoning_effort=clear_effort,
             model_override=None if clear_model else model_override,
+            model_override_id=body.model_override_id,
             _unset_model_override=clear_model,
             cost_control_mode_override=None if clear_cost_control else cost_control_mode_override,
             _unset_cost_control_mode_override=clear_cost_control,
@@ -2873,6 +2874,7 @@ def register_core_routes(
                 # None / clear" from "not chosen — inherit". When unset, the
                 # store falls back to copy_model_settings / copy_terminal_launch_args.
                 override_model_override=None if clear_override_model else override_model,
+                override_model_override_id=body.model_override_id,
                 override_model_override_set=model_override_set,
                 override_reasoning_effort=None if clear_override_effort else override_effort,
                 override_reasoning_effort_set=effort_set,

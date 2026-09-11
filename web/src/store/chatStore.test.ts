@@ -7436,6 +7436,36 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     }
   });
 
+  it("persists the provider ID behind an in-session Codex picker choice", async () => {
+    seedSession("conv_exact", []);
+    await useChatStore.getState().switchTo("conv_exact");
+    useChatStore.setState({
+      sessionHarness: "codex-native",
+      codexModelOptions: [{ id: "picker", model: "provider/exact" }],
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (input === "/v1/sessions/conv_exact" && init?.method === "PATCH") {
+        return mockResponse({
+          id: "conv_exact",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          model_override: "picker",
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().setModel("picker");
+    const patch = fetchMock.mock.calls.find(
+      ([input, init]) => input === "/v1/sessions/conv_exact" && init?.method === "PATCH",
+    );
+    expect(JSON.parse(patch![1]!.body as string)).toEqual({
+      model_override: "picker",
+      model_override_id: "provider/exact",
+    });
+  });
+
   it("lets only the newest model pick settle the persisted sticky preference", async () => {
     // A conversation-id guard can't order two picks. If A's PATCH is slow, the
     // user switches to B and picks again, then A resolves last: A's canonical

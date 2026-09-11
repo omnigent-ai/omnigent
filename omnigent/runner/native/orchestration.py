@@ -1005,6 +1005,18 @@ async def _codex_native_launch_config(
             raise RuntimeError(
                 f"Invalid model_override for Codex session {session_id!r}: {exc}"
             ) from exc
+        model_override_id = snapshot.get("model_override_id")
+        if model_override_id is not None:
+            from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+            if not isinstance(model_override_id, str):
+                raise RuntimeError(f"Invalid model_override_id for Codex session {session_id!r}.")
+            try:
+                model_override = ExactCodexModel(model_override_id)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid model_override_id for Codex session {session_id!r}: {exc}"
+                ) from exc
     external_session_id = snapshot.get("external_session_id")
     if external_session_id is not None and (
         not isinstance(external_session_id, str) or not external_session_id
@@ -3979,6 +3991,7 @@ async def _auto_create_codex_terminal(
         prepare_bridge_dir,
         socket_path_for_bridge_dir,
     )
+    from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
     from omnigent.inner.codex_executor import codex_extended_catalog_env
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -4002,7 +4015,9 @@ async def _auto_create_codex_terminal(
     # Thread the spec so its executor.auth / legacy profile win over
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
+    _codex_launch = await asyncio.to_thread(
+        resolve_native_codex_launch, model=default_model, spec=_launch_spec
+    )
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
@@ -4013,7 +4028,7 @@ async def _auto_create_codex_terminal(
     # the user's shared config can never govern a session (the stale-gpt-5.4
     # 400 class). Profile-backed shapes already resolve their default at
     # materialization time and are left alone.
-    if launch_config.model_override or (
+    if (launch_config.model_override and not isinstance(default_model, ExactCodexModel)) or (
         _codex_launch.model is None and _codex_launch.profile is None
     ):
         from dataclasses import replace as _dataclass_replace
@@ -4063,8 +4078,8 @@ async def _auto_create_codex_terminal(
             if reachable is None:
                 # Re-resolve so provider overrides cannot retain the old model.
                 # A failed probe permits fallback, but cannot retire the pick.
-                _codex_launch = resolve_native_codex_launch(
-                    model=unpinned_model, spec=_launch_spec
+                _codex_launch = await asyncio.to_thread(
+                    resolve_native_codex_launch, model=unpinned_model, spec=_launch_spec
                 )
                 pick_to_reset = pick if fresh_rows else None
                 outcome = (
@@ -5791,11 +5806,14 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
         return None
-    model = spec.executor.model
-    if isinstance(model, str) and model:
-        return model
-    config_model = spec.executor.config.get("model")
-    return config_model if isinstance(config_model, str) and config_model else None
+    model = spec.executor.model or spec.executor.config.get("model")
+    if not isinstance(model, str) or not model:
+        return None
+    if spec.executor.config.get("model_resolution") == "exact":
+        from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+        return ExactCodexModel(model)
+    return model
 
 
 def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:

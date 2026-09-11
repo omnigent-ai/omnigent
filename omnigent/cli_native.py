@@ -341,6 +341,14 @@ def register_native_commands(cli: click.Group) -> None:
     )
     @click.option("--model", default=None, help="Codex model to use for the native thread.")
     @click.option(
+        "--model-id",
+        default=None,
+        help=(
+            "Exact provider model ID; use verbatim without model discovery. "
+            "Mutually exclusive with --model."
+        ),
+    )
+    @click.option(
         "-p",
         "--prompt",
         default=None,
@@ -362,6 +370,7 @@ def register_native_commands(cli: click.Group) -> None:
         resume: str | None,
         session_id: str | None,
         model: str | None,
+        model_id: str | None,
         prompt: str | None,
         smart_routing: bool,
         codex_args: tuple[str, ...],
@@ -371,6 +380,7 @@ def register_native_commands(cli: click.Group) -> None:
         # :param resume: None, picker sentinel, or a conversation id.
         # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
         # :param model: Codex model id.
+        # :param model_id: Exact provider ID, without alias resolution.
         # :param prompt: Optional first prompt.
         # :param smart_routing: When True, arm Smart Routing for the session so
         #     the first typed message picks the model.
@@ -386,6 +396,15 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent codex --smart-routing           # first message picks the model
         """
         _reject_native_on_windows("codex")
+        if model_id is not None:
+            if model is not None:
+                raise click.UsageError("--model and --model-id are mutually exclusive.")
+            from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+            try:
+                model = ExactCodexModel(model_id)
+            except ValueError as exc:
+                raise click.BadParameter(str(exc), param_hint="--model-id") from exc
         if smart_routing:
             # Validate before any side effects (daemon spawn, server discovery)
             # so an unroutable invocation fails instantly.

@@ -593,7 +593,11 @@ def _materialize_codex_agent_spec(
     yaml_path = tmpdir / "codex-native-ui.yaml"
     executor: dict[str, str] = {"harness": "codex-native"}
     if model is not None:
-        executor["model"] = model
+        from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+        executor["model"] = str(model)
+        if isinstance(model, ExactCodexModel):
+            executor["model_resolution"] = "exact"
     raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
@@ -974,6 +978,10 @@ async def _prepare_codex_terminal_via_daemon(
                 patch["terminal_launch_args"] = persist_args
             if model is not None:
                 patch["model_override"] = model
+                from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+                if isinstance(model, ExactCodexModel):
+                    patch["model_override_id"] = model
             if patch:
                 _update_startup_progress(startup_progress, "Updating Codex session...")
                 resp = await client.patch(
@@ -1220,7 +1228,7 @@ async def _prepare_codex_terminal(
         # so `omnigent codex` honors the provider selection like the
         # in-process codex harness. Resolved before any rollout synthesis
         # so session_meta can name the provider the launch routes through.
-        _codex_launch = resolve_native_codex_launch(model=model)
+        _codex_launch = await asyncio.to_thread(resolve_native_codex_launch, model=model)
         if thread_id is not None:
             await _ensure_local_codex_resume_rollout(
                 client,
@@ -1241,7 +1249,8 @@ async def _prepare_codex_terminal(
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _probe:
             _probe.bind(("127.0.0.1", 0))
             codex_ws_url = f"ws://127.0.0.1:{_probe.getsockname()[1]}"
-        app_server = build_codex_native_server(
+        app_server = await asyncio.to_thread(
+            build_codex_native_server,
             socket_path=socket_path,
             codex_home=codex_home,
             cwd=Path.cwd(),

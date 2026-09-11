@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
+from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
 from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
@@ -2378,17 +2379,20 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     then ucode's cached copy of it, then the bundled catalog as the documented
     last resort.
 
-    An explicit model is matched against the servable ids, so a legacy
-    ``model_override`` persisted before this change still launches; one the
-    workspace does not serve passes through untouched, because the gateway's
-    error beats a silent substitution.
+    An :class:`ExactCodexModel` is already selected and passes through without
+    credentials or discovery. Unmarked strings retain alias resolution for
+    old saved sessions and configuration; unknown aliases pass through so
+    the gateway reports the error instead of silently substituting a model.
 
     :param host: Workspace origin, e.g. ``"https://example.com"``.
     :param profile: Databricks CLI profile backing the launch.
-    :param requested: Explicit model id, or ``None`` to take the newest
-        servable one.
+    :param requested: An exact model selection, an unresolved saved name, or
+        ``None`` to take the newest servable model.
     :returns: The model id to pin on the codex launch.
     """
+    if isinstance(requested, ExactCodexModel):
+        return requested
+
     from omnigent.models.databricks_model_discovery import (
         discover_databricks_codex_models,
         select_servable_model,
@@ -2426,9 +2430,10 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
             )
 
     if requested:
-        return select_servable_model(requested, servable) or requested
+        selected = select_servable_model(requested, servable)
+        return ExactCodexModel(selected) if selected else requested
     if servable:
-        return servable[0]
+        return ExactCodexModel(servable[0])
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 
 

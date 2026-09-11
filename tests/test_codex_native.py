@@ -1131,6 +1131,18 @@ def test_materialize_codex_agent_spec_uses_codex_native_harness(
     }
 
 
+def test_exact_model_survives_wrapper_spec_serialization(tmp_path: Path) -> None:
+    from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+    from omnigent.runner.native.orchestration import _codex_native_model_from_spec
+
+    spec_path = codex_native._materialize_codex_agent_spec(
+        tmp_path, model=ExactCodexModel("provider/custom-model")
+    )
+    selected = _codex_native_model_from_spec(load(spec_path))
+    assert isinstance(selected, ExactCodexModel)
+    assert selected == "provider/custom-model"
+
+
 def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
     tmp_path: Path,
 ) -> None:
@@ -11300,11 +11312,16 @@ def test_resolve_native_codex_launch_databricks_provider_sets_summary(
     assert launch.summary == "Databricks ucode profile 'my-profile'"
 
 
+@pytest.mark.parametrize("exact", [False, True])
 def test_resolve_native_codex_launch_connect_broker_managed_host(
     monkeypatch: pytest.MonkeyPatch,
+    exact: bool,
 ) -> None:
     """No configured provider, but a managed connect host (host-only [omnigent]
     profile + broker sidecar) routes Codex through the gateway with broker auth."""
+    from unittest.mock import Mock
+
+    from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
     from omnigent.inner import databricks_executor
     from omnigent.onboarding import ambient, detected, provider_config
     from omnigent.runtime import workflow
@@ -11324,18 +11341,25 @@ def test_resolve_native_codex_launch_connect_broker_managed_host(
         "omnigent.host.databricks_credential.broker_token_command",
         lambda host, *a, **k: "python3 -m omnigent.host.databricks_credential token --coords /x",
     )
+    if not exact:
+        monkeypatch.setattr(
+            codex_native_app_server,
+            "_resolve_databricks_codex_model",
+            lambda host, profile, model: "system.ai.gpt-6-astra",
+        )
+    credentials = Mock(side_effect=AssertionError("unexpected discovery credentials"))
     monkeypatch.setattr(
-        codex_native_app_server,
-        "_resolve_databricks_codex_model",
-        lambda host, profile, model: "system.ai.gpt-6-astra",
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
+    )
+    launch = codex_native_app_server.resolve_native_codex_launch(
+        model=ExactCodexModel("provider/gpt-test") if exact else None
     )
 
-    launch = codex_native_app_server.resolve_native_codex_launch(model=None)
-
     assert launch.profile is None
-    assert launch.model == "system.ai.gpt-6-astra"  # ucode-served model
+    assert launch.model == ("provider/gpt-test" if exact else "system.ai.gpt-6-astra")
     assert launch.config_overrides  # gateway provider table (base_url + broker auth)
     assert "managed connect host" in launch.summary
+    credentials.assert_not_called()
 
 
 def test_resolve_native_codex_launch_no_broker_sidecar_falls_back_to_login(

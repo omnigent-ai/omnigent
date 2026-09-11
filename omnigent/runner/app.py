@@ -3669,13 +3669,18 @@ def create_runner_app(
                 },
             )
 
+        title_model_override = body.model_override
+        if effective_harness == "codex-native" and body.model_override_id is not None:
+            from omnigent.harnesses.codex_native.model_selection import ExactCodexModel
+
+            title_model_override = ExactCodexModel(body.model_override_id)
         context = BackgroundTitleContext(
             prompt=body.prompt[:BACKGROUND_TITLE_MAX_PROMPT_CHARS],
             harness=effective_harness,
             spawn_env=dict(spawn_env or {}),
             process_manager=process_manager,
             cwd=resolver_cwd,
-            model_override=body.model_override,
+            model_override=title_model_override,
             session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
             additional_instructions=body.additional_instructions,
         )
