@@ -62,11 +62,28 @@ async function clearWorkspaceCookies(ses, origin) {
  * DBAUTH — surfacing, e.g., the 403 you'd get if the endpoint's SAFE allowlist
  * doesn't include this client_id.
  */
-function mintSessionCookie(ses, origin, accessToken, nextPath) {
+async function mintSessionCookie(ses, origin, accessToken, nextPath) {
+  // Diagnostic probe: does the workspace accept this bearer for an ordinary API
+  // call? status=200 => token valid + scoped; 401/403 => rejected (e.g. missing
+  // all-apis scope); opaqueredirect/0 => bounced to login (also unauthenticated).
+  try {
+    const probe = await fetch(`${origin}/api/2.0/preview/scim/v2/Me`, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+      redirect: "manual",
+    });
+    console.log(
+      `[omnigent] databricks session: token probe /scim/v2/Me -> status=${probe.status} type=${probe.type}`,
+    );
+  } catch (e) {
+    console.warn("[omnigent] databricks session: token probe failed:", e.message);
+  }
+
   return new Promise((resolve, reject) => {
     const url = `${origin}${SESSION_CREATE_PATH}?next_url=${encodeURIComponent(nextPath)}`;
     const request = net.request({ method: "GET", url, session: ses, redirect: "manual" });
     request.setHeader("Authorization", `Bearer ${accessToken}`);
+    // Ask for JSON so an auth failure comes back as 401 JSON, not a login redirect.
+    request.setHeader("Accept", "application/json");
     let captured = false;
 
     // Resolve if a DBAUTH cookie is present — either parsed from the response's
