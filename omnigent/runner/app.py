@@ -4259,8 +4259,14 @@ def create_runner_app(
             last = history[-1]
             last_type = last.get("type")
             last_role = last.get("role")
+            # A trailing cancellation marker means the user deliberately
+            # abandoned the turn: reconnects must not re-run the prompt.
             needs_turn = (
-                (last_type == "message" and last_role == "user")
+                (
+                    last_type == "message"
+                    and last_role == "user"
+                    and not _is_cancellation_marker(last)
+                )
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
@@ -4886,6 +4892,9 @@ def create_runner_app(
             ]
 
     _CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
+    # First line of the marker; a stable sentinel that survives copy edits to
+    # the fuller wording below (older persisted transcripts carry it too).
+    _CANCELLATION_MARKER_PREFIX = "[System: interrupted]"
     _CANCELLATION_MARKER_TEXT = (
         "[System: interrupted]\n"
         "The user interrupted and abandoned their previous request (the user "
@@ -4894,6 +4903,24 @@ def create_runner_app(
         "user message as the current instruction. The preceding assistant "
         "message may be incomplete."
     )
+
+    def _is_cancellation_marker(item: _JsonObject) -> bool:
+        """True when *item* is the synthetic user marker persisted by a cancel.
+
+        :param item: A history item as loaded by ``_load_history_as_input``.
+        :returns: Whether the item is the cancellation marker message.
+        """
+        if item.get("type") != "message" or item.get("role") != "user":
+            return False
+        content = item.get("content")
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(part, dict)
+            and isinstance((text := part.get("text")), str)
+            and text.startswith(_CANCELLATION_MARKER_PREFIX)
+            for part in content
+        )
 
     def _append_cancellation_items(conv_id: str) -> None:
         history = _session_histories.get(conv_id, [])
