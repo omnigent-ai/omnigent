@@ -87,8 +87,8 @@ async def test_native_session_tracks_prs_across_repositories(
             ["/bin/sh", "-c", rest_command], text=True, cwd=workspace
         )
         mixed_command = (
-            "gh api /repos/example/five/issues/42/comments -f body=fixture; "
-            "gh pr view 42 -R example/one --json url"
+            "gh api /repos/example/commented/issues/42/comments -f body=fixture; "
+            "gh pr view 42 -R example/read --json url"
         )
         mixed_output = subprocess.check_output(
             ["/bin/sh", "-c", mixed_command], text=True, cwd=workspace
@@ -154,6 +154,21 @@ async def test_native_session_tracks_prs_across_repositories(
                 "tool_input": {"command": mixed_command},
                 "tool_response": {"stdout": mixed_output, "exit_code": 0},
             },
+            {
+                "tool_name": "mcp__custom__create_pull_request_review",
+                "tool_input": {
+                    "owner": "example",
+                    "repo": "commented",
+                    "pullNumber": 42,
+                    "event": "COMMENT",
+                },
+                "tool_response": {"html_url": "https://github.com/example/commented/pull/42"},
+            },
+            {
+                "tool_name": "mcp__custom__update_pull_request",
+                "tool_input": {"owner": "example", "repo": "five", "pullNumber": 42},
+                "tool_response": {"html_url": "https://github.com/example/five/pull/42"},
+            },
         ]
         for index, payload in enumerate(payloads):
             payload.update(
@@ -184,7 +199,7 @@ async def test_native_session_tracks_prs_across_repositories(
         }
         registry.remove("https://github.com/example/five/pull/42")
         # A new observation, as well as hook replay, must respect explicit unlinking.
-        for call_id in (payloads[-1]["tool_use_id"], "new-comment"):
+        for call_id in (payloads[-1]["tool_use_id"], "new-update"):
             completed = await asyncio.to_thread(
                 subprocess.run,
                 command,
