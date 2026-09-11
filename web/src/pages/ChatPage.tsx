@@ -4669,6 +4669,11 @@ function SessionHarnessPicker({
       setConfigMenuOpen(true);
     }
   }, [openNonce, disabled, configurable]);
+  // The pill's summary tooltip must not flash open over the menu, nor
+  // instantly reopen when closing the menu refocuses the trigger; see
+  // useMenuGuardedTooltip. Internal menuOpen covers every open path,
+  // including the programmatic /model (openNonce) one.
+  const gearTooltip = useMenuGuardedTooltip(menuOpen);
   useEffect(() => {
     setMenuOpen(false);
     setConfigMenuOpen(false);
@@ -4796,9 +4801,9 @@ function SessionHarnessPicker({
         }}
       >
         <TooltipProvider>
-          <Tooltip>
+          <Tooltip open={gearTooltip.open} onOpenChange={gearTooltip.onOpenChange}>
             <TooltipTrigger asChild>
-              <span className="flex min-w-0">
+              <span className="flex min-w-0" {...gearTooltip.triggerProps}>
                 <DropdownMenuTrigger asChild>
                   <ComposerHarnessTrigger
                     label="Configure session"
@@ -5111,4 +5116,52 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
+}
+/**
+ * How long after the menu closes tooltip open requests stay swallowed.
+ * Radix hands focus back to the trigger on close in the same tick, so the
+ * window only needs to outlive that programmatic focus (and any queued
+ * focus/pointer fallout from the closing menu); 600ms — one hover-open
+ * delay — is comfortably past it without being noticeable to a user who
+ * genuinely re-engages the trigger later.
+ */
+const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
+
+/**
+ * Open state for a tooltip whose trigger contains (or is) a menu trigger.
+ *
+ * Keeps the tooltip closed while the menu is open: the menu trigger sits
+ * inside the tooltip trigger's span, so the focus Radix gives it on open
+ * bubbles to the tooltip trigger and would instantly open the tooltip,
+ * painting it over the menu (equal z-index, later-mounted; the menu content
+ * itself is a portalled React sibling whose events do not bubble here).
+ * Closing the menu hands focus back to that same trigger, which would just
+ * as instantly reopen the tooltip, so open requests stay blocked for a short
+ * window after close — unless the pointer re-enters the trigger, which is
+ * unmistakably fresh hover intent.
+ */
+function useMenuGuardedTooltip(menuOpen: boolean) {
+  const [wantsOpen, setWantsOpen] = useState(false);
+  // Epoch millis until which open requests are ignored; Infinity while the
+  // menu is open. A ref, not state: it is only read when Radix requests an
+  // open, so changing it never needs a re-render.
+  const suppressedUntil = useRef(0);
+  useEffect(() => {
+    if (menuOpen) {
+      setWantsOpen(false);
+      suppressedUntil.current = Number.POSITIVE_INFINITY;
+    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
+      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
+    }
+  }, [menuOpen]);
+  return {
+    open: wantsOpen && !menuOpen,
+    onOpenChange: (next: boolean) =>
+      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
+    triggerProps: {
+      onPointerEnter: () => {
+        if (!menuOpen) suppressedUntil.current = 0;
+      },
+    },
+  } as const;
 }

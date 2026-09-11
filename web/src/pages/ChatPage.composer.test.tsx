@@ -899,6 +899,90 @@ describe("Composer slash-command submit routing", () => {
     expect(document.querySelectorAll('[data-slot="tooltip-content"]')).toHaveLength(1);
   });
 
+  it("suppresses the pill tooltip when bare /model opens the picker", async () => {
+    // The programmatic openNonce path (bare `/model`) must suppress the
+    // pill's summary tooltip exactly like the click/keyboard open paths;
+    // otherwise the focus the gear receives (inside the tooltip trigger's
+    // span, so it bubbles there) paints the tooltip over the just-opened
+    // selector.
+    useChatStore.setState({ llmModel: "sonnet" });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    await screen.findByTestId("composer-agent-menu");
+
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+  });
+
+  it("suppresses the pill tooltip while the selector popover is open", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+
+    // Open the selector popover from the pill.
+    const gear = screen.getByTestId("composer-config-gear");
+    fireEvent.keyDown(gear, { key: "ArrowDown" });
+    const menu = screen.getByTestId("composer-agent-menu");
+
+    // Opening the menu focuses the gear, which sits inside the tooltip
+    // trigger's span and bubbles to it (the menu content is a portalled
+    // React sibling — its events do not bubble to the trigger); the tooltip
+    // must stay closed rather than paint over the open menu.
+    fireEvent.focus(gear);
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+
+    // Closing the popover hands focus back to the trigger; that programmatic
+    // focus must NOT instantly reopen the tooltip.
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("composer-agent-menu")).toBeNull());
+    fireEvent.focus(gear);
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+
+    // Fresh intent releases the suppression: the pointer re-entering the
+    // tooltip trigger (the span wrapping the pill, which carries the
+    // guard's pointer handler) lets the tooltip open again.
+    fireEvent.pointerEnter(gear.parentElement!);
+    fireEvent.focus(gear);
+    expect(await screen.findByTestId("composer-config-gear-tooltip")).toBeInTheDocument();
+  });
+
   it("keeps the label's truncation chain intact through the pill's wrapper", () => {
     useChatStore.setState({ llmModel: "sonnet" });
     const options = CLAUDE_MODEL_OPTIONS.map((option) => ({

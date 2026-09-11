@@ -1281,6 +1281,84 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     });
 
+    it("inherits ALL repositories from a multi-repo sandbox source", async () => {
+      // A source with several repos records them space-joined; the single
+      // URL/branch fields can't represent that, so the fork shows a read-only
+      // list and inherits every repo (workspace omitted) instead of seeding a
+      // broken URL that would grey the submit button.
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api#main https://github.com/org/web",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      // A multi-repo source can only inherit all repos onto a multi-repo dest.
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "agent_sandbox",
+          sandbox_providers: ["agent_sandbox"],
+          sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+        },
+      });
+
+      selectSandbox();
+      openAdvanced();
+      // No editable single-repo field — a read-only list of every source repo.
+      expect(screen.queryByTestId("fork-session-sandbox-repo-input")).toBeNull();
+      const readonly = screen.getByTestId("fork-session-sandbox-repos-readonly");
+      expect(readonly.textContent).toContain("api#main");
+      expect(readonly.textContent).toContain("web");
+
+      // The space-joined label no longer greys the button on a multi-repo dest.
+      const submit = screen.getByTestId("fork-session-submit") as HTMLButtonElement;
+      expect(submit.disabled).toBe(false);
+      fireEvent.click(submit);
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      const call = forkSessionMock.mock.calls[0][1];
+      expect(call?.sandbox?.provider).toBe("agent_sandbox");
+      // workspace omitted (undefined) → the server re-clones ALL source repos.
+      expect(call?.sandbox?.workspace).toBeUndefined();
+    });
+
+    it("blocks forking a multi-repo source onto a single-repo provider", async () => {
+      // modal is single-repo; a source with several repos can't inherit them
+      // there, so the fork is blocked in the UI (not 422'd after creation).
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api#main https://github.com/org/web",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_providers: ["modal"],
+          sandbox_provider_capabilities: { modal: { multi_repo: false } },
+        },
+      });
+
+      selectSandbox();
+      openAdvanced();
+      // The read-only list warns the destination can't take them, and submit
+      // is blocked rather than deferring to a server-side 422.
+      expect(screen.getByTestId("fork-session-repos-unsupported")).toBeInTheDocument();
+      expect((screen.getByTestId("fork-session-submit") as HTMLButtonElement).disabled).toBe(true);
+    });
+
     it("sends an explicit null workspace when the repository is cleared", async () => {
       // Clearing the prefill is a real choice (an empty sandbox), so it must
       // reach the server as an explicit null — omitting the key would make the

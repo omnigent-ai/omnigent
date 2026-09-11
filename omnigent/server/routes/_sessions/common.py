@@ -18,10 +18,12 @@ import cachetools
 import httpx
 from pydantic import TypeAdapter
 
+from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -838,6 +840,25 @@ def get_server_runner_router() -> RunnerRouter | None:
 _server_host_registry: HostRegistry | None = None
 
 
+def host_interactive_shells_for_request(
+    host_id: str,
+    *,
+    host_registry: HostRegistry,
+    runner_router: RunnerRouter | None,
+) -> list[str]:
+    """Return this replica's host shells or signal a misrouted request."""
+    if (
+        host_registry.get(host_id) is None
+        and runner_router is not None
+        and runner_router.host_is_on_another_replica(host_id)
+    ):
+        raise OmnigentError(
+            "host shell inventory is on another replica",
+            code=ErrorCode.WRONG_REPLICA,
+        )
+    return normalize_interactive_shells(host_registry.interactive_shells(host_id))
+
+
 def set_server_host_registry(host_registry: HostRegistry | None) -> None:
     """Stash the live host registry for asleep-session catalog refills.
 
@@ -1037,6 +1058,7 @@ __all__ = [
     "_session_todos_cache",
     "get_server_host_registry",
     "get_server_runner_router",
+    "host_interactive_shells_for_request",
     "set_server_host_registry",
     "set_server_runner_router",
 ]

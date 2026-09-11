@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from omnigent._platform import installed_interactive_shells
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import (
@@ -21,6 +23,9 @@ from omnigent.harness_plugins import (
 from omnigent.harness_plugins import (
     native_agents as _registry_native_agents,
 )
+
+if TYPE_CHECKING:
+    from omnigent.inner.datamodel import TerminalEnvSpec
 
 NATIVE_CODING_AGENTS = _registry_native_agents()
 
@@ -99,10 +104,11 @@ def native_shell_terminal_spec() -> dict[str, dict[str, object]]:
     (:func:`omnigent._platform.installed_interactive_shells`), keyed and
     commanded by the shell basename (``zsh``/``bash``/``fish``), with the user's
     ``$SHELL`` first so the UI can treat it as the click default and offer the
-    rest behind a picker. ``caller_process`` / no sandbox matches the native
-    CLI's own unsandboxed stance on the user's workspace. The block is always
-    non-empty, which is also what gates the MCP relay's ``sys_terminal_*``
-    advertisement.
+    rest behind a picker. Host-bound runners replace these declarations with the
+    selected host's inventory. ``caller_process`` / no sandbox matches the
+    native CLI's own unsandboxed stance on the user's workspace. The block is
+    always non-empty, which is also what gates the MCP relay's
+    ``sys_terminal_*`` advertisement.
 
     :returns: A ``terminals:`` mapping, e.g. ``{"zsh": {...}, "bash": {...}}``,
         with the user's login shell first.
@@ -118,4 +124,29 @@ def native_shell_terminal_spec() -> dict[str, dict[str, object]]:
             },
         }
         for shell in installed_interactive_shells()
+    }
+
+
+def native_shell_terminal_specs(
+    shells: list[str] | tuple[str, ...],
+) -> dict[str, TerminalEnvSpec]:
+    """Build parsed terminal specs for a host's ordered shell inventory.
+
+    Resolution runs in the host-launched runner and honors a matching absolute
+    ``$SHELL`` path, including login shells outside the standard directories.
+    """
+    from omnigent._platform import _resolve_interactive_shell
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+
+    return {
+        shell: TerminalEnvSpec(
+            command=_resolve_interactive_shell(shell) or shell,
+            allow_cwd_override=True,
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
+        )
+        for shell in shells
     }
