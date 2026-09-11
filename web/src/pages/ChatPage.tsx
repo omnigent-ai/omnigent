@@ -1,9 +1,13 @@
 import {
+  type ForwardedRef,
+  type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  forwardRef,
   memo,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -36,6 +40,7 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
   ComposerWorkspaceTrigger,
@@ -73,6 +78,7 @@ import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
+import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -1515,15 +1521,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // surface subscribes to nothing hot, so the composer and chrome below bail
   // out of streaming-frame re-renders.
 
-  // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
-  const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
-  const [replyConversationId, setReplyConversationId] = useState(conversationId);
-  const nextReplyQuoteId = useRef(0);
-
-  if (replyConversationId !== conversationId) {
-    setReplyConversationId(conversationId);
-    setReplyQuotes([]);
-  }
+  const composerRef = useRef<ComposerHandle>(null);
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1614,12 +1612,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // with the full server-side slash_command path.
   const isTerminalFirst = terminalFirst?.isTerminalFirst === true;
   const isNativeWrapper = terminalFirst?.isNativeWrapper === true;
-  // Stable so they don't defeat Composer's memo on the switch re-render burst.
-  const removeReplyQuote = useCallback(
-    (i: number) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i)),
-    [],
-  );
-  const clearReplyQuotes = useCallback(() => setReplyQuotes([]), []);
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
@@ -1772,15 +1764,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
             containerRef={conversationRef}
-            onReply={(text) =>
-              setReplyQuotes((prev) => [
-                ...prev,
-                { id: `reply-quote-${nextReplyQuoteId.current++}`, text },
-              ])
-            }
+            onReply={(text) => composerRef.current?.appendReplyQuote(text)}
           />
 
           <Composer
+            ref={composerRef}
             disabled={disabled}
             status={status}
             isWorking={isWorking}
@@ -1791,9 +1779,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             selectedAgentId={selectedAgentId}
             permissionLevel={permissionLevel}
             readOnlyReason={readOnlyReason}
-            replyQuotes={replyQuotes}
-            onRemoveQuote={removeReplyQuote}
-            onClearAllQuotes={clearReplyQuotes}
             effortLevels={effortLevels}
             showEffort={showEffort}
             showModels={showModels}
@@ -1873,9 +1858,8 @@ function ConversationLoadError({
   );
 }
 
-interface ReplyQuote {
-  id: string;
-  text: string;
+interface ComposerHandle {
+  appendReplyQuote: (text: string) => void;
 }
 
 interface ComposerProps {
@@ -1907,12 +1891,6 @@ interface ComposerProps {
    * leaves the existing ``permissionLevel`` gate alone.
    */
   readOnlyReason: string | null;
-  /** Quoted texts to prepend to the next message (one per "Reply ↵" click). */
-  replyQuotes: ReplyQuote[];
-  /** Removes the quote at the given index without submitting. */
-  onRemoveQuote: (index: number) => void;
-  /** Clears all quotes (called after submit). */
-  onClearAllQuotes: () => void;
   /** Reasoning-effort options to render in `/effort` and the picker dropdown. */
   effortLevels: readonly string[];
   /** Show `/effort` and the Effort picker section. */
@@ -2509,43 +2487,54 @@ export function BackgroundTaskPill() {
  * suggestions menu, and the send/stop controls. Exported for direct
  * unit testing of the slash-command keyboard behavior.
  */
-function ComposerImpl({
-  status,
-  isWorking,
-  disabled,
-  onSend,
-  onSendSlashCommand,
-  onStop,
-  agents,
-  selectedAgentId,
-  permissionLevel,
-  readOnlyReason,
-  replyQuotes,
-  onRemoveQuote,
-  onClearAllQuotes,
-  effortLevels,
-  showEffort,
-  showModels,
-  modelPickerKind,
-  codexModelOptions,
-  showCodexPlanMode,
-  showClaudePermissionMode = false,
-  showCodexApprovalMode = false,
-  showGoalControl = false,
-  runnerOnline,
-  showClaudeGoalControl = false,
-  showPollyCodexGoalControl = false,
-  isTerminalFirst = false,
-  isNativeWrapper = false,
-  unreachable = false,
-  onShowReconnectHelp,
-  costRoutingEligible = false,
-  subagentRoutingEligible = false,
-  subAgentLabel = null,
-  wrapperLabel = null,
-  onViewportShrinkPinScroll,
-}: ComposerProps) {
-  const [value, setValue] = useState("");
+function ComposerImpl(
+  {
+    status,
+    isWorking,
+    disabled,
+    onSend,
+    onSendSlashCommand,
+    onStop,
+    agents,
+    selectedAgentId,
+    permissionLevel,
+    readOnlyReason,
+    effortLevels,
+    showEffort,
+    showModels,
+    modelPickerKind,
+    codexModelOptions,
+    showCodexPlanMode,
+    showClaudePermissionMode = false,
+    showCodexApprovalMode = false,
+    showGoalControl = false,
+    runnerOnline,
+    showClaudeGoalControl = false,
+    showPollyCodexGoalControl = false,
+    isTerminalFirst = false,
+    isNativeWrapper = false,
+    unreachable = false,
+    onShowReconnectHelp,
+    costRoutingEligible = false,
+    subagentRoutingEligible = false,
+    subAgentLabel = null,
+    wrapperLabel = null,
+    onViewportShrinkPinScroll,
+  }: ComposerProps,
+  ref: ForwardedRef<ComposerHandle>,
+) {
+  const {
+    draft,
+    value,
+    setValue,
+    fullText,
+    activeTextId,
+    focusText,
+    editText,
+    replaceText,
+    appendQuote,
+    removeQuote,
+  } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -2585,7 +2574,12 @@ function ComposerImpl({
   // submits the form, so it would otherwise bypass the Button entirely.
   const { trackClick } = useOmnigentAnalytics();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const tailTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const bindTailTextarea = useCallback((element: HTMLTextAreaElement | null) => {
+    tailTextareaRef.current = element;
+    if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
+  }, []);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(value, setValue, textareaRef);
@@ -2725,8 +2719,8 @@ function ComposerImpl({
   const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
-  const valueRef = useRef(value);
-  valueRef.current = value;
+  const valueRef = useRef(fullText);
+  valueRef.current = fullText;
   const filesRef = useRef(files);
   filesRef.current = files;
   // Guards against React StrictMode double-invoke in development:
@@ -2747,7 +2741,8 @@ function ComposerImpl({
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
-    setValue(restored?.text ?? "");
+    replaceText(restored?.text ?? "");
+    textareaRef.current = tailTextareaRef.current;
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
     // Publish which conversation the composer's text now belongs to. The
@@ -2764,25 +2759,14 @@ function ComposerImpl({
         files: filesRef.current,
       });
     };
-  }, [conversationId]);
+  }, [conversationId, replaceText]);
 
   // Publish edits as they happen so the open sidebar updates immediately,
   // rather than only learning about a draft when this composer unmounts.
   useEffect(() => {
     if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
-    setSessionDraft(conversationId, { text: value, files });
-  }, [conversationId, settledConversationId, value, files]);
-
-  // Adding a reply quote (via the floating "Reply" button) should drop the
-  // caret straight into the composer so the user can type immediately. Only
-  // focus when the count grows — removing a quote shouldn't steal focus.
-  const prevQuoteCountRef = useRef(replyQuotes.length);
-  useEffect(() => {
-    if (!isMobileRef.current && replyQuotes.length > prevQuoteCountRef.current) {
-      textareaRef.current?.focus();
-    }
-    prevQuoteCountRef.current = replyQuotes.length;
-  }, [replyQuotes.length]);
+    setSessionDraft(conversationId, { text: fullText, files });
+  }, [conversationId, settledConversationId, fullText, files]);
 
   // Session skills (bundled + host-discovered) come from the snapshot
   // on bind and populate the suggestions menu as ``/skill-name``
@@ -2815,6 +2799,7 @@ function ComposerImpl({
   // "/" (guards against file-path-like strings).
   const trimmedValue = value.trimStart();
   const menuOpen =
+    draft.quotes.length === 0 &&
     trimmedValue.startsWith("/") &&
     !trimmedValue.slice(1).includes("/") &&
     !trimmedValue.includes(" ") &&
@@ -2823,7 +2808,8 @@ function ComposerImpl({
   const menuQuery = menuOpen ? trimmedValue.slice(1) : "";
   // Tint the `/skill` token blue while the draft reads as a slash command, so
   // the command shape is signalled as the user types it.
-  const composerIsCommand = files.length === 0 && isSlashCommandText(value);
+  const composerIsCommand =
+    draft.quotes.length === 0 && files.length === 0 && isSlashCommandText(value);
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -2917,7 +2903,7 @@ function ComposerImpl({
   });
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
-  const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
+  const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
   const showInterruptButton = isWorking && !hasDraft;
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
@@ -2975,7 +2961,8 @@ function ComposerImpl({
       useChatStore.setState({ pendingRetryStableId: null });
       return;
     }
-    setValue(failedSendDraft.text);
+    replaceText(failedSendDraft.text);
+    textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0) {
       const { accepted, errors } = validateAttachments(failedSendDraft.files);
@@ -2983,7 +2970,7 @@ function ComposerImpl({
       setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
     }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId]);
+  }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -3140,7 +3127,7 @@ function ComposerImpl({
     lastGrowthPxRef.current = px;
     onGrowthRef.current?.();
   }, []);
-  useAutoGrowTextarea(textareaRef, value, 10, onGrowth);
+  useAutoGrowTextarea(tailTextareaRef, draft.text, draft.quotes.length ? Infinity : 10, onGrowth);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -3149,6 +3136,33 @@ function ComposerImpl({
   // fires. Lets onChange distinguish "user typed" (reset cursor) from
   // "recall replaced the value" (keep cursor).
   const recallingRef = useRef(false);
+
+  const replyQuoteInsertedRef = useRef(false);
+  useImperativeHandle(ref, () => ({
+    appendReplyQuote(text) {
+      if (disabled || isReadOnly || unreachable || !text.trim()) return;
+      appendQuote(text);
+      textareaRef.current = tailTextareaRef.current;
+      dirtyRef.current = true;
+      replyQuoteInsertedRef.current = true;
+      setCommandError(null);
+      dismissMention();
+      resetCursor();
+    },
+  }));
+
+  // Apply the caret after the updated draft has rendered and auto-grown.
+  useLayoutEffect(() => {
+    if (!replyQuoteInsertedRef.current) return;
+    replyQuoteInsertedRef.current = false;
+    const textarea = tailTextareaRef.current;
+    if (!textarea) return;
+    if (!isMobileRef.current) textarea.focus({ preventScroll: true });
+    textarea.setSelectionRange(0, 0);
+    if (textarea.parentElement)
+      textarea.parentElement.scrollTop = textarea.parentElement.scrollHeight;
+    onGrowthRef.current?.();
+  });
 
   const addFiles = (incoming: File[]) => {
     // Reject unsupported types (only images, PDF, and text/code) and
@@ -3188,14 +3202,17 @@ function ComposerImpl({
       textarea.value = "";
       textarea.setSelectionRange(0, 0);
       textarea.blur();
+    } else if (textarea === document.activeElement) {
+      tailTextareaRef.current?.focus({ preventScroll: true });
     }
-    setValue("");
+    replaceText("");
+    textareaRef.current = tailTextareaRef.current;
   };
 
   const submit = ({
     resetNativeInputSession = false,
   }: { resetNativeInputSession?: boolean } = {}) => {
-    const trimmed = value.trim();
+    const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
@@ -3219,7 +3236,12 @@ function ComposerImpl({
     // Anything else (unknown command, or a skill on a native-terminal
     // session where ``onSendSlashCommand`` is undefined) falls through to the
     // plaintext send path below.
-    if (isSlashCommandText(trimmed) && files.length === 0 && mentionedItems.length === 0) {
+    if (
+      draft.quotes.length === 0 &&
+      isSlashCommandText(trimmed) &&
+      files.length === 0 &&
+      mentionedItems.length === 0
+    ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
@@ -3252,8 +3274,7 @@ function ComposerImpl({
       // "/name" text. `parts[0]` keeps the original case for the server's
       // exact-name lookup. `onSendSlashCommand` is undefined for
       // native-terminal sessions, so those fall through to the plaintext
-      // path below and the vendor TUI loads the skill itself. Reply quotes
-      // don't apply to a slash command (no content field) — clear them.
+      // path below and the vendor TUI loads the skill itself.
       if (onSendSlashCommand && parts[0] in slashCommands) {
         const skillArgs = trimmed.slice(parts[0].length).trim();
         appendEntry(trimmed);
@@ -3261,32 +3282,18 @@ function ComposerImpl({
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
-        onClearAllQuotes();
         return;
       }
     }
 
     setCommandError(null);
-    // Prepend all active reply quotes as Markdown blockquotes.
-    const quotePreamble =
-      replyQuotes.length > 0
-        ? replyQuotes
-            .map((quote) =>
-              quote.text
-                .split("\n")
-                .map((line) => `> ${line}`)
-                .join("\n"),
-            )
-            .join("\n\n") + "\n\n"
-        : "";
     // Prepend each "@"-tagged path as an attachment marker on its own line —
     // the same format the native executors emit for attachments and that
     // title-seeding strips (_ATTACHMENT_MARKER_RE). Wording is harness-aware
     // (codex says "Attached file:"). Folders carry a trailing "/" so the
     // agent knows to open the directory. The native vendor reads the on-disk
     // workspace file/folder from this marker; no upload happens.
-    const messageText =
-      buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
+    const messageText = buildMentionPreamble(mentionedItems, sessionHarness) + trimmed;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
@@ -3299,7 +3306,6 @@ function ComposerImpl({
     setAttachmentError(null);
     setMentionedItems([]);
     setMention(null);
-    onClearAllQuotes();
   };
 
   const handleSubmit = (e: FormEvent) => {
@@ -3313,13 +3319,15 @@ function ComposerImpl({
 
   const applyRecall = (ta: HTMLTextAreaElement, recalled: string) => {
     recallingRef.current = true;
-    setValue(recalled);
+    replaceText(recalled);
+    textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
     // Move the caret to the end after React applies the new value. Without
     // this, the browser leaves the caret at its previous index, which can
     // land mid-word and feels broken.
     queueMicrotask(() => {
-      ta.setSelectionRange(recalled.length, recalled.length);
+      const target = tailTextareaRef.current ?? ta;
+      target.setSelectionRange(target.value.length, target.value.length);
     });
   };
 
@@ -3395,10 +3403,16 @@ function ComposerImpl({
     // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
     // fire even mid-compose; without this guard the recall below intercepts
     // them (replacing the draft) and the hotkeys appear broken in the composer.
-    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (
+      (draft.quotes.length === 0 || recallingRef.current) &&
+      (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey
+    ) {
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
-        const recalled = recallPrevious(value);
+        const recalled = recallPrevious(fullText);
         if (recalled !== null) {
           e.preventDefault();
           applyRecall(ta, recalled);
@@ -3427,6 +3441,26 @@ function ComposerImpl({
       e.preventDefault();
       addFiles(pastedFiles);
     }
+  };
+
+  const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
+    editText(id, e.target.value);
+    dirtyRef.current = true;
+    if (commandError !== null) setCommandError(null);
+    if (attachmentError !== null) setAttachmentError(null);
+    setMention(
+      mentionEnabled
+        ? detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length)
+        : null,
+    );
+    if (recallingRef.current) recallingRef.current = false;
+    else resetCursor();
+  };
+
+  const handleTextFocus = (id: string | null, element: HTMLTextAreaElement) => {
+    textareaRef.current = element;
+    focusText(id);
+    dictation.noteFocus();
   };
 
   return (
@@ -3470,7 +3504,8 @@ function ComposerImpl({
           // Re-sending re-queues it (busy) or sends it (idle).
           const target = queuedMessages.find((m) => m.queueId === queueId);
           if (!target) return;
-          setValue(target.text);
+          replaceText(target.text);
+          textareaRef.current = tailTextareaRef.current;
           setFiles(target.files ?? []);
           dequeueMessage(queueId);
           textareaRef.current?.focus();
@@ -3535,34 +3570,10 @@ function ComposerImpl({
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
         input={{
-          ref: textareaRef,
-          value,
-          onChange: (e) => {
-            setValue(e.target.value);
-            dirtyRef.current = true;
-            if (commandError !== null) setCommandError(null);
-            // A rejected attachment is never added, so there's no chip to
-            // remove and nothing else would ever clear this. Left sticky it
-            // reads as a blocker on a composer the user can actually submit.
-            if (attachmentError !== null) setAttachmentError(null);
-            // Recompute the active "@"-mention from the caret on every
-            // keystroke (native coding-agent sessions — ``mentionEnabled``).
-            setMention(
-              mentionEnabled
-                ? detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length)
-                : null,
-            );
-            // Treat user-driven changes as exiting recall mode. Recall-
-            // driven setValue toggles `recallingRef` first so we skip the
-            // reset for that one tick.
-            if (recallingRef.current) recallingRef.current = false;
-            else resetCursor();
-          },
-          onFocus: () => {
-            // From here the textarea's caret is one the user placed, so
-            // dictation inserts there instead of at the end of the draft.
-            dictation.noteFocus();
-          },
+          ref: bindTailTextarea,
+          value: draft.text,
+          onChange: (e) => handleTextChange(null, e),
+          onFocus: (e) => handleTextFocus(null, e.currentTarget),
           onKeyDown: handleKeyDown,
           onBlur: () => {
             // Dismiss the "@"-mention menu when focus leaves the textarea
@@ -3597,12 +3608,37 @@ function ComposerImpl({
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
+            draft.quotes.length > 0 && "max-h-none overflow-y-hidden",
             // Hand glyph painting to the overlay while a command is drafted;
             // the caret stays visible via caret-foreground.
             composerIsCommand && "text-transparent caret-foreground",
           ),
         }}
         slots={{
+          inputPrefix:
+            draft.quotes.length > 0 ? (
+              <ReplyDraftBlocks
+                quotes={draft.quotes}
+                activeTextId={activeTextId}
+                keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+                disabled={disabled || isReadOnly || unreachable}
+                onGrowth={onViewportShrinkPinScroll}
+                onRemove={(id) => {
+                  removeQuote(id);
+                  textareaRef.current = tailTextareaRef.current;
+                  dirtyRef.current = true;
+                  dismissMention();
+                }}
+                inputFor={(quote) => ({
+                  onChange: (e) => handleTextChange(quote.id, e),
+                  onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
+                  onBlur: dismissMention,
+                  onKeyDown: handleKeyDown,
+                  onPaste: handlePaste,
+                  "data-has-draft": hasDraft ? "true" : undefined,
+                })}
+              />
+            ) : undefined,
           beforeInput: (
             <>
               {/* Slash-command suggestions — floats above the composer box */}
@@ -3626,28 +3662,6 @@ function ComposerImpl({
                   onOpenDir={openMentionDir}
                   onAttach={attachMention}
                 />
-              )}
-              {/* Quote chips — one per quoted selection, shown above the textarea */}
-              {replyQuotes.length > 0 && (
-                <div className="flex flex-col gap-1.5 px-4 pt-3 pb-0">
-                  {replyQuotes.map((quote, i) => (
-                    <div key={quote.id} className="flex items-start gap-2">
-                      <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-sm text-muted-foreground">
-                        <span className="block truncate">
-                          {quote.text.length > 120 ? `${quote.text.slice(0, 120)}…` : quote.text}
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => onRemoveQuote(i)}
-                        className="mt-0.5 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
-                        aria-label="Remove quote"
-                      >
-                        <XIcon className="size-3.5" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
               )}
               {/* Highlight overlay: a textarea can only paint its text one color, so
             to tint just the `/skill` token we hide the textarea's own glyphs
@@ -3905,7 +3919,7 @@ function ComposerImpl({
   );
 }
 
-export const Composer = memo(ComposerImpl);
+export const Composer = memo(forwardRef(ComposerImpl));
 
 /**
  * Whether the main chat's display-only "Working…" indicator should light up.
