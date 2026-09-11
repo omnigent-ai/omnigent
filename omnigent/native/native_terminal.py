@@ -9,6 +9,7 @@ import click
 import httpx
 
 from omnigent.host.daemon_launch import error_text
+from omnigent.native.transient_429 import send_with_transient_429_retry
 
 DAEMON_HOST_ONLINE_TIMEOUT_S = 30.0
 DAEMON_RUNNER_ONLINE_TIMEOUT_S = 60.0
@@ -93,12 +94,15 @@ async def bind_session_runner(
     :param runner_id: Registered runner id, e.g.
         ``"runner_abc123"``.
     :returns: None.
-    :raises click.ClickException: If binding fails.
+    :raises click.ClickException: If binding fails. A transient HTTP 429
+        throttle is retried with bounded backoff before failing.
     """
     try:
-        resp = await client.patch(
-            f"/v1/sessions/{url_component(session_id)}",
-            json={"runner_id": runner_id},
+        resp = await send_with_transient_429_retry(
+            lambda: client.patch(
+                f"/v1/sessions/{url_component(session_id)}",
+                json={"runner_id": runner_id},
+            )
         )
     except httpx.ConnectError as exc:
         # Connection refused/reset or DNS failure: the server was never reached.
