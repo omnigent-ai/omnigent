@@ -1099,6 +1099,58 @@ def test_compress_image_skips_non_raster_type() -> None:
     assert content_type == "image/svg+xml"
 
 
+def test_compress_image_preserves_rgb_trns_transparency() -> None:
+    """An RGB PNG with a tRNS chunk is treated as alpha (not flattened to JPEG)."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        compress_image_attachment,
+    )
+
+    side = 1600
+    image = Image.frombytes("RGB", (side, side), os.urandom(side * side * 3))
+    buffer = BytesIO()
+    # tRNS transparency on a truecolor image: Pillow keeps mode "RGB" and exposes
+    # it via info["transparency"] on reopen.
+    image.save(buffer, format="PNG", transparency=(0, 0, 0))
+    original = buffer.getvalue()
+    assert len(original) > IMAGE_MODEL_BUDGET_BYTES
+
+    result, content_type = compress_image_attachment(original, "image/png")
+
+    assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
+    # Alpha-capable branch, never lossy JPEG.
+    assert content_type in ("image/webp", "image/png")
+
+
+def test_compress_image_rejects_format_mismatch() -> None:
+    """Bytes whose real format differs from the declared MIME are rejected."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        ImageCompressionError,
+        compress_image_attachment,
+    )
+
+    # A real (uncompressed) BMP, but declared as image/png.
+    side = 1200
+    buffer = BytesIO()
+    Image.frombytes("RGB", (side, side), os.urandom(side * side * 3)).save(buffer, format="BMP")
+    bmp = buffer.getvalue()
+    assert len(bmp) > IMAGE_MODEL_BUDGET_BYTES
+
+    with pytest.raises(ImageCompressionError):
+        compress_image_attachment(bmp, "image/png")
+
+
 def test_compress_image_rejects_oversized_animated(monkeypatch: pytest.MonkeyPatch) -> None:
     """An animated image over the budget is rejected (can't be re-encoded)."""
     from io import BytesIO
@@ -1132,6 +1184,7 @@ def test_compress_image_rejects_oversized_animated(monkeypatch: pytest.MonkeyPat
         ("shot.jpg", "image/jpeg", "shot.jpg"),  # already matches → unchanged
         ("shot.PNG", "image/png", "shot.PNG"),  # case-insensitive match → unchanged
         ("shot.png", "image/svg+xml", "shot.png"),  # unknown emit type → unchanged
+        (".", "image/jpeg", "."),  # no stem for with_suffix → unchanged, not 500
     ],
 )
 def test_image_filename_for_content_type(filename: str, content_type: str, expected: str) -> None:

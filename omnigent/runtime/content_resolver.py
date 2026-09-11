@@ -125,6 +125,16 @@ _COMPRESSIBLE_IMAGE_MIMES: frozenset[str] = frozenset(
     {"image/png", "image/jpeg", "image/webp", "image/gif"}
 )
 
+# Pillow format names that legitimately back each compressible MIME. Used to
+# reject a spoofed extension (e.g. a TIFF/BMP labeled image/png) before we hand
+# 50 MB of untrusted bytes to an unintended decoder. MPO is multi-picture JPEG.
+_ALLOWED_PIL_FORMATS: dict[str, frozenset[str]] = {
+    "image/png": frozenset({"PNG"}),
+    "image/jpeg": frozenset({"JPEG", "MPO"}),
+    "image/webp": frozenset({"WEBP"}),
+    "image/gif": frozenset({"GIF"}),
+}
+
 # Budget for an image's RAW stored bytes after compression. The stored blob is
 # re-encoded as a base64 data URI on every turn (see _resolve_file_id_block),
 # which inflates it ~4/3, and providers apply the ~5 MB per-image ceiling to
@@ -247,7 +257,11 @@ def image_filename_for_content_type(filename: str, content_type: str) -> str:
     path = PurePosixPath(filename)
     if path.suffix.lower() == target:
         return filename
-    return str(path.with_suffix(target))
+    try:
+        return str(path.with_suffix(target))
+    except ValueError:
+        # Names like "." / ".." have no stem for with_suffix; keep as-is.
+        return filename
 
 
 def _encode_image(image: Any, image_format: str, **params: Any) -> bytes:
@@ -280,8 +294,9 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
     :param content: Raw uploaded image bytes.
     :param content_type: The resolved image MIME (``image/*``).
     :returns: ``(bytes, content_type)`` — the (possibly re-encoded) image and
-        its MIME. For a decodable still image the bytes are ``<=`` the budget;
-        the content_type may change (e.g. ``image/png`` → ``image/jpeg``).
+        its MIME, with the bytes ``<=`` the budget; the content_type may change
+        (e.g. ``image/png`` → ``image/jpeg``). A high-entropy image that can't
+        reach the budget even at the smallest scale/quality raises instead.
     :raises ImageCompressionError: If the bytes don't decode as an image, are
         an oversized animation, or can't be brought under the budget. The
         message is safe to surface to the client (no raw decoder text).
@@ -299,9 +314,16 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(BytesIO(content)) as probe:
-                n_frames = int(getattr(probe, "n_frames", 1))
+                # Reject a spoofed extension before decoding: the real container
+                # (probe.format, from the header) must match the declared MIME,
+                # so a TIFF/BMP-as-png can't select an unintended 50 MB decoder.
+                if probe.format not in _ALLOWED_PIL_FORMATS.get(content_type, frozenset()):
+                    raise ImageCompressionError("the file is not a readable image")
+                # Cheap header dimensions first — bail before walking frames
+                # (n_frames enumerates every GIF frame).
                 if probe.width * probe.height > IMAGE_MAX_DECODED_PIXELS:
                     raise ImageCompressionError("the image's dimensions are too large to process")
+                n_frames = int(getattr(probe, "n_frames", 1))
             # Animation can't be re-encoded here, and it's over budget, so it
             # would be rejected by the provider at turn time — reject cleanly now.
             if n_frames != 1:
@@ -324,9 +346,11 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
     ) as exc:
         raise ImageCompressionError("the file is not a readable image") from exc
 
-    has_alpha = image.mode in ("RGBA", "LA") or (
-        image.mode == "P" and "transparency" in image.info
-    )
+    # Detect alpha broadly: RGBA/LA modes, and RGB/L/P images carrying a tRNS
+    # chunk (Pillow exposes it as image.info["transparency"] without changing
+    # the mode) — routing them through the alpha branch avoids flattening
+    # transparency to JPEG.
+    has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
     if has_alpha:
         base = image.convert("RGBA")
         # Alpha-preserving encoders, best-compression first. Generated lazily so

@@ -120,6 +120,13 @@ class _RunnerStreamResponse(StreamingResponse):
             await self._upstream.aclose()
 
 
+# Bounds how many image compressions run concurrently across the worker.
+# Each decodes/re-encodes a raster (up to IMAGE_MAX_DECODED_PIXELS, several
+# full buffers live at once), so an unbounded burst of large uploads could
+# spike peak memory even with the to_thread offload keeping the loop responsive.
+_IMAGE_COMPRESSION_CONCURRENCY = asyncio.Semaphore(4)
+
+
 def register_resources_routes(
     router: APIRouter,
     *,
@@ -1569,11 +1576,13 @@ def register_resources_routes(
         filename = file.filename
         if content_type.startswith("image/"):
             try:
-                # Compression decodes + re-encodes (CPU/memory heavy); run it off
-                # the event loop so one large upload can't stall other requests.
-                compressed, resolved_type = await asyncio.to_thread(
-                    compress_image_attachment, content, content_type
-                )
+                # Compression decodes + re-encodes (CPU/memory heavy). Run it off
+                # the event loop, and bound concurrency so a burst of large
+                # uploads can't drive peak memory unbounded.
+                async with _IMAGE_COMPRESSION_CONCURRENCY:
+                    compressed, resolved_type = await asyncio.to_thread(
+                        compress_image_attachment, content, content_type
+                    )
             except ImageCompressionError as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from exc
             # A re-encode (e.g. PNG → JPEG) changes the type; realign the
