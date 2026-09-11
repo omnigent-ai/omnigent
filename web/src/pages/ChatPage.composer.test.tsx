@@ -2469,7 +2469,11 @@ describe("Composer config gear", () => {
     // Asleep/starting/unknown sessions accept sends (which wake the runner),
     // and a config PATCH persists server-side and applies on the next
     // wake/turn — so the gear stays live wherever the composer does.
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ showEffort: true, showModels: true, modelPickerKind: "claude" })}
+      />,
+    );
     expect(gear()).toHaveAttribute("aria-disabled", "false");
     openSessionConfig();
     expect(screen.queryByTestId("composer-config-modal")).not.toBeNull();
@@ -2559,9 +2563,10 @@ describe("Composer config gear", () => {
     );
     openSessionConfig();
     expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
-    // Claude native → Model + Effort selects present.
+    // Claude native → Model select present. Effort lives in the picker menu
+    // (its single home, shared with the new-session picker), never here.
     expect(screen.getByTestId("composer-config-model")).toBeTruthy();
-    expect(screen.getByTestId("composer-config-effort")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-effort")).toBeNull();
   });
 
   it("uses the Default sentinel when Kiro marks no catalog row as default", async () => {
@@ -2701,22 +2706,12 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-config-smart-routing")).toBeNull();
   });
 
-  it("applies drafted model + effort only on Save, model before effort", async () => {
-    // Claude-native types /model and /effort as separate terminal commands, so
-    // Save must await the model PATCH before firing effort — otherwise the two
-    // injections interleave into one bad line. This pins that ordering.
-    const calls: string[] = [];
-    let resolveModel: () => void = () => {};
-    const setModel = vi.fn().mockImplementation(() => {
-      calls.push("model");
-      return new Promise<void>((r) => {
-        resolveModel = r;
-      });
-    });
-    const setEffort = vi.fn().mockImplementation(() => {
-      calls.push("effort");
-      return Promise.resolve();
-    });
+  it("applies the drafted model on Save; effort applies live from the picker menu", async () => {
+    // Model changes draft in the dialog and commit on Save. Effort's single
+    // home is the picker menu (shared presentation with the new-session
+    // picker), where a click applies immediately — no draft, no Save.
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const setEffort = vi.fn().mockResolvedValue(undefined);
     const options = [
       { id: "opus", model: "opus", displayName: "Opus" },
       { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
@@ -2737,33 +2732,31 @@ describe("Composer config gear", () => {
         })}
       />,
     );
+
+    // Effort: open the picker's harness flyout and click a level.
+    fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+    fireEvent.click(await screen.findByTestId("composer-agent-edit"));
+    fireEvent.click(await screen.findByTestId("composer-agent-effort-low"));
+    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
+    expect(setModel).not.toHaveBeenCalled();
+
+    // Model: drafts in the dialog, commits on Save only.
     openSessionConfig();
     await screen.findByTestId("composer-config-modal");
-    // Draft a new model and a new effort.
     fireEvent.click(document.querySelector('[data-testid="composer-config-model"]') as Element);
     fireEvent.click(document.querySelector('[data-model-id="sonnet"]') as Element);
-    fireEvent.click(document.querySelector('[data-testid="composer-config-effort"]') as Element);
-    fireEvent.click(document.querySelector('[data-effort-level="low"]') as Element);
-    // Draft only — no live commit yet.
     expect(setModel).not.toHaveBeenCalled();
-    expect(setEffort).not.toHaveBeenCalled();
-
     fireEvent.click(screen.getByTestId("composer-config-save"));
-    // Model fires first and effort waits for its promise to resolve.
     await waitFor(() =>
       expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
     );
-    expect(setEffort).not.toHaveBeenCalled();
-    resolveModel();
-    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
-    expect(calls).toEqual(["model", "effort"]);
   });
 
-  it("recomputes the Codex effort ladder for the drafted model and drops an unsupported level", async () => {
-    // Codex advertises a per-model effort ladder. Drafting a lower-ceiling
-    // model (Luna, no "ultra") must refresh the dropdown to that model's levels
-    // and drop a picked level it can't run — else Save would send Sol's "ultra"
-    // to Luna, and the dropdown would show a rung Luna rejects.
+  it("offers the session model's Codex effort ladder inline in the picker menu", async () => {
+    // Codex advertises a per-model effort ladder, so the picker's inline
+    // effort list follows the session's resolved model — it never offers a
+    // rung the running model rejects — and title-cases the levels the same
+    // way every other harness does.
     const codexOptions = [
       {
         id: "gpt-5.6-sol",
@@ -2775,7 +2768,6 @@ describe("Composer config gear", () => {
           { reasoningEffort: "medium" },
           { reasoningEffort: "high" },
           { reasoningEffort: "xhigh" },
-          { reasoningEffort: "max" },
           { reasoningEffort: "ultra" },
         ],
       },
@@ -2786,19 +2778,15 @@ describe("Composer config gear", () => {
         supportedReasoningEfforts: [
           { reasoningEffort: "low" },
           { reasoningEffort: "medium" },
-          { reasoningEffort: "high" },
           { reasoningEffort: "xhigh" },
-          { reasoningEffort: "max" },
         ],
       },
     ] as never;
     useChatStore.setState({
-      setModel: vi.fn().mockResolvedValue(undefined),
       setEffort: vi.fn().mockResolvedValue(undefined),
-      selectedEffort: "ultra",
-      llmModel: "gpt-5.6-sol",
+      selectedEffort: "xhigh",
+      llmModel: "gpt-5.6-luna",
       codexModelOptions: codexOptions,
-      refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
     });
     renderWithTooltips(
       <Composer
@@ -2806,27 +2794,35 @@ describe("Composer config gear", () => {
           showModels: true,
           showEffort: true,
           modelPickerKind: "codex",
-          effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+          effortLevels: [],
           codexModelOptions: codexOptions,
         })}
       />,
     );
-    openSessionConfig();
-    await screen.findByTestId("composer-config-modal");
+    fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+    fireEvent.click(await screen.findByTestId("composer-agent-edit"));
 
-    // Sol starts on ultra.
-    expect(screen.getByTestId("composer-config-effort")).toHaveTextContent("ultra");
+    // Luna's ladder only — Sol's "ultra" rung is not offered — plus the
+    // Default row, with consistently title-cased labels ("xHigh", not raw).
+    expect(await screen.findByTestId("composer-agent-effort-default")).toBeTruthy();
+    expect(screen.getByTestId("composer-agent-effort-low").textContent).toBe("Low");
+    expect(screen.getByTestId("composer-agent-effort-xhigh").textContent).toBe("xHigh");
+    expect(screen.queryByTestId("composer-agent-effort-ultra")).toBeNull();
+  });
 
-    // Draft a switch to Luna, whose ceiling is "max".
-    fireEvent.click(document.querySelector('[data-testid="composer-config-model"]') as Element);
-    fireEvent.click(document.querySelector('[data-model-id="gpt-5.6-luna"]') as Element);
-
-    // The picked ultra is dropped (back to Default) and no longer offered,
-    // while Luna's own max stays.
-    expect(screen.getByTestId("composer-config-effort")).toHaveTextContent("Default");
-    fireEvent.click(document.querySelector('[data-testid="composer-config-effort"]') as Element);
-    expect(document.querySelector('[data-effort-level="ultra"]')).toBeNull();
-    expect(document.querySelector('[data-effort-level="max"]')).not.toBeNull();
+  it("lists Advanced settings exactly once, outside the harness flyout", async () => {
+    // The harness row's flyout owns effort; the dialog is reachable from the
+    // single entry at the menu's bottom — never from a second copy inside
+    // the flyout.
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ showModels: true, showEffort: true, modelPickerKind: "claude" })}
+      />,
+    );
+    fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+    fireEvent.click(await screen.findByTestId("composer-agent-edit"));
+    await screen.findByTestId("composer-agent-effort-default");
+    expect(screen.getAllByText("Advanced settings…")).toHaveLength(1);
   });
 
   it("skips unchanged knobs on Save (no spurious slash-command injection)", async () => {

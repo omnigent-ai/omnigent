@@ -227,6 +227,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
+import { formatEffortLabel } from "@/lib/effortLabels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   useConversations,
@@ -2392,11 +2393,9 @@ function HarnessConfigModal({
                       className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
                     >
                       <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                      {/* Codex efforts render raw — its ids aren't title-cased
-                      (matching the in-session gear's labeling). */}
                       {codexEffortLevels.map((level) => (
                         <SelectItem key={level} value={level}>
-                          {level}
+                          {formatEffortLabel(level)}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -3672,13 +3671,17 @@ export function NewChatLandingScreen() {
               },
             ];
       // Mirror the modal's Effort row: em-dash while routing picks per turn,
-      // else the picked level (Codex ids render raw, not title-cased).
+      // else the picked level.
       const effortRows = !isCodex
         ? []
         : [
             {
               label: "Effort",
-              value: routingOn ? EFFORT_UNAVAILABLE_PLACEHOLDER : pickedEffort || "Default",
+              value: routingOn
+                ? EFFORT_UNAVAILABLE_PLACEHOLDER
+                : pickedEffort
+                  ? formatEffortLabel(pickedEffort)
+                  : "Default",
             },
           ];
       return [
@@ -3742,11 +3745,19 @@ export function NewChatLandingScreen() {
       : selectedNativeHarness === "codex-native"
         ? codexModelOptions
         : [];
+  // Codex's effort ladder is per-model catalog metadata, so its options
+  // follow the picked model (the catalog default's ladder when none is
+  // picked) — the same resolution the Advanced settings modal uses.
+  const codexDefaultModelId = codexModelOptions.find((m) => m.isDefault)?.id ?? null;
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
     : selectedNativeHarness === "pi-native"
       ? PI_NATIVE_EFFORTS
-      : [];
+      : selectedNativeHarness === "codex-native"
+        ? codexEffortLevelsForModel(codexModelOptions, pickedModel || codexDefaultModelId).map(
+            (value) => ({ value, label: formatEffortLabel(value) }),
+          )
+        : [];
   const selectPickerModel = (model: string) => {
     if (!selectedNativeHarness) return;
     if (model === MODEL_SELECT_SMART) {
@@ -3759,7 +3770,20 @@ export function NewChatLandingScreen() {
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
     setPickedModel(picked);
     setCostControlMode(null);
-    writeHarnessOption(selectedNativeHarness, { model: picked, routing: "off" });
+    // Drop a picked Codex effort the newly-picked model's ladder doesn't
+    // offer, so no stale rung shows checked or rides the create call.
+    let effortPatch: { effort?: string } = {};
+    if (
+      selectedNativeHarness === "codex-native" &&
+      pickedEffort &&
+      !codexEffortLevelsForModel(codexModelOptions, picked || codexDefaultModelId).includes(
+        pickedEffort,
+      )
+    ) {
+      setPickedEffort("");
+      effortPatch = { effort: "" };
+    }
+    writeHarnessOption(selectedNativeHarness, { model: picked, routing: "off", ...effortPatch });
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectedNativeHarness) return;
@@ -3861,8 +3885,15 @@ export function NewChatLandingScreen() {
               : [];
       const model = catalog.find((option) => option.id === saved.model);
       const label = visibleModelLabel(model ? nativeModelLabel(model) : defaultModelLabel(catalog));
+      // Codex ladders are per-model catalog metadata, so format the saved
+      // level directly; Claude/Pi validate against their static vocabularies.
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
-      const effort = efforts.find((option) => option.value === saved.effort)?.label;
+      const effort =
+        native.iconKind === "codex"
+          ? saved.effort
+            ? formatEffortLabel(saved.effort)
+            : undefined
+          : efforts.find((option) => option.value === saved.effort)?.label;
       return [agent.id, [compactHarnessTriggerValue(label), effort].filter(Boolean).join(" ")];
     }),
   );

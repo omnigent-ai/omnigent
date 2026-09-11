@@ -44,6 +44,7 @@ import {
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
@@ -83,6 +84,7 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
+import { formatEffortLabel } from "@/lib/effortLabels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
@@ -214,8 +216,6 @@ import {
 } from "@/components/ui/select";
 import {
   ConfigRow,
-  EFFORT_SELECT_NONE,
-  EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
@@ -2139,10 +2139,9 @@ export function formatStatusModelLabel(
   return raw;
 }
 
-function formatStatusEffortLabel(effort: string | null, raw = false): string | null {
+function formatStatusEffortLabel(effort: string | null): string | null {
   if (!effort) return null;
-  if (raw) return effort;
-  return effort.toLowerCase() === "xhigh" ? "xHigh" : formatEffortLabel(effort);
+  return formatEffortLabel(effort);
 }
 
 /**
@@ -2150,16 +2149,15 @@ function formatStatusEffortLabel(effort: string | null, raw = false): string | n
  *
  * @param model - Model override or bound model id.
  * @param effort - Current reasoning effort override, if any.
- * @returns Compact label such as ``"gpt-5.5 xhigh"``.
+ * @returns Compact label such as ``"GPT-5.5 xHigh"``.
  */
 export function formatModelEffortStatusLabel(
   model: string | null,
   effort: string | null,
   codexModelOptions: readonly NativeModelOption[] = [],
 ): string | null {
-  const codexOption = model ? findNativeModelOption(codexModelOptions, model.trim()) : null;
   const modelLabel = formatStatusModelLabel(model, codexModelOptions);
-  const effortLabel = formatStatusEffortLabel(effort, codexOption !== null);
+  const effortLabel = formatStatusEffortLabel(effort);
   const parts = [modelLabel, effortLabel].filter((p): p is string => p != null && p.length > 0);
   return parts.length > 0 ? parts.join(" ") : null;
 }
@@ -4329,11 +4327,6 @@ export function shouldShowPollyCodexGoalControl(
   );
 }
 
-/** Title-case an effort level for the status label (``"high"`` → ``"High"``). */
-function formatEffortLabel(effort: string): string {
-  return effort.charAt(0).toUpperCase() + effort.slice(1);
-}
-
 /** Gear-modal row governing the routing of sub-agents the session spawns. */
 const SUBAGENT_ROUTING_LABEL = "Subagent routing";
 const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session spawns";
@@ -4342,25 +4335,25 @@ const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session s
  * In-session run-config modal opened from the composer's gear icon. The
  * live-committing analogue of the new-session ``HarnessConfigModal``: only the
  * knobs switchable mid-session appear — Model (which folds Smart Routing in as
- * an option where a dropdown exists), Effort, and Subagent routing. A session's
- * own Smart Routing is otherwise a create-time choice, and
- * permission/approval/cursor modes are launch-time only (no in-session state to
- * read or write), so they are intentionally absent.
+ * an option where a dropdown exists) and Subagent routing. Effort lives in the
+ * picker menu (one presentation shared with the new-session composer), so this
+ * dialog deliberately does not duplicate it. A session's own Smart Routing is
+ * otherwise a create-time choice, and permission/approval/cursor modes are
+ * launch-time only (no in-session state to read or write), so they are
+ * intentionally absent.
  *
  * Like the new-session modal, changes are drafted locally and only applied on
- * Save (through the store setters ``setModel`` / ``setEffort`` /
- * ``setCostControlMode`` / ``setSubagentRouting``); Cancel / dismiss discards
- * them. The setters enforce the model↔routing mutual exclusion server-side.
+ * Save (through the store setters ``setModel`` / ``setCostControlMode`` /
+ * ``setSubagentRouting``); Cancel / dismiss discards them. The setters enforce
+ * the model↔routing mutual exclusion server-side.
  */
 function SessionConfigModal({
   open,
   onOpenChange,
   harnessLabel,
   showModels,
-  showEffort,
   showClaudePermissionMode = false,
   showCodexApprovalMode = false,
-  effortLevels,
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
@@ -4370,16 +4363,13 @@ function SessionConfigModal({
   onOpenChange: (open: boolean) => void;
   harnessLabel: string | null;
   showModels: boolean;
-  showEffort: boolean;
   showClaudePermissionMode?: boolean;
   showCodexApprovalMode?: boolean;
-  effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
   subagentRoutingEligible: boolean;
 }) {
-  const selectedEffort = useSessionEffort();
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
@@ -4409,7 +4399,6 @@ function SessionConfigModal({
   // `draftModelId` is the resolved model id (null = Default sentinel);
   // `draftRoutingOn` folds Smart Routing in as a mutually-exclusive choice.
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
-  const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
   const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
   const [draftApprovalMode, setDraftApprovalMode] = useState(codexApprovalMode);
@@ -4430,7 +4419,6 @@ function SessionConfigModal({
   useEffect(() => {
     if (!open) return;
     setDraftModelId(resolvedModelId);
-    setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
     setDraftPermissionMode(claudePermissionMode);
     setDraftApprovalMode(codexApprovalMode);
@@ -4455,49 +4443,17 @@ function SessionConfigModal({
   // drafted model, else the "Default" sentinel (no override).
   const modelValue = draftRoutingOn ? MODEL_SELECT_SMART : (draftModelId ?? MODEL_SELECT_DEFAULT);
 
-  // Codex advertises a per-model effort ladder, so the dropdown must follow the
-  // DRAFTED model, not the committed one the parent computed — else picking
-  // Luna still lists Sol's "ultra". "Default" (null) resolves to the catalog
-  // default; non-codex harnesses use a model-independent ladder, so keep the
-  // parent's list.
-  const draftEffortLevels = useMemo(() => {
-    if (modelPickerKind !== "codex") return effortLevels;
-    const modelForEffort =
-      draftModelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
-    const levels = codexEffortLevelsForModel(codexModelOptions, modelForEffort);
-    return levels.length > 0 ? levels : effortLevels;
-  }, [modelPickerKind, codexModelOptions, draftModelId, llmModel, effortLevels]);
-
-  // Drop a picked level the newly-drafted model doesn't offer (Sol's "ultra"
-  // when switching to Luna) so no stale rung shows and Save never submits a
-  // level the model rejects.
-  const clampDraftEffortToModel = (modelId: string | null) => {
-    if (modelPickerKind !== "codex") return;
-    setDraftEffort((prev) => {
-      if (prev === null) return null;
-      const modelForEffort = modelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
-      return codexEffortLevelsForModel(codexModelOptions, modelForEffort).includes(prev)
-        ? prev
-        : null;
-    });
-  };
-
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRoutingOn(true);
       setDraftModelId(null);
-      // The router picks the model (and its effort) per turn, so an explicit
-      // effort can't apply — reset it so it doesn't ride along frozen.
-      setDraftEffort(null);
     } else if (value === MODEL_SELECT_DEFAULT) {
       setDraftModelId(null);
       setDraftRoutingOn(false);
-      clampDraftEffortToModel(null);
     } else {
       // Pinning a model turns routing off (mutually exclusive).
       setDraftModelId(value);
       setDraftRoutingOn(false);
-      clampDraftEffortToModel(value);
     }
   };
 
@@ -4511,13 +4467,11 @@ function SessionConfigModal({
 
   const save = () => {
     // Commit the changed knobs SEQUENTIALLY, awaiting each PATCH before the
-    // next. Claude-native applies model/effort changes by typing separate
-    // ``/model``/``/effort`` slash commands into its terminal, so firing them
-    // concurrently lets the injections interleave into one line (e.g.
-    // ``/model opus/effort medium``, which Claude rejects as a model name).
-    // Awaiting serializes them — each change lands in its own turn. Order
-    // matches HarnessConfigModal.save: model/routing first (their setters
-    // enforce the mutual exclusion server-side), then effort.
+    // next. Claude-native applies changes by typing slash commands into its
+    // terminal, so firing them concurrently lets the injections interleave
+    // into one line, which Claude rejects. Awaiting serializes them — each
+    // change lands in its own turn. Model/routing go first (their setters
+    // enforce the mutual exclusion server-side).
     void (async () => {
       const store = useChatStore.getState();
       try {
@@ -4543,12 +4497,8 @@ function SessionConfigModal({
             });
           if (costRoutingEligible && liveRoutingOn) await store.setCostControlMode("off");
         }
-        // Skip effort while routing is on: the router picks it per turn, and a
-        // stray ``/effort`` injection would just be noise.
-        if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
-          await store.setEffort(draftEffort);
-        // Same pane as /model + /effort, so this must stay in the awaited
-        // sequence rather than firing concurrently.
+        // Same pane as /model, so this must stay in the awaited sequence
+        // rather than firing concurrently.
         if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
           await store.setClaudePermissionMode(draftPermissionMode);
         // Codex approval switch drives Codex's own /permissions popup on the
@@ -4623,47 +4573,6 @@ function SessionConfigModal({
                 activeModelId={draftModelId}
                 componentId="chat.composer.model"
               />
-            </ConfigRow>
-          )}
-          {showEffort && (
-            <ConfigRow label="Effort" description="Reasoning depth vs. speed">
-              <Select
-                // Routing picks the model (and its effort) per turn, so an
-                // explicit effort is meaningless: the row is frozen and reads as
-                // an em-dash placeholder (Radix shows it for the empty value).
-                value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
-                onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
-                disabled={draftRoutingOn}
-                componentId="chat.composer.effort"
-                valueHasNoPii
-              >
-                <SelectTrigger
-                  className="w-full"
-                  data-testid="composer-config-effort"
-                  aria-label="Effort"
-                >
-                  <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
-                </SelectTrigger>
-                <SelectContent
-                  position="popper"
-                  align="start"
-                  className="w-(--radix-select-trigger-width)"
-                >
-                  <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                  {draftEffortLevels.map((level) => (
-                    <SelectItem
-                      key={level}
-                      value={level}
-                      data-effort-level={level}
-                      // Codex efforts render raw (its ids aren't title-cased);
-                      // other harnesses title-case for display.
-                      className={modelPickerKind === "codex" ? undefined : "capitalize"}
-                    >
-                      {formatStatusEffortLabel(level, modelPickerKind === "codex") ?? level}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
             </ConfigRow>
           )}
           {/* Hidden when the mode is unknown — Claude only renders its mode
@@ -4867,8 +4776,10 @@ function SessionHarnessPicker({
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
-  const { effectiveModel, modelLabel, modelOptions, pickerSelectedModel } =
-    useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const { llmModel, modelLabel, pickerSelectedModel } = useResolvedComposerModel(
+    modelPickerKind,
+    codexModelOptions,
+  );
   const nativeAgent =
     nativeCodingAgentForHarness(sessionHarness) ??
     (modelPickerKind ? nativeCodingAgentForHarness(modelPickerKind + "-native") : undefined);
@@ -4892,17 +4803,21 @@ function SessionHarnessPicker({
     showClaudePermissionMode,
     showCodexApprovalMode,
   });
-  const effortLabel =
-    showEffort && !routingOn
-      ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
-      : null;
+  const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
   const label = routingOn
     ? SMART_ROUTING_LABEL
     : (modelLabel ?? nativeAgent?.displayName ?? harnessLabel ?? "Session");
-  const availableEfforts =
-    modelPickerKind === "codex"
-      ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
-      : effortLevels;
+  // Codex advertises a per-model effort ladder, so the list follows the
+  // session's resolved model (falling back to the catalog default, then the
+  // reported model). An empty ladder falls back to the parent's list — the
+  // host row's levels before the session catalog lands.
+  const availableEfforts = useMemo(() => {
+    if (modelPickerKind !== "codex") return effortLevels;
+    const modelForEffort =
+      pickerSelectedModel ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+    const levels = codexEffortLevelsForModel(codexModelOptions, modelForEffort);
+    return levels.length > 0 ? levels : effortLevels;
+  }, [modelPickerKind, codexModelOptions, pickerSelectedModel, llmModel, effortLevels]);
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
@@ -4931,20 +4846,24 @@ function SessionHarnessPicker({
       setBusy(false);
     }
   };
-  const selectModel = (modelId: string | null) =>
-    void apply(async () => {
-      const store = useChatStore.getState();
-      const sourceSessionId = store.conversationId;
-      await store.setModel(modelId, {
-        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
-      });
-      if (
-        costRoutingEligible &&
-        routingOn &&
-        useChatStore.getState().conversationId === sourceSessionId
-      )
-        await store.setCostControlMode("off");
-    });
+  const selectEffort = (effort: string | null) =>
+    void apply(() => useChatStore.getState().setEffort(effort));
+  // The harness row, shown identically whether it drills into the effort
+  // flyout or opens the config dialog directly.
+  const harnessRowContent = (
+    <>
+      <ComposerAgentIcon agent={iconAgent} />
+      <span className="flex-1">{harnessLabel ?? "Session"}</span>
+      <span className="max-w-32 truncate text-xs text-muted-foreground">
+        {routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default")}
+      </span>
+      <span className="text-xs text-muted-foreground">Edit</span>
+    </>
+  );
+  // Whether the Advanced settings dialog has anything left to show — effort
+  // now lives in this menu, so a session with no other knobs gets no entry.
+  const advancedConfigurable =
+    showModels || showClaudePermissionMode || showCodexApprovalMode || subagentRoutingEligible;
   return (
     <>
       <DropdownMenu
@@ -5020,86 +4939,71 @@ function SessionHarnessPicker({
           <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
             {nativeAgent ? "Harnesses" : "Agents"}
           </DropdownMenuLabel>
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger
-              disabled={busy}
+          {showEffort ? (
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger
+                disabled={busy}
+                className="gap-2"
+                data-testid="composer-agent-edit"
+              >
+                {harnessRowContent}
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent
+                className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] max-w-[calc(100vw-2rem)] overflow-y-auto"
+                data-testid="composer-agent-config-menu"
+              >
+                {/* Inline effort list — the same presentation the new-session
+                    picker's config page uses, so the two composers agree. Model
+                    changes live in Advanced settings (the dialog owns the
+                    confirmation flow). */}
+                <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
+                  Effort
+                </DropdownMenuLabel>
+                <DropdownMenuCheckboxItem
+                  checked={!routingOn && selectedEffort === null}
+                  disabled={routingOn || busy}
+                  onCheckedChange={() => selectEffort(null)}
+                  onSelect={(event) => event.preventDefault()}
+                  data-testid="composer-agent-effort-default"
+                >
+                  Default
+                </DropdownMenuCheckboxItem>
+                {availableEfforts.map((effort) => (
+                  <DropdownMenuCheckboxItem
+                    key={effort}
+                    checked={!routingOn && effort === selectedEffort}
+                    disabled={routingOn || busy}
+                    onCheckedChange={() => selectEffort(effort)}
+                    onSelect={(event) => event.preventDefault()}
+                    data-testid={`composer-agent-effort-${effort}`}
+                  >
+                    {formatEffortLabel(effort)}
+                  </DropdownMenuCheckboxItem>
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          ) : (
+            <DropdownMenuItem
+              disabled={busy || !advancedConfigurable}
               className="gap-2"
+              onSelect={() => setOpen(true)}
               data-testid="composer-agent-edit"
             >
-              <ComposerAgentIcon agent={iconAgent} />
-              <span className="flex-1">{harnessLabel ?? "Session"}</span>
-              <span className="max-w-32 truncate text-xs text-muted-foreground">
-                {routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default")}
-              </span>
-              <span className="text-xs text-muted-foreground">Edit</span>
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent
-              className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] max-w-[calc(100vw-2rem)] overflow-y-auto"
-              data-testid="composer-agent-config-menu"
-            >
-              {showModels && (
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>Model</DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent className="composer-agent-menu max-h-[min(28rem,var(--radix-dropdown-menu-content-available-height))] max-w-[calc(100vw-2rem)] overflow-y-auto">
-                    <DropdownMenuItem disabled={busy} onSelect={() => selectModel(null)}>
-                      Default
-                    </DropdownMenuItem>
-                    {modelOptions.map((option) => (
-                      <DropdownMenuItem
-                        key={option.id}
-                        disabled={busy}
-                        onSelect={() => selectModel(option.id)}
-                        data-selected={!routingOn && option.id === pickerSelectedModel}
-                      >
-                        <span className="flex-1">
-                          {option.displayName ?? option.label ?? option.id}
-                        </span>
-                        {!routingOn && option.id === pickerSelectedModel && (
-                          <CheckIcon className="size-4" />
-                        )}
-                      </DropdownMenuItem>
-                    ))}
-                    {effectiveModel &&
-                      !modelOptions.some((option) => option.id === effectiveModel) && (
-                        <DropdownMenuItem disabled>
-                          {modelLabel ?? effectiveModel} (current)
-                        </DropdownMenuItem>
-                      )}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-              )}
-              {showEffort && (
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger disabled={routingOn || busy}>
-                    Effort
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent className="composer-agent-menu">
-                    {availableEfforts.map((effort) => (
-                      <DropdownMenuItem
-                        key={effort}
-                        onSelect={() => void apply(() => useChatStore.getState().setEffort(effort))}
-                        data-selected={effort === selectedEffort}
-                      >
-                        <span className="flex-1">{formatEffortLabel(effort)}</span>
-                        {effort === selectedEffort && <CheckIcon className="size-4" />}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-              )}
-              <DropdownMenuItem disabled={busy} onSelect={() => setOpen(true)}>
+              {harnessRowContent}
+            </DropdownMenuItem>
+          )}
+          {advancedConfigurable && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={busy}
+                onSelect={() => setOpen(true)}
+                data-testid="composer-advanced-settings"
+              >
                 Advanced settings…
               </DropdownMenuItem>
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            disabled={busy}
-            onSelect={() => setOpen(true)}
-            data-testid="composer-advanced-settings"
-          >
-            Advanced settings…
-          </DropdownMenuItem>
+            </>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
       {error && (
@@ -5112,10 +5016,8 @@ function SessionHarnessPicker({
         onOpenChange={setOpen}
         harnessLabel={harnessLabel}
         showModels={showModels}
-        showEffort={showEffort}
         showClaudePermissionMode={showClaudePermissionMode}
         showCodexApprovalMode={showCodexApprovalMode}
-        effortLevels={effortLevels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         costRoutingEligible={costRoutingEligible}
@@ -5164,7 +5066,7 @@ function useSessionConfigSummary({
   // Suppress Effort while routing is on: the router picks the model and its
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
-    const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
+    const effortValue = formatStatusEffortLabel(selectedEffort);
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
   if (!routingOn) {

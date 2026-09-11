@@ -1779,6 +1779,45 @@ describe("NewChatLandingScreen", () => {
     expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort High");
   });
 
+  it("offers the Codex effort section in the harness picker from its catalog ladder", () => {
+    // Codex's catalog advertises per-model effort ladders, so its config page
+    // renders the same inline Effort section Claude Code gets — the catalog
+    // default's ladder while no model is pinned, title-cased consistently.
+    renderLanding();
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    fireEvent.pointerDown(picker, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a2"));
+
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("GPT-5.5");
+    const efforts = screen.getByTestId("new-chat-landing-agent-efforts");
+    expect(efforts).toHaveTextContent("Low");
+    expect(efforts).toHaveTextContent("Medium");
+    expect(efforts).toHaveTextContent("High");
+    // GPT-5.5's ladder has no xhigh — another model's rung is never offered.
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-xhigh")).toBeNull();
+
+    // Picking GPT-5.6 swaps its ladder in (xHigh appears, Low disappears).
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"));
+    expect(screen.getByTestId("new-chat-landing-agent-effort-xhigh")).toHaveTextContent("xHigh");
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-low")).toBeNull();
+  });
+
+  it("drops a picked Codex effort when the newly-picked model's ladder lacks it", () => {
+    // A "low" picked on GPT-5.5 must not ride a switch to GPT-5.6 (whose
+    // ladder has no low): the pick resets to Default instead of silently
+    // submitting a level the model rejects.
+    renderLanding();
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    fireEvent.pointerDown(picker, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a2"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-low"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"));
+    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+  });
+
   it("caps and truncates a long model before fixed trailing controls", () => {
     vi.stubGlobal(
       "SpeechRecognition",
@@ -2722,13 +2761,14 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     openAgentConfig("a2");
     // With no model pinned, the row lists the catalog default's (GPT-5.5)
-    // ladder — raw Codex ids, never another model's rungs.
+    // ladder — title-cased like every harness's levels — never another
+    // model's rungs.
     openSelect("new-chat-landing-config-effort");
-    expect(screen.getByRole("option", { name: "low" })).toBeTruthy();
-    expect(screen.getByRole("option", { name: "medium" })).toBeTruthy();
-    expect(screen.queryByRole("option", { name: "xhigh" })).toBeNull();
-    fireEvent.click(screen.getByRole("option", { name: "high" }));
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
+    expect(screen.getByRole("option", { name: "Low" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Medium" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "xHigh" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "High" }));
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("High");
     saveConfig();
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -2751,12 +2791,12 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     openAgentConfig("a2");
     // Pin GPT-5.6: the Effort row follows the DRAFTED model, so its ladder
-    // swaps in (xhigh appears, low disappears).
+    // swaps in (xHigh appears, Low disappears).
     pickSelectOption("new-chat-landing-config-model", "GPT-5.6");
     openSelect("new-chat-landing-config-effort");
-    expect(screen.queryByRole("option", { name: "low" })).toBeNull();
-    fireEvent.click(screen.getByRole("option", { name: "xhigh" }));
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("xhigh");
+    expect(screen.queryByRole("option", { name: "Low" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "xHigh" }));
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("xHigh");
     // Back to Default (GPT-5.5), whose ladder has no xhigh: the stale rung
     // resets so Save can't commit a level the model rejects.
     openSelect("new-chat-landing-config-model");
@@ -2777,7 +2817,7 @@ describe("NewChatLandingScreen", () => {
   it("remembers the Codex effort per harness without leaking it onto Claude", () => {
     renderLanding();
     openAgentConfig("a2");
-    pickSelectOption("new-chat-landing-config-effort", "high");
+    pickSelectOption("new-chat-landing-config-effort", "High");
     saveConfig();
 
     // Claude's row reopens on its own remembered effort (nothing stored →
@@ -2788,7 +2828,7 @@ describe("NewChatLandingScreen", () => {
 
     // Codex reopens on the remembered pick, still valid for its ladder.
     openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("High");
   });
 
   it("sends the selected Codex launch model without changing Claude's remembered model", async () => {

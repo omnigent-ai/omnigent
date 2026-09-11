@@ -1,4 +1,10 @@
-"""E2E: codex-native model controls render Codex-returned metadata raw."""
+"""E2E: codex-native model controls render Codex catalog metadata.
+
+Model names render exactly as Codex's ``model/list`` returned them
+(``displayName`` verbatim); effort levels render through the shared
+title-casing every harness uses (``xhigh`` → ``xHigh``), in the picker's
+inline effort list and the composer pill alike.
+"""
 
 from __future__ import annotations
 
@@ -112,16 +118,17 @@ def _patch_session_as_codex_native(
     return patch_bodies
 
 
-def test_codex_native_picker_uses_raw_model_metadata(
+def test_codex_native_picker_uses_catalog_names_and_cased_efforts(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Render Codex's display name and effort id without local conversion.
+    """Render Codex display names verbatim and effort levels title-cased.
 
-    This covers the user-facing path that triggered the PR cleanup: the
-    session snapshot carries raw Codex ``model/list`` objects, the model menu
-    uses Codex's ``displayName`` when present, and the Codex effort row is not
-    visually title-cased by the shared effort-menu styling.
+    The session snapshot carries raw Codex ``model/list`` objects: the model
+    menu uses Codex's ``displayName`` exactly as returned, while the effort
+    level renders through the shared casing (``xhigh`` → ``xHigh``) in the
+    composer pill and the picker's inline effort list — the same presentation
+    every harness gets.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -138,31 +145,27 @@ def test_codex_native_picker_uses_raw_model_metadata(
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
         "Codex Pretty 5.5", timeout=15_000
     )
-    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xhigh")
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
     page.get_by_test_id("composer-config-gear").hover()
     expect(page.get_by_test_id("composer-config-gear-tooltip")).to_contain_text("Codex")
 
-    # Open the config modal; its Model dropdown renders Codex's displayName raw.
+    # Effort lives inline in the harness row's flyout, title-cased.
     page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    effort_item = page.get_by_test_id("composer-agent-effort-xhigh")
+    expect(effort_item).to_be_visible()
+    expect(effort_item).to_have_text("xHigh")
+
+    # The Advanced settings dialog owns Model — its dropdown renders Codex's
+    # displayName raw — and no longer duplicates the picker's Effort control.
     page.get_by_test_id("composer-advanced-settings").click()
     expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+    expect(page.get_by_test_id("composer-config-effort")).to_have_count(0)
     page.get_by_test_id("composer-config-model").click()
     model_row = page.locator('[role="option"][data-model-id="gpt-5.5"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("Codex Pretty 5.5")
-    # Re-select the current model to close the listbox without sending Escape
-    # to the surrounding dialog.
-    model_row.click()
-    expect(model_row).to_be_hidden()
-    effort_trigger = page.get_by_test_id("composer-config-effort")
-    expect(effort_trigger).to_be_visible()
-    effort_trigger.click()
-    effort_row = page.locator('[role="option"][data-effort-level="xhigh"]')
-    expect(effort_row).to_be_visible()
-    expect(effort_row).to_contain_text("xhigh")
-    # Codex effort ids render raw (not title-cased) even in the shared Select.
-    assert effort_row.evaluate("el => getComputedStyle(el).textTransform") == "none"
 
 
 def test_custom_codex_native_agent_keeps_model_and_effort_controls(
@@ -189,14 +192,16 @@ def test_custom_codex_native_agent_keeps_model_and_effort_controls(
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
         "Codex Pretty 5.5", timeout=15_000
     )
-    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xhigh")
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible()
     gear.click()
+    # Effort is offered inline in the harness flyout; Model in the dialog.
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-effort-xhigh")).to_be_visible()
     page.get_by_test_id("composer-advanced-settings").click()
     expect(page.get_by_test_id("composer-config-model")).to_be_visible()
-    expect(page.get_by_test_id("composer-config-effort")).to_contain_text("xhigh")
 
 
 def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
@@ -352,9 +357,9 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
     answers ``model/list`` (seconds to ~15s cold) — until then the gear used
     to show a sparse Model row and no Effort row at all. With the session
     catalog empty, the gear rides the host's cached pre-launch probe rows:
-    the Model menu lists them and the Effort menu offers their reasoning
-    efforts immediately. The session's own catalog supersedes them when it
-    lands (covered by the raw-metadata test above).
+    the Model menu lists them and the picker's inline effort list offers
+    their reasoning efforts immediately. The session's own catalog supersedes
+    them when it lands (covered by the catalog-metadata test above).
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real
@@ -370,24 +375,17 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+
+    # The picker's inline effort list offers exactly the host row's reasoning
+    # efforts although the session catalog is still empty.
+    page.get_by_test_id("composer-agent-edit").click()
+    for level in ("low", "medium", "xhigh"):
+        expect(page.get_by_test_id(f"composer-agent-effort-{level}")).to_be_visible(timeout=10_000)
+
+    # The dialog's Model menu lists the host probe row under its display name.
     page.get_by_test_id("composer-advanced-settings").click()
     expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
-
-    # The Effort row is present although the session catalog is still empty.
-    effort_trigger = page.get_by_test_id("composer-config-effort")
-    expect(effort_trigger).to_be_visible(timeout=10_000)
-
-    # The Model menu lists the host probe row under its display name.
     page.get_by_test_id("composer-config-model").click()
     model_row = page.locator('[role="option"][data-model-id="gpt-5.6-luna"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("GPT-5.6-Luna")
-    # Re-select the current model to close the listbox without sending
-    # Escape to the surrounding dialog.
-    model_row.click()
-    expect(model_row).to_be_hidden()
-
-    # The Effort menu offers exactly the host row's reasoning efforts.
-    effort_trigger.click()
-    for level in ("low", "medium", "xhigh"):
-        expect(page.locator(f'[role="option"][data-effort-level="{level}"]')).to_be_visible()
