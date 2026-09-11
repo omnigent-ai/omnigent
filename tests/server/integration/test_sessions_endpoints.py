@@ -4153,6 +4153,7 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
             "item_type": "message",
             "response_id": "resp_terminal_assistant",
             "source_id": "src_terminal_assistant_2",
+            "message_id": "codex:thread_1:turn_1:agentMessage:item_1",
             "item_data": {
                 "role": "assistant",
                 "agent": "claude-native-ui",
@@ -4222,6 +4223,7 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert published[1][1]["item"]["type"] == "function_call"
     assert published[2][1]["item"]["type"] == "function_call_output"
     assert published[3][1]["item"]["type"] == "message"
+    assert published[3][1]["message_id"] == "codex:thread_1:turn_1:agentMessage:item_1"
     assert published[4][1]["item"]["type"] == "terminal_command"
     assert published[5][1]["item"]["type"] == "terminal_command"
 

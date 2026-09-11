@@ -1971,6 +1971,22 @@ def test_subscribe_until_ready_replays_completed_turn_status(
                     "id": "thread_123",
                     "turns": [
                         {
+                            "id": "turn_122",
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "id": "item_old_user",
+                                    "content": [{"type": "text", "text": "already synced"}],
+                                },
+                                {
+                                    "type": "agentMessage",
+                                    "id": "item_old_agent",
+                                    "text": "already synced reply",
+                                },
+                            ],
+                        },
+                        {
                             "id": "turn_123",
                             "status": "completed",
                             "items": [
@@ -1985,7 +2001,7 @@ def test_subscribe_until_ready_replays_completed_turn_status(
                                     "text": "reply",
                                 },
                             ],
-                        }
+                        },
                     ],
                 }
             }
@@ -2025,6 +2041,7 @@ def test_subscribe_until_ready_replays_completed_turn_status(
 
     asyncio.run(run())
 
+    assert fake_client.requests == [("thread/resume", {"threadId": "thread_123"})]
     assert [payload["type"] for payload in posted] == [
         "external_conversation_item",
         "external_conversation_item",
@@ -2935,6 +2952,7 @@ def test_forwarder_persists_interrupted_codex_partial_agent_message(tmp_path: Pa
                     "content": [{"type": "output_text", "text": "partial answer"}],
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:interrupted-partial",
             },
         },
         {
@@ -4004,6 +4022,8 @@ def test_forwarder_keeps_streaming_when_native_tui_answers_codex_elicitation(
                     "content": [{"type": "output_text", "text": "after approval"}],
                 },
                 "response_id": "codex_turn_123",
+                "message_id": "codex:thread_123:turn_123:agentMessage:item_agent",
+                "source_id": "thread_123:turn_123:item_agent",
             },
         },
     ]
@@ -5818,6 +5838,7 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
                     "content": [{"type": "input_text", "text": "hello codex"}],
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:item_user",
             },
         },
         {
@@ -5830,6 +5851,8 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
                     "content": [{"type": "output_text", "text": "hello from codex"}],
                 },
                 "response_id": "codex_turn_123",
+                "message_id": "codex:thread_123:turn_123:agentMessage:item_agent",
+                "source_id": "thread_123:turn_123:item_agent",
             },
         },
     ]
@@ -6132,6 +6155,8 @@ def test_forwarder_posts_completed_codex_plan_item() -> None:
                     ],
                 },
                 "response_id": "codex_turn_123",
+                "message_id": "codex:thread_123:turn_123:plan:plan_123",
+                "source_id": "thread_123:turn_123:plan_123",
             },
         }
     ]
@@ -6232,6 +6257,7 @@ def test_forwarder_posts_codex_command_execution_tool_call() -> None:
                     "call_id": "call_abc123",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:call_abc123:call",
             },
         },
         {
@@ -6243,6 +6269,7 @@ def test_forwarder_posts_codex_command_execution_tool_call() -> None:
                     "output": "hello world\n",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:call_abc123:output",
             },
         },
     ]
@@ -6356,6 +6383,7 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: 
             "output": "collecting tests...\n1 passed\n",
         },
         "response_id": "codex_turn_123",
+        "source_id": "thread_123:turn_123:call_abc123:output",
     }
 
 
@@ -6535,6 +6563,7 @@ def test_forwarder_posts_codex_image_view_tool_call() -> None:
                     "call_id": "img_view_1",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:img_view_1:call",
             },
         },
         {
@@ -6546,6 +6575,7 @@ def test_forwarder_posts_codex_image_view_tool_call() -> None:
                     "output": "/repo/screenshot.png",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:img_view_1:output",
             },
         },
     ]
@@ -6653,6 +6683,7 @@ def test_forwarder_posts_codex_entered_review_mode_marker() -> None:
                     ],
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:review_1",
             },
         }
     ]
@@ -6688,6 +6719,7 @@ def test_forwarder_posts_codex_exited_review_mode_marker() -> None:
                     "content": [{"type": "output_text", "text": "Exited review mode"}],
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:review_2",
             },
         }
     ]
@@ -6773,6 +6805,7 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
                     "call_id": "codex_turn_diff_turn_123",
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:turn-diff:call",
             },
         },
         {
@@ -6784,6 +6817,7 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
                     "output": latest_diff,
                 },
                 "response_id": "codex_turn_123",
+                "source_id": "thread_123:turn_123:turn-diff:output",
             },
         },
         {
@@ -10817,15 +10851,15 @@ async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
 
 
 @pytest.mark.asyncio
-async def test_ensure_local_codex_resume_rollout_preserves_existing_rollout(
+async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     tmp_path: Path,
 ) -> None:
     """
-    Codex cold resume does not rewrite an existing local rollout.
+    Codex cold resume refreshes an existing rollout from server history.
 
-    A local rollout is Codex runtime state, not a cache. If it already
-    exists, the helper must return it untouched instead of fetching AP
-    history and rewriting the file.
+    The server transcript is authoritative on cold resume. A stale local
+    rollout must be atomically replaced with the committed Omnigent items
+    instead of silently preserving divergent history.
 
     :param tmp_path: Temporary directory for isolated ``CODEX_HOME``.
     """
@@ -10837,16 +10871,166 @@ async def test_ensure_local_codex_resume_rollout_preserves_existing_rollout(
         source_cwd="/stale/cwd",
     )
     before = existing.read_bytes()
+    workspace = (tmp_path / "workspace").resolve()
+    requested = False
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
-        Fail if Omnigent history is fetched despite a local rollout.
+        Serve the authoritative Omnigent history.
 
         :param request: Incoming mock HTTP request.
-        :returns: Mock Omnigent response.
+        :returns: Mock Omnigent item page.
         """
-        del request
-        raise AssertionError("existing rollout should avoid Omnigent history fetch")
+        nonlocal requested
+        requested = True
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "msg_server",
+                        "response_id": "codex_turn_server",
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "authoritative server history"}
+                        ],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=workspace,
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+    assert requested
+    assert rollout == existing
+    assert existing.read_bytes() != before
+    records = [json.loads(line) for line in existing.read_text().splitlines()]
+    assert records[0]["payload"]["cwd"] == str(workspace)
+    assert "authoritative server history" in json.dumps(records)
+    assert "/stale/cwd" not in json.dumps(records)
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_empty_server_history_wins(
+    tmp_path: Path,
+) -> None:
+    """A successful empty server history replaces divergent local-only records."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    existing = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/local/only",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=(tmp_path / "workspace").resolve(),
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+    assert rollout == existing
+    records = [json.loads(line) for line in existing.read_text().splitlines()]
+    assert [record["type"] for record in records] == ["session_meta"]
+    assert "/local/only" not in json.dumps(records)
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_uses_unique_atomic_temp_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Separate cold-resume writers never share a temporary rollout path."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    replaced_from: list[Path] = []
+    real_replace = os.replace
+
+    def recording_replace(source: os.PathLike[str], target: os.PathLike[str]) -> None:
+        replaced_from.append(Path(source))
+        real_replace(source, target)
+
+    monkeypatch.setattr(codex_native.os, "replace", recording_replace)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "msg_server",
+                        "response_id": "codex_turn_server",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "server history"}],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for _ in range(2):
+            await codex_native._ensure_local_codex_resume_rollout(
+                client,
+                session_id="conv_codex",
+                external_session_id=thread_id,
+                codex_home=codex_home,
+                workspace=(tmp_path / "workspace").resolve(),
+                model_provider="omnigent_databricks",
+                codex_path=None,
+            )
+
+    assert len(replaced_from) == 2
+    assert replaced_from[0] != replaced_from[1]
+    assert all(path.suffix == ".tmp" for path in replaced_from)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["server", "transport"])
+async def test_ensure_local_codex_resume_rollout_falls_back_when_server_unavailable(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    """A transient server failure falls back to a valid local rollout."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    existing = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/local/fallback",
+    )
+    before = existing.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failure == "transport":
+            raise httpx.ReadError("connection dropped", request=request)
+        return httpx.Response(503, json={"error": {"code": "unavailable"}})
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -10865,9 +11049,137 @@ async def test_ensure_local_codex_resume_rollout_preserves_existing_rollout(
 
 
 @pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_does_not_fallback_on_4xx(
+    tmp_path: Path,
+) -> None:
+    """A server contract rejection cannot revive a local Codex rollout."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    existing = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/local/fallback",
+    )
+    before = existing.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(click.ClickException, match="Failed to fetch history"):
+            await codex_native._ensure_local_codex_resume_rollout(
+                client,
+                session_id="conv_codex",
+                external_session_id=thread_id,
+                codex_home=codex_home,
+                workspace=(tmp_path / "workspace").resolve(),
+                model_provider="omnigent_databricks",
+                codex_path=None,
+            )
+
+    assert existing.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_rejects_invalid_local_fallback(
+    tmp_path: Path,
+) -> None:
+    """An unavailable server cannot fall back to a malformed local rollout."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    invalid = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "09"
+        / "11"
+        / f"rollout-2026-09-11T00-00-00-{thread_id}.jsonl"
+    )
+    invalid.parent.mkdir(parents=True)
+    invalid.write_text("not json\n", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(503, json={"error": {"code": "unavailable"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(click.ClickException, match="Failed to fetch history"):
+            await codex_native._ensure_local_codex_resume_rollout(
+                client,
+                session_id="conv_codex",
+                external_session_id=thread_id,
+                codex_home=codex_home,
+                workspace=(tmp_path / "workspace").resolve(),
+                model_provider="omnigent_databricks",
+                codex_path=None,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_item", [None, "not an object", 42])
+async def test_ensure_local_codex_resume_rollout_rejects_non_object_server_item(
+    tmp_path: Path,
+    bad_item: object,
+) -> None:
+    """Malformed entries in a successful server page fail closed."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    existing = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/local/fallback",
+    )
+    before = existing.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"data": [bad_item], "has_more": False})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(click.ClickException, match="non-object item at index 0"):
+            await codex_native._ensure_local_codex_resume_rollout(
+                client,
+                session_id="conv_codex",
+                external_session_id=thread_id,
+                codex_home=codex_home,
+                workspace=(tmp_path / "workspace").resolve(),
+                model_provider="omnigent_databricks",
+                codex_path=None,
+            )
+
+    assert existing.read_bytes() == before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("bad_item", "message"),
     [
+        (
+            {
+                "id": "fc_bad",
+                "response_id": "codex_turn_1",
+                "type": "function_call",
+                "name": "",
+                "call_id": "call_shell_1",
+                "arguments": "{}",
+            },
+            "function_call 'fc_bad' has an invalid name",
+        ),
+        (
+            {
+                "id": "fc_bad",
+                "response_id": "codex_turn_1",
+                "type": "function_call",
+                "name": "shell",
+                "call_id": "",
+                "arguments": "{}",
+            },
+            "function_call 'fc_bad' has an invalid call_id",
+        ),
         (
             {
                 "id": "fc_bad",
@@ -10877,6 +11189,16 @@ async def test_ensure_local_codex_resume_rollout_preserves_existing_rollout(
                 "call_id": "call_shell_1",
             },
             "function_call 'fc_bad' has non-string arguments",
+        ),
+        (
+            {
+                "id": "fco_bad",
+                "response_id": "codex_turn_1",
+                "type": "function_call_output",
+                "call_id": "",
+                "output": "done",
+            },
+            "function_call_output 'fco_bad' has an invalid call_id",
         ),
         (
             {

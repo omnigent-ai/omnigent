@@ -2482,8 +2482,12 @@ async def _persist_external_conversation_item(
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule(expected_seed_title=conv.title)
+    message_id = body.data.get("message_id")
     _publish_external_conversation_item(
-        session_id, persisted, cleared_pending_id=cleared_pending_id
+        session_id,
+        persisted,
+        cleared_pending_id=cleared_pending_id,
+        message_id=message_id if isinstance(message_id, str) else None,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
     return persisted.id

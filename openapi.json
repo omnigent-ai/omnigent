@@ -3172,6 +3172,18 @@
             ],
             "title": "Role",
             "type": "string"
+          },
+          "stream_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native live-preview stream finalized by this assistant message. Persisted so reconnect snapshots can suppress delayed preview chunks after the authoritative item.",
+            "title": "Stream Message Id"
           }
         },
         "required": [
