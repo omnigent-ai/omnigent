@@ -22,7 +22,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   };
 });
 
-// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// The workspace bar's PR chip reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
 vi.mock("@/hooks/useGithub", () => ({
@@ -223,6 +223,25 @@ describe("Composer status line (branch + context ring)", () => {
   it("hides the PR indicator when the tracked list is empty", () => {
     useGithubInfoMock.mockReturnValue({ data: { prs: [], pr: null } });
     renderComposer();
+    expect(screen.queryByTestId("composer-pr-link")).not.toBeInTheDocument();
+  });
+
+  it("renders the PR link as a chip in the workspace bar, not in the tray below", () => {
+    // The PR link belongs in the gray directory/branch bar ABOVE the
+    // composer. Rendering it in the status tray puts it below the composer
+    // card — and a PR alone must not resurrect that tray.
+    useGithubInfoMock.mockReturnValue({ data: { prs: [{ number: 42 }], pr: null } });
+    renderComposer();
+    const chip = screen.getByTestId("composer-pr-link");
+    expect(chip.closest('[data-testid="composer-workspace-controls"]')).toBeTruthy();
+    expect(statusLine()).toBeNull();
+  });
+
+  it("hides the PR chip on a sub-agent session", () => {
+    // A child session's workspace bar must not advertise the parent's PR;
+    // the gate has to survive the chip living in the workspace bar.
+    useGithubInfoMock.mockReturnValue({ data: { prs: [{ number: 42 }], pr: null } });
+    renderComposer({ subAgentLabel: "check-eligibility" });
     expect(screen.queryByTestId("composer-pr-link")).not.toBeInTheDocument();
   });
 
