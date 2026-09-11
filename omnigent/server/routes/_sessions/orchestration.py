@@ -6854,8 +6854,14 @@ async def _relay_runner_stream_once(
                             # external_session_usage path writes. Empty (a no-op)
                             # for a turn without context_tokens, so native
                             # terminal harnesses (which post their own usage) are
-                            # never double-written. Threaded: DB label write.
-                            _context_labels = _context_labels_from_turn_usage(_resp_usage)
+                            # never double-written. Threaded: the label build
+                            # (get_model_context_window may do a cold blocking
+                            # catalog fetch — offload it off the shared relay
+                            # loop, like the snapshot path does) and the DB
+                            # label write below.
+                            _context_labels = await asyncio.to_thread(
+                                _context_labels_from_turn_usage, _resp_usage
+                            )
                             if _context_labels:
                                 await asyncio.to_thread(
                                     conversation_store.set_labels,

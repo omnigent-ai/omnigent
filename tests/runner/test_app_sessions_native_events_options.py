@@ -3514,3 +3514,72 @@ async def test_events_compact_on_claude_sdk_clears_flag_on_pre_stream_failure() 
         "the in-progress flag must be cleared on the setup-failure path; a leaked "
         "entry corrupts later compaction signalling for this conversation."
     )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_buffered_compact_dispatches_standalone() -> None:
+    """A buffered /compact ahead of a follow-up message still dispatches on its own.
+
+    The non-native continuation drain coalesces the whole buffer and dispatches
+    only the last body. Left unguarded, a /compact buffered behind an active turn
+    with a user message queued after it would be buried in history (never the
+    turn prompt) and silently no-op — the runner already returned 200, so the
+    server won't fall back. The drain must dispatch a buffered /compact as its
+    own turn instead.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "b7d4e5f60718293a4b5c6d7e8f901234"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        # Post-active-turn state: a /compact buffered first, then a follow-up
+        # user message queued after it (the ordering that would bury /compact).
+        app.state.session_message_buffers[sid] = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "/compact"}],
+                "conversation_id": sid,
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "a follow-up message"}],
+                "conversation_id": sid,
+            },
+        ]
+
+        # Drain as the prior turn's continuation would, then wait for the turns
+        # it dispatches to reach the harness.
+        await app.state.check_and_start_next_turn(sid)
+
+        for _ in range(200):
+            if len(hc.posted_bodies) >= 2:
+                break
+            await asyncio.sleep(0.02)
+
+    # The fix drains one at a time when a /compact is buffered, so /compact
+    # dispatches as its OWN turn and the follow-up as a SECOND turn (the scripted
+    # /compact turn completes immediately, kicking off the next drain) → two
+    # dispatches. The buggy coalescing drain folds both into ONE turn (follow-up
+    # as the prompt, /compact buried in history, never run as a slash command)
+    # → a single dispatch. Assert on the count, not body content: the harness
+    # fake captures the shared history list by reference, so a later append is
+    # visible on an already-captured body.
+    n = len(hc.posted_bodies)
+    assert n == 2, (
+        "a buffered /compact must dispatch as its own turn (two dispatches: /compact, then "
+        f"the follow-up), not be coalesced into one; got {n} dispatch(es)"
+    )
+    assert _body_carries_text(hc.posted_bodies[0], "/compact"), (
+        "the first dispatched turn must carry the /compact command"
+    )
