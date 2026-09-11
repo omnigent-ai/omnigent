@@ -3869,6 +3869,7 @@ function ComposerImpl({
                 <ComposerPermissionPicker
                   label="Permissions"
                   value={permissionLabel || "Permissions"}
+                  current={showClaudePermissionMode ? claudePermissionMode : codexApprovalMode}
                   options={permissionOptions}
                   disabled={isReadOnly || unreachable || configBusy}
                   onSelect={(mode) => void changePermission(mode)}

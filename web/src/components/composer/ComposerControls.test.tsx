@@ -82,7 +82,62 @@ describe("shared composer controls", () => {
     fireEvent.keyDown(trigger, {
       key: "ArrowDown",
     });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Plan" }));
     expect(onSelect).toHaveBeenCalledWith("plan");
+  });
+
+  it("marks the current mode's row as checked and leaves the rest unchecked", () => {
+    render(
+      <ComposerPermissionPicker
+        label="Permissions"
+        value="Auto"
+        current="auto"
+        options={[
+          { value: "default", label: "Manual" },
+          { value: "auto", label: "Auto" },
+          { value: "plan", label: "Plan" },
+        ]}
+        onSelect={vi.fn()}
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "Permissions: Auto" }), {
+      key: "ArrowDown",
+    });
+    const currentRow = screen.getByTestId("composer-permission-option-auto");
+    expect(currentRow).toHaveAttribute("aria-checked", "true");
+    // The row carries the shared check-indicator slot, like the other
+    // current-value menus.
+    expect(
+      currentRow.querySelector('[data-slot="dropdown-menu-radio-item-indicator"]'),
+    ).toBeInTheDocument();
+    for (const other of ["default", "plan"]) {
+      expect(screen.getByTestId(`composer-permission-option-${other}`)).not.toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+    }
+  });
+
+  it("marks no row when the current mode is unknown", () => {
+    render(
+      <ComposerPermissionPicker
+        label="Permissions"
+        value="Permissions"
+        options={[
+          { value: "default", label: "Manual" },
+          { value: "auto", label: "Auto" },
+        ]}
+        onSelect={vi.fn()}
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "Permissions: Permissions" }), {
+      key: "ArrowDown",
+    });
+    for (const mode of ["default", "auto"]) {
+      expect(screen.getByTestId(`composer-permission-option-${mode}`)).not.toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+    }
   });
 });
