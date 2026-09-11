@@ -4197,6 +4197,15 @@ describe("new-chat workspace rail", () => {
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
+  it("collapses when New Chat replaces the already selected landing URL", () => {
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    fireEvent.click(screen.getByTestId("nav-home-replace"));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+  });
+
   it("collapses for explicit New Chat, history entry, and replacement from another route", () => {
     mockConversations([]);
     renderShell("/?project=ready");

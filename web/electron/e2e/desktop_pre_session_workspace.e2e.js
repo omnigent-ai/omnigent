@@ -643,6 +643,15 @@ describe(
           await launched.window.getByTestId("new-chat-landing-agent-select").click();
           await launched.window.getByTestId("new-chat-landing-custom-agents").hover();
           await launched.window.getByText(/hello_world/i, { exact: true }).click();
+          await launched.window.keyboard.press("Escape");
+          await launched.window.waitForFunction(
+            () => getComputedStyle(document.body).pointerEvents !== "none",
+          );
+          assert.equal(
+            await launched.window.locator('[role="menu"]:visible, [role="dialog"]:visible').count(),
+            0,
+            "agent picker remained visible after dismissal",
+          );
           await launched.window
             .getByTestId("new-chat-landing-input")
             .fill("Start the demo workspace");
@@ -659,13 +668,25 @@ describe(
           assert.equal(overlapsBrowserPane, false, "native browser bounds overlapped Start");
           const startHitTarget = await launched.window.evaluate(({ x, y, width, height }) => {
             const target = document.elementFromPoint(x + width / 2, y + height / 2);
+            const button = document.querySelector('[data-testid="new-chat-landing-submit"]');
             return {
               html: target?.outerHTML.slice(0, 500) ?? null,
-              path: target
-                ? Array.from(target.closest("button") ? [target.closest("button")] : [])
-                    .map((element) => element.outerHTML.slice(0, 500))
-                    .join("\n")
-                : null,
+              ancestors: button
+                ? Array.from(
+                    (function* () {
+                      let element = button;
+                      while (element) {
+                        yield element;
+                        element = element.parentElement;
+                      }
+                    })(),
+                    (element) => ({
+                      tag: element.tagName,
+                      className: element.className,
+                      pointerEvents: getComputedStyle(element).pointerEvents,
+                    }),
+                  )
+                : [],
             };
           }, startBounds);
           fs.writeFileSync(
@@ -676,7 +697,7 @@ describe(
             BrowserWindow.getAllWindows()[0].webContents.focus();
           });
           startClicked = true;
-          await launched.window.getByTestId("new-chat-landing-submit").click({ timeout: 2_000 });
+          await launched.window.getByTestId("new-chat-landing-submit").click();
           await launched.window.waitForURL(/\/c\/[^/]+$/, { timeout: 45_000 });
           assert.equal(sessionCreateRequests, 1, "Start did not issue exactly one session POST");
           const sessionId = new URL(launched.window.url()).pathname

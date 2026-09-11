@@ -456,8 +456,8 @@ export function AppShell() {
     // Prefill can normalize search params without starting a new landing visit.
     if (
       previous?.pathname === location.pathname &&
-      (navigationType === "REPLACE" ||
-        (navigationType === undefined && previous.search !== location.search))
+      previous.search !== location.search &&
+      (navigationType === "REPLACE" || navigationType === undefined)
     )
       return;
     setRightPanelOpen(false);
