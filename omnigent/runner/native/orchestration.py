@@ -777,37 +777,141 @@ def _kiro_session_workspace(session_workspace: str | None) -> Path:
     return Path(raw.strip()).expanduser().resolve()
 
 
+# A runner->server ``GET /v1/sessions/<id>`` launch-config read that times out
+# under load is a transient upstream condition, not an Omnigent defect. Left
+# un-retried it fails Codex terminal launch, ensure, and the next turn from one
+# blip; a bounded retry rides it out (the read is idempotent) before surfacing
+# a hard error, so genuinely-broken cases still fail loud.
+_LAUNCH_CONFIG_FETCH_TIMEOUT_S = 10.0
+_LAUNCH_CONFIG_FETCH_ATTEMPTS = 3
+_LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S = 0.5
+_LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S = 4.0
+_LAUNCH_CONFIG_RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
+
+
+def _launch_config_fetch_is_transient(exc: httpx.HTTPError) -> bool:
+    """Whether a launch-config fetch HTTP error is a transient, retryable condition.
+
+    :param exc: The ``httpx`` error raised by the snapshot GET.
+    :returns: ``True`` for read/connect/protocol failures that a retry may
+        clear (the deployed ``httpx.ReadTimeout`` among them); ``False`` for
+        anything else, which is surfaced immediately.
+    """
+    return isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ),
+    )
+
+
+async def _launch_config_retry_sleep(delay: float) -> None:
+    """Sleep between launch-config fetch attempts (patched to a no-op in tests)."""
+    await asyncio.sleep(delay)
+
+
+async def _fetch_native_launch_snapshot(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    runtime_label: str,
+) -> dict[str, Any]:
+    """Fetch and validate a session snapshot for a native-terminal launch config.
+
+    Reads ``GET /v1/sessions/<id>`` and returns the parsed snapshot object.
+    A transient runner->server condition (a read/connect timeout, or a
+    ``429``/``502``/``503``/``504``) is retried with bounded exponential
+    backoff so one blip under load does not tear through native terminal
+    launch, ensure, and the next turn. A non-transient status, a persistent
+    transient failure, or a malformed body still raises ``RuntimeError`` so
+    genuinely-broken launches fail loud.
+
+    :param server_client: Runner's Omnigent server HTTP client.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param runtime_label: Human-readable harness name for error text, e.g.
+        ``"Codex"``.
+    :returns: The snapshot mapping.
+    :raises RuntimeError: If the client is missing, the fetch cannot be
+        completed, or the response is not a JSON object.
+    """
+    if server_client is None:
+        raise RuntimeError(
+            f"server_client is required for runner-owned {runtime_label} terminals."
+        )
+    path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
+    resp: httpx.Response | None = None
+    for attempt in range(1, _LAUNCH_CONFIG_FETCH_ATTEMPTS + 1):
+        last_attempt = attempt == _LAUNCH_CONFIG_FETCH_ATTEMPTS
+        try:
+            resp = await server_client.get(path, timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S)
+        except httpx.HTTPError as exc:
+            if last_attempt or not _launch_config_fetch_is_transient(exc):
+                raise RuntimeError(
+                    f"Could not fetch {runtime_label} launch config for {session_id!r}."
+                ) from exc
+            _logger.warning(
+                "Transient %s launch-config fetch error (attempt %d/%d) for "
+                "session=%s; retrying: %s",
+                runtime_label,
+                attempt,
+                _LAUNCH_CONFIG_FETCH_ATTEMPTS,
+                session_id,
+                type(exc).__name__,
+                extra={"session_id": session_id},
+            )
+        else:
+            if resp.status_code == 200:
+                break
+            if last_attempt or resp.status_code not in _LAUNCH_CONFIG_RETRYABLE_STATUS:
+                raise RuntimeError(
+                    f"Could not fetch {runtime_label} launch config for {session_id!r}: "
+                    f"GET /v1/sessions returned {resp.status_code}."
+                )
+            _logger.warning(
+                "Transient %s launch-config fetch status %d (attempt %d/%d) for "
+                "session=%s; retrying",
+                runtime_label,
+                resp.status_code,
+                attempt,
+                _LAUNCH_CONFIG_FETCH_ATTEMPTS,
+                session_id,
+                extra={"session_id": session_id},
+            )
+        backoff = min(
+            _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S * (2 ** (attempt - 1)),
+            _LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S,
+        )
+        await _launch_config_retry_sleep(backoff)
+    assert resp is not None  # loop either broke on 200 or raised
+    try:
+        snapshot = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Could not fetch {runtime_label} launch config for {session_id!r}: invalid JSON."
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise RuntimeError(
+            f"Could not fetch {runtime_label} launch config for {session_id!r}: "
+            "snapshot was not a JSON object."
+        )
+    return snapshot
+
+
 async def _kiro_native_launch_config(
     *,
     session_id: str,
     server_client: httpx.AsyncClient | None,
 ) -> _KiroNativeLaunchConfig:
     """Fetch and validate persisted Kiro launch config for a session."""
-    if server_client is None:
-        raise RuntimeError("server_client is required for runner-owned Kiro terminals.")
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            timeout=10.0,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Could not fetch Kiro launch config for {session_id!r}.") from exc
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Could not fetch Kiro launch config for {session_id!r}: "
-            f"GET /v1/sessions returned {resp.status_code}."
-        )
-    try:
-        snapshot = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Could not fetch Kiro launch config for {session_id!r}: invalid JSON."
-        ) from exc
-    if not isinstance(snapshot, dict):
-        raise RuntimeError(
-            f"Could not fetch Kiro launch config for {session_id!r}: "
-            "snapshot was not a JSON object."
-        )
+    snapshot = await _fetch_native_launch_snapshot(
+        server_client=server_client,
+        session_id=session_id,
+        runtime_label="Kiro",
+    )
     terminal_launch_args = snapshot.get("terminal_launch_args")
     if terminal_launch_args is not None and not (
         isinstance(terminal_launch_args, list)
@@ -858,30 +962,11 @@ async def _pi_native_launch_config(
     :param server_client: Runner Omnigent server client.
     :returns: Parsed launch config.
     """
-    if server_client is None:
-        raise RuntimeError("server_client is required for runner-owned Pi terminals.")
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            timeout=10.0,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Could not fetch Pi launch config for {session_id!r}.") from exc
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Could not fetch Pi launch config for {session_id!r}: "
-            f"GET /v1/sessions returned {resp.status_code}."
-        )
-    try:
-        snapshot = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Could not fetch Pi launch config for {session_id!r}: invalid JSON."
-        ) from exc
-    if not isinstance(snapshot, dict):
-        raise RuntimeError(
-            f"Could not fetch Pi launch config for {session_id!r}: snapshot was not a JSON object."
-        )
+    snapshot = await _fetch_native_launch_snapshot(
+        server_client=server_client,
+        session_id=session_id,
+        runtime_label="Pi",
+    )
     terminal_launch_args = snapshot.get("terminal_launch_args")
     if terminal_launch_args is not None and not (
         isinstance(terminal_launch_args, list)
@@ -960,31 +1045,11 @@ async def _codex_native_launch_config(
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
     """
-    if server_client is None:
-        raise RuntimeError("server_client is required for runner-owned Codex terminals.")
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            timeout=10.0,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Could not fetch Codex launch config for {session_id!r}.") from exc
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Could not fetch Codex launch config for {session_id!r}: "
-            f"GET /v1/sessions returned {resp.status_code}."
-        )
-    try:
-        snapshot = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Could not fetch Codex launch config for {session_id!r}: invalid JSON."
-        ) from exc
-    if not isinstance(snapshot, dict):
-        raise RuntimeError(
-            f"Could not fetch Codex launch config for {session_id!r}: "
-            "snapshot was not a JSON object."
-        )
+    snapshot = await _fetch_native_launch_snapshot(
+        server_client=server_client,
+        session_id=session_id,
+        runtime_label="Codex",
+    )
     terminal_launch_args = snapshot.get("terminal_launch_args")
     if terminal_launch_args is not None and not (
         isinstance(terminal_launch_args, list)
@@ -1126,31 +1191,11 @@ async def _opencode_native_launch_config(
     :returns: Parsed launch config.
     :raises RuntimeError: If the snapshot or required runner env is missing.
     """
-    if server_client is None:
-        raise RuntimeError("server_client is required for runner-owned OpenCode terminals.")
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            timeout=10.0,
-        )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Could not fetch OpenCode launch config for {session_id!r}.") from exc
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Could not fetch OpenCode launch config for {session_id!r}: "
-            f"GET /v1/sessions returned {resp.status_code}."
-        )
-    try:
-        snapshot = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Could not fetch OpenCode launch config for {session_id!r}: invalid JSON."
-        ) from exc
-    if not isinstance(snapshot, dict):
-        raise RuntimeError(
-            f"Could not fetch OpenCode launch config for {session_id!r}: "
-            "snapshot was not a JSON object."
-        )
+    snapshot = await _fetch_native_launch_snapshot(
+        server_client=server_client,
+        session_id=session_id,
+        runtime_label="OpenCode",
+    )
     terminal_launch_args = snapshot.get("terminal_launch_args")
     if terminal_launch_args is not None and not (
         isinstance(terminal_launch_args, list)

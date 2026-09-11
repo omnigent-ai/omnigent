@@ -14,7 +14,31 @@ from typing import Any
 import httpx
 import pytest
 
+import omnigent.runner.native.orchestration as _orchestration
 from omnigent.runner.app import _codex_native_launch_config
+
+
+@pytest.fixture(autouse=True)
+def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Make launch-config retry backoff instant and record the delays slept.
+
+    Every test in this module drives the retry loop; sleeping the real backoff
+    would make the suite slow. Patching the (deliberately extracted) sleep hook
+    to a recorder keeps the tests fast and lets them assert the backoff schedule
+    without coupling to wall-clock time. ``RUNNER_SERVER_URL`` is set here too so
+    tests that reach the config-build step don't fail for a missing-env reason.
+    """
+    slept: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    # raising=False so the retry-behavior tests fail on their behavioral
+    # assertion (no recovery) rather than erroring in setup when run against a
+    # tree that predates the retry hook.
+    monkeypatch.setattr(_orchestration, "_launch_config_retry_sleep", _fake_sleep, raising=False)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    return slept
 
 
 class _Resp:
@@ -43,6 +67,26 @@ class _Client:
             raise self._raise_exc
         assert self._resp is not None
         return self._resp
+
+
+class _SequenceClient:
+    """Async client stub that plays a fixed sequence of ``get`` outcomes.
+
+    Each action is either an ``Exception`` to raise or a ``_Resp`` to return,
+    consumed in order across calls. Records how many times ``get`` ran so a test
+    can assert exactly how many fetch attempts the retry loop made.
+    """
+
+    def __init__(self, actions: list[Any]) -> None:
+        self._actions = list(actions)
+        self.calls = 0
+
+    async def get(self, url: str, timeout: float | None = None) -> _Resp:
+        self.calls += 1
+        action = self._actions[self.calls - 1]
+        if isinstance(action, Exception):
+            raise action
+        return action
 
 
 async def _run(client: _Client | None, session_id: str = "conv_1") -> Any:
@@ -165,3 +209,65 @@ async def test_bypass_sandbox_defaults_off_unless_label_is_one(
         snapshot["labels"] = labels
     cfg = await _run(_Client(_Resp(200, snapshot)))
     assert cfg.bypass_sandbox is False
+
+
+@pytest.mark.asyncio
+async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) -> None:
+    """A first-attempt read timeout is retried, and a follow-up 200 succeeds.
+
+    This is the reported failure: a single runner->server read timeout under
+    load used to abort the terminal launch. The idempotent read should instead
+    be retried and recover.
+    """
+    snapshot = {"workspace": "/tmp/repo", "terminal_launch_args": ["--config", "x=y"]}
+    client = _SequenceClient([httpx.ReadTimeout("slow"), _Resp(200, snapshot)])
+    cfg = await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    assert cfg.terminal_launch_args == ["--config", "x=y"]
+    assert client.calls == 2, "Should retry once after the transient read timeout."
+    assert retry_sleeps == [pytest.approx(0.5)], "One backoff sleep before the retry."
+
+
+@pytest.mark.asyncio
+async def test_persistent_transient_failure_raises_after_attempt_cap(
+    retry_sleeps: list[float],
+) -> None:
+    """A read timeout on every attempt exhausts the bounded retries and fails loud."""
+    client = _SequenceClient([httpx.ReadTimeout("slow")] * 3)
+    with pytest.raises(RuntimeError, match="Could not fetch Codex launch config"):
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    assert client.calls == 3, "Should attempt exactly the configured cap, then fail."
+    assert retry_sleeps == [pytest.approx(0.5), pytest.approx(1.0)], (
+        "Two exponentially-growing backoff sleeps between the three attempts."
+    )
+
+
+@pytest.mark.asyncio
+async def test_retryable_status_recovers_on_retry(retry_sleeps: list[float]) -> None:
+    """A retryable upstream status (503) is retried, and a follow-up 200 succeeds."""
+    snapshot = {"workspace": "/tmp/repo"}
+    client = _SequenceClient([_Resp(503, None), _Resp(200, snapshot)])
+    cfg = await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    assert cfg.workspace.name == "repo"
+    assert client.calls == 2, "A 503 should be retried, not surfaced immediately."
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_status_fails_without_retry(retry_sleeps: list[float]) -> None:
+    """A non-retryable status (404) fails on the first attempt without consuming retries."""
+    client = _SequenceClient([_Resp(404, None)])
+    with pytest.raises(RuntimeError, match="returned 404"):
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    assert client.calls == 1, "A 404 is a hard error, not a transient blip."
+    assert retry_sleeps == [], "No backoff on a non-retryable status."
+
+
+@pytest.mark.asyncio
+async def test_non_transient_transport_error_fails_without_retry(
+    retry_sleeps: list[float],
+) -> None:
+    """A non-transient httpx error surfaces immediately, without burning retries."""
+    client = _SequenceClient([httpx.HTTPError("nope")])
+    with pytest.raises(RuntimeError, match="Could not fetch Codex launch config"):
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    assert client.calls == 1, "A non-transient error should not be retried."
+    assert retry_sleeps == []
