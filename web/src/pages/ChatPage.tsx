@@ -3167,9 +3167,8 @@ function ComposerImpl(
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
   const { appendEntry, recallPrevious, recallNext, resetCursor } = usePromptHistory(conversationId);
-  // Set just before recall sets `value`; cleared when the resulting onChange
-  // fires. Lets onChange distinguish "user typed" (reset cursor) from
-  // "recall replaced the value" (keep cursor).
+  // Allow continued navigation through recalled entries with quote cards.
+  // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
 
   const replyQuoteInsertedRef = useRef(false);
@@ -3183,6 +3182,7 @@ function ComposerImpl(
       setCommandError(null);
       dismissMention();
       resetCursor();
+      recallingRef.current = false;
     },
   }));
 
@@ -3512,8 +3512,8 @@ function ComposerImpl(
         ? detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length)
         : null,
     );
-    if (recallingRef.current) recallingRef.current = false;
-    else resetCursor();
+    recallingRef.current = false;
+    resetCursor();
   };
 
   const handleTextFocus = (id: string | null, element: HTMLTextAreaElement) => {
@@ -3696,6 +3696,8 @@ function ComposerImpl(
                 onGrowth={onViewportShrinkPinScroll}
                 onRemove={(id) => {
                   removeQuote(id);
+                  resetCursor();
+                  recallingRef.current = false;
                   textareaRef.current = tailTextareaRef.current;
                   dirtyRef.current = true;
                   dismissMention();

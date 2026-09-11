@@ -2603,6 +2603,43 @@ describe("Composer reply quotes", () => {
     expect(props.onSend).toHaveBeenLastCalledWith(...sent);
   });
 
+  it("exits history recall when a quote card is removed", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Introduction", text: "Actual card" }],
+      text: "Answer to keep",
+    };
+    localStorage.setItem(
+      "omnigent:prompt-history:conv_test",
+      JSON.stringify([{ text: serializeReplyDraft(replyDraft), replyDraft }]),
+    );
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
+    textarea().setSelectionRange(0, 0);
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    const edited = "Introduction\n\nAnswer to keep";
+    expect(textarea()).toHaveValue(edited);
+    textarea().setSelectionRange(edited.length, edited.length);
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    expect(textarea()).toHaveValue(edited);
+    expect(getSessionDraft("conv_test")?.text).toBe(edited);
+  });
+
+  it("exits history recall on the first manual text edit", () => {
+    localStorage.setItem("omnigent:prompt-history:conv_test", JSON.stringify(["Older prompt"]));
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
+    textarea().setSelectionRange(0, 0);
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue("Older prompt");
+    const edited = "My edited prompt";
+    fireEvent.change(textarea(), { target: { value: edited } });
+    textarea().setSelectionRange(edited.length, edited.length);
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    expect(textarea()).toHaveValue(edited);
+  });
+
   it.each([false, true])("restores failed sends using explicit metadata only: %s", (structured) => {
     const replyDraft: StoredReplyDraft = {
       version: 1,
