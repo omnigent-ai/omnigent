@@ -44,6 +44,29 @@ describe("isCommandPaletteHotkey", () => {
 });
 
 describe("useCommandPaletteHotkey", () => {
+  it("opens session search with Cmd+P without printing or toggling commands", () => {
+    const onToggle = vi.fn();
+    const onSearch = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle, true, true, onSearch));
+    expect(press({ key: "p", metaKey: true }).defaultPrevented).toBe(true);
+    expect(onSearch).toHaveBeenCalledOnce();
+    expect(onToggle).not.toHaveBeenCalled();
+    press({ key: "p", metaKey: true, shiftKey: true });
+    press({ key: "p", metaKey: true, repeat: true });
+    press({ key: "p", ctrlKey: true });
+    expect(onSearch).toHaveBeenCalledOnce();
+  });
+
+  it("uses Ctrl+P on Windows/Linux but yields to terminal history", () => {
+    const onSearch = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(vi.fn(), true, false, onSearch));
+    press({ key: "p", ctrlKey: true });
+    expect(onSearch).toHaveBeenCalledOnce();
+    document.body.innerHTML = '<div class="xterm"><textarea></textarea></div>';
+    document.querySelector("textarea")!.focus();
+    expect(press({ key: "p", ctrlKey: true }).defaultPrevented).toBe(false);
+    expect(onSearch).toHaveBeenCalledOnce();
+  });
   it("toggles on Cmd+K and prevents the browser default", () => {
     const onToggle = vi.fn();
     renderHook(() => useCommandPaletteHotkey(onToggle, true, true));

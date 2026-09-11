@@ -53,6 +53,10 @@ export function usePinnedSessionHotkeys(
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
+      if (e.defaultPrevented || e.repeat) return;
+      const focused = document.activeElement;
+      if (focused instanceof Element && focused.closest(".xterm, .monaco-editor, [role=dialog]"))
+        return;
       // Platform command modifier required; Shift left to other bindings.
       if (e.shiftKey || !hasCommandModifier(e, isMac)) return;
 
