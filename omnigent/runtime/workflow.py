@@ -1585,11 +1585,18 @@ def _build_acp_cli_spawn_env(
 
     # Managed-connect support for jcode: point it at a session-private JCODE_HOME
     # (with a config.toml pinning the gateway provider) + a fresh broker bearer. A
-    # no-op when not connected (connect_jcode_gateway_env returns None).
+    # no-op when not connected (connect_jcode_gateway_env returns None), and — like the
+    # other connect harnesses — suppressed when the spec configures its own API key, so
+    # an explicit key is never silently rerouted through the owner's gateway.
     if harness == "jcode":
+        from omnigent.host.databricks_credential import api_key_auth_precludes_broker
         from omnigent.host.jcode_databricks import connect_jcode_gateway_env
 
-        gateway_env = connect_jcode_gateway_env(session_id=session_id)
+        gateway_env = (
+            None
+            if api_key_auth_precludes_broker(spec)
+            else connect_jcode_gateway_env(session_id=session_id)
+        )
         if gateway_env is not None:
             env.update(gateway_env)
             # The ACP wrap forwards only passthrough-named vars to the jcode subprocess,

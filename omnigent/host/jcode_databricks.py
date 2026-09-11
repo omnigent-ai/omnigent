@@ -19,6 +19,7 @@ and non-connected sandboxes are untouched.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import tempfile
@@ -28,6 +29,7 @@ from omnigent.host.databricks_credential import (
     _read_sidecar,
     _sidecar_path,
     fetch_broker_bearer,
+    https_url_on_workspace_host,
 )
 
 _logger = logging.getLogger(__name__)
@@ -88,7 +90,7 @@ def _session_jcode_home(session_id: str | None) -> Path:
     return Path(home)
 
 
-def _write_session_config(jcode_home: Path, *, host: str, model: str) -> None:
+def _write_session_config(jcode_home: Path, *, base_url: str, model: str) -> None:
     """Write the session-private ``config.toml`` pinning jcode's ``dbx`` provider.
 
     Omnigent owns this file (0600, under the private ``JCODE_HOME``), so the bearer's
@@ -98,24 +100,30 @@ def _write_session_config(jcode_home: Path, *, host: str, model: str) -> None:
     ``JCODE_DBX_TOKEN`` jcode reads it from. Rewritten on every spawn, so a tampered
     file is reverted.
     """
-    base_url = f"{host.rstrip('/')}/ai-gateway/openai/v1"
+    # json.dumps emits a valid TOML basic string (escapes " and \\), so an interpolated
+    # value can't corrupt the file or inject keys even if its source ever loosens.
+    q = json.dumps
     content = (
         "[provider]\n"
-        f'default_provider = "{_JCODE_PROVIDER_ID}"\n'
-        f'default_model = "{model}"\n\n'
+        f"default_provider = {q(_JCODE_PROVIDER_ID)}\n"
+        f"default_model = {q(model)}\n\n"
         f"[providers.{_JCODE_PROVIDER_ID}]\n"
-        'type = "openai-compatible"\n'
-        f'base_url = "{base_url}"\n'
-        'auth = "bearer"\n'
-        f'api_key_env = "{_JCODE_BEARER_ENV}"\n'
-        f'default_model = "{model}"\n'
+        f"type = {q('openai-compatible')}\n"
+        f"base_url = {q(base_url)}\n"
+        f"auth = {q('bearer')}\n"
+        f"api_key_env = {q(_JCODE_BEARER_ENV)}\n"
+        f"default_model = {q(model)}\n"
         "requires_api_key = true\n\n"
         f"[[providers.{_JCODE_PROVIDER_ID}.models]]\n"
-        f'id = "{model}"\n'
+        f"id = {q(model)}\n"
     )
+    # Atomic replace (write temp in the same dir, then rename) so a reader never sees a
+    # partial file.
     config_path = jcode_home / "config.toml"
-    config_path.write_text(content, encoding="utf-8")
-    os.chmod(config_path, 0o600)
+    tmp_path = jcode_home / ".config.toml.tmp"
+    tmp_path.write_text(content, encoding="utf-8")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, config_path)
 
 
 def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str] | None:
@@ -160,6 +168,15 @@ def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str
     if workspace_host.rstrip("/") != coords["workspace_host"].rstrip("/"):
         return None
 
+    # Bind the bearer's destination: only forward it to an HTTPS gateway on the pinned
+    # workspace (guards against a non-HTTPS sidecar host leaking the token in cleartext).
+    base_url = f"{coords['workspace_host'].rstrip('/')}/ai-gateway/openai/v1"
+    if not https_url_on_workspace_host(base_url, coords["workspace_host"]):
+        _logger.warning(
+            "jcode: gateway base URL is not HTTPS on the workspace; withholding bearer"
+        )
+        return None
+
     try:
         model = _jcode_default_model()
     except Exception as exc:  # noqa: BLE001 - catalog unavailable ⇒ skip (no config written).
@@ -170,7 +187,7 @@ def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str
         jcode_home = _session_jcode_home(session_id)
         runtime_dir = jcode_home / "run"
         os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
-        _write_session_config(jcode_home, host=coords["workspace_host"], model=model)
+        _write_session_config(jcode_home, base_url=base_url, model=model)
     except OSError as exc:
         _logger.warning("jcode: could not set up the session config: %r", exc)
         return None

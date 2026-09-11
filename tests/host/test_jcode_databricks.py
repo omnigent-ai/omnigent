@@ -141,6 +141,14 @@ class TestConnectJcodeGatewayEnv:
         _mock_broker(monkeypatch, workspace="https://other.example")
         assert jd.connect_jcode_gateway_env(session_id="s") is None
 
+    def test_withholds_bearer_when_workspace_not_https(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A non-HTTPS workspace host would send the bearer in cleartext → withhold it."""
+        _write_sidecar(tmp_path, workspace_host="http://ws.example")
+        _mock_broker(monkeypatch, workspace="http://ws.example")
+        assert jd.connect_jcode_gateway_env(session_id="s") is None
+
     def test_malicious_session_id_stays_within_root(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
