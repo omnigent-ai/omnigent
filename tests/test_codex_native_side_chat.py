@@ -7,6 +7,9 @@ faked. No live Codex is needed.
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -321,3 +324,80 @@ def test_side_fork_thread_started_is_rotation_ignored() -> None:
     # the fork is ephemeral, so the rotation path skips it -> can't hijack main
     event = _fork_started(thread_id="thread_side", forked_from="thread_parent")
     assert fwd._thread_started_is_ephemeral(event) is True
+
+
+# --------------------------------------------------------------------------- #
+# bridge-dir handoff: the executor records, the forwarder forks
+# --------------------------------------------------------------------------- #
+def test_side_chat_requests_round_trip_and_are_claimed_once(tmp_path: Path) -> None:
+    assert side_chat.take_side_chat_requests(tmp_path) == []  # nothing pending
+
+    side_chat.request_side_chat(tmp_path, "why is the sky blue?")
+    side_chat.request_side_chat(tmp_path, "and the sea?")
+
+    assert sorted(side_chat.take_side_chat_requests(tmp_path)) == [
+        "and the sea?",
+        "why is the sky blue?",
+    ]
+    # claimed, so a second drain (or a second forwarder pass) never re-forks
+    assert side_chat.take_side_chat_requests(tmp_path) == []
+
+
+def test_take_side_chat_requests_skips_unreadable_payloads(tmp_path: Path) -> None:
+    (tmp_path / "side_chat_requests").mkdir()
+    (tmp_path / "side_chat_requests" / "bad.json").write_text("{not json", encoding="utf-8")
+    side_chat.request_side_chat(tmp_path, "good one")
+
+    assert side_chat.take_side_chat_requests(tmp_path) == ["good one"]
+
+
+@pytest.mark.asyncio
+async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain loop must fork on the connection it was handed.
+
+    A fork made on the executor's client streams its answer into a connection
+    that closes immediately, which is why this runs on the forwarder's client.
+    """
+    client = _FakeCodexClient(
+        {
+            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
+            "turn/start": {"result": {"turn": {"id": "turn_1"}}},
+        }
+    )
+    side_chat.request_side_chat(tmp_path, "what does this repo do?")
+
+    async def _stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_sleep", _stop)
+    with pytest.raises(asyncio.CancelledError):
+        await fwd._drive_side_chat_requests(
+            client, bridge_dir=tmp_path, target=SimpleNamespace(thread_id="thread_parent")
+        )
+
+    assert [m for m, _ in client.calls] == ["thread/fork", "turn/start"]
+    assert client.calls[0][1]["threadId"] == "thread_parent"
+    assert client.calls[0][1]["ephemeral"] is True
+    assert client.calls[1][1]["threadId"] == "thread_side"  # first turn on the fork
+    assert side_chat.take_side_chat_requests(tmp_path) == []  # request consumed
+
+
+@pytest.mark.asyncio
+async def test_drive_side_chat_requests_waits_for_a_parent_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _FakeCodexClient({})
+    side_chat.request_side_chat(tmp_path, "q")
+
+    async def _stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_sleep", _stop)
+    with pytest.raises(asyncio.CancelledError):
+        await fwd._drive_side_chat_requests(
+            client, bridge_dir=tmp_path, target=SimpleNamespace(thread_id=None)
+        )
+
+    assert client.calls == []  # no thread to fork from yet

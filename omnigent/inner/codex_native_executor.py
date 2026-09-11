@@ -437,16 +437,11 @@ class CodexNativeExecutor(Executor):
                     side_question = side_chat.side_chat_question(input_items)
                     if side_question is not None:
                         # /side opens an ephemeral fork as its own sub-agent chat.
-                        # Fork + submit the first turn on the CHILD thread and
-                        # leave the main thread (and its TUI view) untouched; the
-                        # forwarder surfaces the fork as a rail child.
-                        child_thread_id = await side_chat.open_side_chat_on_client(
-                            client,
-                            parent_thread_id=state.thread_id,
-                            question=side_question,
-                        )
-                        if child_thread_id is None:
-                            error_msg = "Codex native: failed to open /side side chat"
+                        # The fork must happen on the forwarder's connection —
+                        # it owns the fork's event stream, while this client
+                        # closes as soon as the turn is submitted — so hand the
+                        # question over and leave the main thread untouched.
+                        side_chat.request_side_chat(self._bridge_dir, side_question)
                     else:
                         if goal_objective is not None:
                             await client.request(
