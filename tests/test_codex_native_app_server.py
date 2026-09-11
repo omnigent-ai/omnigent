@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.app_server import (
     _our_policy_hooks_from_list,
     _sync_codex_developer_instructions,
     build_codex_native_server,
+    codex_terminal_env,
     discover_codex_model_options,
     framework_approved_tools,
     trust_all_codex_hooks,
@@ -563,6 +564,28 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     overrides = "\n".join(app_server.config_overrides)
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
+
+
+def test_native_codex_resource_attributes_reach_server_and_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment=example,launch_mode=direct")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer test-token")
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path=sys.executable,
+    )
+
+    for env in (app_server.env, codex_terminal_env(app_server)):
+        assert {key: value for key, value in env.items() if key.startswith("OTEL_")} == {
+            "OTEL_RESOURCE_ATTRIBUTES": "deployment=example,launch_mode=omni"
+        }
 
 
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
