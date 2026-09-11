@@ -89,6 +89,181 @@ def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
     assert instance.running is False
 
 
+def _tmux_disappearance_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """
+    Return the watcher's confirmed tmux-disappearance log records.
+
+    :param caplog: Captured log records from a watcher run.
+    :returns: Records for the "tmux unavailable after N consecutive probes"
+        message, regardless of level.
+    """
+    return [
+        record
+        for record in caplog.records
+        if record.name == terminal_mod.__name__ and "tmux unavailable after" in record.getMessage()
+    ]
+
+
+def test_threaded_idle_watcher_logs_clean_disappearance_below_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Without remain-on-exit, tmux disappearing is a clean exit, not an ERROR.
+
+    Ad-hoc/auxiliary shells launch without ``keep_alive_after_exit``, so a
+    user typing ``exit`` destroys the tmux session: the confirmed
+    disappearance is the designed exit-observation path. It must still be
+    logged, but below ERROR so telemetry does not count every clean shell
+    exit as a session error.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param caplog: Captures the watcher's log records.
+    """
+    instance = TerminalInstance(
+        name="zsh",
+        session_key="u-abc123",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exited = threading.Event()
+
+    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+        assert exited.wait(timeout=1.0)
+        instance._stop_idle_watcher_thread()
+
+    records = _tmux_disappearance_records(caplog)
+    assert records, "the confirmed disappearance must still be logged"
+    assert all(record.levelno < logging.ERROR for record in records), [
+        f"{record.levelname}: {record.getMessage()}" for record in records
+    ]
+
+
+def test_threaded_idle_watcher_logs_disappearance_as_error_with_remain_on_exit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    With remain-on-exit, tmux disappearing is anomalous and stays an ERROR.
+
+    ``keep_alive_after_exit`` keeps the private tmux server alive after the
+    pane's process exits, so the session vanishing means the server died
+    underneath us — a real failure worth an ERROR record.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param caplog: Captures the watcher's log records.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+        keep_alive_after_exit=True,
+    )
+    exited = threading.Event()
+
+    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+        assert exited.wait(timeout=1.0)
+        instance._stop_idle_watcher_thread()
+
+    records = _tmux_disappearance_records(caplog)
+    assert [record.levelno for record in records] == [logging.ERROR]
+
+
+def test_async_idle_watcher_logs_clean_disappearance_below_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The asyncio watcher mirrors the threaded one: clean exits stay below ERROR.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param caplog: Captures the watcher's log records.
+    :param monkeypatch: Shrinks the poll interval so the loop confirms fast.
+    """
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
+    instance = TerminalInstance(
+        name="zsh",
+        session_key="u-abc123",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    exit_calls: list[bool] = []
+
+    async def _capture_fails(*args: str) -> str:
+        raise RuntimeError("no server running")
+
+    async def _session_gone() -> bool:
+        return False
+
+    instance._tmux_output = _capture_fails  # type: ignore[method-assign]
+    instance._tmux_session_exists_async = _session_gone  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        await instance._idle_watch_loop(lambda: None, on_exit=lambda: exit_calls.append(True))
+
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        asyncio.run(asyncio.wait_for(_run(), timeout=5.0))
+
+    assert exit_calls == [True]
+    records = _tmux_disappearance_records(caplog)
+    assert records, "the confirmed disappearance must still be logged"
+    assert all(record.levelno < logging.ERROR for record in records), [
+        f"{record.levelname}: {record.getMessage()}" for record in records
+    ]
+
+
+def test_async_idle_watcher_logs_disappearance_as_error_with_remain_on_exit(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The asyncio watcher keeps ERROR for a remain-on-exit server that vanished.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param caplog: Captures the watcher's log records.
+    :param monkeypatch: Shrinks the poll interval so the loop confirms fast.
+    """
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+        keep_alive_after_exit=True,
+    )
+
+    async def _capture_fails(*args: str) -> str:
+        raise RuntimeError("no server running")
+
+    async def _session_gone() -> bool:
+        return False
+
+    instance._tmux_output = _capture_fails  # type: ignore[method-assign]
+    instance._tmux_session_exists_async = _session_gone  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        await instance._idle_watch_loop(lambda: None, on_exit=lambda: None)
+
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        asyncio.run(asyncio.wait_for(_run(), timeout=5.0))
+
+    records = _tmux_disappearance_records(caplog)
+    assert [record.levelno for record in records] == [logging.ERROR]
+
+
 def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> None:
     """
     The exit callback can still report the last pane text after tmux disappears.
