@@ -203,6 +203,72 @@ def test_configure_clone_credentials_fails_closed_when_probe_fails(
     )
 
 
+class _Resp:
+    """Minimal httpx-response stand-in for endpoint status behaviors."""
+
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> dict:
+        if self._payload is None:
+            raise ValueError("no JSON body")
+        return self._payload
+
+
+def test_fetch_maps_provider_404_to_not_connected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A 404 is the endpoint's definitive "no credential provider on this
+    # server" (no resolver/store configured, or a pre-broker server): nobody
+    # can be connected, so it must read as a confirmed not-connected — not be
+    # flattened into the ambiguous ``None`` a transient fault produces.
+    monkeypatch.setattr(
+        h.httpx, "get", lambda *a, **k: _Resp(404, {"detail": "unknown credential provider"})
+    )
+    assert h._fetch("http://s", "hid", "tok") == {"connected": False}
+
+
+def test_fetch_keeps_transient_faults_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only 404 is definitive. A 5xx (or other non-200) stays ``None`` so the
+    # connected-gated callers keep failing closed on what may be an outage.
+    monkeypatch.setattr(h.httpx, "get", lambda *a, **k: _Resp(503))
+    assert h._fetch("http://s", "hid", "tok") is None
+
+
+def test_configure_clone_credentials_keeps_shared_helper_on_provider_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The reported journey: a server with no GitHub connection configured 404s
+    # the probe. Installing the broker would reset the github.com chain and
+    # disarm the image's shared $GIT_TOKEN helper while the broker itself can
+    # never vend — so the ambient chain must be left untouched, like a 200
+    # ``connected: false``.
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.httpx, "get", lambda *a, **k: _Resp(404, {"detail": "unknown credential provider"})
+    )
+    assert h.configure_clone_credentials("http://srv", "host1") is False
+    assert calls == []  # ambient/shared helper chain untouched
+
+
+def test_configure_host_git_clears_stale_broker_on_provider_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Host startup on a no-provider server must heal, not repeat, the damage: a
+    # broker a prior inconclusive-probe prep installed is cleared so the
+    # ambient shared-$GIT_TOKEN helper works again for in-session git.
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.httpx, "get", lambda *a, **k: _Resp(404, {"detail": "unknown credential provider"})
+    )
+    h.configure_host_git("http://srv", "host1")
+    key = "credential.https://github.com.helper"
+    assert calls == [["git", "config", "--global", "--unset-all", key]]
+
+
 def test_configure_host_gh_writes_hosts_yml(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     # A connected owner: gh's hosts.yml is materialized with the brokered token
     # and the owner's login, 0600, so `gh api` authenticates as them.
