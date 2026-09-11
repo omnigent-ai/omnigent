@@ -1,4 +1,4 @@
-// Cmd+[ / Cmd+] (also with Shift) opens the previous / next
+// Cmd+[ / Cmd+] (Ctrl+[ / Ctrl+] on Win/Linux) opens the previous / next
 // sidebar session, wrapping at the ends. Sibling to the sidebar-toggle
 // (⌘⌥[ / ⌘⌥]) hotkey — they don't collide, that one requires Alt and this one
 // requires Alt up. Bind ONCE.
@@ -37,7 +37,8 @@ export function useSessionSwitchHotkey(
     const handler = (e: globalThis.KeyboardEvent): void => {
       // Ignore auto-repeat: holding the chord would race through sessions.
       if (e.repeat) return;
-      if (!hasCommandModifier(e, isMac) || e.altKey) return;
+      // Cmd/Ctrl only — no Alt (that's the sidebar-toggle chord) or Shift.
+      if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
       // Match the physical bracket key (e.code is layout/modifier-stable), the
       // same way the sidebar-toggle sibling does.
       const dir = e.code === "BracketRight" ? 1 : e.code === "BracketLeft" ? -1 : 0;

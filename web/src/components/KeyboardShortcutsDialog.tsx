@@ -18,7 +18,6 @@ import {
   ENTER_KEY,
   Kbd,
   MOD_KEY,
-  SHIFT_KEY,
 } from "@/components/KeyboardShortcut";
 import {
   Dialog,
@@ -71,7 +70,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Start a new session", keys: [MOD_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
-      { label: "Find a session by name", keys: [MOD_KEY, "P"] },
+      { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
@@ -87,7 +86,6 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   },
   {
     title: "Navigation",
-    note: `hold ${MOD_KEY} to show pinned-session numbers`,
     items: [
       { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
       { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
@@ -144,22 +142,7 @@ function shortcutGroupsFor(
       };
     }
     if (group.title === "Navigation") {
-      const recentKey = native ? "Tab" : "`";
-      return {
-        ...group,
-        items: [
-          ...group.items,
-          ...(native
-            ? [
-                { label: "Previous session (alternate)", keys: [MOD_KEY, SHIFT_KEY, BRACKET_LEFT] },
-                { label: "Next session (alternate)", keys: [MOD_KEY, SHIFT_KEY, BRACKET_RIGHT] },
-              ]
-            : []),
-          pinnedSessionShortcut(native),
-          { label: "Next recently used session", keys: ["Ctrl", recentKey] },
-          { label: "Previous recently used session", keys: ["Ctrl", SHIFT_KEY, recentKey] },
-        ],
-      };
+      return { ...group, items: [...group.items, pinnedSessionShortcut(native)] };
     }
     return group;
   });

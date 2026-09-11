@@ -12,7 +12,6 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
-import { useRecentSessionHotkeys } from "@/hooks/useRecentSessionHotkeys";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -453,15 +452,6 @@ export function AppShell() {
     if (!serverConversationId) return null;
     return allConversations?.find((c) => c.id === serverConversationId) ?? null;
   }, [serverConversationId, allConversations]);
-  const recentSessionIds = useMemo(
-    () =>
-      allConversations?.filter((session) => !session.archived).map((session) => session.id) ?? [],
-    [allConversations],
-  );
-  useRecentSessionHotkeys(
-    recentSessionIds,
-    activeConv?.archived ? undefined : serverConversationId,
-  );
   // A temporary row is display-only: it can supply optimistic breadcrumb
   // text, but must not participate in permissions, actions, or server hooks.
   const provisionalConv = useMemo(() => {

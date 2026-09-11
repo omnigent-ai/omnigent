@@ -69,6 +69,11 @@ describe("KeyboardShortcutsList composer rows", () => {
 });
 
 describe("KeyboardShortcutsDialog", () => {
+  it("advertises the session-search chord without taking the Print shortcut", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
+  });
+
   it("renders nothing until opened", () => {
     render(<KeyboardShortcutsDialog />);
     expect(screen.queryByText("Send message")).toBeNull();

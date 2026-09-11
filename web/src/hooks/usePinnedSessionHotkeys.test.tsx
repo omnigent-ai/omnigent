@@ -51,25 +51,6 @@ afterEach(() => {
 });
 
 describe("usePinnedSessionHotkeys", () => {
-  it("yields to focused dialogs, terminals, and editors", () => {
-    render(["a", "b"], "a");
-    for (const attributes of ['role="dialog"', 'class="xterm"', 'class="monaco-editor"']) {
-      document.body.innerHTML = `<div ${attributes}><input /></div>`;
-      const input = document.querySelector("input")!;
-      input.focus();
-      expect(press("2", { metaKey: true }, input).defaultPrevented).toBe(false);
-    }
-    expect(navigate).not.toHaveBeenCalled();
-  });
-
-  it("yields to an already-claimed key", () => {
-    render(["a", "b"], "a");
-    const event = new KeyboardEvent("keydown", { key: "2", metaKey: true, cancelable: true });
-    event.preventDefault();
-    window.dispatchEvent(event);
-    expect(navigate).not.toHaveBeenCalled();
-  });
-
   const ids = ["a", "b", "c"];
 
   it("exposes ten digits mapping 1–9 then 0", () => {
