@@ -10,25 +10,31 @@ Omnigent sub-agent (rail) child, never in the left sidebar.
 Why a fork and not the claude-native ``/btw`` overlay: Codex ``/side`` is a
 multi-turn ephemeral fork (Codex's own ``/side`` == ``/btw`` == "start a side
 conversation in an ephemeral fork"), so modelling it as a persistent, navigable
-sub-agent chat fits its behaviour, unlike the single-shot dismissable overlay.
+sub-agent chat fits its behaviour.
 
-Storage / cache notes (verified against the Codex source and the installed
-app-server schema):
+Process split (native Codex runs across processes; each helper lives where its
+inputs do):
 
-* ``ephemeral=true`` means the thread is never materialized on disk (no rollout,
-  no state-db row) and cannot be resumed after a runner restart; that is the
-  intended parity with native ``/side``.
-* An ephemeral *root* fork reuses the parent's session id for cache routing
-  inside Codex, so we deliberately do NOT pin a ``prompt_cache_key`` here.
+* The **executor** (which injects turns via a bridge-state app-server client)
+  detects ``/side`` and opens the fork: :func:`side_chat_question` +
+  :func:`open_side_chat_on_client`.
+* The **forwarder** (which watches the app-server event stream and holds the
+  ``_CodexForwarderState`` + Omnigent HTTP client) auto-surfaces the fork as a
+  rail child: :func:`register_side_fork_child`, keyed off the fork's
+  ``forkedFromId`` (:func:`is_omnigent_side_fork`).
+
+Storage / cache notes (verified against the Codex source + the installed 0.147.0
+app-server schema): ``ephemeral=true`` means no rollout / no state-db row (parity
+with native ``/side``, not resumable after a runner restart), and an ephemeral
+root fork reuses the parent's session id for cache routing inside Codex, so we
+deliberately do NOT pin a ``prompt_cache_key``.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from omnigent.harnesses.codex_native import forwarder as _fwd
-
-if TYPE_CHECKING:  # avoid import cost / cycles at runtime
+if TYPE_CHECKING:  # runtime imports are lazy to avoid a forwarder<->side_chat cycle
     import httpx
 
     from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
@@ -43,7 +49,33 @@ SIDE_REFERENCE_ONLY_INSTRUCTIONS = (
     "for this side conversation. Only messages after this boundary are active."
 )
 
+# Display name stamped on a side-chat child so the web can tell it apart from a
+# Codex-spawned sub-agent (drives the "this is a side chat" banner).
+SIDE_CHAT_SUBAGENT_NAME = "side-chat"
+
+_SIDE_PREFIX = "/side "
 _JsonObject = dict[str, Any]
+
+
+def side_chat_question(input_items: list[_JsonObject]) -> str | None:
+    """
+    Return the question when normalized turn input is a ``/side`` command.
+
+    :param input_items: Codex ``turn/start`` input items, e.g.
+        ``[{"type": "text", "text": "/side why?"}]``.
+    :returns: The trimmed question after ``/side``, or ``None`` when the input
+        is not a single ``/side <question>`` text item.
+    """
+    if len(input_items) != 1:
+        return None
+    item = input_items[0]
+    if item.get("type") != "text":
+        return None
+    text = item.get("text")
+    if not isinstance(text, str) or not text.startswith(_SIDE_PREFIX):
+        return None
+    question = text[len(_SIDE_PREFIX) :].strip()
+    return question or None
 
 
 async def fork_ephemeral_side_thread(
@@ -84,8 +116,10 @@ async def submit_side_turn(
     """
     Submit one user turn to a side-chat thread over the app-server.
 
-    This is the out-of-band drive path (mirrors ``_start_plan_implementation_turn``)
-    that keeps the TUI on the main thread while the side thread runs.
+    The out-of-band drive path (mirrors ``_start_plan_implementation_turn``)
+    that keeps the TUI on the main thread while the side thread runs. Used both
+    for the first ``/side`` turn and for later follow-ups the user types into
+    the side chat.
 
     :param codex_client: Connected Codex app-server client.
     :param child_thread_id: Side-chat Codex thread id.
@@ -106,70 +140,44 @@ async def submit_side_turn(
     return turn_id if isinstance(turn_id, str) and turn_id else None
 
 
-async def start_side_chat(
-    ap_client: httpx.AsyncClient,
+async def open_side_chat_on_client(
     codex_client: CodexAppServerClient,
     *,
-    parent_session_id: str,
     parent_thread_id: str,
     question: str,
-    forwarder_state: _CodexForwarderState,
-) -> tuple[str, str] | None:
+    developer_instructions: str | None = SIDE_REFERENCE_ONLY_INSTRUCTIONS,
+) -> str | None:
     """
-    Open a Codex side chat: fork, register as a rail child, submit the question.
+    Open a side chat on an already-connected app-server client (executor path).
 
-    Reuses the existing sub-agent registration pipeline so the fork surfaces in
-    the sub-agent rail and all of its events route to the child session. No
-    forwarder change is needed: the child thread is registered proactively, and
-    the fork's ephemeral ``thread/started`` is already rotation-ignored so it
-    cannot hijack the parent session.
+    Forks an ephemeral child of ``parent_thread_id`` and submits ``question`` as
+    its first turn. Registration/surfacing is the forwarder's job (it observes
+    the fork's ``thread/started`` on the shared event stream), so this does not
+    touch the Omnigent server.
 
-    :param ap_client: HTTP client pointed at the Omnigent server.
-    :param codex_client: Connected Codex app-server client for the parent process.
-    :param parent_session_id: Parent Omnigent conversation id, e.g. ``"conv_p"``.
-    :param parent_thread_id: Parent Codex thread id to fork from.
+    :param codex_client: Connected Codex app-server client (built from bridge state).
+    :param parent_thread_id: The active (main) Codex thread id to fork from.
     :param question: The ``/side`` question, submitted as the first turn.
-    :param forwarder_state: Live forwarder state (child-thread map + model).
-    :returns: ``(child_session_id, child_thread_id)`` on success, else ``None``.
+    :param developer_instructions: Reference-only boundary instructions.
+    :returns: The child Codex thread id, or ``None`` if the fork failed.
     """
-    child_thread_id = await fork_ephemeral_side_thread(codex_client, parent_thread_id)
+    child_thread_id = await fork_ephemeral_side_thread(
+        codex_client, parent_thread_id, developer_instructions=developer_instructions
+    )
     if child_thread_id is None:
         return None
-
-    # ponytail: reuse the proven sub-agent registration + routing pipeline
-    # (_register_child_session POSTs external_codex_subagent_start; note_child_thread
-    # makes _resolve_event_session route the fork's events to the child session).
-    child_session_id = await _fwd._register_child_session(
-        ap_client,
-        parent_session_id=parent_session_id,
-        parent_thread_id=parent_thread_id,
-        child_thread_id=child_thread_id,
-        item={},
-    )
-    if child_session_id is None:
-        return None
-    forwarder_state.note_child_thread(child_thread_id, child_session_id)
-
-    collaboration_mode = _fwd._default_collaboration_mode(forwarder_state)
-    await submit_side_turn(
-        codex_client,
-        child_thread_id,
-        question,
-        collaboration_mode=collaboration_mode,
-    )
-    return child_session_id, child_thread_id
+    await submit_side_turn(codex_client, child_thread_id, question)
+    return child_thread_id
 
 
 def is_omnigent_side_fork(event: _JsonObject) -> bool:
     """
     Return whether a ``thread/started`` event announces an ephemeral side fork.
 
-    The discriminator that separates an intentional side-chat fork from Codex's
-    own system/housekeeping ephemeral thread: a side fork is ``ephemeral=true``
-    AND carries a ``forkedFromId`` (the parent). The housekeeping thread is
-    ephemeral with no ``forkedFromId`` (``threadSource=system``). Not required
-    for routing (we register proactively) but documents the shape and guards any
-    future auto-detection.
+    Discriminator separating an intentional side chat from Codex's own
+    system/housekeeping ephemeral thread: a side fork is ``ephemeral=true`` AND
+    carries a ``forkedFromId`` (the parent). The housekeeping thread is
+    ephemeral with no ``forkedFromId`` (``threadSource=system``).
 
     :param event: Codex app-server notification envelope.
     :returns: ``True`` when the started thread is an ephemeral fork.
@@ -184,3 +192,58 @@ def is_omnigent_side_fork(event: _JsonObject) -> bool:
         return False
     forked_from = thread.get("forkedFromId")
     return thread.get("ephemeral") is True and isinstance(forked_from, str) and bool(forked_from)
+
+
+async def register_side_fork_child(
+    ap_client: httpx.AsyncClient,
+    *,
+    forwarder_state: _CodexForwarderState,
+    parent_session_id: str,
+    parent_thread_id: str,
+    event: _JsonObject,
+) -> str | None:
+    """
+    Surface an ephemeral side fork as an Omnigent sub-agent (rail) child.
+
+    Called from the forwarder's event loop on each ``thread/started``. Only acts
+    when ``event`` is a side fork of ``parent_thread_id`` (:func:`is_omnigent_side_fork`).
+    Reuses the existing sub-agent registration + routing pipeline: once the child
+    thread is mapped, ``_resolve_event_session`` routes its events to the child
+    session. No-op (returns the existing id) if already registered.
+
+    :param ap_client: HTTP client pointed at the Omnigent server.
+    :param forwarder_state: Live forwarder state (child-thread map).
+    :param parent_session_id: Parent Omnigent conversation id.
+    :param parent_thread_id: The active (main) Codex thread id.
+    :param event: The ``thread/started`` notification envelope.
+    :returns: The child Omnigent session id, or ``None`` when not a matching fork
+        or registration failed.
+    """
+    if not is_omnigent_side_fork(event):
+        return None
+    thread = event["params"]["thread"]
+    if thread.get("forkedFromId") != parent_thread_id:
+        return None
+    child_thread_id = thread.get("id")
+    if not isinstance(child_thread_id, str) or not child_thread_id:
+        return None
+    existing = forwarder_state.session_for_child_thread(child_thread_id)
+    if existing is not None:
+        return existing
+
+    # ponytail: reuse the proven sub-agent registration pipeline
+    # (_register_child_session POSTs external_codex_subagent_start; note_child_thread
+    # makes _resolve_event_session route the fork's events to the child session).
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+
+    child_session_id = await _fwd._register_child_session(
+        ap_client,
+        parent_session_id=parent_session_id,
+        parent_thread_id=parent_thread_id,
+        child_thread_id=child_thread_id,
+        item={"sub_agent_name": SIDE_CHAT_SUBAGENT_NAME},
+    )
+    if child_session_id is None:
+        return None
+    forwarder_state.note_child_thread(child_thread_id, child_session_id)
+    return child_session_id
