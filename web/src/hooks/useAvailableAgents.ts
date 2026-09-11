@@ -1,4 +1,4 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
@@ -340,7 +340,9 @@ export async function prefetchAvailableAgentDetails(
  *
  * A failing sessions scan (e.g. transient 5xx) degrades to the catalog list
  * rather than blanking the picker — catalog availability must not be hostage
- * to the discovery extension.
+ * to the discovery extension. A SLOW scan must not hold it hostage either:
+ * {@link useAvailableAgents} serves the same catalog-only rows as placeholder
+ * data while this merged fetch is in flight (see the hook).
  *
  * `pinnedAgentIds` (e.g. a project's configured default agent) are guaranteed
  * to survive: any pinned id the merged list lacks — dropped by the
@@ -351,11 +353,44 @@ export async function prefetchAvailableAgentDetails(
  * A pinned id in neither source stays absent (the consumer surfaces that
  * state).
  */
-async function fetchAvailableAgents(pinnedAgentIds: string[] = []): Promise<AvailableAgent[]> {
+async function fetchAvailableAgents(
+  pinnedAgentIds: string[] = [],
+  fetchCatalog: () => Promise<AvailableAgent[]> = fetchBuiltinAgents,
+): Promise<AvailableAgent[]> {
   const [catalog, scanned] = await Promise.all([
-    fetchBuiltinAgents(),
+    fetchCatalog(),
     scanSessionAgents().catch(() => [] as ScannedSessionAgent[]),
   ]);
+  const merged = mergeAvailableAgents(catalog, scanned);
+
+  // Pinned-survival pass: restore every pinned id the merge lost (from the
+  // scan when it saw the agent but a same-named newer row won its bucket),
+  // from the catalog when the pin is a user-registered template with no
+  // sessions of its own, or via a direct lookup when neither source saw it.
+  const missingPinned = pinnedAgentIds.filter((id) => !merged.some((a) => a.id === id));
+  const restored = await Promise.all(
+    missingPinned.map((id) => {
+      const seen = scanned.find((s) => s.agentId === id);
+      if (seen) return Promise.resolve(sessionAgentFromScan(seen));
+      const template = catalog.find((a) => a.id === id);
+      return template ? Promise.resolve(template) : lookupPinnedAgent(id);
+    }),
+  );
+  merged.push(...restored.filter((a): a is AvailableAgent => a !== null));
+  return merged;
+}
+
+/**
+ * The pure, synchronous core of {@link fetchAvailableAgents}: merge the
+ * catalog with the discovery scan's unique session agents (no pinned-survival
+ * pass — that needs async lookups). Also called with an empty scan to build
+ * the catalog-only placeholder rows served while the scan is in flight; that
+ * shape matches the failing-scan degradation exactly.
+ */
+function mergeAvailableAgents(
+  catalog: AvailableAgent[],
+  scanned: ScannedSessionAgent[],
+): AvailableAgent[] {
   // Seeded built-ins are emitted verbatim and protected; user-registered
   // templates seed the newest-wins buckets so an upload can supersede them.
   // `builtin !== false` keeps both true (seeded) and undefined (older server,
@@ -421,24 +456,14 @@ async function fetchAvailableAgents(pinnedAgentIds: string[] = []): Promise<Avai
   // first. NewChatDialog's display-order sort is stable, so unranked names
   // keep this relative order.
   resolved.sort((a, b) => recencyOf(b) - recencyOf(a));
-  const merged = [...seeded, ...resolved];
-
-  // Pinned-survival pass: restore every pinned id the merge lost (from the
-  // scan when it saw the agent but a same-named newer row won its bucket),
-  // from the catalog when the pin is a user-registered template with no
-  // sessions of its own, or via a direct lookup when neither source saw it.
-  const missingPinned = pinnedAgentIds.filter((id) => !merged.some((a) => a.id === id));
-  const restored = await Promise.all(
-    missingPinned.map((id) => {
-      const seen = scanned.find((s) => s.agentId === id);
-      if (seen) return Promise.resolve(sessionAgentFromScan(seen));
-      const template = catalog.find((a) => a.id === id);
-      return template ? Promise.resolve(template) : lookupPinnedAgent(id);
-    }),
-  );
-  merged.push(...restored.filter((a): a is AvailableAgent => a !== null));
-  return merged;
+  return [...seeded, ...resolved];
 }
+
+// Catalog-only list backing the placeholder rows. Shared by the hook's
+// catalog query and the merged queryFn (via fetchQuery), so a picker mount
+// issues a single GET /v1/agents for both.
+const AGENT_CATALOG_QUERY_KEY = ["available-agents-catalog"] as const;
+const AVAILABLE_AGENTS_STALE_MS = 30_000;
 
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
@@ -504,13 +529,42 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
       applyAcpHarnessCatalog(agents, acpHarnessIds, harnessLabels),
     [acpHarnessIds, harnessLabels],
   );
+  const queryClient = useQueryClient();
+  // The harness/built-in rows come entirely from GET /v1/agents, so they must
+  // not wait for a slow sessions discovery scan (managed deployments with
+  // large session tables). This catalog query resolves fast and feeds the
+  // merged query's placeholder below; same enabled gate as the merged query.
+  const { data: catalog } = useQuery({
+    queryKey: AGENT_CATALOG_QUERY_KEY,
+    queryFn: fetchBuiltinAgents,
+    enabled,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+  // Catalog merged with an empty scan — the same rows a failing scan degrades
+  // to — shown while the merged fetch is in flight and upgraded in place when
+  // the scan lands. Consumers that must not resolve stored ids against a
+  // partial list read isPlaceholderData to tell this state apart.
+  const placeholderData = useMemo(
+    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
+    [catalog],
+  );
   return useQuery({
     // Unpinned consumers keep the historical bare key; pinned variants get
     // their own entry (prefetch patches both via a prefix match).
     queryKey: pinnedKey === "" ? ["available-agents"] : ["available-agents", pinnedKey],
-    queryFn: () => fetchAvailableAgents(pinnedKey === "" ? [] : pinnedKey.split(",")),
+    // fetchQuery dedupes with the catalog query's in-flight fetch, so the
+    // merged fetch reuses (not repeats) the catalog request.
+    queryFn: () =>
+      fetchAvailableAgents(pinnedKey === "" ? [] : pinnedKey.split(","), () =>
+        queryClient.fetchQuery({
+          queryKey: AGENT_CATALOG_QUERY_KEY,
+          queryFn: fetchBuiltinAgents,
+          staleTime: AVAILABLE_AGENTS_STALE_MS,
+        }),
+      ),
     enabled,
-    staleTime: 30_000,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+    placeholderData,
     select,
   });
 }

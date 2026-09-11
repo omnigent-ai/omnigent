@@ -2233,7 +2233,11 @@ export function NewChatLandingScreen() {
   // Pin the configured project agent into discovery so the recency-bounded
   // session scan (or its same-name dedup) can't drop or id-swap it out of
   // the picker — the config must seed the agent the project actually pinned.
-  const { data: agents } = useAvailableAgents({
+  // agentsArePlaceholder: catalog-only rows served while the sessions
+  // discovery scan is still in flight — render them (harnesses must not wait
+  // for a slow scan), but never resolve a stored agent id against them: a
+  // scan-discovered agent may still be on its way.
+  const { data: agents, isPlaceholderData: agentsArePlaceholder } = useAvailableAgents({
     pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
   });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
@@ -3068,13 +3072,22 @@ export function NewChatLandingScreen() {
     projectParam !== "" &&
     prefillConfig?.agentId != null &&
     agents !== undefined &&
+    !agentsArePlaceholder &&
     !agentList.some((a) => a.id === prefillConfig.agentId);
+  // While the list is catalog-only placeholder data, a persisted pick that
+  // isn't in it yet may be a scan-discovered agent still loading — hold the
+  // selection empty instead of silently defaulting to the first catalog row.
+  const pickUnresolvedOnPlaceholder =
+    agentsArePlaceholder &&
+    pickedAgentId !== null &&
+    pickedAgentId !== PENDING_AGENT_ID &&
+    !agentList.some((a) => a.id === pickedAgentId);
   const effectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
         ? pickedAgentId
-        : configuredAgentUnavailable
+        : configuredAgentUnavailable || pickUnresolvedOnPlaceholder
           ? null
           : (agentList[0]?.id ?? null);
   const selectedAgent = useMemo(
@@ -3984,8 +3997,10 @@ export function NewChatLandingScreen() {
     const step = projectPrefillStep(prefill, {
       hosts,
       // The pickable list, not the raw one — a hidden agent's id would seed
-      // a pick that effectiveAgentId rejects. Raw undefined = still loading.
-      agents: agents === undefined ? undefined : agentList,
+      // a pick that effectiveAgentId rejects. Raw undefined = still loading;
+      // placeholder (catalog-only) data counts as loading too, so the prefill
+      // never seeds or validates a pick against a partial list.
+      agents: agents === undefined || agentsArePlaceholder ? undefined : agentList,
       sandboxSelected,
       managedSandboxesEnabled,
       selectedHostId,
@@ -4023,6 +4038,7 @@ export function NewChatLandingScreen() {
     projectParam,
     hosts,
     agents,
+    agentsArePlaceholder,
     agentList,
     sandboxSelected,
     managedSandboxesEnabled,
