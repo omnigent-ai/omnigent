@@ -17,6 +17,7 @@ import httpx
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexMessage,
@@ -2144,6 +2145,16 @@ async def supervise_forwarder(
                     # waiting forever on an idle fresh thread.
                     if not thread_active.is_set() and _event_indicates_thread_active(event):
                         thread_active.set()
+                    # Surface a /side ephemeral fork as its own sub-agent (rail)
+                    # child. No-op unless this event is a fork of the active
+                    # thread; once mapped, the fork's events route to the child.
+                    await side_chat.register_side_fork_child(
+                        ap_client,
+                        forwarder_state=forwarder_state,
+                        parent_session_id=target.session_id,
+                        parent_thread_id=target.thread_id,
+                        event=event,
+                    )
                     await _handle_event(
                         ap_client,
                         session_id=target.session_id,

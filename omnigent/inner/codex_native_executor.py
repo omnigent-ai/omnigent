@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
+from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
@@ -433,21 +434,35 @@ class CodexNativeExecutor(Executor):
                 )
                 await client.connect()
                 try:
-                    if goal_objective is not None:
-                        await client.request(
-                            "thread/goal/set",
-                            {
-                                "threadId": state.thread_id,
-                                "objective": goal_objective,
-                            },
+                    side_question = side_chat.side_chat_question(input_items)
+                    if side_question is not None:
+                        # /side opens an ephemeral fork as its own sub-agent chat.
+                        # Fork + submit the first turn on the CHILD thread and
+                        # leave the main thread (and its TUI view) untouched; the
+                        # forwarder surfaces the fork as a rail child.
+                        child_thread_id = await side_chat.open_side_chat_on_client(
+                            client,
+                            parent_thread_id=state.thread_id,
+                            question=side_question,
                         )
-                    await _inject_codex_turn(
-                        client,
-                        bridge_dir=self._bridge_dir,
-                        state=state,
-                        input_items=input_items,
-                        settings_overrides=settings_overrides,
-                    )
+                        if child_thread_id is None:
+                            error_msg = "Codex native: failed to open /side side chat"
+                    else:
+                        if goal_objective is not None:
+                            await client.request(
+                                "thread/goal/set",
+                                {
+                                    "threadId": state.thread_id,
+                                    "objective": goal_objective,
+                                },
+                            )
+                        await _inject_codex_turn(
+                            client,
+                            bridge_dir=self._bridge_dir,
+                            state=state,
+                            input_items=input_items,
+                            settings_overrides=settings_overrides,
+                        )
                 except Exception as exc:
                     _logger.exception("Codex native turn injection failed")
                     error_msg = f"Codex native executor error: {exc}"
