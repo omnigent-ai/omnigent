@@ -518,8 +518,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         app_server.codex_home = kwargs["codex_home"]
         return app_server
 
-    class _StartupEventClient:
-        """Listener retained across known-thread preload and forwarding."""
+    class _UnexpectedDiscoveryClient:
+        """
+        App-server client that must not connect on a known-thread resume.
+
+        Fresh sessions connect this listener to discover ``thread/started``.
+        Resume sessions already have ``external_session_id`` and should go
+        straight to the known-thread forwarder.
+        """
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -530,8 +536,12 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """Record the connection established before preload."""
-            self.connected = True
+            """
+            Fail if the resume path tries to discover a fresh thread.
+
+            :returns: None.
+            """
+            raise AssertionError("resume path must not connect discovery client")
 
         async def close(self) -> None:
             """:returns: None."""
@@ -610,7 +620,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         "build_codex_native_server",
         _fake_build_codex_native_server,
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 
@@ -678,16 +688,12 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     del forward_calls[0]["subagent_router"]
     assert "turn_router" in forward_calls[0]
     del forward_calls[0]["turn_router"]
-    event_client = forward_calls[0]["event_client"]
-    assert isinstance(event_client, _StartupEventClient)
-    assert event_client.connected
     assert forward_calls == [
         {
             "session_id": session_id,
             "bridge_dir": bridge_dir,
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
-            "event_client": event_client,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
@@ -842,8 +848,8 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         del kwargs
         return app_server
 
-    class _StartupEventClient:
-        """No-op listener for the known-thread startup path."""
+    class _UnexpectedDiscoveryClient:
+        """Discovery client that must not connect on the resume path."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -854,7 +860,8 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """No-op connect."""
+            """:raises AssertionError: Always — the fork resumes a known thread."""
+            raise AssertionError("fork resume path must not connect discovery client")
 
         async def close(self) -> None:
             """:returns: None."""
@@ -927,7 +934,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 
@@ -1118,8 +1125,8 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         del kwargs
         return app_server
 
-    class _StartupEventClient:
-        """No-op listener for the known-thread startup path."""
+    class _UnexpectedDiscoveryClient:
+        """Discovery client that must not connect on the resume path."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """:param ws_url: App-server URL. :param client_name: RPC client name."""
@@ -1127,7 +1134,8 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """No-op connect."""
+            """:raises AssertionError: Always — the fork resumes a known thread."""
+            raise AssertionError("fork resume path must not connect discovery client")
 
         async def close(self) -> None:
             """:returns: None."""
@@ -1186,7 +1194,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 
@@ -3522,8 +3530,8 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         app_server.codex_home = kwargs["codex_home"]
         return app_server
 
-    class _StartupEventClient:
-        """No-op listener for the known-thread startup path."""
+    class _UnexpectedDiscoveryClient:
+        """App-server client that must not connect on a known-thread resume."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -3534,7 +3542,8 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """No-op connect."""
+            """Fail if the resume path tries to discover a fresh thread."""
+            raise AssertionError("resume path must not connect discovery client")
 
         async def close(self) -> None:
             """No-op close."""
@@ -3597,7 +3606,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 
@@ -3758,8 +3767,8 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         app_server.codex_home = kwargs["codex_home"]
         return app_server
 
-    class _StartupEventClient:
-        """No-op listener for the known-thread startup path."""
+    class _UnexpectedDiscoveryClient:
+        """App-server client that must not connect on a known-thread resume."""
 
         def __init__(self, *, ws_url: str, client_name: str) -> None:
             """
@@ -3770,7 +3779,8 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
             self.client_name = client_name
 
         async def connect(self) -> None:
-            """No-op connect."""
+            """Fail if the resume path tries to discover a fresh thread."""
+            raise AssertionError("resume path must not connect discovery client")
 
         async def close(self) -> None:
             """No-op close."""
@@ -3813,7 +3823,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
     )
-    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _StartupEventClient)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
 

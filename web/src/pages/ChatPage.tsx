@@ -12,7 +12,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import {
   BotIcon,
@@ -46,6 +45,7 @@ import {
   ComposerWorkspaceTrigger,
   ComposerPermissionPicker,
   ComposerHarnessTrigger,
+  ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -3798,40 +3798,34 @@ function ComposerImpl(
           trailing: (
             <>
               <div className="flex min-w-0 items-center rounded-lg">
-                <ComposerModelSource
+                <SessionHarnessPicker
+                  busy={configBusy}
+                  busyRef={configBusyRef}
+                  setBusy={setConfigBusy}
+                  agentName={
+                    subAgentName ??
+                    agents?.find((agent) => agent.id === selectedAgentId)?.name ??
+                    agents?.[0]?.name ??
+                    null
+                  }
+                  harnessLabel={harnessLabel}
+                  showModels={showModels}
+                  showEffort={showEffort}
+                  showClaudePermissionMode={showClaudePermissionMode}
+                  showCodexApprovalMode={showCodexApprovalMode}
+                  effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
                   costRoutingEligible={costRoutingEligible}
-                >
-                  <SessionHarnessPicker
-                    busy={configBusy}
-                    busyRef={configBusyRef}
-                    setBusy={setConfigBusy}
-                    agentName={
-                      subAgentName ??
-                      agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                      agents?.[0]?.name ??
-                      null
-                    }
-                    harnessLabel={harnessLabel}
-                    showModels={showModels}
-                    showEffort={showEffort}
-                    showClaudePermissionMode={showClaudePermissionMode}
-                    showCodexApprovalMode={showCodexApprovalMode}
-                    effortLevels={effortLevels}
-                    modelPickerKind={modelPickerKind}
-                    codexModelOptions={codexModelOptions}
-                    costRoutingEligible={costRoutingEligible}
-                    subagentRoutingEligible={subagentRoutingEligible}
-                    // Config changes persist server-side and apply on the next
-                    // wake/turn (the runner forward is best-effort), so the gear
-                    // stays live wherever a message could be sent — including
-                    // asleep/starting/unknown. Only read-only viewers and sessions
-                    // no message can wake (unreachable) get an inert gear.
-                    disabled={isReadOnly || unreachable}
-                    openNonce={pickerOpenNonce}
-                  />
-                </ComposerModelSource>
+                  subagentRoutingEligible={subagentRoutingEligible}
+                  // Config changes persist server-side and apply on the next
+                  // wake/turn (the runner forward is best-effort), so the gear
+                  // stays live wherever a message could be sent — including
+                  // asleep/starting/unknown. Only read-only viewers and sessions
+                  // no message can wake (unreachable) get an inert gear.
+                  disabled={isReadOnly || unreachable}
+                  openNonce={pickerOpenNonce}
+                />
               </div>
               <ComposerMicButton
                 className="size-8 md:size-7"
@@ -4843,11 +4837,7 @@ function SessionHarnessPicker({
               className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
               data-testid="composer-config-gear-tooltip"
             >
-              {summary.map((row) => (
-                <span key={row.label}>
-                  {row.label}: {row.value}
-                </span>
-              ))}
+              <ComposerConfigTooltipRows rows={summary} />
             </TooltipContent>
           </Tooltip>
         </TooltipProvider>
@@ -5135,60 +5125,4 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
-}
-
-/** Compact, inspectable provenance beside the composer's model label. */
-function ComposerModelSource({
-  modelPickerKind,
-  codexModelOptions,
-  costRoutingEligible,
-  children,
-}: {
-  modelPickerKind: NativeModelPickerKind | null;
-  codexModelOptions: readonly NativeModelOption[];
-  costRoutingEligible: boolean;
-  children: ReactNode;
-}) {
-  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
-  const { effectiveModel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
-  const source =
-    findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
-    codexModelOptions.find((option) => option.source)?.source;
-  const routingOn = costRoutingEligible && costControlModeOverride === "on";
-  if (routingOn || !source) return children;
-
-  const rows = modelConfigurationSourceRows(source);
-  return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span
-            tabIndex={0}
-            data-testid="composer-model-source"
-            // `flex` keeps the min-width chain flowing through this wrapper:
-            // as a plain span the label inside loses its flex-imposed width
-            // and its `truncate` never engages, running under the Stop button.
-            className="flex min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {children}
-          </span>
-        </TooltipTrigger>
-        <TooltipContent
-          side="top"
-          className="flex max-w-80 flex-col items-start gap-1 px-3 py-2"
-          data-testid="composer-model-source-tooltip"
-        >
-          <span className="font-medium text-background dark:text-popover-foreground">
-            Model configuration
-          </span>
-          {rows.map((row) => (
-            <span key={row.label} className="max-w-72 truncate text-muted-foreground">
-              {row.label}:{" "}
-              <span className="text-background dark:text-popover-foreground">{row.value}</span>
-            </span>
-          ))}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
 }

@@ -4431,17 +4431,6 @@ async def _auto_create_codex_terminal(
         ws_url=codex_ws_url,
         client_name="omnigent-codex-native-auto",
     )
-    try:
-        # Keep the listener connected through thread creation or preload so
-        # the forwarder receives the initial startup/status notifications.
-        await event_client.connect()
-    except Exception:
-        # connect() may have opened the socket before its handshake failed.
-        with contextlib.suppress(Exception):
-            await event_client.close()
-        await app_server.close()
-        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-        raise
     if launch_config.external_session_id is not None:
         from omnigent.harnesses.codex_native.bridge import (
             CodexNativeBridgeState,
@@ -4459,8 +4448,6 @@ async def _auto_create_codex_terminal(
                 # The app-server started above must not outlive a refused resume:
                 # without this close, every retry stacked another live codex
                 # process (and only the newest stayed tracked for teardown).
-                with contextlib.suppress(Exception):
-                    await event_client.close()
                 with contextlib.suppress(Exception):
                     await app_server.close()
                 _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
@@ -4517,6 +4504,21 @@ async def _auto_create_codex_terminal(
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
+    if launch_config.external_session_id is None:
+        try:
+            # Connect the listener BEFORE launching the TUI so it observes the
+            # ``thread/started`` the TUI emits on startup (the client buffers
+            # notifications, so there is no created-before-listening race).
+            await event_client.connect()
+        except Exception:
+            # connect() may have half-opened the ws before the initialize
+            # handshake failed, so close the listener too — not just the
+            # app-server.
+            with contextlib.suppress(Exception):
+                await event_client.close()
+            await app_server.close()
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            raise
 
     # Register the Codex TUI as a streamable terminal resource attached to
     # the app-server started above (``--remote`` over its loopback ws
@@ -4658,7 +4660,6 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
-                event_client=event_client,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4917,7 +4918,6 @@ async def _codex_forward_known_thread(
     bridge_dir: Path,
     codex_ws_url: str,
     thread_id: str,
-    event_client: CodexAppServerClient,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4930,7 +4930,6 @@ async def _codex_forward_known_thread(
         ``"ws://127.0.0.1:9876"``.
     :param thread_id: Existing Codex app-server thread id, e.g.
         ``"thread_abc123"``.
-    :param event_client: Listener connected before the thread was preloaded.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4945,11 +4944,11 @@ async def _codex_forward_known_thread(
         _RunnerDatabricksAuth,
     )
 
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    auth_factory = _make_auth_token_factory()
+    auth_token = auth_factory() if auth_factory is not None else None
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     try:
-        server_url = _required_runner_env("RUNNER_SERVER_URL")
-        auth_factory = _make_auth_token_factory()
-        auth_token = auth_factory() if auth_factory is not None else None
-        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
         await supervise_forwarder(
             base_url=server_url,
             headers=headers,
@@ -4957,13 +4956,10 @@ async def _codex_forward_known_thread(
             bridge_dir=bridge_dir,
             app_server_url=codex_ws_url,
             thread_id=thread_id,
-            client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
         )
     finally:
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-        with contextlib.suppress(Exception):
-            await event_client.close()
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()
