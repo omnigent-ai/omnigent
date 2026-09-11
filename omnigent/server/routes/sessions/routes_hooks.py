@@ -759,8 +759,11 @@ def register_hooks_routes(
                 media_type="application/json",
             )
 
-        loaded = _sf.get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        loaded = await asyncio.to_thread(
+            _sf.get_agent_cache().load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.session_id is None,
         )
 
         _caps = _sf.get_caps()
@@ -1633,7 +1636,7 @@ def register_hooks_routes(
             decision_scope,
             resolve_turn_route,
         )
-        from omnigent.server.routes._sessions.helpers import _resolve_harness
+        from omnigent.server.routes._sessions.helpers import _resolve_harness_async
         from omnigent.server.routes._sessions.orchestration import (
             _native_turn_catalog,
             _publish_routed_model,
@@ -1772,6 +1775,7 @@ def register_hooks_routes(
             await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
             return True
 
+        parent_harness = await _resolve_harness_async(parent) if parent is not None else None
         decision = await resolve_turn_route(
             session_id,
             route_request,
@@ -1779,7 +1783,7 @@ def register_hooks_routes(
             parent=parent,
             # A pinned routed parent confines its spawns to its own family, so
             # the pane's own family is not the only one that matters.
-            parent_harness=_resolve_harness(parent) if parent is not None else None,
+            parent_harness=parent_harness,
             route_turn=_route,
             reuse_create_route=_reuse_create_route,
             pin=_pin,

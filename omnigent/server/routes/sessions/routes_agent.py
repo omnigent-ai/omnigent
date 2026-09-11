@@ -131,7 +131,7 @@ def register_agent_routes(
                 f"Agent not found: {conv.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
             )
-        return _to_agent_object(agent, agent_cache)
+        return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
 
     @router.get(
         "/sessions/{session_id}/agent/contents",
@@ -293,7 +293,7 @@ def register_agent_routes(
 
         # Idempotency: same bundle content = no-op
         if new_loc == agent.bundle_location:
-            return _to_agent_object(agent, agent_cache)
+            return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
 
         if artifact_store is None:
             raise OmnigentError(
@@ -312,11 +312,15 @@ def register_agent_routes(
             # Only operator-authored template agents
             # (session_id is None) may expand ${VAR} against the server
             # env; tenant session-scoped bundles must not.
-            agent_cache.replace(
-                agent.id, new_loc, bundle_bytes, expand_env=agent.session_id is None
+            await asyncio.to_thread(
+                agent_cache.replace,
+                agent.id,
+                new_loc,
+                bundle_bytes,
+                expand_env=agent.session_id is None,
             )
 
-        return _to_agent_object(updated, agent_cache)
+        return await asyncio.to_thread(_to_agent_object, updated, agent_cache)
 
     # ── POST /sessions/{session_id}/mcp ──────────────────────────────────
     # MCP Streamable HTTP proxy endpoint. Only registered when a

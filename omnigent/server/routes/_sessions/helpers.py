@@ -1818,6 +1818,11 @@ def _resolve_harness(*args: Any, **kwargs: Any) -> str | None:
     return _facade._resolve_harness(*args, **kwargs)
 
 
+async def _resolve_harness_async(*args: Any, **kwargs: Any) -> str | None:
+    """Resolve a harness without blocking the Server event loop."""
+    return await asyncio.to_thread(_resolve_harness, *args, **kwargs)
+
+
 def _resolve_harness_impl(
     conv: Conversation | None,
     *,
@@ -5410,7 +5415,7 @@ async def _launch_runner_on_host_locked(
             # Canonical harness (see _resolve_harness) so the host runs the
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
-            harness=_resolve_harness(conv),
+            harness=await _resolve_harness_async(conv),
         )
     )
     try:
@@ -9885,15 +9890,13 @@ async def _handle_advise_models_mcp(
         agent_obj = await asyncio.to_thread(agent_store.get, conv.agent_id)
         if agent_obj is not None:
             try:
-                spec = (
-                    get_agent_cache()
-                    .load(
-                        agent_obj.id,
-                        agent_obj.bundle_location,
-                        expand_env=agent_obj.session_id is None,
-                    )
-                    .spec
+                loaded = await asyncio.to_thread(
+                    get_agent_cache().load,
+                    agent_obj.id,
+                    agent_obj.bundle_location,
+                    expand_env=agent_obj.session_id is None,
                 )
+                spec = loaded.spec
             except Exception:  # noqa: BLE001
                 _logger.debug(
                     "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
@@ -10734,6 +10737,7 @@ __all__ = [
     "_reset_runner_resources_after_switch",
     "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",
+    "_resolve_harness_async",
     "_resolve_llm_model",
     "_resolve_skill_meta_text_via_runner",
     "_resolve_subagent_spec",
