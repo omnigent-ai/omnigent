@@ -9,7 +9,7 @@ export interface CssColor extends Rgb {
 }
 
 export function parseCssColor(value: string): CssColor | null {
-  const hex = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(value);
+  const hex = value.match(/^#([0-9a-f]{6})([0-9a-f]{2})?$/i);
   if (hex) {
     return {
       r: Number.parseInt(hex[1].slice(0, 2), 16),
@@ -18,8 +18,8 @@ export function parseCssColor(value: string): CssColor | null {
       alpha: hex[2] ? Number.parseInt(hex[2], 16) / 255 : 1,
     };
   }
-  const rgb = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i.exec(
-    value,
+  const rgb = value.match(
+    /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i,
   );
   if (!rgb) return null;
   return {
@@ -33,7 +33,7 @@ export function parseCssColor(value: string): CssColor | null {
 function parseSurface(value: string): CssColor {
   const rgb = parseCssColor(value);
   if (rgb) return rgb;
-  const oklch = /^oklch\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\)$/i.exec(value);
+  const oklch = value.match(/^oklch\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\)$/i);
   if (!oklch) throw new Error(`Unsupported selection surface: ${value}`);
   const lightness = Number(oklch[1]);
   const chroma = Number(oklch[2]);
