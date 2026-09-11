@@ -4211,6 +4211,25 @@ class BtwOverlay:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class PaneSignals:
+    """
+    The poll-time signals scraped from a single Claude pane capture.
+
+    Bundled so the forwarder reads the pane ONCE per poll and parses every
+    footer-derived signal from that one ``capture-pane`` subprocess, instead
+    of spawning a separate capture per signal.
+
+    :param permission_mode: The ``--permission-mode`` footer value, e.g.
+        ``"auto"``, or ``None`` when no mode footer is visible.
+    :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
+        when none is shown / it is still generating.
+    """
+
+    permission_mode: str | None = None
+    btw_overlay: BtwOverlay | None = None
+
+
 def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     """
     Parse a *completed* ``/btw`` side-chat overlay from a captured pane.
@@ -6498,6 +6517,34 @@ def read_btw_overlay(bridge_dir: Path) -> BtwOverlay | None:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return None
     return _btw_overlay_from_pane(_capture_pane(socket_path, tmux_target))
+
+
+def read_pane_signals(bridge_dir: Path) -> PaneSignals:
+    """
+    Read every poll-time footer signal from ONE Claude pane capture.
+
+    Non-blocking, best-effort, read-only. Captures the pane a single time
+    and parses both the permission-mode footer and any settled ``/btw``
+    overlay from it, so the forwarder spawns one ``capture-pane``
+    subprocess per poll rather than one per signal. Returns an empty
+    :class:`PaneSignals` when the terminal isn't up.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: The parsed pane signals (fields ``None`` when absent).
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return PaneSignals()
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return PaneSignals()
+    pane = _capture_pane(socket_path, tmux_target)
+    return PaneSignals(
+        permission_mode=_permission_mode_from_pane(pane),
+        btw_overlay=_btw_overlay_from_pane(pane),
+    )
 
 
 def dismiss_btw_overlay(bridge_dir: Path) -> bool:
