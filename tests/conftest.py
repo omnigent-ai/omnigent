@@ -353,6 +353,19 @@ def _isolate_claude_native_state(
 
 
 @pytest.fixture(autouse=True)
+def _isolate_claude_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a developer's ``CLAUDE_CONFIG_DIR`` out of tests.
+
+    Omnigent resolves Claude's home from it, which would bypass the tmp ``$HOME``
+    tests use to redirect ``~/.claude``. Tests that need a profile set it themselves.
+
+    :param monkeypatch: Pytest monkeypatch fixture; restores the env at teardown.
+    :returns: None.
+    """
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_codex_native_state(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
