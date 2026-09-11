@@ -338,6 +338,46 @@ const TEST_EXTENSION: ExtensionCatalogItem = {
   },
 };
 
+describe("Sidebar scroll divider", () => {
+  it("separates fixed navigation only while sessions are scrolled", () => {
+    mockConversations([conv("session-1", "A session")]);
+    renderSidebar();
+
+    const divider = screen.getByTestId("sidebar-scroll-divider");
+    const scrollContainer = screen.getByRole("navigation");
+
+    expect(divider).toHaveClass("opacity-0", "absolute", "pointer-events-none");
+    expect(divider).toHaveAttribute("aria-hidden", "true");
+    expect(scrollContainer).not.toContainElement(divider);
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 1 } });
+    expect(divider).toHaveClass("opacity-100");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 100 } });
+    expect(divider).toHaveClass("opacity-100");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 0 } });
+    expect(divider).toHaveClass("opacity-0");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: -10 } });
+    expect(divider).toHaveClass("opacity-0");
+  });
+
+  it("resets when returning from settings to a fresh session list", () => {
+    mockConversations([conv("session-1", "A session")]);
+    renderSidebar();
+
+    fireEvent.scroll(screen.getByRole("navigation"), { target: { scrollTop: 100 } });
+    expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-100");
+
+    fireEvent.click(screen.getByTestId("sidebar-settings-float"));
+    expect(screen.queryByTestId("sidebar-scroll-divider")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("link", { name: /back/i }));
+    expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-0");
+  });
+});
+
 describe("Sidebar session list", () => {
   it.each([null, 1, 2, 3, 4])(
     "marks shared sessions regardless of permission level %s",

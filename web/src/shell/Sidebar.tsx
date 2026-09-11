@@ -713,6 +713,11 @@ function SidebarImpl({
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);
+  const [hasScrolled, setHasScrolled] = useState(false);
+  const setScrollContainer = useCallback((node: HTMLElement | null) => {
+    scrollContainerRef.current = node;
+    setHasScrolled((node?.scrollTop ?? 0) > 0);
+  }, []);
 
   // Inbox badge — total approval prompts across loaded rows. We read from both
   // conversationsQuery (all-sessions, page 1 coverage) AND filteredConversationsQuery
@@ -1210,8 +1215,17 @@ function SidebarImpl({
           absolute-positioning inside the aside would place it in the native
           safe-area padding, under the home indicator. */}
             <div className="relative flex min-h-0 flex-1 flex-col">
+              <div
+                aria-hidden="true"
+                data-testid="sidebar-scroll-divider"
+                className={cn(
+                  "pointer-events-none absolute inset-x-0 top-0 z-10 h-px bg-border",
+                  hasScrolled ? "opacity-100" : "opacity-0",
+                )}
+              />
               <nav
-                ref={scrollContainerRef}
+                ref={setScrollContainer}
+                onScroll={(event) => setHasScrolled(event.currentTarget.scrollTop > 0)}
                 // Keep wheel/touch scrolling without letting classic-scrollbar
                 // platforms reserve a wide, permanently visible Sidebar gutter.
                 // max-md:pb-14 is the floating Settings chip's clearance: the
