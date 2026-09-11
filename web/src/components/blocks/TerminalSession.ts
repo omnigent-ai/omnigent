@@ -489,10 +489,10 @@ export function wheelReportPayload(
  *
  * The constructor performs all the setup synchronously — open the
  * terminal on the container, open the WebSocket, wire up listeners,
- * attach a ResizeObserver. {@link dispose} tears them all down in
+ * attach resize and theme observers. {@link dispose} tears them all down in
  * the same order callers expect: abort listeners first (so the
  * close event doesn't fire stale state into a remounted view),
- * disconnect the observer, dispose the xterm data subscription,
+ * disconnect the observers, dispose the xterm data subscription,
  * close the WS, dispose the terminal.
  */
 export class TerminalSession {

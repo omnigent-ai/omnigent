@@ -352,6 +352,16 @@ Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
 
+In **Settings > Appearance**, the built-in or custom accent drives text
+selection in light and dark mode, including Markdown and terminal selections.
+Highlights adjust automatically for contrast without changing your saved
+accent; open terminals update without reconnecting. Opaque selections target
+3:1 highlight contrast against modeled surfaces and 4.5:1 selected-text
+contrast, with a best-effort highlight fallback when surfaces are incompatible.
+These targets do not guarantee contrast at every gradient pixel. PDF selection
+uses a translucent accent wash to keep the rendered page visible, so contrast
+depends on the underlying page image.
+
 <details>
 <summary>Customize automatic session titles</summary>
 
