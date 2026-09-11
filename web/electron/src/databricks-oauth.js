@@ -331,17 +331,18 @@ async function runInteractiveLogin(origin) {
         code_challenge_method: "S256",
       }).toString();
       const authPath = `/oidc/v1/authorize?${authQuery}`;
-      // SPOG account-first: login-host entry with target=ACCOUNT, which resolves
-      // the account and runs the account authorize (skipping /select-workspace),
-      // then redirects back with a code — WITHOUT target=ACCOUNT the login host
-      // just lands on the account console and never redirects. NO isMobile: that
-      // routes the redirect through the /mobile-redirect bounce page; desktop
-      // wants a direct loopback redirect. Login host defaults to the entered
-      // origin unless OMNIGENT_DATABRICKS_LOGIN_URL overrides it. Non-SPOG
+      // SPOG: enter at the login host and let Databricks run its own account ->
+      // workspace selection, then run the authorize against the picked workspace
+      // and redirect back with a WORKSPACE-scoped code (the workspace comes back
+      // as the issuer, iss). Deliberately NO target=ACCOUNT — that flag skips the
+      // /select-workspace step and stops at an account-scoped token. NO isMobile
+      // either — that routes the redirect through the /mobile-redirect bounce
+      // page; desktop wants a direct loopback redirect. Login host defaults to the
+      // entered origin unless OMNIGENT_DATABRICKS_LOGIN_URL overrides it. Non-SPOG
       // authorizes straight against the entered workspace.
       const loginHost = loginUrl || origin;
       const authorizeUrl = spog
-        ? `${loginHost}/?destination_url=${encodeURIComponent(authPath)}&target=ACCOUNT`
+        ? `${loginHost}/?destination_url=${encodeURIComponent(authPath)}`
         : `${origin}${authPath}`;
       console.log(
         `[omnigent] databricks oauth: mode=${spog ? `SPOG(login-host=${loginHost})` : "workspace-direct"} ` +
