@@ -13,10 +13,12 @@
 //                                        loopback redirect. Databricks ignores the port per RFC 8252,
 //                                        so an ephemeral free port is bound unless one is pinned.)
 //   OMNIGENT_DATABRICKS_OAUTH_SCOPES    (default "all-apis offline_access")
-//   OMNIGENT_DATABRICKS_OAUTH_SPOG=1    (account-first entry via the SISU login host — the user picks
-//                                        an account, then a workspace from the account workspaces API.
-//                                        Off = the entered URL is authorized directly.)
-//   OMNIGENT_DATABRICKS_LOGIN_URL       (SISU login host for SPOG; default https://login.databricks.com)
+//
+// The authorize request goes directly to the entered origin's /oidc/v1/authorize.
+// A workspace host yields a workspace-scoped token; an account/SPOG host yields an
+// account-scoped token, and the workspace is then chosen from the account
+// workspaces API (see databricks-session.js). Account-first entry via the SISU
+// login host (target=ACCOUNT, for generic multi-account login) is a follow-up.
 
 "use strict";
 
@@ -25,13 +27,10 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
-const { app, shell, safeStorage } = require("electron");
+const { shell, safeStorage } = require("electron");
 
 const DEFAULT_REDIRECT_BASE = "http://localhost";
 const DEFAULT_SCOPES = "all-apis offline_access";
-// SISU login host for the SPOG account-first picker (mirrors DB One). Prod; set
-// OMNIGENT_DATABRICKS_LOGIN_URL to a staging SISU host when testing on staging.
-const DEFAULT_LOGIN_URL = "https://login.databricks.com";
 // Public first-party OAuth client (PKCE, no secret), registered as a published
 // connector. Overridable via env so a custom app integration can be used for
 // testing before the published "omnigent" connector exists.
@@ -52,8 +51,6 @@ function config() {
   return {
     redirectBase: (process.env.OMNIGENT_DATABRICKS_OAUTH_REDIRECT ?? DEFAULT_REDIRECT_BASE).trim(),
     scopes: (process.env.OMNIGENT_DATABRICKS_OAUTH_SCOPES ?? DEFAULT_SCOPES).trim(),
-    loginUrl: (process.env.OMNIGENT_DATABRICKS_LOGIN_URL ?? DEFAULT_LOGIN_URL).trim().replace(/\/+$/, ""),
-    spog: process.env.OMNIGENT_DATABRICKS_OAUTH_SPOG === "1",
   };
 }
 
@@ -213,7 +210,7 @@ async function refreshTokens(origin, refreshToken) {
 // ── Interactive browser login (loopback redirect) ───────────────────────────
 
 async function runInteractiveLogin(origin) {
-  const { redirectBase, scopes, loginUrl, spog } = config();
+  const { redirectBase, scopes } = config();
   const { verifier, challenge } = makePkce();
   const state = base64url(crypto.randomBytes(24));
   const base = new URL(redirectBase);
@@ -282,9 +279,6 @@ async function runInteractiveLogin(origin) {
     server.listen(fixedPort, base.hostname, () => {
       const port = server.address().port;
       redirectUri = `${base.protocol}//${base.hostname}:${port}${pathPart}`;
-      // Standard PKCE authorize request as a RELATIVE path — in SPOG mode this
-      // rides inside the login host's destination_url so the picker resolves a
-      // workspace before this authorize runs (yielding a workspace-scoped token).
       const authQuery = new URLSearchParams({
         response_type: "code",
         client_id: OAUTH_CLIENT_ID,
@@ -294,33 +288,18 @@ async function runInteractiveLogin(origin) {
         code_challenge: challenge,
         code_challenge_method: "S256",
       }).toString();
-      const authPath = `/oidc/v1/authorize?${authQuery}`;
-      // SPOG (account-first, mirrors genie-one-desktop accountSelector): enter at
-      // the SISU login host with target=ACCOUNT. That flag is what makes SISU
-      // resolve the account's cloud host and redirect the code back to our
-      // loopback — WITHOUT it SISU can't resolve the relative destination_url and
-      // never redirects (it just lands on the account console). The token comes
-      // back ACCOUNT-scoped (issuer = account host); the workspace is chosen
-      // afterward from the account workspaces API. NO isMobile — that routes
-      // through the /mobile-redirect bounce page; desktop wants a direct loopback
-      // redirect. Login host is login.databricks.com unless
-      // OMNIGENT_DATABRICKS_LOGIN_URL overrides it (e.g. a staging SISU host).
-      // Non-SPOG authorizes straight against the entered origin.
-      const loginHost = loginUrl || DEFAULT_LOGIN_URL;
-      const authorizeUrl = spog
-        ? `${loginHost}/?destination_url=${encodeURIComponent(authPath)}` +
-          `&target=ACCOUNT&l=${encodeURIComponent(app.getLocale())}`
-        : `${origin}${authPath}`;
+      // Authorize directly against the entered origin. A workspace host issues a
+      // workspace-scoped token; an account/SPOG host issues an account-scoped one
+      // (the workspace is chosen afterward from the account workspaces API).
+      const authorizeUrl = `${origin}/oidc/v1/authorize?${authQuery}`;
       void shell.openExternal(authorizeUrl);
-      console.log(
-        `[omnigent] databricks oauth: opened system browser for ${spog ? "account" : "workspace"} sign-in`,
-      );
+      console.log("[omnigent] databricks oauth: opened system browser for sign-in");
     });
   });
 
   // The origin the token was issued by comes from the issuer (iss, RFC 9207) when
-  // present — the account host in SPOG mode, the workspace in workspace-direct.
-  // Fall back to the entered origin when absent.
+  // present — an account host for an account-scoped token, the workspace host for
+  // a workspace-scoped one. Fall back to the entered origin when absent.
   let issuerOrigin = origin;
   if (callback.iss) {
     if (!isTrustedDatabricksOrigin(callback.iss)) {
@@ -333,14 +312,13 @@ async function runInteractiveLogin(origin) {
 }
 
 /**
- * Return a valid access token plus the workspace origin it is scoped to, minting
- * or refreshing as needed. In SPOG mode an interactive login can resolve a
- * DIFFERENT workspace origin than the one entered (the user picks it), so callers
- * must use the returned ``workspaceOrigin`` for the session-create call and the
- * window load. With ``interactive: false`` (the session-expiry path) it never
- * opens a browser — it uses a stored/refreshable token or throws.
+ * Return a valid access token plus the origin it was issued by, minting or
+ * refreshing as needed. The issuer can differ from the entered origin (an
+ * account host issues an account-scoped token), so callers read the returned
+ * ``workspaceOrigin``. With ``interactive: false`` (the session-expiry path) it
+ * never opens a browser — it uses a stored/refreshable token or throws.
  *
- * @param {string} origin The entered origin (SPOG/account host or workspace host).
+ * @param {string} origin The entered origin (account host or workspace host).
  * @param {{ interactive?: boolean }} [opts]
  * @returns {Promise<{ accessToken: string, workspaceOrigin: string }>}
  */
