@@ -24,9 +24,13 @@ import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
+    MCP_STARTUP_STARTING,
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
+    pending_mcp_servers,
     read_bridge_state,
+    read_mcp_startup,
+    update_mcp_server_startup,
     write_bridge_state,
 )
 from omnigent.harnesses.codex_native.forwarder import _persist_codex_compaction_item
@@ -3567,3 +3571,95 @@ def test_thread_started_is_ephemeral_false_for_missing_thread() -> None:
     """Event with params but no thread is not ephemeral."""
     event = {"method": "thread/started", "params": {}}
     assert fwd._thread_started_is_ephemeral(event) is False
+
+
+class _ScriptedCodexClient:
+    """Codex app-server stub whose ``thread/resume`` outcomes are scripted."""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        """
+        :param outcomes: Per-call results; an ``Exception`` entry is raised,
+            any other entry is returned as the JSON-RPC response envelope.
+        """
+        self._outcomes = list(outcomes)
+        self.requests: list[tuple[str, dict]] = []
+
+    async def request(self, method: str, params: dict) -> dict:
+        """Record the call and pop the next scripted outcome."""
+        self.requests.append((method, params))
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        assert isinstance(outcome, dict)
+        return outcome
+
+
+def _mcp_startup_posts(client: _RecordingClient) -> list[dict]:
+    """Return the servers map of every ``external_mcp_startup`` post."""
+    return [
+        body["data"]["servers"]
+        for _, body in client.posts
+        if body.get("type") == "external_mcp_startup"
+    ]
+
+
+async def test_persisted_thread_resume_settles_synthesized_mcp_startup(tmp_path: Path) -> None:
+    """A first-attempt resume success clears the pending MCP startup band.
+
+    On cold resume the initial idle edge goes to the preload's temporary
+    connection, never this one, so the forwarder's own successful
+    ``thread/resume`` of the persisted thread must settle the synthesized
+    ``starting`` round.
+    """
+    ap_client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "slowmcp", MCP_STARTUP_STARTING)
+    codex_client = _ScriptedCodexClient([{"result": {"thread": {"id": "thread_x", "turns": []}}}])
+    state = fwd._CodexForwarderState()
+
+    await fwd._subscribe_until_ready(
+        codex_client,  # type: ignore[arg-type]
+        ap_client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_x",
+        usage_coalescer=fwd._SessionUsageCoalescer(ap_client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        forwarder_state=state,
+    )
+
+    assert _mcp_startup_posts(ap_client) == [{}]
+    assert state.mcp_startup_settled is True
+    assert pending_mcp_servers(read_mcp_startup(tmp_path)) == []
+
+
+async def test_fresh_thread_retry_resume_leaves_mcp_startup_pending(tmp_path: Path) -> None:
+    """A post-retry resume success must not settle the MCP startup band.
+
+    A first attempt failing not-ready proves this launch created the
+    thread; its later resume success lands mid-startup (first turn just
+    accepted), so the round keeps waiting for idle/output/ready signals.
+    """
+    ap_client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "slowmcp", MCP_STARTUP_STARTING)
+    codex_client = _ScriptedCodexClient(
+        [
+            RuntimeError("no rollout found for thread id thread_x"),
+            {"result": {"thread": {"id": "thread_x", "turns": []}}},
+        ]
+    )
+    state = fwd._CodexForwarderState()
+
+    await fwd._subscribe_until_ready(
+        codex_client,  # type: ignore[arg-type]
+        ap_client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_x",
+        usage_coalescer=fwd._SessionUsageCoalescer(ap_client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        forwarder_state=state,
+    )
+
+    assert _mcp_startup_posts(ap_client) == []
+    assert state.mcp_startup_settled is False
+    assert pending_mcp_servers(read_mcp_startup(tmp_path)) == ["slowmcp"]

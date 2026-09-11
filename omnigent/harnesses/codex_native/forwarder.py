@@ -2233,6 +2233,16 @@ async def _subscribe_until_ready(
     detect activity and set the signal. A short poll still covers the
     brief window between "thread active" and the rollout being flushed.
 
+    A first-attempt ``thread/resume`` success means the rollout already
+    existed — a persisted thread this forwarder did not create. Codex
+    delivers the initial idle ``thread/status/changed`` only to the
+    connection that FIRST resumes a thread (it is not replayed later), and
+    on cold resume that is the preload's temporary connection — so this
+    connection would wait out the whole settle window with the synthesized
+    MCP startup band stuck on "starting". The successful resume of the
+    already-loaded thread carries the same meaning as that consumed idle
+    edge, so it settles the synthesized round here.
+
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
     :param session_id: Omnigent conversation id.
@@ -2281,6 +2291,18 @@ async def _subscribe_until_ready(
                 continue
             _logger.warning("failed to subscribe to Codex thread %s", thread_id, exc_info=True)
             return
+        if not saw_not_ready:
+            # The rollout already existed: a resumed thread whose initial idle
+            # edge went to its first resumer (preload's temporary connection
+            # on cold resume). This success is the equivalent settle signal.
+            await _settle_mcp_startup(
+                ap_client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                reason="persisted thread resumed",
+            )
+            if forwarder_state is not None:
+                forwarder_state.mcp_startup_settled = True
         if forwarder_state is not None:
             forwarder_state.note_resume_response(response)
             # Source of truth for the cost policy is config.toml's model (what
