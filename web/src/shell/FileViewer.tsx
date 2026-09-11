@@ -84,6 +84,13 @@ import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import {
+  isHostWorkspaceTarget,
+  normalizeWorkspaceResourceTarget,
+  workspaceTargetKey,
+  workspaceTargetSessionId,
+  type WorkspaceResourceTarget,
+} from "@/lib/workspaceTarget";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
@@ -281,7 +288,9 @@ function useToolbarOverflow(actionsKey: string): {
 
 interface FileViewerProps {
   open: boolean;
-  conversationId: string;
+  conversationId?: string;
+  /** Explicit resource scope. Omit to use conversationId for compatibility. */
+  target?: WorkspaceResourceTarget;
   path: string;
   onClose: () => void;
 
@@ -323,9 +332,12 @@ export function FileViewer(props: FileViewerProps) {
   // works for both template agents and session-scoped agents from
   // `omnigent run --server`.
   const agentId = useChatStore((s) => s.boundAgentId);
+  const target = normalizeWorkspaceResourceTarget(props.target ?? props.conversationId);
+  const sessionId = workspaceTargetSessionId(target);
+  if (!sessionId) return <FileViewerBody {...props} target={target} />;
   return (
-    <CommentSenderProvider sessionId={props.conversationId} agentId={agentId}>
-      <FileViewerBody {...props} />
+    <CommentSenderProvider sessionId={sessionId} agentId={agentId}>
+      <FileViewerBody {...props} target={target} />
     </CommentSenderProvider>
   );
 }
@@ -333,6 +345,7 @@ export function FileViewer(props: FileViewerProps) {
 function FileViewerBody({
   open,
   conversationId,
+  target: targetProp,
   path,
   onClose,
   onCloseTab,
@@ -342,9 +355,13 @@ function FileViewerBody({
   onCommentsOpenChange,
   sort = "recent",
 }: FileViewerProps) {
+  const resourceTarget = normalizeWorkspaceResourceTarget(targetProp ?? conversationId);
+  const sessionId = workspaceTargetSessionId(resourceTarget);
+  const hostMode = isHostWorkspaceTarget(resourceTarget);
+  const targetIdentity = workspaceTargetKey(resourceTarget).join("\u0000");
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
-  const canEdit = permissionLevel == null || permissionLevel >= 2;
+  const canEdit = !hostMode && (permissionLevel == null || permissionLevel >= 2);
   const [searchParams, setSearchParams] = useSearchParams();
   // Capture URL params once on open — we don't want re-renders caused by our own
   // param writes to re-run the initialization logic.
@@ -374,9 +391,9 @@ function FileViewerBody({
   // visible. No-op off iOS / with the keyboard closed. Not needed frameless
   // (embedded in the desktop aside, never a fixed overlay).
   const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
-  const fileQuery = useFileContent(conversationId, path);
-  const diffQuery = useFileDiff(conversationId, path);
-  const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const fileQuery = useFileContent(resourceTarget, path);
+  const diffQuery = useFileDiff(resourceTarget, path);
+  const changedFiles = useWorkspaceChangedFiles(resourceTarget);
 
   // Build the navigable file list from all changed files (including deleted),
   // sorted the same way FilesPanel sorts its flat view so the "X/N" index
@@ -392,10 +409,10 @@ function FileViewerBody({
     currentNavIdx >= 0 && currentNavIdx < navigableFiles.length - 1
       ? navigableFiles[currentNavIdx + 1]
       : null;
-  const commentsQuery = useComments(conversationId, path);
-  const addComment = useAddComment(conversationId);
-  const updateComment = useUpdateComment(conversationId);
-  const deleteComment = useDeleteComment(conversationId);
+  const commentsQuery = useComments(sessionId, path);
+  const addComment = useAddComment(sessionId ?? "");
+  const updateComment = useUpdateComment(sessionId ?? "");
+  const deleteComment = useDeleteComment(sessionId ?? "");
   const commentsInitializedRef = useRef(false);
   const linkedCommentAppliedRef = useRef(false);
   const viewModeInitializedRef = useRef(false);
@@ -499,8 +516,9 @@ function FileViewerBody({
   );
 
   const downloadFile = useCallback(() => {
-    downloadWorkspaceFile(conversationId, path).catch(() => toast.error("Download failed"));
-  }, [conversationId, path]);
+    if (!sessionId) return;
+    downloadWorkspaceFile(sessionId, path).catch(() => toast.error("Download failed"));
+  }, [sessionId, path]);
 
   // Pop the HTML artifact into its own browser tab. The artifact is rendered in
   // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
@@ -735,15 +753,19 @@ function FileViewerBody({
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
   // preference still carries across file types — opening markdown in source
   // then switching to an HTML file keeps you in source, etc.
-  const fileViewMode: "editor" | "preview" | "source" = isPreviewable
-    ? lang === "markdown"
-      ? deepLinkBiasPath === path
-        ? "editor"
-        : previewableViewMode
-      : previewableViewMode === "editor"
-        ? "preview"
-        : previewableViewMode
-    : "source";
+  const fileViewMode: "editor" | "preview" | "source" = hostMode
+    ? isPreviewable
+      ? "preview"
+      : "source"
+    : isPreviewable
+      ? lang === "markdown"
+        ? deepLinkBiasPath === path
+          ? "editor"
+          : previewableViewMode
+        : previewableViewMode === "editor"
+          ? "preview"
+          : previewableViewMode
+      : "source";
   // Derived effective view mode — diff takes priority when active and available.
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
@@ -823,7 +845,7 @@ function FileViewerBody({
   // at an unrelated place after a toggle; the namespace is separate from the
   // `viewer:` keys Monaco writes for its own internal scroller.
   const contentScrollKey =
-    conversationId && path ? `viewer-content:${conversationId}:${viewMode}:${path}` : null;
+    resourceTarget && path ? `viewer-content:${targetIdentity}:${viewMode}:${path}` : null;
   const handleContentScroll = useScrollRestore(
     contentAreaRef,
     contentScrollKey,
@@ -923,7 +945,7 @@ function FileViewerBody({
     menu?: ToolbarOption[];
   }
   const toolbarActions: ToolbarAction[] = [];
-  if (lang === "markdown" && viewMode !== "diff") {
+  if (!hostMode && lang === "markdown" && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
     // Editor (default), the rendered Preview, and raw Source. Switching away
     // from the editor must guard unsaved edits; the read-only preview/source
@@ -1024,16 +1046,18 @@ function FileViewerBody({
     });
   }
   // PDFs render through PdfViewer with text-layer comment anchors.
-  toolbarActions.push({
-    key: "comments",
-    label: commentsOpen ? "Hide comments" : "Show comments",
-    icon: <MessageSquareTextIcon className="size-4" />,
-    active: commentsOpen,
-    onSelect: () => {
-      commentsInitializedRef.current = true;
-      setCommentsOpen((prev) => !prev);
-    },
-  });
+  if (!hostMode) {
+    toolbarActions.push({
+      key: "comments",
+      label: commentsOpen ? "Hide comments" : "Show comments",
+      icon: <MessageSquareTextIcon className="size-4" />,
+      active: commentsOpen,
+      onSelect: () => {
+        commentsInitializedRef.current = true;
+        setCommentsOpen((prev) => !prev);
+      },
+    });
+  }
   if (!isPdf && isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
@@ -1071,7 +1095,7 @@ function FileViewerBody({
       onSelect: openSearch,
     },
   ];
-  if (!isDeletedFile && fileQuery.data) {
+  if (!hostMode && !isDeletedFile && fileQuery.data) {
     settingsMenu.push({
       key: "download",
       label: "Download file",
@@ -1527,7 +1551,7 @@ function FileViewerBody({
                   layout={diffLayout}
                   hideWhitespace={hideWhitespace}
                   wrapLines={wrapLines}
-                  conversationId={conversationId}
+                  conversationId={sessionId ?? ""}
                   comments={openComments}
                   activeSelection={activeSelection}
                   onSetActiveSelection={handleSetActiveSelection}
@@ -1539,7 +1563,8 @@ function FileViewerBody({
             )
           ) : (
             <CodeViewer
-              conversationId={conversationId}
+              conversationId={sessionId ?? ""}
+              readOnly={hostMode}
               path={path}
               fileQuery={fileQuery}
               onDirtyChange={setIsEditorDirty}
@@ -1556,11 +1581,13 @@ function FileViewerBody({
               viewMode={viewMode}
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
-              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+              onRequestEditMode={
+                !hostMode && lang === "markdown" ? handleRequestEditMode : undefined
+              }
             />
           )}
         </div>
-        {commentsOpen && (
+        {!hostMode && commentsOpen && (
           <CommentsPanel
             comments={openComments}
             addressedComments={addressedComments}

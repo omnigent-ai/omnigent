@@ -3171,6 +3171,9 @@ def create_app(
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
+        from omnigent.server.routes.host_workspace_contexts import (
+            create_host_workspace_contexts_router,
+        )
         from omnigent.server.routes.hosts import create_hosts_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
@@ -3200,6 +3203,17 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
+            ),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_host_workspace_contexts_router(
+                host_registry,
+                host_store,
+                conversation_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
             ),
             prefix="/v1",
             tags=["hosts"],

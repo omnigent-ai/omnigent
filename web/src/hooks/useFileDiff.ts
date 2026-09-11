@@ -13,6 +13,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { useWorkspaceChangedFiles, useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  normalizeWorkspaceResourceTarget,
+  workspaceResourceUrl,
+  workspaceTargetKey,
+  type WorkspaceResourceTarget,
+} from "@/lib/workspaceTarget";
 
 // The primary workspace environment is always "default".
 const DEFAULT_ENVIRONMENT_ID = "default";
@@ -26,12 +32,16 @@ export interface FileDiffResponse {
   after: string | null;
 }
 
-async function fetchFileDiff(conversationId: string, path: string): Promise<FileDiffResponse> {
+async function fetchFileDiff(
+  target: WorkspaceResourceTarget,
+  path: string,
+): Promise<FileDiffResponse> {
   // Encode each path segment individually so slashes remain structural.
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-  const url =
-    `/v1/sessions/${encodeURIComponent(conversationId)}` +
-    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/diff/${encodedPath}`;
+  const url = workspaceResourceUrl(
+    target,
+    `environments/${DEFAULT_ENVIRONMENT_ID}/diff/${encodedPath}`,
+  );
   const res = await authenticatedFetch(url);
   if (!res.ok) {
     // Surface the server's reason (e.g. "git status timed out after 5.0s")
@@ -57,15 +67,17 @@ async function fetchFileDiff(conversationId: string, path: string): Promise<File
  * - the runner is offline
  * - the file does not appear in the session's changed-files list
  */
-export function useFileDiff(conversationId: string | undefined, path: string | null) {
-  const serveable = useWorkspaceServeable(conversationId);
-  const changedFiles = useWorkspaceChangedFiles(conversationId);
+export function useFileDiff(target: WorkspaceResourceTarget | undefined, path: string | null) {
+  const normalizedTarget = normalizeWorkspaceResourceTarget(target);
+  const targetKey = workspaceTargetKey(normalizedTarget);
+  const serveable = useWorkspaceServeable(normalizedTarget);
+  const changedFiles = useWorkspaceChangedFiles(normalizedTarget);
   const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
 
   return useQuery({
-    queryKey: ["file-diff", conversationId, path],
-    queryFn: () => fetchFileDiff(conversationId!, path!),
-    enabled: !!conversationId && !!path && serveable !== false && isInChangedFiles,
+    queryKey: ["file-diff", ...targetKey, path],
+    queryFn: () => fetchFileDiff(normalizedTarget!, path!),
+    enabled: !!normalizedTarget && !!path && serveable !== false && isInChangedFiles,
     staleTime: 5_000,
   });
 }

@@ -15,6 +15,7 @@ import { toast } from "sonner";
 import {
   type CSSProperties,
   type ReactElement,
+  type ReactNode,
   lazy,
   memo,
   Suspense,
@@ -38,6 +39,8 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import type { WorkspaceResourceTarget } from "@/lib/workspaceTarget";
+import type { TerminalInfo } from "@/hooks/useTerminals";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -564,7 +567,15 @@ function RailTerminalView({
  */
 interface WorkspacePanelProps {
   /** Active session id — panels read the workspace against it. */
-  conversationId: string;
+  conversationId?: string;
+  target?: WorkspaceResourceTarget;
+  browserNamespace?: string;
+  landing?: boolean;
+  resourceCreationDisabled?: boolean;
+  unavailableReason?: string;
+  draftTerminals?: TerminalInfo[];
+  draftTerminalView?: ReactNode;
+  renderDraftNewTabMenu?: (onOpenBrowser?: () => void) => ReactNode;
   /** Show inert panel chrome while the server session id is still pending. */
   pending?: boolean;
   /** Current rail width (px), driven by the resize handle. */
@@ -679,6 +690,14 @@ interface WorkspacePanelProps {
  */
 function WorkspacePanelImpl({
   conversationId,
+  target,
+  browserNamespace,
+  landing = false,
+  resourceCreationDisabled = false,
+  unavailableReason,
+  draftTerminals,
+  draftTerminalView,
+  renderDraftNewTabMenu,
   pending = false,
   width,
   handleProps,
@@ -715,7 +734,7 @@ function WorkspacePanelImpl({
   onShellCreateStart,
   onShellCreateFailed,
 }: WorkspacePanelProps) {
-  const browsers = useBrowserTabs(conversationId);
+  const browsers = useBrowserTabs(browserNamespace ?? conversationId ?? "");
   const closeBrowserTab = async (tabId: string) => {
     const closed = await browsers.close(tabId);
     if (!closed) toast.error("Couldn't close browser tab. Try again.");
@@ -728,6 +747,7 @@ function WorkspacePanelImpl({
     rightRailTab === "browser" && selectedFilePath === null && selectedTerminalKey === null;
   const addBrowser = showBrowserTab
     ? () => {
+        if (resourceCreationDisabled) return;
         browsers.add();
         onRightRailTabChange("browser");
       }
@@ -740,12 +760,13 @@ function WorkspacePanelImpl({
   }, [onCloseFile, selectedFilePath]);
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
-  const { terminals } = useTerminals(conversationId);
+  const { terminals: sessionTerminals } = useTerminals(conversationId ?? null);
+  const terminals = draftTerminals ?? sessionTerminals;
   const terminalLabelFor = useCallback(
     (key: string) => {
       const t = terminals.find((term) => terminalTabKey(term) === key);
       if (!t) return key.replace(/^terminal:/, "");
-      return t.session ? `${t.name} · ${t.session}` : t.name;
+      return t.session && !t.session.startsWith("draft-") ? `${t.name} · ${t.session}` : t.name;
     },
     [terminals],
   );
@@ -1009,31 +1030,38 @@ function WorkspacePanelImpl({
                 stays pinned (never scrolls under / overlaps the tabs) when they
                 overflow, and hugs the last tab when they fit. ml-[2px] keeps the
                 same gap the scroller's gap-0.5 gives between tabs. */}
-            <NewTabMenu
-              conversationId={conversationId}
-              onOpenBrowser={addBrowser}
-              onCreateError={onShellCreateFailed}
-              onOpenTerminal={openTerminalTab}
-              onCreateStart={onShellCreateStart}
-              triggerClassName="ml-[2px]"
-              liveness={liveness}
-            />
+            {landing ? (
+              renderDraftNewTabMenu?.(addBrowser)
+            ) : (
+              <NewTabMenu
+                conversationId={conversationId!}
+                onOpenBrowser={addBrowser}
+                onCreateError={onShellCreateFailed}
+                onOpenTerminal={openTerminalTab}
+                onCreateStart={onShellCreateStart}
+                triggerClassName="ml-[2px]"
+                liveness={liveness}
+              />
+            )}
           </>
         )}
         {/* "+" — open a new Shell tab. With no open tabs it sits here, right
             after the nav tabs (next to Shells); once tabs exist it moves into
             the open-tabs region to trail the last tab (see above). Self-gates
             to nothing when the agent has no terminal access. */}
-        {showEmptyNewTab && (
-          <NewTabMenu
-            conversationId={conversationId}
-            onOpenBrowser={addBrowser}
-            onOpenTerminal={openTerminalTab}
-            onCreateStart={onShellCreateStart}
-            onCreateError={onShellCreateFailed}
-            liveness={liveness}
-          />
-        )}
+        {showEmptyNewTab &&
+          (landing ? (
+            renderDraftNewTabMenu?.(addBrowser)
+          ) : (
+            <NewTabMenu
+              conversationId={conversationId!}
+              onOpenBrowser={addBrowser}
+              onOpenTerminal={openTerminalTab}
+              onCreateStart={onShellCreateStart}
+              onCreateError={onShellCreateFailed}
+              liveness={liveness}
+            />
+          ))}
         {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
             which absorbs the free space before it. When open tabs exist their
             ≥500px flex-1 region absorbs the space instead, so the button still
@@ -1066,22 +1094,33 @@ function WorkspacePanelImpl({
             <Spinner />
             <span className="text-ui">Starting workspace…</span>
           </div>
+        ) : landing &&
+          !target &&
+          (selectedFilePath !== null ||
+            selectedTerminalKey !== null ||
+            (rightRailTab !== "browser" && rightRailTab !== "subagents")) ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-muted-foreground">
+            {unavailableReason ?? "Choose a connected computer and folder to browse the workspace."}
+          </div>
         ) : selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
           // Show the selected shell's xterm only while its terminal is actually
           // present. The selection is sticky (AppShell never prunes it off the
           // list), so during a transient terminals-list churn this falls back to
           // the default view and the xterm reappears when the terminal returns.
-          <RailTerminalView
-            conversationId={conversationId}
-            terminalKey={selectedTerminalKey}
-            readOnly={!isOwnerLevel(permissionLevel)}
-            autoFocus={autoFocusSelectedTerminal}
-          />
+          (draftTerminalView ?? (
+            <RailTerminalView
+              conversationId={conversationId!}
+              terminalKey={selectedTerminalKey}
+              readOnly={!isOwnerLevel(permissionLevel)}
+              autoFocus={autoFocusSelectedTerminal}
+            />
+          ))
         ) : selectedFilePath !== null ? (
           <FileViewer
             frameless
             open
             conversationId={conversationId}
+            target={target}
             path={selectedFilePath}
             onClose={onShowScopeView}
             onCloseTab={handleCloseTab}
@@ -1096,16 +1135,26 @@ function WorkspacePanelImpl({
           <BrowserPane
             key={browsers.viewId}
             conversationId={browsers.viewId}
-            agentBrowser={browsers.selected === null}
+            agentBrowser={!landing && browsers.selected === null}
+            allowDesignMode={!landing}
             className="min-h-0 flex-1"
           />
         ) : rightRailTab === "github" && showGithubTab ? (
-          <GithubPanel conversationId={conversationId} />
-        ) : rightRailTab === "subagents" && rootSessionId ? (
+          <GithubPanel conversationId={conversationId} target={target} />
+        ) : rightRailTab === "subagents" && landing ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-muted-foreground">
+            No agents yet. Start a chat to add an agent.
+          </div>
+        ) : rightRailTab === "subagents" && rootSessionId && conversationId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+        ) : landing && !target ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-muted-foreground">
+            {unavailableReason ?? "Choose a connected computer and folder to browse the workspace."}
+          </div>
         ) : (
           showFilesPanel && (
             <FilesPanel
+              target={target ?? conversationId}
               frameless
               onFileSelect={openFileViewer}
               flatView={rightRailTab === "changes"}

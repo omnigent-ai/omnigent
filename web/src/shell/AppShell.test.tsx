@@ -4121,3 +4121,30 @@ describe("Terminal-first shells — opening a shell from the mobile drawer", () 
     expect(probe).toHaveAttribute("data-terminal-view-key", "terminal:terminal_tui_main");
   });
 });
+
+describe("new-chat workspace rail", () => {
+  it("opens and collapses the workspace before a session exists", async () => {
+    const { writeLandingWorkspacePanel } = await import("@/lib/landingWorkspaceState");
+    writeLandingWorkspacePanel({
+      open: false,
+      rightRailTab: "files",
+      openFiles: [],
+      selectedFilePath: null,
+    });
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(screen.getByRole("tab", { name: "Agents 0" })).toBeInTheDocument();
+    expect(useTerminalsMock.mock.calls.every(([id]) => id == null)).toBe(true);
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Agents 0" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(screen.getByText("No agents yet. Start a chat to add an agent.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    expect(
+      screen.queryByText("No agents yet. Start a chat to add an agent."),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("home")).toBeInTheDocument();
+  });
+});

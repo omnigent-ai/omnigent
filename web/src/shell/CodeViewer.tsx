@@ -392,6 +392,8 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 
 export interface CodeViewerProps {
   conversationId: string;
+  /** Disable every file mutation even if session permissions would allow it. */
+  readOnly?: boolean;
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
   comments: Comment[];
@@ -435,6 +437,7 @@ export interface CodeViewerProps {
 
 export function CodeViewer({
   conversationId,
+  readOnly = false,
   path,
   fileQuery,
   comments,
@@ -453,7 +456,7 @@ export function CodeViewer({
   onTocToggle,
   onRequestEditMode,
 }: CodeViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canEdit = useCanEdit(conversationId) && !readOnly;
   const activeCommentId = activeSelection?.comment_id;
   const previewComments = useMemo(
     () => [...comments, ...addressedComments.filter((c) => c.id === activeCommentId)],

@@ -17,6 +17,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
+  normalizeWorkspaceResourceTarget,
+  workspaceResourceUrl,
+  workspaceTargetKey,
+  workspaceTargetSessionId,
+  type WorkspaceResourceTarget,
+} from "@/lib/workspaceTarget";
+import {
   isRunnerUnavailable503,
   RunnerOfflineError,
   runnerOfflineRetryDelay,
@@ -106,8 +113,16 @@ export interface GithubPrAssociation {
   relationship: "created" | "worked_on" | "attached" | "inferred";
 }
 
-function prQuery(prUrl?: string): string {
-  return prUrl ? `?${new URLSearchParams({ pr_url: prUrl })}` : "";
+function prQuery(prUrl?: string): URLSearchParams {
+  return new URLSearchParams(prUrl ? { pr_url: prUrl } : undefined);
+}
+
+function normalizeTarget(
+  target: WorkspaceResourceTarget | undefined,
+): ReturnType<typeof normalizeWorkspaceResourceTarget> {
+  const normalized = normalizeWorkspaceResourceTarget(target);
+  if (normalized?.kind === "session" && isTempConvId(normalized.sessionId)) return undefined;
+  return normalized;
 }
 
 export interface GithubInfo {
@@ -189,10 +204,16 @@ export function githubNotFoundReason(message: string | undefined): GithubUnavail
     : "no_os_env";
 }
 
-export async function fetchGithubInfo(conversationId: string, prUrl?: string): Promise<GithubInfo> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
-  );
+export function fetchGithubInfo(
+  target: Exclude<WorkspaceResourceTarget, string>,
+  prUrl?: string,
+): Promise<GithubInfo>;
+export function fetchGithubInfo(conversationId: string, prUrl?: string): Promise<GithubInfo>;
+export async function fetchGithubInfo(
+  target: WorkspaceResourceTarget,
+  prUrl?: string,
+): Promise<GithubInfo> {
+  const res = await authenticatedFetch(workspaceResourceUrl(target, "github", prQuery(prUrl)));
   if (res.status === 404) {
     // Preserve the server's message so an outdated host (no github route) is
     // told to update, rather than collapsing every 404 to "unavailable".
@@ -280,20 +301,22 @@ export function computeGithubPollInterval(info: GithubInfo | undefined): number 
  * with capped backoff so a cold-booting runner resolves before any error UI.
  */
 export function useGithubInfo(
-  rawConversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   options?: { poll?: boolean; prUrl?: string },
 ) {
   // A `temp:*` id (navigate-first new-chat window) has no server session.
-  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
-  const serveable = useWorkspaceServeable(conversationId);
+  const target = normalizeTarget(rawTarget);
+  const conversationId = workspaceTargetSessionId(target);
+  const targetKey = workspaceTargetKey(target);
+  const serveable = useWorkspaceServeable(target);
   // Turn-end backstop: refetch when the focused session goes active→idle, so a
   // just-opened PR appears without opening the tab. Keys off the turn lifecycle,
   // so it works for every harness (no per-harness tool detection).
-  useTrailingInvalidate(conversationId, useSessionActive(conversationId), "github-info");
+  useTrailingInvalidate(target, useSessionActive(conversationId), "github-info");
   return useQuery({
-    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () => fetchGithubInfo(conversationId!, options?.prUrl),
-    enabled: !!conversationId && serveable !== false,
+    queryKey: ["github-info", ...targetKey, ...(options?.prUrl ? [options.prUrl] : [])],
+    queryFn: () => fetchGithubInfo(target!, options?.prUrl),
+    enabled: !!target && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
@@ -317,9 +340,11 @@ export interface GithubPreferenceInput {
 }
 
 async function postGithubPreference(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   body: GithubPreferenceInput,
 ): Promise<GithubInfo> {
+  const conversationId = workspaceTargetSessionId(target);
+  if (!conversationId) throw new Error("GitHub preferences require a session");
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/preferences`,
     {
@@ -344,25 +369,26 @@ async function postGithubPreference(
  * account/base can resolve a different PR, the PR-derived queries (changed files,
  * whole-PR diff) are invalidated so they refetch. Requires the runner online.
  */
-export function useSetGithubPreference(conversationId: string | undefined) {
+export function useSetGithubPreference(target: WorkspaceResourceTarget | undefined) {
   const queryClient = useQueryClient();
+  const targetKey = workspaceTargetKey(target);
   return useMutation({
-    mutationFn: (body: GithubPreferenceInput) => postGithubPreference(conversationId!, body),
+    mutationFn: (body: GithubPreferenceInput) => postGithubPreference(target!, body),
     onSuccess: (info) => {
-      queryClient.setQueryData(["github-info", conversationId], info);
-      queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
-      queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
-      queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
+      queryClient.setQueryData(["github-info", ...targetKey], info);
+      queryClient.invalidateQueries({ queryKey: ["github-info", ...targetKey] });
+      queryClient.invalidateQueries({ queryKey: ["github-changed-files", ...targetKey] });
+      queryClient.invalidateQueries({ queryKey: ["github-pr-diff", ...targetKey] });
     },
   });
 }
 
 async function fetchGithubChangedFiles(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   prUrl?: string,
 ): Promise<GithubChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${prQuery(prUrl)}`,
+    workspaceResourceUrl(target, "github/changes", prQuery(prUrl)),
   );
   if (res.status === 404) return { available: false, data: [] };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -379,18 +405,20 @@ async function fetchGithubChangedFiles(
  * empty list otherwise.
  */
 export function useGithubChangedFiles(
-  conversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   hasPr: boolean,
   prUrl?: string,
   revision?: string,
 ) {
-  const serveable = useWorkspaceServeable(conversationId);
+  const target = normalizeTarget(rawTarget);
+  const targetKey = workspaceTargetKey(target);
+  const serveable = useWorkspaceServeable(target);
   return useQuery({
-    queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchGithubChangedFiles(conversationId!, prUrl),
+    queryKey: ["github-changed-files", ...targetKey, ...(prUrl ? [prUrl, revision] : [])],
+    queryFn: () => fetchGithubChangedFiles(target!, prUrl),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
-    enabled: !!conversationId && hasPr && serveable !== false,
+    enabled: !!target && hasPr && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
@@ -403,7 +431,7 @@ export function useGithubChangedFiles(
  * as a hook. Returns `""` sides normalized by the caller.
  */
 export async function fetchGithubFileContents(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   path: string,
   base: string | undefined,
   selected?: { pr_url: string; previous_path?: string; head_sha?: string; base_sha?: string },
@@ -415,10 +443,8 @@ export async function fetchGithubFileContents(
   for (const [key, value] of Object.entries(selected ?? {})) {
     if (value) query.set(key, value);
   }
-  const params = query.size ? `?${query}` : "";
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}` +
-      `/resources/github/diff/${encodedPath}${params}`,
+    workspaceResourceUrl(target, `github/diff/${encodedPath}`, query),
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
@@ -434,12 +460,10 @@ export interface GithubPrDiffResponse {
 }
 
 async function fetchGithubPrDiff(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   prUrl?: string,
 ): Promise<GithubPrDiffResponse> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${prQuery(prUrl)}`,
-  );
+  const res = await authenticatedFetch(workspaceResourceUrl(target, "github/diff", prQuery(prUrl)));
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
@@ -454,26 +478,31 @@ async function fetchGithubPrDiff(
  * disabled when the runner is known offline.
  */
 export function useGithubPrDiff(
-  conversationId: string | undefined,
+  rawTarget: WorkspaceResourceTarget | undefined,
   hasPr: boolean,
   prUrl?: string,
   revision?: string,
 ) {
-  const serveable = useWorkspaceServeable(conversationId);
+  const target = normalizeTarget(rawTarget);
+  const targetKey = workspaceTargetKey(target);
+  const serveable = useWorkspaceServeable(target);
   return useQuery({
-    queryKey: ["github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchGithubPrDiff(conversationId!, prUrl),
-    enabled: !!conversationId && hasPr && serveable !== false,
+    queryKey: ["github-pr-diff", ...targetKey, ...(prUrl ? [prUrl, revision] : [])],
+    queryFn: () => fetchGithubPrDiff(target!, prUrl),
+    enabled: !!target && hasPr && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
   });
 }
 
-export function useUpdateSessionPr(conversationId: string) {
+export function useUpdateSessionPr(target: WorkspaceResourceTarget) {
   const queryClient = useQueryClient();
+  const conversationId = workspaceTargetSessionId(target);
+  const targetKey = workspaceTargetKey(target);
   return useMutation({
     mutationFn: async (body: { url: string; action: "attach" | "remove" }) => {
+      if (!conversationId) throw new Error("Pull request associations require a session");
       const response = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/prs`,
         {
@@ -486,18 +515,18 @@ export function useUpdateSessionPr(conversationId: string) {
       return (await response.json()) as GithubInfo;
     },
     onSuccess: async (info, body) => {
-      await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
-      queryClient.setQueryData(["github-info", conversationId], info);
+      await queryClient.cancelQueries({ queryKey: ["github-info", ...targetKey] });
+      queryClient.setQueryData(["github-info", ...targetKey], info);
       if (info.selected_pr_url) {
-        queryClient.setQueryData(["github-info", conversationId, info.selected_pr_url], info);
+        queryClient.setQueryData(["github-info", ...targetKey, info.selected_pr_url], info);
       }
       if (body.action === "remove") {
         queryClient.removeQueries({
-          queryKey: ["github-info", conversationId, body.url],
+          queryKey: ["github-info", ...targetKey, body.url],
           exact: true,
         });
       }
-      queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["github-info", ...targetKey] });
     },
   });
 }

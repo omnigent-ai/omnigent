@@ -194,6 +194,11 @@ interface ElectronDesktopApi extends NativeShellApi {
     bounds?: unknown,
     opts?: { force?: boolean; agent?: boolean },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  /** Preserve a draft's browser views when its session is created. */
+  browserAdoptDraft?: (
+    sourceId: string,
+    targetId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays

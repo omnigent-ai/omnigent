@@ -82,7 +82,7 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn(), getCurrentUserId: () => null }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({
@@ -391,6 +391,32 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("waits for pending workspace tools before Start and freezes new resource creation until it settles", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    act(() => landing.setLandingWorkspaceBusy(true));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    act(() => landing.setLandingWorkspaceBusy(false));
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    expect(landing.readLandingWorkspaceState().starting).toBe(true);
+    expect(navigateMock).not.toHaveBeenCalled();
+    resolveCreate({ ok: true, json: async () => ({ id: "conv_waited" }) } as Response);
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_waited"));
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+    expect(landing.readLandingWorkspaceState().starting).toBe(false);
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -425,7 +451,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
-  it("resolves a navigate-first create from the exact-token top-level pushed row", async () => {
+  it("keeps draft tools on landing until the exact-token pushed row confirms creation", async () => {
     let resolveCreate!: (response: Response) => void;
     vi.mocked(authenticatedFetch).mockReturnValueOnce(
       new Promise<Response>((resolve) => {
@@ -443,9 +469,8 @@ describe("NewChatLandingScreen create flow", () => {
     typeMessage("inspect the repo");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
-    await waitFor(() =>
-      expect(navigateMock).toHaveBeenCalledWith("/c/temp:1234567890abcdef1234567890abcdef"),
-    );
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
+    expect(navigateMock).not.toHaveBeenCalled();
     await waitFor(() => expect(pushMatchers).toHaveLength(1));
     const isOurs = pushMatchers[0]!;
     expect(
@@ -495,7 +520,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(resolveCreate).toBeTypeOf("function");
   });
 
-  it("keeps a managed create on its temp route until the HTTP response succeeds", async () => {
+  it("keeps a managed create on landing until the HTTP response succeeds", async () => {
     let resolveCreate!: (response: Response) => void;
     vi.mocked(authenticatedFetch).mockReturnValueOnce(
       new Promise<Response>((resolve) => {
@@ -514,9 +539,8 @@ describe("NewChatLandingScreen create flow", () => {
     typeMessage("start a sandbox");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
-    await waitFor(() =>
-      expect(navigateMock).toHaveBeenCalledWith("/c/temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    );
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
+    expect(navigateMock).not.toHaveBeenCalled();
     expect(pushMatchers).toHaveLength(0);
     expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
 
@@ -572,6 +596,155 @@ describe("NewChatLandingScreen create flow", () => {
       ),
     );
     expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves restored tools while the initial host and folder defaults hydrate", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    landing.publishLandingWorkspaceSelection({
+      hostId: "host_1",
+      workspace: SEEDED_WORKSPACE,
+      available: true,
+      reason: "",
+    });
+    landing.writeLandingWorkspacePanel({
+      openBrowsers: ["restored-browser"],
+      selectedBrowserId: "restored-browser",
+      selectedTerminalKey: "terminal:restored-shell",
+    });
+    const namespace = landing.readLandingWorkspaceState().browserNamespace;
+    const discard = vi.fn().mockResolvedValue(undefined);
+    const unregister = landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard,
+      adopt: vi.fn(),
+    });
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      expect(landing.readLandingWorkspaceState().browserNamespace).toBe(namespace);
+      expect(landing.readLandingWorkspaceState().panel.openBrowsers).toEqual(["restored-browser"]);
+      expect(discard).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+
+  it("gives concurrent Starts exactly one owner of the draft shells and browser tabs", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    const responses: ((response: Response) => void)[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          responses.push(resolve);
+        }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const adopt = vi.fn().mockResolvedValue(undefined);
+    const unregister = landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard: vi.fn().mockResolvedValue(undefined),
+      adopt,
+    });
+    act(() =>
+      landing.writeLandingWorkspacePanel({
+        selectedTerminalKey: "terminal:draft-shell",
+        openBrowsers: ["draft-browser"],
+        selectedBrowserId: "draft-browser",
+      }),
+    );
+    const firstNamespace = landing.readLandingWorkspaceState().browserNamespace;
+    const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: { browserAdoptDraft },
+    });
+    try {
+      typeMessage("first owner");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(responses).toHaveLength(1));
+      cleanup();
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("second independent chat");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(responses).toHaveLength(2));
+      responses[1]!({ ok: true, json: async () => ({ id: "conv_second" }) } as Response);
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_second"));
+      expect(adopt).not.toHaveBeenCalled();
+      expect(browserAdoptDraft).not.toHaveBeenCalledWith(firstNamespace, "conv_second");
+      expect(landing.readLandingWorkspaceState().starting).toBe(true);
+      responses[0]!({ ok: true, json: async () => ({ id: "conv_first" }) } as Response);
+      await waitFor(() => expect(adopt).toHaveBeenCalledExactlyOnceWith("conv_first"));
+      expect(
+        browserAdoptDraft.mock.calls.filter(([namespace]) => namespace === firstNamespace),
+      ).toEqual([[firstNamespace, "conv_first"]]);
+      await waitFor(() => expect(landing.readLandingWorkspaceState().starting).toBe(false));
+    } finally {
+      unregister();
+      Reflect.deleteProperty(window, "omnigentDesktop");
+    }
+  });
+
+  it("cleans only the captured tools when an older Start fails after switching workspace", async () => {
+    const landing = await import("@/lib/landingWorkspaceState");
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const discardA = vi.fn().mockResolvedValue(undefined);
+    const unregisterA = landing.registerLandingResourceLifecycle({
+      hasTerminals: () => true,
+      discard: discardA,
+      adopt: vi.fn(),
+    });
+    const namespaceA = landing.readLandingWorkspaceState().browserNamespace;
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: { browserClose },
+    });
+    let unregisterB: (() => void) | undefined;
+    try {
+      typeMessage("older start");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      act(() =>
+        landing.publishLandingWorkspaceSelection({
+          hostId: "host_1",
+          workspace: "/other-folder",
+          available: true,
+          reason: "",
+        }),
+      );
+      const namespaceB = landing.readLandingWorkspaceState().browserNamespace;
+      const discardB = vi.fn().mockResolvedValue(undefined);
+      unregisterB = landing.registerLandingResourceLifecycle({
+        hasTerminals: () => true,
+        discard: discardB,
+        adopt: vi.fn(),
+      });
+      expect(discardA).not.toHaveBeenCalled();
+      resolveCreate({
+        ok: false,
+        status: 500,
+        json: async () => ({ detail: "create failed" }),
+      } as Response);
+      await waitFor(() => expect(discardA).toHaveBeenCalledTimes(1));
+      expect(browserClose).toHaveBeenCalledWith(namespaceA);
+      expect(browserClose).not.toHaveBeenCalledWith(namespaceB);
+      expect(discardB).not.toHaveBeenCalled();
+      expect(landing.readLandingWorkspaceState().browserNamespace).toBe(namespaceB);
+    } finally {
+      unregisterB?.();
+      unregisterA();
+      Reflect.deleteProperty(window, "omnigentDesktop");
+    }
   });
 
   it("keeps a failed create's restored draft when a newer create succeeds", async () => {

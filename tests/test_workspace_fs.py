@@ -247,6 +247,32 @@ def test_search_matches_by_substring(tmp_path: Path) -> None:
     assert paths == {"alpha.py"}
 
 
+def test_search_path_limits_walk_but_keeps_workspace_relative_results(tmp_path: Path) -> None:
+    """A scoped search never visits siblings and keeps root-relative paths."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "target.py").write_text("x")
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "target.md").write_text("y")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("target", path="src")
+
+    assert result["base"] == str(src)
+    assert [entry["path"] for entry in result["data"]] == ["src/target.py"]
+
+
+def test_search_path_cannot_escape_workspace(tmp_path: Path) -> None:
+    """A scoped search rejects parent traversal before walking the filesystem."""
+    reader = WorkspaceReader(tmp_path)
+
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.search("secret", path="../outside")
+
+    assert excinfo.value.status == 400
+
+
 def test_search_blank_query_returns_empty(tmp_path: Path) -> None:
     """A whitespace-only query returns nothing instead of walking the tree.
 

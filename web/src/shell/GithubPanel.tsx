@@ -50,6 +50,13 @@ import {
 import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
+import {
+  isHostWorkspaceTarget,
+  normalizeWorkspaceResourceTarget,
+  workspaceTargetKey,
+  workspaceTargetSessionId,
+  type WorkspaceResourceTarget,
+} from "@/lib/workspaceTarget";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -766,38 +773,50 @@ function SidebarNode({
   );
 }
 
-export function GithubPanel({ conversationId }: { conversationId: string }) {
-  const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
+export function GithubPanel({
+  target: targetProp,
+  conversationId,
+}: {
+  target?: WorkspaceResourceTarget;
+  conversationId?: string;
+}) {
+  const resourceTarget = targetProp ?? conversationId;
+  const target = normalizeWorkspaceResourceTarget(resourceTarget);
+  const sessionId = workspaceTargetSessionId(target);
+  const targetIdentity = workspaceTargetKey(target).join("\u0000");
+  const hostMode = isHostWorkspaceTarget(target);
+  const [selection, setSelection] = useState<{ targetIdentity: string; url?: string }>();
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
-  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
-  const info = useGithubInfo(conversationId, { poll: true, prUrl: selected });
+  const selected = selection?.targetIdentity === targetIdentity ? selection.url : undefined;
+  const info = useGithubInfo(resourceTarget, { poll: true, prUrl: selected });
   const [knownAssociations, setKnownAssociations] = useState<{
-    sessionId: string;
+    targetIdentity: string;
     data: Pick<GithubInfo, "prs" | "tracking_available" | "selected_pr_url">;
   }>();
   useEffect(() => {
     if (info.data) {
       const { prs, tracking_available, selected_pr_url } = info.data;
       setKnownAssociations({
-        sessionId: conversationId,
+        targetIdentity,
         data: { prs, tracking_available, selected_pr_url },
       });
     }
-  }, [conversationId, info.data]);
+  }, [targetIdentity, info.data]);
   // Switching the metadata query must not unmount the session's PR controls.
   const associations =
     info.data ??
-    (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
-  const update = useUpdateSessionPr(conversationId);
+    (knownAssociations?.targetIdentity === targetIdentity ? knownAssociations.data : undefined);
+  const update = useUpdateSessionPr(target ?? "");
   useEffect(() => {
     if (!selected && info.data?.selected_pr_url) {
-      setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
+      setSelection({ targetIdentity, url: info.data.selected_pr_url });
     }
-  }, [conversationId, selected, info.data?.selected_pr_url]);
-  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+  }, [targetIdentity, selected, info.data?.selected_pr_url]);
+  const changeSelection = (next?: string) => setSelection({ targetIdentity, url: next });
   const prs = associations?.prs ?? [];
-  const linkInEmptyState = prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";
+  const linkInEmptyState =
+    !hostMode && prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";
   const linkControls = (
     <>
       {linking && (
@@ -864,7 +883,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
     ) : undefined;
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {associations?.tracking_available && !linkInEmptyState && (
+      {!hostMode && associations?.tracking_available && !linkInEmptyState && (
         <div className="shrink-0 border-b border-border p-2">
           <div className="flex items-center gap-2">
             {prs.length > 0 && (
@@ -922,11 +941,12 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
       )}
       <div className="min-h-0 flex-1">
         <GithubPanelDetails
-          key={`${conversationId}:${selected ?? ""}`}
-          conversationId={conversationId}
+          key={`${targetIdentity}:${selected ?? ""}`}
+          target={resourceTarget}
+          conversationId={sessionId}
           info={info}
           emptyStateAction={
-            associations?.tracking_available && linkInEmptyState ? (
+            !hostMode && associations?.tracking_available && linkInEmptyState ? (
               <div className="mt-2 w-full max-w-sm">
                 <Button onClick={() => setLinking(!linking)}>Link a PR</Button>
                 {linkControls}
@@ -942,22 +962,25 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
 }
 
 function GithubPanelDetails({
+  target,
   conversationId,
   info,
   emptyStateAction,
 }: {
-  conversationId: string;
+  target: WorkspaceResourceTarget | undefined;
+  conversationId: string | undefined;
   info: ReturnType<typeof useGithubInfo>;
   emptyStateAction?: React.ReactNode;
 }) {
+  const hostMode = isHostWorkspaceTarget(normalizeWorkspaceResourceTarget(target));
   const baseRef = info.data?.base_ref ?? undefined;
   const prUrl = info.data?.selected_pr_url;
   const headSha = info.data?.pr?.head_sha;
   const baseSha = info.data?.pr?.base_sha;
   const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
   const hasPr = !!info.data?.pr;
-  const changes = useGithubChangedFiles(conversationId, hasPr, prUrl, revision);
-  const prDiff = useGithubPrDiff(conversationId, hasPr, prUrl, revision);
+  const changes = useGithubChangedFiles(target, hasPr, prUrl, revision);
+  const prDiff = useGithubPrDiff(target, hasPr, prUrl, revision);
 
   // Summary (PR body + comments) vs Changes (the stacked diff). Summary is the
   // landing tab — like GitHub's PR page opening on the Conversation view.
@@ -1043,19 +1066,19 @@ function GithubPanelDetails({
   const loadDiffFiles = useCallback(
     async (fd: FileDiffMetadata) => {
       const { before, after } = prUrl
-        ? await fetchGithubFileContents(conversationId, fd.name, baseRef, {
+        ? await fetchGithubFileContents(target!, fd.name, baseRef, {
             pr_url: prUrl,
             previous_path: fd.prevName,
             head_sha: headSha,
             base_sha: baseSha,
           })
-        : await fetchGithubFileContents(conversationId, fd.name, baseRef);
+        : await fetchGithubFileContents(target!, fd.name, baseRef);
       return {
         oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
         newFile: { name: fd.name, contents: after ?? "" },
       };
     },
-    [conversationId, baseRef, prUrl, headSha, baseSha],
+    [target, baseRef, prUrl, headSha, baseSha],
   );
 
   const diffOptions = useMemo<DiffOptions>(
@@ -1192,7 +1215,9 @@ function GithubPanelDetails({
             </>
           }
         >
-          {info.data && <GithubAccountSelector conversationId={conversationId} info={info.data} />}
+          {info.data && conversationId && (
+            <GithubAccountSelector conversationId={conversationId} info={info.data} />
+          )}
           {emptyStateAction}
         </GithubEmptyState>
       );
@@ -1208,7 +1233,11 @@ function GithubPanelDetails({
               No open PR for <span className="font-mono">{panelState.branch ?? "this branch"}</span>
             </>
           }
-          hint="Pull requests created in this session appear here. You can also link an existing PR."
+          hint={
+            hostMode
+              ? "No open pull request was found for this branch in the upstream repository."
+              : "Pull requests created in this session appear here. You can also link an existing PR."
+          }
         >
           {emptyStateAction}
         </GithubEmptyState>

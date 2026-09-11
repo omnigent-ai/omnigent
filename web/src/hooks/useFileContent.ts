@@ -16,6 +16,13 @@ import {
   useWorkspaceServeable,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { useChatStore } from "@/store/chatStore";
+import {
+  normalizeWorkspaceResourceTarget,
+  workspaceResourceUrl,
+  workspaceTargetKey,
+  workspaceTargetSessionId,
+  type WorkspaceResourceTarget,
+} from "@/lib/workspaceTarget";
 
 // The primary workspace environment is always "default".  This hook targets
 // the primary workspace; pass a different id if terminal environments are needed.
@@ -45,24 +52,24 @@ export interface FileContentResponse {
  * :param query: Extra query parameters, e.g. ``{ download: "true" }``.
  */
 function workspaceFileUrl(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   path: string,
   query: Record<string, string> = {},
 ): string {
   const base = browseLocationBase(path);
   const params = new URLSearchParams(base ? { ...query, base } : query).toString();
-  return (
-    `/v1/sessions/${encodeURIComponent(conversationId)}` +
-    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${browseLocationSegment(path)}` +
-    (params ? `?${params}` : "")
+  return workspaceResourceUrl(
+    target,
+    `environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${browseLocationSegment(path)}`,
+    new URLSearchParams(params),
   );
 }
 
 export async function fetchFileContent(
-  conversationId: string,
+  target: WorkspaceResourceTarget,
   path: string,
 ): Promise<FileContentResponse> {
-  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path));
+  const res = await authenticatedFetch(workspaceFileUrl(target, path));
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as FileContentResponse;
 }
@@ -155,7 +162,10 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * once at end-of-turn, avoiding continuous refetches that would reset the
  * editor's scroll and cursor position.
  */
-export function useFileContent(conversationId: string | undefined, path: string | null) {
+export function useFileContent(target: WorkspaceResourceTarget | undefined, path: string | null) {
+  const normalizedTarget = normalizeWorkspaceResourceTarget(target);
+  const conversationId = workspaceTargetSessionId(normalizedTarget);
+  const targetKey = workspaceTargetKey(normalizedTarget);
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const sessionActive =
@@ -165,7 +175,7 @@ export function useFileContent(conversationId: string | undefined, path: string 
   // Serveable when the runner is online OR (runner offline but) the host can
   // read the workspace from disk — keeps the viewer live while the agent is
   // asleep. `false` only when neither source can answer.
-  const serveable = useWorkspaceServeable(conversationId);
+  const serveable = useWorkspaceServeable(normalizedTarget);
   const queryClient = useQueryClient();
 
   const prevRef = useRef<{ id: string | undefined; active: boolean }>({
@@ -178,15 +188,15 @@ export function useFileContent(conversationId: string | undefined, path: string 
     prevRef.current = { id: conversationId, active: sessionActive };
     if (justWentIdle && conversationId && path) {
       void queryClient.invalidateQueries({
-        queryKey: ["file-content", conversationId, path],
+        queryKey: ["file-content", ...targetKey, path],
       });
     }
-  }, [conversationId, path, sessionActive, queryClient]);
+  }, [conversationId, path, sessionActive, queryClient, targetKey]);
 
   return useQuery({
-    queryKey: ["file-content", conversationId, path],
-    queryFn: () => fetchFileContent(conversationId!, path!),
-    enabled: !!conversationId && !!path && serveable !== false,
+    queryKey: ["file-content", ...targetKey, path],
+    queryFn: () => fetchFileContent(normalizedTarget!, path!),
+    enabled: !!normalizedTarget && !!path && serveable !== false,
     staleTime: 5_000,
   });
 }

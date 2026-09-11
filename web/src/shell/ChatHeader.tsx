@@ -117,6 +117,7 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  landing?: boolean;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
   actionConversation?: Conversation | null;
   /**
@@ -305,6 +306,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  landing = false,
   actionConversation = null,
   conversationTitle,
   projectName,
@@ -784,7 +786,7 @@ export function ChatHeader({
             Share
           </Button>
         ) : null}
-        {conversationId && hasRailContent && (
+        {(conversationId || landing) && hasRailContent && (
           <Tooltip>
             <TooltipTrigger asChild>
               <Button

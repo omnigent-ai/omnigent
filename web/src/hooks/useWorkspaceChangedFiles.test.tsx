@@ -130,6 +130,13 @@ function EnvironmentProbe({ id }: { id: string | undefined }) {
   return null;
 }
 
+function HostWorkspaceProbe({ workspace }: { workspace: string }) {
+  const target = { kind: "host", hostId: "host/a", workspace } as const;
+  useWorkspaceEnvironment(target);
+  useWorkspaceAllFiles(target);
+  return null;
+}
+
 function EnvironmentDataProbe({
   id,
   onData,
@@ -231,6 +238,38 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.resetAllMocks();
+});
+
+describe("host workspace targets", () => {
+  it("isolates workspace requests and never constructs a session route", async () => {
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.includes("/environments/default/filesystem")
+          ? filesystemListResponse()
+          : environmentResponse(),
+      ),
+    );
+    const { rerender } = render(<HostWorkspaceProbe workspace="/repo one" />, { wrapper: Wrap });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/v1/hosts/host%2Fa/workspace/resources/environments/default/filesystem?limit=1000&order=asc&workspace=%2Frepo+one",
+        expect.anything(),
+      ),
+    );
+    expect(onlineMock).toHaveBeenCalledWith(undefined);
+    expect(hostOnlineMock).toHaveBeenCalledWith(undefined);
+    expect(sessionMock).toHaveBeenCalledWith(undefined);
+
+    rerender(<HostWorkspaceProbe workspace="/repo two" />);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/v1/hosts/host%2Fa/workspace/resources/environments/default/filesystem?limit=1000&order=asc&workspace=%2Frepo+two",
+        expect.anything(),
+      ),
+    );
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/v1/sessions/"))).toBe(false);
+  });
 });
 
 describe("useWorkspaceChangedFiles gating", () => {

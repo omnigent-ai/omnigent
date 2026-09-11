@@ -52,6 +52,41 @@ describe("browserViewRegistry — first-navigate activation signal", () => {
     ctx = makeRegistry();
   });
 
+  it("adopts draft browsers without replacing their live views or active tab", () => {
+    const draft = "draft-workspace:1234";
+    const draftTab = "browser-tab:draft-workspace%3A1234:first";
+    ctx.registry.openOrNavigate(draft, "https://example.com");
+    ctx.registry.openOrNavigate(draftTab, "https://example.org");
+    const main = ctx.registry.get(draft);
+    const tab = ctx.registry.get(draftTab);
+    ctx.registry.setActive(draftTab);
+    ctx.registry.setSuppressed(true);
+    const result = ctx.registry.adoptDraft(draft, "conv_new");
+    assert.deepEqual(result, { ok: true, transferred: 2 });
+    assert.equal(ctx.registry.get(draft), null);
+    assert.equal(ctx.registry.get(draftTab), null);
+    assert.equal(ctx.registry.get("conv_new"), main);
+    assert.equal(ctx.registry.get("browser-tab:conv_new:first"), tab);
+    assert.equal(tab.conversationId, "browser-tab:conv_new:first");
+    assert.equal(ctx.registry.activeConversationId(), "browser-tab:conv_new:first");
+    assert.equal(ctx.registry.isSuppressed(), true);
+    assert.equal(ctx.attached.length, 1);
+    assert.equal(ctx.detached.length, 0);
+    assert.deepEqual(ctx.registry.adoptDraft(draft, "conv_new"), { ok: true, transferred: 0 });
+  });
+
+  it("rejects a conflicting adoption without transferring any draft tab", () => {
+    const draft = "draft-workspace:1234";
+    ctx.registry.openOrNavigate(draft, "https://example.com");
+    ctx.registry.openOrNavigate("browser-tab:draft-workspace%3A1234:first", "https://example.org");
+    ctx.registry.openOrNavigate("browser-tab:conv_new:first", "https://existing.example");
+    assert.equal(ctx.registry.adoptDraft(draft, "conv_new").ok, false);
+    assert.equal(ctx.registry.size(), 3);
+    assert.equal(ctx.registry.has(draft), true);
+    assert.equal(ctx.registry.has("conv_new"), false);
+    assert.equal(ctx.registry.adoptDraft("conv_other", "conv_new").ok, false);
+  });
+
   it("keeps the agent view and two user tabs independent through switch and close", () => {
     const ids = ["conv_1", "browser-tab:conv_1:first", "browser-tab:conv_1:second"];
     for (const id of ids) ctx.registry.openOrNavigate(id, "https://example.com");

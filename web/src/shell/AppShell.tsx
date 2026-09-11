@@ -1,6 +1,7 @@
+import { toast } from "sonner";
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Outlet, useParams, useSearchParams } from "@/lib/routing";
+import { Outlet, useParams, useSearchParams, useLocation } from "@/lib/routing";
 import {
   PROJECT_LABEL_KEY,
   type Conversation,
@@ -117,6 +118,16 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { resolveDefaultShell } from "./preferredShell";
+import { useDraftWorkspace } from "@/hooks/useDraftWorkspace";
+import {
+  readLandingWorkspaceState,
+  useLandingWorkspaceState,
+  writeLandingWorkspacePanel,
+  registerLandingResourceLifecycle,
+  setLandingWorkspaceBusy,
+  landingContextClaimedElsewhere,
+} from "@/lib/landingWorkspaceState";
+import { LandingWorkspacePanel, DraftTerminalSurface } from "./LandingWorkspacePanel";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
@@ -227,7 +238,33 @@ export function AppShell() {
   // has no server session behind it. Feed every server-scoped hook this instead
   // of the raw route id so none of them fetch `/v1/sessions/temp:*` during the
   // create window (or on a stale temp reload, before ChatPage redirects).
+  const location = useLocation();
+  const landingRoute = location.pathname === "/";
+  const landingWorkspace = useLandingWorkspaceState();
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
+  const draftWorkspace = useDraftWorkspace(serverConversationId);
+  useEffect(() => {
+    setLandingWorkspaceBusy(landingRoute && draftWorkspace.isLoading);
+  }, [landingRoute, draftWorkspace.isLoading]);
+  useEffect(() => {
+    if (
+      !landingRoute ||
+      landingContextClaimedElsewhere(draftWorkspace.context?.id, landingWorkspace.browserNamespace)
+    )
+      return;
+    return registerLandingResourceLifecycle({
+      contextId: draftWorkspace.context?.id,
+      hasTerminals: () =>
+        !draftWorkspace.context?.session_id &&
+        (draftWorkspace.terminals.length > 0 || draftWorkspace.isLoading),
+      discard: () => draftWorkspace.discard(draftWorkspace.context ?? undefined),
+      discardSnapshot: () =>
+        draftWorkspace.context ? draftWorkspace.discard(draftWorkspace.context) : Promise.resolve(),
+      adopt: async (sessionId) => {
+        if (draftWorkspace.context) await draftWorkspace.adopt(sessionId, draftWorkspace.context);
+      },
+    });
+  }, [draftWorkspace, landingRoute, landingWorkspace.browserNamespace]);
   const pendingConversation = conversationId != null && serverConversationId == null;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
@@ -388,13 +425,11 @@ export function AppShell() {
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
   // the user last left it. Toggled via the header's PanelRightIcon, mirroring
-  // the sidebar collapse. With no conversation the rail can't render, so the
-  // state stays false — leaving it true would let rail-gated side effects fire
-  // on non-session routes like the home page.
+  // the sidebar collapse. The landing route restores its own panel preference.
   const [rightPanelOpen, setRightPanelOpen] = useState(() =>
     conversationId
       ? (readSessionWorkspaceState(conversationId).open ?? readDefaultWorkspacePanelOpen())
-      : false,
+      : (readLandingWorkspaceState().panel.open ?? readDefaultWorkspacePanelOpen()),
   );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
@@ -656,8 +691,19 @@ export function AppShell() {
   // ``setView``) keep the full ``terminals`` list so the agent's own
   // terminal stays openable through the Terminal pill.
   const railTerminals = useMemo(
-    () => inventoryTerminals(terminals, terminalFirst),
-    [terminals, terminalFirst],
+    () => [
+      ...inventoryTerminals(terminals, terminalFirst),
+      ...(draftWorkspace.context?.session_id === serverConversationId
+        ? draftWorkspace.terminals
+        : []),
+    ],
+    [
+      terminals,
+      terminalFirst,
+      draftWorkspace.context?.session_id,
+      draftWorkspace.terminals,
+      serverConversationId,
+    ],
   );
   // Shell soft tabs are 1:1 with the session's shell inventory: every shell —
   // whether the user opened it or the agent spawned it — is its own tab, and a
@@ -754,10 +800,10 @@ export function AppShell() {
   }, [rootSessionId, rootSessionResolved]);
   const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
     useResizableInlinePanel(
-      rootSessionId,
+      landingRoute ? landingWorkspace.browserNamespace : rootSessionId,
       inlinePanelMinWidth,
       sidebarOpen ? sidebarWidth : 0,
-      rootSessionResolved,
+      landingRoute || rootSessionResolved,
     );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
@@ -1014,9 +1060,8 @@ export function AppShell() {
     pendingShellCreateRef.current = null;
     setTerminalPendingClose(null);
     if (!conversationId) {
-      // No session → no rail; false (not the open default) so rail-gated
-      // effects stay quiet on non-session routes.
-      setRightPanelOpen(false);
+      // The landing workspace restores independently from every session.
+      setRightPanelOpen(readLandingWorkspaceState().panel.open ?? readDefaultWorkspacePanelOpen());
       setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
@@ -1230,6 +1275,7 @@ export function AppShell() {
       // must not rewrite the remembered state.
       writeDefaultWorkspacePanelOpen(next);
     }
+    if (landingRoute) writeLandingWorkspacePanel({ open: next });
     if (next) {
       if (selectedFilePath) {
         // Reopening lands back on the file remembered in per-session
@@ -1254,7 +1300,14 @@ export function AppShell() {
       clearFileViewerUrl();
     }
     setRightPanelOpen(next);
-  }, [rightPanelOpen, conversationId, selectedFilePath, clearFileViewerUrl, setSearchParams]);
+  }, [
+    rightPanelOpen,
+    conversationId,
+    selectedFilePath,
+    clearFileViewerUrl,
+    setSearchParams,
+    landingRoute,
+  ]);
 
   // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
   // sidebar counts as open, so toggling collapses it; either way peek is
@@ -1573,7 +1626,49 @@ export function AppShell() {
     clearShellCreatePending,
     openTerminalTab,
   ]);
-  useNewShellHotkey(launchDefaultShell, shellLaunchable);
+  const landingShellCreating = useRef(false);
+  const launchLandingShell = useCallback(() => {
+    const selection = landingWorkspace.selection;
+    if (
+      !selection?.available ||
+      !selection.hostId ||
+      landingShellCreating.current ||
+      landingWorkspace.starting
+    )
+      return;
+    landingShellCreating.current = true;
+    void (async () => {
+      try {
+        const context = await draftWorkspace.ensureContext(selection.hostId!, selection.workspace);
+        const terminal = await draftWorkspace.createTerminal(context);
+        if (readLandingWorkspaceState().browserNamespace !== landingWorkspace.browserNamespace)
+          return;
+        writeLandingWorkspacePanel({
+          open: true,
+          selectedFilePath: null,
+          selectedTerminalKey: terminalTabKey(terminal),
+        });
+        setRightPanelOpen(true);
+      } finally {
+        landingShellCreating.current = false;
+      }
+    })().catch(() => toast.error("Couldn't open shell. Check the selected host and try again."));
+  }, [
+    landingWorkspace.selection,
+    landingWorkspace.browserNamespace,
+    landingWorkspace.starting,
+    draftWorkspace,
+  ]);
+  useNewShellHotkey(
+    landingRoute ? launchLandingShell : launchDefaultShell,
+    landingRoute
+      ? Boolean(
+          landingWorkspace.selection?.available &&
+          !draftWorkspace.isLoading &&
+          !landingWorkspace.starting,
+        )
+      : shellLaunchable,
+  );
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.
@@ -1611,9 +1706,21 @@ export function AppShell() {
       if (remaining.length === 0) return null;
       return remaining[idx - 1] ?? remaining[idx] ?? remaining[0];
     });
+    const adopted = draftWorkspace.terminals.find((terminal) => terminalTabKey(terminal) === key);
+    if (adopted) {
+      void draftWorkspace.deleteTerminal(adopted.id);
+      return;
+    }
     const info = terminals.find((t) => terminalTabKey(t) === key);
     if (info && conversationId) deleteTerminalMutation.mutate(info.id);
-  }, [terminalPendingClose, openTerminals, terminals, conversationId, deleteTerminalMutation]);
+  }, [
+    terminalPendingClose,
+    openTerminals,
+    terminals,
+    conversationId,
+    deleteTerminalMutation,
+    draftWorkspace,
+  ]);
 
   // The active shell selection is sticky: it changes only on explicit user
   // action (opening a shell/file, switching a nav tab, closing the active
@@ -1892,7 +1999,7 @@ export function AppShell() {
     [canClone],
   );
   const workspacePanelVisible = Boolean(
-    conversationId &&
+    (conversationId || landingRoute) &&
     hasRailContent &&
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
@@ -2055,7 +2162,8 @@ export function AppShell() {
                     onAgentInfo={() => setAgentInfoOpen(true)}
                     hasHeaderMenu={hasHeaderMenu}
                     showFilesPanel={showFilesPanel}
-                    hasRailContent={hasRailContent}
+                    hasRailContent={hasRailContent && (!!conversationId || landingRoute)}
+                    landing={landingRoute}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
                     pending={pendingConversation}
@@ -2121,9 +2229,30 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
+                {landingRoute && workspacePanelVisible && (
+                  <LandingWorkspacePanel
+                    key={landingWorkspace.browserNamespace}
+                    width={inlinePanelWidth}
+                    handleProps={inlinePanelHandleProps}
+                    maximized={rightPanelMaximized}
+                    onToggleMaximized={toggleRightPanelMaximized}
+                    draft={draftWorkspace}
+                  />
+                )}
                 {conversationId && workspacePanelVisible && (
                   <WorkspacePanel
                     conversationId={conversationId}
+                    draftTerminals={railTerminals}
+                    draftTerminalView={
+                      draftWorkspace.terminals.some(
+                        (terminal) => terminalTabKey(terminal) === selectedTerminalKey,
+                      ) ? (
+                        <DraftTerminalSurface
+                          draft={draftWorkspace}
+                          terminalKey={selectedTerminalKey}
+                        />
+                      ) : undefined
+                    }
                     pending={pendingConversation}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}

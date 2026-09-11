@@ -13,6 +13,7 @@ import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
+import * as sessionHost from "@/lib/sessionHost";
 import type { ConnectionState } from "./TerminalSession";
 import {
   TerminalView,
@@ -86,6 +87,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => toast.dismiss());
   cleanup();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -143,6 +145,41 @@ describe("buildAttachPath", () => {
     // a leading slash is required for that concatenation to be
     // correct against any page origin.
     expect(buildAttachPath("conv_abc", "terminal_bash_s1", false).startsWith("/")).toBe(true);
+  });
+});
+
+describe("explicit attach path", () => {
+  it("connects a draft terminal without consulting session routing", async () => {
+    vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+    const getSessionHost = vi.spyOn(sessionHost, "getSessionHost");
+
+    render(
+      <TerminalView
+        terminalId="terminal_bash_draft"
+        attachPath="/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach"
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    expect(terminalSessionMock.instances[0].url).toBe(
+      `ws://${window.location.host}/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach`,
+    );
+    expect(getSessionHost).not.toHaveBeenCalled();
+  });
+
+  it("adds read_only once while preserving an existing slice key", async () => {
+    render(
+      <TerminalView
+        terminalId="terminal_bash_draft"
+        attachPath="/v1/hosts/host_1/workspace-contexts/context_abc/resources/terminals/terminal_bash_draft/attach?omnigent_slice_key=host_1"
+        readOnly
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    const url = terminalSessionMock.instances[0].url;
+    expect(url).toContain("omnigent_slice_key=host_1&read_only=true");
+    expect(url.match(/read_only=true/g)).toHaveLength(1);
   });
 });
 

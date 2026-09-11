@@ -69,9 +69,7 @@ export const RECONNECT_BACKOFF_MS = [
  */
 export const RECONNECT_STABLE_MS = 30_000;
 
-interface TerminalViewProps {
-  /** Session/conversation identifier, e.g. ``"conv_abc123"``. */
-  sessionId: string;
+interface TerminalViewBaseProps {
   /** Opaque terminal resource id, e.g. ``"terminal_bash_s1"``. */
   terminalId: string;
   /** If true, drops keyboard input and runs ``tmux attach -r``. */
@@ -111,16 +109,27 @@ interface TerminalViewProps {
    * way. It still grabs focus on the reveal edge and on an explicit open.
    */
   focusOnConnect?: boolean;
-  /**
-   * Loopback attach URL advertised by the session's runner (from the
-   * terminal resource's ``metadata.direct_attach_url``). When set, each
-   * connection attempt probes it first and uses it if the listener
-   * answers — a browser on the runner's machine then attaches with zero
-   * relay legs. Unreachable or absent falls back to the relay URL; the
-   * page URL and all HTTP traffic are unaffected either way.
-   */
-  directAttachUrl?: string;
 }
+
+type TerminalViewProps = TerminalViewBaseProps &
+  (
+    | {
+        /** Session/conversation identifier, e.g. ``"conv_abc123"``. */
+        sessionId: string;
+        /**
+         * Loopback attach URL advertised by the session's runner. The view
+         * probes it and falls back to the session relay when it is unreachable.
+         */
+        directAttachUrl?: string;
+        attachPath?: never;
+      }
+    | {
+        /** Explicit non-session attach route, used by draft workspace terminals. */
+        attachPath: string;
+        sessionId?: never;
+        directAttachUrl?: never;
+      }
+  );
 
 export function TerminalView({
   sessionId,
@@ -134,11 +143,12 @@ export function TerminalView({
   active = true,
   focusOnConnect = active,
   directAttachUrl,
+  attachPath,
 }: TerminalViewProps) {
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
-  const clipboardScope = `${sessionId}\0${terminalId}\0${readOnly ? "read-only" : "writable"}`;
+  const clipboardScope = `${sessionId ?? attachPath}\0${terminalId}\0${readOnly ? "read-only" : "writable"}`;
   const [clipboardPrompt, setClipboardPrompt] = useState<{
     scope: string;
     epoch: number;
@@ -563,12 +573,20 @@ export function TerminalView({
         // and a hostless session yields none. The direct URL needs no key: it
         // bypasses the server entirely.
         const computedHostId = (() => {
-          if (keylessRef.current || !isDatabricksWorkspace()) return undefined;
+          if (attachPath !== undefined || keylessRef.current || !isDatabricksWorkspace()) {
+            return undefined;
+          }
           const h = getSessionHost(sessionId);
           return h && !isHostKeyless(h) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
-        const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
+        const relayUrl =
+          attachPath === undefined
+            ? buildAttachUrl(sessionId, terminalId, readOnly, computedHostId)
+            : resolveWebSocketUrl(withAttachPathParams(attachPath, readOnly));
+        const directUrl =
+          attachPath === undefined && directAttachUrl
+            ? withAttachParams(directAttachUrl, readOnly)
+            : undefined;
         // Never keep the user waiting on the direct path: this resolves
         // direct only when the loopback listener is already known
         // reachable; otherwise it returns the relay URL immediately.
@@ -612,6 +630,7 @@ export function TerminalView({
       terminalId,
       readOnly,
       directAttachUrl,
+      attachPath,
       notifyState,
       notifyActivity,
       notifyInput,
@@ -686,7 +705,7 @@ export function TerminalView({
     // immediately without backoff (the correct route is one handshake away).
     // One-shot: if we're ALREADY keyless and still get 4400, the host is
     // genuinely unreachable from here — stop, don't loop.
-    if (state.code === WS_CLOSE_WRONG_REPLICA) {
+    if (state.code === WS_CLOSE_WRONG_REPLICA && attachPath === undefined) {
       if (keylessRef.current) {
         setReconnectPending(false);
         return;
@@ -740,7 +759,7 @@ export function TerminalView({
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [state, disposeActiveSession, sessionId]);
+  }, [state, disposeActiveSession, sessionId, attachPath]);
 
   return (
     <div
@@ -831,6 +850,12 @@ function StatusOverlay({
 function resumeErrorText(error: unknown): string {
   if (error instanceof Error && error.message) return `Couldn't resume session: ${error.message}`;
   return "Couldn't resume session.";
+}
+
+function withAttachPathParams(attachPath: string, readOnly: boolean): string {
+  if (!readOnly || /(?:^|[?&])read_only=/.test(attachPath)) return attachPath;
+  const separator = attachPath.includes("?") ? "&" : "?";
+  return `${attachPath}${separator}read_only=true`;
 }
 
 /**

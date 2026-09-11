@@ -105,7 +105,7 @@ function createBrowserViewRegistry({
         getDisplayScaleFactor: getHostDisplayScaleFactor,
         setBounds: (bounds) => {
           // Only paint the active entry; inactive views are detached (no-op).
-          if (activeConversationId === conversationId) {
+          if (activeConversationId === entry.conversationId) {
             try {
               view.setBounds(bounds);
             } catch {
@@ -158,7 +158,7 @@ function createBrowserViewRegistry({
     entries.set(conversationId, entry);
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
-    attachAgentNavGuard(conversationId, entry);
+    attachAgentNavGuard(entry);
     return { ok: true, entry, created: true };
   }
 
@@ -244,7 +244,7 @@ function createBrowserViewRegistry({
   // `entry.agentNavLocked` (set per-navigation from opts.agent), so user-typed
   // URL-bar browsing — including legitimate auth-redirect chains to internal
   // hosts — stays permissive.
-  function attachAgentNavGuard(conversationId, entry) {
+  function attachAgentNavGuard(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
@@ -257,7 +257,7 @@ function createBrowserViewRegistry({
           /* event shape without preventDefault — nothing to cancel */
         }
         sendToRenderer("browser-nav-blocked", {
-          conversationId,
+          conversationId: entry.conversationId,
           url: targetUrl,
           error: verdict.error,
         });
@@ -434,6 +434,45 @@ function createBrowserViewRegistry({
     return { ok: true, removed: true };
   }
 
+  function adoptDraft(sourceId, targetId) {
+    if (
+      typeof sourceId !== "string" ||
+      !/^draft-workspace:[a-zA-Z0-9-]+$/.test(sourceId) ||
+      typeof targetId !== "string" ||
+      !/^[a-zA-Z0-9_-]+$/.test(targetId)
+    ) {
+      return { ok: false, error: "Invalid draft or session id" };
+    }
+    const sourcePrefix = `browser-tab:${encodeURIComponent(sourceId)}:`;
+    const targetPrefix = `browser-tab:${encodeURIComponent(targetId)}:`;
+    const transfers = [];
+    for (const [id, entry] of entries) {
+      const nextId =
+        id === sourceId
+          ? targetId
+          : id.startsWith(sourcePrefix)
+            ? targetPrefix + id.slice(sourcePrefix.length)
+            : null;
+      if (!nextId) continue;
+      if (entries.has(nextId) || entry.designModeListener || entry.designModeInputListener) {
+        return { ok: false, error: "Browser destination occupied or draft design mode active" };
+      }
+      transfers.push({ id, nextId, entry });
+    }
+    // Validate the entire transfer before moving any live views.
+    for (const { id, nextId, entry } of transfers) {
+      entries.delete(id);
+      entry.conversationId = nextId;
+      entries.set(nextId, entry);
+      if (activeConversationId === id) activeConversationId = nextId;
+      sendToRenderer("browser-view-created", { conversationId: nextId });
+    }
+    if (transfers.length) {
+      sendToRenderer("browser-host-active-changed", { conversationId: activeConversationId });
+    }
+    return { ok: true, transferred: transfers.length };
+  }
+
   function closeAll(reason) {
     for (const conversationId of [...entries.keys()]) {
       close(conversationId, reason);
@@ -449,6 +488,7 @@ function createBrowserViewRegistry({
     setSuppressed,
     close,
     closeAll,
+    adoptDraft,
     // Introspection
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,

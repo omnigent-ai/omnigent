@@ -257,6 +257,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserClose: (conversationId, reason) =>
     ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
+  /** Move a draft's live browser views into the newly created session. */
+  browserAdoptDraft: (sourceId, targetId) =>
+    ipcRenderer.invoke("omnigent:browser-adopt-draft", { sourceId, targetId }),
   /**
    * Subscribe to which conversation's browser view is currently attached to the
    * host window (`{conversationId}` or `{conversationId: null}` when detached).
