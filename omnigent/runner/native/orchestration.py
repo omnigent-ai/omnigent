@@ -4766,6 +4766,7 @@ async def _codex_discover_thread_and_forward(
         write_bridge_state,
     )
     from omnigent.harnesses.codex_native.forwarder import (
+        _THREAD_START_TIMEOUT_SECONDS,
         supervise_forwarder,
         wait_for_thread_started,
     )
@@ -4805,17 +4806,28 @@ async def _codex_discover_thread_and_forward(
                 # so this wait only serves a possible interactive sign-in.
                 thread_id = await wait_for_thread_started(event_client, timeout=None)
             else:
-                thread_id = await wait_for_thread_started(event_client)
+                try:
+                    thread_id = await wait_for_thread_started(event_client)
+                except TimeoutError:
+                    # The deadline expiring means a slow TUI cold-start, not a
+                    # refusal: giving up would tear down the app-server and
+                    # leave the session mute for life. Keep listening instead.
+                    _logger.warning(
+                        "Codex TUI has not started a thread for %s after %.0fs; "
+                        "still listening (slow cold-start)",
+                        session_id,
+                        _THREAD_START_TIMEOUT_SECONDS,
+                    )
+                    thread_id = await wait_for_thread_started(event_client, timeout=None)
         except (TimeoutError, RuntimeError) as exc:
-            # Expected failure modes of wait_for_thread_started: the TUI exited
-            # at startup, or the event stream ended before a thread was
-            # created. Stop forwarding (cleanup runs in ``finally``); any other
-            # error is a bug and propagates.
+            # The event stream ended before a thread was created (the TUI or
+            # app-server exited at startup). Stop forwarding (cleanup runs in
+            # ``finally``); any other error is a bug and propagates.
             _logger.exception(
                 "Codex TUI never started a thread for %s; chat will not forward",
                 session_id,
             )
-            # Bridge state is never written here; leave the real cause for the executor (#59).
+            # Bridge state is never written here; the executor surfaces the recorded cause.
             cause = (
                 "startup timed out"
                 if isinstance(exc, TimeoutError)

@@ -3394,6 +3394,77 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
 
 
 @pytest.mark.asyncio
+async def test_codex_discover_thread_and_forward_keeps_listening_past_slow_thread_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A thread-start deadline expiring means the TUI is cold-starting slowly,
+    not that it refused: discovery must keep listening without a deadline and
+    adopt the late thread, instead of recording a give-up startup error and
+    leaving the session permanently mute.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    thread_id = "019e96aa-2222-7343-8d3b-6f914d60936b"
+    _default = object()
+    wait_timeouts: list[object] = []
+    supervised: list[object] = []
+
+    async def _fake_wait(_client: object, *, timeout: object = _default) -> str:
+        wait_timeouts.append(timeout)
+        if timeout is None:
+            return thread_id
+        raise TimeoutError("no thread/started observed within the deadline")
+
+    async def _fake_supervise(**kwargs: object) -> None:
+        supervised.append(kwargs["thread_id"])
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    session_id = "e59f1c9c0f024f80a621d9a3ba3fbc10"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # The deadline-bounded wait must be retried without a deadline...
+    assert wait_timeouts == [_default, None]
+    # ...the late thread adopted (bridge state written, forwarder ran)...
+    state = codex_native_bridge.read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == thread_id
+    assert supervised == [thread_id]
+    # ...and no give-up breadcrumb recorded to fail every later turn.
+    assert read_bridge_startup_error(tmp_path) is None
+
+
+@pytest.mark.asyncio
 async def test_cold_start_agy_conversation_rejects_a_foreign_agy_cascade(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

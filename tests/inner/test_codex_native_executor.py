@@ -1363,6 +1363,34 @@ def test_run_turn_surfaces_recorded_startup_error(
     assert error.message != "Codex native bridge state is missing"
 
 
+def test_run_turn_missing_bridge_state_says_tui_still_starting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    When the boot poll exhausts with no bridge state and no recorded startup
+    error (the TUI is still cold-starting and discovery is still listening),
+    the turn error must tell the user to retry once the terminal settles,
+    not report an opaque internal ("bridge state is missing") that reads as
+    a dead session.
+    """
+
+    async def _no_sleep(_seconds: float) -> None:
+        """No-op the poll backoff so the missing-state path is fast."""
+
+    # asyncio.run does not depend on asyncio.sleep, so patching it is safe.
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "hello")
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "cold-starting" in error.message
+    assert "send this message again" in error.message
+
+
 # ── MCP startup: no client-side gate + Stop cancel (issue #2058) ────────
 
 

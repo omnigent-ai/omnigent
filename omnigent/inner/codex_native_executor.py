@@ -460,7 +460,10 @@ class CodexNativeExecutor(Executor):
                 error_msg = (
                     f"Codex native thread never started: {startup_error}"
                     if startup_error
-                    else "Codex native bridge state is missing"
+                    else "Codex native bridge state is missing: the Codex TUI "
+                    "has not started its thread yet (it may still be "
+                    "cold-starting). Wait for the session terminal to settle, "
+                    "then send this message again."
                 )
             elif not _session_is_active(state.session_id, self._request_session_id):
                 error_msg = "Codex native session is no longer active"
