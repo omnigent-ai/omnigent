@@ -13,7 +13,9 @@ def test_composer_pill_highlighted_label_is_clickable(
 ) -> None:
     """The model label shares the trigger's hover paint and click target."""
     base_url, session_id = seeded_session
-    _patch_session_as_claude_native(page, session_id)
+    # A known permission mode keeps the Advanced settings entry offered, so
+    # the click-through below reaches the modal.
+    _patch_session_as_claude_native(page, session_id, permission_mode="default")
     try:
         page.goto(f"{base_url}/c/{session_id}")
         trigger = page.get_by_test_id("composer-config-gear")
