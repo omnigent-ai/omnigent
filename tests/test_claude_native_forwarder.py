@@ -28,6 +28,7 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
+    ClaudeTaskNotification,
     ClaudeTranscriptItem,
     TranscriptReadResult,
     TranscriptRecordItems,
@@ -10323,6 +10324,62 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+def _evidence(
+    task_id: str | None = None, tool_use_id: str | None = None, result: str = "r"
+) -> ClaudeTaskNotification:
+    """Build parsed terminal evidence without touching the transcript."""
+    return ClaudeTaskNotification(
+        task_id=task_id,
+        tool_use_id=tool_use_id,
+        status="completed",
+        result=result,
+        timestamp="2026-09-10T13:23:13.274Z",
+    )
+
+
+def test_apply_terminal_notification_match_order_and_parking() -> None:
+    """Evidence applies by task id, then tool-use id, else parks newer-wins."""
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "a-worker": forwarder.SubagentEntry(
+                subagent_id="a-worker",
+                child_conversation_id="conv_a-worker",
+                tool_use_id="toolu_A",
+            )
+        }
+    )
+    empty = forwarder.SubagentForwardState(subagents={})
+
+    by_task = forwarder._apply_terminal_notification(state, _evidence("a-worker", "toolu_x"))
+    by_tool = forwarder._apply_terminal_notification(state, _evidence("unknown", "toolu_A"))
+    parked = forwarder._apply_terminal_notification(empty, _evidence("late", "toolu_C"))
+    newer = replace(_evidence("late", "toolu_C", "new"), timestamp="2026-09-10T13:24:00.000Z")
+    parked = forwarder._apply_terminal_notification(parked, newer)
+    stale = forwarder._apply_terminal_notification(parked, _evidence("late", "toolu_C", "old"))
+
+    assert by_task.subagents["a-worker"].terminal_status == "completed"
+    assert by_tool.subagents["a-worker"].terminal_status == "completed"
+    assert parked.pending_terminal_notifications == {
+        "late": ("completed", "new", "2026-09-10T13:24:00.000Z")
+    }
+    assert stale.pending_terminal_notifications == parked.pending_terminal_notifications
+
+
+def test_subagent_state_loads_old_format_rows(tmp_path: Path) -> None:
+    """State files written before the terminal fields still load."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    row = {"subagents": {"a-worker": {"child_conversation_id": "conv_child"}}}
+    (bridge_dir / "subagent_forwarder.json").write_text(json.dumps(row), encoding="utf-8")
+
+    state = forwarder._read_subagent_forward_state(bridge_dir)
+
+    assert state.subagents["a-worker"].tool_use_id is None
+    assert state.subagents["a-worker"].terminal_status is None
+    assert state.parent_byte_offset == 0
+    assert state.pending_terminal_notifications == {}
 
 
 def test_record_timestamp_ordering() -> None:
