@@ -1,11 +1,13 @@
-// Tests for BackgroundTaskPill — the "N background task(s)" pill shown above
-// the composer while background shells outlive a turn. We mock the store so
-// the count/self-hide logic and the overlay layout are exercised in isolation.
+// Tests for BackgroundTaskPill — the "N background task(s)" tally shown in
+// the workspace bar's right-side running-work slot while background shells
+// outlive a turn. We mock the store so the count/self-hide logic and the
+// in-bar layout are exercised in isolation.
 //
-// The overlay layout matters: the pill floats over the transcript's bottom
-// (absolute + bottom-full) rather than taking a flow row. A flow row butts
-// against the transcript's overflow edge and clips its last line — the bug this
-// covers — so these tests pin the classes that keep it an overlay.
+// The layout matters: the tally sits in the bar's flow (a relative wrapper
+// reserving its collapsed footprint) instead of floating as an overlay above
+// the bar — the floating chip was the bug — and its morphing card anchors to
+// the wrapper's bottom-right so expansion grows up-left without shifting the
+// bar row.
 
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -36,16 +38,16 @@ afterEach(() => {
 
 describe("BackgroundTaskPill", () => {
   it("renders nothing when no background tasks are running", () => {
-    // WHY: the pill must occupy no space (and cast no overlay) when idle, so it
-    // self-gates to null rather than rendering an empty container.
+    // WHY: the tally must occupy no space in the bar's right slot when idle,
+    // so it self-gates to null rather than rendering an empty container.
     h.count = 0;
     const { container } = render(<BackgroundTaskPill />);
     expect(container.firstChild).toBeNull();
   });
 
   it("shows the singular count", () => {
-    // Scope to the visible pill: an invisible spacer mirrors the same label to
-    // reserve the collapsed footprint, so the text appears twice in the DOM.
+    // Scope to the visible tally: an invisible spacer mirrors the same label
+    // to reserve the collapsed footprint, so the text appears twice in the DOM.
     h.count = 1;
     render(<BackgroundTaskPill />);
     const pill = screen.getByTestId("background-task-pill");
@@ -59,34 +61,35 @@ describe("BackgroundTaskPill", () => {
     expect(within(pill).getByText("3 background tasks")).toBeInTheDocument();
   });
 
-  it("floats as an overlay pinned above the composer, not a flow row", () => {
-    // WHY: the pill must NOT reserve a flow row. A reserved row sits against the
-    // transcript's bottom overflow edge and clips its last line (the reported
-    // bug). The fix pins it as an overlay (absolute + bottom-full) that is
-    // pointer-transparent except for the pill itself, so the transcript beneath
-    // stays visible and scrollable.
+  it("sits in the bar's flow instead of floating as an overlay above it", () => {
+    // WHY: the reported bug was a standalone chip floating above the gray
+    // workspace bar. The tally now takes a flow slot inside the bar (a
+    // relative wrapper reserving its footprint), not an absolute overlay
+    // pinned above the composer.
     h.count = 2;
     const { container } = render(<BackgroundTaskPill />);
-    const overlay = container.firstElementChild as HTMLElement;
-    expect(overlay).toHaveClass("absolute");
-    expect(overlay).toHaveClass("bottom-full");
-    expect(overlay).toHaveClass("pointer-events-none");
+    const wrapper = container.firstElementChild as HTMLElement;
+    expect(wrapper).toHaveClass("relative");
+    expect(wrapper).not.toHaveClass("absolute");
+    expect(wrapper).not.toHaveClass("bottom-full");
+    expect(wrapper).not.toHaveClass("pointer-events-none");
   });
 
-  it("re-enables pointer events on the pill itself so it stays interactive", () => {
-    // WHY: the overlay is pointer-transparent (so the transcript beneath stays
-    // clickable), but the pill must still take hover/tap to expand — it opts
-    // back in with pointer-events-auto.
+  it("anchors the tally bottom-right so the card expands up-left", () => {
+    // WHY: the morphing card must grow away from the bar's right edge (up and
+    // to the left) — a left anchor would push the expanded card outside the
+    // bar and off-screen on narrow viewports.
     h.count = 1;
     const pill = render(<BackgroundTaskPill />).getByTestId("background-task-pill");
-    // The pill's positioned wrapper re-enables pointer events.
-    expect(pill.parentElement).toHaveClass("pointer-events-auto");
+    expect(pill).toHaveClass("absolute");
+    expect(pill).toHaveClass("right-0");
+    expect(pill).toHaveClass("bottom-0");
   });
 
   it("keeps a plain tally (not expandable) when no per-shell detail is present", () => {
     // WHY: an older runner reports only the count with no `backgroundTasks`
-    // detail; the pill must stay a non-focusable tally rather than advertising
-    // an empty expandable card.
+    // detail; the tally must stay a non-focusable count rather than
+    // advertising an empty expandable card.
     h.count = 2;
     h.tasks = [];
     const pill = render(<BackgroundTaskPill />).getByTestId("background-task-pill");
@@ -94,7 +97,7 @@ describe("BackgroundTaskPill", () => {
   });
 
   it("becomes focusable/expandable when per-shell detail is present", () => {
-    // WHY: with per-shell detail the pill expands into a card listing each
+    // WHY: with per-shell detail the tally expands into a card listing each
     // shell, so it must be reachable by keyboard (tabIndex 0) and focus-open.
     h.count = 1;
     h.tasks = [{ id: "s1", description: "Wait for CI" }];
