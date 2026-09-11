@@ -2107,9 +2107,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         for full-text search by :meth:`append`.
 
         The default extracts the searchable text as before. A subclass whose
-        schema omits ``search_text`` (e.g. because ``data`` is stored opaquely
-        and cannot be searched in SQL) returns ``None`` to skip persisting the
-        column and its FTS row entirely.
+        ``data`` is stored opaquely (no plaintext body exists to index), or
+        whose schema omits ``search_text`` entirely, returns ``None`` to skip
+        persisting the column and its FTS row; on the mainline schema the
+        column is nullable, so the row still inserts with ``search_text`` NULL.
         """
         return strip_nul_bytes(extract_search_text(item))
 
@@ -2168,9 +2169,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "created_by": item.created_by,
             }
             # A backend may omit search_text (see _item_search_text): when it
-            # returns None we drop the column so a schema without it still
-            # works, and skip its FTS row. The hook is all-or-nothing per
-            # store, so the key set stays uniform across the executemany.
+            # returns None we drop the column (stored NULL here, and a schema
+            # without the column still works) and skip its FTS row. The hook is
+            # all-or-nothing per store, so the key set stays uniform across the
+            # executemany.
             if search is not None:
                 values["search_text"] = search
             prepared_rows.append((item, values, search))
@@ -4254,7 +4256,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "created_by": src_item.created_by,
                     }
                 )
-                fts_rows.append((new_item_id, new_conv_id, src_item.search_text or ""))
+                # Mirror append(): a NULL search_text (opaque data) gets no
+                # FTS row; an empty string still does.
+                if src_item.search_text is not None:
+                    fts_rows.append((new_item_id, new_conv_id, src_item.search_text))
 
             # The clone copied len(source_items) items at dense positions
             # 0..N-1, so its position allocator starts at N. Seed it from the

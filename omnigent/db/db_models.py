@@ -938,7 +938,9 @@ class SqlConversationItem(ConversationBase):
     :param data: JSON-serialized item payload. Structure varies by
         ``type``.
     :param search_text: Plain-text extraction of ``data`` used for
-        full-text search indexing.
+        full-text search indexing, or ``None`` when the store cannot
+        derive one (``data`` is stored opaquely; see
+        ``SqlAlchemyConversationStore._item_search_text``).
     :param created_by: Identity of the human actor who authored the
         item, or ``None`` for agent/tool/system items and single-user
         mode. Mirrors :class:`SqlComment.created_by`.
@@ -976,7 +978,9 @@ class SqlConversationItem(ConversationBase):
     # row↔entity boundary.
     type: Mapped[int] = mapped_column(SmallInteger)
     data: Mapped[str] = mapped_column(Text)
-    search_text: Mapped[str] = mapped_column(Text)
+    # NULL when the store cannot derive a plaintext body (opaque data);
+    # NULL rows are simply never matched by plaintext session search.
+    search_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
