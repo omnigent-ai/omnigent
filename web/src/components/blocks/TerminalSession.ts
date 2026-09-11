@@ -16,6 +16,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -498,6 +499,7 @@ export class TerminalSession {
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
+  private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
@@ -550,7 +552,9 @@ export class TerminalSession {
     clipboardEnabled = true,
     onClipboardRequest?: TerminalClipboardListener,
     focusOnConnect = true,
+    adaptCodexPalette = false,
   ) {
+    this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
     this.onClipboardRequest = onClipboardRequest;
@@ -562,12 +566,9 @@ export class TerminalSession {
       ...terminalFontOptions(readCodeFont()),
       scrollback: 20000,
       cursorBlink: true,
-      theme: terminalTheme(isDark),
-      // 256-color indices (e.g. Claude Code's 38;5;231 white) can't be
-      // remapped via ITheme (slots 0-15 only), so they vanish on the
-      // light theme's white card. This WCAG AA contrast floor nudges a
-      // cell's foreground luminance only when it lacks contrast against
-      // its actual background.
+      theme: this.theme(isDark),
+      // Keep fixed-color CLI text readable against each cell's background
+      // without replacing its syntax palette.
       minimumContrastRatio: 4.5,
       // Opt into xterm's proposed APIs, matching openui's terminal setup.
       allowProposedApi: true,
@@ -639,7 +640,7 @@ export class TerminalSession {
       (ev) => {
         if (ev.data instanceof ArrayBuffer) {
           const bytes = new Uint8Array(ev.data);
-          this.term.write(bytes);
+          this.term.write(this.codexPalette?.write(bytes) ?? bytes);
           const now = performance.now();
           if (now - lastActivityTs > 300) {
             lastActivityTs = now;
@@ -731,7 +732,12 @@ export class TerminalSession {
    * Safe to call at any point after construction.
    */
   setTheme(isDark: boolean): void {
-    this.term.options.theme = terminalTheme(isDark);
+    this.term.options.theme = this.theme(isDark);
+  }
+
+  private theme(isDark: boolean): ITheme {
+    const theme = terminalTheme(isDark);
+    return this.codexPalette ? codexTerminalTheme(theme, isDark) : theme;
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */

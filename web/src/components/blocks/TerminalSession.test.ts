@@ -520,6 +520,7 @@ describe("TerminalSession", () => {
     clipboardEnabled = true,
     onClipboardRequest?: (text: string) => void,
     focusOnConnect = true,
+    adaptCodexPalette = false,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -534,6 +535,7 @@ describe("TerminalSession", () => {
       clipboardEnabled,
       onClipboardRequest,
       focusOnConnect,
+      adaptCodexPalette,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
@@ -563,6 +565,63 @@ describe("TerminalSession", () => {
     socket.open();
 
     expect(focusSpy).toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it.each([false, true])(
+    "updates cached Codex input and scrollback in both theme directions (starts dark: %s)",
+    async (startsDark) => {
+      const { socket, session } = makeSession(undefined, undefined, true, undefined, true, true);
+      const term = (session as unknown as { term: Terminal }).term;
+      session.setTheme(startsDark);
+      socket.open();
+      const bytes = new TextEncoder().encode(
+        "\x1b[48;2;244;244;244mhistory\x1b[0m\r\n" +
+          "output\r\n".repeat(30) +
+          "\x1b[48;2;30;30;30munsent input\x1b[0m",
+      );
+      const data = new ArrayBuffer(bytes.length);
+      new Uint8Array(data).set(bytes);
+      socket.emit("message", { data });
+      await new Promise<void>((resolve) => {
+        term.write("", resolve);
+      });
+      const writes = vi.spyOn(term, "write");
+      const frames = [...socket.sent];
+      for (const isDark of [!startsDark, startsDark, !startsDark]) {
+        session.setTheme(isDark);
+        expect(term.options.theme?.extendedAnsi?.[239]).toBe(isDark ? "#2f3132" : "#f4f4f4");
+        expect(term.buffer.active.getLine(0)?.getCell(0)?.isBgPalette()).toBe(true);
+        expect(term.buffer.active.getLine(0)?.getCell(0)?.getBgColor()).toBe(255);
+        expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe("history");
+        const input = term.buffer.active.getLine(
+          term.buffer.active.baseY + term.buffer.active.cursorY,
+        );
+        expect(input?.translateToString(true)).toBe("unsent input");
+        expect(input?.getCell(0)?.getBgColor()).toBe(255);
+        expect(socket.sent).toEqual(frames);
+        expect(socket.closed).toBe(false);
+      }
+      expect(writes).not.toHaveBeenCalled();
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      session.dispose();
+    },
+  );
+
+  it("leaves non-Codex terminal colors unchanged", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const bytes = new TextEncoder().encode("\x1b[48;2;244;244;244mtext");
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+    session.setTheme(true);
+    expect(term.buffer.active.getLine(0)?.getCell(0)?.isBgRGB()).toBe(true);
+    expect(term.buffer.active.getLine(0)?.getCell(0)?.getBgColor()).toBe(0xf4f4f4);
+    expect(term.options.theme?.extendedAnsi).toBeUndefined();
     session.dispose();
   });
 
