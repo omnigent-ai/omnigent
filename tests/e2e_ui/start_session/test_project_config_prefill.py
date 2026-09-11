@@ -785,9 +785,8 @@ def test_project_opt_out_wins_over_global_default(
     """A project's explicit ``use_worktree: false`` beats a global default of on.
 
     With the global default on but the project storing an explicit opt-out, the
-    composer must NOT seed a worktree: the branch chip shows the plain main-repo
-    state ("New worktree") and the create posts no ``git`` block (a plain launch
-    in the workspace).
+    composer must NOT seed a worktree: the branch chip shows "New worktree"
+    and the create posts no ``git`` block (a plain launch in the workspace).
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_project_opt_out(base_url, session_id))
@@ -819,7 +818,7 @@ async def _drive_project_opt_out(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
                 "omnigent", timeout=15_000
             )
-            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_text(
                 "New worktree", timeout=15_000
             )
 

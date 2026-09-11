@@ -13,6 +13,7 @@ from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseErr
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
+    read_codex_config_effort,
     read_codex_config_model,
     write_bridge_startup_error,
     write_bridge_state,
@@ -1104,6 +1105,74 @@ def test_effort_only_settings_update_leaves_config_toml_model(
     _run_turn_with_config(executor, "hello", ExecutorConfig(extra={"reasoning_effort": "high"}))
 
     assert read_codex_config_model(tmp_path) == "databricks-gpt-5-5"
+
+
+def test_effort_settings_update_mirrors_effort_into_config_toml(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    An applied effort change is mirrored into codex-home/config.toml.
+
+    ``thread/settings/update`` changes the live thread's reasoning effort but
+    not ``config.toml`` — the file the forwarder's effort mirror treats as
+    source of truth. Without the mirror write, a fresh forwarder state
+    (thread resume / reconnect) re-reads the stale launch effort and posts an
+    ``external_reasoning_effort_change`` back to Omnigent, silently reverting
+    a web-composer effort pick to the spawn default.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n')
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    _run_turn_with_config(executor, "hello", ExecutorConfig(extra={"reasoning_effort": "high"}))
+
+    assert read_codex_config_effort(tmp_path) == "high"
+    assert read_codex_config_model(tmp_path) == "gpt-5.5"
+
+
+def test_model_and_effort_settings_update_mirrors_both_into_config_toml(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A combined model+effort pick lands both keys in config.toml.
+
+    The model write runs first (its clamp may rewrite a stale effort line for
+    the new model); the explicit effort write then records the applied effort,
+    so the mirror file matches what ``thread/settings/update`` actually set.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(
+        'model = "databricks-gpt-5-5"\nmodel_reasoning_effort = "medium"\n'
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    _run_turn_with_config(
+        executor,
+        "hello",
+        ExecutorConfig(model="gpt-5.3-codex", extra={"reasoning_effort": "high"}),
+    )
+
+    assert read_codex_config_model(tmp_path) == "gpt-5.3-codex"
+    assert read_codex_config_effort(tmp_path) == "high"
 
 
 def test_no_settings_update_when_overrides_unset(

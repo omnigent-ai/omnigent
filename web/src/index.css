@@ -386,15 +386,9 @@
   line-height: 20px;
 }
 
-.composer-agent-menu [role="menuitem"].composer-agent-choice {
-  padding-right: 0;
-}
-
-.composer-agent-menu [role="menuitem"].composer-agent-edit {
-  padding: 0 12px;
-  border-radius: 0;
-  font-size: 12px;
-  line-height: 16px;
+.composer-agent-menu [role="menuitem"].composer-agent-row {
+  gap: 4px;
+  padding: 0 12px 0 0;
 }
 
 .composer-agent-menu [role="menuitemcheckbox"] {

@@ -33,6 +33,20 @@ describe("ChatComposer", () => {
     expect(onSubmit).toHaveBeenCalledOnce();
   });
 
+  it("uses the settings-driven chat typography for the draft and input area", () => {
+    render(
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Draft" }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+    const input = screen.getByRole("textbox");
+    expect(input).toHaveClass("text-ui");
+    expect(input.parentElement).toHaveClass("text-ui");
+    expect(input).not.toHaveClass("text-[13px]", "leading-[20.8px]");
+  });
+
   it("preserves interrupt and pending-creation states", () => {
     const { rerender } = render(<ComposerSendButton label="Interrupt" interrupt />);
     expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();

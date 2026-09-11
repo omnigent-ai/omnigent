@@ -486,7 +486,7 @@ describe("formatModelEffortStatusLabel", () => {
           isDefault: true,
         },
       ]),
-    ).toBe("codex says GPT-5.5 xhigh");
+    ).toBe("codex says GPT-5.5 xHigh");
   });
 
   it("leaves unknown model ids raw", () => {
@@ -501,7 +501,7 @@ describe("formatModelEffortStatusLabel", () => {
       formatModelEffortStatusLabel("sonnet[1m]", "high", [
         { id: "sonnet[1m]", model: "claude-sonnet-5[1m]", displayName: "Sonnet 5 (1M context)" },
       ]),
-    ).toBe("Sonnet 5 (1M context) high");
+    ).toBe("Sonnet 5 (1M context) High");
   });
 
   it("renders a catalog-less Claude [1m] alias friendly without claiming a version", () => {
