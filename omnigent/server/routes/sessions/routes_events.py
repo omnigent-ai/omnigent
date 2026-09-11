@@ -2457,13 +2457,24 @@ def register_events_routes(
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,
             )
-        # Session file cleanup.
+        # Session file cleanup. Blob deletion is best-effort like the
+        # other cleanup steps: the metadata rows are already gone, so a
+        # failing store backend must not abort the delete as an
+        # unhandled 500 — the blob leaks and can be reaped later.
         if file_store is not None and artifact_store is not None:
             deleted_file_ids = await asyncio.to_thread(
                 file_store.delete_all_for_session, session_id
             )
             for fid in deleted_file_ids:
-                await asyncio.to_thread(artifact_store.delete, fid)
+                try:
+                    await asyncio.to_thread(artifact_store.delete, fid)
+                except Exception:
+                    _logger.warning(
+                        "Failed to delete file blob during session delete: session=%s file_id=%s",
+                        session_id,
+                        fid,
+                        exc_info=True,
+                    )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
         deleted = await conversation_store.delete_conversation(session_id)
