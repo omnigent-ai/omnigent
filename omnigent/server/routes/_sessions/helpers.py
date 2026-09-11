@@ -4964,7 +4964,7 @@ def _publish_btw_sidechat(
     Publish a transient ``session.btw_sidechat`` overlay to the live stream.
 
     Emitted when the claude-native forwarder scrapes a settled ``/btw``
-    side-chat from the pane (see ``_forward_btw_overlay_from_pane`` in the
+    side-chat from the pane (see ``_relay_btw_overlay`` in the
     claude-native forwarder). Broadcast-only: nothing is written to the
     conversation store, so the ephemeral exchange never lands in the main
     transcript. Live viewers render a dismissable overlay; a client that

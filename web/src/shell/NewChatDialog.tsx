@@ -3066,12 +3066,10 @@ export function NewChatLandingScreen() {
       }
       // Sandbox no longer offered (e.g. an OSS server) — fall through.
     } else if (lastChoice) {
-      // A persisted host pick can only be honored once the host list has
-      // loaded and shows it online. Wait for the load rather than defaulting
-      // past it — defaulting to the sandbox here would set sandboxSelected and
-      // this effect would then never re-run to restore the host.
+      // Restore offline hosts too; availability gates creation, not selection.
+      // Wait for the list so a remembered host cannot lose to a default.
       if (hostsLoading) return;
-      const stored = (hosts ?? []).find((h) => h.host_id === lastChoice && h.status === "online");
+      const stored = (hosts ?? []).find((h) => h.host_id === lastChoice);
       if (stored) {
         setSelectedHostId(stored.host_id);
         return;
@@ -4412,7 +4410,7 @@ export function NewChatLandingScreen() {
   const canSubmit =
     message.trim().length > 0 &&
     selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : !!selectedHostId && workspaceValid) &&
+    (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
     !creating &&
     preparingAttachmentCount === 0;
 
@@ -4430,13 +4428,15 @@ export function NewChatLandingScreen() {
           } — remove the extras`
         : sandboxSelected && !sandboxRepoValid
           ? "Please enter a valid repository URL"
-          : !sandboxSelected && (!selectedHostId || !workspaceValid)
-            ? "Please choose a host and working directory"
-            : configuredAgentUnavailable && selectedAgent == null
-              ? "This project's configured agent is unavailable — pick an agent to continue"
-              : message.trim().length === 0
-                ? "Enter a message to get started"
-                : null;
+          : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+            ? "Selected host is unavailable. Reconnect it or choose another host."
+            : !sandboxSelected && (!selectedHostId || !workspaceValid)
+              ? "Please choose a host and working directory"
+              : configuredAgentUnavailable && selectedAgent == null
+                ? "This project's configured agent is unavailable — pick an agent to continue"
+                : message.trim().length === 0
+                  ? "Enter a message to get started"
+                  : null;
 
   // Chip display labels.
   const worktreeHeader = composerWorktreeHeaderState({
