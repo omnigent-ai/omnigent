@@ -7,6 +7,7 @@ import {
   detectIdleTransitions,
   detectNewElicitations,
   type ConversationStatus,
+  viewerHasSeenLatestActivity,
 } from "./idleTransitions";
 
 function conv(id: string, status?: Conversation["status"]): Conversation {
@@ -143,6 +144,34 @@ describe("detectNewElicitations", () => {
     const prev = new Map([["a", 0]]);
     const conversation = { ...convE("a", 0), pending_elicitations_count: undefined };
     expect(detectNewElicitations(prev, [conversation])).toEqual([]);
+  });
+});
+
+describe("viewerHasSeenLatestActivity", () => {
+  it("is true when the read baseline caught up with updated_at", () => {
+    expect(
+      viewerHasSeenLatestActivity({ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 100 }),
+    ).toBe(true);
+    expect(
+      viewerHasSeenLatestActivity({ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 150 }),
+    ).toBe(true);
+  });
+
+  it("is false when the baseline lags updated_at", () => {
+    expect(
+      viewerHasSeenLatestActivity({ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 99 }),
+    ).toBe(false);
+  });
+
+  it("is false without read state (absent or null reads as not-seen)", () => {
+    expect(viewerHasSeenLatestActivity({ ...conv("a", "idle"), updated_at: 100 })).toBe(false);
+    expect(
+      viewerHasSeenLatestActivity({
+        ...conv("a", "idle"),
+        updated_at: 100,
+        viewer_last_seen: null,
+      }),
+    ).toBe(false);
   });
 });
 

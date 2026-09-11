@@ -25,6 +25,9 @@
 // the user is actively viewing it: the window is focused AND it's the open
 // conversation. Notifications follow the same rule — anything that needs
 // attention notifies, except the conversation you're actively looking at.
+// A turn-end additionally stays quiet when the per-viewer read state
+// (`viewer_last_seen`, redistributed by the list/updates stream) shows the
+// user already watched the session's latest activity on another device.
 //
 // Notifications are on by default — there's no settings toggle. In a plain
 // browser the Web Notifications API still requires a permission grant, so we
@@ -58,6 +61,7 @@ import {
   type ConversationStatus,
   detectIdleTransitions,
   detectNewElicitations,
+  viewerHasSeenLatestActivity,
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
@@ -297,9 +301,14 @@ export function useIdleNotifications(activeConversationId?: string): void {
     const timers = idleNotifyTimers.current;
 
     // Resume cancels a pending turn-end: any session back to `running` was just
-    // between steps, not finished — drop its deferred cue before it fires.
+    // between steps, not finished — drop its deferred cue before it fires. The
+    // viewer's read state catching up cancels too: the user watched this turn
+    // end on another device (which marked the session seen there), so this
+    // device must stay quiet.
     for (const conversation of conversations) {
-      if (conversation.status !== "running") continue;
+      if (conversation.status !== "running" && !viewerHasSeenLatestActivity(conversation)) {
+        continue;
+      }
       const pending = timers.get(conversation.id);
       if (pending !== undefined) {
         clearTimeout(pending);
@@ -331,6 +340,9 @@ export function useIdleNotifications(activeConversationId?: string): void {
         // `undefined` connectivity is treated as online so we never
         // over-suppress a genuine completion.
         if (conversation.runner_online === false) continue;
+        // The viewer already saw this session's latest activity on another
+        // device — they sent and watched this turn there. Don't cue it here.
+        if (viewerHasSeenLatestActivity(conversation)) continue;
         const id = conversation.id;
         // Already beeped for this session and the user hasn't viewed it since —
         // don't beep again for another finish (no new banner increments). This
@@ -348,6 +360,10 @@ export function useIdleNotifications(activeConversationId?: string): void {
             // Re-check suppression at fire time — the user may have opened the
             // session (or refocused the window) during the settle window.
             if (windowFocusedRef.current && id === activeIdRef.current) return;
+            // Cross-device read state re-check: the watching device's
+            // mark-seen typically lands during the settle window.
+            const latest = latestConversations.current?.find((c) => c.id === id);
+            if (latest !== undefined && viewerHasSeenLatestActivity(latest)) return;
             // Mark it beeped so a later finish stays silent until the user has
             // viewed this session.
             notifiedSessions.current.add(id);
