@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from omnigent.runner import create_runner_app
+from omnigent.runner.app import get_session_agent_id
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, SkillSpec
 from tests.runner.conftest import (
@@ -210,4 +211,179 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset() -> Non
     assert "marker-v2" in names, f"post-reset spec not served; skills = {sorted(names)}"
     assert "marker-v1" not in names, (
         f"superseded pre-reset spec still served after reset; skills = {sorted(names)}"
+    )
+
+
+_NEW_AGENT_ID = "agentswitch_9c2c1f5f0e5a4a76a1d2b3c4d5e6f708"
+
+
+class _SwitchableSnapshotServerClient(NullServerClient):
+    """Server stub whose session snapshot names a switchable agent.
+
+    Mutating :attr:`agent_id` mid-test mimics the server-side agent edit that
+    accompanies a mid-init agent-cache reset, so the runner's snapshot
+    fallback observably disagrees with the binding init resolved.
+    """
+
+    class _SnapshotResponse(NullServerClient._Response):
+        """Stub 200 carrying a caller-supplied session snapshot body."""
+
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def json(self) -> dict[str, Any]:
+            """Return the session snapshot body supplied at construction."""
+            return self._payload
+
+    def __init__(self, session_id: str, agent_id: str) -> None:
+        self._session_id = session_id
+        self.agent_id = agent_id
+
+    async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        """Serve the current snapshot; defer everything else to the null parent.
+
+        :param url: Request path, e.g. ``"/v1/sessions/<id>"``.
+        :param kwargs: Extra keyword arguments (forwarded to the parent).
+        :returns: Snapshot response for the session URL, empty 200 otherwise.
+        """
+        if url.split("?", 1)[0] == f"/v1/sessions/{self._session_id}":
+            return self._SnapshotResponse(
+                {
+                    "id": self._session_id,
+                    "agent_id": self.agent_id,
+                    "created_at": 1234,
+                    "workspace": None,
+                }
+            )
+        return await super().get(url, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_session_init_does_not_reinstate_agent_binding_superseded_by_reset() -> None:
+    """A reset acknowledged during init also wins over the agent-id binding.
+
+    ``_clear_session_agent_caches`` retires ``_session_agent_ids`` alongside
+    the spec entry, and two reset paths later read that binding to pick which
+    agent's shared spec-cache entry to drop (``reset_session_agent_cache``'s
+    no-body fallback and ``reset_session_state``). An init that reinstated a
+    superseded binding would misdirect them at the old agent, so the write is
+    fenced by the same generation guard as the spec-cache memoization.
+
+    Steps (over the runner's HTTP API, plus the module-level binding
+    accessor):
+
+    1. ``POST /v1/sessions`` with the old agent — init starts; agent-spec
+       resolution blocks, holding init open.
+    2. The server-side agent switch lands: the snapshot now names the new
+       agent, and the accompanying ``POST /v1/sessions/{id}/agent-cache/reset``
+       retires the old agent's caches mid-init.
+    3. Resolution completes; init finishes on the old agent's spec.
+    4. The binding must not have been reinstated, and a body-less reset must
+       fall back to the fresh snapshot's (new) agent rather than pop the old
+       agent's shared entry.
+    """
+    session_id = "cachebindrace_7a41c3d0b52e4f8fa6c1de92b30a54e1"
+    resolver_entered = asyncio.Event()
+    release_resolver = asyncio.Event()
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        resolver_entered.set()
+        await release_resolver.wait()
+        return _spec("v1")
+
+    server_client = _SwitchableSnapshotServerClient(session_id, _AGENT_ID)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+
+    async with _runner_client(app) as client:
+        init_task = asyncio.create_task(
+            client.post(
+                "/v1/sessions",
+                json={"session_id": session_id, "agent_id": _AGENT_ID},
+            )
+        )
+        await asyncio.wait_for(resolver_entered.wait(), timeout=10)
+
+        # The user's agent edit lands mid-init: the server now binds the new
+        # agent and invalidates the old agent's runner-side caches.
+        server_client.agent_id = _NEW_AGENT_ID
+        reset_resp = await client.post(
+            f"/v1/sessions/{session_id}/agent-cache/reset",
+            json={"agent_id": _AGENT_ID},
+        )
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["reset"] is True
+
+        release_resolver.set()
+        init_resp = await asyncio.wait_for(init_task, timeout=30)
+        assert init_resp.status_code == 201, init_resp.text
+
+        assert get_session_agent_id(session_id) is None, (
+            "init reinstated the agent-id binding retired by the mid-init "
+            f"reset (bound {get_session_agent_id(session_id)!r})"
+        )
+
+        fallback_resp = await client.post(
+            f"/v1/sessions/{session_id}/agent-cache/reset",
+            json={},
+        )
+
+    assert fallback_resp.status_code == 200
+    assert fallback_resp.json()["agent_id"] == _NEW_AGENT_ID, (
+        "body-less reset was misdirected at the superseded agent binding "
+        f"instead of the fresh snapshot's agent (got "
+        f"{fallback_resp.json()['agent_id']!r})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_init_memoizes_agent_binding_when_no_reset_intervenes() -> None:
+    """Absent a reset, init's agent-id binding must stand (no over-fencing).
+
+    Guards the fence added for the binding: a session that saw no
+    invalidation during init must keep the binding init wrote, and a later
+    body-less reset must be served from it rather than the session snapshot.
+    """
+    session_id = "cachebindkeep_2e95abf04c47d5a08b3c6d19e7f2ab41"
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return _spec("v1")
+
+    server_client = _SwitchableSnapshotServerClient(session_id, _AGENT_ID)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": _AGENT_ID},
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        assert get_session_agent_id(session_id) == _AGENT_ID, (
+            "uninterrupted init failed to memoize the agent-id binding: "
+            "the fence was wrongly applied without a reset"
+        )
+
+        # Even if the snapshot were to disagree, the reset must be served
+        # from the binding init memoized.
+        server_client.agent_id = _NEW_AGENT_ID
+        reset_resp = await client.post(
+            f"/v1/sessions/{session_id}/agent-cache/reset",
+            json={},
+        )
+
+    assert reset_resp.status_code == 200
+    assert reset_resp.json()["agent_id"] == _AGENT_ID, (
+        "body-less reset ignored the binding memoized by an uninterrupted "
+        f"init (got {reset_resp.json()['agent_id']!r})"
     )

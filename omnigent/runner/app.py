@@ -3856,7 +3856,14 @@ def create_runner_app(
             )
 
         _session_start_cache.setdefault(session_id, time.time())
-        _session_agent_ids[session_id] = agent_id
+        # The same reset that retires the spec entry also retires this
+        # binding, and later resets read it to decide which agent's shared
+        # ``_spec_cache`` entry to drop; reinstating a superseded binding
+        # would misdirect them at the old agent. Same fence as the spec-cache
+        # write above — a fenced-out reader falls back to the fresh session
+        # snapshot instead.
+        if _session_cache_generation_is_current(session_id, spec_cache_generation):
+            _session_agent_ids[session_id] = agent_id
         if session_id not in _session_event_queues:
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
