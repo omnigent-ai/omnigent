@@ -312,7 +312,7 @@ class WorkspaceContextManager:
                     "first_id": resources[0]["id"] if resources else None,
                     "last_id": resources[-1]["id"] if resources else None,
                 }
-            if frame.op == "create_terminal":
+            if frame.op in {"create_terminal", "delete_terminal"}:
                 expected_session_id = frame.params.get("session_id")
                 if expected_session_id is not None and (
                     not isinstance(expected_session_id, str) or not expected_session_id
@@ -320,6 +320,7 @@ class WorkspaceContextManager:
                     raise WorkspaceContextError(400, "Expected session id is invalid")
                 if ctx.session_id != expected_session_id:
                     raise WorkspaceContextError(409, "Workspace context ownership changed")
+            if frame.op == "create_terminal":
                 name = frame.params.get("terminal", "bash")
                 key = frame.params.get("session_key")
                 if (

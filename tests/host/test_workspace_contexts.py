@@ -792,7 +792,7 @@ async def test_terminal_creation_requires_current_context_ownership(tmp_path: Pa
                 manager,
                 "delete_terminal",
                 context_id=adopted_context_id,
-                params={"terminal_id": session_terminal["id"]},
+                params={"terminal_id": session_terminal["id"], "session_id": "session-one"},
             )
         )
         _ok(
@@ -800,7 +800,7 @@ async def test_terminal_creation_requires_current_context_ownership(tmp_path: Pa
                 manager,
                 "delete_terminal",
                 context_id=adopted_context_id,
-                params={"terminal_id": original["id"]},
+                params={"terminal_id": original["id"], "session_id": "session-one"},
             )
         )
         _ok(await _request(manager, "delete", context_id=draft_context_id))
@@ -865,12 +865,26 @@ async def test_stale_view_cannot_delete_context_after_other_view_handoff(
         assert manager.registry.get(context_id, "bash", "shared") is instance
         assert await instance.is_alive()
 
+        stale_terminal_delete = await _request(
+            manager,
+            "delete_terminal",
+            context_id=context_id,
+            params={"terminal_id": terminal["id"], "session_id": None},
+            tunnel=stale_view,
+        )
+        assert (stale_terminal_delete.status, stale_terminal_delete.error_status) == (
+            "error",
+            409,
+        )
+        assert manager.registry.get(context_id, "bash", "shared") is instance
+        assert await instance.is_alive()
+
         terminal_delete = _ok(
             await _request(
                 manager,
                 "delete_terminal",
                 context_id=context_id,
-                params={"terminal_id": terminal["id"]},
+                params={"terminal_id": terminal["id"], "session_id": "session-shared"},
                 tunnel=adopting_view,
             )
         )
@@ -910,7 +924,7 @@ async def test_repeated_adopted_terminal_deletion_does_not_exhaust_context_limit
                         manager,
                         "delete_terminal",
                         context_id=context_id,
-                        params={"terminal_id": terminal["id"]},
+                        params={"terminal_id": terminal["id"], "session_id": None},
                     )
                 )
                 assert deleted == {"id": terminal["id"], "deleted": True}
@@ -938,7 +952,10 @@ async def test_repeated_adopted_terminal_deletion_does_not_exhaust_context_limit
                         manager,
                         "delete_terminal",
                         context_id=context_id,
-                        params={"terminal_id": terminal["id"]},
+                        params={
+                            "terminal_id": terminal["id"],
+                            "session_id": f"session-{index}",
+                        },
                     )
                 )
                 assert deleted == {

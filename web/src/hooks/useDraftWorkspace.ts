@@ -287,9 +287,11 @@ export async function deleteDraftTerminal(
   hostId: string,
   contextId: string,
   terminalId: string,
+  sessionId: string | null,
 ): Promise<boolean | null> {
+  const query = sessionId === null ? "" : `?${new URLSearchParams({ session_id: sessionId })}`;
   const response = await authenticatedFetch(
-    `${contextBasePath(hostId, contextId)}/resources/terminals/${encodeURIComponent(terminalId)}`,
+    `${contextBasePath(hostId, contextId)}/resources/terminals/${encodeURIComponent(terminalId)}${query}`,
     { method: "DELETE" },
   );
   if (!response.ok && response.status !== 404) {
@@ -646,9 +648,16 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
             !upsertContext(refreshed)
           )
             throw new Error("Draft workspace selection changed", { cause });
+          const workspaceAliases = active.workspaceAliases;
           const freshContext = ensureContext(active.hostId, active.workspace);
           completionGeneration = transitionGenerationRef.current;
-          active = await freshContext;
+          const replacement = await freshContext;
+          active = withHost(replacement, replacement.hostId, [
+            ...replacement.workspaceAliases,
+            ...workspaceAliases,
+          ]);
+          if (!upsertContext(active))
+            throw new Error("Draft workspace selection changed", { cause });
           terminal = await createDraftTerminal(active.hostId, active.id, null);
         }
         if (
@@ -657,7 +666,12 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
           transitionGenerationRef.current !== completionGeneration ||
           tombstonesRef.current.has(active.id)
         ) {
-          await deleteDraftTerminal(active.hostId, active.id, terminal.id).catch(() => undefined);
+          await deleteDraftTerminal(
+            active.hostId,
+            active.id,
+            terminal.id,
+            operationSessionId,
+          ).catch(() => undefined);
           await discardContext(active).catch(() => undefined);
           throw new Error("Draft workspace selection changed");
         }
@@ -691,7 +705,27 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
       const active = targetContext ?? contextRef.current;
       if (active === null) throw noActiveContextError();
       const operationStorageKey = activeStorageKeyRef.current;
-      const contextDeleted = await deleteDraftTerminal(active.hostId, active.id, terminalId);
+      const operationSessionId = sessionIdRef.current ?? null;
+      let contextDeleted: boolean | null;
+      try {
+        contextDeleted = await deleteDraftTerminal(
+          active.hostId,
+          active.id,
+          terminalId,
+          operationSessionId,
+        );
+      } catch (cause) {
+        if (
+          !(cause instanceof DraftWorkspaceHttpError) ||
+          cause.status !== 409 ||
+          operationSessionId !== null
+        )
+          throw cause;
+        const refreshed = await heartbeatDraftWorkspaceContext(active);
+        if (refreshed.session_id === null) throw cause;
+        upsertContext(refreshed);
+        return;
+      }
       if (
         activeStorageKeyRef.current !== operationStorageKey ||
         tombstonesRef.current.has(active.id)
@@ -717,7 +751,7 @@ export function useDraftWorkspace(sessionId?: string | null): UseDraftWorkspaceR
       }));
       setError(null);
     },
-    [clearContext, refreshTerminals],
+    [clearContext, refreshTerminals, upsertContext],
   );
 
   const discard = useCallback(

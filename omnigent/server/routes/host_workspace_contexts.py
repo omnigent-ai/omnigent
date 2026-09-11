@@ -206,10 +206,25 @@ def create_host_workspace_contexts_router(
 
     @router.delete("/{context_id}/resources/terminals/{terminal_id}")
     async def delete_terminal(
-        request: Request, host_id: str, context_id: str, terminal_id: str
+        request: Request,
+        host_id: str,
+        context_id: str,
+        terminal_id: str,
+        session_id: str | None = Query(default=None, min_length=1),
     ) -> dict[str, Any]:
-        return await operation(
-            request, host_id, context_id, "delete_terminal", {"terminal_id": terminal_id}
+        conn, user_id = await resolve(request, host_id)
+        if session_id is not None:
+            await require_access(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+        await authorize_context(conn, user_id, context_id)
+        return await _request_context(
+            host_registry,
+            conn,
+            user_id,
+            "delete_terminal",
+            context_id,
+            {"terminal_id": terminal_id, "session_id": session_id},
         )
 
     @router.websocket("/{context_id}/resources/terminals/{terminal_id}/attach")

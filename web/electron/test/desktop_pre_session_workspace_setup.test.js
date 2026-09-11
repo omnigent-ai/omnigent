@@ -8,9 +8,33 @@ const os = require("node:os");
 const path = require("node:path");
 
 const {
+  resolveShellWindow,
   startPodServices,
   startWorkspaceFixtures,
 } = require("../e2e/desktop_pre_session_workspace_setup");
+
+describe("pre-session workspace shell resolution", () => {
+  it("waits past auxiliary windows for the exact server origin", async () => {
+    const overlay = { url: () => "file:///update-overlay/index.html" };
+    const wrongServer = { url: () => "http://127.0.0.1:49152/new" };
+    const shell = { url: () => "http://127.0.0.1:49151/new" };
+    let reads = 0;
+    const electronApp = {
+      windows: () => {
+        reads += 1;
+        return reads === 1 ? [overlay, wrongServer] : [overlay, wrongServer, shell];
+      },
+    };
+
+    const resolved = await resolveShellWindow(electronApp, "http://127.0.0.1:49151", {
+      timeoutMs: 100,
+      pollMs: 0,
+    });
+
+    assert.equal(resolved, shell);
+    assert.equal(reads, 2);
+  });
+});
 
 describe("pre-session workspace fixture setup", () => {
   it("closes a started pod when page setup fails", async () => {

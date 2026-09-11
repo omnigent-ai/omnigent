@@ -81,4 +81,34 @@ async function startWorkspaceFixtures(startPod, startPage) {
   }
 }
 
-module.exports = { startPodServices, startWorkspaceFixtures };
+async function resolveShellWindow(electronApp, serverUrl, options = {}) {
+  const expectedOrigin = new URL(serverUrl).origin;
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const pollMs = options.pollMs ?? 100;
+  const deadline = Date.now() + timeoutMs;
+  const resolveCurrent = async () => {
+    const pages = electronApp.windows();
+    const shell = pages.find((page) => {
+      try {
+        return new URL(page.url()).origin === expectedOrigin;
+      } catch {
+        return false;
+      }
+    });
+    if (shell) return shell;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `no shell window appeared on ${expectedOrigin}; windows: ${pages
+          .map((page) => page.url())
+          .join(", ")}`,
+      );
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, Math.min(pollMs, Math.max(0, deadline - Date.now())));
+    });
+    return resolveCurrent();
+  };
+  return resolveCurrent();
+}
+
+module.exports = { resolveShellWindow, startPodServices, startWorkspaceFixtures };

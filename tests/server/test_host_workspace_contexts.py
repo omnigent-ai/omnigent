@@ -96,6 +96,14 @@ def setup() -> SimpleNamespace:
                 )
                 return
             state.context["session_id"] = frame.params["session_id"]
+        if (
+            frame.op in {"create_terminal", "delete_terminal"}
+            and frame.params.get("session_id") != state.context["session_id"]
+        ):
+            future.set_result(
+                {"status": "failed", "error_status": 409, "error": "ownership changed"}
+            )
+            return
         if frame.op == "attach":
             queue = connection.workspace_context_streams[frame.params["channel_id"]]
             queue.put_nowait(
@@ -176,6 +184,7 @@ def test_create_and_terminal_lifecycle(setup: SimpleNamespace) -> None:
         "session_id": None,
     }
     assert setup.client.delete(f"{_TERMINALS}/terminal_test").status_code == 200
+    assert setup.sent[-1].params == {"terminal_id": "terminal_test", "session_id": None}
     assert setup.client.delete(_CONTEXT).status_code == 200
     assert not setup.conn.pending_workspace_contexts
 
@@ -198,13 +207,21 @@ def test_draft_terminal_rejects_agent_harness(setup: SimpleNamespace) -> None:
     assert not setup.sent
 
 
-def test_terminal_creation_requires_owner_access_to_expected_session(
-    setup: SimpleNamespace,
+@pytest.mark.parametrize(
+    "method,url,body",
+    [
+        (
+            "post",
+            _TERMINALS,
+            {"terminal": "bash", "session_key": "foreign", "session_id": "session-foreign"},
+        ),
+        ("delete", f"{_TERMINALS}/terminal_test?session_id=session-foreign", None),
+    ],
+)
+def test_terminal_mutation_requires_owner_access_to_expected_session(
+    setup: SimpleNamespace, method: str, url: str, body: dict[str, Any] | None
 ) -> None:
-    response = setup.client.post(
-        _TERMINALS,
-        json={"terminal": "bash", "session_key": "foreign", "session_id": "session-foreign"},
-    )
+    response = setup.client.request(method, url, json=body)
     assert response.status_code == 404
     assert setup.sent == []
 
@@ -255,6 +272,25 @@ def test_adopted_terminal_creation_forwards_expected_session(setup: SimpleNamesp
     }
 
 
+def test_adopted_terminal_delete_requires_expected_session(setup: SimpleNamespace) -> None:
+    assert (
+        setup.client.post(f"{_CONTEXT}/handoff", json={"session_id": "session_test"}).status_code
+        == 200
+    )
+    setup.sent.clear()
+
+    stale = setup.client.delete(f"{_TERMINALS}/terminal_test")
+    assert stale.status_code == 409
+    assert setup.sent[-1].params == {"terminal_id": "terminal_test", "session_id": None}
+
+    rightful = setup.client.delete(f"{_TERMINALS}/terminal_test?session_id=session_test")
+    assert rightful.status_code == 200
+    assert setup.sent[-1].params == {
+        "terminal_id": "terminal_test",
+        "session_id": "session_test",
+    }
+
+
 @pytest.mark.parametrize(
     "method,suffix,body",
     [
@@ -262,11 +298,6 @@ def test_adopted_terminal_creation_forwards_expected_session(setup: SimpleNamesp
         ("delete", "", None),
         ("get", "/resources/terminals", None),
         ("post", "/resources/terminals", {"terminal": "bash"}),
-        (
-            "post",
-            "/resources/terminals",
-            {"terminal": "bash", "session_id": "session_test"},
-        ),
         ("delete", "/resources/terminals/terminal_test", None),
     ],
 )

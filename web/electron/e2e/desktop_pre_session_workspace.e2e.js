@@ -26,6 +26,7 @@ const {
   saveRecording,
 } = require("./desktopHarness");
 const {
+  resolveShellWindow,
   startPodServices,
   startWorkspaceFixtures,
 } = require("./desktop_pre_session_workspace_setup");
@@ -417,41 +418,45 @@ describe(
         let sessionCreateRequests = 0;
         const prematureSessionResourceRequests = [];
         let startClicked = false;
-        launched.window.on("request", (request) => {
-          const requestPath = new URL(request.url()).pathname;
-          if (request.method() === "POST" && requestPath === "/v1/sessions") {
-            sessionCreateRequests += 1;
-          }
-          if (!startClicked && /^\/v1\/sessions\/(?:[^/]*)\/resources(?:\/|$)/.test(requestPath)) {
-            prematureSessionResourceRequests.push(`${request.method()} ${requestPath}`);
-          }
-        });
-        launched.window.on("websocket", (socket) => {
-          const socketPath = new URL(socket.url()).pathname;
-          if (!startClicked && /^\/v1\/sessions\/(?:[^/]*)\/resources(?:\/|$)/.test(socketPath)) {
-            prematureSessionResourceRequests.push(`WS ${socketPath}`);
-          }
-        });
         let saved;
         let browserTabId;
         let workspaceContextId;
         try {
-          await windowReady(launched.window);
+          const shell = await resolveShellWindow(launched.electronApp, pod.serverUrl);
+          shell.on("request", (request) => {
+            const requestPath = new URL(request.url()).pathname;
+            if (request.method() === "POST" && requestPath === "/v1/sessions") {
+              sessionCreateRequests += 1;
+            }
+            if (
+              !startClicked &&
+              /^\/v1\/sessions\/(?:[^/]*)\/resources(?:\/|$)/.test(requestPath)
+            ) {
+              prematureSessionResourceRequests.push(`${request.method()} ${requestPath}`);
+            }
+          });
+          shell.on("websocket", (socket) => {
+            const socketPath = new URL(socket.url()).pathname;
+            if (!startClicked && /^\/v1\/sessions\/(?:[^/]*)\/resources(?:\/|$)/.test(socketPath)) {
+              prematureSessionResourceRequests.push(`WS ${socketPath}`);
+            }
+          });
+          await windowReady(shell);
           assert.equal(sessionRows(await getJson(`${pod.serverUrl}/v1/sessions`)).length, 0);
 
-          await chooseWorkspace(launched.window, fixtureRepo);
-          const panel = launched.window.locator("[data-workspace-panel-content]");
+          await chooseWorkspace(shell, fixtureRepo);
+          const panel = shell.locator("[data-workspace-panel-content]");
           await panel.waitFor({ state: "hidden", timeout: 20_000 });
-          await launched.window.getByRole("button", { name: "Expand right panel" }).click();
+          await shell.getByRole("button", { name: "Expand right panel" }).click();
           await panel.waitFor({ state: "visible", timeout: 20_000 });
 
-          await launched.window.getByRole("tab", { name: "Files" }).click();
+          await shell.getByRole("tab", { name: "Files" }).click();
           await panel.getByText("README.md", { exact: true }).waitFor({ state: "visible" });
 
-          await launched.window.getByRole("tab", { name: /Changes/ }).click();
+          await shell.getByRole("tab", { name: /Changes/ }).click();
           await panel.getByText("draft.txt", { exact: true }).waitFor({ state: "visible" });
 
-          await launched.window.getByRole("tab", { name: "GitHub" }).click();
+          await shell.getByRole("tab", { name: "GitHub" }).click();
           const githubState = panel
             .getByText(
               /omnigent-ai\/omnigent|no open pr|pull requests created|upstream repo|sign in|authentication/i,
@@ -463,11 +468,11 @@ describe(
             `${await githubState.innerText()}\n`,
           );
 
-          await launched.window.getByRole("button", { name: "Open new" }).click();
-          await launched.window.getByText("Shell (bash)", { exact: true }).click();
+          await shell.getByRole("button", { name: "Open new" }).click();
+          await shell.getByText("Shell (bash)", { exact: true }).click();
           const terminal = panel.locator(".xterm-helper-textarea");
           await terminal.waitFor({ state: "visible", timeout: 20_000 });
-          workspaceContextId = await launched.window.evaluate(() => {
+          workspaceContextId = await shell.evaluate(() => {
             const key = Object.keys(localStorage).find((candidate) =>
               candidate.startsWith("omnigent:draft-workspace-contexts:v1:"),
             );
@@ -485,12 +490,12 @@ describe(
             fs.realpathSync(fixtureRepo),
           );
 
-          await launched.window.getByRole("button", { name: "Open new" }).click();
-          await launched.window.getByRole("menuitem", { name: "Browser", exact: true }).click();
-          const address = launched.window.getByRole("textbox", { name: "Address bar" });
+          await shell.getByRole("button", { name: "Open new" }).click();
+          await shell.getByRole("menuitem", { name: "Browser", exact: true }).click();
+          const address = shell.getByRole("textbox", { name: "Address bar" });
           await address.fill(demoPage.url);
           await address.press("Enter");
-          await launched.window.waitForFunction(
+          await shell.waitForFunction(
             () => {
               for (const key of Object.keys(localStorage)) {
                 try {
@@ -506,7 +511,7 @@ describe(
             null,
             { timeout: 20_000 },
           );
-          const browserState = await launched.window.evaluate(() => {
+          const browserState = await shell.evaluate(() => {
             for (const key of Object.keys(localStorage)) {
               try {
                 const candidate = JSON.parse(localStorage.getItem(key));
@@ -523,7 +528,7 @@ describe(
             throw new Error("landing browser state was not persisted");
           });
           browserTabId = browserState.tabId;
-          await launched.window.waitForFunction(
+          await shell.waitForFunction(
             async ([viewId, expected]) => {
               const result = await window.omnigentDesktop.browserExecute(
                 viewId,
@@ -534,21 +539,21 @@ describe(
             [browserState.viewId, "Opened safely before Start."],
             { timeout: 20_000 },
           );
-          const storageBeforeReload = await captureLandingStorage(launched.window);
+          const storageBeforeReload = await captureLandingStorage(shell);
 
-          await launched.window.reload();
-          await windowReady(launched.window);
+          await shell.reload();
+          await windowReady(shell);
           await panel.waitFor({ state: "hidden", timeout: 20_000 });
-          await launched.window.getByRole("button", { name: "Expand right panel" }).click();
+          await shell.getByRole("button", { name: "Expand right panel" }).click();
           await panel.waitFor({ state: "visible", timeout: 20_000 });
-          const storageAfterReload = await captureLandingStorage(launched.window);
+          const storageAfterReload = await captureLandingStorage(shell);
           fs.writeFileSync(
             path.join(RECORD_DIR, "reload-storage.json"),
             `${JSON.stringify({ before: storageBeforeReload, after: storageAfterReload }, null, 2)}\n`,
           );
           assert.equal(sessionRows(await getJson(`${pod.serverUrl}/v1/sessions`)).length, 0);
           assert.equal(sessionCreateRequests, 0, "reload created a session before Start");
-          await launched.window
+          await shell
             .locator('[role="button"][title]')
             .filter({ hasText: /bash/i })
             .first()
@@ -561,9 +566,9 @@ describe(
           );
           await reloadedTerminal.press("Enter");
           await waitForFile(path.join(fixtureRepo, ".desktop-e2e-reload"), "retained");
-          await launched.window.getByRole("tab", { name: "Browser", exact: true }).click();
-          await launched.window.getByRole("tab", { name: "Browser 1", exact: true }).click();
-          await launched.window.waitForFunction(
+          await shell.getByRole("tab", { name: "Browser", exact: true }).click();
+          await shell.getByRole("tab", { name: "Browser 1", exact: true }).click();
+          await shell.waitForFunction(
             async ([viewId, expected]) => {
               const result = await window.omnigentDesktop.browserExecute(
                 viewId,
@@ -575,7 +580,7 @@ describe(
             { timeout: 20_000 },
           );
 
-          const browserPaneBounds = await launched.window
+          const browserPaneBounds = await shell
             .locator(`[data-browser-pane-conversation="${browserState.viewId}"]`)
             .evaluate((pane) => {
               const rect = pane.lastElementChild.getBoundingClientRect();
@@ -605,7 +610,7 @@ describe(
             );
           }
 
-          await launched.window.getByRole("tab", { name: /Agents 0/ }).click();
+          await shell.getByRole("tab", { name: /Agents 0/ }).click();
           await panel
             .getByText("No agents yet. Start a chat to add an agent.", { exact: true })
             .waitFor({
@@ -619,31 +624,29 @@ describe(
             "a session-scoped resource request occurred before Start",
           );
 
-          const toggle = launched.window.getByRole("button", { name: "Collapse right panel" });
+          const toggle = shell.getByRole("button", { name: "Collapse right panel" });
           await toggle.click();
           await panel.waitFor({ state: "hidden" });
-          await launched.window.getByRole("button", { name: "Expand right panel" }).click();
+          await shell.getByRole("button", { name: "Expand right panel" }).click();
           await panel.waitFor({ state: "visible" });
           const widthBefore = (await panel.boundingBox()).width;
-          const resizeHandle = launched.window.getByRole("separator", { name: "Resize panel" });
+          const resizeHandle = shell.getByRole("separator", { name: "Resize panel" });
           await resizeHandle.press("ArrowLeft");
           await resizeHandle.press("ArrowLeft");
           const widthAfter = (await panel.boundingBox()).width;
           assert.ok(widthAfter > widthBefore, `${widthBefore} did not grow after resize`);
 
-          await launched.window.getByTestId("new-chat-landing-agent-select").click();
-          await launched.window.getByTestId("new-chat-landing-custom-agents").hover();
-          await launched.window.getByText(/hello_world/i, { exact: true }).click();
-          const visibleOverlays = launched.window.locator(
-            '[role="menu"]:visible, [role="dialog"]:visible',
-          );
+          await shell.getByTestId("new-chat-landing-agent-select").click();
+          await shell.getByTestId("new-chat-landing-custom-agents").hover();
+          await shell.getByText(/hello_world/i, { exact: true }).click();
+          const visibleOverlays = shell.locator('[role="menu"]:visible, [role="dialog"]:visible');
           /* oxlint-disable no-await-in-loop */
           for (let attempt = 0; attempt < 4 && (await visibleOverlays.count()) > 0; attempt += 1) {
-            await launched.window.keyboard.press("Escape");
-            await launched.window.waitForTimeout(100);
+            await shell.keyboard.press("Escape");
+            await shell.waitForTimeout(100);
           }
           /* oxlint-enable no-await-in-loop */
-          await launched.window.waitForFunction(
+          await shell.waitForFunction(
             () => getComputedStyle(document.body).pointerEvents !== "none",
           );
           assert.equal(
@@ -651,12 +654,8 @@ describe(
             0,
             "agent picker remained visible after dismissal",
           );
-          await launched.window
-            .getByTestId("new-chat-landing-input")
-            .fill("Start the demo workspace");
-          const startBounds = await launched.window
-            .getByTestId("new-chat-landing-submit")
-            .boundingBox();
+          await shell.getByTestId("new-chat-landing-input").fill("Start the demo workspace");
+          const startBounds = await shell.getByTestId("new-chat-landing-submit").boundingBox();
           assert.ok(startBounds, "Start button did not have renderer bounds");
           const overlapsBrowserPane = !(
             startBounds.x + startBounds.width <= browserPaneBounds.x ||
@@ -665,7 +664,7 @@ describe(
             browserPaneBounds.y + browserPaneBounds.height <= startBounds.y
           );
           assert.equal(overlapsBrowserPane, false, "native browser bounds overlapped Start");
-          const startHitTarget = await launched.window.evaluate(({ x, y, width, height }) => {
+          const startHitTarget = await shell.evaluate(({ x, y, width, height }) => {
             const target = document.elementFromPoint(x + width / 2, y + height / 2);
             const button = document.querySelector('[data-testid="new-chat-landing-submit"]');
             return {
@@ -692,17 +691,12 @@ describe(
             path.join(RECORD_DIR, "browser-view-bounds.json"),
             `${JSON.stringify({ browserPaneBounds, nativeBrowserView, startBounds, startHitTarget }, null, 2)}\n`,
           );
-          await launched.electronApp.evaluate(({ BrowserWindow }) => {
-            BrowserWindow.getAllWindows()[0].webContents.focus();
-          });
+          await shell.bringToFront();
           startClicked = true;
-          await launched.window.getByTestId("new-chat-landing-submit").click();
-          await launched.window.waitForURL(/\/c\/[^/]+$/, { timeout: 45_000 });
+          await shell.getByTestId("new-chat-landing-submit").click();
+          await shell.waitForURL(/\/c\/[^/]+$/, { timeout: 45_000 });
           assert.equal(sessionCreateRequests, 1, "Start did not issue exactly one session POST");
-          const sessionId = new URL(launched.window.url()).pathname
-            .split("/")
-            .filter(Boolean)
-            .at(-1);
+          const sessionId = new URL(shell.url()).pathname.split("/").filter(Boolean).at(-1);
           assert.ok(sessionId);
           const sessions = sessionRows(await getJson(`${pod.serverUrl}/v1/sessions`));
           assert.equal(sessions.length, 1);
@@ -712,13 +706,13 @@ describe(
           );
           assert.equal(session.host_id, pod.hostId);
           assert.equal(session.workspace, fs.realpathSync(fixtureRepo));
-          await launched.window
+          await shell
             .getByText("DESKTOP_HANDOFF_OK", { exact: true })
             .waitFor({ state: "visible", timeout: 45_000 });
 
-          const sessionPanel = launched.window.locator("[data-workspace-panel-content]");
+          const sessionPanel = shell.locator("[data-workspace-panel-content]");
           await sessionPanel.waitFor({ state: "visible", timeout: 20_000 });
-          const retainedShellTab = launched.window
+          const retainedShellTab = shell
             .locator('[role="button"][title]')
             .filter({ hasText: /bash/i })
             .first();
@@ -732,17 +726,15 @@ describe(
           await retainedTerminal.press("Enter");
           await waitForFile(path.join(fixtureRepo, ".desktop-e2e-retained"), "retained");
 
-          await launched.window.getByRole("tab", { name: "Browser", exact: true }).click();
-          await launched.window.getByRole("tab", { name: "Browser 1", exact: true }).click();
-          await launched.window
-            .getByRole("textbox", { name: "Address bar" })
-            .waitFor({ state: "visible" });
+          await shell.getByRole("tab", { name: "Browser", exact: true }).click();
+          await shell.getByRole("tab", { name: "Browser 1", exact: true }).click();
+          await shell.getByRole("textbox", { name: "Address bar" }).waitFor({ state: "visible" });
           assert.equal(
-            await launched.window.getByRole("textbox", { name: "Address bar" }).inputValue(),
+            await shell.getByRole("textbox", { name: "Address bar" }).inputValue(),
             demoPage.url,
           );
           const adoptedBrowserViewId = `browser-tab:${encodeURIComponent(sessionId)}:${browserTabId}`;
-          await launched.window.waitForFunction(
+          await shell.waitForFunction(
             async ([viewId, expected]) => {
               const result = await window.omnigentDesktop.browserExecute(
                 viewId,

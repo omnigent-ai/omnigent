@@ -77,34 +77,109 @@ describe("buildDraftTerminalAttachPath", () => {
 });
 
 describe("useDraftWorkspace", () => {
-  it("acquires a fresh draft for a stale tab while permitting session-owned shell creation", async () => {
+  it.each(["/repo", "/alias", "/other-alias"])(
+    "preserves selected workspace %s when replacing an adopted draft",
+    async (selectedWorkspace) => {
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify([
+          {
+            id: "shared",
+            workspace: "/repo",
+            workspaceAliases: ["/repo", "/alias", "/other-alias"],
+            hostId: "host_1",
+            leaseSeconds: 600,
+            sessionId: null,
+          },
+        ]),
+      );
+      let sharedSession: string | null = null;
+      const sharedShells = [terminal("original")];
+      const freshShells: ReturnType<typeof terminal>[] = [];
+      fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/shared/heartbeat"))
+          return response(context("shared", "/repo", sharedSession));
+        if (url.endsWith("/shared/handoff")) {
+          sharedSession = "conv_1";
+          return response(context("shared", "/repo", sharedSession));
+        }
+        if (url === "/v1/hosts/host_1/workspace-contexts")
+          return response(context("fresh", "/repo"));
+        if (url.endsWith("/resources/terminals")) {
+          const shared = url.includes("/shared/");
+          const shells = shared ? sharedShells : freshShells;
+          if (init?.method === "POST") {
+            const body = JSON.parse(String(init.body));
+            if (body.session_id !== (shared ? sharedSession : null)) return response({}, 409);
+            shells.push(terminal(shared ? "session_shell" : "draft_shell"));
+            return response(shells.at(-1));
+          }
+          return response({ object: "list", data: [...shells] });
+        }
+        throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+      });
+      const first = renderHook(
+        ({ sessionId }: { sessionId: string | null }) => useDraftWorkspace(sessionId),
+        { initialProps: { sessionId: null as string | null } },
+      );
+      const stale = renderHook(() => useDraftWorkspace(null));
+      await waitFor(() => expect(first.result.current.terminals).toHaveLength(1));
+      await waitFor(() => expect(stale.result.current.terminals).toHaveLength(1));
+      await act(async () => {
+        await first.result.current.adopt("conv_1");
+      });
+      first.rerender({ sessionId: "conv_1" });
+      expect(stale.result.current.context?.session_id).toBeNull();
+
+      await act(async () => {
+        const captured = await stale.result.current.ensureContext("host_1", selectedWorkspace);
+        expect((await stale.result.current.createTerminal(captured)).id).toBe("draft_shell");
+      });
+      expect(stale.result.current.context?.id).toBe("fresh");
+      expect(stale.result.current.context?.workspaceAliases).toContain(selectedWorkspace);
+      await act(async () => {
+        expect((await stale.result.current.ensureContext("host_1", selectedWorkspace)).id).toBe(
+          "fresh",
+        );
+      });
+      expect(freshShells.map((shell) => shell.id)).toEqual(["draft_shell"]);
+      expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "DELETE")).toEqual([]);
+      expect(sharedShells.map((shell) => shell.id)).toEqual(["original"]);
+      await act(async () => {
+        expect((await first.result.current.createTerminal()).id).toBe("session_shell");
+      });
+      expect(sharedShells.map((shell) => shell.id)).toEqual(["original", "session_shell"]);
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "shared", sessionId: "conv_1" }),
+          expect.objectContaining({ id: "fresh", sessionId: null }),
+        ]),
+      );
+    },
+  );
+
+  it("reconciles a stale draft close while allowing the session's confirmed close", async () => {
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify([
         { id: "shared", workspace: "/repo", hostId: "host_1", leaseSeconds: 600, sessionId: null },
       ]),
     );
-    let sharedSession: string | null = null;
-    const sharedShells = [terminal("original")];
-    const freshShells: ReturnType<typeof terminal>[] = [];
+    let owner: string | null = null;
+    let running = true;
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
-      if (url.endsWith("/shared/heartbeat"))
-        return response(context("shared", "/repo", sharedSession));
-      if (url.endsWith("/shared/handoff")) {
-        sharedSession = "conv_1";
-        return response(context("shared", "/repo", sharedSession));
+      if (url.endsWith("/heartbeat")) return response(context("shared", "/repo", owner));
+      if (url.endsWith("/handoff")) {
+        owner = "conv_1";
+        return response(context("shared", "/repo", owner));
       }
-      if (url === "/v1/hosts/host_1/workspace-contexts") return response(context("fresh", "/repo"));
-      if (url.endsWith("/resources/terminals")) {
-        const shared = url.includes("/shared/");
-        const shells = shared ? sharedShells : freshShells;
-        if (init?.method === "POST") {
-          const body = JSON.parse(String(init.body));
-          if (body.session_id !== (shared ? sharedSession : null)) return response({}, 409);
-          shells.push(terminal(shared ? "session_shell" : "draft_shell"));
-          return response(shells.at(-1));
-        }
-        return response({ object: "list", data: [...shells] });
+      if (url.endsWith("/resources/terminals"))
+        return response({ object: "list", data: running ? [terminal("shared_shell")] : [] });
+      if (init?.method === "DELETE") {
+        const expectedSession = new URL(url, "http://local.test").searchParams.get("session_id");
+        if (expectedSession !== owner) return response({}, 409);
+        running = false;
+        return response({ deleted: true, context_deleted: true });
       }
       throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
     });
@@ -113,29 +188,28 @@ describe("useDraftWorkspace", () => {
       { initialProps: { sessionId: null as string | null } },
     );
     const stale = renderHook(() => useDraftWorkspace(null));
-    await waitFor(() => expect(first.result.current.terminals).toHaveLength(1));
     await waitFor(() => expect(stale.result.current.terminals).toHaveLength(1));
     await act(async () => {
       await first.result.current.adopt("conv_1");
     });
     first.rerender({ sessionId: "conv_1" });
     expect(stale.result.current.context?.session_id).toBeNull();
-
     await act(async () => {
-      const captured = await stale.result.current.ensureContext("host_1", "/repo");
-      expect((await stale.result.current.createTerminal(captured)).id).toBe("draft_shell");
+      await stale.result.current.deleteTerminal("shared_shell");
     });
-    expect(stale.result.current.context?.id).toBe("fresh");
-    expect(sharedShells.map((shell) => shell.id)).toEqual(["original"]);
+    expect(running).toBe(true);
+    expect(stale.result.current.context).toBeNull();
+    expect(stale.result.current.error).toBeNull();
+    expect(first.result.current.terminals[0]?.id).toBe("shared_shell");
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)[0].sessionId).toBe("conv_1");
     await act(async () => {
-      expect((await first.result.current.createTerminal()).id).toBe("session_shell");
+      await first.result.current.deleteTerminal("shared_shell");
     });
-    expect(sharedShells.map((shell) => shell.id)).toEqual(["original", "session_shell"]);
-    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ id: "shared", sessionId: "conv_1" }),
-        expect.objectContaining({ id: "fresh", sessionId: null }),
-      ]),
+    expect(running).toBe(false);
+    expect(first.result.current.context).toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/hosts/host_1/workspace-contexts/shared/resources/terminals/shared_shell?session_id=conv_1",
+      { method: "DELETE" },
     );
   });
 
@@ -575,7 +649,7 @@ describe("useDraftWorkspace", () => {
       }
       if (
         url ===
-          "/v1/hosts/host_1/workspace-contexts/context_final/resources/terminals/terminal_final" &&
+          "/v1/hosts/host_1/workspace-contexts/context_final/resources/terminals/terminal_final?session_id=conv_1" &&
         init?.method === "DELETE"
       ) {
         return response({ id: "terminal_final", deleted: true, context_deleted: true });
