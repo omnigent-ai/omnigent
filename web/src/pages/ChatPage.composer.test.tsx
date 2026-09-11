@@ -902,8 +902,9 @@ describe("Composer slash-command submit routing", () => {
   it("suppresses the pill tooltip when bare /model opens the picker", async () => {
     // The programmatic openNonce path (bare `/model`) must suppress the
     // pill's summary tooltip exactly like the click/keyboard open paths;
-    // otherwise focus bubbling from the portalled menu paints the tooltip
-    // over the just-opened selector.
+    // otherwise the focus the gear receives (inside the tooltip trigger's
+    // span, so it bubbles there) paints the tooltip over the just-opened
+    // selector.
     useChatStore.setState({ llmModel: "sonnet" });
     render(
       <Composer
@@ -919,9 +920,8 @@ describe("Composer slash-command submit routing", () => {
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "/model " } });
     fireEvent.keyDown(ta, { key: "Enter" });
-    const menu = await screen.findByTestId("composer-agent-menu");
+    await screen.findByTestId("composer-agent-menu");
 
-    fireEvent.focus(menu);
     fireEvent.focus(screen.getByTestId("composer-config-gear"));
     await act(
       () =>
@@ -949,10 +949,10 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.keyDown(gear, { key: "ArrowDown" });
     const menu = screen.getByTestId("composer-agent-menu");
 
-    // The popover portals inside the tooltip trigger's React tree, so focus
-    // landing in it bubbles to the trigger; the tooltip must stay closed
-    // rather than paint over the open menu.
-    fireEvent.focus(menu);
+    // Opening the menu focuses the gear, which sits inside the tooltip
+    // trigger's span and bubbles to it (the menu content is a portalled
+    // React sibling — its events do not bubble to the trigger); the tooltip
+    // must stay closed rather than paint over the open menu.
     fireEvent.focus(gear);
     await act(
       () =>

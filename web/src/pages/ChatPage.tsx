@@ -5130,13 +5130,15 @@ const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
 /**
  * Open state for a tooltip whose trigger contains (or is) a menu trigger.
  *
- * Keeps the tooltip closed while the menu is open: the menu portals inside
- * the tooltip trigger's React tree, so its focus/pointer events bubble here
- * and would instantly open the tooltip, painting it over the menu (equal
- * z-index, later-mounted). Closing the menu hands focus back to the trigger,
- * which would just as instantly reopen the tooltip, so open requests stay
- * blocked for a short window after close — unless the pointer re-enters the
- * trigger, which is unmistakably fresh hover intent.
+ * Keeps the tooltip closed while the menu is open: the menu trigger sits
+ * inside the tooltip trigger's span, so the focus Radix gives it on open
+ * bubbles to the tooltip trigger and would instantly open the tooltip,
+ * painting it over the menu (equal z-index, later-mounted; the menu content
+ * itself is a portalled React sibling whose events do not bubble here).
+ * Closing the menu hands focus back to that same trigger, which would just
+ * as instantly reopen the tooltip, so open requests stay blocked for a short
+ * window after close — unless the pointer re-enters the trigger, which is
+ * unmistakably fresh hover intent.
  */
 function useMenuGuardedTooltip(menuOpen: boolean) {
   const [wantsOpen, setWantsOpen] = useState(false);
