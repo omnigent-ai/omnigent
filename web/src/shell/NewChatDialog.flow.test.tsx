@@ -372,6 +372,15 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         expect.any(Object),
         project,
+        // The picked identity rides along so the temp conversation's composer
+        // shows THIS create's agent + workspace, never the previously viewed
+        // session's model or a "No workspace" placeholder.
+        {
+          agentId: "ag_hello",
+          agentName: "hello_world",
+          harness: null,
+          workspace: SEEDED_WORKSPACE,
+        },
       ),
     );
     await waitFor(() =>

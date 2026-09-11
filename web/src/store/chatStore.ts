@@ -253,6 +253,20 @@ function removeConvRow(tempId: string): void {
 }
 
 /**
+ * The identity the landing composer picked for a not-yet-created session:
+ * the agent (id, name, harness — when known client-side) and the workspace
+ * the create request will carry. Seeded onto the temp conversation's entry
+ * so the composer identifies the NEW pick during the create window instead
+ * of whatever identity the previously viewed session left behind.
+ */
+export interface LocalConversationIdentity {
+  agentId: string | null;
+  agentName: string | null;
+  harness: string | null;
+  workspace: string | null;
+}
+
+/**
  * Start a client-only conversation synchronously, before `createSession` runs:
  * one temp id (`temp:*`) shared by the sidebar row, the registry entry, and the
  * URL; the optimistic first message pushed into the entry; made active so the
@@ -267,6 +281,7 @@ export function beginLocalConversation(
   files: File[] | undefined,
   provisional = newTempConversation(),
   project?: LocalConversationProject,
+  identity?: LocalConversationIdentity,
 ): { tempConvId: string; pendingMsgTempId: string; createToken: string } | null {
   if (queryClient === null) return null;
   const { id: tempConvId, token: createToken } = provisional;
@@ -301,6 +316,18 @@ export function beginLocalConversation(
     pendingUserMessages: [bubble],
     loadingConversation: false,
     status: "streaming",
+    // Seed the picked identity so the create window renders it: ChatPage's
+    // picker syncs to `boundAgentId`, and the composer pill / workspace chip
+    // read these fields while the create POST is in flight. The real
+    // session's snapshot overwrites them with server truth on bind.
+    ...(identity
+      ? {
+          boundAgentId: identity.agentId,
+          boundAgentName: identity.agentName,
+          sessionHarness: identity.harness,
+          sessionWorkspace: identity.workspace,
+        }
+      : {}),
   });
   useChatStore.setState({ conversationId: tempConvId });
   conversationRegistry.setActive(tempConvId);
@@ -728,6 +755,14 @@ export interface ConversationState {
    * snapshot on bind; drives the composer pill's harness suffix.
    */
   sessionHarness: string | null;
+  /**
+   * Workspace path bound to the active session, e.g. ``"/work/repo"``.
+   * Seeded from the landing composer's pick for a client-only ``temp:*``
+   * conversation (so the create window shows the picked workspace instead
+   * of a placeholder), then overwritten with the server's value on
+   * snapshot bind. ``null`` when the session has no workspace.
+   */
+  sessionWorkspace: string | null;
   /**
    * The active session's sub-agent head name (e.g. `"gpt"`), or null for a
    * top-level session. Set from the snapshot on bind; lets a head sub-agent's
@@ -1652,6 +1687,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   llmModel: null,
   pendingModelChange: null,
   sessionHarness: null,
+  sessionWorkspace: null,
   subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
@@ -3412,6 +3448,7 @@ function sessionBindingPatch(
   | "pendingModelChange"
   | "sessionModelOverride"
   | "sessionHarness"
+  | "sessionWorkspace"
   | "subAgentName"
   | "costControlModeOverride"
   | "subagentRoutingOverride"
@@ -3439,6 +3476,7 @@ function sessionBindingPatch(
     pendingModelChange: null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
+    sessionWorkspace: session.workspace ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
