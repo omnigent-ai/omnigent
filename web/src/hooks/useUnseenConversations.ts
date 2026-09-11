@@ -42,6 +42,14 @@ type LastSeenMap = Record<string, number>;
 let lastSeenMap: LastSeenMap = {};
 const explicitlyUnread = new Set<string>();
 
+// Sessions with an Undo-restore in flight. Unarchiving is a self-initiated
+// write that bumps the server's `updated_at`, which the WS push surfaces before
+// the restore's seen-anchor lands, so the row would briefly read as unseen and
+// flash an unread dot. Hold the dot off for that in-flight window (see
+// `beginUnseenSuppression`). Kept sub-second: released the moment the restore
+// settles, not for the archived-flag propagation window.
+const restoringSessions = new Set<string>();
+
 // localStorage persistence. Best-effort everywhere: storage can be
 // missing (SSR), full, or blocked — the in-memory mirror always works.
 const STORAGE_KEY = "omnigent.readState.v1";
@@ -201,6 +209,7 @@ export function useSeedReadState(conversations: readonly ReadStateSeed[] | undef
 export function resetReadStateForTests(): void {
   lastSeenMap = {};
   explicitlyUnread.clear();
+  restoringSessions.clear();
   seeded.clear();
   hydrated = false;
   try {
@@ -285,6 +294,25 @@ export function markConversationUnread(conversationId: string, updatedAt: number
 }
 
 /**
+ * Hold the unseen dot off a session while an Undo-restore is in flight — the
+ * unarchive's own `updated_at` bump is self-initiated and shouldn't read as new
+ * activity before the seen-anchor lands. Paired with {@link endUnseenSuppression},
+ * which the restore calls once it settles (a sub-second window, not the full
+ * archived-flag propagation window). Explicitly-unread rows are left alone: the
+ * dot condition already short-circuits on those, and the user's intent wins.
+ */
+export function beginUnseenSuppression(conversationId: string): void {
+  if (restoringSessions.has(conversationId)) return;
+  restoringSessions.add(conversationId);
+  notifySubscribers();
+}
+
+/** Release the {@link beginUnseenSuppression} hold once the restore settles. */
+export function endUnseenSuppression(conversationId: string): void {
+  if (restoringSessions.delete(conversationId)) notifySubscribers();
+}
+
+/**
  * Subscribes the caller to read-state mirror writes and returns the current
  * write version, so a component re-renders (and recomputes
  * `isConversationUnseen`) the instant the user marks a row read/unread — not
@@ -336,6 +364,9 @@ export function isConversationUnseen(
   status: string | undefined,
 ): boolean {
   if (status === "running" || status === undefined) return false;
+  // An Undo-restore in flight owns this row's updated_at bump (its own
+  // unarchive write); don't read that self-initiated bump as new activity.
+  if (restoringSessions.has(conversationId)) return false;
   const stored = lastSeenMap[conversationId];
   if (stored === undefined) return false;
   return updatedAt > stored;

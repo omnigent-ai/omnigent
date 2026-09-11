@@ -59,7 +59,11 @@ import {
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
-import { markConversationSeen } from "./useUnseenConversations";
+import {
+  beginUnseenSuppression,
+  endUnseenSuppression,
+  markConversationSeen,
+} from "./useUnseenConversations";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
@@ -1391,6 +1395,11 @@ export async function undoArchiveConversations(
 ): Promise<void> {
   if (conversations.length === 0) return;
   const ids = conversations.map((c) => c.id);
+  // Hold the unread dot off every restored row until this settles. The unarchive
+  // bumps each session's updated_at (a self-initiated write), which the WS push
+  // surfaces before the seen-anchor below lands, so the row would otherwise
+  // flash an unread badge on the way back in. Released in `finally`.
+  for (const id of ids) beginUnseenSuppression(id);
   // Un-hide any rows still in the list cache (flag flip). Rows a refetch already
   // evicted aren't here to flip; the keep-alive below covers those. The paint
   // also arms the unarchive tombstone (`marked`), which coerces a lagging
@@ -1462,6 +1471,9 @@ export async function undoArchiveConversations(
       );
     }
   } finally {
+    // Restore settled: the seen-anchor for the ids that came back has landed
+    // (marked seen in the loop above), so the dot can read normally again.
+    for (const id of ids) endUnseenSuppression(id);
     void queryClient.invalidateQueries({ queryKey: ["projects"] });
     void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
     void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
