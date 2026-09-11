@@ -199,6 +199,67 @@ def test_make_auth_token_factory_returns_none_without_databricks_creds(
     assert _make_auth_token_factory() is None
 
 
+def test_sdk_token_resolution_failure_is_not_latched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient SDK-auth resolution failure must not latch ``None`` forever.
+
+    The factory is built while a stored OIDC token satisfies the probe, so the
+    Databricks ``_sdk_token`` path is not exercised at build. When the OIDC
+    token later lapses and the first fallback to ``_sdk_token`` hits a
+    transient resolution error, the NEXT call must re-resolve (build a fresh
+    ``Config``) rather than return ``None`` for the life of the factory — that
+    is what lets a long-lived host self-heal without a restart.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError, _DatabricksBearerAuth
+
+    server = "https://ws.example.com/api/2.0/omnigent"
+    for var in (
+        "RUNNER_SERVER_URL",
+        "RUNNER_INITIAL_AUTH_TOKEN",
+        "RUNNER_DELEGATED_AUTH",
+        "RUNNER_TUNNEL_BINDING_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    # OIDC token present at build (probe succeeds without _sdk_token), then
+    # lapses so later calls fall through to the Databricks SDK path.
+    oidc: dict[str, str | None] = {"token": "oidc-token"}
+
+    def _load_token(url: str, *, min_remaining_seconds: float = 0) -> str | None:
+        return oidc["token"]
+
+    monkeypatch.setattr("omnigent.cli_auth.load_token", _load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda url: None)
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer sdk-token"}
+
+    calls = {"n": 0}
+
+    def _resolve(profile: str | None = None) -> tuple[Any, str]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise DatabricksAuthError("transient resolution failure")
+        return _DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ws.example.com"
+
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+
+    factory = _make_auth_token_factory(server_url=server)
+    assert factory is not None
+    assert factory() == "oidc-token"  # OIDC path; _sdk_token untouched
+
+    # OIDC lapses → fall to _sdk_token.
+    oidc["token"] = None
+    # First fallback resolution fails transiently...
+    assert factory() is None
+    # ...and it is NOT latched: the next call re-resolves and succeeds.
+    assert factory() == "sdk-token"
+    assert calls["n"] == 2
+
+
 def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

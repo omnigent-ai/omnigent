@@ -679,7 +679,14 @@ def _make_auth_token_factory(
                     sdk_auth, _host = _resolve_databricks_auth()
             except (DatabricksAuthError, ImportError, ValueError):
                 sdk_auth = None
-            sdk_auth_resolved = True
+            # Cache only a SUCCESSFUL resolution. A transient failure
+            # (a databricks CLI hiccup, the network down across a laptop
+            # suspend, a workspace IP-ACL window) must not latch ``None`` for
+            # the life of the factory — that wedges the process into dialing
+            # unauthenticated forever and only a restart clears it. Leaving the
+            # flag False re-resolves (a fresh ``Config``) on the next call, so
+            # the factory self-heals once credentials resolve again.
+            sdk_auth_resolved = sdk_auth is not None
         if sdk_auth is None:
             return None
         try:
