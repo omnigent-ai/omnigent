@@ -82,9 +82,11 @@ class RunnerUnavailableError(OmnigentError):
     """No runner is serving the session (HTTP 503 ``runner_unavailable``).
 
     Distinct from :class:`HostUnavailableError`: nothing is known to be offline,
-    the session just has no runner bound yet — a managed session's sandbox is
-    still provisioning, or an external host's runner needs launching. Recoverable
-    by waiting or by a relaunch, not by reconfiguring.
+    the session just has no runner bound — a managed session's sandbox is still
+    provisioning (or its launch failed; the server raises the same code for
+    both), or an external host's runner needs launching. Often recoverable by
+    waiting or by a relaunch, never by reconfiguring — but this class alone does
+    not prove the wait will resolve, so callers must not promise recovery.
     """
 
 

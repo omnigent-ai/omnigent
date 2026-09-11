@@ -4,9 +4,11 @@ Journey (the real user path): a user configured for a server-provisioned
 (managed) sandbox @mentions the bot in a channel. The bot creates the managed
 session and submits the first message while the server is still provisioning
 the session's sandbox; the server answers ``503 runner_unavailable`` with its
-curated "still provisioning; try again shortly" reason. That is a normal,
-recoverable state — the user must see an accurate "still starting — try again"
-notice, not the generic "Something went wrong" failure.
+curated "still provisioning; try again shortly" reason. The user must see the
+bot-composed, cause-neutral "sandbox isn't ready yet — try again" notice (the
+same 503 also covers a failed sandbox launch, so it must not promise the
+sandbox is merely starting), not the generic "Something went wrong" failure —
+and the server's raw reason must never be echoed into the channel.
 
 Same vertical harness as ``test_integration.py``: the REAL
 ``SlackOmnigentService`` and ``OmnigentClient`` (real ``httpx``) against
@@ -23,7 +25,7 @@ import respx
 from fakes import FakeOmnigentServer, RecordingSlackClient
 from omnigent_slack.models import UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
-from omnigent_slack.service import SlackOmnigentService
+from omnigent_slack.service import _MANAGED_SANDBOX_NOT_READY_TEXT, SlackOmnigentService
 from omnigent_slack.store import SQLiteStore
 from omnigent_slack.text import GENERIC_FAILURE_TEXT
 
@@ -119,14 +121,16 @@ async def test_managed_still_provisioning_surfaces_curated_notice(tmp_path: Path
     surfaced = surfaced.strip()
     assert surfaced, "the failed turn must deliver a user-facing notice"
 
-    # The still-provisioning sandbox is a normal, recoverable state. It must
-    # NOT read as a server failure...
+    # The not-ready sandbox must NOT read as a server failure...
     assert GENERIC_FAILURE_TEXT not in surfaced, (
         f"a still-provisioning managed sandbox surfaced as the generic failure: {surfaced!r}"
     )
-    # ...and the notice must actually say the sandbox is still coming up
-    # (bot-composed "still starting" or the server's "still provisioning").
-    lowered = surfaced.lower()
-    assert "provision" in lowered or "still starting" in lowered, (
-        f"notice does not communicate the still-starting sandbox state: {surfaced!r}"
+    # ...the user must see exactly the bot-composed, cause-neutral notice...
+    assert _MANAGED_SANDBOX_NOT_READY_TEXT in surfaced, (
+        f"notice does not communicate the not-ready sandbox state: {surfaced!r}"
+    )
+    # ...and the server's raw curated reason must never be echoed into the
+    # channel (the "server error bodies are never echoed" rule in DESIGN.md).
+    assert _PROVISIONING_REASON not in surfaced, (
+        f"the server's raw 503 reason leaked into the channel: {surfaced!r}"
     )

@@ -86,11 +86,17 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
-# Shown when a MANAGED session has no runner yet: the server is still
-# provisioning its sandbox (tens of seconds on a first message). A normal,
-# recoverable wait, so the text asks for a retry rather than reporting a failure.
-_MANAGED_SANDBOX_STARTING_TEXT = (
-    ":warning: Your managed sandbox is still starting. Try again in a moment."
+# Shown when a MANAGED session has no runner: usually the server is still
+# provisioning its sandbox (tens of seconds on a first message), but the server
+# raises the SAME 503 ``runner_unavailable`` when the sandbox launch failed
+# outright, and the client discards the discriminating server message (it may
+# carry internal detail). The wording is therefore cause-neutral: it names the
+# not-ready sandbox and asks for a retry without promising the wait will
+# resolve, and escalates to the operator when it keeps happening (the
+# failed-launch subcase).
+_MANAGED_SANDBOX_NOT_READY_TEXT = (
+    ":warning: Your managed sandbox isn't ready yet. Try again in a moment; if it "
+    "keeps happening, contact your Omnigent operator."
 )
 
 # The same "no runner" report on an EXTERNAL host: no runner is bound, and the
@@ -163,10 +169,12 @@ def _classify_turn_error(
         # surface it so the user knows to run `omnigent setup` on the host.
         return f":warning: {exc}"
     if isinstance(exc, RunnerUnavailableError):
-        # No runner is serving the session. Recoverable by waiting, not by
-        # reconfiguring — so name the wait instead of the generic failure.
+        # No runner is serving the session. Usually recoverable by waiting, but
+        # the managed 503 also covers a failed sandbox launch and the class does
+        # not discriminate — so name the not-ready state instead of the generic
+        # failure, without promising that waiting will resolve it.
         if host_type == "managed":
-            return _MANAGED_SANDBOX_STARTING_TEXT
+            return _MANAGED_SANDBOX_NOT_READY_TEXT
         return _RUNNER_UNAVAILABLE_TEXT
     return None
 

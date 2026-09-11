@@ -228,9 +228,11 @@ user-facing messages, shared by the session-startup and mid-turn paths:
   actionable code's message is surfaced; everything else is logged server-side and
   shown as a generic failure.
 - **503 `runner_unavailable`** → "try again in a moment", worded by the turn's
-  `host_type`: a managed session's sandbox is still provisioning; an external
-  host has no runner bound and launching one didn't recover it. Recoverable by
-  waiting, so it must not read as a failure.
+  `host_type`: a managed session's sandbox isn't ready (the server raises the
+  same code while it is still provisioning AND when its launch failed, and the
+  client discards the discriminating server message — so the managed wording is
+  cause-neutral and escalates to the operator when it keeps happening); an
+  external host has no runner bound and launching one didn't recover it.
 
 ## Authentication (per-user, delegated)
 

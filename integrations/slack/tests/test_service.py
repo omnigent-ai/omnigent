@@ -19,7 +19,7 @@ from omnigent_slack.omnigent import (
 )
 from omnigent_slack.service import (
     _ACK_TEXT,
-    _MANAGED_SANDBOX_STARTING_TEXT,
+    _MANAGED_SANDBOX_NOT_READY_TEXT,
     _RUNNER_UNAVAILABLE_TEXT,
     _SERVER_UNREACHABLE_TEXT,
     _STREAM_INTERRUPTED_TEXT,
@@ -2351,12 +2351,13 @@ class RunnerUnavailableTurnClient(FakeOmnigentClient):
         yield  # pragma: no cover -- makes this an async generator
 
 
-async def test_managed_sandbox_still_provisioning_asks_for_a_retry(tmp_path: Path) -> None:
-    # A managed sandbox that hasn't finished provisioning fails the turn with a
-    # 503 runner_unavailable, which the client re-raises rather than relaunching
-    # (the server owns the sandbox). That is a normal, recoverable wait, so the
-    # user must be told to try again — not shown the generic "something went
-    # wrong", which reads as a broken session.
+async def test_managed_sandbox_not_ready_asks_for_a_retry(tmp_path: Path) -> None:
+    # A managed sandbox that isn't ready fails the turn with a 503
+    # runner_unavailable, which the client re-raises rather than relaunching
+    # (the server owns the sandbox). The same code covers both a sandbox that is
+    # still provisioning and one whose launch failed, so the user must see the
+    # cause-neutral not-ready notice — not the generic "something went wrong",
+    # and not a promise that the sandbox is merely "still starting".
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = RunnerUnavailableTurnClient()
@@ -2373,13 +2374,16 @@ async def test_managed_sandbox_still_provisioning_asks_for_a_retry(tmp_path: Pat
     await service.shutdown()
 
     assert omnigent.turn_host_types == ["managed"]
-    # A recoverable wait must not read as a broken turn.
+    # A possibly-recoverable wait must not read as a broken turn.
     assert all("went wrong" not in stream.text for stream in slack.streams)
-    # The notice is a public post naming the wait, and it does not echo the raw
-    # exception wording.
+    # The notice is a public post naming the not-ready sandbox, and it does not
+    # echo the raw exception wording.
     text = slack.posts[-1]["text"]
-    assert text == _MANAGED_SANDBOX_STARTING_TEXT
+    assert text == _MANAGED_SANDBOX_NOT_READY_TEXT
     assert "unavailable" not in text.lower()
+    # Cause-neutral: the same 503 also covers a failed sandbox launch, so the
+    # notice must not assert the sandbox is merely starting.
+    assert "still starting" not in text.lower()
     assert slack.ephemerals == []
 
 
