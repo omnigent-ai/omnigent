@@ -14,36 +14,12 @@ LLM turn, whose timing would make the assertions flaky.
 
 from __future__ import annotations
 
-import re
-
 import httpx
 from playwright.sync_api import Page, expect
 
-_WORKING = '[data-testid="working-indicator"]'
+from tests.e2e_ui.chat._working_labels import WORKING_LABEL_RE as _WORKING_LABEL_RE
 
-# Rotating labels the working indicator cycles through — mirror of
-# WORKING_MESSAGES in web/src/components/chat/chatBubbleParts.tsx. Which one shows depends on
-# the wall-clock bucket the turn lands on, so the test accepts any of them.
-# Keep this list in sync if that pool changes.
-_WORKING_LABELS = (
-    "Working…",
-    "Cooking…",
-    "Crunching…",
-    "Tinkering…",
-    "Pondering…",
-    "Brewing…",
-    "Noodling…",
-    "Wrangling…",
-    "Conjuring…",
-    "Assembling…",
-    "Percolating…",
-    "Untangling…",
-    "Scheming…",
-    "Finagling…",
-    "Whirring…",
-    "Puzzling…",
-)
-_WORKING_LABEL_RE = re.compile("|".join(re.escape(label) for label in _WORKING_LABELS))
+_WORKING = '[data-testid="working-indicator"]'
 
 
 def _publish_status(
