@@ -420,6 +420,57 @@ async def test_nested_subagent_parent_without_inbox_is_acked(
 
 
 @pytest.mark.asyncio
+async def test_retained_result_is_delivered_when_parent_inbox_is_created(
+    _clean_subagent_registry: None,
+) -> None:
+    """A result acknowledged without a parent inbox is delivered once the inbox exists.
+
+    After the nested-parent 204 the forwarder never resends, so the runner must
+    hand the retained result over itself when it creates the parent's inbox
+    (session init or a drain), the way the pending retry used to the moment
+    the inbox appeared. Delivered exactly once.
+    """
+    child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SnapshotServerClient(  # type: ignore[arg-type]
+            child_body, _parent_snapshot(parent_session_id="conv_top_level")
+        ),
+    )
+    async with _runner_client(app) as client:
+        acked = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={"type": "external_session_status", "data": {"status": "idle", "output": "x"}},
+        )
+        assert acked.status_code == 204
+        assert PARENT_SESSION_ID not in runner_app._session_inboxes_ref
+
+        # The parent's inbox appears on this process; a second creation is a no-op.
+        await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+        await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    assert inbox.qsize() == 1
+    delivered = inbox.get_nowait()
+    assert delivered["task_id"] == CHILD_SESSION_ID
+    assert delivered["status"] == "completed"
+    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None
+    assert entry.delivered is True
+
+
+@pytest.mark.asyncio
 async def test_replayed_idle_after_drain_does_not_redeliver(
     _clean_subagent_registry: None,
 ) -> None:

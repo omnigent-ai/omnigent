@@ -2317,7 +2317,9 @@ def _subagent_delivery_not_confirmed_response(
     an untracked status remains a no-op unless the runner knows this session
     was created as a sub-agent. For known sub-agents, Omnigent must not receive a
     2xx acknowledgement unless the terminal payload is confirmed in the
-    parent's inbox.
+    parent's inbox — except a tracked entry whose parent is itself a
+    sub-agent, which ``post_session_events`` acknowledges before calling here
+    and retains for delivery when the parent's inbox is created.
 
     :param ack: Delivery acknowledgement returned by
         ``mark_subagent_work_terminal``.
@@ -4965,18 +4967,37 @@ def create_runner_app(
         """
         Return whether an undelivered result's parent is itself a sub-agent.
 
-        A sub-agent parent that has no inbox on this runner never gets one: a
-        mirrored claude-native child is never initialized here, and a
-        runner-launched one re-queues undrained results from the server when
-        it is re-initialized. Retrying its children's terminal status buys
-        nothing. An unreadable parent snapshot reads as a top-level parent, so
-        the retry contract still covers a parent that lives elsewhere.
+        A sub-agent parent normally has no inbox on this runner: a mirrored
+        claude-native child is never initialized here. Retrying its children's
+        terminal status every 30 s buys nothing, so the status is acknowledged
+        and the entry kept; creating the parent's inbox later delivers it (see
+        ``_deliver_retained_subagent_results``). An unreadable parent snapshot
+        reads as a top-level parent, so the retry contract still covers a
+        parent that lives elsewhere or is re-initializing after a restart.
 
         :param entry: Terminal work entry whose parent inbox was missing.
         :returns: ``True`` when the parent's snapshot names its own parent.
         """
         snapshot = await _session_snapshot(entry.parent_session_id)
         return snapshot.ok and snapshot.parent_session_id is not None
+
+    def _deliver_retained_subagent_results(parent_id: str) -> None:
+        """
+        Hand over results acknowledged while ``parent_id`` had no inbox here.
+
+        A terminal child whose parent inbox was missing is acknowledged with
+        its entry kept undelivered. Creating the parent's inbox delivers those
+        entries and wakes the parent, as the forwarder's pending retry used to
+        the moment the inbox appeared. Idempotent: delivered entries are skipped.
+
+        :param parent_id: Parent whose inbox now exists, e.g. ``"conv_parent123"``.
+        :returns: None.
+        """
+        for entry in list_subagent_work(parent_id):
+            if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
+                continue
+            if _deliver_subagent_completion(entry).delivered_now:
+                _schedule_subagent_wake(entry)
 
     async def _recover_undrained_subagent_results(parent_id: str) -> None:
         """
@@ -4988,15 +5009,17 @@ def create_runner_app(
         before the next ``sys_read_inbox`` drain. The inbox is created here
         when missing: after a reconnect the server can dispatch a pending
         message before it re-initializes the session, and that turn's drain
-        must still see the recovered results.
+        must still see the recovered results. Results acknowledged while this
+        parent had no inbox here are handed over first, on every call.
 
         :param parent_id: Parent session whose inbox was recreated, e.g.
             ``"conv_parent123"``.
         :returns: None.
         """
+        _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        _deliver_retained_subagent_results(parent_id)
         if parent_id in _subagent_recovery_done:
             return
-        _session_inboxes.setdefault(parent_id, asyncio.Queue())
         lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
         async with lock:
             if parent_id in _subagent_recovery_done:
@@ -8760,8 +8783,9 @@ def create_runner_app(
                     and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
                     and await _parent_is_nested_subagent(delivery_ack.entry)
                 ):
-                    # No inbox will appear here for this result; the entry stays
-                    # terminal and undelivered for the parent's own recovery scan.
+                    # Acknowledge instead of asking the forwarder to poll; the
+                    # entry stays terminal and undelivered until this runner
+                    # creates the parent's inbox and hands it over.
                     return Response(status_code=204)
                 is_known = (
                     conversation_id in _session_sub_agent_names or recovered_entry is not None
