@@ -7910,10 +7910,11 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
     event type absent from the route's payload-validation passthrough 400s
     every POST, and one absent from ``ServerStreamEvent`` fails at the SSE
     boundary — both invisible to the forwarder, which logs post failures at
-    debug level. Drives ``_forward_permission_mode_from_pane`` itself rather
-    than a hand-rolled POST, so the mirror's own logic is on the path.
+    debug level. Drives ``_forward_pane_signals`` itself rather than a
+    hand-rolled POST, so the mirror's own logic is on the path.
     """
     from omnigent.harnesses.claude_native import forwarder as fwd
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
     from tests.server.helpers import start_session_stream_collector
 
     agent = await create_test_agent(client)
@@ -7922,21 +7923,21 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
 
     pane_mode = "default"
 
-    def _fake_read(_bridge_dir: Any) -> str | None:
-        """Serve the pane footer the forwarder would capture via tmux."""
-        return pane_mode
+    def _fake_read(_bridge_dir: Any) -> PaneSignals:
+        """Serve the pane signals the forwarder would capture via tmux."""
+        return PaneSignals(permission_mode=pane_mode)
 
     dedupe = fwd._ForwardDedupeState()
     collector = await start_session_stream_collector(session_id)
     try:
         with (
-            patch.object(fwd, "read_permission_mode", _fake_read),
-            patch.object(fwd, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0),
+            patch.object(fwd, "read_pane_signals", _fake_read),
+            patch.object(fwd, "_PANE_POLL_INTERVAL_S", 0.0),
         ):
 
             async def _poll() -> None:
-                """Run one real permission-mode mirror pass against the server."""
-                await fwd._forward_permission_mode_from_pane(
+                """Run one real pane-signal mirror pass against the server."""
+                await fwd._forward_pane_signals(
                     client=client,
                     session_id=session_id,
                     bridge_dir=Path("/tmp/omnigent/claude-native/e2e"),
