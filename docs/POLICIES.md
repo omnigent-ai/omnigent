@@ -310,6 +310,7 @@ Controls GitHub access across MCP tools and `git`/`gh` shell commands. Restricts
 | `read_repos` | string[] | `[]` | Repos readable when `read_all` is false (`owner/repo` or URLs) |
 | `write_repos` | string[] | `[]` | Repos the agent may write to |
 | `write_branches` | string[] | `[]` | Branches writable within allowed repos (empty = any) |
+| `write_violation_action` | `"DENY"` \| `"ASK"` | `"DENY"` | Verdict on a write outside the allowlist, or one whose target cannot be determined |
 | `mcp_tool_prefixes` | string[] | `["mcp__github__", "github__"]` | Tool-name prefixes to match |
 | `shell_tools` | string[] | `["sys_os_shell"]` | Shell tools whose commands are parsed for git/gh |
 
@@ -324,6 +325,22 @@ github_access:
     write_branches:
       - "feature/*"
       - "fix/*"
+```
+
+Set `write_violation_action: ASK` for a trusted allowlist that should still
+permit user-authorized work elsewhere: listed repos are written silently, and
+anything else asks instead of failing the turn. Destructive operations, force
+pushes and tag pushes keep denying, since those are refused on their own merits
+rather than for missing the allowlist.
+
+```yaml
+github_access:
+  type: function
+  handler: omnigent.policies.builtins.github.github_policy
+  factory_params:
+    write_repos:
+      - myorg/trusted-repo
+    write_violation_action: ASK
 ```
 
 ### Google Workspace
