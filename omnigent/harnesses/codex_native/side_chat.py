@@ -32,6 +32,10 @@ deliberately do NOT pin a ``prompt_cache_key``.
 
 from __future__ import annotations
 
+import json
+import logging
+import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # runtime imports are lazy to avoid a forwarder<->side_chat cycle
@@ -54,6 +58,15 @@ SIDE_REFERENCE_ONLY_INSTRUCTIONS = (
 SIDE_CHAT_DISPLAY_NAME = "Side chat"
 
 _SIDE_PREFIX = "/side "
+
+# Pending ``/side`` questions, written by the executor and drained by the
+# forwarder. Whoever calls ``thread/fork`` owns the fork's event stream, and the
+# executor's app-server client closes as soon as it submits the turn — so the
+# fork has to happen on the forwarder's long-lived connection instead, and the
+# question is handed over through the bridge dir like the active turn id.
+_SIDE_REQUEST_DIRNAME = "side_chat_requests"
+
+_logger = logging.getLogger(__name__)
 _JsonObject = dict[str, Any]
 
 
@@ -246,3 +259,47 @@ async def register_side_fork_child(
         forwarder_state=forwarder_state,
     )
     return forwarder_state.session_for_child_thread(child_thread_id)
+
+
+def request_side_chat(bridge_dir: Path, question: str) -> None:
+    """
+    Record a ``/side`` question for the forwarder to fork.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param question: The side-chat question.
+    :returns: None.
+    """
+    request_dir = bridge_dir / _SIDE_REQUEST_DIRNAME
+    request_dir.mkdir(parents=True, exist_ok=True)
+    path = request_dir / f"{uuid.uuid4().hex}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"question": question}), encoding="utf-8")
+    tmp.replace(path)  # atomic publish, so the drainer never reads a partial file
+
+
+def take_side_chat_requests(bridge_dir: Path) -> list[str]:
+    """
+    Claim every pending ``/side`` question, removing each as it is read.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The claimed questions, oldest first; empty when none are pending.
+    """
+    request_dir = bridge_dir / _SIDE_REQUEST_DIRNAME
+    try:
+        paths = sorted(request_dir.glob("*.json"))
+    except OSError:
+        return []
+    questions: list[str] = []
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            path.unlink()
+        except (OSError, ValueError):
+            # A half-written or vanished request is dropped rather than retried
+            # forever; the user can re-issue /side.
+            _logger.warning("Codex side-chat request unreadable: %s", path, exc_info=True)
+            continue
+        question = payload.get("question") if isinstance(payload, dict) else None
+        if isinstance(question, str) and question:
+            questions.append(question)
+    return questions
