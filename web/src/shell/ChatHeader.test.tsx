@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -54,6 +55,8 @@ const mobileMenu = {
   onOpenChanges: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
+  githubPanelOpen: false,
+  onOpenGithub: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
@@ -76,6 +79,7 @@ function renderHeader(props: {
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
   showFilesPanel?: boolean;
+  pending?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
   onFork?: () => void;
@@ -113,6 +117,7 @@ function renderHeader(props: {
             hasRailContent={props.hasRailContent ?? true}
             rightPanelOpen={false}
             onToggleRightPanel={() => {}}
+            pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
           />
         </TooltipProvider>
@@ -167,6 +172,38 @@ describe("ChatHeader — deployed Share presentation", () => {
       "share-button-glassy",
     );
     expect(share.querySelector(".lucide-user-plus")).not.toBeNull();
+  });
+});
+
+describe("ChatHeader — pending session presentation", () => {
+  it("shows the full desktop control shell disabled while Workspace remains available", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "temp:12345678",
+      conversationTitle: "Inspect the workspace",
+      pending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Add to project" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Agent tools and policies" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Chat view" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Terminal view" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Share session" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeEnabled();
+  });
+
+  it("collapses pending controls into one disabled mobile actions button", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "temp:12345678",
+      conversationTitle: "Inspect the workspace",
+      pending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Session actions" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Share session" })).toBeNull();
   });
 });
 
@@ -442,60 +479,44 @@ function makeTerminalFirstCtx(
  * mounts. QueryClientProvider covers AgentInfoButton's react-query hooks; it
  * self-hides here (no agent info), leaving the toggle as the asserted control.
  */
-function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
+function renderHeaderWithSession(
+  ctx: TerminalFirstContextValue | null,
+  overrides: Partial<ComponentProps<typeof ChatHeader>> = {},
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const header = (
+    <ChatHeader
+      sidebarOpen
+      onOpenSidebar={() => {}}
+      isChildSession={false}
+      conversationId="sess-1"
+      conversationTitle={null}
+      projectName={null}
+      boundAgent={undefined}
+      wrapperLabel={null}
+      canShare={false}
+      canFork={false}
+      onShare={() => {}}
+      onFork={() => {}}
+      hasAgentInfo={false}
+      onAgentInfo={() => {}}
+      hasHeaderMenu={false}
+      showFilesPanel={false}
+      hasRailContent={false}
+      rightPanelOpen={false}
+      onToggleRightPanel={() => {}}
+      mobileMenu={mobileMenu}
+      {...overrides}
+    />
+  );
   return render(
     <MemoryRouter initialEntries={["/c/sess-1"]}>
       <QueryClientProvider client={qc}>
         <TooltipProvider>
           {ctx ? (
-            <TerminalFirstContextProvider value={ctx}>
-              <ChatHeader
-                sidebarOpen
-                onOpenSidebar={() => {}}
-                isChildSession={false}
-                conversationId="sess-1"
-                conversationTitle={null}
-                projectName={null}
-                boundAgent={undefined}
-                wrapperLabel={null}
-                canShare={false}
-                canFork={false}
-                onShare={() => {}}
-                onFork={() => {}}
-                hasAgentInfo={false}
-                onAgentInfo={() => {}}
-                hasHeaderMenu={false}
-                showFilesPanel={false}
-                hasRailContent={false}
-                rightPanelOpen={false}
-                onToggleRightPanel={() => {}}
-                mobileMenu={mobileMenu}
-              />
-            </TerminalFirstContextProvider>
+            <TerminalFirstContextProvider value={ctx}>{header}</TerminalFirstContextProvider>
           ) : (
-            <ChatHeader
-              sidebarOpen
-              onOpenSidebar={() => {}}
-              isChildSession={false}
-              conversationId="sess-1"
-              conversationTitle={null}
-              projectName={null}
-              boundAgent={undefined}
-              wrapperLabel={null}
-              canShare={false}
-              canFork={false}
-              onShare={() => {}}
-              onFork={() => {}}
-              hasAgentInfo={false}
-              onAgentInfo={() => {}}
-              hasHeaderMenu={false}
-              showFilesPanel={false}
-              hasRailContent={false}
-              rightPanelOpen={false}
-              onToggleRightPanel={() => {}}
-              mobileMenu={mobileMenu}
-            />
+            header
           )}
         </TooltipProvider>
       </QueryClientProvider>
@@ -569,18 +590,23 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(toggle).toHaveClass("size-10");
   });
 
-  it("insets the pill's leading edge for the Chat/Terminal track", () => {
-    // The track paints its own background to its edge, so with the pill's
-    // zero padding it sat flush against the border while an icon-only
-    // neighbour cleared it by the slack in its 40px box. The inset is
-    // conditional: a lone kebab must stay the 40px circle asserted above.
+  it("folds the Chat/Terminal switch into the header kebab on mobile", () => {
+    // The narrow mobile header can't carry the segmented track beside the "…"
+    // menu, so the track is dropped and the switch rides inside the kebab.
     isMobileMock.mockReturnValue(true);
-    renderHeaderWithSession(makeTerminalFirstCtx());
+    renderHeaderWithSession(makeTerminalFirstCtx(), {
+      // terminalFirst surfaces the fallback kebab even without other actions.
+      mobileMenu: { ...mobileMenu, terminalFirst: true },
+    });
 
-    const cluster = screen.getByTestId("view-mode-toggle").parentElement;
-    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:pl-1.5");
-    // The guard keys off the track's own data-slot, so it has to be present.
-    expect(screen.getByTestId("view-mode-toggle")).toHaveAttribute("data-slot", "view-mode-toggle");
+    // The segmented track is gone on mobile.
+    expect(screen.queryByTestId("view-mode-toggle")).toBeNull();
+
+    // Opening the kebab reveals the Chat/Terminal entries.
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("session-actions-menu"));
+    expect(screen.getByTestId("view-mode-menu-chat")).toBeInTheDocument();
+    expect(screen.getByTestId("view-mode-menu-terminal")).toBeInTheDocument();
   });
 
   it("rounds the kebab's own background so no square shows inside the pill", () => {
@@ -785,13 +811,22 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
+    // textContent includes it but it's invisible; the labels are what matters.
+    const svgTitleText = (el: Element) =>
+      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
+    expect(
+      screen
+        .getAllByRole("menuitem")
+        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
+    ).toEqual([
       "Pin",
       "Rename",
       "Mark as unread",
       "Add to project",
       "Files",
       "Changes",
+      "GitHub",
       "Agents1",
       "Archive",
       "Delete",

@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -37,13 +38,14 @@ import queue
 import re
 import secrets
 import shlex
+import socket
 import stat
 import sys
 import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -81,6 +83,23 @@ BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 
+# Bind/advertise coordinates for the bridge's HTTP servers (the tool relay and
+# the MCP control ingress). These default to loopback (127.0.0.1) so an
+# ordinary host keeps them off every other interface. Sandbox backends with
+# SSRF hardening (e.g. OpenShell) deny loopback destinations unconditionally,
+# making a loopback-advertised relay unreachable from hook subprocesses there;
+# such an integrator opts into an all-interfaces bind by setting
+# BRIDGE_BIND_HOST_ENV_VAR to "0.0.0.0" (the servers then advertise the host's
+# routable address so those hooks can reach them). Ports come from a small
+# stable pool a sandbox network policy can allowlist by exact host+port —
+# OS-assigned ephemeral ports cannot be.
+BRIDGE_BIND_HOST_ENV_VAR = "OMNIGENT_BRIDGE_BIND_HOST"
+BRIDGE_PORT_POOL_ENV_VAR = "OMNIGENT_BRIDGE_PORT_POOL"
+# Kept below Linux's default ephemeral range (32768+) so OS-assigned ports
+# never collide with the pool. Several servers coexist per host (the MCP
+# ingress plus one tool relay per session), hence a pool rather than one port.
+DEFAULT_BRIDGE_PORT_POOL: tuple[int, ...] = tuple(range(28700, 28716))
+
 # Root for the per-process Claude bridge tree. Namespaced by uid so
 # other Unix users on the same host cannot read the bearer token or
 # pre-create the parent as a symlink to redirect the bridge tree. The
@@ -90,10 +109,27 @@ BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 _TRUSTED_PARENT = Path(tempfile.gettempdir())
 _BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
+# Markers for permission hooks parked on a verdict, keyed by SESSION id: the
+# idle pane reaper's busy check holds a pane's conversation id, and resolving
+# that to a bridge id needs a session-label fetch no per-scan check can afford.
+# Inside the bridge root so it inherits the same owner-only validation; it
+# carries no ``owner.pid``, which is exactly what makes the orphan pruner skip
+# it (see ``native_bridge_common.prune_orphaned_dirs``).
+_APPROVAL_WAIT_DIR_NAME = "approval-waits"
+_APPROVAL_WAIT_ROOT = _BRIDGE_ROOT / _APPROVAL_WAIT_DIR_NAME
+# A parked hook re-touches its marker this often for as long as its POST is
+# held, so the marker stays fresh whether or not a gateway ever severs the poll
+# (a direct server holds one POST for the whole wait).
+APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
+# A marker touched more recently than this means a hook is still waiting.
+# Several refresh intervals of slack, so a hook that is slow to wake never
+# reads stale; a hook killed mid-wait leaves a marker that expires on its own.
+APPROVAL_WAIT_MARKER_TTL_S = 420.0
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 _STATE_FILE = "state.json"
 _HOOKS_FILE = "hooks.jsonl"
+OBSERVER_HOOK_STDERR_FILE = "observer_hook.stderr"
 _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
 _FORKED_FROM_LINE_LIMIT = 200
@@ -160,7 +196,18 @@ _COMPOSER_MODE_GLYPHS = (_CLAUDE_PROMPT_GLYPH, _SHELL_MODE_GLYPH)
 # rule on screen is where the footer begins (see
 # :func:`_permission_mode_from_pane`). Corner glyphs are included because
 # Claude Code has framed the input box both ways across versions.
-_BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
+_BOX_RULE_GLYPHS = "─━╭╮╰╯│┃╌╍"
+_BOX_RULE_CHARS = frozenset(_BOX_RULE_GLYPHS)
+# Glyphs that may frame a *labelled* rule. Verticals are excluded because they
+# bound table cells and ``tree`` rows, which are otherwise the same shape as a
+# labelled rule (see :func:`_is_box_rule`).
+_VERTICAL_RULE_GLYPHS = "│┃"
+_TITLED_RULE_EDGE_GLYPHS = "".join(
+    glyph for glyph in _BOX_RULE_GLYPHS if glyph not in _VERTICAL_RULE_GLYPHS
+)
+# Narrowest a labelled rule may be: the composer's rule spans the pane, so a
+# short run of glyphs around a word is decoration, not the box.
+_MIN_TITLED_RULE_WIDTH = 20
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
@@ -558,6 +605,19 @@ class ClaudeTranscriptItem:
 
 
 @dataclass(frozen=True)
+class TranscriptRecordItems:
+    """Parsed items and durable cursor for one complete JSONL record.
+
+    ``next_byte_offset`` is safe to persist only after every item in
+    ``items`` has been accepted by the server. Records that produce no visible
+    items are included so a forwarder can advance past them without rescanning.
+    """
+
+    next_byte_offset: int
+    items: tuple[ClaudeTranscriptItem, ...]
+
+
+@dataclass(frozen=True)
 class TranscriptReadResult:
     """
     Result of reading Claude transcript JSONL records.
@@ -582,6 +642,9 @@ class TranscriptReadResult:
         in the Claude Code pane writes. ``None`` when no such record was
         scanned. Claude's own auto-generated ``aiTitle`` is deliberately
         not surfaced here; Omnigent titles unnamed sessions itself.
+    :param record_items: Parsed items grouped by their complete source JSONL
+        record, with the byte offset immediately after each record. Native
+        child-transcript batching uses these boundaries for partial checkpoints.
     """
 
     line_cursor: int
@@ -591,6 +654,7 @@ class TranscriptReadResult:
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    record_items: tuple[TranscriptRecordItems, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -854,6 +918,96 @@ def _http_server_host_port(httpd: ThreadingHTTPServer) -> tuple[str, int]:
     return cast(tuple[str, int], httpd.server_address)
 
 
+def _routable_local_address() -> str | None:
+    """Return this host's routable IPv4 source address, or ``None``.
+
+    Uses the UDP-connect trick: no packet is sent; the kernel just reports
+    the source address it would pick to reach a routable destination
+    (TEST-NET-1 here, never actually contacted). Hosts without a routable
+    interface (or without a default route) return ``None``.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 80))
+            address = str(probe.getsockname()[0])
+        parsed = ipaddress.ip_address(address)
+    except (OSError, ValueError):
+        return None
+    if parsed.is_loopback or parsed.is_link_local or parsed.is_unspecified:
+        return None
+    return address
+
+
+def _bridge_bind_hosts() -> tuple[str, str]:
+    """Return ``(bind_host, advertised_host)`` for bridge HTTP servers.
+
+    Defaults to loopback (``127.0.0.1``) so the servers stay off every other
+    interface on an ordinary host. :data:`BRIDGE_BIND_HOST_ENV_VAR` opts into
+    a different posture: ``0.0.0.0`` binds all interfaces and advertises the
+    host's routable address (falling back to loopback when none exists) —
+    the setting an SSRF-hardened sandbox integrator uses, since such a
+    sandbox denies the loopback default unconditionally. Any other value
+    pins that exact host for both bind and advertisement.
+    """
+    override = os.environ.get(BRIDGE_BIND_HOST_ENV_VAR, "").strip()
+    if not override:
+        return "127.0.0.1", "127.0.0.1"
+    if override != "0.0.0.0":
+        return override, override
+    return "0.0.0.0", _routable_local_address() or "127.0.0.1"
+
+
+def _bridge_port_pool() -> tuple[int, ...]:
+    """Return candidate bridge server ports: env override or the stable pool.
+
+    :data:`BRIDGE_PORT_POOL_ENV_VAR` accepts comma-separated ports and
+    inclusive ``start-end`` ranges, e.g. ``"28700-28703,29000"``. Malformed
+    values fall back to :data:`DEFAULT_BRIDGE_PORT_POOL`.
+    """
+    raw = os.environ.get(BRIDGE_PORT_POOL_ENV_VAR, "").strip()
+    if not raw:
+        return DEFAULT_BRIDGE_PORT_POOL
+    ports: list[int] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        start_text, _, end_text = entry.partition("-")
+        try:
+            start = int(start_text)
+            end = int(end_text) if end_text else start
+        except ValueError:
+            return DEFAULT_BRIDGE_PORT_POOL
+        if not 0 < start <= end <= 65535:
+            return DEFAULT_BRIDGE_PORT_POOL
+        ports.extend(range(start, end + 1))
+    return tuple(ports) if ports else DEFAULT_BRIDGE_PORT_POOL
+
+
+def _start_bridge_http_server(
+    handler_cls: type[BaseHTTPRequestHandler],
+) -> tuple[ThreadingHTTPServer, str]:
+    """Bind a bridge HTTP server and return it with its advertised base URL.
+
+    Tries each pool port in order (skipping ports already bound by other
+    bridge servers or unrelated processes), then falls back to an
+    OS-assigned port so local use never fails when the pool is exhausted —
+    though a sandbox allowlisting only the pool cannot reach that fallback.
+    """
+    bind_host, advertised_host = _bridge_bind_hosts()
+    httpd: ThreadingHTTPServer | None = None
+    for port in _bridge_port_pool():
+        try:
+            httpd = ThreadingHTTPServer((bind_host, port), handler_cls)
+        except OSError:
+            continue
+        break
+    if httpd is None:
+        httpd = ThreadingHTTPServer((bind_host, 0), handler_cls)
+    _, port = _http_server_host_port(httpd)
+    return httpd, f"http://{advertised_host}:{port}"
+
+
 class ClaudeNativeToolRelay:
     """
     HTTP relay for Claude MCP tool calls, scoped to its caller's lifetime.
@@ -871,21 +1025,26 @@ class ClaudeNativeToolRelay:
 
     :param bridge_dir: Bridge directory containing
         ``tool_relay.json``, e.g. ``/tmp/omnigent/claude-native/x``.
-    :param httpd: Started localhost HTTP server for tool calls. Its bound
-        address identifies this relay's advertisement on close.
+    :param httpd: Started HTTP server for tool calls.
+    :param advertised_url: Base URL written to ``tool_relay.json``; it
+        identifies this relay's advertisement on close.
     """
 
-    def __init__(self, *, bridge_dir: Path, httpd: ThreadingHTTPServer) -> None:
+    def __init__(
+        self, *, bridge_dir: Path, httpd: ThreadingHTTPServer, advertised_url: str
+    ) -> None:
         """
         Initialize the relay handle.
 
         :param bridge_dir: Bridge directory containing the relay
             advertisement, e.g. ``Path("/tmp/omnigent/...")``.
-        :param httpd: Started localhost HTTP server for tool calls.
+        :param httpd: Started HTTP server for tool calls.
+        :param advertised_url: Base URL advertised in ``tool_relay.json``.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
         self._httpd = httpd
+        self._advertised_url = advertised_url
 
     def close(self) -> None:
         """
@@ -903,11 +1062,10 @@ class ClaudeNativeToolRelay:
         :returns: None.
         """
         relay_file = self._bridge_dir / _TOOL_RELAY_FILE
-        host, port = _http_server_host_port(self._httpd)
         # A newer relay that overwrote the file advertises a different url
         # (this relay's socket is still bound, so its port is unique), so the
         # file is left for that relay to own.
-        if _read_json_file(relay_file).get("url") == f"http://{host}:{port}":
+        if _read_json_file(relay_file).get("url") == self._advertised_url:
             with contextlib.suppress(FileNotFoundError):
                 relay_file.unlink()
         self._httpd.shutdown()
@@ -1052,6 +1210,147 @@ def bridge_dir_for_conversation_id(conversation_id: str) -> Path:
     return bridge_dir_for_bridge_id(conversation_id)
 
 
+def _approval_wait_digest(session_id: str) -> str:
+    """
+    Return the filename stem shared by every marker for one session.
+
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :returns: Hex digest prefix, e.g. ``"3f0e..."`` (32 chars).
+    """
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+
+
+def approval_wait_marker_path(session_id: str, *, bridge_dir: Path | None = None) -> Path:
+    """
+    Return the marker path a parked permission hook keeps fresh.
+
+    One marker per hook process: concurrent prompts on one session (a
+    permission request and an AskUserQuestion, or parallel tool calls) each
+    own a file, so the first to finish never clears another's evidence.
+
+    :param session_id: Omnigent session id whose verdict a hook is waiting
+        on, e.g. ``"conv_abc123"``.
+    :param bridge_dir: The caller's own bridge directory, e.g.
+        ``/tmp/omnigent-501/claude-native/<digest>``. When given, the marker
+        root is derived from it instead of from this process's own temp root: a
+        hook subprocess is *told* its bridge dir, so deriving from it cannot
+        disagree with the runner about ``$TMPDIR`` the way an independently
+        computed root could — and a marker written where the reaper never looks
+        would fail silently. ``None`` uses this process's own root, which is
+        the runner side including the pane reaper.
+    :returns: Absolute marker path under ``<temp root>/approval-waits``, e.g.
+        ``.../approval-waits/<digest>.<pid>.wait``.
+    """
+    root = (
+        bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME
+        if bridge_dir is not None
+        else _APPROVAL_WAIT_ROOT
+    )
+    return root / f"{_approval_wait_digest(session_id)}.{os.getpid()}.wait"
+
+
+def touch_approval_wait_marker(marker: Path) -> None:
+    """
+    Stamp an approval-wait marker with the current time.
+
+    Refreshed on a timer for the life of a hook's wait (see
+    :func:`hold_approval_wait_marker`) so the idle pane reaper can tell a
+    pane parked on a permission prompt — which emits no output and reports no
+    active turn — from an abandoned one. The root is created and validated by
+    :func:`prepare_bridge_dir` in the runner, so this only writes inside an
+    already-trusted directory. Best-effort: a marker that cannot be written
+    only costs the pre-existing reap behavior.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: None.
+    """
+    try:
+        marker.touch()
+    except OSError:
+        _logger.debug("Could not touch approval-wait marker", exc_info=True)
+
+
+def clear_approval_wait_marker(marker: Path) -> None:
+    """
+    Remove an approval-wait marker.
+
+    Called when the hook stops waiting (verdict, rejection, give-up, or a
+    signal that kills it mid-wait) so the pane returns to normal idle
+    accounting at once rather than after :data:`APPROVAL_WAIT_MARKER_TTL_S`.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: None.
+    """
+    with contextlib.suppress(OSError):
+        marker.unlink(missing_ok=True)
+
+
+def approval_wait_is_fresh(session_id: str) -> bool:
+    """
+    Whether a permission hook is parked on this session's verdict right now.
+
+    Scans every hook's marker for the session; a stale one (a hook killed
+    mid-wait) is removed on the way so they never accumulate.
+
+    :param session_id: Omnigent session id to check, e.g.
+        ``"conv_abc123"``.
+    :returns: ``True`` when any marker was touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
+        are stale, or the root is unreadable.
+    """
+    try:
+        markers = list(_APPROVAL_WAIT_ROOT.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
+    except OSError:
+        return False
+    now = time.time()
+    fresh = False
+    for marker in markers:
+        try:
+            touched_at = marker.stat().st_mtime
+        except OSError:
+            continue
+        if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
+            fresh = True
+        else:
+            clear_approval_wait_marker(marker)
+    return fresh
+
+
+@contextlib.contextmanager
+def hold_approval_wait_marker(marker: Path) -> Iterator[None]:
+    """
+    Keep *marker* fresh for the duration of the block, then remove it.
+
+    Touches the marker at once and again every
+    :data:`APPROVAL_WAIT_MARKER_REFRESH_S` on a daemon thread, so a hook
+    blocked in one long POST (a direct server holds the poll for the whole
+    wait) reads as parked exactly like one a gateway severs every few
+    minutes. The refresher is stopped before the marker is cleared so a late
+    touch cannot resurrect it; a hook killed mid-wait takes the thread with
+    it and its marker simply expires.
+
+    :param marker: Marker path from :func:`approval_wait_marker_path`.
+    :returns: ``None`` for the duration of the block.
+    """
+    stop = threading.Event()
+
+    def _refresh() -> None:
+        while not stop.wait(APPROVAL_WAIT_MARKER_REFRESH_S):
+            touch_approval_wait_marker(marker)
+
+    touch_approval_wait_marker(marker)
+    refresher = threading.Thread(
+        target=_refresh, name="omnigent-approval-wait-marker", daemon=True
+    )
+    refresher.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        refresher.join(timeout=5.0)
+        clear_approval_wait_marker(marker)
+
+
 def build_claude_native_spawn_env(
     conversation_id: str,
     *,
@@ -1140,6 +1439,11 @@ def prepare_bridge_dir(
     resolved_bridge_id = bridge_id or conversation_id
     bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
     _ensure_secure_dir(bridge_dir)
+    # A parked permission hook only touches files in this root, so the runner
+    # owns creating and validating it before any hook can fire. Derived from the
+    # bridge dir just validated rather than read from the module global, so it
+    # lands in the same tree the caller asked for.
+    _ensure_secure_dir(bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME)
     config = _read_json_file(bridge_dir / _CONFIG_FILE)
     token = config.get("token") if isinstance(config, dict) else None
     if not isinstance(token, str) or not token:
@@ -1172,6 +1476,7 @@ def prepare_bridge_dir(
         _SERVER_FILE,
         _STATE_FILE,
         _HOOKS_FILE,
+        OBSERVER_HOOK_STDERR_FILE,
         _TOOL_RELAY_FILE,
         _TMUX_FILE,
     ):
@@ -1521,6 +1826,7 @@ def build_hook_settings(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    model_overrides: Mapping[str, str] | None = None,
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
     launch_bypass_permissions: bool = False,
@@ -1546,6 +1852,11 @@ def build_hook_settings(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param model_overrides: Canonical-to-served model id rewrites for
+        Claude Code's ``modelOverrides`` setting, e.g.
+        ``{"claude-opus-4-8": "databricks-claude-opus-4-8"}``. Empty or
+        ``None`` writes no ``modelOverrides`` (the endpoint already
+        speaks canonical ids, or the catalog was not enumerated).
     :param launch_model: Effective launch model from ``--model``. Mirrored
         into the invocation-local settings sidecar so a wrapped Claude Code
         re-exec that preserves ``--settings`` but rebuilds argv cannot fall
@@ -1586,7 +1897,10 @@ def build_hook_settings(
         "--bridge-dir",
         str(bridge_dir),
     ]
-    command = shlex.join(command_parts)
+    # Claude owns command-hook stderr, so it does not reach the runner logs.
+    # Persist it for the forwarder to relay with the Omnigent session id.
+    observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
+    command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
     session_start_hook = {
         "type": "command",
@@ -1652,6 +1966,11 @@ def build_hook_settings(
         # publish live token deltas to the web UI.
         "MessageDisplay": [{"hooks": [message_display_hook]}],
     }
+    from omnigent.native.tool_observer_hook import hook_settings
+
+    hooks["PostToolUse"].append(
+        {"hooks": [hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")]}
+    )
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
@@ -1823,6 +2142,8 @@ def build_hook_settings(
         settings["effortLevel"] = launch_effort
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
+    if model_overrides:
+        settings["modelOverrides"] = dict(model_overrides)
     # Override Claude Code's statusLine so we receive its stdin (the
     # only place ``context_window`` surfaces). A /bin/sh shim captures
     # the raw payload atomically (no interpreter spawn on Claude's
@@ -1912,6 +2233,7 @@ def augment_claude_args(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    model_overrides: Mapping[str, str] | None = None,
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
@@ -1941,6 +2263,10 @@ def augment_claude_args(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param model_overrides: Canonical-to-served model id rewrites
+        threaded to :func:`build_hook_settings` so the sidecar carries
+        Claude Code's ``modelOverrides`` map. ``None`` or empty omits
+        the key.
     :param bundle_dir: Materialized agent-bundle root, when the
         session's agent ships a ``skills/`` directory. Triggers
         ``--plugin-dir <bundle>`` so Claude Code discovers bundled
@@ -1976,6 +2302,7 @@ def augment_claude_args(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=api_key_helper,
+        model_overrides=model_overrides,
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
@@ -2426,12 +2753,14 @@ def read_transcript_items_since(
     Read Claude transcript records as Omnigent conversation items.
 
     Claude Code writes append-only JSONL records whose ``message``
-    payloads include user prompts, assistant text, native tool calls,
-    and native tool results. This parser intentionally renders no
-    conversation item for metadata records (title, file-history,
-    permission mode, system bookkeeping) or raw ``thinking`` blocks,
+    payloads include user prompts, assistant text, ``thinking``
+    blocks, native tool calls, and native tool results. This parser
+    intentionally renders no conversation item for metadata records
+    (title, file-history, permission mode, system bookkeeping),
     while translating the user-visible semantic records into Omnigent
-    item types the web UI already understands. Some metadata is still
+    item types the web UI already understands — ``thinking`` blocks
+    become ``reasoning`` items so the chat surfaces the same
+    reasoning context the TUI shows. Some metadata is still
     read for out-of-band mirroring rather than dropped outright — a
     ``custom-title`` record surfaces on
     :attr:`TranscriptReadResult.latest_custom_title`.
@@ -2496,14 +2825,25 @@ def read_transcript_items_since_with_position(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    record_items: list[TranscriptRecordItems] = []
     for record in read_result.records:
+        parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         try:
             entry = json.loads(record.text)
         except json.JSONDecodeError:
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         if not isinstance(entry, dict):
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
@@ -2528,14 +2868,30 @@ def read_transcript_items_since_with_position(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        record_items.append(
+            TranscriptRecordItems(
+                next_byte_offset=record.next_byte_offset,
+                items=tuple(parsed),
+            )
+        )
+    items = _dedupe_compact_noop_echo(items)
+    retained_source_ids = {item.source_id for item in items}
+    record_items = [
+        TranscriptRecordItems(
+            next_byte_offset=record.next_byte_offset,
+            items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+        )
+        for record in record_items
+    ]
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=_dedupe_compact_noop_echo(items),
+        items=items,
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        record_items=tuple(record_items),
     )
 
 
@@ -2589,14 +2945,25 @@ def read_transcript_items_from_offset(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    record_items: list[TranscriptRecordItems] = []
     for record in read_result.records:
+        parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         try:
             entry = json.loads(record.text)
         except json.JSONDecodeError:
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         if not isinstance(entry, dict):
+            record_items.append(
+                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
+            )
             continue
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
@@ -2622,14 +2989,30 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        record_items.append(
+            TranscriptRecordItems(
+                next_byte_offset=record.next_byte_offset,
+                items=tuple(parsed),
+            )
+        )
+    items = _dedupe_compact_noop_echo(items)
+    retained_source_ids = {item.source_id for item in items}
+    record_items = [
+        TranscriptRecordItems(
+            next_byte_offset=record.next_byte_offset,
+            items=tuple(item for item in record.items if item.source_id in retained_source_ids),
+        )
+        for record in record_items
+    ]
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=_dedupe_compact_noop_echo(items),
+        items=items,
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        record_items=tuple(record_items),
     )
 
 
@@ -4052,7 +4435,13 @@ def post_tools_changed(
     :raises RuntimeError: If the bridge server is not ready, cannot
         be reached, or rejects the notification.
     """
-    server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+    try:
+        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+    except OSError as exc:
+        # Reading the advertisement can fail for reasons other than the file
+        # being absent — fd exhaustion is the one seen in the wild. Callers
+        # treat this notification as best-effort and only expect RuntimeError.
+        raise RuntimeError(f"failed to read the Claude native bridge server info: {exc}") from exc
     token = server.get("token")
     url = server.get("url")
     if not isinstance(token, str) or not isinstance(url, str):
@@ -4372,11 +4761,43 @@ def _is_box_rule(line: str) -> bool:
     the rule directly above the composer, so it is the position that
     identifies the box, not the corners.
 
-    :param line: A single pane line, e.g. ``"──────────"``.
+    A rule may also carry a **label**: Claude Code breaks the box's
+    opening rule with the session's title (``"──── my session ─"``). The
+    frame still marks the box, so a labelled rule counts as one. Demanding
+    every glyph be a rule glyph instead anchors :func:`_composer_row` on
+    the *closing* rule, which reports "no input box" with ``❯`` plainly on
+    screen and times the turn out with the message undelivered. A label is
+    accepted between a leading and a trailing run of
+    :data:`_TITLED_RULE_EDGE_GLYPHS` when it is spaced off from both,
+    carries no rule glyph itself, and the whole rule is at least
+    :data:`_MIN_TITLED_RULE_WIDTH` wide. Those conditions are what keep
+    ordinary output from passing as a rule: a pasted ``tree``/table line of
+    nested ``│`` glyphs and spaces, and a ``│ cell │`` of any width, must
+    stay content, or :func:`_composer_row` collects it as an interior rule
+    and misses the real opening rule the same way. Excluding the vertical
+    glyphs is what draws that line, since a table cell and a labelled rule
+    are otherwise the same shape. The length of the leading run cannot draw
+    it: Claude Code right-aligns the label, so that run shrinks to a single
+    glyph once the title nears the pane width, and the pane is only as wide
+    as the person's browser terminal.
+
+    :param line: A single pane line, e.g. ``"──────────"`` or
+        ``"──────── my session ─"``.
     :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
-    return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
+    if len(stripped) < 3:
+        return False
+    if all(ch in _BOX_RULE_CHARS for ch in stripped):
+        return True
+    lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
+    trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
+    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
+        return False
+    label = stripped[lead : len(stripped) - trail]
+    if any(ch in _BOX_RULE_CHARS for ch in label):
+        return False
+    return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
 
 
 def _submit_needle(content: str) -> str:
@@ -4613,10 +5034,11 @@ def start_tool_relay(
     """
     Start a relay for Omnigent tool calls from Claude.
 
-    Writes ``tool_relay.json`` and starts the localhost HTTP server that
-    backs it. The caller owns the relay's lifetime (a single turn or a
-    whole session) and must call :meth:`ClaudeNativeToolRelay.close` when
-    that scope ends.
+    Writes ``tool_relay.json`` and starts the HTTP server that backs it
+    (see :func:`_start_bridge_http_server` for the bind/advertise rules).
+    The caller owns the relay's lifetime (a single turn or a whole
+    session) and must call :meth:`ClaudeNativeToolRelay.close` when that
+    scope ends.
 
     When ``policy_client`` and ``session_id`` are provided the relay also
     exposes ``POST /policies/evaluate``, which proxies requests to the
@@ -4641,10 +5063,9 @@ def start_tool_relay(
         session_id=session_id,
         bridge_dir=bridge_dir,
     )
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = _http_server_host_port(httpd)
+    httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
-        "url": f"http://{host}:{port}",
+        "url": advertised_url,
         "token": token,
         "tools": _normalize_relay_tool_specs(tools),
         "pid": os.getpid(),
@@ -4656,7 +5077,7 @@ def start_tool_relay(
     # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
     env_path = bridge_dir / _TOOL_RELAY_ENV_FILE
     env_path.write_text(
-        f"OMNIGENT_RELAY_URL='http://{host}:{port}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
+        f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
         encoding="utf-8",
     )
     os.chmod(env_path, 0o600)
@@ -4666,7 +5087,7 @@ def start_tool_relay(
         daemon=True,
     )
     thread.start()
-    return ClaudeNativeToolRelay(bridge_dir=bridge_dir, httpd=httpd)
+    return ClaudeNativeToolRelay(bridge_dir=bridge_dir, httpd=httpd, advertised_url=advertised_url)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -4740,7 +5161,7 @@ def _start_http_ingress(
     notification_queue: queue.Queue[_JsonObject | None],
 ) -> ThreadingHTTPServer:
     """
-    Start the localhost control HTTP server.
+    Start the bridge control HTTP server.
 
     Currently only serves ``POST /tools-changed``, which queues a
     standard MCP ``notifications/tools/list_changed`` for the stdio
@@ -4753,10 +5174,9 @@ def _start_http_ingress(
     :returns: Started :class:`ThreadingHTTPServer`.
     """
     handler_cls = _handler_factory(token, notification_queue)
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = _http_server_host_port(httpd)
+    httpd, advertised_url = _start_bridge_http_server(handler_cls)
     server_info: _JsonObject = {
-        "url": f"http://{host}:{port}",
+        "url": advertised_url,
         "token": token,
         "pid": os.getpid(),
         "updated_at": time.time(),
@@ -4899,6 +5319,7 @@ def _tool_relay_handler_factory(
                 "/tool",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
+                "/hook/observe-tool",
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -4908,6 +5329,13 @@ def _tool_relay_handler_factory(
             payload = self._read_json_body()
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if self.path == "/hook/observe-tool":
+                from omnigent.runner.pr_observer import observe_hook
+
+                if session_id is not None:
+                    observe_hook(session_id, payload)
+                self._send_json({})
                 return
             if self.path == "/hook/claude/evaluate-policy":
                 self._handle_hook_evaluate(payload)
@@ -5100,6 +5528,8 @@ def _tool_relay_handler_factory(
             try:
                 length = int(length_raw)
             except ValueError:
+                return None
+            if self.path == "/hook/observe-tool" and not 0 <= length <= 1_048_576:
                 return None
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -6387,6 +6817,24 @@ def _escape_unsupported_slash_command(content: str) -> str:
     return _escape_slash_command_text(content)
 
 
+def is_auth_slash_command(content: str) -> bool:
+    """
+    Return whether *content* is Claude Code's ``/login`` or ``/logout``.
+
+    Both sit in :data:`_CLAUDE_CLI_DROPPED_COMMANDS`, so
+    :func:`_escape_unsupported_slash_command` hands them to Claude Code
+    as plain text and the CLI answers them as an ordinary prompt. On the
+    expired login these commands exist to fix, that answer is "Login
+    expired · Please run /login" — the very instruction the user just
+    tried to follow. Callers use this to short-circuit the turn with a
+    remedy that works from outside the TUI (``omni setup`` on the host).
+
+    :param content: Raw user message text.
+    :returns: ``True`` for a leading ``/login`` or ``/logout``.
+    """
+    return _first_slash_command_name(content) in {"login", "logout"}
+
+
 def _passthrough_slash_command_name(content: str) -> str | None:
     """
     Name the leading slash command that passes through as a *guessed* skill.
@@ -6861,6 +7309,7 @@ def _assistant_transcript_items_from_entry(
         else current_response_id or _response_id_from_source(source_key)
     )
     items: list[ClaudeTranscriptItem] = []
+    is_api_error = _is_api_error_entry(entry)
 
     if isinstance(content, str):
         if content:
@@ -6871,6 +7320,7 @@ def _assistant_transcript_items_from_entry(
                     agent_name=agent_name,
                     response_id=response_id,
                     text=content,
+                    is_api_error=is_api_error,
                 )
             )
         if waking:
@@ -6898,6 +7348,26 @@ def _assistant_transcript_items_from_entry(
                         agent_name=agent_name,
                         response_id=response_id,
                         text=text,
+                        is_api_error=is_api_error,
+                    )
+                )
+            continue
+        if block_type == "thinking":
+            # Mirror the thought as a reasoning item so the chat offers the
+            # same expandable reasoning context the TUI renders. Redacted
+            # thinking carries no readable text anywhere, so it stays dropped.
+            thinking = block.get("thinking")
+            if isinstance(thinking, str) and thinking.strip():
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, item_index, "reasoning"),
+                        item_type="reasoning",
+                        data={
+                            "agent": agent_name,
+                            "summary": [],
+                            "content": [{"type": "reasoning_text", "text": thinking}],
+                        },
+                        response_id=response_id,
                     )
                 )
             continue
@@ -6966,6 +7436,83 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
     "space, or /clear to start a new conversation."
 )
 
+# Claude Code points its auth failures at ``/login`` — a dead end in the
+# web chat, where ``/login`` is a dropped command: it is escaped into
+# plain text and answered by the same expired session with the same
+# line. These records get guidance APPENDED sending the user to
+# ``omni setup`` on the host, which does re-authenticate.
+#
+# The strings are hardcoded constants in the CLI binary (read out of
+# @anthropic-ai/claude-code 2.1.212), and there is more than one shape:
+#
+#     "Login expired · Please run /login"
+#     "OAuth token revoked · Please run /login"
+#     "...organization has disabled API key authentication · Run /login
+#      to sign in with your claude.ai account"
+#
+# so the instruction is not always the trailing clause and is not always
+# spelled "Please run". Rather than edit inside a sentence whose shape
+# the next CLI release may change, the guidance is appended below the
+# CLI's own text. Appending, not replacing: some variants carry a
+# remedy beyond re-auth ("If CLAUDE_CODE_OAUTH_TOKEN is set, unset it
+# or re-mint it ... then /logout and /login.", "Credit balance too low
+# · Run /login to switch accounts") and wholesale replacement would
+# delete the only instruction that fixes them, stranding the user with
+# advice for a different problem.
+#
+# Matching the bare token anywhere in the message is only safe because
+# it is paired with :func:`_is_api_error_entry`: a flagged record is not
+# model output, so there is no prose to mislabel. An UNFLAGGED record is
+# never touched, however much it looks like the error — appending
+# remedy text to a real model turn that merely mentions /login would
+# misdirect the user, which is worse than leaving the CLI's line alone.
+#
+# The lookbehind keeps paths and URLs out (``a/login``, ``//login``,
+# ``https://host/login``); ``\b`` keeps ``/loginfoo`` out while still
+# matching ``/login.`` and ``/login,``. A token-initial ``/login/...``
+# still matches — acceptable, because only flagged CLI-authored
+# constants ever reach this check.
+#
+# ``/logout`` is deliberately NOT matched. The CLI has auth errors that
+# name it alone — "· unset it or /logout to clear the saved key",
+# "Unset the ANTHROPIC_API_KEY environment variable, or claude /logout
+# then say ...", "This background session shares credentials with other
+# sessions; /logout here has no effect." Those describe a DIFFERENT
+# failure (an env var or another session overriding the credential)
+# whose remedy is unsetting that variable — something ``omni setup``
+# does not do, so pointing at it there would only add noise. The one
+# shape worth catching, "...then /logout and /login.", already matches
+# on its ``/login``.
+_LOGIN_COMMAND_RE = re.compile(r"(?<![\w/])/login\b")
+
+_LOGIN_GUIDANCE = (
+    "`/login` is not available from the Omnigent web chat — run "
+    "`omni setup` on the host to sign in again."
+)
+
+
+def _is_api_error_entry(entry: _JsonObject) -> bool:
+    """
+    Return whether Claude Code flagged this record as its own API error.
+
+    ``isApiErrorMessage`` is the CLI's marker for a record it synthesized
+    itself rather than received from the model — an expired login never
+    reaches the API, so there is no model turn behind the text. The CLI
+    writes the flag beside ``message`` (``{"type": "assistant",
+    "isApiErrorMessage": true, "message": {...}}``) and reads it back
+    from both there and from inside ``message``, so both are accepted.
+
+    A flagged record cannot be model prose, which is what makes matching
+    the bare ``/login`` token anywhere in it safe.
+
+    :param entry: Decoded Claude transcript record.
+    :returns: ``True`` when the record is a CLI-authored error.
+    """
+    if entry.get("isApiErrorMessage") is True:
+        return True
+    message = entry.get("message")
+    return isinstance(message, dict) and message.get("isApiErrorMessage") is True
+
 
 def _assistant_message_item(
     *,
@@ -6974,6 +7521,7 @@ def _assistant_message_item(
     agent_name: str,
     response_id: str,
     text: str,
+    is_api_error: bool = False,
 ) -> ClaudeTranscriptItem:
     """
     Build an assistant message item from one Claude text block.
@@ -6983,11 +7531,18 @@ def _assistant_message_item(
     :param agent_name: Agent/model name for the assistant message.
     :param response_id: Response id grouping the Claude turn.
     :param text: Assistant text block.
+    :param is_api_error: Whether Claude Code flagged the record as its
+        own API error (see :func:`_is_api_error_entry`). Gates the
+        ``/login`` guidance append, which is safe only on CLI-authored
+        text.
     :returns: Parsed transcript item.
     """
     display_text = text
-    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+    stripped = text.strip()
+    if _CONTEXT_OVERFLOW_RE.match(stripped):
         display_text = _CONTEXT_OVERFLOW_REPLACEMENT
+    elif is_api_error and _LOGIN_COMMAND_RE.search(stripped):
+        display_text = f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return ClaudeTranscriptItem(
         source_id=_source_id(source_key, item_index, "message"),
         item_type="message",

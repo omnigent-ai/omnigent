@@ -400,23 +400,29 @@ async def test_serve_tunnel_recycle_close_code_resets_backoff(
 async def test_serve_tunnel_on_reconnect_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """on_reconnect is called after successful reconnect (not initial connect)."""
-    reconnects: list[str] = []
+    """on_reconnect runs only after a reconnect reaches the ready state."""
+    events: list[str] = []
     call_count = 0
 
     async def _serve_once(app: Any, **kwargs: Any) -> None:
         nonlocal call_count
         call_count += 1
-        # A clean return models a served-then-closed connection, so the
-        # upgrade-accepted callback fires like the real _serve_tunnel_once.
+        events.append(f"attempt-{call_count}")
+        if call_count == 2:
+            raise ConnectionError("server is still starting")
         kwargs["on_connected"]()
+        on_ready = kwargs["on_ready"]
+        if on_ready is not None:
+            events.append(f"ready-{call_count}")
+            await on_ready()
 
     async def _sleep(delay: float) -> None:
-        if call_count >= 2:
+        del delay
+        if call_count >= 3:
             raise asyncio.CancelledError
 
     async def _on_reconnect() -> None:
-        reconnects.append("reconnected")
+        events.append("reconnected")
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
@@ -430,8 +436,13 @@ async def test_serve_tunnel_on_reconnect_callback(
             on_reconnect=_on_reconnect,
         )
 
-    # on_reconnect is called before the second _serve_once, not the first.
-    assert reconnects == ["reconnected"]
+    assert events == [
+        "attempt-1",
+        "attempt-2",
+        "attempt-3",
+        "ready-3",
+        "reconnected",
+    ]
 
 
 @pytest.mark.asyncio

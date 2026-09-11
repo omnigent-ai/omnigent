@@ -827,11 +827,10 @@ def test_managed_columns_survive_connect(db_uri: str) -> None:
     )
 
 
-def test_delete_host_removes_row_and_revokes_token(db_uri: str) -> None:
+def test_delete_host_hides_row_and_retains_cleanup_tombstone(db_uri: str) -> None:
     """
-    ``delete_host`` removes the host from the picker AND revokes its
-    launch token in one operation (the row IS the credential); a
-    second delete is a safe no-op for racing cleanup paths.
+    Logical deletion removes the host from user-visible reads and revokes its
+    token while retaining the sandbox id until cleanup succeeds.
     """
     store = HostStore(db_uri)
     store.register_managed_host(
@@ -853,11 +852,58 @@ def test_delete_host_removes_row_and_revokes_token(db_uri: str) -> None:
         is None
     )
     assert store.list_hosts("alice@example.com") == []
-    # Second delete is a no-op, not an error.
-    assert store.delete_host("dcf4eb5fc0b04985ec45f79cfda95566") is None
+    retry = store.delete_host("dcf4eb5fc0b04985ec45f79cfda95566")
+    assert retry is not None
+    assert retry.deleted_at is not None
+    assert retry.sandbox_id == "sb-m5"
+
+    cleanup = store.list_stale_managed_sandbox_hosts(now_epoch())
+    assert [host.host_id for host in cleanup] == ["dcf4eb5fc0b04985ec45f79cfda95566"]
+    assert cleanup[0].deleted_at == retry.deleted_at
+    assert store.mark_sandbox_terminated(
+        "dcf4eb5fc0b04985ec45f79cfda95566",
+        sandbox_id="sb-m5",
+    )
+    assert store.list_stale_managed_sandbox_hosts(now_epoch()) == []
+
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        assert session.get(SqlHost, (0, "dcf4eb5fc0b04985ec45f79cfda95566")) is None
 
 
-def test_replace_managed_host_sandbox_cannot_recreate_deleted_host(db_uri: str) -> None:
+def test_stale_completion_removes_host_deleted_after_detach(db_uri: str) -> None:
+    store = HostStore(db_uri)
+    host_id = "405a78021f6648e5ae887350047f76b5"
+    original = store.register_managed_host(
+        host_id=host_id,
+        name="managed-detach-delete-complete",
+        user_id="alice@example.com",
+        token="detach-delete-token",
+        provider="modal",
+        sandbox_id="detach-delete-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert store.detach_stale_managed_sandbox(
+        host_id,
+        sandbox_id="detach-delete-sandbox",
+        expected_updated_at=original.updated_at,
+    )
+    deleted = store.delete_host(host_id)
+    assert deleted is not None
+    assert deleted.deleted_at is not None
+    assert deleted.terminating_sandbox_id == "detach-delete-sandbox"
+
+    assert store.mark_sandbox_terminated(
+        host_id,
+        sandbox_id="detach-delete-sandbox",
+    )
+
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        assert session.get(SqlHost, (0, host_id)) is None
+
+
+def test_replace_managed_host_sandbox_cannot_recreate_missing_host(db_uri: str) -> None:
     store = HostStore(db_uri)
 
     assert (
@@ -872,6 +918,38 @@ def test_replace_managed_host_sandbox_cannot_recreate_deleted_host(db_uri: str) 
         is None
     )
     assert store.resolve_launch_token("c48e6fda4172492aa60ec299e5ce01d3", "too-late-token") is None
+
+
+def test_replace_managed_host_sandbox_cannot_revive_deleted_tombstone(db_uri: str) -> None:
+    store = HostStore(db_uri)
+    host_id = "be41c27f5a6746db8178096b13685b44"
+    store.register_managed_host(
+        host_id=host_id,
+        name="managed-deleted-replace",
+        user_id="alice@example.com",
+        token="original-token",
+        provider="modal",
+        sandbox_id="original-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert store.delete_host(host_id) is not None
+
+    assert (
+        store.replace_managed_host_sandbox(
+            host_id=host_id,
+            user_id="alice@example.com",
+            token="replacement-token",
+            provider="modal",
+            sandbox_id="replacement-sandbox",
+            token_expires_at=now_epoch() + 3600,
+        )
+        is None
+    )
+    tombstones = store.list_stale_managed_sandbox_hosts(now_epoch())
+    assert [(host.host_id, host.sandbox_id) for host in tombstones] == [
+        (host_id, "original-sandbox")
+    ]
+    assert store.resolve_launch_token(host_id, "replacement-token") is None
 
 
 def test_delete_host_serializes_with_sandbox_replacement(db_uri: str) -> None:
@@ -1036,14 +1114,14 @@ def test_managed_sandbox_reaper_queries_and_compare_clear_span_workspaces(
         assert store.resolve_launch_token(host_11, "token-11") is None
         assert store.list_managed_sandbox_workspace_ids() == [11, 22]
         assert (
-            store.mark_terminating_sandbox_terminated(
+            store.mark_sandbox_terminated(
                 host_11,
                 sandbox_id="sb-other",
             )
             is False
         )
         assert (
-            store.mark_terminating_sandbox_terminated(
+            store.mark_sandbox_terminated(
                 host_11,
                 sandbox_id="sb-11",
             )

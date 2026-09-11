@@ -196,6 +196,8 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "codex_thread_reset": (
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
+    "codex_turn_error": "Codex ran into an error during this turn.",
+    "native_turn_error": "The agent ran into an error during this turn.",
 }
 
 

@@ -33,7 +33,9 @@ from omnigent.debug_logging import (
     ORIGIN_WORKSPACE_ID_ENV_VAR,
     PRIMARY_SESSION_ID_ENV_VAR,
     USER_ID_ENV_VAR,
+    debug_event,
 )
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -83,6 +85,7 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
+    workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
     WorktreeError,
@@ -1578,6 +1581,43 @@ class HostProcess:
             "Check the server URL and your access."
         )
 
+    def _launch_failed(
+        self,
+        frame: HostLaunchRunnerFrame,
+        error: str,
+        *,
+        error_code: str | None = None,
+    ) -> HostLaunchRunnerResultFrame:
+        """Report and return a failed runner launch.
+
+        :param frame: Launch request that failed.
+        :param error: Human-readable failure reason.
+        :param error_code: Optional machine-readable failure category.
+        :returns: Failed result frame for the server.
+        """
+        session_id = frame.session_id or "<unknown>"
+        diagnostic_lines = error.splitlines()
+        diagnostic = diagnostic_lines[0] if diagnostic_lines else error
+        _logger.warning(
+            "Runner launch failed for session %r in workspace %r: %r",
+            session_id,
+            frame.workspace,
+            diagnostic,
+        )
+        print(
+            "  ! Runner launch failed\n"
+            f"    session: {session_id!r}\n"
+            f"    workspace: {frame.workspace!r}\n"
+            f"    reason: {diagnostic!r}",
+            flush=True,
+        )
+        return HostLaunchRunnerResultFrame(
+            request_id=frame.request_id,
+            status="failed",
+            error=error,
+            error_code=error_code,
+        )
+
     def _classify_transient_404(self) -> HostConnectError | None:
         """Treat a 404 on the tunnel upgrade as a transient restart blip.
 
@@ -1652,9 +1692,8 @@ class HostProcess:
 
         :param frame: The launch request frame.
         :returns: Result frame with status and runner_id, or a
-            ``"failed"`` result with ``error_code`` set to
-            ``"harness_not_configured"`` when the harness check
-            refuses the launch.
+            ``"failed"`` result. Deterministic preflight refusals
+            include a machine-readable ``error_code``.
         """
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
@@ -1667,10 +1706,9 @@ class HostProcess:
         if frame.harness is not None and not await asyncio.to_thread(
             harness_is_configured, frame.harness
         ):
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=(
+            return self._launch_failed(
+                frame,
+                (
                     f"harness {frame.harness!r} is not configured on host "
                     f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
                 ),
@@ -1679,10 +1717,9 @@ class HostProcess:
 
         workspace = Path(frame.workspace).expanduser()
         if not workspace.is_dir():
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=f"workspace path does not exist: {workspace}",
+            return self._launch_failed(
+                frame,
+                workspace_missing_message(workspace),
                 error_code=WORKSPACE_MISSING_ERROR_CODE,
             )
 
@@ -1742,21 +1779,19 @@ class HostProcess:
             spawn.add_done_callback(self._discard_abandoned_spawn)
             raise
         except OSError as exc:
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=f"failed to spawn runner: {exc}",
+            return self._launch_failed(
+                frame,
+                f"failed to spawn runner: {exc}",
             )
 
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=_runner_exit_error(proc.returncode, log_path),
-            )
+            error = _runner_exit_error(proc.returncode, log_path)
+            # The returned result retains the diagnostic tail, while
+            # _launch_failed limits the host lifecycle line to its first line.
+            return self._launch_failed(frame, error)
 
         # One live runner per session: the session's previous runner —
         # whose binding the server has already rotated away — is
@@ -2130,7 +2165,21 @@ class HostProcess:
             _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
+        # A non-zero runner exit is a runner-process fault that blocks the
+        # session; the specific cause lives in the unparsed log tail (lifecycle
+        # stage unknown).
+        _logger.warning(
+            "Runner %s died unexpectedly: %s",
+            runner_id,
+            error,
+            extra=debug_event(
+                "runner_died",
+                runner_id=runner_id,
+                error_category=ErrorCategory.RUNNER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
+            ),
+        )
         await self._report_runner_exit(runner_id, error)
 
     async def _report_runner_exit(self, runner_id: str, error: str) -> None:
@@ -2243,8 +2292,10 @@ class HostProcess:
         total). It reads + normalizes each and sends it immediately
         (``host.import_local_session``) so a large batch never rides in one frame
         and the server persists as each arrives. A terminal ``host.import_local_done``
-        closes the stream. Sessions that fail to load are skipped; a single-harness
-        enumeration failure fails the request.
+        closes the stream. A session that fails to load, normalize, encode, or
+        send is skipped and counted so the rest of the batch still uploads; only
+        a dead tunnel (ConnectionClosed) or a single-harness enumeration failure
+        fails the whole request.
         """
 
         def _targets() -> tuple[list[tuple[str, str]], str | None]:
@@ -2307,19 +2358,33 @@ class HostProcess:
             total = len(ordered)
             load_failed = 0
             for source, session_id in ordered:
-                session = await asyncio.to_thread(_load, source, session_id)
-                if session is None:
-                    # Unreadable/corrupt transcript: no frame to send, but report
-                    # it on the done frame so the server's counts stay honest.
-                    load_failed += 1
-                    continue
-                await ws.send(
-                    encode_host_frame(
-                        HostImportLocalSessionFrame(
-                            request_id=frame.request_id, total=total, session=session
+                try:
+                    session = await asyncio.to_thread(_load, source, session_id)
+                    if session is None:
+                        # Unreadable/corrupt transcript: no frame to send, but
+                        # report it on the done frame so the counts stay honest.
+                        load_failed += 1
+                        continue
+                    await ws.send(
+                        encode_host_frame(
+                            HostImportLocalSessionFrame(
+                                request_id=frame.request_id, total=total, session=session
+                            )
                         )
                     )
-                )
+                except ConnectionClosed:
+                    # Dead tunnel: abort the batch (recovery is owned upstream),
+                    # never a per-session skip — nothing more can be sent.
+                    raise
+                except Exception:
+                    # Any other failure reading, normalizing, encoding, or sending
+                    # one session must not drop the rest of the batch: count it and
+                    # move on so the remaining sessions still upload.
+                    _logger.exception(
+                        "import_local: skipping session source=%r id=%r", source, session_id
+                    )
+                    load_failed += 1
+                    continue
             await ws.send(
                 encode_host_frame(
                     HostImportLocalDoneFrame(
@@ -2841,7 +2906,7 @@ class HostProcess:
             # Harness-truth lane: every launch shape is answered from the
             # shared catalog, probed from the configured Codex binary itself.
             # No curated fallback and no serving-endpoints listing — a probe
-            # that cannot run yields an honest empty answer with the reason.
+            # that cannot run is a failed lookup, not a successful empty catalog.
             probed = await self._probed_codex_model_options()
             if probed is not None:
                 return HostModelOptionsResultFrame(
@@ -2852,8 +2917,7 @@ class HostProcess:
                 )
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
-                status="ok",
-                models=[],
+                status="failed",
                 error="the codex model probe failed — see the host log",
             )
 
@@ -2935,8 +2999,7 @@ class HostProcess:
             )
         return HostModelOptionsResultFrame(
             request_id=frame.request_id,
-            status="ok",
-            models=[],
+            status="failed",
             error="the claude model probe failed — see the host log",
         )
 
@@ -2981,16 +3044,21 @@ class HostProcess:
                 limit=_coerce_int(params.get("limit", 500)),
             )
         if op == "github_info":
-            return r.github_info()
+            return r.github_info(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_changes":
-            return r.github_changes()
+            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
                 str(params.get("path", "")),
+                session_id=session_id,
+                pr_url=cast("str | None", params.get("pr_url")),
+                previous_path=cast("str | None", params.get("previous_path")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff()
+            return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
@@ -3023,7 +3091,9 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
         try:
-            payload = self._dispatch_fs_write_op(expanded, frame.op, frame.params or {})
+            payload = self._dispatch_fs_write_op(
+                expanded, frame.op, {**(frame.params or {}), "session_id": frame.session_id}
+            )
         except ValueError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3063,6 +3133,15 @@ class HostProcess:
                 workspace,
                 account=cast("str | None", params.get("account")),
                 remote=cast("str | None", params.get("remote")),
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+            )
+        if op == "github_prs_update":
+            return github_resource.update_session_pr(
+                workspace,
+                str(params["session_id"]),
+                str(params["url"]),
+                str(params.get("action", "attach")),
             )
         raise ValueError(f"unknown fs write op: {op!r}")
 
@@ -4137,6 +4216,47 @@ class HostProcess:
             await self._handle_import_local(ws, frame)
 
 
+def _generate_ucode_configs() -> None:
+    """At host boot, have ucode generate the harnesses' gateway config (OSS connect).
+
+    The OSS managed-connect gate: only when the host-only ``[omnigent]`` profile +
+    broker sidecar are present (the owner linked Databricks via the connect flow)
+    do we drive ucode, passing the broker command in the configure env so ucode
+    mints per request and nothing lands on disk. The reusable run lives in
+    :func:`omnigent.onboarding.ucode_setup.configure_ucode_for_sandbox` (a
+    background, best-effort populate of ``~/.ucode/state.json``), which the
+    managed lakebox launcher shares with ``use_pat=True`` against its injected PAT.
+
+    Configures opencode too (alongside claude/codex/pi), overlapping host boot, so
+    the runner never has to fall back to a synchronous on-demand ``ucode
+    configure`` when opencode first launches — the slow path for opencode startup.
+    """
+    from omnigent.host.databricks_credential import (
+        HOST_DATABRICKS_PROFILE,
+        broker_token_command,
+    )
+    from omnigent.inner.databricks_executor import _read_databrickscfg_host
+    from omnigent.onboarding.ucode_setup import configure_ucode_for_sandbox
+
+    workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+    if not workspace:
+        return
+    bearer_command = broker_token_command(workspace)
+    if not bearer_command:
+        return  # no broker sidecar → not a managed connect host
+    # opencode is included here (unlike lakebox's claude/codex/pi ``--use-pat``
+    # wrappers) so its config is ready at first launch instead of forcing a
+    # synchronous on-demand ``ucode configure`` on the runner.
+    configure_ucode_for_sandbox(
+        HOST_DATABRICKS_PROFILE,
+        agents=("claude", "codex", "pi", "opencode"),
+        extra_env={
+            "DATABRICKS_BEARER_COMMAND": bearer_command,
+            "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,
+        },
+    )
+
+
 def run_host_process(
     server_url: str,
     config_path: Path | None = None,
@@ -4231,6 +4351,15 @@ def run_host_process(
     # broker blip at startup can't strand a connected owner for the whole session).
     configure_host_gh(server_url, identity.host_id)
     start_host_gh_refresh(server_url, identity.host_id)
+
+    # Executor-agnostic Databricks setup: when the owner has linked a workspace,
+    # materialize their per-user token as a ``~/.databrickscfg`` profile so the
+    # agent's model serving + MCP route through their Databricks AI Gateway.
+    # Best-effort; a no-op when Databricks isn't connected/configured.
+    from omnigent.host.databricks_credential import configure_host_databricks
+
+    configure_host_databricks(server_url, identity.host_id)
+    _generate_ucode_configs()
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)

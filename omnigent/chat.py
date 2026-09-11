@@ -686,6 +686,7 @@ def _remote_headers(
     server_url: str | None = None,
     *,
     host_id: str | None,
+    org_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build headers for remote AP-server requests.
@@ -711,6 +712,8 @@ def _remote_headers(
         request that keys off the runner-env host_id). Required-keyword with
         no default so every call site consciously decides — pass the request
         path's host when it has one rather than silently defaulting to unkeyed.
+    :param org_id: Workspace selector captured from the current server URL, or
+        ``None`` to fall back to the stored login record.
     :returns: Headers to pass to httpx / OmnigentClient.
     """
     # Resolve the bearer in the documented precedence order (one credential
@@ -746,7 +749,7 @@ def _remote_headers(
     if server_url:
         from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_request_headers(server_url, host_id=host_id))
+        headers.update(databricks_request_headers(server_url, host_id=host_id, org_id=org_id))
     return headers
 
 

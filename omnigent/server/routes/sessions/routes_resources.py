@@ -2264,6 +2264,7 @@ def register_resources_routes(
     async def read_github_pr_diff(
         request: Request,
         session_id: str,
+        pr_url: str | None = None,
     ) -> Any:
         """
         Return the whole PR as one unified diff patch.
@@ -2281,7 +2282,8 @@ def register_resources_routes(
             session_id,
             conv,
             op="github_pr_diff",
-            host_params={},
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
             runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
         )
 
@@ -2296,13 +2298,16 @@ def register_resources_routes(
         session_id: str,
         relative_path: str,
         base: str | None = Query(default=None),
+        pr_url: str | None = None,
+        previous_path: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> Any:
         """
-        Return before/after content for a file in the branch-vs-base diff.
+        Return before/after content for a file in the selected PR.
 
-        Reads the file at HEAD and at the base branch's merge-base via
-        ``git show``. Falls back to the host tunnel when the runner is offline,
-        so the diff stays viewable from the workspace on disk.
+        Tracked PRs read GitHub revisions; legacy requests use the workspace.
+        Falls back to the host tunnel when the runner is offline.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
@@ -2311,13 +2316,24 @@ def register_resources_routes(
         :returns: JSON with ``before`` and ``after`` content strings.
         """
         conv = await _authorize_browse_read(session_id, request, relative_path)
+        params = {
+            key: value
+            for key, value in {
+                "base": base,
+                "pr_url": pr_url,
+                "previous_path": previous_path,
+                "head_sha": head_sha,
+                "base_sha": base_sha,
+            }.items()
+            if value is not None
+        }
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_diff",
-            host_params={"base": base, "path": relative_path},
+            host_params={"base": base, "path": relative_path, **params},
             runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{relative_path}",
-            runner_params={"base": base} if base else None,
+            runner_params=params or None,
         )
 
     @file_read_router.get(
@@ -2569,6 +2585,7 @@ def register_resources_routes(
     async def get_session_github(
         request: Request,
         session_id: str,
+        pr_url: str | None = None,
     ) -> dict[str, Any]:
         """
         Return GitHub context (repo, branch, base ref, PR) for a session.
@@ -2586,7 +2603,8 @@ def register_resources_routes(
             session_id,
             conv,
             op="github_info",
-            host_params={},
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
             runner_path=f"/v1/sessions/{session_id}/resources/github",
         )
 
@@ -2597,6 +2615,7 @@ def register_resources_routes(
     async def list_session_github_changes(
         request: Request,
         session_id: str,
+        pr_url: str | None = None,
     ) -> dict[str, Any]:
         """
         List the PR's changed files (empty when the branch has no PR).
@@ -2610,9 +2629,43 @@ def register_resources_routes(
             session_id,
             conv,
             op="github_changes",
-            host_params={},
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
             runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
         )
+
+    @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
+    async def update_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        params = {
+            "url": body["url"],
+            "action": body.get("action", "attach"),
+            "session_id": session_id,
+        }
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/prs",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_prs_update", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(
+                status_code=status, detail=result.get("detail", "Cannot update pull requests")
+            )
+        return result
 
     @router.post(
         "/sessions/{session_id}/resources/github/preferences",
@@ -2639,6 +2692,8 @@ def register_resources_routes(
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
         params = {"account": body.get("account"), "remote": body.get("remote")}
+        if body.get("pr_url"):
+            params.update(pr_url=body["pr_url"], session_id=session_id)
         try:
             status, result = await _proxy_post_to_runner(
                 session_id,

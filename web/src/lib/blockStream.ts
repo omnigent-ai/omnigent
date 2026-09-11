@@ -122,6 +122,12 @@ interface ReducerState {
   // final ReasoningBlock is then suppressed so renderers don't show
   // the same text twice (once live, once as a summary panel).
   reasoningChunksEmitted: boolean;
+  // Set when ANY reasoning section of the current response streamed via
+  // deltas. A later persisted reasoning item (`reasoning_done`) is then
+  // suppressed — the deltas already painted the thought — while settled
+  // mirrors with no deltas (claude-native) still render. Per-response
+  // scope, reset with the other dedup state.
+  reasoningStreamed: boolean;
 
   inText: boolean;
   accumulated: string;
@@ -176,6 +182,7 @@ function createState(flushThreshold: number): ReducerState {
     summaryText: "",
     reasoningAccumulated: "",
     reasoningChunksEmitted: false,
+    reasoningStreamed: false,
     inText: false,
     accumulated: "",
     fullText: "",
@@ -330,6 +337,7 @@ function* beginResponse(state: ReducerState, response: Response): Generator<AnyB
   // reuse must render independently (see migration plan §4.4).
   state.seenCallIds.clear();
   state.seenResultCallIds.clear();
+  state.reasoningStreamed = false;
   // Bump `turn` after the first task so blocks carry their task index.
   if (state.started) state.turn += 1;
   state.started = true;
@@ -390,6 +398,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       state.summaryText = "";
       state.reasoningAccumulated = "";
       state.reasoningChunksEmitted = false;
+      state.reasoningStreamed = true;
       yield {
         type: "reasoning_start",
         ctx: ctx(state),
@@ -410,6 +419,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         state.summaryText = "";
         state.reasoningAccumulated = "";
         state.reasoningChunksEmitted = false;
+        state.reasoningStreamed = true;
         yield {
           type: "reasoning_start",
           ctx: ctx(state),
@@ -715,6 +725,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         state.toolExecutionsByCallId.clear();
         state.seenCallIds.clear();
         state.seenResultCallIds.clear();
+        state.reasoningStreamed = false;
       }
 
       // Same-response: deltas already produced the text; skip event.content to
@@ -739,6 +750,40 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           hasCodeBlocks: text.includes("```"),
         } satisfies TextDone;
       }
+      return;
+    }
+
+    case "reasoning_done": {
+      // A persisted reasoning item (`output_item.done`, type `reasoning`).
+      // When this response's reasoning already streamed via deltas, the
+      // thought is painted — the item only marks the section's end (same
+      // dedup contract as message_done's "deltas already produced the
+      // text"). With no deltas at all — a native transcript mirror such as
+      // claude-native thinking blocks — render the item as one settled
+      // reasoning block so the chat surfaces the thought.
+      if (state.inReasoning) {
+        yield* closeReasoning(state);
+        return;
+      }
+      if (state.reasoningStreamed) return;
+      // Entering reasoning closes open text — same boundary as
+      // reasoning_started.
+      yield* closeText(state);
+      // A mirrored thought opens its turn before any message names it; a
+      // new id is the same genuine turn transition message_done adopts.
+      if (event.responseId && event.responseId !== state.responseId) {
+        state.responseId = event.responseId;
+        state.pendingTools.clear();
+        state.toolExecutionsByCallId.clear();
+        state.seenCallIds.clear();
+        state.seenResultCallIds.clear();
+      }
+      yield {
+        type: "reasoning_block",
+        ctx: ctx(state, event.itemId || null),
+        reasoningText: event.text,
+        summaryText: event.summary,
+      } satisfies ReasoningBlock;
       return;
     }
 
@@ -872,6 +917,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         exitPlanMode: event.exitPlanMode,
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
+        allowAutoMode: event.allowAutoMode,
         rememberScope: event.rememberScope,
         codexPersistModes: event.codexPersistModes,
       } satisfies ElicitationBlock;

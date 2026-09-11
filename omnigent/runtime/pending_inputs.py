@@ -120,6 +120,7 @@ class DrainedInput:
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    background_titles_enabled: bool = True
 
 
 @dataclass
@@ -156,6 +157,7 @@ class _Entry:
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    background_titles_enabled: bool = True
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
     created_at: float = field(default_factory=lambda: _now())
@@ -196,6 +198,8 @@ def record(
     content: list[dict[str, Any]],
     created_by: str | None = None,
     stable_id: str | None = None,
+    *,
+    background_titles_enabled: bool = True,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -232,7 +236,11 @@ def record(
                     return existing.pending_id
         pending_id = f"pending_{uuid.uuid4().hex}"
         entry = _Entry(
-            pending_id=pending_id, content=content, created_by=created_by, stable_id=stable_id
+            pending_id=pending_id,
+            content=content,
+            created_by=created_by,
+            stable_id=stable_id,
+            background_titles_enabled=background_titles_enabled,
         )
         _pending.setdefault(conversation_id, {})[pending_id] = entry
     return pending_id
@@ -299,6 +307,7 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
             content=copy.deepcopy(entry.content),
             created_by=entry.created_by,
             stable_id=entry.stable_id,
+            background_titles_enabled=entry.background_titles_enabled,
         )
 
 
@@ -321,6 +330,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         content=copy.deepcopy(drained.content),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
+        background_titles_enabled=drained.background_titles_enabled,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -439,6 +449,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,
         stable_id=entry.stable_id,
+        background_titles_enabled=entry.background_titles_enabled,
     )
 
 

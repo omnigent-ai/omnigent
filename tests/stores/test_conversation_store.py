@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import event, text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import Session
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
@@ -33,6 +38,33 @@ from omnigent.stores.host_store import HostStore
 # ── CRUD ──────────────────────────────────────────────
 
 
+class _CommitSerializationFailure(Exception):
+    """Synthetic CockroachDB serialization failure."""
+
+    sqlstate = "40001"
+
+
+class _RetryOnceMaker:
+    """Wrap a real maker and inject one failure before its first commit."""
+
+    def __init__(self, delegate: Any) -> None:
+        """Create a CockroachDB-shaped maker around a real test session."""
+        self.engine = MagicMock()
+        self.engine.dialect.name = "cockroachdb"
+        self.query_name_prefix = delegate.query_name_prefix
+        self._delegate = delegate
+        self.attempts = 0
+
+    @contextmanager
+    def __call__(self, query_name: str) -> Iterator[Session]:
+        """Roll back the first attempt, then allow the second to commit."""
+        with self._delegate(query_name) as session:
+            yield session
+            self.attempts += 1
+            if self.attempts == 1:
+                raise DBAPIError("commit", {}, _CommitSerializationFailure(), False)
+
+
 def test_fork_drops_import_provenance_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -52,6 +84,28 @@ def test_fork_drops_import_provenance_labels(
     assert fork.labels["kept"] == "yes"
     assert IMPORT_SOURCE_LABEL_KEY not in fork.labels
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
+
+
+def test_fork_drops_sandbox_repo_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork must not inherit the repository the source's sandbox was built
+    from: the label is what a sandbox RELAUNCH re-clones, so a clone that
+    asked for an empty sandbox would get the source's repo re-cloned into it
+    on the first relaunch. The fork's own launch re-stamps whatever it
+    resolves."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main", "kept": "yes"},
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert MANAGED_REPO_LABEL_KEY not in fork.labels
 
 
 def test_fork_drops_per_user_pin_labels(
@@ -100,6 +154,32 @@ def test_create_with_existing_caller_supplied_id_raises(db_uri: str) -> None:
     assert created.id == conversation_id
     with pytest.raises(ConversationAlreadyExistsError):
         second_store.create_conversation(conversation_id=conversation_id)
+
+
+def test_create_retries_metadata_phase_after_conversation_commit(tmp_path: Path) -> None:
+    """A metadata 40001 replays only that phase after the AP row commits."""
+    from omnigent.db.db_models import SqlConversation, SqlConversationMetadata
+
+    conversation_id = "b" * 32
+    metadata_uri = f"sqlite:///{tmp_path / 'metadata.db'}"
+    conversation_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
+    store = SqlAlchemyConversationStore(metadata_uri, conversation_uri)
+    retrying_metadata_maker = _RetryOnceMaker(store._session_immediate)
+    store._session_immediate = retrying_metadata_maker
+
+    created = store.create_conversation(
+        conversation_id=conversation_id,
+        title="retry metadata",
+        terminal_launch_args=["--safe"],
+    )
+
+    assert retrying_metadata_maker.attempts == 2
+    assert created.id == conversation_id
+    assert created.terminal_launch_args == ["--safe"]
+    with store._conv_session("test_select_conversation") as session:
+        assert session.query(SqlConversation).filter_by(id=conversation_id).count() == 1
+    with store._session("test_select_metadata") as session:
+        assert session.query(SqlConversationMetadata).filter_by(id=conversation_id).count() == 1
 
 
 def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> None:
@@ -594,6 +674,101 @@ def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
     assert [item.data.content[0]["text"] for item in persisted] == texts
     read_back = store.list_items(conv.id).data
     assert [item.data.content[0]["text"] for item in read_back] == texts
+
+
+def test_append_retry_reuses_prepared_id_and_encoded_payload(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A serialization replay repeats SQL, not ID generation or encoding."""
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.exc import DBAPIError
+
+    class SerializationFailure(Exception):
+        sqlstate = "40001"
+
+    class RecordingStore(SqlAlchemyConversationStore):
+        def __init__(self, uri: str) -> None:
+            super().__init__(uri)
+            self.encode_calls = 0
+
+        def _encode_item_data_batch(self, data_jsons: list[str]) -> list[str]:
+            self.encode_calls += 1
+            return super()._encode_item_data_batch(data_jsons)
+
+    class RetryOnceMaker:
+        def __init__(self, delegate: Any) -> None:
+            self.engine = MagicMock()
+            self.engine.dialect.name = "cockroachdb"
+            self.query_name_prefix = delegate.query_name_prefix
+            self._delegate = delegate
+            self.attempts = 0
+
+        @contextmanager
+        def __call__(self, query_name: str) -> Iterator[Session]:
+            with self._delegate(query_name) as session:
+                yield session
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise DBAPIError("commit", {}, SerializationFailure(), False)
+
+    item_id = "1" * 32
+    id_calls = 0
+
+    def generate_id(_item_type: str) -> str:
+        nonlocal id_calls
+        id_calls += 1
+        return item_id
+
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.generate_item_id",
+        generate_id,
+    )
+    store = RecordingStore(db_uri)
+    conv = store.create_conversation()
+    retrying_maker = RetryOnceMaker(store._conv_session_immediate)
+    store._conv_session_immediate = retrying_maker
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement.strip().upper())
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture_statement)
+    try:
+        [persisted] = store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_retry",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "retry once"}],
+                    ),
+                )
+            ],
+        )
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture_statement)
+
+    assert retrying_maker.attempts == 2
+    if store._conv_engine.dialect.name == "sqlite":
+        assert statements.count("BEGIN IMMEDIATE") == 2
+    else:
+        assert sum(statement.endswith("FOR UPDATE") for statement in statements) == 2
+    assert id_calls == 1
+    assert store.encode_calls == 1
+    assert persisted.id == item_id
+    assert [item.id for item in store.list_items(conv.id).data] == [item_id]
 
 
 def test_append_function_call_items(
@@ -3672,6 +3847,44 @@ def test_set_external_session_id_same_value_is_idempotent(
     assert fetched.external_session_id == "sid-1"
 
 
+def test_find_conversation_by_external_session_id_matches_column_without_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The lookup keys off the metadata column, so a native run (no import
+    labels) is found — this is what lets an import dedupe against it."""
+    conv = conversation_store.create_conversation(title="native run")
+    conversation_store.set_external_session_id(conv.id, "sid-native")
+
+    found = conversation_store.find_conversation_by_external_session_id("sid-native")
+    assert found is not None
+    assert found.id == conv.id
+    assert conversation_store.find_conversation_by_external_session_id("sid-absent") is None
+
+
+def test_find_conversation_by_external_session_id_returns_earliest(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When duplicates already exist for one id, the earliest-created wins.
+
+    ``created_at`` is integer seconds, so the two rows would otherwise tie and
+    fall back to the (random) id order; pin distinct stamps to assert the
+    created_at ordering itself.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    first = conversation_store.create_conversation(title="first")
+    conversation_store.set_external_session_id(first.id, "sid-dupe")
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    second = conversation_store.create_conversation(title="second")
+    conversation_store.set_external_session_id(second.id, "sid-dupe")
+
+    found = conversation_store.find_conversation_by_external_session_id("sid-dupe")
+    assert found is not None
+    assert found.id == first.id
+
+
 def test_set_external_session_id_rejects_overwrite_with_different_value(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3790,6 +4003,66 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+@pytest.mark.parametrize("up_to_response_id", [None, "resp_001", "resp_002"])
+def test_fork_conversation_preserves_item_timestamps(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    up_to_response_id: str | None,
+) -> None:
+    """Copied history keeps its timing; the fork and new items use the current time."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    current_time = 1000
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: current_time)
+    source = conversation_store.create_conversation()
+    for index, created_at in enumerate((1010, 1116, 1210, 1252)):
+        current_time = created_at
+        conversation_store.append(
+            source.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_00{index // 2 + 1}",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": f"Step {index}"}],
+                        agent="test-agent",
+                    ),
+                )
+            ],
+        )
+
+    source_items = conversation_store.list_items(source.id).data
+    expected_count = 2 if up_to_response_id == "resp_001" else 4
+    expected_timestamps = [item.created_at for item in source_items[:expected_count]]
+    parent_id = source.id
+    for fork_time in (2000, 3000):
+        current_time = fork_time
+        fork = conversation_store.fork_conversation(parent_id, up_to_response_id=up_to_response_id)
+        assert fork.created_at == fork_time
+        assert fork.updated_at == fork_time
+        fork_items = conversation_store.list_items(fork.id).data
+        assert [item.created_at for item in fork_items] == expected_timestamps
+        assert fork_items[1].created_at - fork_items[0].created_at == 106
+        parent_id = fork.id
+
+    current_time = 4000
+    [new_item] = conversation_store.append(
+        parent_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_new",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "Continue"}]
+                ),
+            )
+        ],
+    )
+    assert new_item.created_at == current_time
+    assert conversation_store.list_items(source.id).data == source_items
+
+
 def test_fork_remaps_compaction_boundary_to_copied_item(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3835,6 +4108,153 @@ def test_fork_remaps_compaction_boundary_to_copied_item(
     fork_compaction = next(item for item in fork_items if item.type == "compaction")
     assert isinstance(fork_compaction.data, CompactionData)
     assert fork_compaction.data.last_item_id != boundary.id
+    assert fork_compaction.data.last_item_id == fork_items[0].id
+
+
+def _count_encode_hooks(
+    store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, int]:
+    """Replace *store*'s payload-transform hooks with counting identities.
+
+    Models a deployment-shaped store where every hook call (per-item or
+    batch) is one round-trip, so a test can pin how many round-trips an
+    operation pays.
+
+    :param store: The store instance to instrument.
+    :param monkeypatch: Pytest monkeypatch for test-scoped patching.
+    :returns: Mutable counters keyed ``"item"``/``"batch"``/``"decode_batch"``.
+    """
+    calls = {"item": 0, "batch": 0, "decode_batch": 0}
+
+    def per_item_encode(data_json: str) -> str:
+        calls["item"] += 1
+        return data_json
+
+    def batch_encode(data_jsons: list[str]) -> list[str]:
+        calls["batch"] += 1
+        return list(data_jsons)
+
+    def batch_decode(stored: list[str]) -> list[str]:
+        calls["decode_batch"] += 1
+        return list(stored)
+
+    monkeypatch.setattr(store, "_encode_item_data", per_item_encode)
+    monkeypatch.setattr(store, "_encode_item_data_batch", batch_encode)
+    monkeypatch.setattr(store, "_decode_item_data_batch", batch_decode)
+    return calls
+
+
+def test_fork_reuses_encoded_payloads_without_per_item_encode(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forking must not pay one encode round-trip per copied item.
+
+    On a store whose payload encode is a per-call RPC (the documented
+    batch-hook deployment), a per-item fan-out multiplies the user's
+    blocked fork request by the item count. Non-compaction payloads never
+    change on copy, so the fork must reuse the stored encoding verbatim:
+    zero encode calls of either kind for a compaction-free source.
+    """
+    source = conversation_store.create_conversation()
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index:03d}",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"turn {index}"}],
+                ),
+            )
+            for index in range(5)
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls["item"] == 0, (
+        f"fork paid {calls['item']} per-item encode round-trips; copied "
+        f"payloads must reuse the source's stored encoding"
+    )
+    assert calls["batch"] == 0, (
+        f"fork paid {calls['batch']} batch encode calls for a source with "
+        f"no compaction items; nothing needed re-encoding"
+    )
+    assert calls["decode_batch"] == 0, (
+        f"fork paid {calls['decode_batch']} batch decode calls for a source "
+        f"with no compaction items; nothing needed decoding"
+    )
+    fork_items = conversation_store.list_items(fork.id).data
+    source_items = conversation_store.list_items(source.id).data
+    assert [item.data for item in fork_items] == [item.data for item in source_items]
+
+
+def test_fork_reencodes_only_compaction_payloads_in_one_batch(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only compaction payloads (whose cursor is remapped) pay a re-encode,
+    and they pay it as ONE batch decode + ONE batch encode — never one call
+    per copied item."""
+    source = conversation_store.create_conversation()
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "old"}]),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="compact_001",
+                data=CompactionData(
+                    summary="The user said old.",
+                    last_item_id=boundary.id,
+                    token_count=6,
+                ),
+            )
+        ]
+        + [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index:03d}",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"turn {index}"}],
+                ),
+            )
+            for index in range(2, 6)
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls["item"] == 0, (
+        f"fork paid {calls['item']} per-item encode round-trips; compaction "
+        f"re-encoding must go through the batch hook"
+    )
+    assert calls["batch"] == 1, (
+        f"fork paid {calls['batch']} batch encode calls; the remapped "
+        f"compaction payloads must be re-encoded in one batch"
+    )
+    assert calls["decode_batch"] == 1, (
+        f"fork paid {calls['decode_batch']} batch decode calls; only the "
+        f"compaction payloads need decoding, in one batch"
+    )
+    fork_items = conversation_store.list_items(fork.id).data
+    fork_compaction = next(item for item in fork_items if item.type == "compaction")
+    assert isinstance(fork_compaction.data, CompactionData)
     assert fork_compaction.data.last_item_id == fork_items[0].id
 
 
@@ -4578,6 +4998,25 @@ def test_instance_scoped_label_keys_match_harness_constants() -> None:
     # miss means a rename slipped past the store's hard-coded literal.
     assert BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
     assert CODEX_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+
+
+def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:
+    """
+    The store's fork-only denylist matches the server's sandbox-repo key.
+
+    The store hard-codes the repository literal (to avoid importing the
+    server into the persistence layer). If the server renames
+    ``MANAGED_REPO_LABEL_KEY``, the literal in
+    :data:`_FORK_ONLY_DROPPED_LABEL_KEYS` would silently stop matching and
+    a fork would re-inherit the source's repository — a clone that asked
+    for an empty sandbox would get the source's repo re-cloned into it on
+    the first relaunch. Importing the real constant here makes that rename
+    fail loudly at test time.
+    """
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
+
+    assert MANAGED_REPO_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(
@@ -5432,6 +5871,61 @@ def test_fork_seeds_next_position_from_copied_items(
     assert _stored_next_position(conversation_store, fork.id) == 3
     conversation_store.append(fork.id, [_user_message("after")])
     assert _stored_positions(conversation_store, fork.id) == [0, 1, 2, 3]
+
+
+def test_fork_retry_reuses_prepared_ids_and_encoded_payloads(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fork retries replay inserts without repeating preparation hooks."""
+
+    class RecordingStore(SqlAlchemyConversationStore):
+        def __init__(self, uri: str) -> None:
+            super().__init__(uri)
+            self.decode_calls = 0
+            self.encode_calls = 0
+
+        def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+            self.decode_calls += 1
+            return super()._decode_item_data_batch(stored)
+
+        def _encode_item_data(self, data_json: str) -> str:
+            self.encode_calls += 1
+            return super()._encode_item_data(data_json)
+
+    store = RecordingStore(db_uri)
+    source = store.create_conversation()
+    store.append(
+        source.id,
+        [_user_message("first", "resp_1"), _user_message("second", "resp_1")],
+    )
+    store.decode_calls = 0
+    store.encode_calls = 0
+    item_ids = iter(["1" * 32, "2" * 32])
+    generated_ids: list[str] = []
+
+    def generate_id(_item_type: str) -> str:
+        item_id = next(item_ids)
+        generated_ids.append(item_id)
+        return item_id
+
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.generate_item_id",
+        generate_id,
+    )
+    retrying_ap_maker = _RetryOnceMaker(store._conv_session_immediate)
+    store._conv_session_immediate = retrying_ap_maker
+
+    fork = store.fork_conversation(source.id)
+
+    assert retrying_ap_maker.attempts == 2
+    # Copied payloads reuse the source's stored encoding verbatim (only
+    # compaction payloads re-encode, and this source has none), so a retry
+    # replays SQL alone: zero decode/encode hook calls on either attempt.
+    assert store.decode_calls == 0
+    assert store.encode_calls == 0
+    assert generated_ids == ["1" * 32, "2" * 32]
+    assert [item.id for item in store.list_items(fork.id).data] == generated_ids
 
 
 def test_truncated_fork_seeds_next_position_from_copied_items(

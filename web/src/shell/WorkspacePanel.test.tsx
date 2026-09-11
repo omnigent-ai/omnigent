@@ -90,6 +90,7 @@ function renderWorkspace(
     selectedTerminalKey?: string | null;
     maximized?: boolean;
     liveness?: SessionLiveness;
+    pending?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -103,7 +104,13 @@ function renderWorkspace(
       <WorkspacePanel
         conversationId="conv_ws"
         width={360}
-        handleProps={{ tabIndex: 0 }}
+        handleProps={{
+          tabIndex: 0,
+          role: "separator",
+          "aria-label": "Resize panel",
+          onMouseDown: vi.fn(),
+          onKeyDown: vi.fn(),
+        }}
         rightRailTab={overrides.rightRailTab ?? "files"}
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
@@ -131,6 +138,7 @@ function renderWorkspace(
         filesPanelShowHidden={false}
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
+        pending={overrides.pending}
       />
     </TooltipProvider>,
   );
@@ -165,6 +173,29 @@ describe("WorkspacePanel surface presentation", () => {
     expect(filesTab).not.toHaveAttribute("title");
     expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
+  });
+
+  it("shows inert workspace chrome while a temporary session is pending", () => {
+    renderWorkspace({ pending: true });
+
+    for (const name of ["Files", "Changes", "GitHub", "Agents"]) {
+      expect(screen.getByRole("tab", { name: new RegExp(name) })).toBeDisabled();
+    }
+    expect(screen.getByText("Starting workspace…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    expect(screen.queryByTestId("subagents-stub")).toBeNull();
+    expect(useCreateTerminalMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Full screen" })).toBeDisabled();
+    expect(screen.getByRole("separator", { name: "Resize panel" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.getByRole("separator", { name: "Resize panel" })).toHaveAttribute(
+      "tabindex",
+      "-1",
+    );
   });
 
   it("has no static Shells nav tab — shells open only as closable soft tabs", () => {

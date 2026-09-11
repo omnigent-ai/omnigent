@@ -1,7 +1,7 @@
 """CLI-side auth storage for ``omnigent login``.
 
 Persists per-server auth state in ``~/.omnigent/auth_tokens.json``
-keyed by server URL. Two record shapes live side by side:
+keyed by server URL. Three record shapes live side by side:
 
 - **Session JWTs** from the browser-based OIDC / accounts login flow
   (``{"token": ..., "user_id": ..., "expires_at": ...}``).
@@ -12,6 +12,9 @@ keyed by server URL. Two record shapes live side by side:
   just names the workspace whose host-keyed Databricks CLI OAuth cache
   (``databricks auth login --host <ws>``) mints fresh bearers on
   demand.
+- **Workspace routing selectors** (``{"org_id": ...}``) remembered while
+  normalizing a managed URL. They may stand alone or augment either credential
+  record so subprocesses route to the same workspace.
 
 See ``designs/OIDC_AUTH.md`` §CLI Login Flow.
 """
@@ -70,6 +73,32 @@ def _normalize_server_url(server_url: str) -> str:
     :returns: Normalized URL string.
     """
     return server_url.rstrip("/")
+
+
+def _safe_log_url(url: str) -> str:
+    """Strip credential-bearing parts from a URL before it reaches a log.
+
+    A URL can carry secrets in its userinfo (``https://user:token@host``) or
+    query string (``?access_token=...``), so logging one verbatim risks
+    leaking them. Keep the non-secret identity — scheme, host, port, path —
+    and drop userinfo, query, and fragment. Server URLs here carry no
+    credentials, but sanitizing at the sink keeps that guarantee local to the
+    log call instead of trusting every caller.
+
+    :param url: A server URL, e.g. ``"https://ws.example.com/api/2.0/omnigent"``.
+    :returns: The sanitized URL, or ``"<server>"`` when it cannot be parsed.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "<server>"
+    if not parts.scheme or not host:
+        return "<server>"
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _write_tokens_file(path: Path, data: dict[str, dict[str, str | float]]) -> None:
@@ -181,6 +210,9 @@ def store_token(
     }
     if refresh_token is not None:
         entry["refresh_token"] = refresh_token
+    existing_org_id = load_databricks_org_id(server_url)
+    if existing_org_id is not None:
+        entry["org_id"] = existing_org_id
     _store_entry(server_url, entry)
 
 
@@ -217,7 +249,28 @@ def store_databricks_auth(
         entry["user_id"] = user_id
     if org_id:
         entry["org_id"] = org_id
+    else:
+        existing_org_id = load_databricks_org_id(server_url)
+        if existing_org_id is not None:
+            entry["org_id"] = existing_org_id
     _store_entry(server_url, entry)
+
+
+def store_databricks_org_id(server_url: str, org_id: str) -> None:
+    """Persist a workspace selector without replacing existing credentials.
+
+    URL normalization calls this when a managed server URL carries ``?o=``.
+    Keeping the selector beside the server's existing auth record lets later
+    CLI helpers and child processes rebuild routing headers after the query has
+    been removed from the HTTP base URL.
+
+    :param server_url: Canonical server API base.
+    :param org_id: Workspace selector parsed from the user-supplied URL.
+    """
+    existing = _load_entry(server_url) or {}
+    if existing.get("org_id") == org_id:
+        return
+    _store_entry(server_url, {**existing, "org_id": org_id})
 
 
 def _load_entry(server_url: str) -> dict[str, str | float] | None:
@@ -415,6 +468,9 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
 
 def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | None:
     """Perform the refresh exchange; caller holds the token-file lock."""
+    # Log only the sanitized URL — the raw one may embed credentials, and the
+    # refresh token is never logged.
+    safe = _safe_log_url(normalized)
     entry = _load_entry(server_url)
     if entry is None:
         return None
@@ -442,31 +498,53 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             timeout=timeout,
         )
     except httpx.HTTPError as exc:
-        _logger.warning("Token refresh against %s failed: %s", normalized, exc)
+        _logger.warning("Token refresh against %s failed: %s", safe, exc)
+        return None
+    if resp.status_code == 404:
+        # No ``/oauth/token`` route: a local/header-mode dev server or an
+        # older build that never issues refreshable sessions. Re-login
+        # cannot add the route, so the "run `omnigent login`" advice below
+        # is misleading. On a loopback target this is the expected case and
+        # would otherwise spam a warning on every near-expiry reconnect, so
+        # keep it at debug; a remote 404 (wrong URL / too-old server) still
+        # warrants a visible, non-credential-blaming note.
+        from omnigent_client._http import is_loopback_url
+
+        if is_loopback_url(normalized):
+            _logger.debug(
+                "Token refresh against %s skipped: server has no /oauth/token endpoint.",
+                safe,
+            )
+        else:
+            _logger.warning(
+                "Token refresh against %s returned HTTP 404 — the server does not "
+                "expose /oauth/token (wrong URL or a build without session refresh).",
+                safe,
+            )
         return None
     if resp.status_code != 200:
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
             "to re-authenticate.",
-            normalized,
+            safe,
             resp.status_code,
-            normalized,
+            safe,
         )
         return None
     try:
         payload = resp.json()
     except ValueError:
-        _logger.warning("Token refresh against %s returned a malformed response", normalized)
+        _logger.warning("Token refresh against %s returned a malformed response", safe)
         return None
     if not isinstance(payload, dict):
-        _logger.warning("Token refresh against %s returned a malformed response", normalized)
+        _logger.warning("Token refresh against %s returned a malformed response", safe)
         return None
     access_token = payload.get("access_token")
     new_refresh = payload.get("refresh_token")
     # Only overwrite the stored pair with genuinely usable material —
     # a null/non-string field must never clobber a working credential.
     if not isinstance(access_token, str) or not access_token:
-        _logger.warning("Token refresh against %s returned no access token", normalized)
+        _logger.warning("Token refresh against %s returned no access token", safe)
         return None
     if not isinstance(new_refresh, str) or not new_refresh:
         # A server that renews without returning refresh material keeps the
@@ -485,7 +563,7 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     # A fresh token means any earlier expiry warning is stale; allow
     # a new one if this credential ever lapses again.
     _warned_expired_servers.discard(normalized)
-    _logger.info("Refreshed login session for %s", normalized)
+    _logger.info("Refreshed login session for %s", safe)
     return access_token
 
 
@@ -524,16 +602,15 @@ def load_databricks_workspace_host(server_url: str) -> str | None:
 
 
 def load_databricks_org_id(server_url: str) -> str | None:
-    """Load the workspace org id from a Databricks pointer record.
+    """Load the workspace org id from a stored server record.
 
     :param server_url: The server URL, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
     :returns: The org id, e.g. ``"2850744067564480"``, or ``None``
-        when the stored record (if any) is not a Databricks pointer
-        record or carries no org id.
+        when the stored record carries no org id.
     """
     entry = _load_entry(server_url)
-    if entry is None or entry.get("auth_type") != "databricks":
+    if entry is None:
         return None
     org_id = entry.get("org_id")
     return org_id if isinstance(org_id, str) and org_id else None
@@ -587,6 +664,7 @@ def databricks_request_headers(
     *,
     bearer_token: str | None = None,
     host_id: str | None = None,
+    org_id: str | None = None,
 ) -> dict[str, str]:
     """Build the headers for a request to a Databricks-fronted server.
 
@@ -619,6 +697,9 @@ def databricks_request_headers(
         sharding layer that reads it. ``None`` defaults to the runner's own
         host_id inside a runner process (via ``OMNIGENT_RUNNER_SLICE_KEY``) and
         otherwise leaves routing to the default.
+    :param org_id: An explicit workspace selector captured from the current
+        server URL. When omitted, the selector from the stored login record is
+        used. An explicit value wins over stored state.
     :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
         ``X-Databricks-Omnigent-Slice-Key``, and/or the configured extra headers
         as available, possibly empty.
@@ -626,7 +707,7 @@ def databricks_request_headers(
     headers: dict[str, str] = {}
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
-    org_id = load_databricks_org_id(server_url)
+    org_id = org_id or load_databricks_org_id(server_url)
     if org_id:
         headers[DATABRICKS_ORG_ID_HEADER] = org_id
     # Resolve the slice-key host_id when the caller names none, so every

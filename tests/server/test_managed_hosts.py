@@ -39,6 +39,7 @@ from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
+    KUBERNETES_HOME_SIZE_LIMIT_DEFAULT,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MICROSANDBOX_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
@@ -763,8 +764,12 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
                 "node_selector": {"omnigent.ai/runner-ready": "true"},
                 "runtime_class": "kata",
                 "in_cluster": True,
-                "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
+                "resources": {
+                    "requests": {"cpu": "500m", "ephemeral-storage": "2Gi"},
+                    "limits": {"memory": "8Gi", "ephemeral-storage": "8Gi"},
+                },
                 "pod_ready_timeout_s": 300,
+                "home_size_limit": "20Gi",
             },
         }
     )
@@ -785,8 +790,12 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert fake.node_selector == {"omnigent.ai/runner-ready": "true"}
     assert fake.runtime_class == "kata"
     assert fake.in_cluster is True
-    assert fake.resources == {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}}
+    assert fake.resources == {
+        "requests": {"cpu": "500m", "ephemeral-storage": "2Gi"},
+        "limits": {"memory": "8Gi", "ephemeral-storage": "8Gi"},
+    }
     assert fake.pod_ready_timeout_s == 300
+    assert fake.home_size_limit == "20Gi"
 
 
 def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -808,6 +817,34 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.resources is None
     assert fake.pvc_mounts is None
     assert fake.pod_ready_timeout_s is None
+    # Absent, not None: a stock deployment gets a bounded HOME emptyDir.
+    assert fake.home_size_limit == KUBERNETES_HOME_SIZE_LIMIT_DEFAULT == "8Gi"
+
+
+def test_parse_kubernetes_home_size_limit_default_mirrors_launcher() -> None:
+    """The parse-time default and the launcher's manifest default stay in step."""
+    import omnigent.onboarding.sandboxes.kubernetes as k8s
+
+    assert KUBERNETES_HOME_SIZE_LIMIT_DEFAULT == k8s._HOME_SIZE_LIMIT_DEFAULT
+
+
+def test_parse_kubernetes_home_size_limit_null_is_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit `home_size_limit: null` reaches the launcher as None (no sizeLimit)."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"home_size_limit": None},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.home_size_limit is None
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -940,7 +977,17 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         ({"runtime_class": "Not_A_DNS_Name"}, "sandbox.kubernetes.runtime_class"),
         ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
         ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
+        (
+            {"resources": {"limits": {"ephemeral-storage": "eight gigs"}}},
+            "valid Kubernetes quantity",
+        ),
         ({"in_cluster": "yes"}, "must be a boolean"),
+        # The HOME sizeLimit must be a real quantity string (or an explicit
+        # null): a number or a typo would either fail the Pod's admission or
+        # silently leave the emptyDir unbounded.
+        ({"home_size_limit": 8}, "quantity string"),
+        ({"home_size_limit": ""}, "quantity string"),
+        ({"home_size_limit": "lots"}, "valid Kubernetes quantity"),
         # A misspelled section key would silently no-op (e.g. no PVCs mounted)
         # without the allowlist check.
         ({"pvc_mount": [{"claim_name": "c", "mount_path": "/mnt/x"}]}, "unknown key"),
@@ -1007,6 +1054,111 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
     assert fake.pvc_mounts is None
+
+
+def test_parse_kubernetes_tolerations_normalizes_and_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tolerations parse into normalized entries (operator defaults 'Equal') on the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "tolerations": [
+                    {
+                        "key": "sei.io/node-role",
+                        "value": "omnigent-sandbox",
+                        "effect": "NoSchedule",
+                    },
+                    {"operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.tolerations == [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        },
+        {"operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+    ]
+
+
+def test_parse_kubernetes_without_tolerations_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted (or empty) tolerations reach the launcher as None — no tolerations added."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"tolerations": []},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.tolerations is None
+
+
+@pytest.mark.parametrize(
+    ("tolerations", "expected_fragment"),
+    [
+        # Wrong container shapes.
+        ("sei.io/node-role", "must be a list"),
+        ([["sei.io/node-role"]], "must be a mapping"),
+        ([{"bogus": "x"}], "unknown key"),
+        # key/value field shape.
+        ([{"key": "", "operator": "Equal"}], "key.*must be a non-empty string"),
+        ([{"key": "k", "value": 123}], "value.*must be a string"),
+        # key/value Kubernetes label format.
+        ([{"key": "sei.io/node role", "operator": "Exists"}], "not a valid Kubernetes label key"),
+        (
+            [{"key": "k", "operator": "Equal", "value": "x" * 64}],
+            "not a valid Kubernetes label value",
+        ),
+        # operator/effect given the wrong Python type outright (a config typo
+        # nesting a mapping/list under a scalar field) must still fail as
+        # ValueError, not escape as an unhandled TypeError from the `in`
+        # membership test against an unhashable value.
+        ([{"operator": {"nested": "mapping"}}], "operator.*must be one of"),
+        ([{"key": "k", "effect": ["NoSchedule"]}], "effect.*must be one of"),
+        # key/operator combinations Kubernetes itself would reject.
+        ([{"operator": "Equal"}], "only pairs with 'Exists'"),
+        ([{"key": "sei.io/x", "operator": "Maybe"}], "operator.*must be one of"),
+        ([{"operator": "Exists", "value": "x"}], "not allowed with operator 'Exists'"),
+        # effect / tolerationSeconds combinations.
+        ([{"key": "sei.io/x", "effect": "Sometimes"}], "effect.*must be one of"),
+        (
+            [{"key": "sei.io/x", "effect": "NoSchedule", "tolerationSeconds": 60}],
+            "only applies with effect 'NoExecute'",
+        ),
+        (
+            [{"key": "sei.io/x", "tolerationSeconds": "60"}],
+            "tolerationSeconds.*must be an integer",
+        ),
+    ],
+)
+def test_parse_kubernetes_tolerations_invalid_fails_loud(
+    tolerations: object, expected_fragment: str
+) -> None:
+    """An operator typo in tolerations fails at parse (server startup), not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"tolerations": tolerations},
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -3407,15 +3559,15 @@ async def test_terminate_managed_host_deletes_row_before_provider_call(
     assert fake.terminated == ["sb-delete-first"]
 
 
-async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
+async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Best-effort contract: a provider termination failure neither
-    propagates nor blocks the row deletion (the provider's lifetime
-    cap reaps the sandbox; the credential must die now).
+    A provider failure does not block logical deletion, and the persisted
+    sandbox id is retried by the existing reaper.
     """
     fake = FakeSandboxLauncher()
+    original_terminate = fake.terminate
 
     def _explode(sandbox_id: str) -> None:
         """Simulate a provider API failure during termination."""
@@ -3439,15 +3591,83 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
+    tombstones = host_store.list_stale_managed_sandbox_hosts(now_epoch())
+    assert len(tombstones) == 1
+    assert tombstones[0].deleted_at is not None
+    assert tombstones[0].sandbox_id == "sb-term-2"
+
+    monkeypatch.setattr(fake, "terminate", original_terminate)
+    reaper = ManagedSandboxReaper(
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+    )
+    assert await reaper.sweep_once() == 1
+    assert fake.terminated == ["sb-term-2"]
+    assert host_store.list_stale_managed_sandbox_hosts(now_epoch()) == []
+
+
+async def test_terminate_managed_host_retains_only_failed_generation(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSandboxLauncher()
+    original_terminate = fake.terminate
+    host_store = HostStore(db_uri)
+    host_id = "9e50e018919e494886b984df0bbec12b"
+    original = host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-term-partial",
+        user_id=_OWNER,
+        token="tok-term-old-partial",
+        provider="modal",
+        sandbox_id="sb-term-old-partial",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host_store.detach_stale_managed_sandbox(
+        host_id,
+        sandbox_id="sb-term-old-partial",
+        expected_updated_at=original.updated_at,
+    )
+    host = host_store.replace_managed_host_sandbox(
+        host_id=host_id,
+        user_id=_OWNER,
+        token="tok-term-new-partial",
+        provider="modal",
+        sandbox_id="sb-term-new-partial",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host is not None
+    attempts: list[str] = []
+
+    def _terminate(sandbox_id: str) -> None:
+        attempts.append(sandbox_id)
+        if sandbox_id == "sb-term-new-partial":
+            raise click.ClickException("provider unavailable")
+        original_terminate(sandbox_id)
+
+    monkeypatch.setattr(fake, "terminate", _terminate)
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    assert attempts == ["sb-term-new-partial", "sb-term-old-partial"]
+    tombstones = host_store.list_stale_managed_sandbox_hosts(now_epoch())
+    assert len(tombstones) == 1
+    assert tombstones[0].sandbox_id == "sb-term-new-partial"
+    assert tombstones[0].terminating_sandbox_id is None
+
+    monkeypatch.setattr(fake, "terminate", original_terminate)
+    reaper = ManagedSandboxReaper(
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+    )
+    assert await reaper.sweep_once() == 1
+    assert fake.terminated == ["sb-term-old-partial", "sb-term-new-partial"]
+    assert host_store.list_stale_managed_sandbox_hosts(now_epoch()) == []
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
     """
-    A config change between launch and teardown (current launcher's
-    provider ≠ the provider recorded on the row) must NOT aim the new
-    provider's terminate at a stale sandbox id — the sandbox is left
-    to its lifetime cap, but the row still dies (token revoked, no
-    picker ghost). Also covers config=None (section removed).
+    A config change between launch and teardown must not aim the new provider's
+    terminate at a stale sandbox id. The host becomes invisible and its cleanup
+    tombstone remains available if that provider is configured again later.
     """
     fake = FakeSandboxLauncher()  # provider "modal"
     host_store = HostStore(db_uri)
@@ -3470,7 +3690,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
         host_store.resolve_launch_token("487212fd2b157b6ab6a6d6d3ef06ce5b", "tok-term-3") is None
     )
 
-    # config=None behaves the same: row deleted, nothing terminated.
+    # config=None behaves the same: host hidden, cleanup retained.
     host2 = host_store.register_managed_host(
         host_id="b114bf90a8fd155ce6007c3bb262aa79",
         name="managed-term4",

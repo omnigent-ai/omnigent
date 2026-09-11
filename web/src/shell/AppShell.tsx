@@ -20,6 +20,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
+import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
@@ -73,7 +74,6 @@ import {
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { useGithubInfo } from "@/hooks/useGithub";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -96,6 +96,7 @@ import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
+import { GithubPanel } from "./GithubPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -227,6 +228,7 @@ export function AppShell() {
   // of the raw route id so none of them fetch `/v1/sessions/temp:*` during the
   // create window (or on a stale temp reload, before ChatPage redirects).
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
+  const pendingConversation = conversationId != null && serverConversationId == null;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
@@ -381,6 +383,7 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
+  const [githubPanelOpen, setGithubPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
@@ -424,6 +427,7 @@ export function AppShell() {
 
   const debugMode = useDebugMode();
   const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true);
+  const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
   // the active conversation id, which suppresses the notification/badge for
@@ -441,11 +445,15 @@ export function AppShell() {
   useSeedReadState(allConversations);
   const activeConv = useMemo(() => {
     if (!serverConversationId) return null;
-    return (
-      conversationsData?.pages.flatMap((p) => p.data).find((c) => c.id === serverConversationId) ??
-      null
-    );
-  }, [serverConversationId, conversationsData]);
+    return allConversations?.find((c) => c.id === serverConversationId) ?? null;
+  }, [serverConversationId, allConversations]);
+  // A temporary row is display-only: it can supply optimistic breadcrumb
+  // text, but must not participate in permissions, actions, or server hooks.
+  const provisionalConv = useMemo(() => {
+    if (!conversationId || !isTempConvId(conversationId)) return null;
+    const row = allConversations?.find((c) => c.id === conversationId);
+    return row?.provisional === true ? row : null;
+  }, [conversationId, allConversations]);
   // Single-conversation snapshot (shared cache with chatStore.bindStream).
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
@@ -523,11 +531,14 @@ export function AppShell() {
   // the snapshot, so a parent outside the loaded window shows no folder.
   const { session: parentSession } = useSession(activeSession?.parentSessionId);
   const { data: projectSummaries } = useProjects();
-  const breadcrumbConv = isChildSession ? parentConv : activeConv;
+  const breadcrumbConv = isChildSession ? parentConv : (activeConv ?? provisionalConv);
   const headerConversationTitle =
     breadcrumbConv?.title ||
     (isChildSession ? parentSession?.title : activeSession?.title) ||
     (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ||
+    (isTempConvId(conversationId)
+      ? (optimisticConversationTitle ?? UNTITLED_CONVERSATION_LABEL)
+      : null) ||
     (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
   const headerProjectSummary =
     breadcrumbConv?.project_id != null
@@ -611,7 +622,8 @@ export function AppShell() {
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
   // Agent tools/policies exist to show.
-  const hasAgentInfo = !!conversationId && agentHasInfo(boundAgent, conversationId);
+  const hasAgentInfo =
+    serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
   // Whether the mobile three-dot menu has any entry to offer.
   const hasHeaderMenu = canShare || hasAgentInfo;
   // The live snapshot is authoritative; the sidebar row is only a fallback
@@ -764,15 +776,6 @@ export function AppShell() {
     enabled: canBrowseWorkspace,
   });
   const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
-  // The GitHub tab needs a git checkout on disk: hide it once the session's
-  // GitHub info resolves to "not a git repo" — that panel is a dead end. Other
-  // unavailable reasons keep the tab: `host_outdated` renders an actionable
-  // "update your host" prompt, and `no_os_env` is already covered by the Files
-  // gate. While the info is still loading the tab stays, matching the Files
-  // gate's no-flash default. Shares ChatPage's status-line query cache, so no
-  // extra fetch.
-  const githubInfoQuery = useGithubInfo(serverConversationId);
-  const showGithubTab = showFilesPanel && githubInfoQuery.data?.reason !== "not_a_git_repo";
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -783,11 +786,9 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab: workspace gate plus the resolved GitHub info — a
-        // non-git workspace hides the tab instead of opening a dead-end
-        // panel. The panel still renders the "gh not installed" /
-        // "not signed in" / "update your host" states for a real checkout.
-        github: showGithubTab,
+        // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
+        // other unavailable reasons are shown as empty states in the panel.
+        github: showFilesPanel,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
         // older desktop build predates the `browser*` bridge — both hide the
@@ -801,7 +802,7 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel, showGithubTab],
+    [showFilesPanel],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1634,6 +1635,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setExecutionLogsKey(key);
   }
 
@@ -1646,6 +1648,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setFilesDrawerFlatView(flatView);
     setFilesPanelOpen(true);
   }
@@ -1661,6 +1664,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -1675,7 +1679,22 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setGithubPanelOpen(false); // close mobile github drawer
     setShellsPanelOpen(true);
+  }
+
+  // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
+  // (matches the desktop rail's GitHub tab; the panel handles all states —
+  // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
+  function openGithubPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(true);
   }
 
   function openMainExecutionLog() {
@@ -1857,7 +1876,7 @@ export function AppShell() {
     [canClone],
   );
   const workspacePanelVisible = Boolean(
-    serverConversationId &&
+    conversationId &&
     hasRailContent &&
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
@@ -2023,6 +2042,7 @@ export function AppShell() {
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
+                    pending={pendingConversation}
                     mobileMenu={{
                       fileViewerOpen,
                       panelOpen,
@@ -2031,6 +2051,7 @@ export function AppShell() {
                       filesPanelOpen,
                       subagentsPanelOpen,
                       shellsPanelOpen,
+                      githubPanelOpen,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2047,6 +2068,7 @@ export function AppShell() {
                       onOpenChanges: openChangesPanel,
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
+                      onOpenGithub: openGithubPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -2054,6 +2076,7 @@ export function AppShell() {
                 <main
                   className="relative flex min-h-0 min-w-0 flex-1 flex-col"
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
+                  data-session-id={conversationId}
                 >
                   <Outlet />
                 </main>
@@ -2082,9 +2105,10 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {serverConversationId && workspacePanelVisible && (
+                {conversationId && workspacePanelVisible && (
                   <WorkspacePanel
-                    conversationId={serverConversationId}
+                    conversationId={conversationId}
+                    pending={pendingConversation}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}
                     handleProps={inlinePanelHandleProps}
@@ -2191,6 +2215,16 @@ export function AppShell() {
                     // the "+ New shell" create row.
                     showNewShell
                   />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && showFilesPanel && (
+                <MobilePanelDrawer
+                  open={githubPanelOpen}
+                  title="GitHub"
+                  onClose={() => setGithubPanelOpen(false)}
+                  testId="github-panel-drawer"
+                >
+                  <GithubPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}

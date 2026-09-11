@@ -207,6 +207,109 @@ async def test_run_turn_rejects_stale_session_after_clear(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/login", "/logout"])
+async def test_run_turn_points_auth_commands_at_omni_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+) -> None:
+    """
+    ``/login`` must not be typed into the pane as a prompt.
+
+    Claude Code's sign-in is an interactive TUI handoff the bridge
+    cannot drive, so the bridge escapes ``/login`` into plain text and
+    the CLI answers it as an ordinary message. On an expired login that
+    answer is "Login expired · Please run /login" — the instruction the
+    user just followed, so the turn is wasted and the session is stuck.
+    Fail the turn with the host command that does re-authenticate.
+    """
+
+    def fail_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """
+        Fail if an auth command reaches tmux injection.
+
+        :param bridge_dir_arg: Bridge directory passed by the executor.
+        :param content: Text that would be typed into tmux.
+        :param timeout_s: tmux-target readiness timeout.
+        :returns: Never returns.
+        """
+        del bridge_dir_arg, content, timeout_s
+        raise AssertionError("auth slash command injected into tmux")
+
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        fail_inject_user_message,
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": command}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "omni setup" in events[0].message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/login", "/logout"])
+async def test_enqueue_session_message_refuses_auth_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+) -> None:
+    """
+    A live-steered ``/login`` must not be typed into the pane either.
+
+    ``enqueue_session_message`` is the second injection path: a message
+    sent while a turn is active. Refusing it (``False``) leaves the
+    runner's buffered copy undelivered, so the message arrives as the
+    next turn and ``run_turn``'s short-circuit answers it with the
+    ``omni setup`` guidance. The monkeypatched injector raises, so this
+    test fails if anything reaches tmux.
+    """
+
+    def fail_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """
+        Fail if an auth command reaches tmux injection.
+
+        :param bridge_dir_arg: Bridge directory passed by the executor.
+        :param content: Text that would be typed into tmux.
+        :param timeout_s: tmux-target readiness timeout.
+        :returns: Never returns.
+        """
+        del bridge_dir_arg, content, timeout_s
+        raise AssertionError("auth slash command injected into tmux")
+
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        fail_inject_user_message,
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    accepted = await executor.enqueue_session_message("session-key", command)
+
+    assert accepted is False
+
+
+@pytest.mark.asyncio
 async def test_enqueue_session_message_rejects_stale_session_after_clear(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

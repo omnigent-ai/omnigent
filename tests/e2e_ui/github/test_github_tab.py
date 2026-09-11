@@ -152,9 +152,10 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="GitHub").click()
 
-    # PR header (shared across both inner tabs): title + number.
+    # PR header (shared across both inner tabs): title, number, and state.
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
+    expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
 
     # CI checks on their own line as labeled pills; a zero bucket shows nothing.
     expect(rail.get_by_text("Checks")).to_be_visible()

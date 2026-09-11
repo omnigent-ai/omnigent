@@ -32,6 +32,8 @@ const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
 const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
+let searchParams = new URLSearchParams();
+let projects: { id: string | null; name: string }[] = [];
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 // Prompt history is scoped per conversation; the landing composer writes under
@@ -47,9 +49,7 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigateMock,
-  // The landing screen reads `?project=` to pre-fill the project chip; this
-  // flow suite never sets one, so an empty params object is enough.
-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+  useSearchParams: () => [searchParams, vi.fn()],
 }));
 
 // The screen hands the first message to ChatPage through the chatStore
@@ -119,12 +119,10 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
 }));
-// The composer's project chip lists projects via useProjects; stub it to an
-// empty list so it doesn't fire its own authenticatedFetch (which would land
-// at mock.calls[0] and skew these create-POST call assertions).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
-  useProjects: () => ({ data: [] }),
+  useProjects: () => ({ data: projects }),
+  useProjectConfig: () => ({ data: null, isLoading: false }),
   // Same reason as useProjects above: the landing reads useConversations for
   // hasNoSessions, so stub it to avoid an authenticatedFetch skewing calls[0].
   useConversations: () => ({ data: undefined }),
@@ -272,8 +270,24 @@ function selectAgent(agentId: string): void {
  * The knobs (model / effort / permission / approval / cursor mode / brain
  * harness) live in this modal, not the picker dropdown.
  */
+function openAgentModels(agentId: string): void {
+  const picker = screen.getByTestId("new-chat-landing-agent-select");
+  fireEvent.pointerDown(picker, { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+  }
+  if (screen.queryByTestId(`new-chat-landing-agent-config-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+    fireEvent.pointerDown(picker, { button: 0 });
+    if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    }
+  }
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+}
+
 function openAgentConfig(agentId: string): void {
-  selectAgent(agentId);
+  openAgentModels(agentId);
   fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
 }
 
@@ -310,6 +324,8 @@ beforeEach(() => {
   resetLandingDraft();
   clearOptimisticTitles();
   localStorage.clear();
+  searchParams = new URLSearchParams();
+  projects = [];
   vi.mocked(useHostModelOptions).mockReturnValue({
     data: [
       { id: "opus", displayName: "Opus" },
@@ -331,6 +347,49 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it("keeps project placement on the provisional and rekeyed conversation", async () => {
+    searchParams = new URLSearchParams("project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_1",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    const project = { id: "proj_alpha", name: "Alpha" };
+    await waitFor(() =>
+      expect(beginLocalConversationMock).toHaveBeenCalledWith(
+        "inspect the repo",
+        [],
+        expect.any(Object),
+        project,
+      ),
+    );
+    await waitFor(() =>
+      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
+        "temp:1234567890abcdef1234567890abcdef",
+        "conv_new",
+        "ag_hello",
+        "inspect the repo",
+        [],
+        "pend_1",
+        null,
+        navigateMock,
+        expect.any(Function),
+        project,
+      ),
+    );
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -429,6 +488,7 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
+        undefined,
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -474,6 +534,7 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
+        undefined,
       ),
     );
   });
@@ -593,6 +654,7 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
+        undefined,
       ),
     );
 
@@ -1502,10 +1564,10 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     // Model, effort and permission mode share Claude Code's one config modal;
     // both can be set in one visit and commit together on Save.
-    openAgentConfig("ag_native");
-    pickSelectOption("new-chat-landing-config-model", "Opus");
-    pickSelectOption("new-chat-landing-config-effort", "High");
-    saveConfig();
+    openAgentModels("ag_native");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1547,20 +1609,19 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_pi");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
+    openAgentModels("ag_pi");
     const fullNameRow = document.querySelector(
-      '[data-model-id="omnigent-openai/system.ai.gpt-5-6-sol"]',
+      '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
     expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
-    fireEvent.change(screen.getByTestId("new-chat-landing-config-model-search"), {
+    fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
       target: { value: "gpt sol" },
     });
     expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
     expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
     fireEvent.click(screen.getByText("GPT 5.6 Sol"));
-    saveConfig();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1616,9 +1677,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_native");
-    pickSelectOption("new-chat-landing-config-model", "Opus");
-    saveConfig();
+    openAgentModels("ag_native");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));

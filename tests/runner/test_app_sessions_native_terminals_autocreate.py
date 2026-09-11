@@ -313,6 +313,134 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no managed provider, a pinned model still reaches the pi argv.
+
+    Pi falls back to its own login when ``resolve_pi_native_provider()`` is
+    ``None``, but the session's pinned model must not be silently dropped:
+    it passes through as ``--model`` so Pi resolves it against its own
+    catalog instead of opening its default model.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+            model_override="anthropic/claude-sonnet-4-5",
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, spec: Any, **_kwargs: Any
+        ) -> SessionResourceView:
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_pi_terminal(
+        "47f049b9d13df4db397c7f46859b825f",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    args = captured["spec"].args
+    assert "--model" in args
+    assert args[args.index("--model") + 1] == "anthropic/claude-sonnet-4-5"
+    # No managed provider was injected — Pi runs on its own login.
+    assert "--provider" not in args
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed slash-bearing pick never reaches the own-login pi argv.
+
+    ``omnigent/moonshotai/kimi-k2.5`` is unresolvable without the managed
+    provider, and stripping the prefix would leave ``moonshotai/kimi-k2.5``,
+    which Pi's ``--model`` parser mis-routes (leading segment read as a
+    provider). The launch must omit ``--model`` so Pi keeps its own default.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+            model_override="omnigent/moonshotai/kimi-k2.5",
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, spec: Any, **_kwargs: Any
+        ) -> SessionResourceView:
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_pi_terminal(
+        "47f049b9d13df4db397c7f46859b825f",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    args = captured["spec"].args
+    assert "--model" not in args
+    assert "--provider" not in args
+
+
+@pytest.mark.asyncio
 async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolated_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1310,6 +1438,16 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         env=dict(gateway_env),
         api_key_helper="printf %s sk-sentinel-do-not-use",
         model="databricks-claude-opus-4-7",
+        routable_models=(
+            "databricks-claude-opus-4-7",
+            "databricks-claude-opus-4-8",
+            "databricks-claude-sonnet-5",
+        ),
+        model_overrides={
+            "claude-opus-4-7": "databricks-claude-opus-4-7",
+            "claude-opus-4-8": "databricks-claude-opus-4-8",
+            "claude-sonnet-5": "databricks-claude-sonnet-5",
+        },
     )
     # The runner imports ``_ucode_config_for_profile`` from
     # ``omnigent.harnesses.claude_native.main`` per call, so patch it at the source.
@@ -1380,6 +1518,11 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     assert all("sk-sentinel-do-not-use" not in arg for arg in spec.args)
     settings = _load_claude_invocation_settings(spec.args)
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
+    assert settings["modelOverrides"] == {
+        "claude-opus-4-7": "databricks-claude-opus-4-7",
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-sonnet-5": "databricks-claude-sonnet-5",
+    }
     assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
 
     await fake_client.aclose()

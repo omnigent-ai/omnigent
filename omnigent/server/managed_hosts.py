@@ -315,6 +315,9 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # value). ``conversations.workspace`` is overwritten with the CLONED
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
+# Per-session state: a fork never inherits it (the store drops it, and
+# the fork's own launch re-stamps whatever repository it resolves),
+# while an in-place agent switch keeps it — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 
 
@@ -1367,6 +1370,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "secret_name",
                     "service_account",
                     "node_selector",
+                    "tolerations",
                     "kubeconfig",
                     "in_cluster",
                     "resources",
@@ -1374,6 +1378,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "secret_mounts",
                     "pod_ready_timeout_s",
                     "runtime_class",
+                    "home_size_limit",
                 },
                 "sandbox.kubernetes",
             )
@@ -1388,6 +1393,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             secret_name=_parse_provider_string(raw, "kubernetes", "secret_name"),
             service_account=_parse_provider_string(raw, "kubernetes", "service_account"),
             node_selector=_parse_provider_str_mapping(raw, "kubernetes", "node_selector"),
+            tolerations=_parse_kubernetes_tolerations(raw),
             kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
@@ -1397,6 +1403,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 raw, "kubernetes", "pod_ready_timeout_s"
             ),
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
+            home_size_limit=_parse_kubernetes_home_size_limit(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     elif provider == "microsandbox":
@@ -2463,6 +2470,17 @@ _K8S_LABEL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
 # Kubernetes resource quantity, e.g. "500m", "2", "1Gi", "1.5" — a number with
 # an optional binary/decimal suffix.
 _K8S_QUANTITY_RE = re.compile(r"^\d+(\.\d+)?([eE][-+]?\d+)?[a-zA-Z]{0,2}i?$")
+# Container resource fields ``sandbox.kubernetes.resources`` may carry per tier.
+# ``ephemeral-storage`` bounds the Pod's node-local disk (emptyDirs, container
+# writable layers, logs): its request lets the scheduler spread sandboxes by
+# disk and its limit makes the kubelet evict only the sandbox that exceeds it.
+_KUBERNETES_RESOURCE_FIELDS: frozenset[str] = frozenset({"cpu", "memory", "ephemeral-storage"})
+# Default ``sizeLimit`` of the writable-HOME emptyDir when
+# ``sandbox.kubernetes.home_size_limit`` is absent. Mirrors
+# ``_HOME_SIZE_LIMIT_DEFAULT`` in omnigent.onboarding.sandboxes.kubernetes
+# (kept in step by a test); the launcher module is imported lazily so the
+# server never pays for the kubernetes SDK at config-parse time.
+KUBERNETES_HOME_SIZE_LIMIT_DEFAULT: str = "8Gi"
 
 
 def _validate_dns1123_label(value: str | None, field: str) -> None:
@@ -2525,14 +2543,127 @@ def _validate_kubernetes_identifiers(
             )
 
 
+# Kubernetes Toleration ``operator`` / ``effect`` enums for parse-time
+# validation of ``sandbox.kubernetes.tolerations`` entries.
+_K8S_TOLERATION_OPERATORS: frozenset[str] = frozenset({"Exists", "Equal"})
+_K8S_TOLERATION_EFFECTS: frozenset[str] = frozenset(
+    {"NoSchedule", "PreferNoSchedule", "NoExecute"}
+)
+
+
+def _parse_kubernetes_tolerations(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.tolerations`` list.
+
+    Each entry is a Kubernetes Toleration — ``{key?, operator?, value?,
+    effect?, tolerationSeconds?}`` — added to every runner Pod's
+    ``spec.tolerations`` verbatim. Lets an operator dedicate a tainted
+    NodePool to sandbox Pods (pair with ``node_selector`` to also pin them
+    there — a toleration alone only permits scheduling, it does not attract
+    it). Validated at parse time so a malformed entry fails server startup
+    instead of the first managed launch.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Normalized entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, or
+        combines fields Kubernetes itself would reject (an ``Exists``
+        operator with a ``value``, an empty ``key`` with an operator other
+        than ``Exists``, or a ``tolerationSeconds`` without ``effect:
+        NoExecute``).
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("tolerations")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.tolerations' must be a list of "
+            "{key?, operator?, value?, effect?, tolerationSeconds?} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.tolerations[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        _reject_unknown_keys(
+            entry, {"key", "operator", "value", "effect", "tolerationSeconds"}, path_prefix
+        )
+        key = entry.get("key")
+        if key is not None and (not isinstance(key, str) or not key.strip()):
+            raise ValueError(f"server config '{path_prefix}.key' must be a non-empty string")
+        if key is not None and not _validate_label_key(key.strip()):
+            raise ValueError(
+                f"server config '{path_prefix}.key' is not a valid Kubernetes label key: {key!r}"
+            )
+        operator = entry.get("operator", "Equal")
+        if not isinstance(operator, str) or operator not in _K8S_TOLERATION_OPERATORS:
+            raise ValueError(
+                f"server config '{path_prefix}.operator' must be one of: "
+                f"{', '.join(sorted(_K8S_TOLERATION_OPERATORS))} (got {operator!r})"
+            )
+        if key is None and operator != "Exists":
+            raise ValueError(
+                f"server config '{path_prefix}' omits 'key' but sets operator "
+                f"{operator!r} — an empty key only pairs with 'Exists' "
+                "(Kubernetes' 'tolerate everything' form)"
+            )
+        entry_value = entry.get("value")
+        if entry_value is not None and not isinstance(entry_value, str):
+            raise ValueError(f"server config '{path_prefix}.value' must be a string")
+        if entry_value and (len(entry_value) > 63 or not _K8S_LABEL_SEGMENT_RE.match(entry_value)):
+            raise ValueError(
+                f"server config '{path_prefix}.value' is not a valid Kubernetes "
+                f"label value: {entry_value!r}"
+            )
+        if operator == "Exists" and entry_value:
+            raise ValueError(
+                f"server config '{path_prefix}.value' is not allowed with operator 'Exists'"
+            )
+        effect = entry.get("effect")
+        if effect is not None and (
+            not isinstance(effect, str) or effect not in _K8S_TOLERATION_EFFECTS
+        ):
+            raise ValueError(
+                f"server config '{path_prefix}.effect' must be one of: "
+                f"{', '.join(sorted(_K8S_TOLERATION_EFFECTS))} (got {effect!r})"
+            )
+        toleration_seconds = entry.get("tolerationSeconds")
+        if toleration_seconds is not None:
+            if not isinstance(toleration_seconds, int) or isinstance(toleration_seconds, bool):
+                raise ValueError(
+                    f"server config '{path_prefix}.tolerationSeconds' must be an integer"
+                )
+            if effect != "NoExecute":
+                raise ValueError(
+                    f"server config '{path_prefix}.tolerationSeconds' only applies "
+                    "with effect 'NoExecute'"
+                )
+        normalized_entry: dict[str, object] = {"operator": operator}
+        if key is not None:
+            normalized_entry["key"] = key.strip()
+        if entry_value:
+            normalized_entry["value"] = entry_value
+        if effect is not None:
+            normalized_entry["effect"] = effect
+        if toleration_seconds is not None:
+            normalized_entry["tolerationSeconds"] = toleration_seconds
+        normalized.append(normalized_entry)
+    return normalized or None
+
+
 def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the optional ``sandbox.kubernetes.resources`` block.
 
-    Shape: ``{requests?: {cpu?, memory?}, limits?: {cpu?, memory?}}`` — every
-    level optional, each ``cpu`` / ``memory`` a non-empty Kubernetes quantity
-    string. Validated at parse time so an operator typo fails server startup
-    instead of the first managed launch; an omitted field keeps the default.
+    Shape: ``{requests?: {cpu?, memory?, ephemeral-storage?}, limits?: {cpu?,
+    memory?, ephemeral-storage?}}`` — every level optional, each field a
+    non-empty Kubernetes quantity string. Validated at parse time so an
+    operator typo fails server startup instead of the first managed launch; an
+    omitted ``cpu`` / ``memory`` keeps the launcher default, an omitted
+    ``ephemeral-storage`` stays unset (a namespace ``LimitRange`` may default
+    it).
 
     :param raw: The raw ``sandbox`` mapping.
     :returns: The validated resources block, or ``None`` when omitted.
@@ -2559,14 +2690,15 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
         if not isinstance(tier_value, dict):
             raise ValueError(
                 f"server config 'sandbox.kubernetes.resources.{tier}' must be a "
-                "mapping of 'cpu' / 'memory' to quantity strings"
+                "mapping of 'cpu' / 'memory' / 'ephemeral-storage' to quantity strings"
             )
         norm_tier: dict[str, str] = {}
         for field, field_value in tier_value.items():
-            if field not in ("cpu", "memory"):
+            if field not in _KUBERNETES_RESOURCE_FIELDS:
                 raise ValueError(
                     f"server config 'sandbox.kubernetes.resources.{tier}' has an "
-                    f"unknown key {field!r} (expected 'cpu' or 'memory')"
+                    f"unknown key {field!r} (expected 'cpu', 'memory' or "
+                    "'ephemeral-storage')"
                 )
             if not isinstance(field_value, str) or not field_value.strip():
                 raise ValueError(
@@ -2583,6 +2715,44 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
             norm_tier[field] = quantity
         normalized[tier] = norm_tier
     return normalized
+
+
+def _parse_kubernetes_home_size_limit(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.home_size_limit``.
+
+    The ``sizeLimit`` of the writable-HOME emptyDir every runner Pod mounts.
+    Three states, distinguished at parse time so the launcher receives a
+    resolved value:
+
+    - key absent → :data:`KUBERNETES_HOME_SIZE_LIMIT_DEFAULT`, so a stock
+      deployment is bounded without any config;
+    - explicit ``null`` → ``None``, an unbounded emptyDir (the pre-limit
+      behaviour, for operators whose nodes have ample nodefs);
+    - a Kubernetes quantity string (``"8Gi"``, ``"20Gi"``) → that limit.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The size limit, or ``None`` for unbounded.
+    :raises ValueError: When the field is present but not a quantity string.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None or "home_size_limit" not in section:
+        return KUBERNETES_HOME_SIZE_LIMIT_DEFAULT
+    value = section["home_size_limit"]
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "server config 'sandbox.kubernetes.home_size_limit' must be a Kubernetes "
+            "quantity string (e.g. '8Gi') or null for an unbounded HOME emptyDir"
+        )
+    quantity = value.strip()
+    if not _K8S_QUANTITY_RE.match(quantity):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.home_size_limit' is not a valid "
+            f"Kubernetes quantity: {value!r} (e.g. '8Gi', '20Gi')"
+        )
+    return quantity
 
 
 # Path prefixes a pvc_mounts mount_path may not overlap — neither sitting at
@@ -2823,6 +2993,7 @@ def _kubernetes_launcher_factory(
     secret_name: str | None,
     service_account: str | None,
     node_selector: dict[str, str] | None,
+    tolerations: list[dict[str, object]] | None,
     kubeconfig: str | None,
     in_cluster: bool | None,
     resources: dict[str, object] | None,
@@ -2830,6 +3001,7 @@ def _kubernetes_launcher_factory(
     secret_mounts: list[dict[str, object]] | None,
     pod_ready_timeout_s: int | None,
     runtime_class: str | None,
+    home_size_limit: str | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -2849,6 +3021,10 @@ def _kubernetes_launcher_factory(
     :param node_selector: Extra node selector labels merged with a default
         ``kubernetes.io/arch: amd64`` (an entry for that key overrides it),
         or ``None``.
+    :param tolerations: Normalized Toleration entries added to every runner
+        Pod's ``spec.tolerations`` verbatim, or ``None``. Permits scheduling
+        onto a tainted NodePool; pair with *node_selector* to also pin the
+        Pod there.
     :param kubeconfig: Explicit kubeconfig path for the out-of-cluster fallback,
         or ``None``.
     :param in_cluster: Force the cluster-config source, or ``None`` to try
@@ -2863,6 +3039,8 @@ def _kubernetes_launcher_factory(
     :param runtime_class: ``RuntimeClass`` name every runner Pod is scheduled
         under as ``spec.runtimeClassName`` (e.g. ``kata`` for micro-VM
         isolation), or ``None`` for the cluster's default runtime.
+    :param home_size_limit: Resolved ``sizeLimit`` for every runner Pod's
+        writable-HOME emptyDir, or ``None`` for an unbounded emptyDir.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -2886,6 +3064,7 @@ def _kubernetes_launcher_factory(
             secret_name=secret_name,
             service_account=service_account,
             node_selector=node_selector,
+            tolerations=tolerations,
             kubeconfig=kubeconfig,
             in_cluster=in_cluster,
             resources=resources,
@@ -2893,6 +3072,7 @@ def _kubernetes_launcher_factory(
             secret_mounts=secret_mounts,
             pod_ready_timeout_s=pod_ready_timeout_s,
             runtime_class=runtime_class,
+            home_size_limit=home_size_limit,
         )
 
     return _build
@@ -3560,7 +3740,7 @@ async def resume_managed_host(
                     )
                     if terminated and current.terminating_sandbox_id == sandbox_id:
                         await asyncio.to_thread(
-                            host_store.mark_terminating_sandbox_terminated,
+                            host_store.mark_sandbox_terminated,
                             host.host_id,
                             sandbox_id=sandbox_id,
                         )
@@ -3599,12 +3779,11 @@ async def terminate_managed_host(
     """
     Terminate a managed host's sandbox and delete its host row.
 
-    The latest row is locked and deleted before provider termination. This
-    serializes full teardown with generation replacement: either teardown takes
-    the newly registered generation, or replacement observes the missing row
-    and cleans up its unregistered sandbox. Deleting the row also removes the
-    host from the picker and revokes its launch token. Provider termination
-    remains best-effort and never blocks database teardown.
+    The latest row is locked and logically deleted before provider termination.
+    This removes the host from user-visible reads, revokes its token, and
+    serializes teardown with generation replacement. Recorded sandbox ids remain
+    on the tombstone until termination succeeds, allowing the reaper to retry
+    transient provider failures.
 
     :param host: The managed host to tear down. Active and pending sandbox ids
         are both terminated when present.
@@ -3613,19 +3792,25 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
-    deleted = await asyncio.to_thread(host_store.delete_host, host.host_id)
-    if deleted is None:
+    tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    if tombstone is None:
         return
-    launcher = _launcher_for_teardown(deleted, config)
-    sandbox_ids = dict.fromkeys((deleted.sandbox_id, deleted.terminating_sandbox_id))
+    launcher = _launcher_for_teardown(tombstone, config)
+    sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:
         if sandbox_id is not None:
-            await _terminate_sandbox_best_effort(
+            terminated = await _terminate_sandbox_best_effort(
                 launcher,
                 sandbox_id,
-                host_id=deleted.host_id,
-                provider=deleted.sandbox_provider,
+                host_id=tombstone.host_id,
+                provider=tombstone.sandbox_provider,
             )
+            if terminated:
+                await asyncio.to_thread(
+                    host_store.mark_sandbox_terminated,
+                    tombstone.host_id,
+                    sandbox_id=sandbox_id,
+                )
 
 
 async def _terminate_sandbox_best_effort(

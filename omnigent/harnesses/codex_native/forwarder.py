@@ -125,6 +125,10 @@ _CODEX_ELICITATION_CONNECT_TIMEOUT_SECONDS = 30.0
 # idle long-polls); later retries back off.
 _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
 _CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS = 30.0
+# A POST held at least this long before failing was severed by the gateway at
+# its request cap, not refused by a sick server, so its retry must not back off
+# — see the backoff reset in :func:`_post_codex_elicitation_request`.
+_CODEX_ELICITATION_HELD_POLL_FLOOR_SECONDS = 10.0
 _CODEX_MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request"
 # Per-server MCP startup progress (issue #2058). Codex runs an MCP
 # startup round when a thread starts, but delivers the per-server
@@ -234,7 +238,7 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
 )
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
-_CODEX_REAUTH_HINT = "Codex needs you to re-authenticate. Run `codex login` and retry."
+_CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
 
 
 @dataclass
@@ -3275,9 +3279,12 @@ async def _maybe_handle_turn_event(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 _logger.warning(
-                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                    "Failed to persist codex compaction item for %s: %s",
+                    session_id,
+                    _compaction_persist_failure_reason(exc),
+                    exc_info=True,
                 )
             else:
                 if forwarder_state is not None:
@@ -4009,6 +4016,7 @@ async def _post_codex_elicitation_request(
     backoff_s = _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
     while True:
         response: httpx.Response | None = None
+        attempt_started = loop.time()
         try:
             response = await client.post(url, json=event, timeout=timeout)
         except httpx.HTTPError:
@@ -4017,6 +4025,7 @@ async def _post_codex_elicitation_request(
                 event.get("method"),
                 exc_info=True,
             )
+        held_s = loop.time() - attempt_started
         if response is not None and response.status_code < 500:
             return response
         if response is not None:
@@ -4034,7 +4043,14 @@ async def _post_codex_elicitation_request(
             )
             return None
         await _elicitation_retry_sleep(backoff_s)
-        backoff_s = min(backoff_s * 2, _CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS)
+        if held_s >= _CODEX_ELICITATION_HELD_POLL_FLOOR_SECONDS:
+            # The gateway severed a held poll rather than a sick server refusing
+            # it: re-POST inside the server's re-park grace so the approval card
+            # survives the gap instead of clearing between polls. Growth is kept
+            # for fast failures, which are the ones worth backing off from.
+            backoff_s = _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
+        else:
+            backoff_s = min(backoff_s * 2, _CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS)
 
 
 def _note_native_plan_implementation_prompt(
@@ -4640,9 +4656,12 @@ async def _handle_completed_item(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 _logger.warning(
-                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                    "Failed to persist codex compaction item for %s: %s",
+                    session_id,
+                    _compaction_persist_failure_reason(exc),
+                    exc_info=True,
                 )
             else:
                 if forwarder_state is not None:
@@ -6302,6 +6321,24 @@ async def _post_compaction_status(
         forwarder_state.compaction_status_posted = status
         if status == "in_progress":
             forwarder_state.compaction_item_persisted = False
+
+
+def _compaction_persist_failure_reason(exc: BaseException) -> str:
+    """Describe why persisting a compaction item failed.
+
+    ``raise_for_status`` reports only the status and URL, so a 4xx rejection of
+    the compaction payload was undiagnosable from logs -- which field the server
+    objected to is stated only in the response body.
+
+    :param exc: The exception raised while persisting.
+    :returns: A one-line reason, e.g. ``"server returned 400: ..."``.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        body_preview = exc.response.text[:200] if exc.response.content else ""
+        return f"server returned {exc.response.status_code}" + (
+            f": {body_preview}" if body_preview else ""
+        )
+    return f"{type(exc).__name__}: {exc}"
 
 
 async def _persist_codex_compaction_item(

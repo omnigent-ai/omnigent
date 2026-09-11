@@ -31,7 +31,10 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_effort,
     write_codex_config_model,
 )
-from omnigent.inner.codex_goal_command import goal_objective_from_content
+from omnigent.inner.codex_goal_command import (
+    goal_objective_from_content,
+    goal_objective_length_error,
+)
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -369,6 +372,13 @@ class CodexNativeExecutor(Executor):
         settings_overrides = _model_effort_overrides(config)
         latest_user_content = _latest_user_content(messages)
         goal_objective = goal_objective_from_content(latest_user_content)
+        if goal_objective is not None:
+            # Reject over-long objectives here so the app-server's raw
+            # JSON-RPC -32600 error never reaches the user.
+            length_error = goal_objective_length_error(goal_objective)
+            if length_error is not None:
+                yield ExecutorError(message=length_error)
+                return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
             if goal_objective is not None

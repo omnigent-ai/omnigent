@@ -45,7 +45,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import phase_scope, runner_primary_session_id
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -53,7 +53,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, ErrorPhase, OmnigentError
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -92,6 +92,11 @@ from omnigent.runner.background_titles import (
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.mcp_execution_registry import (
+    McpExecutionConflict,
+    McpExecutionRegistry,
+    McpExecutionResult,
+)
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
     _COST_POPUP_REPOP_TASKS,
@@ -1626,6 +1631,28 @@ def new_subagent_work_id() -> str:
     return f"subagent_{uuid.uuid4().hex[:12]}"
 
 
+# Per-child locks serializing the classify+register step of an in-flight
+# sub-agent send (see ``tool_dispatch._send_to_in_flight_child``), so two
+# concurrent sends to one child can't install divergent work entries. Co-located
+# with the work registries so it is torn down alongside them — otherwise a
+# long-lived runner would accumulate one lock per steered child forever.
+_in_flight_send_locks: dict[str, asyncio.Lock] = {}
+
+
+def in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
+    """
+    Return (creating on first use) the per-child in-flight-send lock.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The lock guarding that child's in-flight-send bookkeeping.
+    """
+    lock = _in_flight_send_locks.get(child_session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _in_flight_send_locks[child_session_id] = lock
+    return lock
+
+
 def register_subagent_work(
     *,
     parent_session_id: str,
@@ -1737,6 +1764,7 @@ def unregister_subagent_work(
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
     _subagent_work_by_child.pop(child_session_id, None)
+    _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
     if children is None:
         return
@@ -1759,9 +1787,11 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     """
     unregister_subagent_work(session_id)
     _drained_delivered_subagent_children.discard(session_id)
+    _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
+        _in_flight_send_locks.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
 
@@ -2693,6 +2723,8 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+    mcp_execution_registry = McpExecutionRegistry()
+    app.state.mcp_execution_registry = mcp_execution_registry
 
     from omnigent.runtime import telemetry
 
@@ -4374,6 +4406,7 @@ def create_runner_app(
             turn_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await turn_task
+        await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
@@ -7167,7 +7200,10 @@ def create_runner_app(
             arguments: _JsonObject,
         ) -> _JsonObject:
             result_str = await ProxyMcpManager(
-                _captured_session_id, server_client, publish_event=_publish_event
+                _captured_session_id,
+                server_client,
+                publish_event=_publish_event,
+                execution_registry=mcp_execution_registry,
             ).call_tool(None, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
@@ -7209,10 +7245,15 @@ def create_runner_app(
                 await asyncio.get_running_loop().run_in_executor(
                     None, post_tools_changed, bridge_dir
                 )
-            except RuntimeError:
+            except (RuntimeError, OSError):
+                # Fire-and-forget below, so anything escaping here resurfaces as
+                # an unretrieved task exception at ERROR. Re-advertising the tool
+                # list is best-effort; a stale list costs one turn, a dead task
+                # loop costs the session.
                 _logger.debug(
                     "tools-changed notification skipped for session=%s (bridge server not ready)",
                     session_id,
+                    exc_info=True,
                     extra={"session_id": session_id},
                 )
 
@@ -7237,47 +7278,50 @@ def create_runner_app(
         # can't suppress this turn's legitimate terminal publish.
         _desynced_sessions.discard(conv)
         _desync_terminalized.pop(conv, None)
-        try:
-            await _run_turn_bg_setup_and_stream(msg_body, conv)
-        except _ContextWindowOverflow:
-            # Re-raise so the streaming-phase handler (which publishes the
-            # error event) is never shadowed by the generic except below.
-            raise
-        except asyncio.CancelledError as exc:
-            _logger.error(
-                "turn cancelled for %s: %s",
-                conv,
-                exc,
-                exc_info=True,
-                extra={"session_id": conv},
-            )
-            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
-            raise
-        except Exception as exc:
-            _logger.error(
-                "turn setup failed for %s: %s",
-                conv,
-                exc,
-                exc_info=True,
-                extra={"session_id": conv},
-            )
-            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
-        finally:
-            # Permanent-wedge floor: guarantee _active_turns is never left stale,
-            # however the body exits — including a BaseException that escapes
-            # ``except Exception``. A setup-phase abnormal exit otherwise leaves
-            # the slot set and every later message buffers forever.
-            #
-            # Identity compare-and-clear: only finalize when the slot STILL holds
-            # THIS turn's own task. A turn that ended cleanly already popped its
-            # slot via _on_proxy_stream_end, which schedules a continuation that
-            # can bind a NEW turn's task under the same conv — a bare
-            # ``conv in _active_turns`` check would then let this stale finally
-            # clobber the newer turn (the same class of bug the ExecutorAdapter
-            # identity CAS fixes). When the slot is a None sentinel or a
-            # different task, this turn is already accounted for — skip.
-            if _active_turns.get(conv) is _own_task and _own_task is not None:
-                _on_proxy_stream_end(conv)
+        # Locate any uncoded exception logged below in the turn phase (this task's
+        # context carries it for its lifetime). Coded errors keep their own phase.
+        with phase_scope(ErrorPhase.TURN):
+            try:
+                await _run_turn_bg_setup_and_stream(msg_body, conv)
+            except _ContextWindowOverflow:
+                # Re-raise so the streaming-phase handler (which publishes the
+                # error event) is never shadowed by the generic except below.
+                raise
+            except asyncio.CancelledError as exc:
+                _logger.error(
+                    "turn cancelled for %s: %s",
+                    conv,
+                    exc,
+                    exc_info=True,
+                    extra={"session_id": conv},
+                )
+                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                raise
+            except Exception as exc:
+                _logger.error(
+                    "turn setup failed for %s: %s",
+                    conv,
+                    exc,
+                    exc_info=True,
+                    extra={"session_id": conv},
+                )
+                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            finally:
+                # Permanent-wedge floor: guarantee _active_turns is never left stale,
+                # however the body exits — including a BaseException that escapes
+                # ``except Exception``. A setup-phase abnormal exit otherwise leaves
+                # the slot set and every later message buffers forever.
+                #
+                # Identity compare-and-clear: only finalize when the slot STILL holds
+                # THIS turn's own task. A turn that ended cleanly already popped its
+                # slot via _on_proxy_stream_end, which schedules a continuation that
+                # can bind a NEW turn's task under the same conv — a bare
+                # ``conv in _active_turns`` check would then let this stale finally
+                # clobber the newer turn (the same class of bug the ExecutorAdapter
+                # identity CAS fixes). When the slot is a None sentinel or a
+                # different task, this turn is already accounted for — skip.
+                if _active_turns.get(conv) is _own_task and _own_task is not None:
+                    _on_proxy_stream_end(conv)
 
     def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
         """Reasoning block to forward on a turn, or ``None`` when unset.
@@ -7557,7 +7601,11 @@ def create_runner_app(
 
             _mcp_hash = compute_spec_hash(list(cached_spec.mcp_servers))
             if _mcp_hash != _session_mcp_spec_hash.get(conv):
-                _session_mcp_proxy = ProxyMcpManager(conv, server_client)
+                _session_mcp_proxy = ProxyMcpManager(
+                    conv,
+                    server_client,
+                    execution_registry=mcp_execution_registry,
+                )
                 try:
                     mcp_result = await _session_mcp_proxy.schemas_for(
                         cached_spec,
@@ -7875,7 +7923,11 @@ def create_runner_app(
                         _spec_cache[_turn_agent_id] = _resolved_turn_spec
                         _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
-            _turn_mcp = ProxyMcpManager(conv_id, server_client)
+            _turn_mcp = ProxyMcpManager(
+                conv_id,
+                server_client,
+                execution_registry=mcp_execution_registry,
+            )
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
                     _mcp = await _turn_mcp.schemas_for(cast(AgentSpec, _turn_spec))
@@ -8260,6 +8312,7 @@ def create_runner_app(
                                             conv_id,
                                             server_client,
                                             publish_event=_publish_event,
+                                            execution_registry=mcp_execution_registry,
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
@@ -10029,82 +10082,73 @@ def create_runner_app(
             )
         return root
 
-    @app.get("/v1/sessions/{session_id}/resources/github")
-    async def read_github_info(session_id: str) -> JSONResponse:
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import github_info
+    async def _github_call(session_id: str, operation: str, **kwargs: Any) -> JSONResponse:
+        from omnigent.runner import github_resource
 
         root = await _github_workspace_root(session_id)
-        info = await _asyncio.to_thread(github_info, root)
-        return JSONResponse(status_code=200, content=info)
+        function = getattr(github_resource, operation)
+        try:
+            result = await asyncio.to_thread(function, root, session_id=session_id, **kwargs)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github")
+    async def read_github_info(session_id: str, pr_url: str | None = None) -> JSONResponse:
+        return await _github_call(session_id, "github_info", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
-    async def read_github_changes(session_id: str) -> JSONResponse:
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import github_changed_files
-
-        root = await _github_workspace_root(session_id)
-        result = await _asyncio.to_thread(github_changed_files, root)
-        return JSONResponse(status_code=200, content=result)
+    async def read_github_changes(session_id: str, pr_url: str | None = None) -> JSONResponse:
+        return await _github_call(session_id, "github_changed_files", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
-    async def read_github_pr_diff(session_id: str) -> JSONResponse:
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import github_pr_diff
-
-        root = await _github_workspace_root(session_id)
-        result = await _asyncio.to_thread(github_pr_diff, root)
-        return JSONResponse(status_code=200, content=result)
+    async def read_github_pr_diff(session_id: str, pr_url: str | None = None) -> JSONResponse:
+        return await _github_call(session_id, "github_pr_diff", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
         session_id: str,
         relative_path: str,
-        base: str | None = Query(default=None),
+        base: str | None = None,
+        pr_url: str | None = None,
+        previous_path: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import github_file_diff, resolve_base_ref
-
-        # Repo-root-relative paths only; reject traversal even though ``git show``
-        # reads from the object store (not disk) and rejects out-of-tree paths.
         if relative_path.startswith("/") or any(
             seg in ("", "..") for seg in relative_path.split("/")
         ):
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"code": "invalid_path", "message": "Invalid path"}},
-            )
-        root = await _github_workspace_root(session_id)
-        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
-        result = await _asyncio.to_thread(
-            github_file_diff, root, resolved_base or "", relative_path
+            raise HTTPException(status_code=400, detail="Invalid path")
+        return await _github_call(
+            session_id,
+            "github_file_diff",
+            base=base or "",
+            path=relative_path,
+            pr_url=pr_url,
+            previous_path=previous_path,
+            head_sha=head_sha,
+            base_sha=base_sha,
         )
-        return JSONResponse(status_code=200, content=result)
+
+    @app.post("/v1/sessions/{session_id}/resources/github/prs")
+    async def update_github_pr_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id, "update_session_pr", url=body["url"], action=body.get("action", "attach")
+        )
 
     @app.post("/v1/sessions/{session_id}/resources/github/preferences")
-    async def set_github_preference_route(
-        session_id: str,
-        request: Request,
-    ) -> JSONResponse:
-        # Apply the panel's account / remote selection (gh repo set-default +
-        # a per-repo account preference), then return the refreshed info payload.
-        import asyncio as _asyncio
-
-        from omnigent.runner.github_resource import set_github_preference
-
+    async def set_github_preference_route(session_id: str, request: Request) -> JSONResponse:
         body = await request.json()
-        root = await _github_workspace_root(session_id)
-        info = await _asyncio.to_thread(
-            set_github_preference,
-            root,
+        return await _github_call(
+            session_id,
+            "set_github_preference",
             account=body.get("account"),
             remote=body.get("remote"),
+            pr_url=body.get("pr_url"),
         )
-        return JSONResponse(status_code=200, content=info)
 
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
@@ -11084,6 +11128,58 @@ def create_runner_app(
         method: str = body.get("method") or ""
         params: _JsonObject = body.get("params") or {}
 
+        raw_operation = body.get("_omnigent_operation")
+        if method == "tools/call" and raw_operation is not None:
+            operation = raw_operation if isinstance(raw_operation, dict) else {}
+            operation_id = operation.get("id")
+            operation_step = operation.get("step")
+            if not (
+                isinstance(operation_id, str)
+                and 1 <= len(operation_id) <= 128
+                and isinstance(operation_step, str)
+                and 1 <= len(operation_step) <= 64
+            ):
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "error": {
+                            "code": -32000,
+                            "message": "Invalid runner MCP operation metadata",
+                        }
+                    },
+                )
+
+            nested_body = cast("_JsonObject", {**body, "_omnigent_operation": None})
+            nested_body.pop("_omnigent_operation")
+
+            async def _run_retained_mcp_execution() -> McpExecutionResult:
+                nested_response = await mcp_execute(
+                    session_id,
+                    cast("Request", _BodyRequest(nested_body)),
+                )
+                nested_content = json.loads(bytes(nested_response.body))
+                if not isinstance(nested_content, dict):
+                    raise RuntimeError("Runner MCP execution returned a non-object response")
+                return McpExecutionResult(
+                    status_code=nested_response.status_code,
+                    content=cast("_JsonObject", nested_content),
+                )
+
+            try:
+                retained = await mcp_execution_registry.execute(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    step=operation_step,
+                    params=cast("_JsonObject", {"method": method, "params": params}),
+                    run=_run_retained_mcp_execution,
+                )
+            except McpExecutionConflict as exc:
+                return JSONResponse(
+                    status_code=200,
+                    content={"error": {"code": -32000, "message": str(exc)}},
+                )
+            return JSONResponse(status_code=retained.status_code, content=retained.content)
+
         if method == "tools/list":
             if mcp_manager is None:
                 return JSONResponse(
@@ -11501,6 +11597,13 @@ def create_runner_app(
             )
 
     async def _catch_up_scan() -> None:
+        recreated_prompts = pending_approvals.notify_server_reconnect()
+        if recreated_prompts:
+            _logger.info(
+                "Recreating %d pending approval or elicitation request(s) after reconnect",
+                recreated_prompts,
+                extra={"session_id": runner_primary_session_id()},
+            )
         # The tunnel just reconnected, which usually means the SERVER restarted
         # (deploy, crash, replica failover) and lost its in-memory session-status
         # cache. This runner did not restart, so every status source still
@@ -11596,6 +11699,7 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
+        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
@@ -11621,6 +11725,11 @@ def create_runner_app(
             ):
                 return True
             if _native_pane_status.get(conv_id) == "running":
+                return True
+            # A pane parked on a permission prompt emits nothing and reports no
+            # active turn, so every signal above reads idle. Reaping it kills the
+            # prompt and strands its approval card unanswerable.
+            if approval_wait_is_fresh(conv_id):
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             if clients:
@@ -11964,7 +12073,7 @@ def _build_spawn_env_from_spec(
             # Builtin ACP CLI harnesses (one catalog row each) share a single
             # builder; the row supplies the command, label, and install info.
             env = _build_acp_cli_spawn_env(
-                effective_spec, harness=harness, cwd=cwd, workdir=workdir
+                effective_spec, harness=harness, cwd=cwd, workdir=workdir, session_id=session_id
             )
         else:
             builder_path = spawn_env_builders().get(harness)

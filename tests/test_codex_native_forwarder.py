@@ -839,6 +839,91 @@ async def test_elicitation_post_reposts_after_transport_cut_with_same_envelope(
 
 
 @pytest.mark.asyncio
+async def test_elicitation_post_resets_backoff_after_a_gateway_severed_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A gateway-severed HELD poll resets the retry backoff; fast failures grow it.
+
+    The front door caps a request at 300s and answers with 504, so a parked
+    approval is severed every five minutes. A backoff that kept doubling
+    pushed the re-POST past the server's re-park grace, which cleared the
+    approval card to "Resolved elsewhere" between polls. Growth belongs to
+    fast failures (a sick or unreachable server), not to a poll the gateway
+    held for its full budget.
+    """
+    loop = asyncio.get_running_loop()
+    clock = {"t": 0.0}
+    monkeypatch.setattr(loop, "time", lambda: clock["t"])
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        """
+        Record the backoff instead of waiting it out.
+
+        :param seconds: Backoff the loop asked for.
+        :returns: None.
+        """
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(fwd, "_elicitation_retry_sleep", _record_sleep)
+    held = fwd._CODEX_ELICITATION_HELD_POLL_FLOOR_SECONDS + 290.0
+    # (held_s, outcome) per attempt: a gateway sever holds the poll for its
+    # full budget, a refused connection fails instantly.
+    script = [
+        (held, "5xx"),
+        (held, "5xx"),
+        (0.0, "cut"),
+        (0.0, "cut"),
+        (held, "5xx"),
+        (0.0, "ok"),
+    ]
+
+    class _ScriptedElicitationClient:
+        """Stub client whose POSTs follow *script*, advancing the fake clock."""
+
+        def __init__(self) -> None:
+            self.posts: list[tuple[str, dict]] = []
+
+        async def post(self, url: str, *, json: dict, timeout: httpx.Timeout) -> httpx.Response:
+            """
+            Fail or succeed per the script, charging the attempt's hold time.
+
+            :param url: Request URL.
+            :param json: Codex JSON-RPC request envelope.
+            :param timeout: Per-attempt budget (ignored by the stub).
+            :returns: 504 for a gateway sever, 200 once the script says so.
+            :raises httpx.ReadError: For an instantly refused connection.
+            """
+            del timeout
+            self.posts.append((url, json))
+            held_s, outcome = script[len(self.posts) - 1]
+            clock["t"] += held_s
+            request = httpx.Request("POST", url)
+            if outcome == "cut":
+                raise httpx.ReadError("connection refused", request=request)
+            if outcome == "5xx":
+                return httpx.Response(504, request=request)
+            return httpx.Response(200, json={"action": "accept"}, request=request)
+
+    client = _ScriptedElicitationClient()
+
+    response = await fwd._post_codex_elicitation_request(
+        client,  # type: ignore[arg-type]  # stub implements the one used method
+        "conv_x",
+        event=_ELICITATION_EVENT,
+    )
+
+    assert response is not None
+    assert response.status_code == 200
+    initial = fwd._CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
+    assert sleeps == [initial, initial, initial, initial * 2, initial * 4], (
+        "a gateway-severed held poll must reset the backoff so the re-POST lands "
+        "inside the server's re-park grace; only fast failures may back off"
+    )
+
+
+@pytest.mark.asyncio
 async def test_elicitation_post_retries_gateway_5xx(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1787,6 +1872,32 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
     assert "Codex" in body["data"]["summary"]
     assert body["data"]["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
     assert body["data"]["compacted_messages"][0]["role"] == "user"
+
+
+def test_compaction_persist_failure_reason_includes_server_body() -> None:
+    """A rejected compaction persist must name the server's reason.
+
+    ``raise_for_status`` reports only the status and URL, so a 400 on this POST
+    left no way to tell which field the server objected to — the payload is
+    assembled from Codex's rollout, so the answer is only in the response body.
+    """
+    request = httpx.Request("POST", "https://example.invalid/v1/sessions/conv_x/events")
+    response = httpx.Response(
+        400,
+        request=request,
+        text='{"error_code":"INVALID_PARAMETER_VALUE","message":"last_item_id not found"}',
+    )
+    exc = httpx.HTTPStatusError("400 Bad Request", request=request, response=response)
+
+    reason = fwd._compaction_persist_failure_reason(exc)
+
+    assert "400" in reason
+    assert "last_item_id not found" in reason
+
+
+def test_compaction_persist_failure_reason_handles_non_http_errors() -> None:
+    """A non-HTTP failure still gets a one-line reason rather than an empty string."""
+    assert fwd._compaction_persist_failure_reason(RuntimeError("boom")) == "RuntimeError: boom"
 
 
 @pytest.mark.asyncio
