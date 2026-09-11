@@ -1468,12 +1468,18 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
   });
 });
 
+// The host chip labels this machine from the user agent ("This machine" on
+// Linux, "This Mac" on macOS). jsdom reports the host OS, so pin the Linux
+// agent CI uses for the assertions that spell the label out.
+const LINUX_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64)";
+
 describe("NewChatLandingScreen", () => {
   beforeEach(setupLandingMocks);
   afterEach(() => {
     cleanup();
     localStorage.clear();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("renders the inline composer with the prompt headline", () => {
@@ -1558,6 +1564,7 @@ describe("NewChatLandingScreen", () => {
     useHostWorktreesMock.mockReturnValue({
       data: [{ path: "/Users/corey/repo", branch: "main", is_main: true, detached: false }],
     } as unknown as ReturnType<typeof useHostWorktrees>);
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(LINUX_USER_AGENT);
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
@@ -2076,6 +2083,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("keeps compact host and working-directory controls accessibly named", () => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(LINUX_USER_AGENT);
     renderLanding();
 
     const hostTrigger = screen.getByTestId("new-chat-landing-host-chip");
