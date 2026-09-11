@@ -935,19 +935,21 @@ def _main_ask_user_question(argv: list[str]) -> int:
     """
     Handle a ``PreToolUse`` hook for Claude's built-in ``AskUserQuestion`` tool.
 
-    In ``bypassPermissions`` mode the ``PermissionRequest`` hook never fires,
-    so ``AskUserQuestion`` questions are silently swallowed — the web UI never
-    sees them. This handler intercepts the tool via ``PreToolUse`` (which fires
-    in all permission modes), POSTs the same payload to the Omnigent server's
-    ``/hooks/permission-request`` endpoint, waits for the user's web-UI answer,
-    and converts the ``PermissionRequest``-format response into a
-    ``PreToolUse``-format output (``updatedInput``) so Claude receives the
-    answers and skips its own TUI picker.
+    ``AskUserQuestion`` needs no permission to run, so Claude Code fires no
+    ``PermissionRequest`` hook for it in any mode — the question is only ever
+    drawn in the terminal TUI. Left alone, a web-UI session shows nothing while
+    the terminal blocks on a picker no one is watching. This handler intercepts
+    the tool via ``PreToolUse`` (which fires in every permission mode), POSTs
+    the payload to the Omnigent server's ``/hooks/permission-request`` endpoint,
+    waits for the user's web-UI answer, and converts the
+    ``PermissionRequest``-format response into a ``PreToolUse``-format output
+    (``updatedInput``) so Claude receives the answers and skips its own picker.
 
-    When ``permission_mode`` is anything other than ``"bypassPermissions"``
-    (including absent/unknown), this is a no-op: the ``PermissionRequest`` hook
-    will handle the call, and returning empty output here prevents a duplicate
-    elicitation from appearing.
+    Runs in all permission modes, not just ``bypassPermissions``. Returning
+    ``permissionDecision`` ``allow``/``deny`` here short-circuits Claude's
+    permission flow, so a build that did gate ``AskUserQuestion`` would never
+    then also surface it — no double form. On timeout or error this emits no
+    output ("no opinion"), so Claude falls back to its own TUI picker.
 
     :param argv: CLI argv after the ``ask-user-question`` subcommand,
         e.g. ``["--bridge-dir", "/tmp/x"]``.
@@ -965,12 +967,6 @@ def _main_ask_user_question(argv: list[str]) -> int:
         return 0
     if not isinstance(payload, dict):
         print("omnigent ask-user-question hook: expected JSON object", file=sys.stderr)
-        return 0
-    # Only intercept in bypassPermissions mode. In any other mode the
-    # PermissionRequest hook fires independently and owns the elicitation;
-    # returning empty output here is "no opinion" so Claude's own flow
-    # continues unimpeded and we avoid surfacing the form twice.
-    if payload.get("permission_mode") != "bypassPermissions":
         return 0
     bridge_dir = Path(args.bridge_dir)
     session_id = read_active_session_id(bridge_dir)

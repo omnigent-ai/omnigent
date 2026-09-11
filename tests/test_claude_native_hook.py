@@ -1504,39 +1504,46 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
     assert captured.err == ""
 
 
-def test_ask_user_question_hook_noop_in_non_bypass_mode(
+def test_ask_user_question_hook_posts_in_every_permission_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """
-    ``ask-user-question`` subcommand is a no-op when not in bypassPermissions mode.
+    ``ask-user-question`` forwards to the web UI in every permission mode.
 
-    In default / acceptEdits / plan modes the ``PermissionRequest`` hook fires
-    and owns the elicitation.  The ``ask-user-question`` PreToolUse hook must
-    return empty output (no opinion) so the form is not shown twice.
+    Claude Code fires no ``PermissionRequest`` for ``AskUserQuestion`` (it needs
+    no permission), so this ``PreToolUse`` hook is the only way to surface the
+    question in the web UI — in default / acceptEdits / plan / bypass alike. It
+    must POST to Omnigent and lift the answer into ``updatedInput`` so Claude
+    skips its own TUI picker.
 
-    This fails if the handler forwards the payload to Omnigent in non-bypass mode —
-    which would cause a duplicate elicitation card in the web UI and race for
-    the same answer.
+    This fails if the handler no-ops in non-bypass mode (the regression that
+    left the question stuck in the terminal, never reaching the web UI).
     """
-    calls: list[str] = []
+    posted_urls: list[str] = []
+    answers = {"q1": "Option A"}
+    server_response = {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow", "updatedInput": {"answers": answers}},
+        }
+    }
 
-    class _RaisesIfCalled:
-        """HTTP client stub that fails the test if called unexpectedly."""
+    class _FakeHttpxClient:
+        """HTTP client stub returning a canned allow verdict."""
 
         def __init__(self, **_kwargs: object) -> None:
             """
-            Record unexpected construction.
+            Accept constructor kwargs.
 
-            :param _kwargs: Ignored constructor args.
+            :param _kwargs: Ignored.
             :returns: None.
             """
-            calls.append("constructed")
 
-        def __enter__(self) -> _RaisesIfCalled:
+        def __enter__(self) -> _FakeHttpxClient:
             """
-            Enter context — should not be reached.
+            Enter context.
 
             :returns: self.
             """
@@ -1544,32 +1551,38 @@ def test_ask_user_question_hook_noop_in_non_bypass_mode(
 
         def __exit__(self, *_args: object) -> None:
             """
-            Exit context — should not be reached.
+            Exit context.
 
-            :param _args: Ignored exception args.
+            :param _args: Ignored.
             :returns: None.
             """
 
-        def post(self, *_args: object, **_kwargs: object) -> object:
+        def post(self, url: str, *, json: object) -> object:
             """
-            Fail if Omnigent is called — must not happen in non-bypass mode.
+            Record the call and return the canned allow response.
 
-            :param _args: Ignored.
-            :param _kwargs: Ignored.
-            :returns: Never.
-            :raises AssertionError: Always, so the test fails visibly.
+            :param url: Target URL.
+            :param json: Request body (ignored).
+            :returns: Fake HTTP response.
             """
-            raise AssertionError(
-                "AP was called for ask-user-question in non-bypass mode — "
-                "PermissionRequest hook should own the elicitation instead"
+            import json as _json
+
+            import httpx as _httpx
+
+            posted_urls.append(url)
+            return _httpx.Response(
+                200,
+                text=_json.dumps(server_response),
+                request=_httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="b1", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_abc")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
 
-    for mode in ("default", "acceptEdits", "plan", None):
+    for mode in ("default", "acceptEdits", "plan", None, "bypassPermissions"):
+        posted_urls.clear()
         payload: dict[str, object] = {
             "hook_event_name": "PreToolUse",
             "tool_name": "AskUserQuestion",
@@ -1580,10 +1593,18 @@ def test_ask_user_question_hook_noop_in_non_bypass_mode(
         monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
         exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
         captured = capsys.readouterr()
-        # No Omnigent call, no output — "no opinion" so PermissionRequest takes over.
         assert exit_code == 0, f"Non-zero exit for mode={mode!r}"
-        assert captured.out == "", f"Unexpected output for mode={mode!r}: {captured.out!r}"
-        assert calls == [], f"AP client was constructed for mode={mode!r}"
+        # The question must be forwarded to the active session's endpoint.
+        assert posted_urls == [
+            "http://127.0.0.1:8787/v1/sessions/conv_abc/hooks/permission-request"
+        ], f"AP not called (or wrong URL) for mode={mode!r}: {posted_urls!r}"
+        # And the answer lifted into PreToolUse ``updatedInput`` so Claude skips
+        # its own picker.
+        result = json.loads(captured.out)
+        hs = result["hookSpecificOutput"]
+        assert hs["hookEventName"] == "PreToolUse", f"Not PreToolUse-shaped for mode={mode!r}"
+        assert hs["permissionDecision"] == "allow", f"Not allow for mode={mode!r}"
+        assert hs["updatedInput"]["answers"] == answers, f"Answers not lifted for mode={mode!r}"
 
 
 def test_ask_user_question_hook_posts_and_returns_pre_tool_use_output_in_bypass_mode(

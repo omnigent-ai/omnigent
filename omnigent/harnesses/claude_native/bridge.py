@@ -2051,9 +2051,10 @@ def build_hook_settings(
             "command": evaluate_policy_command,
         }
 
-        # In bypassPermissions mode PermissionRequest never fires, so
-        # AskUserQuestion needs its own PreToolUse hook to surface the
-        # form. It's a no-op in other modes to avoid double-surfacing.
+        # Claude Code fires no PermissionRequest for AskUserQuestion (it needs
+        # no permission), so this PreToolUse hook is the only way to surface the
+        # question in the web UI. It runs in every permission mode; the handler
+        # short-circuits Claude's own picker via an allow/deny decision.
         ask_uq_command_parts = [
             python,
             "-I",
@@ -2066,12 +2067,11 @@ def build_hook_settings(
         ask_uq_hook: _JsonObject = {
             "type": "command",
             "command": shlex.join(ask_uq_command_parts),
-            # Short timeout: if the web-UI elicitation isn't answered
-            # within 10s, the hook returns empty output so Claude falls
-            # through to its TUI picker in bypassPermissions mode. In
-            # default mode this hook exits immediately (no-op), so the
-            # timeout is irrelevant there.
-            "timeout": 10,
+            # Wait up to a day for the web answer, matching the PermissionRequest
+            # hook and the server-side park window: a human reading a multi-part
+            # question needs far longer than a few seconds. On timeout the hook
+            # emits no output, so Claude falls back to its TUI picker.
+            "timeout": 86400,
         }
         # The ``AskUserQuestion`` matcher only fires if that tool is actually
         # callable. A session launched with ``--disallowedTools AskUserQuestion``
