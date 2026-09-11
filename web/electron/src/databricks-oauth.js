@@ -32,8 +32,10 @@ const DEFAULT_SCOPES = "all-apis offline_access";
 // SISU login host for the SPOG account-first picker (mirrors DB One). Prod; set
 // OMNIGENT_DATABRICKS_LOGIN_URL to a staging SISU host when testing on staging.
 const DEFAULT_LOGIN_URL = "https://login.databricks.com";
-// Public first-party OAuth client (PKCE, no secret), registered as a published connector.
-const OAUTH_CLIENT_ID = "omnigent";
+// Public first-party OAuth client (PKCE, no secret), registered as a published
+// connector. Overridable via env so a custom app integration can be used for
+// testing before the published "omnigent" connector exists.
+const OAUTH_CLIENT_ID = (process.env.OMNIGENT_DATABRICKS_OAUTH_CLIENT_ID || "omnigent").trim();
 // Bound on how long we wait for the human to finish logging in in the browser.
 const AUTH_TIMEOUT_MS = 300_000;
 // Renew a little before real expiry so a mint isn't racing the clock.
