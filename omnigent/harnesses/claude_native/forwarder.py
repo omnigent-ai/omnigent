@@ -611,6 +611,7 @@ class _PendingSubagentItem:
     item: ClaudeTranscriptItem
     checkpoint_after: int | None = None
     drop_reason: str | None = None
+    record_timestamp: str | None = None
 
 
 @dataclass
@@ -1918,7 +1919,10 @@ def _pending_items_from_records(
     for record in result.record_items:
         unseen = [item for item in record.items if item.source_id not in seen]
         if unseen:
-            pending.extend(_PendingSubagentItem(item=item) for item in unseen)
+            pending.extend(
+                _PendingSubagentItem(item=item, record_timestamp=record.timestamp)
+                for item in unseen
+            )
             pending[-1] = replace(pending[-1], checkpoint_after=record.next_byte_offset)
         elif pending:
             pending[-1] = replace(pending[-1], checkpoint_after=record.next_byte_offset)
@@ -2055,6 +2059,7 @@ async def _forward_one_subagent(
             break
         drop_reason = batch[0].drop_reason if len(batch) == 1 else None
         completed_items: list[_PendingSubagentItem] = []
+        delivered_now: list[_PendingSubagentItem] = []
         delivered = False
         stop_after_batch = False
         if drop_reason is not None:
@@ -2158,6 +2163,7 @@ async def _forward_one_subagent(
                     retry_individually = True
             else:
                 completed_items.extend(batch)
+                delivered_now.extend(batch)
                 delivered = True
                 item_retry_tracker.clear(retry_key)
         if retry_individually and drop_reason is None:
@@ -2221,6 +2227,7 @@ async def _forward_one_subagent(
                     )
                 else:
                     item_retry_tracker.clear(item_retry_key)
+                    delivered_now.append(pending_item)
                     delivered = True
                 completed_items.append(pending_item)
         had_item = had_item or delivered
@@ -2233,6 +2240,10 @@ async def _forward_one_subagent(
             for pending_item in completed_items
             if pending_item.checkpoint_after is not None
         ]
+        for delivered_item in delivered_now:
+            new_entry = _observe_resume(
+                new_entry, delivered_item.item, delivered_item.record_timestamp
+            )
         new_entry = replace(
             new_entry,
             byte_offset=max(completed_offsets, default=new_entry.byte_offset),
@@ -2433,6 +2444,48 @@ def _terminal_is_current(entry: SubagentEntry, observed_at: str | None) -> bool:
     baseline = _parse_record_timestamp(entry.terminal_observed_at)
     candidate = _parse_record_timestamp(observed_at)
     return baseline is None or (candidate is not None and candidate >= baseline)
+
+
+def _observe_resume(
+    entry: SubagentEntry, item: ClaudeTranscriptItem, timestamp: str | None
+) -> SubagentEntry:
+    """Persist accepted prompt order even when its preceding completion is late."""
+    if not _is_user_resume_item(item) or _parse_record_timestamp(timestamp) is None:
+        return entry
+    if entry.resume_observed_at is not None and not _record_timestamp_is_newer(
+        timestamp, entry.resume_observed_at
+    ):
+        return entry
+    entry = replace(entry, resume_observed_at=timestamp)
+    if entry.terminal_status is not None and _record_timestamp_is_newer(
+        timestamp, entry.terminal_observed_at
+    ):
+        entry = replace(
+            entry,
+            terminal_status=None,
+            terminal_output=None,
+            terminal_observed_at=None,
+            last_status=None,
+            status_reconcile_pending=True,
+        )
+    return entry
+
+
+def _is_user_resume_item(item: ClaudeTranscriptItem) -> bool:
+    """Return True for a delivered user prompt that may resume a stopped child."""
+    if (
+        item.item_type != "message"
+        or item.is_compact_summary
+        or item.is_compact_noop
+        or item.data.get("role") != "user"
+    ):
+        return False
+    if item.data.get("is_meta") is True and not item.is_coordinator_resume:
+        return False
+    content = item.data.get("content")
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "input_text" for block in content
+    )
 
 
 def _apply_terminal_notification(

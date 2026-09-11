@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -31,6 +32,18 @@ def _terminal(*, task="worker", tool="tool_spawn", timestamp=T1, output="first d
                 f"<status>completed</status><result>{output}</result></task-notification>"
             ),
         },
+    }
+
+
+def _resume(timestamp=T2) -> dict:
+    return {
+        "type": "user",
+        "uuid": "resume",
+        "timestamp": timestamp,
+        "isSidechain": True,
+        "isMeta": True,
+        "origin": {"kind": "coordinator"},
+        "message": {"role": "user", "content": "Continue the next part."},
     }
 
 
@@ -133,6 +146,44 @@ class _Scene:
         assert self.events[-1]["status"] in {"completed", "idle"}
         assert self.events[-1]["output"] == output
         assert self.state.subagents["worker"].terminal_status == "completed"
+
+
+async def test_resume_running_retries_after_host_restart_and_long_pause(tmp_path):
+    scene = _Scene(tmp_path)
+    scene.register()
+    await scene.tick(_terminal())
+    _append(scene.child, _resume())
+    await scene.tick(fail_status=True)
+    scene.reload()
+    with patch.object(
+        f.time, "time", return_value=scene.state.subagents["worker"].last_activity_ts + 60
+    ):
+        await scene.tick()
+    assert scene.events[-1]["status"] == "running"
+
+
+@pytest.mark.parametrize("completion_already_seen", [True, False])
+async def test_older_completion_cannot_close_an_accepted_resume(tmp_path, completion_already_seen):
+    scene = _Scene(tmp_path)
+    scene.register()
+    await scene.tick(*([_terminal()] if completion_already_seen else []))
+    _append(scene.child, _resume())
+    await scene.tick()
+    scene.reload()
+    await scene.tick(_terminal())
+    assert scene.events[-1]["status"] == "running"
+    assert scene.state.subagents["worker"].terminal_status is None
+
+
+@pytest.mark.parametrize("tool", ["tool_spawn", None])
+async def test_two_completed_runs_survive_one_parent_read(tmp_path, tool):
+    scene = _Scene(tmp_path)
+    scene.register()
+    _append(scene.child, _resume())
+    await scene.tick(
+        _terminal(tool=tool), _terminal(tool=tool, timestamp=T3, output="second done")
+    )
+    scene.assert_completed("second done")
 
 
 @pytest.mark.parametrize("legacy", [False])

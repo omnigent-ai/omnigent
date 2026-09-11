@@ -10327,6 +10327,8 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
 
 
 _RESUME_TS = "2026-09-10T13:23:13.274Z"
+_EVIDENCE_TS = "2026-09-10T13:22:05.710Z"
+_COORD_TEXT = "The coordinator sent a message while you were working: Keep going."
 
 
 def _terminal_row(
@@ -10639,6 +10641,32 @@ async def test_quiescence_edge_for_ungated_children(
     assert events == [event]
 
 
+def _child_row(uuid: str, text: str, ts: str, kind: str = "prompt") -> dict[str, Any]:
+    """Build one child row; kind selects the prompt/resume/assistant/meta shape."""
+    row: dict[str, Any] = {
+        "isSidechain": True,
+        "type": "assistant" if kind == "assistant" else "user",
+        "uuid": uuid,
+        "timestamp": ts,
+    }
+    if kind == "assistant":
+        row["message"] = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+    else:
+        row["message"] = {"role": "user", "content": text}
+    if kind in ("resume", "meta"):
+        row["isMeta"] = True
+    if kind == "resume":
+        row["origin"] = {"kind": "coordinator"}
+    return row
+
+
+def _append_child_rows(child_jsonl: Path, rows: list[dict[str, Any]]) -> None:
+    """Append decoded rows to a child transcript."""
+    with child_jsonl.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+
 def test_record_timestamp_ordering() -> None:
     """Record timestamps order by instant, never by raw string."""
     newer = "2026-09-10T13:23:13.274Z"
@@ -10649,3 +10677,71 @@ def test_record_timestamp_ordering() -> None:
     assert not forwarder._record_timestamp_is_newer(older, "2026-09-10T13:22:05.710000Z")
     assert not forwarder._record_timestamp_is_newer("not-a-timestamp", older)
     assert not forwarder._record_timestamp_is_newer(None, older)
+
+
+async def test_terminal_child_reopens_on_coordinator_resume(tmp_path: Path) -> None:
+    """A newer coordinator prompt reopens a child; new evidence closes it."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("a-worker", "toolu_A", "completed", "first done", _EVIDENCE_TS)]
+    state = await _tick_subagents(tmp_path, rows, events)
+    assert [e["status"] for e in events] == ["idle"]
+    _append_child_rows(
+        child_jsonl, [_child_row("resume-1", _COORD_TEXT, _RESUME_TS, kind="resume")]
+    )
+    state = await _tick_subagents(tmp_path, [], events, state)
+    assert [e["status"] for e in events] == ["idle", "running"]
+    assert events[1] == {"status": "running"}
+    assert state.subagents["a-worker"].terminal_status is None
+    assert state.subagents["a-worker"].last_status == "running"
+    rows = [
+        _terminal_row("a-worker", "toolu_C2", "completed", "second done", "2026-09-10T13:24:00Z")
+    ]
+    state = await _tick_subagents(tmp_path, rows, events, state)
+    assert [e["status"] for e in events] == ["idle", "running", "idle"]
+    assert events[2] == {"status": "idle", "output": "second done"}
+    assert state.subagents["a-worker"].terminal_status == "completed"
+
+
+async def test_terminal_child_ignores_non_resume_records(tmp_path: Path) -> None:
+    """Assistant output, meta bubbles, and stale prompts never reopen a child."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("a-worker", "toolu_A", "completed", "first done", _EVIDENCE_TS)]
+    state = await _tick_subagents(tmp_path, rows, events)
+    _append_child_rows(
+        child_jsonl,
+        [
+            _child_row("a1", "still thinking", _RESUME_TS, kind="assistant"),
+            _child_row("m1", "cli scaffolding", _RESUME_TS, kind="meta"),
+            _child_row("r1", _COORD_TEXT, "not-a-timestamp", kind="resume"),
+            _child_row("p1", "original spawn prompt", "2026-09-10T13:21:00.000Z"),
+        ],
+    )
+    state = await _tick_subagents(tmp_path, [], events, state)
+
+    assert [e["status"] for e in events] == ["idle"]
+    assert state.subagents["a-worker"].terminal_status == "completed"
+
+
+async def test_reopened_running_post_retries_after_failure(tmp_path: Path) -> None:
+    """A reopened child's failed running POST is retried on the next tick."""
+    transcript_path = tmp_path / "session.jsonl"
+    child_jsonl = _seed_worker(transcript_path, "a-worker", "toolu_A")
+    events: list[dict[str, Any]] = []
+    rows = [_terminal_row("a-worker", "toolu_A", "completed", "first done", _EVIDENCE_TS)]
+    state = await _tick_subagents(tmp_path, rows, events)
+    _append_child_rows(
+        child_jsonl, [_child_row("resume-1", _COORD_TEXT, _RESUME_TS, kind="resume")]
+    )
+    state = await _tick_subagents(tmp_path, [], events, state, fail_status_times=1)
+
+    assert [e["status"] for e in events] == ["idle"]
+    assert state.subagents["a-worker"].terminal_status is None
+    assert state.subagents["a-worker"].last_status is None
+    assert state.subagents["a-worker"].status_reconcile_pending is True
+    state = await _tick_subagents(tmp_path, [], events, state)
+
+    assert [e["status"] for e in events] == ["idle", "running"]
