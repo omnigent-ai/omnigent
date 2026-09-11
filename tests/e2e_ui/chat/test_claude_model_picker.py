@@ -258,7 +258,9 @@ def test_claude_native_picker_updates_after_delayed_catalog(
     assert not any("model_override" in body for body in patch_bodies)
     page.get_by_test_id("composer-config-gear").click()
     page.get_by_test_id("composer-agent-edit").click()
-    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(
+        len(_EXPECTED_ROWS)
+    )
 
 
 def test_claude_native_alias_selection_persists(
@@ -394,7 +396,9 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
     # The catalog still populates the dropdown while the session sleeps.
-    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(
+        len(_EXPECTED_ROWS)
+    )
     _screenshot(page, "asleep-config-gear")
 
     with page.expect_response(
