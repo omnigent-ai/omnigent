@@ -1476,8 +1476,10 @@ def run_claude_native(
     :param prompt: Optional first prompt for the TUI, e.g.
         ``"review the last commit"``. Delivered as Claude Code's
         positional prompt argument, so a multi-line prompt survives
-        intact (one argv entry — never a tmux paste). ``None`` starts
-        the TUI empty.
+        intact (one argv entry — never a tmux paste). Placed before
+        the pass-through args: a trailing variadic value flag (e.g.
+        ``--mcp-config <configs...>``) would consume a trailing
+        positional as another value. ``None`` starts the TUI empty.
     :param command: Executable to run in the terminal resource,
         e.g. ``"claude"``. Kept off the public CLI surface so v0
         always exposes Claude Code, while tests can supply a fake
@@ -1509,9 +1511,12 @@ def run_claude_native(
     sanitized_args = _strip_resume_from_claude_args(claude_args)
     # Claude Code takes the initial prompt as a positional argument, so it
     # rides along with the launch args (persisted for the runner on the remote
-    # path). One argv entry keeps newlines and quotes intact.
+    # path). One argv entry keeps newlines and quotes intact. The prompt goes
+    # first: pass-through args may end in a variadic value flag (e.g.
+    # ``--mcp-config <configs...>``) that would swallow a trailing positional
+    # as another value, while every later merge point only appends flags.
     if prompt and prompt.strip():
-        sanitized_args = (*sanitized_args, prompt)
+        sanitized_args = (prompt, *sanitized_args)
     startup_profiler.mark("claude args normalized")
     # Resolve the launch config across all offerings: a configured provider
     # (configure harnesses), the Databricks ucode profile, or Claude's own
@@ -4208,6 +4213,52 @@ async def _close_claude_terminal(
 # attaching. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
 
+async def _newest_session_error_item(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> tuple[str, str] | None:
+    """
+    Return the newest persisted error item as ``(item_id, message)``.
+
+    When a native terminal launch fails, the runner persists a
+    ``type="error"`` conversation item carrying the diagnosis and the
+    last captured pane output (e.g. claude's own startup error). This
+    reads it so the terminal-ready wait can surface the real cause on
+    the user's TTY. Best-effort: any transport failure, non-200, or
+    unexpected payload yields ``None``.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :returns: The newest error item's ``(id, message)``, or ``None``
+        when the session has none (or the read failed).
+    """
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{url_component(session_id)}/items",
+            params={"limit": 5, "order": "desc"},
+            timeout=30.0,
+        )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "error":
+            continue
+        item_id = item.get("id")
+        message = item.get("message")
+        if isinstance(item_id, str) and isinstance(message, str) and message:
+            return item_id, message
+    return None
+
+
 async def _wait_for_claude_terminal_ready(
     client: httpx.AsyncClient,
     session_id: str,
@@ -4222,19 +4273,47 @@ async def _wait_for_claude_terminal_ready(
     session, so the CLI waits for the resource to appear rather than
     creating it.
 
+    A launch that dies (e.g. ``claude`` exits at argv parse) never
+    produces a running terminal, but the runner does persist the
+    failure as an error item with the captured pane output. The wait
+    watches for an error item that lands after it started and fails
+    fast with that real cause, instead of burning the full timeout and
+    reporting only a generic message.
+
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     :param timeout_s: Max seconds to wait, e.g. ``60.0``.
     :returns: The terminal resource id, e.g. ``"terminal_claude_main"``.
-    :raises click.ClickException: If no terminal appears in time.
+    :raises click.ClickException: If the launch failed (with the
+        runner's recorded cause) or no terminal appears in time.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
     intervals = daemon_poll_intervals()
+    # Errors persisted before the wait began (e.g. a resumed session's old
+    # failure) are not this launch's outcome; only fail fast on a new one.
+    baseline = await _newest_session_error_item(client, session_id)
+    baseline_id = baseline[0] if baseline is not None else None
+
+    def _launch_failure(error: tuple[str, str] | None) -> str | None:
+        if error is None or error[0] == baseline_id:
+            return None
+        return error[1]
+
     while asyncio.get_event_loop().time() < deadline:
         terminal_id = await _find_running_claude_terminal(client, session_id)
         if terminal_id is not None:
             return terminal_id
+        failure = _launch_failure(await _newest_session_error_item(client, session_id))
+        if failure is not None:
+            raise click.ClickException(
+                f"The runner could not start the Claude terminal for {session_id!r}:\n\n{failure}"
+            )
         await asyncio.sleep(next(intervals))
+    failure = _launch_failure(await _newest_session_error_item(client, session_id))
+    if failure is not None:
+        raise click.ClickException(
+            f"The runner could not start the Claude terminal for {session_id!r}:\n\n{failure}"
+        )
     raise click.ClickException(
         f"The runner did not create the Claude terminal for {session_id!r} "
         f"within {timeout_s:.0f}s."

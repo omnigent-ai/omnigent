@@ -341,6 +341,16 @@ export const WORKING_MESSAGES = [
   "Tinkering…",
   "Pondering…",
   "Brewing…",
+  "Noodling…",
+  "Wrangling…",
+  "Conjuring…",
+  "Assembling…",
+  "Percolating…",
+  "Untangling…",
+  "Scheming…",
+  "Finagling…",
+  "Whirring…",
+  "Puzzling…",
 ] as const;
 
 /**

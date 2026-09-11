@@ -11,14 +11,27 @@ export interface ReplyDraft {
   text: string;
 }
 
-function joinParagraphs(parts: string[]): string {
-  return parts
-    .map((part) => part.replace(/^\n+|\n+$/g, ""))
-    .filter((part) => part.trim() !== "")
-    .join("\n\n");
+export interface StoredReplyDraft {
+  version: 1;
+  quotes: Omit<ReplyQuote, "id">[];
+  text: string;
 }
 
-export function serializeReplyDraft(draft: ReplyDraft): string {
+export interface ComposerDraft {
+  text: string;
+  replyDraft?: StoredReplyDraft;
+}
+
+function joinParagraphs(parts: string[]): string {
+  return parts.reduce((joined, part) => {
+    if (!joined || !part) return joined + part;
+    const trailing = joined.match(/(?:\r?\n){1,2}$/)?.[0].match(/\n/g)?.length ?? 0;
+    const leading = part.match(/^(?:\r?\n){1,2}/)?.[0].match(/\n/g)?.length ?? 0;
+    return joined + "\n".repeat(Math.max(0, 2 - trailing - leading)) + part;
+  }, "");
+}
+
+export function serializeReplyDraft(draft: Omit<StoredReplyDraft, "version">): string {
   if (draft.quotes.length === 0) return draft.text;
   return joinParagraphs([
     ...draft.quotes.flatMap((quote) => [
@@ -32,49 +45,48 @@ export function serializeReplyDraft(draft: ReplyDraft): string {
   ]);
 }
 
-/** Restore quote cards from saved, recalled, queued, or failed-send Markdown. */
-export function parseReplyDraft(text: string): ReplyDraft {
-  const quotes: ReplyQuote[] = [];
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  let pending: string[] = [];
-  let fence: { marker: string; length: number } | null = null;
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]!;
-    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (fenceMatch) {
-      const marker = fenceMatch[1]!;
-      const info = fenceMatch[2]!;
-      if (!fence) {
-        if (marker[0] !== "`" || !info.includes("`")) {
-          fence = { marker: marker[0]!, length: marker.length };
-        }
-      } else if (
-        marker[0] === fence.marker &&
-        marker.length >= fence.length &&
-        /^[ \t]*$/.test(info)
-      ) {
-        fence = null;
-      }
-    }
-    if (!fence && /^>( |$)/.test(line)) {
-      const quoted = [line.replace(/^> ?/, "")];
-      while (index + 1 < lines.length && /^>( |$)/.test(lines[index + 1]!)) {
-        quoted.push(lines[++index]!.replace(/^> ?/, ""));
-      }
-      quotes.push({
-        id: nanoid(),
-        before: pending.join("\n").replace(/^\n+|\n+$/g, ""),
-        text: quoted.join("\n"),
-      });
-      pending = [];
-    } else {
-      pending.push(line);
-    }
-  }
+export function snapshotReplyDraft(draft: ReplyDraft): StoredReplyDraft | undefined {
+  if (draft.quotes.length === 0) return undefined;
   return {
-    quotes,
-    text: quotes.length ? pending.join("\n").replace(/^\n+/, "") : text,
+    version: 1,
+    quotes: draft.quotes.map(({ before, text }) => ({ before, text })),
+    text: draft.text,
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Unannotated or unsupported drafts remain plain text, never inferred cards. */
+export function readComposerDraft(value: unknown): ComposerDraft | undefined {
+  if (typeof value === "string") return { text: value };
+  if (!isRecord(value) || typeof value.text !== "string") return undefined;
+  const plain = { text: value.text };
+  const saved = value.replyDraft;
+  if (
+    !isRecord(saved) ||
+    saved.version !== 1 ||
+    typeof saved.text !== "string" ||
+    !Array.isArray(saved.quotes) ||
+    saved.quotes.length === 0
+  )
+    return plain;
+  const quotes: StoredReplyDraft["quotes"] = [];
+  for (const quote of saved.quotes) {
+    if (!isRecord(quote) || typeof quote.before !== "string" || typeof quote.text !== "string")
+      return plain;
+    quotes.push({ before: quote.before, text: quote.text });
+  }
+  const replyDraft: StoredReplyDraft = { version: 1, quotes, text: saved.text };
+  return serializeReplyDraft(replyDraft) === value.text ? { ...plain, replyDraft } : plain;
+}
+
+export function restoreReplyDraft(text: string, replyDraft?: StoredReplyDraft): ReplyDraft {
+  const saved = readComposerDraft({ text, replyDraft })?.replyDraft;
+  return saved
+    ? { quotes: saved.quotes.map((quote) => ({ ...quote, id: nanoid() })), text: saved.text }
+    : { quotes: [], text };
 }
 
 export function removeReplyQuote(draft: ReplyDraft, id: string): ReplyDraft {

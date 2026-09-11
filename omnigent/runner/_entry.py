@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
+import json
 import logging
 import os
 import signal
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from fastapi import FastAPI
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 
     from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
+    from omnigent.spec.types import AgentSpec
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
 _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
@@ -67,6 +69,34 @@ _logger = logging.getLogger(__name__)
 # shares the proxy bearer, even after RUNNER_INITIAL_AUTH_TOKEN has been
 # popped from the environment.
 _runner_auth_factory: Callable[[], str | None] | None = None
+
+
+def _host_interactive_shells_from_env() -> list[str] | None:
+    """Read the host daemon's ordered shell inventory from runner wiring."""
+    from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
+
+    raw = os.environ.get(RUNNER_INTERACTIVE_SHELLS_ENV_VAR)
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    shells = normalize_interactive_shells(decoded)
+    return shells or None
+
+
+def _apply_host_interactive_shells(spec: AgentSpec) -> None:
+    """Replace a native wrapper's portable terminals with its host inventory."""
+    from omnigent.native.native_coding_agents import (
+        native_coding_agent_for_agent_name,
+        native_shell_terminal_specs,
+    )
+
+    shells = _host_interactive_shells_from_env()
+    if shells is None or native_coding_agent_for_agent_name(getattr(spec, "name", None)) is None:
+        return
+    spec.terminals = native_shell_terminal_specs(shells)
 
 
 def _set_runner_auth_factory(factory: Callable[[], str | None] | None) -> None:
@@ -1308,6 +1338,7 @@ async def _resolve_agent_spec_from_server(
         dest.mkdir(parents=True)
         load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
 
 

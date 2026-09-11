@@ -71,7 +71,7 @@ def test_reply_quotes_interleave_with_typed_answers(
 
     _quote_passage(page, _PARA_2)
     expect(remove_quote).to_have_count(2)
-    composer.fill(f"{_ANSWER_1}\n\n{_ANSWER_2}")
+    composer.fill(_ANSWER_2)
 
     events_url = f"{base_url}/v1/sessions/{session_id}/events"
     with page.expect_request(events_url) as sent_request:
@@ -87,6 +87,7 @@ def test_reply_quotes_interleave_with_typed_answers(
     content = sent_request.value.post_data_json["data"]["content"]
     assert content and content[0]["type"] == "input_text"
     text = content[0]["text"]
+    assert text == f"> {_PARA_1}\n\n{_ANSWER_1}\n\n> {_PARA_2}\n\n{_ANSWER_2}"
 
     positions = {
         "first quote": text.find(f"> {_PARA_1}"),

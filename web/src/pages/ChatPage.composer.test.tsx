@@ -16,6 +16,7 @@ import {
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
@@ -901,6 +902,90 @@ describe("Composer slash-command submit routing", () => {
     expect(document.querySelectorAll('[data-slot="tooltip-content"]')).toHaveLength(1);
   });
 
+  it("suppresses the pill tooltip when bare /model opens the picker", async () => {
+    // The programmatic openNonce path (bare `/model`) must suppress the
+    // pill's summary tooltip exactly like the click/keyboard open paths;
+    // otherwise the focus the gear receives (inside the tooltip trigger's
+    // span, so it bubbles there) paints the tooltip over the just-opened
+    // selector.
+    useChatStore.setState({ llmModel: "sonnet" });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    await screen.findByTestId("composer-agent-menu");
+
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+  });
+
+  it("suppresses the pill tooltip while the selector popover is open", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+
+    // Open the selector popover from the pill.
+    const gear = screen.getByTestId("composer-config-gear");
+    fireEvent.keyDown(gear, { key: "ArrowDown" });
+    const menu = screen.getByTestId("composer-agent-menu");
+
+    // Opening the menu focuses the gear, which sits inside the tooltip
+    // trigger's span and bubbles to it (the menu content is a portalled
+    // React sibling — its events do not bubble to the trigger); the tooltip
+    // must stay closed rather than paint over the open menu.
+    fireEvent.focus(gear);
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+
+    // Closing the popover hands focus back to the trigger; that programmatic
+    // focus must NOT instantly reopen the tooltip.
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("composer-agent-menu")).toBeNull());
+    fireEvent.focus(gear);
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        }),
+    );
+    expect(screen.queryByTestId("composer-config-gear-tooltip")).toBeNull();
+
+    // Fresh intent releases the suppression: the pointer re-entering the
+    // tooltip trigger (the span wrapping the pill, which carries the
+    // guard's pointer handler) lets the tooltip open again.
+    fireEvent.pointerEnter(gear.parentElement!);
+    fireEvent.focus(gear);
+    expect(await screen.findByTestId("composer-config-gear-tooltip")).toBeInTheDocument();
+  });
+
   it("keeps the label's truncation chain intact through the pill's wrapper", () => {
     useChatStore.setState({ llmModel: "sonnet" });
     const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
@@ -1530,6 +1615,24 @@ describe("Composer shared visible controls", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["Session workspace", 0],
+    ["Session worktree", 1],
+  ])("wraps text inside the %s popover", (label, triggerIndex) => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const controls = screen.getByTestId("composer-workspace-controls");
+    fireEvent.keyDown(within(controls).getAllByRole("button")[triggerIndex], {
+      key: "ArrowDown",
+    });
+
+    const popover = screen.getByRole("menu");
+    expect(within(popover).getByText(label)).toBeVisible();
+    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,28rem)]");
+    expect(popover).not.toHaveClass("whitespace-nowrap");
+    expect(popover.querySelector("p")).toHaveClass("break-all");
   });
 
   it("renders the same workspace, host, permission and model controls as landing", () => {
@@ -2177,7 +2280,14 @@ describe("Composer pending elicitation", () => {
 describe("Composer reply quotes", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({ conversationId: "conv_test", skills: [], blocks: [] });
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      queuedMessages: [],
+    });
   });
 
   afterEach(() => {
@@ -2220,6 +2330,14 @@ describe("Composer reply quotes", () => {
     expect(props.onSend).toHaveBeenCalledWith(
       "My introduction\n\n> First point\n\nMy first answer\n\n> Second point\n> More detail\n\nMy second answer",
       undefined,
+      {
+        version: 1,
+        quotes: [
+          { before: "My introduction", text: "First point" },
+          { before: "My first answer", text: "Second point\nMore detail" },
+        ],
+        text: "My second answer",
+      },
     );
     expect(textarea()).toHaveValue("");
     expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(0);
@@ -2328,7 +2446,11 @@ describe("Composer reply quotes", () => {
     act(() => ref.current?.appendReplyQuote("Quoted text"));
     expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenLastCalledWith("> Quoted text", undefined);
+    expect(props.onSend).toHaveBeenLastCalledWith("> Quoted text", undefined, {
+      version: 1,
+      quotes: [{ before: "", text: "Quoted text" }],
+      text: "",
+    });
     expect(textarea()).toHaveValue("");
 
     fireEvent.change(textarea(), { target: { value: "Next message" } });
@@ -2376,6 +2498,14 @@ describe("Composer reply quotes", () => {
     expect(props.onSend).toHaveBeenCalledWith(
       "> First quote\n\nRewritten answer\n\n> Second quote",
       undefined,
+      {
+        version: 1,
+        quotes: [
+          { before: "", text: "First quote" },
+          { before: "Rewritten answer", text: "Second quote" },
+        ],
+        text: "",
+      },
     );
     expect(textarea()).toHaveFocus();
   });
@@ -2417,15 +2547,150 @@ describe("Composer reply quotes", () => {
     );
   });
 
-  it("restores Markdown quotes from the previous build as styled cards", () => {
-    setSessionDraft("conv_test", {
-      text: "> First quote\n\nMy first answer\n\n> Second quote\n\n",
-      files: [],
-    });
-    render(<Composer {...composerProps()} />);
+  it.each(["intro\n> quote\nreply", "> quoted\ncontinued", "\nNotes:\n\n> Example text\n\n"])(
+    "restores unannotated Markdown as editable text: %j",
+    (text) => {
+      setSessionDraft("conv_test", { text, files: [] });
+      const props = composerProps();
+      render(<Composer {...props} />);
+      expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(0);
+      expect(textarea()).toHaveValue(text);
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledWith(text.trim(), undefined);
+    },
+  );
+
+  it("restores only actual cards beside authored quotes and an unfinished code fence", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    const before = "Notes:\n> authored\ncontinued\n\n\n";
+    const tail = "~~~markdown\n> code example\n";
+    fireEvent.change(textarea(), { target: { value: before } });
+    act(() => ref.current?.appendReplyQuote("Actual Reply quote"));
+    fireEvent.change(textarea(), { target: { value: tail } });
+    act(() => ref.current?.appendReplyQuote("Quote after unfinished fence"));
+    const saved = getSessionDraft("conv_test");
+
+    act(() => useChatStore.setState({ conversationId: "other" }));
+    act(() => useChatStore.setState({ conversationId: "conv_test" }));
+    expect(getSessionDraft("conv_test")).toEqual(saved);
     expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
-    expect(screen.getByLabelText("Reply text before quote 2")).toHaveValue("My first answer");
-    expect(textarea()).toHaveValue("");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(before);
+    expect(screen.getByLabelText("Reply text before quote 2")).toHaveValue(tail);
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[1]!);
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    expect(textarea()).toHaveValue(before + tail);
+  });
+
+  it("recalls actual cards from history without reclassifying authored Markdown", () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { unmount } = render(<Composer {...props} ref={ref} />);
+    const before = "Intro\n> authored\nlazy continuation\n\n";
+    fireEvent.change(textarea(), { target: { value: before } });
+    act(() => ref.current?.appendReplyQuote("Actual card"));
+    fireEvent.change(textarea(), { target: { value: "My answer\n\n\n" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const sent = vi.mocked(props.onSend).mock.calls[0]!;
+    unmount();
+
+    render(<Composer {...props} />);
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(before);
+    expect(textarea()).toHaveValue("My answer\n\n\n");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenLastCalledWith(...sent);
+  });
+
+  it.each([false, true])("restores failed sends using explicit metadata only: %s", (structured) => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "intro\n> authored\ncontinued", text: "Actual card" }],
+      text: "Answer",
+    };
+    const text = structured ? serializeReplyDraft(replyDraft) : "intro\n> authored\ncontinued";
+    const props = composerProps();
+    render(<Composer {...props} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text,
+          files: [],
+          ...(structured ? { replyDraft } : {}),
+        },
+      }),
+    );
+    expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(structured ? 1 : 0);
+    expect(textarea()).toHaveValue(structured ? "Answer" : text);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe(text);
+    if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
+  });
+
+  it.each([false, true])(
+    "edits and persists queued messages with explicit metadata only: %s",
+    (structured) => {
+      const replyDraft: StoredReplyDraft = {
+        version: 1,
+        quotes: [{ before: "intro\n> authored\ncontinued", text: "Actual card" }],
+        text: "Answer",
+      };
+      const text = structured ? serializeReplyDraft(replyDraft) : "intro\n> authored\ncontinued";
+      useChatStore.setState({
+        status: "streaming",
+        sessionStatus: "running",
+        queuedMessages: [
+          {
+            queueId: "q_reply",
+            conversationId: "conv_test",
+            text,
+            ...(structured ? { replyDraft } : {}),
+          },
+        ],
+      });
+      const props = composerProps({ status: "streaming", isWorking: true });
+      renderWithTooltips(<Composer {...props} />);
+      fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+      expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(structured ? 1 : 0);
+      expect(textarea()).toHaveValue(structured ? "Answer" : text);
+      expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+      expect(getSessionDraft("conv_test")?.text).toBe(text);
+      expect(getSessionDraft("conv_test")?.replyDraft).toEqual(structured ? replyDraft : undefined);
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe(text);
+      if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
+    },
+  );
+
+  it("keeps mention markers in the structured payload used to restore a failed send", () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    render(<Composer {...props} ref={ref} />);
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    act(() => ref.current?.appendReplyQuote("Actual card"));
+    fireEvent.change(textarea(), { target: { value: "My answer" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const [text, , replyDraft] = vi.mocked(props.onSend).mock.calls[0]!;
+    expect(text).toBe("[Attached file: src/example.ts]\n\n> Actual card\n\nMy answer");
+    expect(serializeReplyDraft(replyDraft!)).toBe(text);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text, files: [], replyDraft },
+      }),
+    );
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Actual card");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(
+      "[Attached file: src/example.ts]\n\n",
+    );
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toBe(text);
   });
 
   it("sends slash-command-looking replies as part of the quoted message", () => {
@@ -2436,7 +2701,11 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: "/help" } });
     expect(activeRow()).toBeNull();
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledWith("> Explain /help\n\n/help", undefined);
+    expect(props.onSend).toHaveBeenCalledWith("> Explain /help\n\n/help", undefined, {
+      version: 1,
+      quotes: [{ before: "", text: "Explain /help" }],
+      text: "/help",
+    });
   });
 });
 

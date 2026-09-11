@@ -121,6 +121,12 @@ import {
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  serializeReplyDraft,
+  snapshotReplyDraft,
+  type ComposerDraft,
+  type StoredReplyDraft,
+} from "@/lib/replyDraft";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
@@ -191,6 +197,7 @@ import {
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
+import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
@@ -631,6 +638,7 @@ export function ChatPage() {
     sessionId: string;
     text: string;
     files: File[];
+    replyDraft?: StoredReplyDraft;
   } | null>(null);
 
   // Replay the queued message once the picker's bind brings the runner
@@ -643,9 +651,9 @@ export function ChatPage() {
     if (pendingResumePrompt === null || !agentId || !urlConvId) return;
     if (pendingResumePrompt.sessionId !== urlConvId) return;
     if (runnerOnline !== true) return;
-    const { text, files } = pendingResumePrompt;
+    const { text, files, replyDraft } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files);
+    void useChatStore.getState().send(text, agentId, files, { replyDraft });
   }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
   // Opened when the user tries to interact with an unreachable session
@@ -887,7 +895,7 @@ export function ChatPage() {
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
   const onSend = useCallback(
-    (text: string, files?: File[]) => {
+    (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
       if (isTempConvId(urlConvId)) return;
@@ -897,7 +905,7 @@ export function ChatPage() {
       // into a session the user may switch to first; carry any attachments
       // so the replay sends the same payload.
       if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
+        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [], replyDraft });
         setResumeDirDialogOpen(true);
         return;
       }
@@ -922,10 +930,11 @@ export function ChatPage() {
           readAlwaysSteer(),
         )
       ) {
-        chat.enqueueMessage(text, files);
+        chat.enqueueMessage(text, files, replyDraft);
         return;
       }
       void useChatStore.getState().send(text, agentId, files, {
+        replyDraft,
         onConversationCreated: (newId) => {
           // Eager URL update: the moment the server tells us this
           // conversation's id, promote `/` → `/c/:newId`. Replace (not
@@ -1299,7 +1308,7 @@ interface MainAgentSurfaceProps {
   liveness: SessionLiveness;
   agentsError: unknown;
   disabled: boolean;
-  onSend: (text: string, files?: File[]) => void;
+  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
   /**
    * Invoke a skill via the `slash_command` event path. Gated off inside
    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
@@ -1588,9 +1597,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   }, [scroller]);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const handleSend = useCallback(
-    (text: string, files?: File[]) => {
+    (...args: Parameters<MainAgentSurfaceProps["onSend"]>) => {
       setSendScrollNonce((n) => n + 1);
-      onSend(text, files);
+      onSend(...args);
     },
     [onSend],
   );
@@ -1859,7 +1868,7 @@ interface ComposerProps {
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
   disabled: boolean;
-  onSend: (text: string, files?: File[]) => void;
+  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
   /**
    * Send a recognised skill as a `slash_command` event (the REPL's wire
    * shape) instead of plaintext. When present and the typed command names
@@ -1983,12 +1992,15 @@ export function buildSlashCommandMap(
   showEffort: boolean,
   showModel: boolean,
   showCompact = true,
+  showBtw = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
+    // /btw is a Claude Code CLI built-in — only offer it on claude-native.
+    if (name === "/btw" && !showBtw) continue;
     m[name] = description;
   }
   for (const skill of skills) {
@@ -2016,10 +2028,13 @@ export function buildSlashCommandWithArgsSet(
   skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
+  showBtw = false,
 ): Set<string> {
   const s = new Set<string>();
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
+  // Selecting /btw fills "/btw " so the user types the side question after it.
+  if (showBtw) s.add("/btw");
   for (const skill of skills) s.add(`/${skill.name}`);
   return s;
 }
@@ -2518,6 +2533,7 @@ function ComposerImpl(
     value,
     setValue,
     fullText,
+    storedReplyDraft,
     activeTextId,
     focusText,
     editText,
@@ -2552,6 +2568,28 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  // A settled /btw side-chat overlay is open, so Escape dismisses it here
+  // (before the "Esc cancels turn" branch) rather than interrupting a turn.
+  const btwSidechat = useChatStore((s) => s.btwSidechat);
+  const dismissBtwSidechat = useChatStore((s) => s.dismissBtwSidechat);
+  // While the /btw "Claude Quick Answer" overlay is open, lock the composer:
+  // the side chat is modal (like the terminal overlay), so the next input is
+  // Esc / ✕ to dismiss it, not a new message.
+  const composerLockedByBtw = btwSidechat !== null;
+  // The composer's own Escape handler can't fire while the textarea is
+  // disabled (disabled inputs emit no keydown), so close the overlay from a
+  // document-level Escape while it's open — matching native Claude Code.
+  useEffect(() => {
+    if (!composerLockedByBtw) return;
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        dismissBtwSidechat();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [composerLockedByBtw, dismissBtwSidechat]);
   // The conversation whose draft the composer's value/files currently hold.
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
@@ -2711,6 +2749,8 @@ function ComposerImpl(
   });
   const valueRef = useRef(fullText);
   valueRef.current = fullText;
+  const replyDraftRef = useRef(storedReplyDraft);
+  replyDraftRef.current = storedReplyDraft;
   const filesRef = useRef(files);
   filesRef.current = files;
   // Guards against React StrictMode double-invoke in development:
@@ -2731,7 +2771,7 @@ function ComposerImpl(
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
-    replaceText(restored?.text ?? "");
+    replaceText(restored?.text ?? "", restored?.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -2747,6 +2787,7 @@ function ComposerImpl(
       setSessionDraft(conversationId, {
         text: valueRef.current,
         files: filesRef.current,
+        replyDraft: replyDraftRef.current,
       });
     };
   }, [conversationId, replaceText]);
@@ -2755,8 +2796,8 @@ function ComposerImpl(
   // rather than only learning about a draft when this composer unmounts.
   useEffect(() => {
     if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
-    setSessionDraft(conversationId, { text: fullText, files });
-  }, [conversationId, settledConversationId, fullText, files]);
+    setSessionDraft(conversationId, { text: fullText, files, replyDraft: storedReplyDraft });
+  }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
 
   // Session skills (bundled + host-discovered) come from the snapshot
   // on bind and populate the suggestions menu as ``/skill-name``
@@ -2771,16 +2812,20 @@ function ComposerImpl(
   // codex-native) which inject the slash command into the terminal.
   // SDK harnesses (openai-agents-sdk, claude-sdk) don't support it yet.
   const showCompact = isNativeWrapper;
+  // /btw is a Claude Code CLI built-in (side chat), so offer it only on
+  // claude-native sessions. Selected/typed, it sends as plaintext to the
+  // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
+  const showBtw = sessionHarness === "claude-native";
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact),
-    [skills, showEffort, showModel, showCompact],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw),
+    [skills, showEffort, showModel, showCompact, showBtw],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
-    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel),
-    [skills, showEffort, showModel],
+    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw),
+    [skills, showEffort, showModel, showBtw],
   );
 
   // Suggestions menu is open while the user is still typing the command
@@ -2951,7 +2996,7 @@ function ComposerImpl(
       useChatStore.setState({ pendingRetryStableId: null });
       return;
     }
-    replaceText(failedSendDraft.text);
+    replaceText(failedSendDraft.text, failedSendDraft.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0) {
@@ -3130,7 +3175,7 @@ function ComposerImpl(
   const replyQuoteInsertedRef = useRef(false);
   useImperativeHandle(ref, () => ({
     appendReplyQuote(text) {
-      if (disabled || isReadOnly || unreachable || !text.trim()) return;
+      if (disabled || isReadOnly || unreachable || composerLockedByBtw || !text.trim()) return;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
@@ -3202,6 +3247,8 @@ function ComposerImpl(
   const submit = ({
     resetNativeInputSession = false,
   }: { resetNativeInputSession?: boolean } = {}) => {
+    // The /btw overlay locks the composer — never send while it's open.
+    if (composerLockedByBtw) return;
     const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
@@ -3254,7 +3301,11 @@ function ComposerImpl(
         setPickerOpenNonce((n) => n + 1);
         return;
       }
-      if (cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
+      // /btw is a built-in for menu/autocomplete purposes only — it is NOT
+      // executed locally. It must reach the vendor TUI as plaintext so Claude
+      // Code opens its side chat and the forwarder relays the answer to the
+      // web overlay; fall through to the plaintext send path below.
+      if (cmd !== "/btw" && cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
         executeSlashCommand(cmd, arg);
         return;
       }
@@ -3283,13 +3334,25 @@ function ComposerImpl(
     // (codex says "Attached file:"). Folders carry a trailing "/" so the
     // agent knows to open the directory. The native vendor reads the on-disk
     // workspace file/folder from this marker; no upload happens.
-    const messageText = buildMentionPreamble(mentionedItems, sessionHarness) + trimmed;
+    const mentionPreamble = buildMentionPreamble(mentionedItems, sessionHarness);
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
-    if (trimmed) appendEntry(trimmed);
-    onSend(messageText, files.length > 0 ? files : undefined);
+    if (trimmed) appendEntry(fullText, storedReplyDraft);
+    const sendFiles = files.length > 0 ? files : undefined;
+    if (draft.quotes.length > 0) {
+      // Preserve authored whitespace and quote provenance, including mention markers.
+      const outgoing = {
+        ...draft,
+        quotes: draft.quotes.map((quote, index) =>
+          index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
+        ),
+      };
+      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
+    } else {
+      onSend(mentionPreamble + trimmed, sendFiles);
+    }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     setFiles([]);
@@ -3307,9 +3370,9 @@ function ComposerImpl(
     submit({ resetNativeInputSession: true });
   };
 
-  const applyRecall = (ta: HTMLTextAreaElement, recalled: string) => {
+  const applyRecall = (ta: HTMLTextAreaElement, recalled: ComposerDraft) => {
     recallingRef.current = true;
-    replaceText(recalled);
+    replaceText(recalled.text, recalled.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
     // Move the caret to the end after React applies the new value. Without
@@ -3373,6 +3436,12 @@ function ComposerImpl(
       submit();
       return;
     }
+    // Esc dismisses the /btw sidechat overlay if open
+    if (e.key === "Escape" && btwSidechat) {
+      e.preventDefault();
+      dismissBtwSidechat();
+      return;
+    }
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
@@ -3402,7 +3471,7 @@ function ComposerImpl(
     ) {
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
-        const recalled = recallPrevious(fullText);
+        const recalled = recallPrevious(fullText, storedReplyDraft);
         if (recalled !== null) {
           e.preventDefault();
           applyRecall(ta, recalled);
@@ -3494,7 +3563,10 @@ function ComposerImpl(
           // Re-sending re-queues it (busy) or sends it (idle).
           const target = queuedMessages.find((m) => m.queueId === queueId);
           if (!target) return;
-          replaceText(target.text);
+          replaceText(target.text, target.replyDraft);
+          dirtyRef.current = true;
+          resetCursor();
+          recallingRef.current = false;
           textareaRef.current = tailTextareaRef.current;
           setFiles(target.files ?? []);
           dequeueMessage(queueId);
@@ -3521,7 +3593,11 @@ function ComposerImpl(
                 title={composerWorkspace ?? "No workspace bound"}
               />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" side="top" className="max-w-[min(90vw,24rem)]">
+            <DropdownMenuContent
+              align="start"
+              side="top"
+              className="max-w-[min(90vw,28rem)] whitespace-normal"
+            >
               <DropdownMenuLabel>Session workspace</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
                 {composerWorkspace ?? "This session has no workspace binding."}
@@ -3539,7 +3615,11 @@ function ComposerImpl(
                 data-testid="composer-git-branch"
               />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" side="top" className="max-w-[min(90vw,24rem)]">
+            <DropdownMenuContent
+              align="start"
+              side="top"
+              className="max-w-[min(90vw,28rem)] whitespace-normal"
+            >
               <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
               <p className="break-all px-2 py-1 text-xs text-muted-foreground">
                 {composerBranch || "The runner has not reported a branch for this session."}
@@ -3579,8 +3659,9 @@ function ComposerImpl(
             if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
           },
           "aria-label": "Message the agent",
-          placeholder:
-            readOnlyReason !== null
+          placeholder: composerLockedByBtw
+            ? "Side chat open — press Esc to close"
+            : readOnlyReason !== null
               ? readOnlyReason
               : isReadOnly
                 ? "You have read-only access to this session"
@@ -3594,7 +3675,7 @@ function ComposerImpl(
                         ? "Send a follow-up (queued) — Esc to stop"
                         : "Send a message…",
           rows: 1,
-          disabled: disabled || isReadOnly || unreachable,
+          disabled: disabled || isReadOnly || unreachable || composerLockedByBtw,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
@@ -3611,7 +3692,7 @@ function ComposerImpl(
                 quotes={draft.quotes}
                 activeTextId={activeTextId}
                 keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-                disabled={disabled || isReadOnly || unreachable}
+                disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
                 onGrowth={onViewportShrinkPinScroll}
                 onRemove={(id) => {
                   removeQuote(id);
@@ -3652,6 +3733,39 @@ function ComposerImpl(
                   onOpenDir={openMentionDir}
                   onAttach={attachMention}
                 />
+              )}
+              {/* /btw side-chat overlay — transient question+answer panel,
+            dismissed with Esc / ✕. Never persisted to the transcript. */}
+              {btwSidechat && (
+                <div className="border-b border-border bg-card/50 p-4 backdrop-blur-sm">
+                  <div className="mb-3 flex items-start justify-between">
+                    <h3 className="text-sm font-medium">Claude Quick Answer</h3>
+                    <button
+                      type="button"
+                      onClick={() => dismissBtwSidechat()}
+                      className="rounded-full p-0.5 text-muted-foreground hover:text-foreground"
+                      aria-label="Close side chat"
+                    >
+                      <XIcon className="size-4" />
+                    </button>
+                  </div>
+                  <div className="mb-2">
+                    <p className="mb-1 text-xs text-muted-foreground">Question:</p>
+                    <p className="text-sm">{btwSidechat.question}</p>
+                  </div>
+                  <div className="mb-2">
+                    <p className="mb-1 text-xs text-muted-foreground">Answer:</p>
+                    <div className="prose prose-sm dark:prose-invert max-w-none text-sm">
+                      <FilePathAwareMessageResponse>
+                        {btwSidechat.answer}
+                      </FilePathAwareMessageResponse>
+                    </div>
+                  </div>
+                  {btwSidechat.truncated && (
+                    <p className="text-xs italic text-muted-foreground">Answer was truncated</p>
+                  )}
+                  <p className="mt-2 text-xs text-muted-foreground">Press Esc to close</p>
+                </div>
               )}
               {/* Highlight overlay: a textarea can only paint its text one color, so
             to tint just the `/skill` token we hide the textarea's own glyphs
@@ -3763,7 +3877,9 @@ function ComposerImpl(
             <>
               <ComposerAddMenu
                 disabled={false}
-                attachDisabled={disabled || isReadOnly || hasPendingElicitation}
+                attachDisabled={
+                  disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw
+                }
                 onAttach={() => fileInputRef.current?.click()}
                 showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
                 onGoal={() => setGoalDialogOpen(true)}
@@ -3830,7 +3946,7 @@ function ComposerImpl(
               <ComposerMicButton
                 className="size-8 md:size-7"
                 enableHotkey
-                disabled={disabled || isReadOnly || hasPendingElicitation}
+                disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
                   voiceSnapshotRef.current = value;
                 }}
@@ -4683,6 +4799,11 @@ function SessionHarnessPicker({
       setConfigMenuOpen(true);
     }
   }, [openNonce, disabled, configurable]);
+  // The pill's summary tooltip must not flash open over the menu, nor
+  // instantly reopen when closing the menu refocuses the trigger; see
+  // useMenuGuardedTooltip. Internal menuOpen covers every open path,
+  // including the programmatic /model (openNonce) one.
+  const gearTooltip = useMenuGuardedTooltip(menuOpen);
   useEffect(() => {
     setMenuOpen(false);
     setConfigMenuOpen(false);
@@ -4810,9 +4931,9 @@ function SessionHarnessPicker({
         }}
       >
         <TooltipProvider>
-          <Tooltip>
+          <Tooltip open={gearTooltip.open} onOpenChange={gearTooltip.onOpenChange}>
             <TooltipTrigger asChild>
-              <span className="flex min-w-0">
+              <span className="flex min-w-0" {...gearTooltip.triggerProps}>
                 <DropdownMenuTrigger asChild>
                   <ComposerHarnessTrigger
                     label="Configure session"
@@ -5125,4 +5246,52 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
+}
+/**
+ * How long after the menu closes tooltip open requests stay swallowed.
+ * Radix hands focus back to the trigger on close in the same tick, so the
+ * window only needs to outlive that programmatic focus (and any queued
+ * focus/pointer fallout from the closing menu); 600ms — one hover-open
+ * delay — is comfortably past it without being noticeable to a user who
+ * genuinely re-engages the trigger later.
+ */
+const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
+
+/**
+ * Open state for a tooltip whose trigger contains (or is) a menu trigger.
+ *
+ * Keeps the tooltip closed while the menu is open: the menu trigger sits
+ * inside the tooltip trigger's span, so the focus Radix gives it on open
+ * bubbles to the tooltip trigger and would instantly open the tooltip,
+ * painting it over the menu (equal z-index, later-mounted; the menu content
+ * itself is a portalled React sibling whose events do not bubble here).
+ * Closing the menu hands focus back to that same trigger, which would just
+ * as instantly reopen the tooltip, so open requests stay blocked for a short
+ * window after close — unless the pointer re-enters the trigger, which is
+ * unmistakably fresh hover intent.
+ */
+function useMenuGuardedTooltip(menuOpen: boolean) {
+  const [wantsOpen, setWantsOpen] = useState(false);
+  // Epoch millis until which open requests are ignored; Infinity while the
+  // menu is open. A ref, not state: it is only read when Radix requests an
+  // open, so changing it never needs a re-render.
+  const suppressedUntil = useRef(0);
+  useEffect(() => {
+    if (menuOpen) {
+      setWantsOpen(false);
+      suppressedUntil.current = Number.POSITIVE_INFINITY;
+    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
+      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
+    }
+  }, [menuOpen]);
+  return {
+    open: wantsOpen && !menuOpen,
+    onOpenChange: (next: boolean) =>
+      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
+    triggerProps: {
+      onPointerEnter: () => {
+        if (!menuOpen) suppressedUntil.current = 0;
+      },
+    },
+  } as const;
 }

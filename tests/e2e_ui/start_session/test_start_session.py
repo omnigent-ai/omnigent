@@ -52,6 +52,7 @@ import threading
 from collections.abc import Coroutine
 from typing import Any
 
+import pytest
 from playwright.async_api import Request, Route, async_playwright, expect
 
 from tests.e2e_ui.start_session.helpers import (
@@ -1286,6 +1287,98 @@ async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> N
             )
             chip = page.get_by_test_id("new-chat-landing-host-chip")
             await expect(chip).to_have_attribute("aria-label", re.compile(beta_name))
+        finally:
+            await browser.close()
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["connected-host", "managed-sandbox"])
+def test_start_session_keeps_offline_host_selected(
+    seeded_session: tuple[str, str], managed: bool
+) -> None:
+    """An offline last pick stays selected and blocks sending until an explicit switch."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_keeps_offline_host_selected(base_url, session_id, managed))
+
+
+async def _drive_keeps_offline_host_selected(
+    base_url: str, session_id: str, managed: bool
+) -> None:
+    alpha_id, _alpha_name = _HOST_ALPHA
+    beta_id, beta_name = _HOST_BETA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        hosts = json.loads(_two_hosts_body())
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(json=hosts)
+
+            async def handle_info(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                )
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(json={"data": []})
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            if managed:
+                await page.route("**/v1/info", handle_info)
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{
+                        "{alpha_id}": ["/work/repo"],
+                        "{beta_id}": ["/work/repo"]
+                    }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{beta_id}").click()
+            await expect(chip).to_have_attribute("aria-label", f"Host: {beta_name}, Online")
+
+            # Reload without the in-memory draft after the chosen host disconnects.
+            hosts["hosts"][1]["status"] = "offline"
+            await page.reload()
+            await expect(chip).to_have_attribute("aria-label", f"Host: {beta_name}, Offline")
+            prompt = page.get_by_test_id("new-chat-landing-input")
+            await prompt.fill("Work on this repository")
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_attribute(
+                "aria-label", "Working directory: /work/repo"
+            )
+            submit = page.get_by_test_id("new-chat-landing-submit")
+            await expect(submit).to_be_disabled()
+            await prompt.press("Enter")
+            await chip.click()
+            await expect(
+                page.get_by_test_id(f"new-chat-landing-host-{beta_id}")
+            ).to_have_attribute("data-active", "true")
+            assert create_bodies == []
+
+            # Only an explicit destination change permits creation elsewhere.
+            replacement = (
+                "new-chat-landing-sandbox-option"
+                if managed
+                else f"new-chat-landing-host-{alpha_id}"
+            )
+            await page.get_by_test_id(replacement).click()
+            await expect(submit).to_be_enabled()
+            await submit.click()
+            await _wait_until(lambda: len(create_bodies) == 1)
+            if managed:
+                assert create_bodies[0]["host_type"] == "managed"
+                assert "host_id" not in create_bodies[0]
+            else:
+                assert create_bodies[0]["host_id"] == alpha_id
         finally:
             await browser.close()
 

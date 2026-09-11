@@ -1,10 +1,12 @@
-import { useCallback, useState, type SetStateAction } from "react";
+import { useCallback, useMemo, useState, type SetStateAction } from "react";
 import { nanoid } from "nanoid";
 import {
-  parseReplyDraft,
+  restoreReplyDraft,
   removeReplyQuote,
   serializeReplyDraft,
+  snapshotReplyDraft,
   type ReplyDraft,
+  type StoredReplyDraft,
 } from "@/lib/replyDraft";
 
 export function useReplyDraft() {
@@ -29,8 +31,8 @@ export function useReplyDraft() {
     (next: SetStateAction<string>) => editText(activeTextId, next),
     [activeTextId, editText],
   );
-  const replaceText = useCallback((text: string) => {
-    setDraft(parseReplyDraft(text));
+  const replaceText = useCallback((text: string, saved?: StoredReplyDraft) => {
+    setDraft(restoreReplyDraft(text, saved));
     focusText(null);
   }, []);
   const appendQuote = useCallback((text: string) => {
@@ -45,12 +47,14 @@ export function useReplyDraft() {
     setDraft((current) => removeReplyQuote(current, id));
     focusText(null);
   }, []);
+  const storedReplyDraft = useMemo(() => snapshotReplyDraft(draft), [draft]);
 
   return {
     draft,
     value,
     setValue,
     fullText: serializeReplyDraft(draft),
+    storedReplyDraft,
     activeTextId,
     focusText,
     editText,

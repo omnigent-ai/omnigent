@@ -178,3 +178,57 @@ def test_removing_quote_cards_preserves_edited_replies(
     remove_quote.click()
     expect(remove_quote).to_have_count(0)
     expect(composer).to_have_value("Introduction\n\nRewritten answer\n\nSecond answer")
+
+
+def test_authored_markdown_stays_editable_after_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_role("textbox", name="Message the agent")
+    text = "intro\n> quote\nreply\n\n> quoted\ncontinued"
+    composer.fill(text)
+    page.reload()
+    expect(composer).to_have_value(text)
+    expect(page.get_by_test_id("composer-reply-quote")).to_have_count(0)
+
+    events_url = f"{base_url}/v1/sessions/{session_id}/events"
+    page.route(events_url, lambda route: route.fulfill(json={"queued": True}))
+    with page.expect_request(events_url) as sent:
+        page.get_by_role("button", name="Send", exact=True).click()
+    assert sent.value.post_data_json["data"]["content"] == [{"type": "input_text", "text": text}]
+
+
+def test_reply_card_provenance_survives_reload_beside_authored_markdown(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    base_url, session_id = seeded_session
+    seed_committed_turn(session_id, prompt="Two points", reply="First point.\n\nSecond point.")
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_role("textbox", name="Message the agent")
+    assistant = page.locator('[data-role="assistant"]')
+    before = "Notes:\n> authored blockquote\nlazy continuation\n\n\n"
+    middle = "~~~markdown\n> code example\n"
+    tail = "> authored tail\ncontinued\n\n"
+    composer.fill(before)
+    _reply_to(page, assistant.get_by_text("First point.", exact=True))
+    composer.fill(middle)
+    _reply_to(page, assistant.get_by_text("Second point.", exact=True))
+    composer.fill(tail)
+
+    page.reload()
+    cards = page.get_by_test_id("composer-reply-quote")
+    expect(cards).to_have_count(2)
+    expect(cards.first.locator("blockquote")).to_have_text("First point.")
+    expect(cards.nth(1).locator("blockquote")).to_have_text("Second point.")
+    expect(page.get_by_role("textbox", name="Reply text before quote 1")).to_have_value(before)
+    expect(page.get_by_role("textbox", name="Reply text before quote 2")).to_have_value(middle)
+    expect(composer).to_have_value(tail)
+
+    page.get_by_role("button", name="Remove quote", exact=True).first.click()
+    page.get_by_role("button", name="Remove quote", exact=True).click()
+    expect(cards).to_have_count(0)
+    expect(composer).to_have_value(before + middle + "\n" + tail)

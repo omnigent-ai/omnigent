@@ -1189,6 +1189,73 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
 
 
 @pytest.mark.asyncio
+async def test_create_terminal_rejects_unavailable_native_shell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mixed-version request cannot silently substitute another shell."""
+    from omnigent.inner.datamodel import AgentDef
+    from omnigent.native.native_coding_agents import (
+        CLAUDE_NATIVE_AGENT_NAME,
+        native_shell_terminal_specs,
+    )
+
+    fish = tmp_path / "nix-profile" / "bin" / "fish"
+    fish.parent.mkdir(parents=True)
+    fish.write_text("#!/bin/sh\n")
+    fish.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(fish))
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr("omnigent._platform._INTERACTIVE_SHELL_DIRS", ())
+
+    agent = AgentDef(
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals=native_shell_terminal_specs(["fish"]),
+    )
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_native"})
+
+    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+        return agent
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    resource_registry = _CapturingResourceRegistry(tmp_path)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as client,
+    ):
+        response = await client.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={
+                "terminal": "zsh",
+                "session_key": "shell-1",
+                "spec": {"command": "zsh"},
+            },
+        )
+        success = await client.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={"terminal": "fish", "session_key": "shell-2"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_input"
+    assert "not available on this host" in response.json()["error"]["message"]
+    assert success.status_code == 200
+    assert len(resource_registry.launches) == 1
+    assert resource_registry.launches[0].command == str(fish)
+
+
+@pytest.mark.asyncio
 async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     tmp_path: Path,
 ) -> None:

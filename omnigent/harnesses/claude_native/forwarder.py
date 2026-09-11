@@ -12,7 +12,7 @@ import os
 import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -21,6 +21,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
+    BtwOverlay,
     ClaudeHookRecord,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
@@ -34,7 +35,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
-    read_permission_mode,
+    read_pane_signals,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
@@ -112,11 +113,16 @@ def _subagent_id_from_meta_path(meta_path: Path) -> str:
 _DEFAULT_POLL_INTERVAL_S = 0.25
 _TRANSCRIPT_DISCOVERY_WARNING_S = 30.0
 _OBSERVER_HOOK_STDERR_READ_BYTES = 64 * 1024
-# Minimum spacing between permission-mode pane reads. Unlike the model mirror
-# (which reads a JSON file), this spawns a ``tmux capture-pane`` subprocess, so
-# it runs well below the poll interval; a mode switch is a human action and 2s
-# of lag is imperceptible.
-_PERMISSION_MODE_POLL_INTERVAL_S = 2.0
+# Minimum spacing between pane reads. One ``tmux capture-pane`` subprocess per
+# window feeds every footer-derived signal (permission mode + /btw overlay), so
+# the cost is one subprocess regardless of how many signals are parsed. Both
+# signals change only on a human action (shift+tab, a /btw), so 2s of lag is
+# imperceptible and keeps the subprocess rate low.
+_PANE_POLL_INTERVAL_S = 2.0
+# Bound on the per-session ring of already-relayed /btw exchange keys. The
+# overlay persists (and stacks history) across polls, so a handful of keys
+# covers a session's side chats while keeping the dedupe set small.
+_MAX_SEEN_BTW_KEYS = 64
 # Hard ceiling on one live-output poll. Child-history batches run in their own
 # task, so elapsed time here means the latency-sensitive lane stopped making
 # progress rather than that a healthy backlog drain simply took a long time.
@@ -736,9 +742,10 @@ class _ForwardDedupeState:
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
     # which the web UI can observe on its own.
     posted_permission_mode: str | None = None
-    # Monotonic deadline before which the next pane read is skipped, so the
-    # subprocess spawn runs at _PERMISSION_MODE_POLL_INTERVAL_S, not every poll.
-    permission_mode_next_read: float = 0.0
+    # Monotonic deadline before which the next pane capture is skipped, so the
+    # single ``capture-pane`` subprocess (feeding both the permission-mode and
+    # /btw signals) spawns at _PANE_POLL_INTERVAL_S, not every poll.
+    pane_next_read: float = 0.0
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
@@ -767,6 +774,15 @@ class _ForwardDedupeState:
     # whose ``PreCompact`` was missed from later hijacking an unrelated
     # genuine compaction's token.
     pending_compaction_dismiss_seq: int | None = None
+    # /btw side-chat relay. The overlay is never persisted (transcript,
+    # deltas and hooks are all empty for it), so it is scraped read-only from
+    # the shared pane capture. ``posted_btw_keys`` rings the (question, answer)
+    # hashes already relayed so the persistent, history-stacking overlay isn't
+    # re-posted every poll. ``btw_pending_key`` requires the same exchange on
+    # two consecutive reads before posting, so a torn capture can't relay a
+    # partial answer.
+    btw_pending_key: str | None = None
+    posted_btw_keys: dict[str, None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1336,9 +1352,12 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
                         )
-                        # Same rationale for the permission mode: a shift+tab in
-                        # the pane emits no event, so poll the footer.
-                        await _forward_permission_mode_from_pane(
+                        # Footer-derived signals (permission mode, /btw overlay)
+                        # emit no event and live only in the rendered pane. One
+                        # throttled capture feeds both, so a shift+tab switch and
+                        # a settled /btw exchange both reach the web view without
+                        # spawning a capture-pane subprocess per signal.
+                        await _forward_pane_signals(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
@@ -5070,7 +5089,7 @@ async def _post_external_permission_mode_change(
     resp.raise_for_status()
 
 
-async def _forward_permission_mode_from_pane(
+async def _forward_pane_signals(
     client: httpx.AsyncClient,
     *,
     session_id: str,
@@ -5078,32 +5097,57 @@ async def _forward_permission_mode_from_pane(
     dedupe: _ForwardDedupeState,
 ) -> None:
     """
-    Mirror the pane's permission-mode footer to the session label each poll.
+    Capture the Claude pane ONCE per window and relay every footer signal.
 
-    A shift+tab pressed inside the TUI produces no event Omnigent can see, so
-    without this the web picker shows a stale mode until the next UI-driven
-    switch. Polling the footer is the only signal available: Claude Code emits
-    nothing on a mode change, and hook payloads only arrive on tool use.
-
-    The launch mode is posted too, not just later switches: a session started
-    in manual mode carries no ``--permission-mode`` arg and no mode label, so
-    with nothing posted the web picker has no mode to render and hides itself.
-    Best-effort and idempotent — the server ignores a mode equal to the stored
-    label, an unchanged mode or unreadable pane is a no-op, and a failed POST
-    is retried next poll.
+    Neither the permission mode nor a ``/btw`` side-chat is observable to
+    Omnigent through the transcript, deltas, or hooks — both live only in the
+    rendered pane. Rather than each spawning its own ``tmux capture-pane``
+    subprocess, this reads the pane a single time (throttled to
+    :data:`_PANE_POLL_INTERVAL_S`) and hands the one snapshot to each relay,
+    so the always-on cost is one subprocess per window regardless of how many
+    signals are parsed.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param dedupe: Shared per-session dedupe state; mutated in place.
     """
-    # Throttled: this spawns a tmux subprocess, unlike the file-backed model
-    # mirror that shares this poll loop.
     now = time.monotonic()
-    if now < dedupe.permission_mode_next_read:
+    if now < dedupe.pane_next_read:
         return
-    dedupe.permission_mode_next_read = now + _PERMISSION_MODE_POLL_INTERVAL_S
-    mode = await asyncio.to_thread(read_permission_mode, bridge_dir)
+    dedupe.pane_next_read = now + _PANE_POLL_INTERVAL_S
+    signals = await asyncio.to_thread(read_pane_signals, bridge_dir)
+    await _relay_permission_mode(
+        client, session_id=session_id, mode=signals.permission_mode, dedupe=dedupe
+    )
+    await _relay_btw_overlay(
+        client, session_id=session_id, overlay=signals.btw_overlay, dedupe=dedupe
+    )
+
+
+async def _relay_permission_mode(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    mode: str | None,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Mirror the pane's permission-mode footer to the session label.
+
+    A shift+tab pressed inside the TUI produces no event Omnigent can see, so
+    without this the web picker shows a stale mode until the next UI-driven
+    switch. The launch mode is posted too, not just later switches: a session
+    started in manual mode carries no ``--permission-mode`` arg and no mode
+    label, so with nothing posted the web picker has no mode to render and
+    hides itself. Best-effort and idempotent — an unchanged or unreadable
+    (``None``) mode is a no-op, and a failed POST is retried next poll.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param mode: The permission-mode footer parsed from the pane, or ``None``.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    """
     if mode is None or mode == dedupe.posted_permission_mode:
         return
     try:
@@ -5122,6 +5166,104 @@ async def _forward_permission_mode_from_pane(
         )
         return
     dedupe.posted_permission_mode = mode
+
+
+async def _relay_btw_overlay(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    overlay: BtwOverlay | None,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Mirror a completed Claude Code ``/btw`` side-chat into the web view.
+
+    ``/btw`` answers live only in the in-TUI overlay — never in the
+    transcript, the message-deltas file, or a hook — so the transcript
+    forwarder relays nothing. Given the settled overlay scraped from the
+    shared pane capture, this posts it as a single TRANSIENT
+    ``external_btw_sidechat`` event: the web UI shows the ephemeral overlay
+    (dismissed with Escape) and nothing is written to the main transcript,
+    faithful to ``/btw``'s side-chat nature. Both entry points are covered:
+    a ``/btw`` typed in the web composer or directly in the embedded terminal.
+
+    Best-effort: a long answer the pane clipped is relayed with the
+    ``truncated`` flag set (the overlay points at the terminal for the full
+    text — read-only capture cannot page the overlay). Deduped so the
+    persistent, history-stacking overlay posts each distinct exchange once;
+    a failed POST simply retries next poll.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param overlay: The settled ``/btw`` overlay parsed from the pane, or
+        ``None`` when none is shown.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    """
+    if overlay is None:
+        dedupe.btw_pending_key = None
+        return
+    key = hashlib.sha256(f"{overlay.question or ''}\x00{overlay.answer}".encode()).hexdigest()
+    if key in dedupe.posted_btw_keys:
+        return
+    # Require the same exchange on two consecutive reads before relaying so a
+    # torn capture (footer read, answer still painting) can't post a partial.
+    if dedupe.btw_pending_key != key:
+        dedupe.btw_pending_key = key
+        return
+    try:
+        await _post_external_btw_sidechat(
+            client,
+            session_id=session_id,
+            question=overlay.question or "/btw",
+            answer=overlay.answer,
+            truncated=overlay.truncated,
+        )
+    except httpx.HTTPError:
+        # Leave the exchange un-relayed (not in ``posted_btw_keys``) so the
+        # next poll retries; the overlay persists until dismissed.
+        _logger.debug(
+            "claude-native /btw relay post failed; session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    dedupe.posted_btw_keys[key] = None
+    dedupe.btw_pending_key = None
+    while len(dedupe.posted_btw_keys) > _MAX_SEEN_BTW_KEYS:
+        dedupe.posted_btw_keys.pop(next(iter(dedupe.posted_btw_keys)))
+
+
+async def _post_external_btw_sidechat(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    question: str,
+    answer: str,
+    truncated: bool,
+) -> None:
+    """
+    Post one transient ``external_btw_sidechat`` event to the Sessions API.
+
+    The server broadcasts it to the conversation's live stream without
+    persisting anything (see ``_publish_btw_sidechat``), so the ``/btw``
+    exchange shows as a dismissable overlay and never enters the transcript.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param question: The ``/btw`` request line as typed.
+    :param answer: The side-chat answer text.
+    :param truncated: True when the pane clipped a longer answer.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_btw_sidechat",
+            "data": {"question": question, "answer": answer, "truncated": truncated},
+        },
+    )
+    resp.raise_for_status()
 
 
 async def _post_external_model_change(

@@ -30,7 +30,9 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
 )
+from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
@@ -3291,6 +3293,137 @@ async def test_list_sessions_includes_external_session_id(
 
 
 # ── claude-native session discovery (list + snapshot) ────────────
+
+
+async def test_session_agent_terminals_follow_selected_host(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+) -> None:
+    """Fresh projections use the host for both old and new native sessions."""
+    host_id = "6b9c07bfb42f687d53af44f018adebee"
+    terminal_spec = {
+        "bash": {
+            "command": "bash",
+            "os_env": {"type": "caller_process", "cwd": "."},
+        }
+    }
+    native_agent = await create_test_agent(
+        client,
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals=terminal_spec,
+    )
+    native_session = await _create_session(client, native_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        native_session["id"], host_id=host_id, workspace="/tmp/native"
+    )
+
+    HostStore(db_uri).upsert_on_connect(host_id, "zsh-host", "owner@example.com")
+    app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="zsh-host",
+            interactive_shells=["zsh", "bash"],
+        ),
+        owner="owner@example.com",
+    )
+
+    native_response = await client.get(f"/v1/sessions/{native_session['id']}/agent")
+    assert native_response.status_code == 200, native_response.text
+    assert native_response.json()["terminals"] == ["zsh", "bash"]
+
+    new_native_session = await _create_session(client, native_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        new_native_session["id"], host_id=host_id, workspace="/tmp/new-native"
+    )
+    new_native_response = await client.get(f"/v1/sessions/{new_native_session['id']}/agent")
+    assert new_native_response.status_code == 200, new_native_response.text
+    assert new_native_response.json()["terminals"] == ["zsh", "bash"]
+
+    custom_agent = await create_test_agent(
+        client,
+        name="custom-shell-agent",
+        terminals=terminal_spec,
+    )
+    custom_session = await _create_session(client, custom_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        custom_session["id"], host_id=host_id, workspace="/tmp/custom"
+    )
+
+    custom_response = await client.get(f"/v1/sessions/{custom_session['id']}/agent")
+    assert custom_response.status_code == 200, custom_response.text
+    assert custom_response.json()["terminals"] == ["bash"]
+
+
+@pytest.mark.parametrize("cached_inventory", [False, True])
+async def test_host_shell_inventory_miss_returns_wrong_replica(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    cached_inventory: bool,
+) -> None:
+    """Missing or stale replica-local metadata must trigger re-addressing."""
+    host_id = "7b9c07bfb42f687d53af44f018adebee"
+    HostStore(db_uri).upsert_on_connect(host_id, "remote-host", "owner@example.com")
+    native_agent = await create_test_agent(
+        client,
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals={
+            "zsh": {
+                "command": "zsh",
+                "os_env": {"type": "caller_process", "cwd": "."},
+            }
+        },
+    )
+    session = await _create_session(client, native_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        session["id"], host_id=host_id, workspace="/tmp/native"
+    )
+    if cached_inventory:
+        app.state.host_registry.register(
+            host_id,
+            AsyncMock(),
+            HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="former-local-host",
+                interactive_shells=["bash"],
+            ),
+            owner="owner@example.com",
+        )
+        app.state.host_registry.deregister(host_id)
+
+    agent_response = await client.get(f"/v1/sessions/{session['id']}/agent")
+    terminal_response = await client.post(
+        f"/v1/sessions/{session['id']}/resources/terminals",
+        json={"terminal": "zsh", "session_key": "shell-1"},
+    )
+
+    assert agent_response.status_code == 400
+    assert agent_response.json()["error"]["code"] == "wrong_replica"
+    assert terminal_response.status_code == 400
+    assert terminal_response.json()["error"]["code"] == "wrong_replica"
+
+    custom_agent = await create_test_agent(
+        client,
+        name="custom-remote-agent",
+        terminals={
+            "zsh": {
+                "command": "zsh",
+                "os_env": {"type": "caller_process", "cwd": "."},
+            }
+        },
+    )
+    custom_session = await _create_session(client, custom_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        custom_session["id"], host_id=host_id, workspace="/tmp/custom"
+    )
+    custom_response = await client.get(f"/v1/sessions/{custom_session['id']}/agent")
+    assert custom_response.status_code == 200
+    assert custom_response.json()["terminals"] == ["zsh"]
 
 
 async def test_claude_native_session_discoverable_with_terminal_metadata(
@@ -7777,10 +7910,11 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
     event type absent from the route's payload-validation passthrough 400s
     every POST, and one absent from ``ServerStreamEvent`` fails at the SSE
     boundary — both invisible to the forwarder, which logs post failures at
-    debug level. Drives ``_forward_permission_mode_from_pane`` itself rather
-    than a hand-rolled POST, so the mirror's own logic is on the path.
+    debug level. Drives ``_forward_pane_signals`` itself rather than a
+    hand-rolled POST, so the mirror's own logic is on the path.
     """
     from omnigent.harnesses.claude_native import forwarder as fwd
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
     from tests.server.helpers import start_session_stream_collector
 
     agent = await create_test_agent(client)
@@ -7789,21 +7923,21 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
 
     pane_mode = "default"
 
-    def _fake_read(_bridge_dir: Any) -> str | None:
-        """Serve the pane footer the forwarder would capture via tmux."""
-        return pane_mode
+    def _fake_read(_bridge_dir: Any) -> PaneSignals:
+        """Serve the pane signals the forwarder would capture via tmux."""
+        return PaneSignals(permission_mode=pane_mode)
 
     dedupe = fwd._ForwardDedupeState()
     collector = await start_session_stream_collector(session_id)
     try:
         with (
-            patch.object(fwd, "read_permission_mode", _fake_read),
-            patch.object(fwd, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0),
+            patch.object(fwd, "read_pane_signals", _fake_read),
+            patch.object(fwd, "_PANE_POLL_INTERVAL_S", 0.0),
         ):
 
             async def _poll() -> None:
-                """Run one real permission-mode mirror pass against the server."""
-                await fwd._forward_permission_mode_from_pane(
+                """Run one real pane-signal mirror pass against the server."""
+                await fwd._forward_pane_signals(
                     client=client,
                     session_id=session_id,
                     bridge_dir=Path("/tmp/omnigent/claude-native/e2e"),

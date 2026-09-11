@@ -208,6 +208,7 @@ export function SwitchHostDialog({
       // sitting in "Switching…" long after the move has landed.
       handleOpenChange(false);
       void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["session-agent", sessionId] });
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't switch hosts. Try again.");

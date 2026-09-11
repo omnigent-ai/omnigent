@@ -17,6 +17,7 @@ from omnigent.entities import (
     Agent,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -371,7 +372,12 @@ def _policy_description(spec: PolicySpec) -> str | None:
     return None
 
 
-def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
+def _to_agent_object(
+    agent: Agent,
+    cache: AgentCache | None,
+    *,
+    terminals_override: list[str] | None = None,
+) -> AgentObject:
     """
     Convert a runtime :class:`Agent` entity to an API-layer
     :class:`AgentObject`.
@@ -385,6 +391,8 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
 
     :param agent: The runtime agent entity.
     :param cache: Agent cache, or ``None`` in test setups.
+    :param terminals_override: Selected host's shell inventory. Applied only
+        when the loaded spec is a recognized native wrapper.
     :returns: An :class:`AgentObject` for the API response.
     """
     mcp_servers: list[MCPServerSummary] = []
@@ -409,7 +417,12 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
                 description = loaded.spec.description
             # Declared terminal names, in spec order — the Web UI
             # gates its "new terminal" affordance on this list.
-            terminals = list(loaded.spec.terminals or {})
+            terminals = (
+                list(terminals_override)
+                if terminals_override is not None
+                and native_coding_agent_for_agent_name(loaded.spec.name) is not None
+                else list(loaded.spec.terminals or {})
+            )
             # Bundled skills only (mirrors GET /v1/agents); the merged
             # bundled + host-discovered set lives on the session snapshot.
             skills = [

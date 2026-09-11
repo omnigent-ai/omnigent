@@ -27,6 +27,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    BtwOverlay,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     TranscriptReadResult,
@@ -4146,34 +4147,17 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_forwarder_mirrors_in_pane_permission_mode_switch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_relay_permission_mode_mirrors_switch_and_dedupes() -> None:
     """
     Both the launch mode and a later shift+tab reach the session label.
 
-    Claude Code emits no event on a mode change, so the pane footer is polled.
-    The launch mode is posted as well: a manual-mode session has no mode label
-    and no launch flag, so skipping it would leave the web picker with nothing
-    to render. Repeat polls of an unchanged footer stay quiet.
+    Claude Code emits no event on a mode change, so the pane footer is
+    mirrored. The launch mode is posted as well: a manual-mode session has no
+    mode label and no launch flag, so skipping it would leave the web picker
+    with nothing to render. An unchanged footer stays quiet, and a footerless
+    (``None``) read must not post a reversal.
     """
-    bridge_dir = tmp_path / "bridge"
-    pane_mode: str | None = "default"
-    reads = 0
-
-    def _fake_read(_bridge_dir: Path) -> str | None:
-        """Serve the pane's current mode, counting each capture."""
-        nonlocal reads
-        reads += 1
-        return pane_mode
-
-    monkeypatch.setattr(forwarder, "read_permission_mode", _fake_read)
-    # Reads are throttled off a monotonic deadline; zero the interval so each
-    # call in this test performs a capture instead of returning early.
-    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
     dedupe = forwarder._ForwardDedupeState()
-
     posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
@@ -4184,61 +4168,51 @@ async def test_forwarder_mirrors_in_pane_permission_mode_switch(
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
 
-        async def _poll() -> None:
-            """Run one permission-mode mirror pass."""
-            await forwarder._forward_permission_mode_from_pane(
-                client=client,
+        async def _relay(mode: str | None) -> None:
+            """Run one permission-mode relay pass for the given pane mode."""
+            await forwarder._relay_permission_mode(
+                client,
                 session_id="conv_abc",
-                bridge_dir=bridge_dir,
+                mode=mode,
                 dedupe=dedupe,
             )
 
-        # Poll 1: the launch mode is posted, so the picker has a mode to show.
-        await _poll()
+        # The launch mode is posted, so the picker has a mode to show.
+        await _relay("default")
         assert [p["type"] for p in posts] == ["external_permission_mode_change"]
         assert posts[0]["data"] == {"permission_mode": "default"}
         assert dedupe.posted_permission_mode == "default"
 
-        # Poll 2: unchanged footer is a no-op, not a repeat POST.
-        await _poll()
+        # Unchanged footer is a no-op, not a repeat POST.
+        await _relay("default")
         assert len(posts) == 1
 
-        # Poll 3: the user presses shift+tab into auto mode.
-        pane_mode = "auto"
-        await _poll()
+        # The user presses shift+tab into auto mode.
+        await _relay("auto")
         assert posts[-1]["data"] == {"permission_mode": "auto"}
         assert dedupe.posted_permission_mode == "auto"
 
-        # Poll 4: still auto — the switch isn't re-posted every poll.
-        await _poll()
+        # Still auto — the switch isn't re-posted every poll.
+        await _relay("auto")
         assert len(posts) == 2
 
         # A footerless pane reads as unknown and must not post a reversal.
-        pane_mode = None
-        await _poll()
+        await _relay(None)
         assert len(posts) == 2
         assert dedupe.posted_permission_mode == "auto"
-    assert reads == 5
 
 
 @pytest.mark.asyncio
-async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_relay_permission_mode_posts_manual_launch_mode() -> None:
     """
     A manual-mode launch publishes a mode, keeping the picker reachable.
 
     Manual is the default, and launching into it writes no
     ``--permission-mode`` arg and no mode label, leaving the pane footer as the
-    only source. The first poll must post it: with no mode stored the web
+    only source. The first relay must post it: with no mode stored the web
     picker hides itself, and manual becomes a state no one can switch out of.
     """
-    bridge_dir = tmp_path / "bridge"
-    monkeypatch.setattr(forwarder, "read_permission_mode", lambda _bridge_dir: "default")
-    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
     dedupe = forwarder._ForwardDedupeState()
-
     posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
@@ -4248,10 +4222,10 @@ async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        await forwarder._forward_permission_mode_from_pane(
-            client=client,
+        await forwarder._relay_permission_mode(
+            client,
             session_id="conv_abc",
-            bridge_dir=bridge_dir,
+            mode="default",
             dedupe=dedupe,
         )
 
@@ -4262,10 +4236,7 @@ async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_retries_permission_mode_post_after_transient_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_relay_permission_mode_retries_after_transient_failure() -> None:
     """
     A failed mode POST is retried, so the switch isn't silently dropped.
 
@@ -4273,16 +4244,7 @@ async def test_forwarder_retries_permission_mode_post_after_transient_failure(
     advanced the baseline, the web picker would stay stale until the user
     switched modes again.
     """
-    pane_mode = "default"
-
-    def _fake_read(_bridge_dir: Path) -> str | None:
-        """Serve the pane's current mode."""
-        return pane_mode
-
-    monkeypatch.setattr(forwarder, "read_permission_mode", _fake_read)
-    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
     dedupe = forwarder._ForwardDedupeState()
-
     posts: list[dict[str, Any]] = []
     fail_modes = {"plan"}
 
@@ -4299,65 +4261,29 @@ async def test_forwarder_retries_permission_mode_post_after_transient_failure(
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
 
-        async def _poll() -> None:
-            """Run one permission-mode mirror pass."""
-            await forwarder._forward_permission_mode_from_pane(
-                client=client,
+        async def _relay(mode: str | None) -> None:
+            """Run one permission-mode relay pass for the given pane mode."""
+            await forwarder._relay_permission_mode(
+                client,
                 session_id="conv_abc",
-                bridge_dir=tmp_path / "bridge",
+                mode=mode,
                 dedupe=dedupe,
             )
 
-        await _poll()  # the launch mode lands
+        await _relay("default")  # the launch mode lands
         assert dedupe.posted_permission_mode == "default"
 
-        pane_mode = "plan"
-        await _poll()
+        await _relay("plan")
         assert len(posts) == 2
         assert dedupe.posted_permission_mode == "default"  # NOT advanced — POST failed
 
-        await _poll()
+        await _relay("plan")
         assert [p["data"] for p in posts] == [
             {"permission_mode": "default"},
             {"permission_mode": "plan"},
             {"permission_mode": "plan"},
         ]
         assert dedupe.posted_permission_mode == "plan"  # now committed
-
-
-@pytest.mark.asyncio
-async def test_forwarder_throttles_permission_mode_pane_reads(tmp_path: Path) -> None:
-    """
-    Pane reads are spaced by the throttle, not run on every poll.
-
-    Unlike the file-backed model mirror sharing this loop, each read spawns a
-    ``tmux capture-pane`` subprocess. The poll loop is far tighter than the
-    throttle, so an unthrottled read would spawn processes continuously for a
-    signal that only changes when a human presses shift+tab.
-    """
-    reads = 0
-
-    def _fake_read(_bridge_dir: Path) -> str | None:
-        """Count captures; the mode itself is irrelevant here."""
-        nonlocal reads
-        reads += 1
-        return "default"
-
-    with patch.object(forwarder, "read_permission_mode", _fake_read):
-        dedupe = forwarder._ForwardDedupeState()
-        transport = httpx.MockTransport(lambda _req: httpx.Response(202, json={}))
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            for _ in range(5):
-                await forwarder._forward_permission_mode_from_pane(
-                    client=client,
-                    session_id="conv_abc",
-                    bridge_dir=tmp_path / "bridge",
-                    dedupe=dedupe,
-                )
-
-    # Five back-to-back polls inside one throttle window capture once.
-    assert reads == 1
-    assert dedupe.permission_mode_next_read > 0.0
 
 
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(
@@ -10323,3 +10249,166 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+# ── /btw side-chat overlay relay ───────────────────────────────────
+
+
+def _btw_recording_client_calls() -> tuple[list[dict[str, Any]], httpx.MockTransport]:
+    """
+    Build a MockTransport that records POST bodies for /btw relay tests.
+
+    :returns: The shared ``calls`` list and the transport to hand an
+        ``httpx.AsyncClient``.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record each POST body and return a benign success."""
+        calls.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"queued": False, "item_id": "item_x"})
+
+    return calls, httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_relays_after_stability_then_dedupes() -> None:
+    """
+    A settled /btw overlay relays ONE transient side-chat event.
+
+    The first read only records the exchange as pending (torn-capture
+    guard); the second (same exchange) posts the transient
+    ``external_btw_sidechat`` event; the third is deduped and posts nothing.
+    """
+    overlay = BtwOverlay(question="/btw is this ok?", answer="Yes, all good.", truncated=False)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(3):
+            await forwarder._relay_btw_overlay(
+                client,
+                session_id="conv1",
+                overlay=overlay,
+                dedupe=dedupe,
+            )
+
+    assert len(calls) == 1
+    (body,) = calls
+    assert body["type"] == "external_btw_sidechat"
+    assert body["data"]["question"] == "/btw is this ok?"
+    assert body["data"]["answer"] == "Yes, all good."
+    assert body["data"]["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_relays_truncated_flag() -> None:
+    """A clipped overlay relays the visible answer with truncated=True."""
+    overlay = BtwOverlay(question="/btw big", answer="line1\nline2", truncated=True)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(2):
+            await forwarder._relay_btw_overlay(
+                client,
+                session_id="conv1",
+                overlay=overlay,
+                dedupe=dedupe,
+            )
+
+    assert len(calls) == 1
+    assert calls[0]["data"]["answer"] == "line1\nline2"
+    assert calls[0]["data"]["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_relay_btw_overlay_no_overlay_is_noop() -> None:
+    """No visible overlay posts nothing and clears any pending key."""
+    dedupe = forwarder._ForwardDedupeState()
+    dedupe.btw_pending_key = "stale"
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._relay_btw_overlay(
+            client,
+            session_id="conv1",
+            overlay=None,
+            dedupe=dedupe,
+        )
+
+    assert calls == []
+    assert dedupe.btw_pending_key is None
+
+
+@pytest.mark.asyncio
+async def test_forward_pane_signals_captures_once_and_relays_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    One throttled capture feeds both the permission-mode and /btw relays.
+
+    Back-to-back polls inside one throttle window capture the pane exactly
+    once (the shared-capture win), and the single snapshot's mode + settled
+    overlay both reach the wire (the overlay after its two-read stability
+    guard).
+    """
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    overlay = BtwOverlay(question="/btw ok?", answer="Yes.", truncated=False)
+    reads = 0
+
+    def _fake_signals(_bridge_dir: Path) -> PaneSignals:
+        """Serve one snapshot carrying both signals, counting captures."""
+        nonlocal reads
+        reads += 1
+        return PaneSignals(permission_mode="auto", btw_overlay=overlay)
+
+    monkeypatch.setattr(forwarder, "read_pane_signals", _fake_signals)
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(3):
+            await forwarder._forward_pane_signals(
+                client,
+                session_id="conv1",
+                bridge_dir=tmp_path,
+                dedupe=dedupe,
+            )
+
+    types = [c["type"] for c in calls]
+    assert types.count("external_permission_mode_change") == 1
+    assert types.count("external_btw_sidechat") == 1
+    assert dedupe.posted_permission_mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_forward_pane_signals_throttles_capture(tmp_path: Path) -> None:
+    """Back-to-back polls inside one throttle window capture the pane once."""
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    reads = 0
+
+    def _fake_signals(_bridge_dir: Path) -> PaneSignals:
+        """Count captures; the signals themselves are irrelevant here."""
+        nonlocal reads
+        reads += 1
+        return PaneSignals()
+
+    with patch.object(forwarder, "read_pane_signals", _fake_signals):
+        dedupe = forwarder._ForwardDedupeState()
+        transport = httpx.MockTransport(lambda _req: httpx.Response(202, json={}))
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+            for _ in range(5):
+                await forwarder._forward_pane_signals(
+                    client,
+                    session_id="conv1",
+                    bridge_dir=tmp_path,
+                    dedupe=dedupe,
+                )
+
+    assert reads == 1
+    assert dedupe.pane_next_read > 0.0
