@@ -2319,8 +2319,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
     setActive((s) => {
       if (s.conversationId !== sessionId) return {};
+      // Deliberately leaves `pendingUserMessages` alone: a just-sent prompt
+      // may still be optimistic (POSTed, not yet reconciled by
+      // `session.input.consumed`), and wiping it here deletes the user's
+      // message from the transcript with no undo. Reconciliation is owned by
+      // the server events: `input.consumed` promotes the bubble and the
+      // terminal `session.status` handler clears truly dangling ones.
       const patch: Partial<ChatState> = {
-        pendingUserMessages: [],
         status: "idle",
         sessionStatus: "idle",
         backgroundTaskCount: 0,
