@@ -17,6 +17,7 @@
 // groups react to the same input.
 
 import type React from "react";
+import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useState } from "react";
 import {
   CalendarClockIcon,
@@ -45,6 +46,7 @@ import {
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
 export interface CommandPaletteProps {
+  sessionsOnly?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Flip the left (Conversations) sidebar — owned by AppShell. */
@@ -99,6 +101,7 @@ function HighlightedText({ text, query }: { text: string; query: string }): Reac
 const IDLE_SESSION_LIMIT = 5;
 
 export function CommandPalette({
+  sessionsOnly = false,
   open,
   onOpenChange,
   onToggleLeftSidebar,
@@ -174,16 +177,26 @@ export function CommandPalette({
 
   const filteredActions = useMemo(() => {
     const q = query.trim().toLowerCase();
+    if (sessionsOnly) return [];
     if (q === "") return actions;
     return actions.filter(
       (a) =>
         a.label.toLowerCase().includes(q) || a.keywords.some((k) => k.toLowerCase().includes(q)),
     );
-  }, [actions, query]);
+  }, [actions, query, sessionsOnly]);
 
   // includeArchived=true shares the sidebar's cache key; archived rows are
   // filtered out below so the palette only lists active sessions.
-  const { data, isFetching } = useConversations(debouncedQuery, true);
+  const { data, isFetching, hasNextPage, fetchNextPage, isFetchNextPageError } = useConversations(
+    sessionsOnly ? "" : debouncedQuery,
+    !sessionsOnly,
+    { enabled: open },
+  );
+  useEffect(() => {
+    if (open && sessionsOnly && hasNextPage && !isFetching && !isFetchNextPageError) {
+      void fetchNextPage();
+    }
+  }, [open, sessionsOnly, hasNextPage, isFetching, isFetchNextPageError, fetchNextPage]);
 
   const sessions = useMemo(() => {
     const seen = new Set<string>();
@@ -207,8 +220,20 @@ export function CommandPalette({
     // Actions group below the fold. Cap the idle list to the few most-recent
     // sessions so both groups fit without scrolling; once the user types, show
     // every match (finding a specific session is then the point).
+    if (sessionsOnly) {
+      if (!query.trim()) return out;
+      return out
+        .map((session) => ({ ...session, score: defaultFilter(session.label, query.trim()) }))
+        .filter((session) => session.score > 0)
+        .sort((first, second) => second.score - first.score);
+    }
     return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, debouncedQuery]);
+  }, [data, debouncedQuery, query, sessionsOnly]);
+
+  const paletteLabel = sessionsOnly ? "Switch session" : "Command palette";
+  const placeholder = sessionsOnly
+    ? "Search sessions by name…"
+    : "Search sessions or run a command";
 
   const runAction = (action: ActionCommand): void => {
     close();
@@ -250,12 +275,12 @@ export function CommandPalette({
         }
         showCloseButton={false}
       >
-        <DialogTitle className="sr-only">Command palette</DialogTitle>
+        <DialogTitle className="sr-only">{paletteLabel}</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions
             (see file header). vimBindings=false: keep Ctrl+K/J from doubling as
             list-nav on Win/Linux, where Ctrl+K is also the opener. */}
         {/* Command's base class is `size-full`, so it already fills the sheet. */}
-        <Command shouldFilter={false} vimBindings={false} label="Command palette">
+        <Command shouldFilter={false} vimBindings={false} label={paletteLabel}>
           {isMobile ? (
             // Search field and an explicit close button share a top row; the
             // full-screen sheet has no ⌘K/Esc affordance the way the desktop
@@ -265,7 +290,7 @@ export function CommandPalette({
                 <CommandInput
                   value={query}
                   onValueChange={setQuery}
-                  placeholder="Search sessions or run a command"
+                  placeholder={placeholder}
                   data-testid="command-palette-input"
                 />
               </div>
@@ -283,13 +308,27 @@ export function CommandPalette({
             <CommandInput
               value={query}
               onValueChange={setQuery}
-              placeholder="Search sessions or run a command"
+              placeholder={placeholder}
               data-testid="command-palette-input"
             />
           )}
           <CommandList className={isMobile ? "max-h-none flex-1" : undefined}>
+            {sessionsOnly && (isFetching || isFetchNextPageError) && (
+              <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
+                {isFetchNextPageError ? "Couldn't load more sessions." : "Loading sessions…"}
+                {isFetchNextPageError && (
+                  <button
+                    type="button"
+                    className="ml-2 underline"
+                    onClick={() => void fetchNextPage()}
+                  >
+                    Retry
+                  </button>
+                )}
+              </p>
+            )}
             <CommandEmpty>
-              {isFetching && debouncedQuery ? "Searching…" : "No results found"}
+              {isFetching && (sessionsOnly || debouncedQuery) ? "Searching…" : "No results found"}
             </CommandEmpty>
             {sessions.length > 0 && (
               <CommandGroup heading="Sessions">
