@@ -74,11 +74,15 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  WorkspacePicker,
+  isNavigablePath,
+  resolveWorkspacePath,
+  useResolvedHostHome,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
-  isValidWorkspace,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
 } from "./NewChatDialog";
@@ -87,6 +91,12 @@ import {
 // non-empty value). When chosen, the fork omits agent_id and the server
 // clones the source's agent.
 const SAME_AS_SOURCE = "__same__";
+
+// This dialog's pickers use the compact `text-sm` font (matching the Agent
+// field), on both the trigger value and the open dropdown's options. Items set
+// their own `text-ui`, so the option font is shrunk via a descendant selector
+// on the dropdown content rather than plain inheritance.
+const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 
 /**
  * Compact host label for the Select item — mirrors NewChatDialog's
@@ -455,6 +465,8 @@ function ForkRunConfig({
             testId="fork-session-config-model"
             models={modelSelectOptions}
             defaultLabel={defaultModelLabel(modelOptions)}
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
             componentId="fork_session.config.model"
           >
             {modelsLoading && (
@@ -479,13 +491,13 @@ function ForkRunConfig({
               valueHasNoPii
             >
               <SelectTrigger
-                className="w-full cursor-pointer"
+                className="w-full cursor-pointer text-sm"
                 data-testid="fork-session-config-effort"
                 aria-label="Reasoning effort"
               >
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
+              <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
                 <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                 {CLAUDE_NATIVE_EFFORTS.map((e) => (
                   <SelectItem key={e.value} value={e.value}>
@@ -503,6 +515,8 @@ function ForkRunConfig({
               options={CLAUDE_NATIVE_PERMISSION_MODES}
               testId="fork-session-config-permission"
               ariaLabel="Permissions"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
@@ -526,6 +540,8 @@ function ForkRunConfig({
               }
               testId="fork-session-config-approval"
               ariaLabel="Approval"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.approval"
             />
           </ForkConfigRow>
@@ -553,6 +569,8 @@ function ForkRunConfig({
             options={CURSOR_NATIVE_EXEC_MODES}
             testId="fork-session-config-cursor-mode"
             ariaLabel="Mode"
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
             componentId="fork_session.config.cursor_mode"
           />
         </ForkConfigRow>
@@ -567,6 +585,8 @@ function ForkRunConfig({
               options={AGY_NATIVE_SKIP_MODES}
               testId="fork-session-config-agy-skip"
               ariaLabel="Permissions"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
@@ -868,8 +888,14 @@ export function ForkSessionForm({
     }
   }, [onSourceHost, workspace, sourceWorkspace, sourceRepo, sourceBranch]);
 
-  const workspaceTrimmed = normalizeWorkspacePath(workspace) ?? "";
-  const workspaceValid = isValidWorkspace(workspace);
+  // Resolve a typed "~/…" path to its absolute form against the host's home,
+  // so it's directly submittable without opening the tree browser (the server
+  // never expands ~). Already-absolute values pass through normalized; a
+  // tilde path stays unresolved (null) until the home listing arrives.
+  const resolvedHome = useResolvedHostHome(selectedHostId);
+  const resolvedWorkspace = resolveWorkspacePath(workspace, resolvedHome);
+  const workspaceTrimmed = resolvedWorkspace ?? normalizeWorkspacePath(workspace) ?? "";
+  const workspaceValid = resolvedWorkspace !== null;
   // The prefilled repo + source-branch pair left untouched: that branch
   // already exists (with a live worktree), so instead of asking the server
   // to create it — which would fail — the clone binds straight to the

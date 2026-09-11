@@ -1,7 +1,7 @@
 import type { Conversation } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -154,6 +154,36 @@ export function getConversationAgentType(conversation: Conversation): string {
     return conversation.agent_name;
   }
   return "Other";
+}
+
+/**
+ * Whether the viewer owns a session. A row with no ``owner`` (single-user mode,
+ * or a store with no permission grants wired) reads as owned. ``viewerId`` is
+ * ``null`` until identity resolves and is then treated as "not the owner" for
+ * shared rows, so they never flash into the viewer's own lists.
+ */
+export function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
+  const owner = conversation.owner ?? null;
+  if (owner === null) return true;
+  return owner === viewerId;
+}
+
+/**
+ * Dual-read project membership shared by the sidebar folders and the Canvas
+ * tabs: the session carries the first-class ``project_id`` OR the legacy
+ * ``omni_project`` label of this name, and — filing being owner-only — the
+ * viewer owns it.
+ */
+export function sessionBelongsToProject(
+  conversation: Conversation,
+  project: { id: string | null; name: string },
+  viewerId: string | null,
+): boolean {
+  return (
+    isOwnedByViewer(conversation, viewerId) &&
+    ((project.id !== null && conversation.project_id === project.id) ||
+      conversation.labels?.[PROJECT_LABEL_KEY] === project.name)
+  );
 }
 
 export function conversationDisplayLabel(conversation: Conversation): string {

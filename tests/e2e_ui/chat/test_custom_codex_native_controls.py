@@ -191,6 +191,7 @@ def test_custom_codex_native_session_shows_model_and_effort_controls(
         gear = page.get_by_test_id("composer-config-gear")
         expect(gear).to_be_visible(timeout=15_000)
         gear.click()
+        page.get_by_test_id("composer-advanced-settings").click()
         expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
 
         # The Codex model picker is selected and lists Codex's raw catalog.

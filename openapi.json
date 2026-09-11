@@ -1056,9 +1056,13 @@
                 "type": "integer"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
+            "description": "Opaque vendor compaction-window identifier. Current Codex writes a UUID string to `payload.window_id` on its `type == \"compacted\"` rollout JSONL record; older Codex rollouts used integer counters there.",
             "title": "Window Id"
           }
         },
@@ -1100,7 +1104,7 @@
         "type": "object"
       },
       "CompactionInProgressEvent": {
-        "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.",
+        "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.\n\nA long compaction is announced repeatedly (once per status poll), so\nclients must treat every event carrying the same `started_at` as one\ncompaction \u2014 refreshing their indicator rather than stacking another.",
         "properties": {
           "sequence_number": {
             "anyOf": [
@@ -1114,6 +1118,20 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp (seconds) when this compaction was first reported in progress. Stable across repeated progress events for the same compaction, so clients can anchor an elapsed counter to the true start \u2014 including after a page reload. `None` when the emitter does not track it.",
+            "title": "Started At"
           },
           "type": {
             "const": "response.compaction.in_progress",
@@ -1671,6 +1689,20 @@
             "description": "Correlation id of the elicitation being cleared, e.g. `\"elicit_abc123\"`. Must match the id of a prior `ElicitationRequestEvent`.",
             "title": "Elicitation Id",
             "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "const": "unanswered",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Why a verdict-less resolution happened, when known. `\"unanswered\"`: the hook stopped waiting (a severed poll never re-parked, the ask timed out) before anyone answered, so the prompt is gone rather than decided and the UI can say so instead of implying it was resolved elsewhere. `None` when a verdict is present or the reason is unknown.",
+            "title": "Reason"
           },
           "sequence_number": {
             "anyOf": [
@@ -2578,6 +2610,43 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostModelOptionsResponse": {
+        "description": "Pre-launch model choices resolved by a host harness.\n\n`error` carries the host's reason for an empty catalog \u2014 a probe that\nfailed on the host is not a transport failure, so the request still\nsucceeds and the picker can say WHY it is empty instead of a generic\n\"Models unavailable\".",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "models": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "routable_models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Routable Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models",
+          "routable_models"
+        ],
+        "title": "HostModelOptionsResponse",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -2618,6 +2687,17 @@
             "default": false,
             "title": "Force",
             "type": "boolean"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
           },
           "items": {
             "items": {
@@ -3869,6 +3949,36 @@
           "delta"
         ],
         "title": "ReasoningTextDeltaEvent",
+        "type": "object"
+      },
+      "ResetSessionModelOverrideRequest": {
+        "additionalProperties": false,
+        "description": "Reset a launch-time model selection only while that selection is current.",
+        "properties": {
+          "expected_model_override": {
+            "minLength": 1,
+            "title": "Expected Model Override",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_model_override"
+        ],
+        "title": "ResetSessionModelOverrideRequest",
+        "type": "object"
+      },
+      "ResetSessionModelOverrideResponse": {
+        "description": "Whether the launch-time selection was still current and was cleared.",
+        "properties": {
+          "reset": {
+            "title": "Reset",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reset"
+        ],
+        "title": "ResetSessionModelOverrideResponse",
         "type": "object"
       },
       "ResourceEventData": {
@@ -6551,6 +6661,12 @@
             ],
             "description": "Managed-sandbox launch progress while the session's background sandbox launch is in flight or has failed \u2014 see `SandboxStatus`. `None` for sessions without a managed launch and once the launch succeeds. Sourced from the Omnigent server's in-memory `_session_sandbox_status_cache` at snapshot build time, so a client opening the session mid-launch sees the current stage."
           },
+          "share_workspace_files": {
+            "default": false,
+            "description": "Whether the owner opted into letting view-level collaborators browse the workspace (Files/Changes/GitHub surfaces). `False` by default \u2014 read grants share the conversation only. The web share dialog reads this to render the toggle, and the rail reads it to decide whether to mount the file surfaces for a view-only viewer.",
+            "title": "Share Workspace Files",
+            "type": "boolean"
+          },
           "skills": {
             "description": "Skills the bound agent has access to \u2014 the merged result of the agent spec's bundled `skills` and the host-scope skills discovered along the agent workdir / `~/.claude/skills/` (subject to the spec's `skills_filter`). Mirrors what the TUI passes to the runner at startup. Empty list when the agent spec cannot be loaded, or when bundled + host discovery yields nothing.",
             "items": {
@@ -8133,6 +8249,18 @@
             "description": "Identifier of a registered runner, e.g. `\"runner_abc123\"`. `None` leaves runner binding unchanged.",
             "title": "Runner Id"
           },
+          "share_workspace_files": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opt-in that lets people with *view* (read-only) access browse the session's workspace files. `True` turns sharing on, `False` turns it off (back to edit-only, the default), `None` leaves it unchanged. Manage-gated \u2014 it sits with the grant/revoke and public-access controls that decide who can see the session. Never widens absolute-path browsing, which stays owner-only.",
+            "title": "Share Workspace Files"
+          },
           "silent": {
             "default": false,
             "description": "When `True`, persist metadata changes but skip the runner-side side effects \u2014 specifically the native `/effort` / `/model` / Codex collaboration-mode forwards into the live runtime. Used by automatic bind-time handoffs (web's sticky-pref apply on session switch, the REPL's pre-create `/model` snapshot) where injecting a visible slash command into a freshly-spawned pane would render as an unexpected \"Command model X\" item before the user has sent anything. Default `False` preserves the user-driven picker / `/model` behaviour where the live forward IS the desired feedback.",
@@ -9543,12 +9671,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {},
-                    "type": "array"
-                  },
-                  "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HostModelOptionsResponse"
                 }
               }
             },
@@ -12043,6 +12166,59 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/model-override/reset": {
+      "post": {
+        "description": "Retire a rejected pick after fallback without replacing a newer selection.",
+        "operationId": "reset_session_model_override_v1_sessions__session_id__model_override_reset_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetSessionModelOverrideRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetSessionModelOverrideResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Session Model Override",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/owner": {
       "get": {
         "description": "Return the owner of a session.\n\nRequires read-level access.\n\n**Returns:** `{\"owner\": \"<user_id>\"}` or `{\"owner\": null}`.",
@@ -12359,7 +12535,7 @@
     },
     "/v1/sessions/{session_id}/policies/evaluate": {
       "post": {
-        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.claude_native_hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
+        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.harnesses.claude_native.hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
         "operationId": "evaluate_policy_v1_sessions__session_id__policies_evaluate_post",
         "parameters": [
           {
@@ -13911,6 +14087,22 @@
               "title": "Session Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pr Url"
+            }
           }
         ],
         "responses": {
@@ -13953,6 +14145,22 @@
               "title": "Session Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pr Url"
+            }
           }
         ],
         "responses": {
@@ -13976,6 +14184,88 @@
           }
         },
         "summary": "List Session Github Changes",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/preferences": {
+      "post": {
+        "description": "Apply the GitHub panel's account (and optional base) selection.\n\nPersists the choice \u2014 a per-workspace account preference in the user\nconfig, and `gh repo set-default` when a base is given \u2014 then returns the\nrefreshed `session.github.info`. Served by the runner when it's online,\nelse by the host over its tunnel (both run the same\n`github_resource.set_github_preference` against the local config +\nworkspace), so a preference change works with the runner asleep.\n\n**Returns:** The refreshed `session.github.info` object.",
+        "operationId": "set_session_github_preference_v1_sessions__session_id__resources_github_preferences_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Session Github Preference",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/prs": {
+      "post": {
+        "operationId": "update_session_github_pr_v1_sessions__session_id__resources_github_prs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Pr",
         "tags": [
           "session_resources"
         ]

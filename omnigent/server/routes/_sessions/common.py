@@ -426,7 +426,12 @@ _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = 300.0
 _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 
 
-_HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
+# How long a severed elicitation's card survives before it is cleared, giving a
+# hook retry time to re-park the same id. Wide enough to absorb a slow re-POST
+# (a lapsed token costs a re-mint round trip) so a still-blocked prompt is not
+# flipped to "Resolved elsewhere" between polls; a hook that died for real just
+# leaves the card up this much longer.
+_HARNESS_ELICITATION_REPARK_GRACE_S = 30.0
 
 
 _HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")

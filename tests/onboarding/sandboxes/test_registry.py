@@ -126,6 +126,13 @@ def test_instantiate_loads_blaxel_without_optional_sdk() -> None:
     assert launcher.provider == "blaxel"
 
 
+def test_instantiate_loads_microsandbox_without_optional_sdk() -> None:
+    """The lazy microsandbox module imports before the optional SDK is installed."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("microsandbox")
+    assert launcher.provider == "microsandbox"
+
+
 def test_instantiate_unknown_raises() -> None:
     """Instantiating an unknown provider raises SandboxRegistryError."""
     reset_plugin_state_for_tests()
@@ -277,6 +284,16 @@ def test_get_launcher_uses_registry() -> None:
     reset_plugin_state_for_tests()
     launcher = get_launcher("modal")
     assert launcher.provider == "modal"
+
+
+def test_get_launcher_passes_server_url_to_microsandbox() -> None:
+    """CLI server context reaches the microsandbox network configuration."""
+    reset_plugin_state_for_tests()
+    launcher = get_launcher(
+        "microsandbox",
+        server_url="http://host.microsandbox.internal:8799",
+    )
+    assert launcher._host_ports == (8799,)
 
 
 def test_get_launcher_unknown_raises_click_exception() -> None:

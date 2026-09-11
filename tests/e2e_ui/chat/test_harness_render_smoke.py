@@ -230,11 +230,12 @@ def test_harness_session_renders_without_crashing(
     # The composer renders → the page did not blank on a render throw.
     expect(page.get_by_test_id("composer-config-gear")).to_be_visible(timeout=15_000)
     # The status label runs the model-id fold over the rows.
-    expect(page.get_by_test_id("composer-model-effort-label")).to_have_count(1)
+    expect(page.get_by_test_id("composer-agent-config-value")).to_have_count(1)
 
     # Opening the gear renders the model control, folding every row (the exact
     # path the null-``model`` cursor crash took).
     page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-advanced-settings").click()
     expect(page.get_by_test_id("composer-config-modal")).to_be_visible(timeout=10_000)
     expect(page.get_by_test_id("composer-config-model")).to_be_visible()
     page.get_by_test_id("composer-config-model").click()

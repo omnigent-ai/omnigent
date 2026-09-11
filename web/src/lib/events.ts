@@ -254,6 +254,13 @@ export interface ElicitationRequest {
    */
   allowAllEdits?: boolean;
   /**
+   * Producer-supplied extra (eligible claude-native tool prompts): when
+   * true, the ApprovalCard offers "Approve & switch to auto mode" —
+   * accepting with ``allow_auto_mode`` echoes a session-scoped
+   * ``setMode(auto)`` in the hook decision.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
    * supports a persistent "don't ask again" allow rule (everything
@@ -283,6 +290,20 @@ export interface ElicitationRequest {
 export interface ElicitationResolved {
   type: "elicitation_resolved";
   elicitationId: string;
+  /**
+   * Verdict the prompt was resolved with, when the server knows it
+   * (answered on another surface: native terminal popup, another tab,
+   * the approve page). Absent when the resolution carried no verdict,
+   * e.g. a tool-result auto-resolve.
+   */
+  action?: "accept" | "decline" | "cancel";
+  /**
+   * Why the prompt resolved without a verdict, when the server knows:
+   * `"unanswered"` means the hook stopped waiting (a severed poll never
+   * re-parked, the ask timed out) before anyone answered, so the prompt
+   * is gone rather than decided. Never present alongside `action`.
+   */
+  reason?: "unanswered";
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */
@@ -299,6 +320,22 @@ export interface NativeToolCall {
 export interface MessageDone {
   type: "message_done";
   content: Record<string, unknown>[];
+  itemId: string;
+  responseId: string;
+}
+
+/**
+ * A persisted reasoning item from `output_item.done` (type `reasoning`).
+ * Produced with no preceding reasoning deltas by native transcript
+ * mirrors (e.g. claude-native thinking blocks); delta-streaming
+ * harnesses may also publish it after the streamed section.
+ */
+export interface ReasoningDone {
+  type: "reasoning_done";
+  /** Joined raw reasoning text from the item's `content` blocks. */
+  text: string;
+  /** Joined summary text from the item's `summary` blocks. */
+  summary: string;
   itemId: string;
   responseId: string;
 }
@@ -413,6 +450,13 @@ export interface ErrorEvent {
 /** `response.compaction.in_progress` — server started compacting. */
 export interface CompactionInProgress {
   type: "compaction_in_progress";
+  /**
+   * Unix epoch seconds when the server first saw this compaction in
+   * progress. Stable across the repeated progress events a long compaction
+   * emits, so the elapsed counter can anchor to the true start — including
+   * after a page reload. Absent when the emitter doesn't track it.
+   */
+  startedAtS?: number;
 }
 
 /** `response.compaction.completed` — compaction finished successfully. */
@@ -943,6 +987,7 @@ export type StreamEvent =
   | RoutingDecision
   | TerminalCommandEvent
   | MessageDone
+  | ReasoningDone
   | OutputFileDone
   | RetryEvent
   | ErrorEvent

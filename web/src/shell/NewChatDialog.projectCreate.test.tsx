@@ -33,6 +33,7 @@ const navigateMock = vi.fn();
 const RECENT_KEY = "omnigent:recent-workspaces";
 const RECENT_WORKSPACE = "/Users/corey/universe/src/foo";
 const REPO = "/Users/corey/projects/alpha";
+const EXISTING_WORKTREE = "/Users/corey/worktrees/alpha-feature";
 
 // Mutable so a test can choose a project-driven or plain visit.
 let searchParams = new URLSearchParams("project=Alpha");
@@ -73,15 +74,15 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
 }));
-// The file browser is heavy UI; a stub button stands in for a user browse —
-// the same onNavigate channel, deliberately re-picking the config workspace.
+// The file browser is heavy UI; a stub button stands in for a user selection —
+// deliberately re-picking the config workspace through the modal commit path.
 vi.mock("./WorkspacePicker", () => ({
   isNavigablePath: () => false,
-  WorkspacePicker: (props: { onNavigate: (path: string) => void }) => (
+  WorkspacePicker: (props: { onSelect: (path: string) => void }) => (
     <button
       type="button"
-      data-testid="test-workspace-navigate"
-      onClick={() => props.onNavigate("/Users/corey/projects/alpha")}
+      data-testid="test-workspace-select"
+      onClick={() => props.onSelect(REPO)}
     />
   ),
 }));
@@ -298,7 +299,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("workspace" in body).toBe(false);
   });
 
-  it("keeps a non-project visit's body unchanged: no project_id, all fields explicit", async () => {
+  it("keeps a non-project visit explicit and adds only the create token label", async () => {
     searchParams = new URLSearchParams("");
     localStorage.setItem("omnigent:last-agent-id", "ag_hello");
     renderLanding();
@@ -307,12 +308,13 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     );
 
     const body = await submitAndReadBody();
-    // Byte-identical to the pre-project_id shape: exactly the explicit
-    // fields, nothing new riding along.
-    expect(Object.keys(body).sort()).toEqual(["agent_id", "host_id", "workspace"]);
+    expect(Object.keys(body).sort()).toEqual(["agent_id", "host_id", "labels", "workspace"]);
     expect(body.agent_id).toBe("ag_hello");
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
+    expect(body.labels).toEqual({
+      "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+    });
   });
 
   it("skips the post-create move when project_id was sent (atomic server-side filing)", async () => {
@@ -368,15 +370,67 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
-    // Open the working-directory popover and "browse" to the config path —
-    // an explicit choice of the exact value the config seeded.
+    // Open the working-directory popover, launch the modal, and select the
+    // config path — an explicit choice of the exact value the config seeded.
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
-    fireEvent.click(await screen.findByTestId("test-workspace-navigate"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
+    fireEvent.click(await screen.findByTestId("test-workspace-select"));
 
     const body = await submitAndReadBody();
     expect(body.project_id).toBe("proj_alpha");
     expect(body.workspace).toBe(REPO);
     // The agent was never touched — still omitted.
+    expect("agent_id" in body).toBe(false);
+  });
+
+  it("sends workspace when the user explicitly selects a recent path", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-recent-0"));
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+    expect("agent_id" in body).toBe(false);
+  });
+
+  it("sends workspace when the user explicitly selects an existing worktree", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    vi.mocked(useHostWorktrees).mockImplementation(
+      (hostId, path) =>
+        ({
+          data:
+            hostId === "host_1" && path === REPO
+              ? ([
+                  { path: REPO, branch: "main", is_main: true, detached: false },
+                  {
+                    path: EXISTING_WORKTREE,
+                    branch: "feature/alpha",
+                    is_main: false,
+                    detached: false,
+                  },
+                ] as HostWorktree[])
+              : ([] as HostWorktree[]),
+          isError: false,
+        }) as unknown as ReturnType<typeof useHostWorktrees>,
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
+    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-worktree-option"));
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.workspace).toBe(EXISTING_WORKTREE);
     expect("agent_id" in body).toBe(false);
   });
 

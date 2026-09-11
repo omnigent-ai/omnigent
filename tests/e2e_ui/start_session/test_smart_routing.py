@@ -217,10 +217,14 @@ async def _drive_smart_routing_harness(base_url: str, session_id: str) -> None:
             # The router scores the typed message at create time.
             assert body["smart_routing_message"] == "refactor the auth module", body
             # None of the placeholder wrapper's own knobs ride along — the
-            # router may pick the other harness entirely.
+            # router may pick the other harness entirely. The create-correlation
+            # label remains so the temporary chat can resolve from /updates.
             assert body.get("model_override") is None, body
             assert body.get("terminal_launch_args") is None, body
-            assert body.get("labels") is None, body
+            assert re.fullmatch(
+                r"[0-9a-f]{32}",
+                body["labels"]["omnigent.client_create_token"],
+            ), body
         finally:
             await browser.close()
 
@@ -277,7 +281,7 @@ async def _drive_smart_routing_model_option(base_url: str, session_id: str) -> N
             await browser.close()
 
 
-def test_start_session_hides_smart_routing_when_server_disables_it(
+def test_start_session_disables_smart_routing_when_server_disables_it(
     seeded_session: tuple[str, str],
 ) -> None:
     """Routing off on the server withholds both Smart Routing surfaces.
@@ -310,16 +314,19 @@ async def _drive_smart_routing_disabled(base_url: str, session_id: str) -> None:
             )
 
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            # The Harnesses group renders, so the picker is populated — only the
-            # routing row is missing.
+            # The routing entry remains visible but cannot be selected.
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
             ).to_be_visible()
             await expect(
                 page.get_by_test_id("new-chat-landing-harness-smart-routing")
-            ).to_have_count(0)
+            ).to_be_disabled()
 
-            await page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e").click()
+            await (
+                page.get_by_test_id("new-chat-landing-agent-config-ag_claude_e2e")
+                .get_by_text("Edit", exact=True)
+                .click()
+            )
             await page.get_by_test_id("new-chat-landing-config-gear").click()
             await page.get_by_test_id("new-chat-landing-config-model").click()
             await expect(

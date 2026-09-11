@@ -29,6 +29,48 @@ point package installs at the internal proxies. See
 [`dev/agent-environment.md`](../agent-environment.md) before running any
 `npm`/`pnpm`/`pip`/`uv` install.
 
+## You are operating autonomously
+
+Once launched you run unattended. On the `ci_link` path nobody is at a terminal at
+all, and even locally the user is not watching turn by turn — so carry the run to
+its end yourself. Every step in this procedure — recovering the handoff, auditing
+and running tests, committing, pushing, opening the PR, and driving Step 4 to a
+green, reviewed, maintainer-tagged state — is already requested work: do it, rather
+than stopping to ask permission for it or to announce that you will ("Next, I'll…").
+Reversible actions that follow from the run proceed without a check-in; the human
+gate sits up front (`dev/resolve.py` confirms before launch) and after the fact (the
+ready-for-review PR), not mid-run.
+
+Before you end a turn, look at your last paragraph. If it is a plan, a promise, or a
+list of next steps rather than the finished work, do that work now with tool calls —
+including retrying after an error and gathering what you are missing yourself. Don't
+stop because the context or the session has run long.
+
+This does **not** loosen the deliberate stops defined below. Still stop — with the
+stated `needs_more_info` or `nothing_to_fix` outcome and a clear reason — when the
+handoff can't be recovered, the input `bug_url` and the recovered one disagree, the
+fix is a product decision that isn't yours to make, or you've hit the Step 4 round
+cap. Those are genuine blockers and honest end states, not permission-seeking. The
+rule is simply: never pause to ask about work you were already sent to do, and
+always stop, on the terms this procedure defines, when you are actually blocked.
+
+## How you write
+
+Everything you write for a person to read is part of the deliverable, and its
+quality is judged like the fix itself: the PR title and description, review comments
+and Polly-reply comments, commit messages, and the live-validation prompt. Write
+them plainly and directly, at the density that conveys the point and no more — a
+reviewer should be able to skim the root cause, the fix, and the fail→pass proof
+without wading through padding.
+
+Remove all mannered prose. Mannered prose substitutes metaphor and flourish for
+direct statement: "a dial worth turning" instead of "a parameter worth varying,"
+"this point earns its keep" instead of "this point still matters." Those phrases
+exist to display the writer, not to convey the idea, and readers can tell — they
+make the reader work harder so the writer can perform, and they are imprecise,
+because a metaphor drags in connotations you did not choose and cannot control. When
+a literal phrase is available, use it: say what you mean.
+
 ## Input contract
 
 You are invoked with exactly one work source:
@@ -170,11 +212,12 @@ For `session` and `ci_link`, you need four things before you can do anything: th
    read its **`workspace`** field: that is the `repro/<slug>` worktree the repro
    ran in, where repro-agent left the authored test **uncommitted** at
    `test_path`. Read the full file from `<workspace>/<test_path>` off disk and
-   copy it into your own worktree at `test_path`. (Do **not** rely on the
-   transcript for the test body — it is truncated; the file on disk is the source
-   of truth. The session's own `workspace` is the authoritative link back to the
-   right reproduction — never guess by picking some "newest" repro worktree, which
-   may belong to an unrelated bug.)
+   copy it into your own worktree at `test_path` — with **shell** commands: that
+   workspace sits outside your own worktree, where your file tools cannot reach.
+   (Do **not** rely on the transcript for the test body — it is truncated; the
+   file on disk is the source of truth. The session's own `workspace` is the
+   authoritative link back to the right reproduction — never guess by picking
+   some "newest" repro worktree, which may belong to an unrelated bug.)
 3. If `sys_session_get_info` returns no `workspace`, or that path/`test_path`
    doesn't exist (e.g. the repro worktree was removed), stop with
    `needs_more_info` naming what you couldn't recover — do not reconstruct the
@@ -186,10 +229,17 @@ The repro worktree is gone, so recover from the run's artifacts and logs with th
 `gh` CLI. Be **tolerant** — the exact artifact layout may vary, so try in order
 and fall back rather than assuming a fixed structure:
 
-1. Download this run's `repro-bundle-<run-id>` artifact first. If it contains
-   top-level `repro-handoff.json`, parse and validate that checkpoint before
-   reading the full job log: it is the smallest, most direct structured source
-   for `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id`. Copy each
+1. Download this run's `repro-bundle-<run-id>` artifact first, staging it
+   **inside your worktree** at `.omnigent/repro-bundle/` (e.g. `gh run download
+   <run-id> --name repro-bundle-<run-id> --dir .omnigent/repro-bundle`). Your
+   file tools are worktree-scoped: a bundle staged under `/tmp` or
+   `$RUNNER_TEMP` sits outside the environment root, so every file-tool read of
+   it errors and only shell fallbacks work. `.omnigent/` is gitignored and
+   excluded by the commit rules, so nothing staged there can leak into your
+   diff. If the bundle contains top-level `repro-handoff.json`, parse and
+   validate that checkpoint before reading the full job log: it is the
+   smallest, most direct structured source for
+   `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id`. Copy each
    test named by `test_path` from the artifact's `files/` tree into your checkout.
    Also retain `patch.diff`, recordings, and `run.log` as supporting evidence.
 
@@ -521,6 +571,9 @@ Fix the root cause, not the symptom. Change the code the bug lives in, matching
 surrounding conventions, as small as the root cause allows. Do not touch the test
 to make it pass; the *code* must change to satisfy it.
 
+Keep code comments short. Prefer a single line; only write a longer comment
+when the complexity genuinely requires it.
+
 ### 2B.4 — Add targeted tests at the layer you changed
 
 The reproduction test is a full end-to-end journey — slow, one layer above your
@@ -606,7 +659,13 @@ produces*:
   and the handoff (`recordings`). Omit it **only** for the genuine environmental
   blockers named in `dev/recording-lanes.md` (tooling missing, server won't come
   online, `api`-surface facet with nothing to film) — and then say which, with the
-  evidence; never report an after-clip you didn't actually produce. When you run
+  evidence; never report an after-clip you didn't actually produce.
+- A clip must show a **live action producing the corrected outcome** — a command
+  runs and the pane prints it, a screen changes — never static text asserting the
+  fix works. When the fixed outcome is just a static line, value, or the absence
+  of an error with nothing to watch, do **not** film a video of text: keep
+  `recordings: []` for that facet and state the corrected text in your evidence
+  and the PR Demo section, per `dev/recording-lanes.md`. When you run
   inside a server-spawned runner (`OMNIGENT_RUNNER_ID` is set), a recorder
   `online: false` is **not** an environmental blocker until you have stripped the
   leaked runner/host env vars per `dev/recording-lanes.md`; an un-stripped
@@ -714,9 +773,12 @@ Once the set is genuinely green:
    before/after recordings in the **Demo** section: upload the files when your
    environment can attach media to the PR; otherwise link where they live (the
    CI run's artifact bundle, or the repro session) so reviewers can watch the
-   failure and the fix. When the bug is a Linear ticket and a Linear key is
-   available, also attach both recordings to the ticket (GraphQL `fileUpload` +
-   `attachmentCreate`) so the ticket carries the visual before/after.
+   failure and the fix. When a facet's outcome is purely textual (nothing to
+   film), put the observed before/after text in the **Demo** section in place of a
+   video, so the section is never left empty or padded with a video of text. When
+   the bug is a Linear ticket and a Linear key is available, also attach both
+   recordings to the ticket (GraphQL `fileUpload` + `attachmentCreate`) so the
+   ticket carries the visual before/after.
 5. **Emit an interim handoff now — the moment the PR is open.** As soon as
    `gh pr create` succeeds, print the full handoff json block (the Output schema)
    with `pr_url` set and `outcome` at its current best assessment, *before* you
@@ -1329,11 +1391,15 @@ Field meanings:
   review mode, the "after" entries are the drivers recorded against the reviewed
   PR head. The list is empty **only** when recording is genuinely blocked — the
   recorder tooling is missing, or the fixture can't come online after the SPA
-  build — never merely because the upstream run left no footage.
+  build — or when the outcome is purely textual with nothing to watch; never
+  merely because the upstream run left no footage.
 - `recording_unavailable_reason` — empty when every expected clip is present;
-  otherwise name the concrete blocker. For API-only evidence, say it is textual.
-  Missing or rejected footage never blocks the fix or PR, and must never be
-  replaced with a synthetic fallback or a video of the test runner.
+  otherwise name the concrete blocker. For purely textual evidence — an `api`
+  facet, or a facet whose fixed outcome is just a static line or value — say it is
+  textual and carry the observed text in the PR Demo section; `recordings: []` is
+  correct and not a blocker. Missing or rejected footage never blocks the fix or
+  PR, and must never be replaced with a synthetic fallback or a video of the test
+  runner.
 - `test_audit` — the result of the Step 2B.1 audit (author mode). In review mode,
   note whether the repro test was behavioral as-is.
 - `hermetic_check` — the result of the Step 2B.5 hostile-env re-run when the diff

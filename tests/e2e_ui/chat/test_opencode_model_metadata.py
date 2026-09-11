@@ -136,4 +136,4 @@ def test_opencode_native_model_command_opens_picker_and_persists_pick(
         page.get_by_test_id("composer-config-save").click()
 
     assert patch_bodies[-1] == {"model_override": ALTERNATE_MODEL}
-    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text(ALTERNATE_MODEL)
+    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(ALTERNATE_MODEL)

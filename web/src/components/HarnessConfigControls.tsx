@@ -89,6 +89,7 @@ export function RoutingModelSelect({
   defaultLabel = "Default",
   activeModelId,
   contentClassName,
+  triggerClassName,
   componentId,
   children,
 }: {
@@ -101,6 +102,8 @@ export function RoutingModelSelect({
   defaultLabel?: string;
   activeModelId?: string | null;
   contentClassName?: string;
+  // Extra classes for the trigger, e.g. a caller that wants a smaller font.
+  triggerClassName?: string;
   // Opt-in analytics id. Model values are a bounded catalog + the "smart"/
   // "default" sentinels, so the value is reported (valueHasNoPii) for pattern
   // analysis of model choice.
@@ -110,7 +113,11 @@ export function RoutingModelSelect({
   return (
     // valueHasNoPii assumes a bounded catalog; drop it if reused for typed values.
     <Select value={value} onValueChange={onValueChange} componentId={componentId} valueHasNoPii>
-      <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
+      <SelectTrigger
+        className={cn("w-full", triggerClassName)}
+        data-testid={testId}
+        aria-label={ariaLabel}
+      >
         <SelectValue />
       </SelectTrigger>
       <SelectContent
@@ -216,6 +223,8 @@ export function DescribedSelect({
   testId,
   ariaLabel,
   disabled,
+  triggerClassName,
+  contentClassName,
   componentId,
 }: {
   value: string;
@@ -224,6 +233,10 @@ export function DescribedSelect({
   testId: string;
   ariaLabel: string;
   disabled?: boolean;
+  // Extra classes for the trigger, e.g. a caller that wants a smaller font.
+  triggerClassName?: string;
+  // Extra classes for the dropdown content, e.g. to shrink the option font.
+  contentClassName?: string;
   // Opt-in analytics id. Options are a fixed enum (permission / approval modes),
   // so the selected value is reported (valueHasNoPii).
   componentId?: string;
@@ -244,7 +257,11 @@ export function DescribedSelect({
         if (!next) setPreviewed(null);
       }}
     >
-      <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
+      <SelectTrigger
+        className={cn("w-full", triggerClassName)}
+        data-testid={testId}
+        aria-label={ariaLabel}
+      >
         <SelectValue />
       </SelectTrigger>
       {/* Pin the popup to the trigger width so a long blurb wraps in the footer
@@ -252,7 +269,10 @@ export function DescribedSelect({
       <SelectContent
         position="popper"
         align="start"
-        className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+        className={cn(
+          "w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5",
+          contentClassName,
+        )}
       >
         {options.map((o) => (
           <SelectItem

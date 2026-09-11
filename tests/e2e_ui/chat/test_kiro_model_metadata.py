@@ -95,6 +95,7 @@ def test_kiro_native_picker_lists_models_and_persists_pick(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+    page.get_by_test_id("composer-advanced-settings").click()
     page.get_by_test_id("composer-config-model").click()
 
     # The discovered Kiro catalog renders with its display names.

@@ -13,6 +13,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
+    run_write_transaction,
 )
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
@@ -107,6 +108,11 @@ class SqlAlchemyProjectStore(ProjectStore):
             self._engine,
             query_name_prefix="omnigent.project_store",
         )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.project_store",
+            immediate=True,
+        )
 
     def _name_taken(
         self,
@@ -152,7 +158,10 @@ class SqlAlchemyProjectStore(ProjectStore):
         concurrent create of the same name can slip through; see
         ``SqlProject.__table_args__`` for why that is acceptable.
         """
-        with self._session("insert_project") as session:
+        created_at = now_epoch()
+        encoded_config = _encode_config(config)
+
+        def write(session: Session) -> Project:
             if self._name_taken(session, user_id=user_id, name=name, exclude_id=None):
                 raise OmnigentError(
                     f"A project named {name!r} already exists",
@@ -162,13 +171,15 @@ class SqlAlchemyProjectStore(ProjectStore):
                 id=project_id,
                 name=name,
                 user_id=user_id,
-                created_at=now_epoch(),
+                created_at=created_at,
                 updated_at=None,
-                config=_encode_config(config),
+                config=encoded_config,
             )
             session.add(row)
             session.flush()
             return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "insert_project", write)
 
     def get(self, project_id: str, *, user_id: str | None) -> Project | None:
         """Return an owned project by id, or ``None`` if not found."""
@@ -208,7 +219,10 @@ class SqlAlchemyProjectStore(ProjectStore):
         only uniqueness guard, so concurrent renames to the same name can both
         land.
         """
-        with self._session("update_project") as session:
+        encoded_config = _encode_config(config) if config is not None else None
+        updated_at = now_epoch()
+
+        def write(session: Session) -> Project | None:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.user_id != user_id:
                 return None
@@ -222,20 +236,24 @@ class SqlAlchemyProjectStore(ProjectStore):
                 row.name = name
                 changed = True
             if config is not None:
-                encoded = _encode_config(config)
-                if row.config != encoded:
-                    row.config = encoded
+                if row.config != encoded_config:
+                    row.config = encoded_config
                     changed = True
             if changed:
-                row.updated_at = now_epoch()
+                row.updated_at = updated_at
             session.flush()
             return _to_entity(row)
 
+        return run_write_transaction(self._session_immediate, "update_project", write)
+
     def delete(self, project_id: str, *, user_id: str | None) -> bool:
         """Delete an owned project. Idempotent; returns ``False`` if not found."""
-        with self._session("delete_project") as session:
+
+        def write(session: Session) -> bool:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.user_id != user_id:
                 return False
             session.delete(row)
             return True
+
+        return run_write_transaction(self._session_immediate, "delete_project", write)

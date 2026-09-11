@@ -15,6 +15,8 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -27,6 +29,11 @@ import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 // layers are stubbed so the test isolates that wiring.
 const navigateMock = vi.fn();
 const setPendingInitialPromptMock = vi.fn();
+const beginLocalConversationMock = vi.fn();
+const hydrateLocalConversationMock = vi.fn();
+const removeLocalConversationMock = vi.fn();
+let searchParams = new URLSearchParams();
+let projects: { id: string | null; name: string }[] = [];
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 // Prompt history is scoped per conversation; the landing composer writes under
@@ -42,14 +49,15 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigateMock,
-  // The landing screen reads `?project=` to pre-fill the project chip; this
-  // flow suite never sets one, so an empty params object is enough.
-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+  useSearchParams: () => [searchParams, vi.fn()],
 }));
 
 // The screen hands the first message to ChatPage through the chatStore
 // (keyed by conversation id), not router state — assert on that call.
 vi.mock("@/store/chatStore", () => ({
+  beginLocalConversation: (...args: unknown[]) => beginLocalConversationMock(...args),
+  hydrateLocalConversation: (...args: unknown[]) => hydrateLocalConversationMock(...args),
+  removeLocalConversation: (...args: unknown[]) => removeLocalConversationMock(...args),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
 }));
 
@@ -111,12 +119,10 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
 }));
-// The composer's project chip lists projects via useProjects; stub it to an
-// empty list so it doesn't fire its own authenticatedFetch (which would land
-// at mock.calls[0] and skew these create-POST call assertions).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
-  useProjects: () => ({ data: [] }),
+  useProjects: () => ({ data: projects }),
+  useProjectConfig: () => ({ data: null, isLoading: false }),
   // Same reason as useProjects above: the landing reads useConversations for
   // hasNoSessions, so stub it to avoid an authenticatedFetch skewing calls[0].
   useConversations: () => ({ data: undefined }),
@@ -170,7 +176,10 @@ function setAgents(agents: AvailableAgent[]): void {
   >);
 }
 
-function renderLanding(cachedSessionIds: string[] = []): void {
+function renderLanding(
+  cachedSessionIds: string[] = [],
+  infoOverrides: Partial<ServerInfo> = {},
+): void {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -190,8 +199,32 @@ function renderLanding(cachedSessionIds: string[] = []): void {
       pageParams: [undefined],
     });
   }
+  const info = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    enabled_connections: [],
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: {},
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+    ...infoOverrides,
+  } as ServerInfo;
   function Wrapper({ children }: { children: ReactNode }) {
-    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+      </QueryClientProvider>
+    );
   }
   render(<NewChatLandingScreen />, { wrapper: Wrapper });
 }
@@ -238,7 +271,19 @@ function selectAgent(agentId: string): void {
  * harness) live in this modal, not the picker dropdown.
  */
 function openAgentConfig(agentId: string): void {
-  selectAgent(agentId);
+  const picker = screen.getByTestId("new-chat-landing-agent-select");
+  fireEvent.pointerDown(picker, { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+  }
+  if (screen.queryByTestId(`new-chat-landing-agent-config-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+    fireEvent.pointerDown(picker, { button: 0 });
+    if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    }
+  }
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
   fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
 }
 
@@ -262,6 +307,11 @@ function saveConfig(): void {
 beforeEach(() => {
   navigateMock.mockReset();
   setPendingInitialPromptMock.mockReset();
+  beginLocalConversationMock.mockReset();
+  beginLocalConversationMock.mockReturnValue(null);
+  hydrateLocalConversationMock.mockReset();
+  removeLocalConversationMock.mockReset();
+  removeLocalConversationMock.mockReturnValue(false);
   pushMatchers.length = 0;
   announcePushedSession = null;
   vi.mocked(authenticatedFetch).mockReset();
@@ -270,6 +320,8 @@ beforeEach(() => {
   resetLandingDraft();
   clearOptimisticTitles();
   localStorage.clear();
+  searchParams = new URLSearchParams();
+  projects = [];
   vi.mocked(useHostModelOptions).mockReturnValue({
     data: [
       { id: "opus", displayName: "Opus" },
@@ -291,6 +343,49 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it("keeps project placement on the provisional and rekeyed conversation", async () => {
+    searchParams = new URLSearchParams("project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_1",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    const project = { id: "proj_alpha", name: "Alpha" };
+    await waitFor(() =>
+      expect(beginLocalConversationMock).toHaveBeenCalledWith(
+        "inspect the repo",
+        [],
+        expect.any(Object),
+        project,
+      ),
+    );
+    await waitFor(() =>
+      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
+        "temp:1234567890abcdef1234567890abcdef",
+        "conv_new",
+        "ag_hello",
+        "inspect the repo",
+        [],
+        "pend_1",
+        null,
+        navigateMock,
+        expect.any(Function),
+        project,
+      ),
+    );
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -316,11 +411,251 @@ describe("NewChatLandingScreen create flow", () => {
       host_id: "host_1",
       workspace: SEEDED_WORKSPACE,
     });
-    // A plain YAML agent carries no terminal-wrapper labels.
-    expect(body.labels).toBeUndefined();
+    expect(body.id).toBeUndefined();
+    expect(body.labels).toEqual({
+      "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+    });
 
     // On success the screen routes to the freshly created session.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("resolves a navigate-first create from the exact-token top-level pushed row", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_1",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith("/c/temp:1234567890abcdef1234567890abcdef"),
+    );
+    await waitFor(() => expect(pushMatchers).toHaveLength(1));
+    const isOurs = pushMatchers[0]!;
+    expect(
+      isOurs({
+        id: "conv_pushed",
+        parent_session_id: null,
+        labels: { "omnigent.client_create_token": "1234567890abcdef1234567890abcdef" },
+      }),
+    ).toBe(true);
+    expect(
+      isOurs({
+        id: "conv_wrong",
+        parent_session_id: null,
+        labels: { "omnigent.client_create_token": "ffffffffffffffffffffffffffffffff" },
+      }),
+    ).toBe(false);
+    expect(isOurs({ id: "conv_missing", parent_session_id: null })).toBe(false);
+    expect(
+      isOurs({
+        id: "conv_child",
+        parent_session_id: "conv_parent",
+        labels: { "omnigent.client_create_token": "1234567890abcdef1234567890abcdef" },
+      }),
+    ).toBe(false);
+
+    act(() =>
+      announcePushedSession?.({
+        id: "conv_pushed",
+        parent_session_id: null,
+        labels: { "omnigent.client_create_token": "1234567890abcdef1234567890abcdef" },
+      }),
+    );
+    await waitFor(() =>
+      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
+        "temp:1234567890abcdef1234567890abcdef",
+        "conv_pushed",
+        "ag_hello",
+        "inspect the repo",
+        [],
+        "pend_1",
+        null,
+        navigateMock,
+        expect.any(Function),
+        undefined,
+      ),
+    );
+    expect(resolveCreate).toBeTypeOf("function");
+  });
+
+  it("keeps a managed create on its temp route until the HTTP response succeeds", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      pendingMsgTempId: "pend_managed",
+      createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+
+    renderLanding([], { managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    typeMessage("start a sandbox");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith("/c/temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    expect(pushMatchers).toHaveLength(0);
+    expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+
+    resolveCreate({
+      ok: true,
+      json: async () => ({ id: "conv_managed" }),
+    } as unknown as Response);
+    await waitFor(() =>
+      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
+        "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "conv_managed",
+        "ag_hello",
+        "start a sandbox",
+        [],
+        "pend_managed",
+        null,
+        navigateMock,
+        expect.any(Function),
+        undefined,
+      ),
+    );
+  });
+
+  it("removes a managed temp conversation when the HTTP response rejects it", async () => {
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      pendingMsgTempId: "pend_managed_fail",
+      createToken: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    });
+
+    renderLanding([], { managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    typeMessage("start a sandbox");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    expect(pushMatchers).toHaveLength(0);
+
+    resolveCreate({
+      ok: false,
+      status: 503,
+      json: async () => ({ detail: "managed launch rejected" }),
+    } as unknown as Response);
+    await waitFor(() =>
+      expect(removeLocalConversationMock).toHaveBeenCalledWith(
+        "temp:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      ),
+    );
+    expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a failed create's restored draft when a newer create succeeds", async () => {
+    let resolveFirst!: (response: Response) => void;
+    let resolveSecond!: (response: Response) => void;
+    vi.mocked(authenticatedFetch)
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveFirst = resolve;
+        }) as ReturnType<typeof authenticatedFetch>,
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveSecond = resolve;
+        }) as ReturnType<typeof authenticatedFetch>,
+      );
+    beginLocalConversationMock
+      .mockReturnValueOnce({
+        tempConvId: "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pendingMsgTempId: "pend_a",
+        createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      })
+      .mockReturnValueOnce({
+        tempConvId: "temp:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        pendingMsgTempId: "pend_b",
+        createToken: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      });
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("restore this draft");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("newer successful create");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
+    expect(pushMatchers).toHaveLength(2);
+    const firstRow = {
+      id: "conv_first",
+      parent_session_id: null,
+      labels: { "omnigent.client_create_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    };
+    const secondRow = {
+      id: "conv_second",
+      parent_session_id: null,
+      labels: { "omnigent.client_create_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    };
+    expect(pushMatchers[0]?.(firstRow)).toBe(true);
+    expect(pushMatchers[0]?.(secondRow)).toBe(false);
+    expect(pushMatchers[1]?.(firstRow)).toBe(false);
+    expect(pushMatchers[1]?.(secondRow)).toBe(true);
+    cleanup();
+
+    resolveFirst({
+      ok: false,
+      status: 500,
+      json: async () => ({ detail: "first create failed" }),
+    } as unknown as Response);
+    await waitFor(() =>
+      expect(removeLocalConversationMock).toHaveBeenCalledWith(
+        "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ),
+    );
+
+    resolveSecond({
+      ok: true,
+      json: async () => ({ id: "conv_second" }),
+    } as unknown as Response);
+    await waitFor(() =>
+      expect(hydrateLocalConversationMock).toHaveBeenCalledWith(
+        "temp:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "conv_second",
+        "ag_hello",
+        "newer successful create",
+        [],
+        "pend_b",
+        null,
+        navigateMock,
+        expect.any(Function),
+        undefined,
+      ),
+    );
+
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("restore this draft");
   });
 
   it("records the launched workspace under its host without corrupting other recents", async () => {
@@ -374,7 +709,15 @@ describe("NewChatLandingScreen create flow", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(announcePushedSession).not.toBeNull());
-    act(() => announcePushedSession?.({ id: "conv_pushed" }));
+    const [, createInit] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const token = JSON.parse(createInit.body as string).labels["omnigent.client_create_token"];
+    act(() =>
+      announcePushedSession?.({
+        id: "conv_pushed",
+        parent_session_id: null,
+        labels: { "omnigent.client_create_token": token },
+      }),
+    );
 
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_pushed"));
     // The first message is handed off under the same id. That coupling is why
@@ -398,22 +741,23 @@ describe("NewChatLandingScreen create flow", () => {
 
     await waitFor(() => expect(pushMatchers).toHaveLength(1));
     const isOurs = pushMatchers[0]!;
+    const [, createInit] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const token = JSON.parse(createInit.body as string).labels["omnigent.client_create_token"];
     const ours: SessionListWireItem = {
       id: "conv_mine",
-      agent_id: "ag_hello",
-      host_id: "host_1",
+      parent_session_id: null,
+      labels: { "omnigent.client_create_token": token },
     };
     expect(isOurs(ours)).toBe(true);
 
-    // The stream announces every session that becomes visible to this user and
-    // restates the ones already on screen, so each of these would otherwise be
-    // mistaken for the create's own row: a session started elsewhere on another
-    // agent or host, a sub-agent child (never what a create returns), and a row
-    // this tab was already showing.
-    expect(isOurs({ ...ours, agent_id: "ag_other" })).toBe(false);
-    expect(isOurs({ ...ours, host_id: "host_2" })).toBe(false);
+    expect(
+      isOurs({
+        ...ours,
+        labels: { "omnigent.client_create_token": "ffffffffffffffffffffffffffffffff" },
+      }),
+    ).toBe(false);
+    expect(isOurs({ ...ours, labels: undefined })).toBe(false);
     expect(isOurs({ ...ours, parent_session_id: "conv_parent" })).toBe(false);
-    expect(isOurs({ ...ours, id: "conv_existing" })).toBe(false);
   });
 
   it("shows a busy spinner on the submit button while the create is in flight", async () => {
@@ -763,6 +1107,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.labels).toEqual({
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "claude-code-native-ui",
+      "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
     });
   });
 
@@ -790,6 +1135,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.labels).toEqual({
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "antigravity-native-ui",
+      "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
     });
   });
 

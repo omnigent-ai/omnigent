@@ -232,3 +232,34 @@ def test_build_ucode_configure_command_normalizes_pasted_url() -> None:
         "claude",
         "--enable-fable",
     ]
+
+
+def test_build_ucode_configure_command_for_profile_broker_mode() -> None:
+    from omnigent.onboarding.ucode_setup import build_ucode_configure_command_for_profile
+
+    argv = build_ucode_configure_command_for_profile(
+        ["ucode"], profile="omnigent", agents=["claude", "codex", "pi"]
+    )
+    assert argv == [
+        "ucode",
+        "configure",
+        "--profiles",
+        "omnigent",
+        "--agents",
+        "claude,codex,pi",
+        "--skip-validate",
+        "--skip-upgrade",
+        "--skip-unavailable",
+    ]
+    # broker mode: no --use-pat (the caller supplies DATABRICKS_BEARER_COMMAND)
+    assert "--use-pat" not in argv
+
+
+def test_build_ucode_configure_command_for_profile_pat_mode() -> None:
+    from omnigent.onboarding.ucode_setup import build_ucode_configure_command_for_profile
+
+    argv = build_ucode_configure_command_for_profile(
+        ["ucode"], profile="DEFAULT", agents=["claude"], use_pat=True
+    )
+    assert argv[-1] == "--use-pat"  # lakebox authenticates from the injected profile PAT
+    assert "claude" in argv[argv.index("--agents") + 1]

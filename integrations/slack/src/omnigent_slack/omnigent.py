@@ -19,6 +19,7 @@ from omnigent_slack.events import (
     ElicitationOption,
     ElicitationQuestion,
     ElicitationRequest,
+    HostType,
     OmnigentError,
     OutputFile,
     SessionActivity,
@@ -49,6 +50,7 @@ __all__ = [
     "ElicitationQuestion",
     "ElicitationRequest",
     "HarnessNotConfiguredError",
+    "HostType",
     "HostUnavailableError",
     "OmnigentClient",
     "OmnigentClientPool",
@@ -89,7 +91,12 @@ class AuthRequiredError(OmnigentError):
 
 
 class ServerUnreachableError(OmnigentError):
-    """The Omnigent server could not be reached at all (transport failure)."""
+    """The Omnigent server could not be reached at all (transport failure).
+
+    Ends a turn only when the FIRST connection fails — nothing is running
+    server-side yet to rejoin. A refused re-open inside the reconnect window
+    spends the stream budget instead, like any other mid-turn drop.
+    """
 
 
 class TokenRefreshTransientError(OmnigentError):
@@ -143,6 +150,12 @@ class HarnessNotConfiguredError(OmnigentError):
 # healthy turn riding through many proxy caps is never abandoned. A separate hard
 # cap on *total* reconnects backstops a pathological "replay one byte then drop"
 # loop, which would otherwise reset the consecutive counter forever.
+#
+# A failure to RE-open the stream (``ServerUnreachableError``) spends the same
+# budget: a refused connection during the reconnect window is the same transient
+# blip one step earlier in the request lifecycle, and the turn is still running
+# server-side. Only the very FIRST connection fails fast, because nothing is
+# running yet to rejoin.
 _STREAM_RECONNECT_MAX_ATTEMPTS = 6
 _STREAM_RECONNECT_MAX_TOTAL = 200
 _STREAM_RECONNECT_BACKOFF_S = 1.0
@@ -184,10 +197,19 @@ def _is_auth_redirect(location: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class ValidatedServer:
-    """Outcome of probing an Omnigent server during Slack setup."""
+    """Outcome of probing an Omnigent server during Slack setup.
+
+    ``managed_hosts`` is whether the server can provision a sandbox for a
+    session itself, so setup can offer that instead of dead-ending a user who
+    runs no host of their own. ``managed_host_provider`` names the backing
+    provider (e.g. ``"modal"``) for the menu label, and is ``None`` when the
+    server doesn't name one.
+    """
 
     agents: list[dict[str, Any]]
     online_hosts: list[dict[str, Any]]
+    managed_hosts: bool = False
+    managed_host_provider: str | None = None
 
 
 class ClientAuth:
@@ -354,23 +376,59 @@ class OmnigentClient:
         # Setup-time probe. Confirms the server is reachable (``/health``) and
         # that unauthenticated access works — ``list_agents`` hits an
         # auth-gated endpoint, so a server with auth enabled raises
-        # ``AuthRequiredError`` here. Returns the agents and online hosts that
-        # populate the setup select menus.
+        # ``AuthRequiredError`` here. Returns the agents, online hosts, and
+        # managed-sandbox support that populate the setup select menus.
         await self.check_health()
         agents = await self.list_agents()
         hosts = await self.list_hosts()
         online_hosts = [host for host in hosts if _is_host_online(host)]
-        return ValidatedServer(agents=agents, online_hosts=online_hosts)
+        managed_hosts, provider = await self.managed_host_support()
+        return ValidatedServer(
+            agents=agents,
+            online_hosts=online_hosts,
+            managed_hosts=managed_hosts,
+            managed_host_provider=provider,
+        )
 
-    async def create_session(self, agent_id: str, title: str) -> str:
+    async def managed_host_support(self) -> tuple[bool, str | None]:
+        """Whether the server provisions managed sandboxes, and which provider.
+
+        Reads ``managed_sandboxes_enabled`` / ``sandbox_provider`` off the
+        unauthenticated ``GET /v1/info`` — the same gate the web UI's
+        new-session sandbox option uses, so a server whose ``sandbox:`` config
+        is missing or can't actually launch never advertises the option.
+        Best-effort: an unreadable probe reports "not supported", so setup
+        offers a managed session only when the create would be accepted.
+        """
+        info = await self._get_json("/v1/info")
+        if info is None:
+            self._logger.info("Omnigent server info unavailable; managed sandboxes not offered")
+            return False, None
+        enabled = info.get("managed_sandboxes_enabled") is True
+        provider = info.get("sandbox_provider")
+        self._logger.debug("Omnigent managed sandboxes enabled=%s provider=%s", enabled, provider)
+        return enabled, provider if isinstance(provider, str) and provider else None
+
+    async def create_session(
+        self,
+        agent_id: str,
+        title: str,
+        *,
+        host_type: HostType = "external",
+    ) -> str:
         # Don't log the title — it embeds the user's message text; log only the
         # agent id (everywhere else we log lengths, not content).
-        self._logger.info("Creating Omnigent session agent_id=%s", agent_id)
-        response = await self._request(
-            "POST",
-            "/v1/sessions",
-            json={"agent_id": agent_id, "title": title},
+        self._logger.info(
+            "Creating Omnigent session agent_id=%s host_type=%s", agent_id, host_type
         )
+        body: dict[str, Any] = {"agent_id": agent_id, "title": title}
+        if host_type == "managed":
+            # The server picks the sandbox's host and workspace, and rejects a
+            # caller-supplied ``host_id``/path with a 422 — so send only the
+            # switch. The key is omitted for an external session so that request
+            # stays byte-identical to what the server has always received.
+            body["host_type"] = host_type
+        response = await self._request("POST", "/v1/sessions", json=body)
         await _raise_for_status(response)
         payload = response.json()
         session_id = _extract_session_id(payload)
@@ -382,6 +440,18 @@ class OmnigentClient:
             raise OmnigentError("Omnigent server returned no session id.")
         self._logger.info("Created Omnigent session session_id=%s", session_id)
         return session_id
+
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session, e.g. one stranded by a failed runner launch.
+
+        A 404 is benign — the session is already gone, which is the goal.
+        """
+        self._logger.info("Deleting Omnigent session session_id=%s", session_id)
+        response = await self._request("DELETE", f"/v1/sessions/{session_id}")
+        if response.status_code == 404:
+            return
+        await _raise_for_status(response)
+        self._logger.info("Deleted Omnigent session session_id=%s", session_id)
 
     async def submit_message(self, session_id: str, text: str) -> None:
         self._logger.info(
@@ -580,8 +650,9 @@ class OmnigentClient:
         # A transport error BEFORE the stream connects means the server is
         # unreachable; one AFTER the ``200 OK`` (thrown back in when the caller's
         # tail iteration fails) is a mid-stream drop — a proxy severing a
-        # long-lived chunked response, not a down server. The caller reconnects
-        # on the latter, so the two are classified distinctly.
+        # long-lived chunked response, not a down server. The caller reconnects on
+        # the latter, and on the former too once a turn is in flight — only the
+        # first open fails fast — so the two stay classified distinctly.
         connected = False
         try:
             async with self._client.stream(
@@ -611,6 +682,7 @@ class OmnigentClient:
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: HostType = "external",
         idle_grace_seconds: float = 600.0,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
@@ -618,6 +690,16 @@ class OmnigentClient:
                 yield event
             return
         except RunnerUnavailableError:
+            if host_type == "managed":
+                # The server owns a managed session's sandbox and rebinds its
+                # runner itself; there is no host of ours to launch on, and the
+                # session has no workspace path to launch in.
+                self._logger.info(
+                    "Managed session reported no runner; leaving the relaunch to "
+                    "the server session_id=%s",
+                    session_id,
+                )
+                raise
             # No runner bound to the session — launch one and retry the turn once.
             if not workspace:
                 raise
@@ -867,7 +949,12 @@ class OmnigentClient:
                 # The stream ended without a terminal event or a drop (the server
                 # closed it cleanly) — the turn is over from this client's view.
                 return
-            except StreamInterruptedError as exc:
+            except (StreamInterruptedError, ServerUnreachableError) as exc:
+                if isinstance(exc, ServerUnreachableError) and attempt == 0:
+                    # The FIRST connection never landed, so no turn is running
+                    # server-side to rejoin — report the server unreachable rather
+                    # than retrying into nothing.
+                    raise
                 total_reconnects += 1
                 # A leg that forwarded a NEW event before dropping is progress, not
                 # a failing reconnect — reset the consecutive budget so the cap
@@ -882,19 +969,21 @@ class OmnigentClient:
                     attempt >= _STREAM_RECONNECT_MAX_ATTEMPTS
                     or total_reconnects >= _STREAM_RECONNECT_MAX_TOTAL
                 ):
-                    # Give up reconnecting — surface as a stream interruption (a
-                    # non-alarming "lost the live connection", not "server down").
+                    # Give up reconnecting — surface the last failure as it was
+                    # classified: a mid-tail drop stays the non-alarming "lost the
+                    # live connection", a run of refused re-opens is "server down".
                     self._logger.info(
-                        "Omnigent stream dropped and reconnect exhausted "
-                        "(%s attempts) session_id=%s",
+                        "Omnigent stream reconnect exhausted (%s attempts) session_id=%s: %s",
                         attempt,
                         session_id,
+                        exc,
                     )
                     raise
                 # The turn may have finished during the drop. If the server reports
                 # it no longer running, stop cleanly — the caller's end-of-turn
                 # reconcile recovers the committed final text. Unknown status means
-                # reconnect (a truly-down server re-fails as ServerUnreachableError).
+                # reconnect (this probe is best-effort, and a truly-down server
+                # re-fails on the next open until the budget runs out).
                 activity = await self.get_session_activity(session_id)
                 if activity.status in ("idle", "failed"):
                     self._logger.info(

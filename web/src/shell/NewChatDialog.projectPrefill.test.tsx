@@ -638,11 +638,12 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1" });
     renderLanding();
 
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
-        "feature-x",
-      ),
-    );
+    const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
+    const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
+    await waitFor(() => expect(workspaceTrigger).toHaveAttribute("title", LINKED_WORKTREE));
+    expect(workspaceTrigger).toHaveTextContent("gamma");
+    expect(worktreeTrigger).toHaveTextContent("feature/x");
+    expect(worktreeTrigger).toHaveAttribute("title", "Existing worktree branch: feature/x");
     const body = await submitAndReadBody();
     // Bound straight to the worktree dir; the worktree's branch rides along and
     // no base branch is set (it's a bind, not a fork).
@@ -737,8 +738,8 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
     const body = await submitAndReadBody();
@@ -758,8 +759,8 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
     const body = await submitAndReadBody();
@@ -778,8 +779,8 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
     const body = await submitAndReadBody();
@@ -794,12 +795,17 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
     const { rerender } = renderLanding();
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
 
     // Commit "Sonnet" through the agent-config modal (the user's explicit pick).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-config-model"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
@@ -824,13 +830,18 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
     const { unmount } = renderRoutingLanding();
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
 
     // Turn Smart Routing on via the config modal, then park the draft by
     // unmounting (submittedRef stays false → landingDraft keeps routing "on").
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-config-model"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
@@ -843,8 +854,8 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
     renderRoutingLanding();
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
 
@@ -887,9 +898,8 @@ describe("NewChatLandingScreen project prefill", () => {
 const ALWAYS_WORKTREE_KEY = "omnigent:always-use-worktree";
 
 describe("NewChatLandingScreen global always-use-worktree default", () => {
-  // The branch chip's label reflects the branch field ("Worktree" when empty),
-  // so it lets a test observe the seeded/retracted branch without opening the
-  // popover the actual input lives in.
+  // The compact header exposes the visible branch/request label separately
+  // from its state-specific accessible description.
   function branchLabel(): string {
     return screen.getByTestId("new-chat-landing-branch-chip").textContent ?? "";
   }
@@ -1010,7 +1020,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     localStorage.removeItem(ALWAYS_WORKTREE_KEY);
     render(<NewChatLandingScreen />, { wrapper: Wrapper });
 
-    await waitFor(() => expect(branchLabel()).toContain("Worktree"));
+    await waitFor(() => expect(branchLabel()).toBe("New worktree"));
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();

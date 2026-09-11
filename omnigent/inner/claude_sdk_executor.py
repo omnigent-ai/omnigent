@@ -42,24 +42,24 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
-from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
-from omnigent.claude_model_vocabulary import (
-    ALIAS_MODEL_ENV_VARS,
-    served_alias_pins,
-    served_canonical_overrides,
-)
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
-from omnigent.model_metadata import concrete_reported_model
-from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
+from omnigent.models import model_catalog
+from omnigent.models.claude_model_vocabulary import (
+    ALIAS_MODEL_ENV_VARS,
+    served_alias_pins,
+    served_canonical_overrides,
+)
+from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
 from .async_utils import run_sync_on_thread
@@ -1003,7 +1003,7 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
     :returns: The model id to launch on.
     """
     try:
-        from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
+        from omnigent.models.databricks_model_discovery import discover_databricks_claude_catalog
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
         creds = resolve_databricks_workspace(profile)

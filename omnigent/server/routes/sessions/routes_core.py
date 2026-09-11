@@ -30,9 +30,6 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.cost_plan import (
-    reserved_cost_control_keys,
-)
 from omnigent.db.utils import generate_agent_id
 from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import (
@@ -41,13 +38,8 @@ from omnigent.entities import (
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.model_override import validate_model_override
-from omnigent.reasoning_effort import (
-    EFFORT_CLEAR_VALUES,
-    EFFORT_VALUES,
-    validate_effort,
-)
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
@@ -69,6 +61,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
@@ -150,6 +143,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_permission_mode_forward,
     _reset_runner_resources_after_switch,
     _same_provider_family,
+    _session_status_cache,
     _session_status_from_cache,
     _set_read_state,
     _surface_model_change_forward_failure,
@@ -157,6 +151,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
+    reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -180,6 +175,8 @@ from omnigent.server.schemas import (
     PaginatedList,
     ProjectSessionCreateRequest,
     ReadStatePutRequest,
+    ResetSessionModelOverrideRequest,
+    ResetSessionModelOverrideResponse,
     SessionAgentChangedEvent,
     SessionCreateRequest,
     SessionForkRequest,
@@ -191,9 +188,6 @@ from omnigent.server.schemas import (
     SessionSwitchAgentRequest,
     UpdateSessionRequest,
 )
-from omnigent.session_lifecycle import (
-    labels_with_closed_status,
-)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -203,12 +197,25 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
     ConversationNotFoundError,
     pinned_label_key,
+    runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.util.cost_plan import (
+    reserved_cost_control_keys,
+)
+from omnigent.util.reasoning_effort import (
+    EFFORT_CLEAR_VALUES,
+    EFFORT_VALUES,
+    validate_effort,
+)
+from omnigent.util.session_lifecycle import (
+    labels_with_closed_status,
+)
 from omnigent.version import VERSION
 
 
@@ -440,19 +447,35 @@ def register_core_routes(
                 harness=harness,
             )
         )
-        host_registry.send_text(conn, launch_frame)
         try:
+            host_registry.send_text(conn, launch_frame)
             launch_result = await asyncio.wait_for(future, timeout=30.0)
+        except ConnectionError as exc:
+            launch_result = {"status": "failed", "error": str(exc)}
         except asyncio.TimeoutError:
-            conn.pending_launches.pop(request_id, None)
             launch_result = {"status": "failed", "error": "host launch timed out"}
+        finally:
+            conn.pending_launches.pop(request_id, None)
+            if not future.done():
+                future.cancel()
         launch_failed = launch_result.get("status") == "failed"
         if launch_failed:
+            # The runner failed to come up (generic launch-failure path with no
+            # structured error_code), blocking the session at launch. A coded
+            # deployment failure (harness_not_configured, etc.) is attributed
+            # CONFIG where it raises as OmnigentError.
             _logger.warning(
                 "Host %s failed to launch runner for session %s: %s",
                 host_id,
                 session_id,
                 launch_result.get("error"),
+                extra=debug_event(
+                    "runner_launch_failed",
+                    session_id=session_id,
+                    error_category=ErrorCategory.RUNNER.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+                ),
             )
         return runner_id, launch_failed
 
@@ -830,7 +853,7 @@ def register_core_routes(
         # here — it co-locates on the parent's runner.
         if parsed_metadata.host_id is not None and inherited_runner_id is None:
             from omnigent.harness_aliases import canonicalize_harness
-            from omnigent.model_catalog import spec_harness
+            from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
             await _bind_and_launch_on_caller_host(
@@ -1250,6 +1273,65 @@ def register_core_routes(
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
+        # A session whose persisted live_status is still running/waiting but
+        # whose runner is confirmed gone — a replica that restarted and
+        # outlived its runner, a crashed host, a graceful disconnect
+        # mid-turn — would otherwise read "running" forever: no executor is
+        # left to emit the terminal edge that clears it. Settle that exact
+        # subset here so the sidebar (and every other reader) stops showing a
+        # turn that isn't happening. The list still does NOT compute liveness
+        # for the general case (see the note below the item build): the probe
+        # is bounded to a tiny suspect set so the common path pays nothing.
+        #
+        # Suspect = a row that (a) still says running/waiting, (b) has a bound
+        # runner, (c) has NO live entry in this replica's status cache — i.e.
+        # its "running" came from the cross-replica DB mirror, not a runner
+        # this replica is actively relaying — and (d) has a stale/absent
+        # runner_last_seen heartbeat. The freshness check reads the stamp
+        # already carried on the list row (no extra query): a runner up on
+        # another replica keeps it fresh, so such a session is filtered out
+        # here and never reaches the probe. Only stamp-stale candidates fall
+        # through to liveness_lookup, which additionally rules out a runner
+        # whose tunnel is live on THIS replica before we settle.
+        if liveness_lookup is not None:
+            orphan_suspects = [
+                conv
+                for conv in page.data
+                if conv.agent_id is not None
+                and conv.runner_id is not None
+                and conv.live_status in ("running", "waiting")
+                and _session_status_cache.get(conv.id) is None
+                and not runner_seen_is_fresh(conv.runner_last_seen)
+                and (
+                    permission_store is None
+                    or _permission_level_from_grants(
+                        user_id,
+                        perms_by_conv.get(conv.id, []),
+                        user_is_admin,
+                    )
+                    == LEVEL_OWNER
+                )
+            ]
+            if orphan_suspects:
+                orphan_liveness = await asyncio.to_thread(
+                    liveness_lookup, [conv.id for conv in orphan_suspects]
+                )
+                for conv in orphan_suspects:
+                    result = orphan_liveness.get(conv.id)
+                    # runner_online is False only once the runner is gone from
+                    # every replica (no tunnel anywhere AND runner_last_seen
+                    # stale past the TTL), so this fires for a genuinely
+                    # orphaned runner, never one mid-reconnect within grace.
+                    if result is not None and not result.runner_online:
+                        await asyncio.to_thread(
+                            reconcile_orphaned_running_status,
+                            conv.id,
+                            conversation_store,
+                            int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        )
+        # Build items after reconciliation so each settled row reads its new
+        # status straight from the (now-updated) cache.
         items: list[SessionListItem] = [
             _build_session_list_item(
                 conv,
@@ -1265,7 +1347,8 @@ def register_core_routes(
             for conv in page.data
             if conv.agent_id is not None
         ]
-        # The list deliberately does NOT compute per-item liveness
+        # Apart from the bounded orphan-suspect probe above, the list does not
+        # compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the
         # sidebar no longer surfaces connection state, and the only live
         # consumer — the open-session view — sources liveness from the
@@ -1663,6 +1746,17 @@ def register_core_routes(
                                 "hosts-changed push failed; client will rely on fallback poll",
                                 exc_info=True,
                             )
+                elif evt_type == "projects_changed":
+                    async with emit_lock:
+                        try:
+                            await _send({"type": "projects_changed"})
+                        except WebSocketDisconnect:
+                            raise
+                        except Exception:
+                            _logger.warning(
+                                "projects-changed push failed; client converges on next load",
+                                exc_info=True,
+                            )
 
         reader_task = asyncio.create_task(_reader(), name="session-updates-reader")
         ticker_task = asyncio.create_task(_ticker(), name="session-updates-ticker")
@@ -1768,6 +1862,38 @@ def register_core_routes(
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
+    @router.post(
+        "/sessions/{session_id}/model-override/reset",
+        response_model=ResetSessionModelOverrideResponse,
+    )
+    async def reset_session_model_override(
+        request: Request,
+        session_id: str,
+        body: ResetSessionModelOverrideRequest,
+    ) -> ResetSessionModelOverrideResponse:
+        """Retire a rejected pick after fallback without replacing a newer selection."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or conv.agent_id is None:
+            raise _session_not_found()
+        try:
+            validate_model_override(body.expected_model_override)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid expected_model_override: {exc}", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        # The terminal already launched its fallback. This only retires metadata;
+        # forwarding another model change could undo a concurrent live selection.
+        reset = await asyncio.to_thread(
+            conversation_store.clear_model_override_if_matches,
+            session_id,
+            body.expected_model_override,
+        )
+        return ResetSessionModelOverrideResponse(reset=reset)
+
     @router.patch(
         "/sessions/{session_id}",
         response_model=None,
@@ -1815,11 +1941,18 @@ def register_core_routes(
         #   owner-gated stop (an editor must not hide/stop a session they can't
         #   issue that stop for). Presence is the signal for project (``""``
         #   unfiles), so gate on model_fields_set, not a non-None value.
+        # * MANAGE — exposing the workspace to view-level collaborators
+        #   (``share_workspace_files``). It is a sharing decision, so it sits
+        #   with the same tier that already controls who is granted access
+        #   (grant/revoke, public toggle) — the share dialog is manage-gated.
+        #   Presence is the signal (the flag's own True/False is the value).
         # * EDIT — every other field.
         #
-        # Owner implies edit, so a single check at the resolved level gates all
-        # three with no redundant second permission-store read.
+        # A higher tier implies the lower ones, so a single check at the
+        # resolved (strictest requested) level gates them all with no redundant
+        # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_share_workspace = "share_workspace_files" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
@@ -1827,6 +1960,8 @@ def register_core_routes(
             required_level = LEVEL_READ
         elif body.archived is not None or set_project:
             required_level = LEVEL_OWNER
+        elif set_share_workspace:
+            required_level = LEVEL_MANAGE
         else:
             required_level = LEVEL_EDIT
         await _require_access(
@@ -2131,6 +2266,9 @@ def register_core_routes(
                 None if clear_subagent_routing else subagent_routing_override
             ),
             _unset_subagent_routing_override=clear_subagent_routing,
+            # Owner opt-in for workspace-file browsing. Presence is the signal:
+            # an omitted field leaves it unchanged; True/False set or clear it.
+            share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )
@@ -2755,13 +2893,21 @@ def register_core_routes(
         # Push the forked session to this user's other open tabs.
         _announce_session_added(user_id, new_conv.id)
 
+        # Bound the response like the GET-session snapshot: newest item page,
+        # chronological. Clients navigate by the fork's id and hydrate the
+        # transcript via the paged items endpoint, so returning the whole
+        # copied history only made the user-blocked response scale with
+        # source size.
         fork_items = await asyncio.to_thread(
-            conversation_store.list_items, new_conv.id, limit=10000
+            conversation_store.list_items,
+            new_conv.id,
+            limit=100,
+            order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
         return _build_session_response(
             new_conv,
-            fork_items.data,
+            list(reversed(fork_items.data)),
             "idle",
             permission_level=level,
             last_task_error=None,

@@ -1,4 +1,4 @@
-"""Tests for omnigent.pi_native_credentials (native Pi provider wiring)."""
+"""Tests for omnigent.harnesses.pi_native.credentials (native Pi provider wiring)."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent import pi_native_credentials as creds
+from omnigent.harnesses.pi_native import credentials as creds
 
 
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
@@ -701,7 +701,7 @@ def test_cli_config_databricks_warns_on_unresolvable(
     monkeypatch.setenv("HOME", str(tmp_path))
     import logging
 
-    with caplog.at_level(logging.INFO, logger="omnigent.pi_native_credentials"):
+    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.pi_native.credentials"):
         assert (
             creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config) is None
         )
@@ -1092,11 +1092,13 @@ def test_databricks_prefixed_override_normalized_for_inline_openai() -> None:
     Same contract as the Anthropic case for the OpenAI family: a
     ``databricks-gpt-*`` id is a gateway spelling the vendor-direct OpenAI
     endpoint cannot route, so the prefix is stripped to the bare ``gpt-*`` id.
+    Vendor-direct means key-kind; a gateway-kind provider passes the id
+    through verbatim (it may front the very gateway that serves it).
     """
     config = {
         "providers": {
-            "openai-gateway": {
-                "kind": "gateway",
+            "openai-direct": {
+                "kind": "key",
                 "default": True,
                 "openai": {
                     "base_url": "https://api.openai.com/v1",
@@ -1179,6 +1181,310 @@ def test_inline_family_configured_gateway_default_survives_verbatim() -> None:
     assert provider.model == "databricks-claude-opus-4-8"
     cfg = provider.to_models_config()
     assert cfg["providers"]["omnigent"]["models"][0]["id"] == "databricks-claude-opus-4-8"
+
+
+# ── Cross-family routing: a known-family model served over the other family's
+#    wire must carry a routing warning; own-family and "other"-token routing
+#    stays silent. ──────────────────────────────────────────────────────────
+
+
+def _openai_only_gateway(default_model: str = "claude-fable-5-1") -> dict[str, object]:
+    """A ``kind: gateway`` provider exposing only an openai (chat) family."""
+    return {
+        "providers": {
+            "corp-gateway": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "openai": {
+                    "base_url": "https://gw.invalid/openai",
+                    "api_key": "test-gateway-key",
+                    "wire_api": "chat",
+                    "models": {"default": default_model},
+                },
+            }
+        }
+    }
+
+
+def test_claude_override_on_openai_only_gateway_carries_routing_warning() -> None:
+    """A Claude override falling through to an openai family warns.
+
+    The fallthrough still resolves (a protocol-translating proxy may serve
+    it), but a raw passthrough gateway 404s every turn, so the resolution
+    must not be silent.
+    """
+    provider = creds.resolve_pi_native_provider(
+        model="claude-fable-5-1", config_loader=lambda: _openai_only_gateway()
+    )
+    assert provider is not None
+    assert provider.api == "openai-completions"
+    assert provider.credential_warning is not None
+    assert "claude-fable-5-1" in provider.credential_warning
+    assert "anthropic" in provider.credential_warning
+
+
+def test_claude_family_default_on_openai_only_gateway_carries_routing_warning() -> None:
+    """The configured family default is warned about too, not just overrides.
+
+    The reported journey configures ``openai.models.default`` as a Claude id
+    and launches with no override; the misroute must still be flagged.
+    """
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: _openai_only_gateway())
+    assert provider is not None
+    assert provider.api == "openai-completions"
+    assert provider.credential_warning is not None
+    assert "claude-fable-5-1" in provider.credential_warning
+
+
+def test_gpt_on_anthropic_only_gateway_carries_routing_warning() -> None:
+    """The inverse direction warns too: a GPT id over an Anthropic wire."""
+    config = {
+        "providers": {
+            "proxy": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://litellm.internal.example.com/anthropic",
+                    "api_key": "sk-a",
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(model="gpt-5-5", config_loader=lambda: config)
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.credential_warning is not None
+    assert "gpt-5-5" in provider.credential_warning
+
+
+def test_own_family_routing_has_no_warning() -> None:
+    """A Claude model served by an anthropic family resolves silently."""
+    config = {
+        "providers": {
+            "corp-gateway": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "anthropic": {
+                    "base_url": "https://gw.invalid/anthropic",
+                    "api_key": "test-gateway-key",
+                    "models": {"default": "claude-fable-5-1"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="claude-fable-5-1", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.credential_warning is None
+
+
+def test_other_token_fallthrough_stays_silent() -> None:
+    """An id with no known family keeps the silent LiteLLM-passthrough intent."""
+    config = {
+        "providers": {
+            "proxy": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://litellm.internal.example.com/anthropic",
+                    "api_key": "sk-a",
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="gemini-3-5-flash", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.credential_warning is None
+
+
+# ── Provider-qualified overrides: a ``provider/`` prefix naming a configured
+#    omnigent provider selects that provider's model; any other slash id is
+#    the endpoint's own model naming and stays verbatim. ────────────────────
+
+
+def _rpw_fable_anthropic_gateway() -> dict[str, object]:
+    """A ``kind: gateway`` pi default whose anthropic family serves Claude."""
+    return {
+        "providers": {
+            "rpw-fable": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "anthropic": {
+                    "base_url": "https://gw.invalid/anthropic",
+                    "api_key": "test-gateway-key",
+                    "models": {"default": "databricks-claude-fable-5-1"},
+                },
+            }
+        }
+    }
+
+
+def test_provider_qualified_override_split_to_configured_provider() -> None:
+    """An override qualified by the configured provider's name is split.
+
+    The web model picker emits ``<provider>/<model>`` values qualified by the
+    omnigent provider name; registering that verbatim renders a slash id no
+    endpoint serves. Splitting is silent: the named provider is exactly the
+    one serving the session.
+    """
+    provider = creds.resolve_pi_native_provider(
+        model="rpw-fable/databricks-claude-fable-5-1",
+        config_loader=_rpw_fable_anthropic_gateway,
+    )
+    assert provider is not None
+    # Prefix split; the gateway-kind provider keeps the id verbatim.
+    assert provider.model == "databricks-claude-fable-5-1"
+    assert provider.credential_warning is None
+    cfg = provider.to_models_config()
+    ids = [m["id"] for prov in cfg["providers"].values() for m in prov["models"]]
+    assert not [mid for mid in ids if "/" in mid]
+
+
+def test_override_qualified_by_other_configured_provider_warns() -> None:
+    """Naming a configured provider other than the serving one warns.
+
+    The session is served by the pi-default provider, so a model picked from
+    another configured provider is requested from the default instead — say
+    so rather than silently reinterpreting the value.
+    """
+    config = _rpw_fable_anthropic_gateway()
+    config["providers"]["other-gw"] = {
+        "kind": "gateway",
+        "anthropic": {
+            "base_url": "https://other.invalid/anthropic",
+            "api_key": "test-key",
+            "models": {"default": "databricks-claude-fable-5-1"},
+        },
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="other-gw/databricks-claude-fable-5-1", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.model == "databricks-claude-fable-5-1"
+    assert provider.credential_warning is not None
+    assert "other-gw" in provider.credential_warning
+    assert "rpw-fable" in provider.credential_warning
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["zai-org/GLM-4.7", "openai/gpt-4o", "moonshotai/kimi-k2.6"],
+)
+def test_vendor_namespaced_model_id_is_not_split(model_id: str) -> None:
+    """A slash id whose prefix is no configured provider survives untouched.
+
+    OpenRouter/LiteLLM-style endpoints route by vendor-namespaced ids
+    (``openai/gpt-4o``, ``moonshotai/kimi-k2.6``, ``zai-org/GLM-4.7``); the
+    prefix is the endpoint's model namespace, not a provider reference — no
+    strip, no warning.
+    """
+    config = {
+        "providers": {
+            "deepinfra": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.deepinfra.com/v1/openai",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {"default": model_id},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(model=model_id, config_loader=lambda: config)
+    assert provider is not None
+    assert provider.model == model_id
+    assert provider.credential_warning is None
+
+
+def test_vendor_namespaced_claude_id_is_not_split() -> None:
+    """``anthropic/claude-…`` on an anthropic family passes through verbatim."""
+    config = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://openrouter.invalid/anthropic",
+                    "api_key": "sk-test",
+                    "models": {"default": "anthropic/claude-opus-4-8"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="anthropic/claude-opus-4-8", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.model == "anthropic/claude-opus-4-8"
+    assert provider.credential_warning is None
+
+
+# ── Gateway/local kinds pass overrides through verbatim; only vendor-direct
+#    (key-kind) endpoints strip the mechanical ``databricks-`` prefix. ───────
+
+
+def test_gateway_override_keeps_databricks_prefix_for_anthropic_family() -> None:
+    """A ``databricks-`` override on a gateway-kind provider is sent verbatim.
+
+    A gateway fronting the Databricks AI Gateway is addressed by the prefixed
+    endpoint name; stripping yields an id the endpoint answers 404 for. The
+    family-default path already passed it through — the override path must
+    agree.
+    """
+    config = {
+        "providers": {
+            "corp-gateway": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "anthropic": {
+                    "base_url": "https://gw.invalid/anthropic",
+                    "api_key": "test-gateway-key",
+                    "models": {"default": "databricks-claude-fable-5-1"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-claude-fable-5-1", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.model == "databricks-claude-fable-5-1"
+    assert provider.credential_warning is None
+    cfg = provider.to_models_config()
+    assert "databricks-claude-fable-5-1" in [
+        m["id"] for m in cfg["providers"]["omnigent"]["models"]
+    ]
+
+
+def test_local_kind_override_passes_through_verbatim() -> None:
+    """A local-kind provider serves its own inventory; overrides pass through."""
+    config = {
+        "providers": {
+            "vllm": {
+                "kind": "local",
+                "default": True,
+                "openai": {
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "api_key": "local",
+                    "wire_api": "chat",
+                    "models": {"default": "databricks-gpt-5-4"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-gpt-5-4", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.model == "databricks-gpt-5-4"
 
 
 def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1402,8 +1708,8 @@ def test_fetch_pi_model_lists_carries_catalog_token_limits(
 
     import httpx
 
-    from omnigent import model_catalog
-    from omnigent.model_metadata import ModelMetadata
+    from omnigent.models import model_catalog
+    from omnigent.models.model_metadata import ModelMetadata
 
     payload = {
         "model_services": [
@@ -1467,7 +1773,7 @@ def test_fetch_pi_model_lists_survives_catalog_outage(monkeypatch: pytest.Monkey
 
     import httpx
 
-    from omnigent import model_catalog
+    from omnigent.models import model_catalog
 
     payload = {
         "model_services": [
@@ -1549,7 +1855,7 @@ def _mock_databricks_model_lists(
 def _set_catalog_default(monkeypatch: pytest.MonkeyPatch, model_id: str) -> None:
     """Set the release-curated Databricks Claude default for one test."""
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(model_id=model_id),
     )
 
@@ -2005,7 +2311,7 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 def test_default_claude_model_from_picks_by_tier_then_newest() -> None:
     """Pi's launch default follows the ``opus > sonnet > …`` precedence, newest first."""
-    from omnigent.pi_native_credentials import _default_claude_model_from
+    from omnigent.harnesses.pi_native.credentials import _default_claude_model_from
 
     entries = [
         {"id": "system.ai.claude-sonnet-5"},
@@ -2133,7 +2439,7 @@ def test_cli_config_pi_provider_uses_live_discovery_over_catalog_default(
     # Stub catalog default to an unserved id (the bug: this must NOT win).
     UNSERVED_DEFAULT = "databricks-claude-fable-5"
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(model_id=UNSERVED_DEFAULT),
     )
 
@@ -2191,7 +2497,7 @@ def test_cli_config_pi_provider_explicit_override_wins_over_discovery(
     the live list (callers are responsible for validating overrides).
     """
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda *_a, **_kw: SimpleNamespace(model_id="databricks-claude-fable-5"),
     )
     monkeypatch.setattr(
@@ -2236,7 +2542,7 @@ def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
     the model), rather than returning None or raising.
     """
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda *_a, **_kw: SimpleNamespace(model_id="catalog-databricks-claude-default"),
     )
 
@@ -2349,3 +2655,56 @@ def test_pi_own_login_model_arg_strips_managed_prefix_only() -> None:
         == "anthropic/claude-sonnet-4-5"
     )
     assert creds.pi_own_login_model_arg("claude-sonnet-4-5") == "claude-sonnet-4-5"
+
+
+def test_connect_broker_managed_host_resolves_without_configured_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed connect host with no configured provider still resolves a Pi
+    Databricks provider via the broker (the connect-broker fallback).
+
+    No omnigent provider is configured, so ``default_provider_for_harness``
+    returns None; the host-only ``[omnigent]`` profile + broker sidecar then route
+    Pi through the gateway with a broker ``!command`` apiKey and the ucode-served
+    model. The live-credential probe fails on the token-less profile, but that
+    warning is suppressed (the broker mints per request).
+    """
+    from types import SimpleNamespace
+
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor, "_read_databrickscfg_host", lambda profile: "https://ws.example"
+    )
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.broker_token_command",
+        lambda host, *a, **k: "python3 -m omnigent.host.databricks_credential token --coords /x",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda host: SimpleNamespace(
+            agent=lambda name: SimpleNamespace(model="system.ai.claude-sonnet-4-6")
+        ),
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}})
+
+    assert provider is not None
+    assert provider.base_url == "https://ws.example/ai-gateway/anthropic"
+    assert provider.model == "system.ai.claude-sonnet-4-6"  # ucode-served, not legacy catalog
+    assert provider.api_key.startswith("!")  # broker command, minted per request
+    assert provider.credential_warning is None  # false "expired" warning suppressed
+
+
+def test_connect_broker_skipped_without_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No broker sidecar (e.g. a laptop) → connect-broker branch no-ops → None,
+    so non-sandbox auth is untouched."""
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor, "_read_databrickscfg_host", lambda profile: "https://ws.example"
+    )
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.broker_token_command", lambda host, *a, **k: None
+    )
+    assert creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}}) is None

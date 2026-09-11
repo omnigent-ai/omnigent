@@ -135,14 +135,17 @@ def test_codex_native_picker_uses_raw_model_metadata(
 
     # The read-only composer label shows the resolved model + effort; the
     # harness identity moved into the config gear's hover tooltip.
-    label = page.get_by_test_id("composer-model-effort-label")
-    expect(label).to_contain_text("Codex Pretty 5.5 xhigh", timeout=15_000)
+    expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
+        "Codex Pretty 5.5", timeout=15_000
+    )
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xhigh")
 
     page.get_by_test_id("composer-config-gear").hover()
     expect(page.get_by_test_id("composer-config-gear-tooltip")).to_contain_text("Codex")
 
     # Open the config modal; its Model dropdown renders Codex's displayName raw.
     page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-advanced-settings").click()
     expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
     page.get_by_test_id("composer-config-model").click()
     model_row = page.locator('[role="option"][data-model-id="gpt-5.5"]')
@@ -183,12 +186,15 @@ def test_custom_codex_native_agent_keeps_model_and_effort_controls(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    label = page.get_by_test_id("composer-model-effort-label")
-    expect(label).to_contain_text("Codex Pretty 5.5 xhigh", timeout=15_000)
+    expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
+        "Codex Pretty 5.5", timeout=15_000
+    )
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xhigh")
 
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible()
     gear.click()
+    page.get_by_test_id("composer-advanced-settings").click()
     expect(page.get_by_test_id("composer-config-model")).to_be_visible()
     expect(page.get_by_test_id("composer-config-effort")).to_contain_text("xhigh")
 
@@ -214,10 +220,11 @@ def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    plan_toggle = page.get_by_test_id("codex-plan-mode-toggle")
+    page.get_by_test_id("composer-attach").click()
+    plan_toggle = page.get_by_test_id("composer-plan-action")
     expect(plan_toggle).to_be_visible(timeout=15_000)
     expect(plan_toggle).to_have_attribute("aria-label", "Enter Plan mode")
-    expect(plan_toggle).to_have_attribute("aria-pressed", "false")
+    expect(plan_toggle).not_to_have_attribute("data-active", "true")
 
     with page.expect_response(
         lambda response: (
@@ -229,8 +236,10 @@ def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
         plan_toggle.click()
 
     assert patch_bodies[-1] == {"collaboration_mode": "plan"}
+    expect(plan_toggle).not_to_be_visible()
+    page.get_by_test_id("composer-attach").click()
     expect(plan_toggle).to_have_attribute("aria-label", "Exit Plan mode")
-    expect(plan_toggle).to_have_attribute("aria-pressed", "true")
+    expect(plan_toggle).to_have_attribute("data-active", "true")
     expect(page.get_by_test_id("composer-plan-mode")).to_contain_text("Plan mode")
 
     with page.expect_response(
@@ -243,8 +252,10 @@ def test_codex_native_plan_mode_toggle_uses_codex_session_patch(
         plan_toggle.click()
 
     assert patch_bodies[-1] == {"collaboration_mode": "default"}
+    expect(plan_toggle).not_to_be_visible()
+    page.get_by_test_id("composer-attach").click()
     expect(plan_toggle).to_have_attribute("aria-label", "Enter Plan mode")
-    expect(plan_toggle).to_have_attribute("aria-pressed", "false")
+    expect(plan_toggle).not_to_have_attribute("data-active", "true")
     expect(page.get_by_test_id("composer-plan-mode")).to_have_count(0)
 
 
@@ -359,6 +370,7 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+    page.get_by_test_id("composer-advanced-settings").click()
     expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
 
     # The Effort row is present although the session catalog is still empty.

@@ -22,7 +22,6 @@ import pytest
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
-from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -37,6 +36,7 @@ from omnigent.tools.builtins.spawn import (
     SysSessionListTool,
     SysSessionSendTool,
 )
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 
 @dataclass

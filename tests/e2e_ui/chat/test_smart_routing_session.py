@@ -207,6 +207,7 @@ def test_routed_session_config_modal_names_the_routed_model(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+    page.get_by_test_id("composer-advanced-settings").click()
 
     model_row = page.get_by_test_id("composer-config-model")
     expect(model_row).to_be_visible()

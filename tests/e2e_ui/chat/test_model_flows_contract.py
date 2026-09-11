@@ -78,6 +78,7 @@ def _open_gear_model_dropdown(page: Page) -> None:
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+    page.get_by_test_id("composer-advanced-settings").click()
     page.get_by_test_id("composer-config-model").click()
 
 
@@ -136,7 +137,7 @@ def test_row13_off_catalog_reported_model_appends_and_highlights_exactly(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    chip = page.get_by_test_id("composer-model-effort-label")
+    chip = page.get_by_test_id("composer-agent-config-value")
     expect(chip).to_contain_text(reported, timeout=15_000)
 
     _open_gear_model_dropdown(page)
@@ -188,7 +189,7 @@ def test_row14_pick_stays_pending_until_the_harness_confirms(
     )
 
     page.goto(f"{base_url}/c/{session_id}")
-    chip = page.get_by_test_id("composer-model-effort-label")
+    chip = page.get_by_test_id("composer-agent-config-value")
     expect(chip).to_contain_text("Sonnet 5", timeout=15_000)
 
     _open_gear_model_dropdown(page)
@@ -232,7 +233,7 @@ def test_row15_failed_switch_surfaces_error_and_keeps_the_reported_model(
     )
 
     page.goto(f"{base_url}/c/{session_id}")
-    chip = page.get_by_test_id("composer-model-effort-label")
+    chip = page.get_by_test_id("composer-agent-config-value")
     expect(chip).to_contain_text("Sonnet 5", timeout=15_000)
 
     _open_gear_model_dropdown(page)
