@@ -3106,7 +3106,12 @@ function ComposerImpl(
       // executed locally. It must reach the vendor TUI as plaintext so Claude
       // Code opens its side chat and the forwarder relays the answer to the
       // web overlay; fall through to the plaintext send path below.
-      if (cmd !== "/btw" && cmd !== "/side" && cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
+      if (
+        cmd !== "/btw" &&
+        cmd !== "/side" &&
+        cmd in BUILTIN_SLASH_COMMANDS &&
+        cmd in slashCommands
+      ) {
         executeSlashCommand(cmd, arg);
         return;
       }
