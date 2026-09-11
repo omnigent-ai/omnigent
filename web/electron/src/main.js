@@ -2494,56 +2494,64 @@ function browserRegistryForSender(event) {
   return windows.get(win)?.browserRegistry ?? null;
 }
 
+const WORKSPACE_PICKER_PAGE = path.join(__dirname, "..", "workspace-picker", "index.html");
+
 /**
- * Choose which workspace to bridge an account-scoped (SPOG) Databricks token to.
+ * Show the searchable workspace picker (workspace-picker/index.html) as a modal
+ * of `parent`, and resolve with the chosen workspace (or null if dismissed).
+ * Used for account-scoped (SPOG) logins to choose which workspace to bridge the
+ * account token to. Sibling in spirit to genie-one-desktop's WorkspacePicker.
  *
- * If OMNIGENT_DATABRICKS_WORKSPACE_ORIGIN names one of the account's workspaces,
- * auto-pick it (deterministic testing — no prompt). Otherwise show a native
- * chooser. This is an MVP picker via a message box; a polished list picker
- * (like genie-one-desktop's WorkspacePicker) is a follow-up.
- *
- * @param {Electron.BrowserWindow} win
+ * @param {Electron.BrowserWindow} parent
  * @param {Array<{workspaceId: string, name: string, fqdn: string}>} workspaces
- * @returns {Promise<{fqdn: string, name: string} | null>}
+ * @returns {Promise<{workspaceId: string, name: string, fqdn: string} | null>}
  */
-async function pickWorkspaceForBridge(win, workspaces) {
-  const pref = (process.env.OMNIGENT_DATABRICKS_WORKSPACE_ORIGIN || "").trim();
-  if (pref) {
-    let host;
-    try {
-      host = new URL(pref).host;
-    } catch {
-      host = pref.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+function pickWorkspaceForBridge(parent, workspaces) {
+  return new Promise((resolve) => {
+    const picker = new BrowserWindow({
+      parent,
+      modal: true,
+      width: 540,
+      height: 620,
+      resizable: true,
+      minimizable: false,
+      maximizable: false,
+      title: "Select a workspace",
+      webPreferences: {
+        preload: path.join(__dirname, "workspace_picker_preload.js"),
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    });
+
+    let settled = false;
+    const provideList = () => workspaces;
+    const onChoose = (_event, workspaceId) =>
+      finish(workspaces.find((w) => w.workspaceId === workspaceId) ?? null);
+    const onCancel = () => finish(null);
+
+    function cleanup() {
+      ipcMain.removeHandler("workspacePicker:list");
+      ipcMain.removeListener("workspacePicker:choose", onChoose);
+      ipcMain.removeListener("workspacePicker:cancel", onCancel);
     }
-    const match = workspaces.find((w) => w.fqdn === host);
-    if (match) {
-      console.log(`[omnigent] databricks workspace picker: auto-picked ${match.fqdn} from override`);
-      return match;
+    function finish(value) {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (!picker.isDestroyed()) picker.close();
+      resolve(value);
     }
-    console.warn(`[omnigent] databricks workspace picker: override ${pref} not in the account's workspaces`);
-  }
-  // MVP picker: a native message box only works for a short list. A searchable
-  // list picker (like genie-one-desktop's WorkspacePicker) is the follow-up. For
-  // a long list, refuse rather than render hundreds of buttons — point the tester
-  // at the override instead.
-  const MAX_BUTTONS = 8;
-  if (workspaces.length > MAX_BUTTONS) {
-    const sample = workspaces.slice(0, 5).map((w) => w.fqdn);
-    throw new Error(
-      `${workspaces.length} workspaces is too many for the MVP picker. Set ` +
-        `OMNIGENT_DATABRICKS_WORKSPACE_ORIGIN to one, e.g. https://${sample[0]} ` +
-        `(sample: ${sample.join(", ")} …)`,
-    );
-  }
-  const buttons = [...workspaces.map((w) => w.name), "Cancel"];
-  const { response } = await dialog.showMessageBox(win, {
-    type: "question",
-    title: "Select a workspace",
-    message: "Choose a Databricks workspace to open in Omnigent",
-    buttons,
-    cancelId: buttons.length - 1,
+
+    ipcMain.handle("workspacePicker:list", provideList);
+    ipcMain.on("workspacePicker:choose", onChoose);
+    ipcMain.on("workspacePicker:cancel", onCancel);
+    // A closed window (user hit the OS close button) resolves as cancelled.
+    picker.on("closed", () => finish(null));
+
+    console.log(`[omnigent] databricks workspace picker: showing ${workspaces.length} workspace(s)`);
+    void picker.loadFile(WORKSPACE_PICKER_PAGE);
   });
-  return response >= 0 && response < workspaces.length ? workspaces[response] : null;
 }
 
 function registerIpc() {

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Select a workspace</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, sans-serif;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      header {
+        padding: 14px 16px 10px;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 10px;
+      }
+      #search {
+        width: 100%;
+        padding: 9px 10px;
+        font-size: 14px;
+        border: 1px solid #b9b9b9;
+        border-radius: 6px;
+      }
+      #search:focus {
+        outline: 2px solid #2272b4;
+        border-color: #2272b4;
+      }
+      #count {
+        color: #777;
+        font-size: 12px;
+        margin-top: 6px;
+      }
+      ul {
+        list-style: none;
+        margin: 0;
+        padding: 0 8px 8px;
+        overflow-y: auto;
+        flex: 1;
+      }
+      li {
+        padding: 9px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      li.active,
+      li:hover {
+        background: #e8f1fb;
+      }
+      .name {
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .fqdn {
+        color: #777;
+        font-size: 12px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      footer {
+        padding: 10px 16px;
+        border-top: 1px solid #e2e2e2;
+        text-align: right;
+      }
+      button {
+        padding: 7px 14px;
+        font-size: 13px;
+        border-radius: 6px;
+        border: 1px solid #b9b9b9;
+        background: #fff;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Select a Databricks workspace</h1>
+      <input id="search" type="text" placeholder="Search by name or URL…" autocomplete="off" autofocus />
+      <div id="count"></div>
+    </header>
+    <ul id="list"></ul>
+    <footer>
+      <button id="cancel" type="button">Cancel</button>
+    </footer>
+    <script src="./picker.js"></script>
+  </body>
+</html>
