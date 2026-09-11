@@ -302,6 +302,11 @@ _IDLE_POLL_INTERVAL_SECONDS = 1.0
 _IDLE_EXIT_FAILURE_THRESHOLD = 3
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
+# Substrings in a failed tmux probe's stderr that classify the "tmux unavailable"
+# exit: a whole private server gone vs. a single session removed while the server
+# stayed up. Matched case-insensitively; see :meth:`TerminalInstance._classify_tmux_exit`.
+_TMUX_SERVER_GONE_MARKERS = ("no server running", "error connecting", "no such file")
+_TMUX_SESSION_GONE_MARKERS = ("can't find session", "can’t find session", "session not found")
 
 # Process creation can fail temporarily while the host is under resource
 # pressure. Only those errno values leave terminal liveness unknown; permanent
@@ -970,13 +975,17 @@ class TerminalInstance:
     # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
     # until the process exits or when tmux reports no numeric status.
     _last_exit_status: int | None = field(default=None, repr=False)
-    # Detail of the most recent ``capture-pane`` probe the idle watcher saw
-    # rejected (the tmux ``rc``/stderr text). Retained so the "tmux unavailable"
-    # exit ERROR can name *why* tmux went away — its stderr distinguishes a
-    # vanished server ("no server running") from a single lost session ("can't
-    # find session") — instead of only reporting that it did. ``None`` until a
-    # probe is rejected; cleared on the next successful capture.
-    _last_idle_probe_error: str | None = field(default=None, repr=False)
+    # Diagnostics the idle watcher records as tmux probes fail, so the
+    # "tmux unavailable" exit ERROR can *classify* why tmux went away rather than
+    # only reporting that it did. ``_last_capture_probe_error`` is the stderr of
+    # the last rejected ``capture-pane``; ``_last_session_probe_error`` is the
+    # stderr of the ``has-session`` probe that then confirmed the session gone —
+    # and that one is the discriminator: "no server running on <socket>" is a
+    # whole-server death (machine slept, tmux killed, socket dir reaped, OOM)
+    # while "can't find session" is a single-session kill. Both ``None`` until a
+    # probe is rejected; each is cleared on its next successful probe.
+    _last_capture_probe_error: str | None = field(default=None, repr=False)
+    _last_session_probe_error: str | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1495,6 +1504,7 @@ class TerminalInstance:
                 await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
                 continue
             except RuntimeError as exc:
+                self._last_capture_probe_error = str(exc)
                 logger.warning(
                     "tmux capture-pane probe failed for terminal %s:%s: %s",
                     self.name,
@@ -1511,13 +1521,11 @@ class TerminalInstance:
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
                 logger.error(
-                    "tmux unavailable after %d consecutive probes for terminal %s:%s "
-                    "(keep_alive_after_exit=%s): last capture-pane error: %s",
+                    "tmux unavailable after %d consecutive probes for terminal %s:%s: %s",
                     consecutive_capture_failures,
                     self.name,
                     self.session_key,
-                    self.keep_alive_after_exit,
-                    exc,
+                    self._classify_tmux_exit(),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1719,13 +1727,11 @@ class TerminalInstance:
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
                 logger.error(
-                    "tmux unavailable after %d consecutive probes for terminal %s:%s "
-                    "(keep_alive_after_exit=%s): %s",
+                    "tmux unavailable after %d consecutive probes for terminal %s:%s: %s",
                     consecutive_capture_failures,
                     self.name,
                     self.session_key,
-                    self.keep_alive_after_exit,
-                    self._diagnose_tmux_gone_sync(),
+                    self._classify_tmux_exit(),
                 )
                 self.running = False
                 if on_exit is not None:
@@ -1798,7 +1804,7 @@ class TerminalInstance:
         except _TmuxProcessStartError:
             raise
         except RuntimeError as exc:
-            self._last_idle_probe_error = str(exc)
+            self._last_capture_probe_error = str(exc)
             logger.warning(
                 "tmux capture-pane probe failed for terminal %s:%s: %s",
                 self.name,
@@ -1806,7 +1812,7 @@ class TerminalInstance:
                 exc,
             )
             return None
-        self._last_idle_probe_error = None
+        self._last_capture_probe_error = None
         return snapshot
 
     def _tmux_session_exists_sync(self) -> bool | None:
@@ -1822,39 +1828,81 @@ class TerminalInstance:
                 exc,
             )
             return None
-        except RuntimeError:
+        except RuntimeError as exc:
+            self._last_session_probe_error = str(exc)
             return False
+        self._last_session_probe_error = None
         return True
 
-    def _diagnose_tmux_gone_sync(self) -> str:
-        """Classify why tmux went away, for the idle watcher's exit ERROR.
+    def _classify_tmux_exit(self) -> str:
+        """Classify why the idle watcher declared tmux unavailable, for its ERROR.
 
-        Called once when the threaded watcher declares the terminal dead, so
-        the ERROR can say *what* failed rather than only that the terminal is
-        gone. Re-probes ``has-session`` and, when tmux reports the session
-        gone, the server-wide ``list-sessions`` — separating a vanished private
-        server (crash / OOM / external kill / socket removed) from a single
-        session that disappeared while the server stayed up, which are triaged
-        differently — and appends the last rejected ``capture-pane`` stderr. A
-        probe that cannot start leaves liveness genuinely unknown.
+        Reads only the diagnostics recorded while the probes were failing — no
+        fresh tmux call — so it is safe on both the async and threaded watchers
+        and cannot race a server that is still tearing down. Emits two grep-able
+        tokens the reliability dashboard can group or exclude on, then the
+        supporting evidence:
 
-        :returns: A compact, non-empty human-readable reason.
+        - ``cause=`` — a hard classification from the probe stderr:
+          ``server-vanished`` (whole private server gone), ``session-killed``
+          (server alive, this session removed), or ``unknown``.
+        - ``likely=`` — a softer teardown-vs-fault hint (see
+          :meth:`_classify_tmux_exit_likelihood`).
+
+        :returns: A compact, non-empty classified reason.
         """
-        try:
-            self._tmux_output_sync("has-session", "-t", self.tmux_target)
-            state = "session reappeared on re-probe (transient probe failure)"
-        except _TmuxProcessStartError as exc:
-            state = f"tmux liveness unknown, probe could not start: {exc}"
-        except RuntimeError as has_session_exc:
-            try:
-                self._tmux_output_sync("list-sessions")
-                state = f"session gone, tmux server still alive: {has_session_exc}"
-            except _TmuxProcessStartError as exc:
-                state = f"session gone; server liveness unknown, probe could not start: {exc}"
-            except RuntimeError as server_exc:
-                state = f"tmux server not reachable: {server_exc}"
-        last = self._last_idle_probe_error
-        return f"{state}; last capture-pane error: {last}" if last else state
+        session_err = self._last_session_probe_error or ""
+        capture_err = self._last_capture_probe_error or ""
+        probe_text = f"{session_err} {capture_err}".lower()
+        if any(m in probe_text for m in _TMUX_SERVER_GONE_MARKERS):
+            cause = "server-vanished"
+        elif any(m in probe_text for m in _TMUX_SESSION_GONE_MARKERS):
+            cause = "session-killed"
+        else:
+            cause = "unknown"
+
+        tail = self.last_pane_text()
+        likely = self._classify_tmux_exit_likelihood(tail)
+
+        evidence: list[str] = [f"keep_alive_after_exit={self.keep_alive_after_exit}"]
+        if session_err:
+            evidence.append(f"has-session said: {session_err}")
+        if capture_err:
+            evidence.append(f"last capture error: {capture_err}")
+        if self._last_exit_status is not None:
+            evidence.append(f"pane exit status: {self._last_exit_status}")
+        last_interaction = self._last_client_interaction_at
+        if last_interaction == float("-inf"):
+            evidence.append("no web client interaction observed")
+        else:
+            idle_s = time.monotonic() - last_interaction
+            evidence.append(f"{idle_s:.0f}s since web client interaction")
+        evidence.append(
+            f"last pane tail: {tail[-240:]!r}" if tail else "last pane: <none captured>"
+        )
+        return f"cause={cause} likely={likely} ({'; '.join(evidence)})"
+
+    def _classify_tmux_exit_likelihood(self, tail: str | None) -> str:
+        """Return a teardown-vs-fault hint for the "tmux unavailable" exit.
+
+        Deliberately a hint, not a verdict: a clean pane exit status or a benign
+        ``[process exited]`` / ``logout`` frame reads as expected teardown, a
+        nonzero exit or a Python/Go crash frame as a possible fault, and
+        anything else stays ``unknown`` rather than being guessed.
+
+        :param tail: The last captured pane text, or ``None`` if none was kept.
+        :returns: ``expected-teardown``, ``possible-fault``, or ``unknown``.
+        """
+        if self._last_exit_status == 0:
+            return "expected-teardown"
+        low = (tail or "").lower()
+        if "traceback (most recent call last)" in low or "panic:" in low:
+            return "possible-fault"
+        if self._last_exit_status is not None:
+            return "possible-fault"
+        if "[process exited]" in low or "logout" in low:
+            return "expected-teardown"
+        return "unknown"
 
     def _pane_is_dead(self) -> bool | None:
         """
@@ -2063,8 +2111,10 @@ class TerminalInstance:
                 exc,
             )
             return None
-        except RuntimeError:
+        except RuntimeError as exc:
+            self._last_session_probe_error = str(exc)
             return False
+        self._last_session_probe_error = None
         return True
 
     async def _tmux(self, *args: str) -> None:

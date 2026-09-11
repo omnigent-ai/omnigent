@@ -432,19 +432,48 @@ def test_capture_probe_logs_command_return_code_and_stderr(
 
 
 @pytest.mark.parametrize(
-    ("list_sessions_rc", "expected_fragment"),
+    ("session_err", "exit_status", "pane_tail", "expected_cause", "expected_likely"),
     [
-        (1, "tmux server not reachable"),
-        (0, "session gone, tmux server still alive"),
+        # Whole private server gone + a clean pane exit → expected teardown.
+        (
+            "has-session -t main: no server running on /tmp/x",
+            0,
+            None,
+            "server-vanished",
+            "expected-teardown",
+        ),
+        # Server gone + a crash frame left in the pane → possible fault.
+        (
+            "has-session -t main: no server running on /tmp/x",
+            None,
+            "Traceback (most recent call last):\n  File 'x.py'",
+            "server-vanished",
+            "possible-fault",
+        ),
+        # Server alive, this session removed; nothing else to go on → unknown.
+        ("has-session -t main: can't find session: main", None, None, "session-killed", "unknown"),
+        # A benign "[process exited]" frame reads as teardown even without a status.
+        (
+            "has-session -t main: no server running on /tmp/x",
+            None,
+            "[process exited]",
+            "server-vanished",
+            "expected-teardown",
+        ),
+        # No recorded probe stderr at all → both fields fall back to unknown.
+        (None, None, None, "unknown", "unknown"),
     ],
 )
-def test_diagnose_tmux_gone_sync_classifies_server_vs_session(
+def test_classify_tmux_exit_labels_cause_and_likelihood(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    list_sessions_rc: int,
-    expected_fragment: str,
+    session_err: str | None,
+    exit_status: int | None,
+    pane_tail: str | None,
+    expected_cause: str,
+    expected_likely: str,
 ) -> None:
-    """Exit diagnosis separates a dead server from a lost session, keeping capture stderr."""
+    """The exit classifier turns recorded probe state into grep-able cause/likely labels."""
     instance = TerminalInstance(
         name="claude",
         session_key="main",
@@ -452,34 +481,30 @@ def test_diagnose_tmux_gone_sync_classifies_server_vs_session(
         private_dir=tmp_path,
         running=True,
     )
-    instance._last_idle_probe_error = (
-        "tmux command failed (rc=1): tmux -S sock capture-pane -t main -p -e: no server running"
+    instance._last_session_probe_error = session_err
+    instance._last_exit_status = exit_status
+    instance._last_pane_snapshot = pane_tail
+    # The classifier must read recorded state only — never spawn a fresh probe.
+    monkeypatch.setattr(
+        terminal_mod.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("classifier must not spawn a fresh tmux probe"),
     )
 
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        # ``has-session`` always fails here (the watcher only diagnoses once the
-        # session is already gone); ``list-sessions`` decides server liveness.
-        if "list-sessions" in cmd:
-            return SimpleNamespace(
-                returncode=list_sessions_rc, stdout=b"", stderr=b"no server running"
-            )
-        return SimpleNamespace(returncode=1, stdout=b"", stderr=b"can't find session: main")
+    reason = instance._classify_tmux_exit()
 
-    monkeypatch.setattr(terminal_mod.subprocess, "run", _fake_run)
-
-    reason = instance._diagnose_tmux_gone_sync()
-
-    assert expected_fragment in reason
-    assert "last capture-pane error:" in reason
-    assert "no server running" in reason
+    assert f"cause={expected_cause}" in reason
+    assert f"likely={expected_likely}" in reason
+    if session_err:
+        assert "has-session said:" in reason
 
 
-def test_threaded_idle_watcher_exit_error_names_cause(
+def test_threaded_idle_watcher_exit_error_classifies_cause(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The ``tmux unavailable`` exit ERROR carries why tmux went away, not just that it did."""
+    """The ``tmux unavailable`` exit ERROR carries a classified cause, from recorded state."""
     instance = TerminalInstance(
         name="claude",
         session_key="main",
@@ -490,22 +515,27 @@ def test_threaded_idle_watcher_exit_error_names_cause(
     exited = threading.Event()
 
     def _capture() -> None:
-        # Simulate a swallowed capture-pane rejection: record the stderr and
-        # signal "tmux gone" to the watcher by returning None implicitly.
-        instance._last_idle_probe_error = (
+        # Swallowed capture-pane rejection: record its stderr, return None.
+        instance._last_capture_probe_error = (
             "tmux command failed (rc=1): tmux -S sock capture-pane -t main -p -e: "
             "no server running on /tmp/x"
         )
 
+    def _session_gone() -> bool:
+        # has-session then confirms the whole server is gone; record its stderr.
+        instance._last_session_probe_error = (
+            "tmux command failed (rc=1): tmux -S sock has-session -t main: "
+            "no server running on /tmp/x"
+        )
+        return False
+
     instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
-    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
-    # The one-shot diagnosis re-probe finds the whole server unreachable.
+    instance._tmux_session_exists_sync = _session_gone  # type: ignore[method-assign]
+    # The exit ERROR must classify from recorded state, without a fresh probe.
     monkeypatch.setattr(
         terminal_mod.subprocess,
         "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=1, stdout=b"", stderr=b"no server running on /tmp/x"
-        ),
+        lambda *a, **k: pytest.fail("exit classification must not spawn a fresh tmux probe"),
     )
 
     with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
@@ -515,8 +545,8 @@ def test_threaded_idle_watcher_exit_error_names_cause(
     message = caplog.text
     assert "tmux unavailable after" in message
     assert "consecutive probes" in message
+    assert "cause=server-vanished" in message
     assert "keep_alive_after_exit=False" in message
-    assert "tmux server not reachable" in message
     assert "no server running on /tmp/x" in message
 
 
