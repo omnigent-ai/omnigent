@@ -4691,7 +4691,13 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Repeated accepted-but-silent connections escalate to slow backoff."""
+    """Repeated accepted-but-silent connections escalate to slow backoff.
+
+    The endpoint failing to answer is a server-side condition the host rides
+    out on backoff, so the escalation record must be a WARNING with server
+    attribution — never a bare ERROR (the error KPI would count the server's
+    outage as an Omnigent defect).
+    """
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
@@ -4704,9 +4710,21 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
         await host.run()
 
-    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
-    assert len(errors) == 1
-    assert "3 consecutive connections but never responded" in errors[0].message
+    assert not [record for record in caplog.records if record.levelno == logging.ERROR]
+    escalations = [
+        record
+        for record in caplog.records
+        if "consecutive connections but never responded" in record.message
+    ]
+    assert len(escalations) == 1
+    escalation = escalations[0]
+    assert escalation.levelno == logging.WARNING
+    assert "3 consecutive connections but never responded" in escalation.message
+    assert escalation.event_name == "silent_endpoint_escalated"
+    assert escalation.attributes["error_category"] == "server"
+    assert escalation.attributes["error_impact"] == "blocking"
+    assert escalation.attributes["error_phase"] == "unknown"
+    assert escalation.attributes["consecutive_silent_connections"] == 3
     assert capsys.readouterr().err.count("never responded") == 1
     reconnects = [
         record.message for record in caplog.records if "Reconnecting in" in record.message
