@@ -5649,3 +5649,179 @@ async def test_terminal_error_carries_observed_usage() -> None:
     assert usage["context_tokens"] == 100_000
     # output_tokens is unknown on an incomplete turn — reported as 0.
     assert usage["output_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: a cached client whose CLI child terminated is evicted between turns
+# ---------------------------------------------------------------------------
+
+
+def _make_transport_with_process(returncode):
+    """Fake ``SubprocessCLITransport`` whose child reports *returncode*."""
+
+    class _Transport:
+        def __init__(self):
+            self._process = SimpleNamespace(returncode=returncode, pid=4242, wait=AsyncMock())
+            self._stdout_stream = None
+            self._stdin_stream = None
+            self._stderr_stream = None
+            self._stderr_task = None
+            self._ready = returncode is None
+
+    return _Transport()
+
+
+def _make_recovery_fake_sdk():
+    """Fake SDK whose clients record construction and queried prompts."""
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    class _Sentinel:
+        pass
+
+    sdk_result = SDKResultMessage(
+        subtype="result",
+        session_id="s1",
+        result="recovered",
+        total_cost_usd=0.0,
+        duration_ms=100,
+        duration_api_ms=80,
+        is_error=False,
+        num_turns=1,
+        usage={"input_tokens": 10, "output_tokens": 5},
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        created_clients = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+                self.prompts = []
+                self._query = None
+                self._transport = _make_transport_with_process(None)
+                _FakeSDK.created_clients.append(self)
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                self.prompts.append(prompt)
+
+            async def receive_response(self):
+                yield sdk_result
+
+            async def set_model(self, model):
+                return None
+
+            async def disconnect(self):
+                return None
+
+    return _FakeSDK
+
+
+@pytest.mark.asyncio
+async def test_terminated_cli_client_is_evicted_and_turn_recovers() -> None:
+    """A cached client whose CLI child died is rebuilt, not written to.
+
+    The executor keeps one ``ClaudeSDKClient`` per session across turns. When
+    the ``claude`` CLI child is killed between turns (OS / cgroup / idle reap;
+    SIGTERM exits it with 143), nothing evicted the dead client, so the next
+    turn's ``query()`` hit the SDK transport's "Cannot write to terminated
+    process" and the crash boundary wedged the session permanently. The
+    executor must instead detect the terminated child before building the
+    prompt, discard the dead client, and run the turn on a fresh client with
+    full history replayed.
+    """
+    from omnigent.inner.claude_sdk_executor import (
+        ClaudeSDKExecutor,
+        _ClaudeClientState,
+    )
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+
+    dead_client = SimpleNamespace(
+        _query=None,
+        _transport=_make_transport_with_process(143),
+        disconnect=AsyncMock(),
+        query=AsyncMock(side_effect=AssertionError("dead client must not be queried")),
+        set_model=AsyncMock(),
+    )
+    executor._clients["sess-1"] = _ClaudeClientState(client=dead_client, model=None)
+
+    messages = [
+        {"role": "user", "content": "first question", "session_id": "sess-1"},
+        {"role": "assistant", "content": "first answer", "session_id": "sess-1"},
+        {"role": "user", "content": "second question", "session_id": "sess-1"},
+    ]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [e async for e in executor.run_turn(messages, [], "")]
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert not errors, f"Turn after a terminated CLI must recover, got: {errors}"
+    assert any(isinstance(e, TurnComplete) for e in events)
+
+    # The dead client was never written to; a fresh client ran the turn.
+    dead_client.query.assert_not_called()
+    assert len(fake_sdk.created_clients) == 1
+    fresh = fake_sdk.created_clients[0]
+    assert executor._clients["sess-1"].client is fresh
+
+    # The rebuilt session replays full history (resume_session was False).
+    assert len(fresh.prompts) == 1
+    prompt = fresh.prompts[0]
+    assert isinstance(prompt, str)
+    assert "first question" in prompt
+    assert "second question" in prompt
+
+    # The eviction must not mark the session crashed: recovery, not poison.
+    assert "sess-1" not in executor._crashed_sessions
+
+
+@pytest.mark.asyncio
+async def test_live_cached_client_is_reused_between_turns() -> None:
+    """A cached client with a running CLI child is reused, not rebuilt.
+
+    Guards the eviction check's polarity: only a positively terminated child
+    (``returncode`` set) triggers a rebuild. A live child keeps the resume
+    path — the turn sends just the trailing user content to the same client.
+    """
+    from omnigent.inner.claude_sdk_executor import (
+        ClaudeSDKExecutor,
+        _ClaudeClientState,
+    )
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+
+    # Seed a live cached client of the fake SDK's own type (so it can serve
+    # the turn), with a transport whose child is still running.
+    live_client = fake_sdk.ClaudeSDKClient(options=None)
+    fake_sdk.created_clients.clear()
+    executor._clients["sess-1"] = _ClaudeClientState(client=live_client, model=None)
+
+    messages = [
+        {"role": "user", "content": "first question", "session_id": "sess-1"},
+        {"role": "assistant", "content": "first answer", "session_id": "sess-1"},
+        {"role": "user", "content": "second question", "session_id": "sess-1"},
+    ]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [e async for e in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+
+    # No rebuild: the cached client served the turn on the resume path.
+    assert fake_sdk.created_clients == []
+    assert executor._clients["sess-1"].client is live_client
+    assert live_client.prompts == ["second question"]
