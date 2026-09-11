@@ -213,6 +213,7 @@ function selectAgent(agentId: string): void {
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "Escape" });
 }
 
 async function submitAndReadBody(
