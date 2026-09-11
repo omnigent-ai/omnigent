@@ -897,12 +897,19 @@ describe("index.css mobile sidebar glass chip opacity", () => {
 
 describe("index.css text selection colors", () => {
   const selectionRule = cssSource.match(/::selection\s*\{([^}]*)\}/)?.[1];
+  const darkSelectionRule = cssSource.match(/\.dark ::selection\s*\{([^}]*)\}/)?.[1];
 
-  it("matches the active sidebar item in every color mode", () => {
+  it("matches the active sidebar item in light mode", () => {
     expect(selectionRule).toContain("background: var(--sidebar-active)");
     expect(selectionRule).toContain("color: var(--sidebar-active-foreground)");
-    expect(selectionRule).not.toContain("--brand-accent");
-    expect(cssSource).not.toContain(".dark ::selection");
+  });
+
+  it("keeps the solid brand-accent pair in dark mode", () => {
+    // Dark sidebar row tints are low-alpha washes that render ~1.1:1 against
+    // the page — an invisible selection highlight (see the dark-mode text
+    // selection suite below, which measures this for every palette).
+    expect(darkSelectionRule).toContain("background: var(--brand-accent)");
+    expect(darkSelectionRule).toContain("color: #ffffff");
   });
 });
 
@@ -1186,4 +1193,200 @@ function extractInsetRule(css: string): { selectors: string; body: string } | nu
   const bodyEnd = css.indexOf("}", bodyStart);
   if (bodyStart === -1 || bodyEnd === -1) return null;
   return { selectors, body: css.slice(bodyStart + 1, bodyEnd) };
+}
+
+/* Regression test for invisible dark-mode text selection.
+ *
+ * `::selection` mirrors the sidebar's active-row pair, but dark palettes
+ * define that pair as a low-alpha row tint (`rgba(240, 1, 150, 0.15)` on the
+ * default palette, a 7% foreground mix on the themed ones) that renders
+ * ~1.1:1 against the page — selected text looks unhighlighted. Dark mode
+ * therefore carries its own `.dark ::selection` pair. This suite resolves the
+ * effective dark selection wash for every built-in palette from the real CSS
+ * sources and requires it to stay perceptible against the page background.
+ */
+describe("index.css dark-mode text selection", () => {
+  const baseSelectionBackground = selectionBackgroundOf("::selection");
+  const darkSelectionBackground = selectionBackgroundOf(".dark ::selection");
+
+  it("has the selection rules this suite asserts against", () => {
+    expect(baseSelectionBackground).not.toBeNull();
+    expect(darkSelectionBackground).not.toBeNull();
+  });
+
+  const darkPaletteCases = cssBlocks
+    .map(([block]) => block)
+    .filter((block) => {
+      const selector = selectorOf(block);
+      return (
+        selector === ".dark:not([data-theme])" ||
+        /^\.dark\[data-theme="(?!custom")[a-z]+"\]$/.test(selector)
+      );
+    })
+    .map((block) => [selectorOf(block), block] as const);
+
+  it("covers every built-in dark palette", () => {
+    // 7 today: the default palette plus six themed ones. Fewer means a
+    // palette was removed or the extraction broke — update this count.
+    expect(darkPaletteCases.length).toBe(7);
+  });
+
+  it.each(darkPaletteCases)("paints a perceptible selection wash in %s", (_selector, block) => {
+    // The effective dark wash: the dark override when present, else the
+    // app-wide rule — so this measures what dark-mode users actually get.
+    const background = darkSelectionBackground ?? baseSelectionBackground;
+    if (background === null) throw new Error("no ::selection background rule found");
+    const tokens = customPropertiesOf(block);
+    const pageValue = tokens.get("background");
+    if (pageValue === undefined) throw new Error(`no --background in ${_selector}`);
+    const page = evalColor(pageValue, tokens);
+    const wash = compositeOver(evalColor(background, tokens), page);
+    const contrast = contrastRatio(wash, page);
+    expect(
+      contrast,
+      `selection wash ${background} resolves to an imperceptible ${contrast.toFixed(2)}:1 ` +
+        `against the ${_selector} page background (needs >= 3:1)`,
+    ).toBeGreaterThanOrEqual(3);
+  });
+});
+
+interface Rgba {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+/** The `background` declaration of the rule with exactly this selector. */
+function selectionBackgroundOf(selector: string): string | null {
+  const rule = cssBlocks.map(([block]) => block).find((block) => selectorOf(block) === selector);
+  if (rule === undefined) return null;
+  const declaration = /background:\s*([^;]+);/.exec(rule);
+  return declaration === null ? null : declaration[1].trim();
+}
+
+/** The `--name: value;` custom properties declared by a rule block. */
+function customPropertiesOf(block: string): Map<string, string> {
+  const body = block.slice(block.indexOf("{") + 1, block.lastIndexOf("}"));
+  return new Map(
+    [...body.matchAll(/--([\w-]+):\s*([^;]+);/g)].map((match) => [match[1], match[2].trim()]),
+  );
+}
+
+/** Substitute `var(--token)` references from the palette's declarations. */
+function resolveVars(value: string, tokens: ReadonlyMap<string, string>): string {
+  let resolved = value;
+  for (let depth = 0; depth < 8 && resolved.includes("var("); depth += 1) {
+    resolved = resolved.replace(
+      /var\(--([\w-]+)\)/g,
+      (whole, name: string) => tokens.get(name) ?? whole,
+    );
+  }
+  if (resolved.includes("var(")) throw new Error(`unresolved var() in: ${value} -> ${resolved}`);
+  return resolved;
+}
+
+/** Parse `#rgb` / `#rrggbb` / `rgb()` / `rgba()` literals. */
+function parseColorLiteral(value: string): Rgba | null {
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(value.trim());
+  if (hex !== null) {
+    const digits =
+      hex[1].length === 6 ? hex[1] : [...hex[1]].map((digit) => digit + digit).join("");
+    return {
+      r: parseInt(digits.slice(0, 2), 16),
+      g: parseInt(digits.slice(2, 4), 16),
+      b: parseInt(digits.slice(4, 6), 16),
+      a: 1,
+    };
+  }
+  const rgb = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)$/i.exec(
+    value.trim(),
+  );
+  if (rgb !== null) {
+    return { r: +rgb[1], g: +rgb[2], b: +rgb[3], a: rgb[4] === undefined ? 1 : +rgb[4] };
+  }
+  return null;
+}
+
+/** Comma-split at paren depth 0, so nested `rgb(...)` args stay intact. */
+function splitTopLevel(value: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    if (value[i] === "(") depth += 1;
+    else if (value[i] === ")") depth -= 1;
+    else if (value[i] === "," && depth === 0) {
+      parts.push(value.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(value.slice(start));
+  return parts;
+}
+
+/**
+ * Evaluate a palette color value: literals plus the one function form the
+ * palettes use, `color-mix(in srgb, <color> <pct>?, <color> <pct>?)`
+ * (alpha-premultiplied interpolation, per the CSS spec).
+ */
+function evalColor(rawValue: string, tokens: ReadonlyMap<string, string>): Rgba {
+  const value = resolveVars(rawValue, tokens).trim();
+  const mix = /^color-mix\(\s*in srgb\s*,(.+)\)$/i.exec(value);
+  if (mix !== null) {
+    const parts = splitTopLevel(mix[1]);
+    if (parts.length !== 2) throw new Error(`unsupported color-mix arity: ${value}`);
+    const components = parts.map((part) => {
+      const match = /^(.*?)(?:\s+([\d.]+)%)?$/.exec(part.trim());
+      if (match === null) throw new Error(`unsupported color-mix component: ${part}`);
+      return {
+        color: evalColor(match[1], tokens),
+        pct: match[2] === undefined ? null : Number(match[2]) / 100,
+      };
+    });
+    const [first, second] = components;
+    const p1 = first.pct ?? (second.pct === null ? 0.5 : 1 - second.pct);
+    const p2 = second.pct ?? 1 - p1;
+    const a = p1 * first.color.a + p2 * second.color.a;
+    const channel = (c1: number, c2: number) =>
+      a === 0 ? 0 : (p1 * first.color.a * c1 + p2 * second.color.a * c2) / a;
+    return {
+      r: channel(first.color.r, second.color.r),
+      g: channel(first.color.g, second.color.g),
+      b: channel(first.color.b, second.color.b),
+      a,
+    };
+  }
+  const literal = parseColorLiteral(value);
+  if (literal === null) throw new Error(`unsupported color value: ${rawValue} -> ${value}`);
+  return literal;
+}
+
+/** Source-over composite of a (possibly translucent) wash onto the page. */
+function compositeOver(top: Rgba, bottom: Rgba): Rgba {
+  const a = top.a + bottom.a * (1 - top.a);
+  const channel = (t: number, b: number) =>
+    a === 0 ? 0 : (t * top.a + b * bottom.a * (1 - top.a)) / a;
+  return {
+    r: channel(top.r, bottom.r),
+    g: channel(top.g, bottom.g),
+    b: channel(top.b, bottom.b),
+    a,
+  };
+}
+
+/** WCAG relative luminance of an (opaque) sRGB color. */
+function relativeLuminance({ r, g, b }: Rgba): number {
+  const linear = (channel: number) => {
+    const c = channel / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+}
+
+/** WCAG contrast ratio between two (opaque) colors. */
+function contrastRatio(a: Rgba, b: Rgba): number {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
 }

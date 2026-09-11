@@ -1051,11 +1051,17 @@ aside[aria-label="Workspace"][data-maximized] {
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection mirrors the sidebar's active-item treatment in every
-   * palette and color mode. */
+  /* Text selection mirrors the sidebar's active-item treatment in light
+   * mode. Dark palettes need their own pair: their sidebar row tints are
+   * low-alpha washes that render ~1.1:1 against the page — an invisible
+   * highlight — so dark selection keeps the solid brand accent + white. */
   ::selection {
     background: var(--sidebar-active);
     color: var(--sidebar-active-foreground);
+  }
+  .dark ::selection {
+    background: var(--brand-accent);
+    color: #ffffff;
   }
 }
 
