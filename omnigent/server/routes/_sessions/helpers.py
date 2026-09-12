@@ -7528,6 +7528,15 @@ async def _relay_persist(
         )
 
 
+# Pause before the single RESPONSE-evaluation retry, absorbing transient
+# upstream failures (e.g. a workspace store briefly over its request limit).
+_RESPONSE_POLICY_RETRY_DELAY_S = 1.0
+
+# Deny reason persisted in the sentinel when RESPONSE-phase evaluation
+# itself fails and the relay withholds the text (fail closed).
+_RESPONSE_POLICY_UNAVAILABLE_REASON = "response policy evaluation failed; assistant text withheld"
+
+
 async def _relay_response_policy_deny_reason(
     conversation_store: ConversationStore,
     session_id: str,
@@ -7544,14 +7553,23 @@ async def _relay_response_policy_deny_reason(
     becomes durable — making a spec's ``response``-phase policy enforceable
     in the runner topology.
 
-    Fails OPEN (returns ``None``) on any evaluation error, matching the LLM
-    phases' advisory default: a policy-engine hiccup must not destroy the
-    narration the user already watched.
+    Fails CLOSED on evaluation error: this flush is the sole RESPONSE
+    enforcement point in the runner topology, so an evaluation that raises
+    must not let possibly-denied text become durable (the rationale behind
+    :data:`omnigent.policies.types.FAIL_CLOSED_PHASES`) — a deny policy that
+    gated the same content one turn earlier would otherwise silently stop
+    enforcing whenever the engine hiccups. The evaluation is retried once
+    after a short pause so a transient upstream failure (e.g. a store call
+    rejected with a request-limit error) rarely costs the narration; a
+    session provably subject to no output policy never reaches the failure
+    path (:func:`_evaluate_output_policy` returns before building the
+    engine).
 
     :param conversation_store: Store for the conversation/labels lookup.
     :param session_id: Session/conversation identifier.
     :param text: The joined assistant text segment about to persist.
-    :returns: The deny reason when an output policy DENYs, else ``None``.
+    :returns: The deny reason when an output policy DENYs, the fail-closed
+        reason when evaluation itself fails, else ``None``.
     """
     from omnigent.runtime._globals import _agent_store
 
@@ -7565,39 +7583,50 @@ async def _relay_response_policy_deny_reason(
             extra={"session_id": session_id},
         )
         return None
-    try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None or conv.agent_id is None:
-            return None
-        body = SessionEventInput(
-            type="message",
-            data={
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
-            },
-        )
-        # The relay has no HTTP caller; the acting principal is the
-        # turn-initiating human persisted at forward time (same label the
-        # policy-evaluate route falls back to), so per-user policies gate
-        # on the correct actor.
-        turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
-        verdict = await _evaluate_output_policy(
-            session_id,
-            conv,
-            body,
-            conversation_store,
-            _agent_store,
-            None,
-            actor=_build_actor(turn_actor),
-        )
-    except Exception:  # noqa: BLE001 — fail open: output phases are advisory on error
-        _logger.exception(
-            "Relay: RESPONSE-phase policy evaluation failed for session=%s; "
-            "persisting the text unmodified",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return None
+    verdict: dict[str, Any] | None = None
+    for attempt in (1, 2):
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None or conv.agent_id is None:
+                return None
+            body = SessionEventInput(
+                type="message",
+                data={
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                },
+            )
+            # The relay has no HTTP caller; the acting principal is the
+            # turn-initiating human persisted at forward time (same label the
+            # policy-evaluate route falls back to), so per-user policies gate
+            # on the correct actor.
+            turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
+            verdict = await _evaluate_output_policy(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+                _agent_store,
+                None,
+                actor=_build_actor(turn_actor),
+            )
+            break
+        except Exception:  # noqa: BLE001 — fail closed after one retry
+            if attempt == 1:
+                _logger.warning(
+                    "Relay: RESPONSE-phase policy evaluation failed for session=%s; retrying once",
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+                await asyncio.sleep(_RESPONSE_POLICY_RETRY_DELAY_S)
+                continue
+            _logger.exception(
+                "Relay: RESPONSE-phase policy evaluation failed for "
+                "session=%s; withholding the text (fail closed)",
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return _RESPONSE_POLICY_UNAVAILABLE_REASON
     if verdict is None:
         return None
     return str(verdict.get("reason") or "Denied by policy")

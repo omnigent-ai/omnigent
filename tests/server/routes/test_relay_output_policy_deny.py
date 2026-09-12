@@ -203,15 +203,21 @@ async def test_flush_response_phase_allow_persists_unmodified() -> None:
     assert _persisted_texts(store) == ["plain assistant answer"]
 
 
-async def test_flush_response_phase_failure_fails_open() -> None:
+async def test_flush_response_phase_failure_withholds_text() -> None:
     """
-    A policy-engine crash during the RESPONSE evaluation must not destroy
-    the narration — the text persists unmodified (output phases are
-    advisory on evaluation error, matching the LLM phases' default).
+    A RESPONSE evaluation that keeps raising fails CLOSED: the flush
+    persists the withheld sentinel, never the unevaluated text.
+
+    This flush is the sole RESPONSE enforcement point in the runner
+    topology, so failing open here silently disables a configured output
+    deny policy — the text it gated one turn earlier would persist
+    unmodified the moment the policy engine hiccups.
     """
     store = _FakeConversationStore()
+    calls = {"n": 0}
 
     async def _boom(*args: Any, **kwargs: Any) -> None:
+        calls["n"] += 1
         raise RuntimeError("engine construction failed")
 
     with (
@@ -223,14 +229,89 @@ async def test_flush_response_phase_failure_fails_open() -> None:
     ):
         await _flush_relay_text(
             store,  # type: ignore[arg-type]
-            "conv_failopen_1",
-            ["survives engine failure"],
+            "conv_failclosed_1",
+            [_DENIED_TEXT],
             "resp_4",
             "test-agent",
             evaluate_response_phase=True,
         )
 
-    assert _persisted_texts(store) == ["survives engine failure"]
+    texts = _persisted_texts(store)
+    assert texts == [
+        "[Denied by policy: response policy evaluation failed; assistant text withheld]"
+    ], f"expected the withheld sentinel, got {texts!r}"
+    assert calls["n"] == 2, "evaluation must be retried once before failing closed"
+
+
+async def test_flush_response_phase_transient_failure_recovers() -> None:
+    """
+    The single evaluation retry absorbs a transient failure: the second
+    attempt's ALLOW persists the narration unmodified.
+    """
+    store = _FakeConversationStore()
+    calls = {"n": 0}
+
+    async def _flaky_allow(*args: Any, **kwargs: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("REQUEST_LIMIT_EXCEEDED: transient store failure")
+        return
+
+    with (
+        patch(
+            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            _flaky_allow,
+        ),
+        patch("omnigent.runtime._globals._agent_store", object()),
+    ):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_transient_1",
+            ["plain assistant answer"],
+            "resp_5",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    assert _persisted_texts(store) == ["plain assistant answer"]
+    assert calls["n"] == 2, "a failed evaluation must be retried once"
+
+
+async def test_flush_response_phase_deny_on_retry_substitutes_sentinel() -> None:
+    """
+    A DENY returned by the retry attempt still gates the text: the deny
+    sentinel persists, not the denied content.
+    """
+    store = _FakeConversationStore()
+    calls = {"n": 0}
+
+    async def _flaky_deny(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("REQUEST_LIMIT_EXCEEDED: transient store failure")
+        return {"verdict": "deny", "reason": "tripwire hit", "_denied_body": None}
+
+    with (
+        patch(
+            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            _flaky_deny,
+        ),
+        patch("omnigent.runtime._globals._agent_store", object()),
+    ):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_retry_deny_1",
+            [_DENIED_TEXT],
+            "resp_6",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    texts = _persisted_texts(store)
+    assert texts == ["[Denied by policy: tripwire hit]"], (
+        f"expected the deny sentinel from the retry's verdict, got {texts!r}"
+    )
+    assert calls["n"] == 2, "a failed evaluation must be retried once"
 
 
 # ── Full relay loop: deny marker consumed at the terminal flush ──────
