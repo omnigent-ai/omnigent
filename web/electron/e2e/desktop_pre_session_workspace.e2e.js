@@ -26,6 +26,7 @@ const {
   saveRecording,
 } = require("./desktopHarness");
 const {
+  isolatedChildEnv,
   resolveShellWindow,
   startPodServices,
   startWorkspaceFixtures,
@@ -67,17 +68,6 @@ function wait(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-function isolatedChildEnv(overrides = {}) {
-  const safe = Object.fromEntries(
-    Object.entries(process.env).filter(
-      ([key]) =>
-        !/^(ANTHROPIC_|CLAUDE_|CODEX_|DATABRICKS_|GEMINI_|OPENAI_|AWS_)/.test(key) &&
-        !/^(GH_TOKEN|GITHUB_TOKEN|GOOGLE_APPLICATION_CREDENTIALS|CURSOR_API_KEY)$/.test(key),
-    ),
-  );
-  return { ...safe, ...overrides };
 }
 
 async function getJson(url) {
@@ -198,7 +188,9 @@ async function startIsolatedPod(root) {
   const mockPort = await findFreePort();
   const mockLogPath = path.join(root, "mock-llm.log");
   const seedConfigDir = path.join(root, "seed-config");
+  const fixtureHome = path.join(root, "home");
   fs.mkdirSync(seedConfigDir, { recursive: true });
+  fs.mkdirSync(fixtureHome, { recursive: true });
   fs.writeFileSync(
     path.join(seedConfigDir, "config.yaml"),
     [
@@ -250,6 +242,7 @@ async function startIsolatedPod(root) {
       options: {
         cwd: REPO_ROOT,
         env: isolatedChildEnv({
+          HOME: fixtureHome,
           OMNIGENT_CONFIG_HOME: seedConfigDir,
           OMNIGENT_DISABLE_KEYRING: "1",
           PYTHONPATH: REPO_ROOT,
@@ -263,6 +256,7 @@ async function startIsolatedPod(root) {
       options: {
         cwd: REPO_ROOT,
         env: isolatedChildEnv({
+          HOME: fixtureHome,
           OMNIGENT_CONFIG_HOME: seedConfigDir,
           OMNIGENT_DATA_DIR: path.join(root, "supervisor-data"),
           GH_CONFIG_DIR: path.join(root, "gh-config"),

@@ -2,16 +2,45 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const { once } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
 const {
+  isolatedChildEnv,
   resolveShellWindow,
   startPodServices,
   startWorkspaceFixtures,
 } = require("../e2e/desktop_pre_session_workspace_setup");
+
+it("starts children with process basics and explicit overrides, excluding ambient credentials", () => {
+  const env = isolatedChildEnv(
+    { OPENAI_API_KEY: "mock-key", LANG: "C" },
+    {
+      PATH: process.env.PATH,
+      LANG: "en_US.UTF-8",
+      GH_TOKEN: "test-only",
+      GITHUB_TOKEN: "test-only",
+      OPENAI_API_KEY: "test-only",
+      UNLISTED_CREDENTIAL: "test-only",
+      NODE_OPTIONS: "--require=/nonexistent-ambient-hook.js",
+    },
+  );
+  const child = spawnSync(process.execPath, ["-e", "console.log(JSON.stringify(process.env))"], {
+    env,
+    encoding: "utf8",
+  });
+  assert.equal(child.status, 0, child.stderr);
+  const received = JSON.parse(child.stdout);
+  assert.equal(received.PATH, process.env.PATH);
+  assert.equal(received.LANG, "C");
+  assert.equal(received.OPENAI_API_KEY, "mock-key");
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "UNLISTED_CREDENTIAL", "NODE_OPTIONS"]) {
+    assert.equal(received[key], undefined);
+  }
+});
 
 describe("pre-session workspace shell resolution", () => {
   it("waits past auxiliary windows for the exact server origin", async () => {

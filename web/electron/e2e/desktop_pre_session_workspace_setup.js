@@ -3,6 +3,16 @@
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 
+function isolatedChildEnv(overrides = {}, source = process.env) {
+  // Inherit only process basics; provider credentials and runtime injection
+  // settings must not leak into the mock services.
+  const keys = ["PATH", "HOME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"];
+  const base = Object.fromEntries(
+    keys.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]),
+  );
+  return { ...base, ...overrides };
+}
+
 async function stopProcess(proc) {
   if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) return;
   let timer;
@@ -111,4 +121,4 @@ async function resolveShellWindow(electronApp, serverUrl, options = {}) {
   return resolveCurrent();
 }
 
-module.exports = { resolveShellWindow, startPodServices, startWorkspaceFixtures };
+module.exports = { isolatedChildEnv, resolveShellWindow, startPodServices, startWorkspaceFixtures };
