@@ -154,37 +154,136 @@ describe("useWebUpdateNotifications", () => {
     },
   );
 
-  it("polls on mount, visible intervals, foreground, network and socket reconnect", async () => {
+  it.each(["interval", "foreground"])(
+    "confirms a changed build promptly from an %s check",
+    async (trigger) => {
+      const { result } = renderHook(useWebUpdateNotifications);
+      await act(async () => {});
+      respond("new");
+      if (trigger === "interval") {
+        await act(async () => vi.advanceTimersByTimeAsync(300_000));
+      } else {
+        await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+      }
+      expect(result.current.availableBuildId).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await act(async () => vi.advanceTimersByTimeAsync(999));
+      expect(result.current.availableBuildId).toBeNull();
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(result.current.availableBuildId).toBe("new");
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it("detects and confirms a deploy while hidden without a foreground or reconnect event", async () => {
+    const { result } = renderHook(useWebUpdateNotifications);
+    await act(async () => {});
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    respond("new");
+    await act(async () => vi.advanceTimersByTimeAsync(301_000));
+    expect(result.current.availableBuildId).toBe("new");
+    expect(nativeNotify).toHaveBeenCalledOnce();
+    await act(async () => vi.advanceTimersByTimeAsync(600_000));
+    expect(nativeNotify).toHaveBeenCalledOnce();
+  });
+
+  it("bounds follow-up requests when replicas return different builds", async () => {
+    const { result } = renderHook(useWebUpdateNotifications);
+    await act(async () => {});
+    await poll("new");
+    respond("other");
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(result.current.availableBuildId).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(result.current.availableBuildId).toBeNull();
+    await poll("other");
+    expect(result.current.availableBuildId).toBe("other");
+  });
+
+  it("cancels a pending confirmation when another check fails or the hook unmounts", async () => {
     const { result, unmount } = renderHook(useWebUpdateNotifications);
+    await act(async () => {});
+    await poll("new");
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    await act(async () => window.dispatchEvent(new Event("online")));
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(result.current.availableBuildId).toBeNull();
+    await poll("new");
+    unmount();
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(nativeNotify).not.toHaveBeenCalled();
+  });
+
+  it.each(["blur", "hidden"])(
+    "notifies once when an already confirmed update becomes backgrounded via %s",
+    async (transition) => {
+      const { result } = renderHook(useWebUpdateNotifications);
+      await act(async () => {});
+      await poll("new");
+      await poll("new");
+      expect(result.current.availableBuildId).toBe("new");
+      expect(nativeNotify).not.toHaveBeenCalled();
+      if (transition === "hidden") {
+        vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+      }
+      await act(async () => {
+        if (transition === "blur") window.dispatchEvent(new Event("blur"));
+        else document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(nativeNotify).toHaveBeenCalledOnce();
+      await act(async () => window.dispatchEvent(new Event("blur")));
+      await act(async () => vi.advanceTimersByTimeAsync(300_000));
+      expect(nativeNotify).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("does not notify a dismissed update when the page later loses focus", async () => {
+    const { result } = renderHook(useWebUpdateNotifications);
+    await act(async () => {});
+    await poll("new");
+    await poll("new");
+    act(() => result.current.dismiss());
+    await act(async () => window.dispatchEvent(new Event("blur")));
+    await act(async () => vi.advanceTimersByTimeAsync(301_000));
+    expect(result.current.availableBuildId).toBeNull();
+    expect(nativeNotify).not.toHaveBeenCalled();
+  });
+
+  it("polls on mount, visible and hidden intervals, foreground, network and socket reconnect", async () => {
+    const { unmount } = renderHook(useWebUpdateNotifications);
     await act(async () => {});
     expect(fetchMock).toHaveBeenCalledTimes(1);
     await act(async () => vi.advanceTimersByTime(299_999));
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    respond("new");
     await act(async () => vi.advanceTimersByTime(1));
     expect(fetchMock).toHaveBeenCalledTimes(2);
     vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
     await act(async () => document.dispatchEvent(new Event("visibilitychange")));
-    await act(async () => vi.advanceTimersByTime(600_000));
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await act(async () => vi.advanceTimersByTimeAsync(600_000));
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
     await act(async () => document.dispatchEvent(new Event("visibilitychange")));
-    expect(result.current.availableBuildId).toBe("new");
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     vi.mocked(sessionUpdatesSocket.isConnected).mockReturnValue(false);
     await act(async () => socketStatus());
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     vi.mocked(sessionUpdatesSocket.isConnected).mockReturnValue(true);
     await act(async () => socketStatus());
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    await poll("new");
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    await poll("loaded");
+    expect(fetchMock).toHaveBeenCalledTimes(7);
     unmount();
     await act(async () => {
       window.dispatchEvent(new Event("online"));
       document.dispatchEvent(new Event("visibilitychange"));
       vi.advanceTimersByTime(600_000);
     });
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(7);
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
