@@ -4636,6 +4636,30 @@ export function NewChatLandingScreen() {
         !smartRoutingHarnessSelected &&
         SMART_ROUTING_ARMS.some((harness) => harness === nativeAgent?.harness);
 
+      // Normalized create-time model / effort — shared by the optimistic seed
+      // and the POST body so the temp composer shows exactly what the create
+      // request pins. Never pinned alongside routing.
+      const normalizedModelOverride =
+        !smartRoutingHarnessSelected &&
+        !routingOwnsModel &&
+        (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
+        pickedModel
+          ? pickedModel
+          : null;
+      const normalizedReasoningEffort =
+        !smartRoutingHarnessSelected &&
+        !routingOwnsModel &&
+        (agentSupportsPermissionMode ||
+          selectedNativeHarness === "pi-native" ||
+          nativeAgent?.harness === "codex-native") &&
+        pickedEffort
+          ? pickedEffort
+          : null;
+      // Resolved default (shown when nothing is pinned): the catalog's default
+      // row's provider-facing model id, else its row id.
+      const defaultModelRow = pickerModelOptions.find((option) => option.isDefault);
+      const resolvedDefaultModel = defaultModelRow?.model ?? defaultModelRow?.id ?? null;
+
       // Prepend each "@"-tagged path as an attachment marker on its own line —
       // the same wording the native executors emit and that title-seeding
       // strips. The runner, rooted at this workspace, reads the on-disk file
@@ -4745,7 +4769,17 @@ export function NewChatLandingScreen() {
         // Normal path: bind to an existing registered agent.
         const provisional = newTempConversation();
         try {
-          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject);
+          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
+            // Seed the temp session with the NORMALIZED create identity so the
+            // optimistic composer shows the model/effort/harness/routing being
+            // created — not the previous session's sticky state (#7039).
+            modelOverride: normalizedModelOverride,
+            llmModel: resolvedDefaultModel,
+            reasoningEffort: normalizedReasoningEffort,
+            harness: smartRoutingHarnessSelected ? null : (pickedHarness ?? null),
+            costControlModeOverride: costControlOverride ?? null,
+            boundAgentId: effectiveAgentId,
+          });
           if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
         } catch {
           /* non-fatal: the response still opens the server session */
@@ -4826,22 +4860,8 @@ export function NewChatLandingScreen() {
             // the runner launches. Claude, Codex, and Pi read model_override at
             // terminal launch; an unselected ("") knob is omitted so the
             // harness keeps its own configured/default model.
-            model_override:
-              !smartRoutingHarnessSelected &&
-              !routingOwnsModel &&
-              (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
-              pickedModel
-                ? pickedModel
-                : undefined,
-            reasoning_effort:
-              !smartRoutingHarnessSelected &&
-              !routingOwnsModel &&
-              (agentSupportsPermissionMode ||
-                selectedNativeHarness === "pi-native" ||
-                nativeAgent?.harness === "codex-native") &&
-              pickedEffort
-                ? pickedEffort
-                : undefined,
+            model_override: normalizedModelOverride ?? undefined,
+            reasoning_effort: normalizedReasoningEffort ?? undefined,
             cost_control_mode_override: costControlOverride,
             // Top-level Smart Routing sends the same "auto" sentinel the bundle
             // path does; the server tells them apart by the bound agent being a
