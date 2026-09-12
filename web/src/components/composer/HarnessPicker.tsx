@@ -1,4 +1,4 @@
-import { type ComponentProps, type ReactNode, useEffect, useRef, useState } from "react";
+import { type ComponentProps, type ReactNode, useEffect, useId, useRef, useState } from "react";
 import { ChevronLeftIcon } from "lucide-react";
 import { ComposerHarnessTrigger } from "./ComposerControls";
 import {
@@ -120,11 +120,15 @@ export function HarnessPickerEntry({
   configTestId?: string;
 }) {
   const rowContent = <HarnessMenuRowContent {...row} editable={editable} isMobile={isMobile} />;
+  // Stable handle for restoring focus to this row after a scoped Escape close;
+  // the UI DropdownMenuSubTrigger wrapper doesn't forward a ref.
+  const rowFocusId = useId();
   const rowProps = {
     className: cn(HARNESS_MENU_ROW_CLASS_NAME, row.active && "bg-muted"),
     "data-harness-menu-row": "",
     "data-active": row.active ? "true" : undefined,
     "data-testid": testId,
+    "data-escape-id": rowFocusId,
     disabled,
   };
   if (editable && !isMobile) {
@@ -134,10 +138,9 @@ export function HarnessPickerEntry({
           {...rowProps}
           onPointerMove={(event) => event.preventDefault()}
           onClick={(event) => {
-            // A second click on an already-open row toggles the config flyout
-            // closed (#7069). Pointer-move is suppressed on this trigger, which
-            // blocks the natural hover-out close, so an explicit pointer
-            // dismissal is required to match the keyboard path.
+            // Pointer-move is suppressed on this trigger to keep the flyout
+            // stable, which also blocks hover-out close; a second click on an
+            // open row is the explicit pointer dismissal.
             if (open) {
               event.preventDefault();
               onOpenChange(false);
@@ -152,12 +155,14 @@ export function HarnessPickerEntry({
           collisionPadding={12}
           data-testid={configTestId}
           onEscapeKeyDown={(event) => {
-            // Escape closes only this config flyout and returns focus to its
-            // row, rather than dismissing the whole harness menu (#7069).
-            // preventDefault stops the shared dismiss layer from also closing
-            // the parent menu.
+            // Scope Escape to this flyout: preventDefault stops the shared
+            // dismiss layer from closing the whole menu; close just the sub and
+            // return focus to its row.
             event.preventDefault();
             onOpenChange(false);
+            document
+              .querySelector<HTMLElement>(`[data-escape-id="${CSS.escape(rowFocusId)}"]`)
+              ?.focus();
           }}
           onFocusOutside={(event) => {
             if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
