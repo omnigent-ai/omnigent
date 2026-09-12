@@ -29,6 +29,22 @@ journey, but the clip itself must show the product surface and user-visible
 outcome, never the test process, pytest output, assertions, logs, or a synthetic
 evidence-summary slide.
 
+**Judge the textual exemption by the ticket's symptom, never by how you verified
+the facet.** When the reported symptom is content missing from (or wrong in) a
+rendered view — chat, the terminal pane, a sidebar, any view the user watches —
+the exemption above does **not** apply: "the expected content never appears in
+the view" is a watchable divergence (the action happens, one surface shows the
+content, the view that should show it stays empty), not a textual outcome. Film
+that divergence through the documented lane, showing the trigger and the view
+where the content is missing or wrong. Driving the failing state with a test
+fixture instead of the organic trigger is acceptable for these clips — a
+fixture-driven stand-in — and the caption must say it is one. That you confirmed
+such a facet structurally (a settings dict, a unit-level relay drive, a pytest
+assertion) describes your *verification*, not what the user sees, and never
+reclassifies the facet as textual. Skip a visibility facet only for a genuine
+environmental blocker, and only after `recording_unavailable_reason` quotes the
+concrete error each documented lane produced when you tried it.
+
 **A valid clip shows a live action producing the outcome — not static text
 asserting it.** A recording earns its place only when there is something to
 *watch*: a user action drives the surface and the product visibly responds — a
