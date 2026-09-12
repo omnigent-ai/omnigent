@@ -147,7 +147,7 @@ export function ComposerActionRow({ className, ...props }: ComponentPropsWithout
   return (
     <div
       className={cn(
-        "@container/composer-actions flex min-w-0 flex-wrap items-center justify-between gap-2 px-2 pt-1 pb-2",
+        "@container/composer-actions flex min-w-0 flex-nowrap items-center justify-between gap-2 px-2 pt-1 pb-2",
         className,
       )}
       {...props}
@@ -164,7 +164,7 @@ export function ComposerActionGroup({
     <div
       className={cn(
         "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-auto overflow-visible" : "ml-auto max-w-full shrink-0",
+        side === "left" ? "flex-[0_1_auto] overflow-visible" : "ml-auto max-w-full flex-[0_1_auto]",
         className,
       )}
       {...props}

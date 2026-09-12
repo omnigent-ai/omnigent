@@ -266,11 +266,45 @@ function removeConvRow(tempId: string): void {
  * Returns the temp id + the bubble's `pendingMsgTempId` for
  * `hydrateLocalConversation`, or `null` with no query cache (tests).
  */
+/**
+ * The model/agent identity the optimistic conversation should show while
+ * `createSession` is in flight. Every field mirrors the SAME normalized create
+ * request the POST sends — NOT raw picker state — so the temp view matches the
+ * session that binds. When cost-control routing is on the composer renders the
+ * routing label over any model, so the model fields stay `null` there.
+ */
+export interface OptimisticSessionModel {
+  /** The `model_override` the create POSTs, or `null` when none (default/routing). */
+  modelOverride: string | null;
+  /** The agent's resolved default model id, shown when there's no override. Omit
+   *  to leave `llmModel` unset (composer reads "agent default"). */
+  llmModel?: string | null;
+  /** The `reasoning_effort` the create POSTs, or `null`. */
+  reasoningEffort?: string | null;
+  /** Normalized brain/session harness (e.g. `"claude-sdk"`), NOT the picker's
+   *  `*-native` id. Omit when unknown; the composer tolerates a null harness. */
+  harness?: string | null;
+  /** Model context window, when known up front. Omit to leave unset. */
+  contextWindow?: number | null;
+  /** The `cost_control_mode_override` the create POSTs. `"on"` makes the
+   *  composer render the routing label instead of a model. */
+  costControlModeOverride?: "on" | "off" | null;
+  /** The `subagent_routing_override` the create POSTs, when set. */
+  subagentRoutingOverride?: "on" | "off" | null;
+  /** Bound agent identity for the composer, when resolved. */
+  boundAgentId?: string | null;
+  boundAgentName?: string | null;
+  /** Selected host id, so the temp composer can evaluate routing's per-family
+   *  gateway guard against the real chosen host during the pre-session window. */
+  hostId?: string | null;
+}
+
 export function beginLocalConversation(
   text: string,
   files: File[] | undefined,
   provisional = newTempConversation(),
   project?: LocalConversationProject,
+  model?: OptimisticSessionModel,
 ): { tempConvId: string; pendingMsgTempId: string; createToken: string } | null {
   if (queryClient === null) return null;
   const { id: tempConvId, token: createToken } = provisional;
@@ -300,8 +334,39 @@ export function beginLocalConversation(
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
 
+  // Seed the model/agent identity so the optimistic composer shows the selected
+  // model (with the caller's pending spinner) instead of the previous session's
+  // or a blank one. Every field mirrors the normalized create request; when
+  // cost-control routing is on the composer renders the routing label over any
+  // model, so a routing create simply leaves the model fields null.
+  const modelSeed: Partial<ConversationState> =
+    model === undefined
+      ? {}
+      : {
+          sessionModelOverride: model.modelOverride,
+          sessionModelSeeded: true,
+          sessionReasoningEffort: model.reasoningEffort ?? null,
+          // Authoritative only when the caller actually supplied an effort
+          // (a value or an intentional null) — an omitted effort stays a
+          // sticky-fallback, never a claimed "no effort".
+          sessionEffortSeeded: model.reasoningEffort !== undefined,
+          boundAgentId: model.boundAgentId ?? null,
+          boundAgentName: model.boundAgentName ?? null,
+          sessionHostId: model.hostId ?? null,
+          ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
+          ...(model.harness !== undefined ? { sessionHarness: model.harness } : {}),
+          ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+          ...(model.costControlModeOverride !== undefined
+            ? { costControlModeOverride: model.costControlModeOverride }
+            : {}),
+          ...(model.subagentRoutingOverride !== undefined
+            ? { subagentRoutingOverride: model.subagentRoutingOverride }
+            : {}),
+        };
+
   const entry = conversationRegistry.acquire(tempConvId);
   entry.setState({
+    ...modelSeed,
     pendingUserMessages: [bubble],
     loadingConversation: false,
     status: "streaming",
@@ -619,6 +684,23 @@ export interface ConversationState {
    * answer "what is THIS conversation at".
    */
   sessionReasoningEffort: string | null;
+  /**
+   * True when ``sessionReasoningEffort`` is AUTHORITATIVE for this conversation
+   * — set by the optimistic create seed (incl. an intentional ``null``) and by a
+   * live ``session_reasoning_effort`` report (also incl. null) — so the composer
+   * must NOT fall back to the app-global sticky pick. Distinguishes a
+   * deliberately-seeded / live-reported null from an unhydrated null. Cold
+   * hydration (bind) deliberately leaves this false: it folds the sticky pref
+   * into the value itself.
+   */
+  sessionEffortSeeded: boolean;
+  sessionModelSeeded: boolean;
+  /**
+   * Selected host id seeded at optimistic create, so the temp composer can run
+   * routing's per-family gateway guard against the real chosen host before the
+   * server session (which then owns ``hostId``) exists. ``null`` when unknown.
+   */
+  sessionHostId: string | null;
   /**
    * Per-session cost-control switch for the active session: ``"on"``
    * activates the spec's configured cost-control mode, ``"off"``
@@ -1645,6 +1727,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
   sessionReasoningEffort: null,
+  sessionEffortSeeded: false,
+  sessionModelSeeded: false,
+  sessionHostId: null,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
@@ -2601,7 +2686,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Harness has no effort control: undo the optimistic session-scoped write
       // so this conversation doesn't claim an effort the server will never hold.
       if (!supportsEffortControl(session)) {
-        setterFor(conversationId)({ sessionReasoningEffort: null });
+        setterFor(conversationId)({ sessionReasoningEffort: null, sessionEffortSeeded: false });
         return;
       }
       await updateSession(conversationId, { reasoningEffort: effort });
@@ -3460,12 +3545,16 @@ function mcpStartupSnapshotPatch(
  */
 function sessionBindingPatch(
   session: Session,
-  state: Pick<ConversationState, "mcpStartupLaunch">,
+  state: Pick<
+    ConversationState,
+    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+  >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
   | "nativeVendorOwnsModel"
+  | "sessionModelSeeded"
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
@@ -3487,6 +3576,7 @@ function sessionBindingPatch(
   | "mcpStartup"
   | "mcpStartupLaunch"
 > {
+  const retainModelSeed = state.sessionModelSeeded && session.llmModel == null;
   return {
     isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
@@ -3496,9 +3586,12 @@ function sessionBindingPatch(
       isNativeTerminalSessionFn(session) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
-    llmModel: session.llmModel ?? null,
+    llmModel: retainModelSeed ? state.llmModel : (session.llmModel ?? null),
+    sessionModelSeeded: retainModelSeed,
     pendingModelChange: null,
-    sessionModelOverride: session.modelOverride ?? null,
+    sessionModelOverride: retainModelSeed
+      ? state.sessionModelOverride
+      : (session.modelOverride ?? null),
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
@@ -3884,10 +3977,8 @@ async function bindStream(
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
-        // Session truth for the `/model` readout — overrides the snapshot
-        // value spread via `...bindingPatch` so the claude-native sticky
-        // handoff (fired above, silent) shows immediately.
-        sessionModelOverride: session.modelOverride ?? null,
+        // Server hydration supersedes any optimistic effort seed.
+        sessionEffortSeeded: false,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
@@ -5994,6 +6085,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // outcome of the ask.
       applyToNamedConversation(event.conversationId, {
         llmModel: event.model,
+        sessionModelSeeded: false,
         pendingModelChange: null,
       });
       return;
@@ -6028,6 +6120,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // wrong until a refresh.
       applyToNamedConversation(event.conversationId, {
         sessionReasoningEffort: event.reasoningEffort,
+        // The live report is the AUTHORITATIVE per-session effort — including an
+        // explicit null ("reset to agent default"). Keep the authority flag set
+        // so a background reset-to-null is retained through a warm A→B→A switch
+        // (never falling back to another session's sticky pick). Cold hydration
+        // is different: bind folds the sticky pref into the value on purpose.
+        sessionEffortSeeded: true,
       });
       // `selectedEffort` is the app-global sticky pick, so only adopt a value
       // reported by the conversation the user is actually looking at.

@@ -17,6 +17,12 @@ import {
   COMPOSER_HARNESS_MENU_SIZE,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
+import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
+import {
+  codexCreateApprovalOptions,
+  applyCodexApprovalSelection,
+} from "@/lib/codexApprovalOptions";
 import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
@@ -287,10 +293,6 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // landing composer. Deliberately an allowlist while the pattern proves
 // out — other agents keep the "/" menu as the only skill surface.
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
-
-function codexPickerEffortLabel(effort: string): string {
-  return effort === "xhigh" ? "xHigh" : effort.charAt(0).toUpperCase() + effort.slice(1);
-}
 
 function createdHarnessOptions({
   harness,
@@ -1275,11 +1277,6 @@ function visibleModelLabel(label: string): string {
   return label.replaceAll("`", "");
 }
 
-function compactHarnessTriggerValue(value: string): string {
-  const defaultModel = /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
-  return defaultModel.replace(/ \([^()]*context[^()]*\)$/i, "");
-}
-
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 
 /**
@@ -1405,13 +1402,13 @@ export function AgentHarnessPicker({
   const triggerEffort = triggerDetails.find(
     (detail) => detail.label === "Effort" || detail.label === "Thinking level",
   );
-  const triggerModelText = triggerModel ? compactHarnessTriggerValue(triggerModel.value) : "";
-  const triggerEffortText = triggerEffort ? compactHarnessTriggerValue(triggerEffort.value) : "";
+  const triggerModelText = triggerModel ? compactModelTriggerLabel(triggerModel.value) : "";
+  const triggerEffortText = triggerEffort ? compactModelTriggerLabel(triggerEffort.value) : "";
   const visibleModelText = triggerModelText === "Default" ? "Models unavailable" : triggerModelText;
   const visibleEffortText =
     triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
   const triggerAccessibleDetails = triggerDetails
-    .map((detail) => `${detail.label} ${compactHarnessTriggerValue(detail.value)}`)
+    .map((detail) => `${detail.label} ${compactModelTriggerLabel(detail.value)}`)
     .join(", ");
   const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerAccessibleDetails]
     .filter(Boolean)
@@ -1434,7 +1431,7 @@ export function AgentHarnessPicker({
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
     const details = active
       ? triggerDetails
-          .map((detail) => compactHarnessTriggerValue(detail.value))
+          .map((detail) => compactModelTriggerLabel(detail.value))
           .filter((value) => value !== "Default" && value !== EFFORT_UNAVAILABLE_PLACEHOLDER)
           .join(" ")
       : "";
@@ -2455,7 +2452,7 @@ export function NewChatLandingScreen() {
       sandboxSelected
         ? CLAUDE_NATIVE_MODELS.map((model) => ({
             id: model.id,
-            displayName: model.label,
+            displayName: model.id,
           }))
         : (hostClaudeModelOptions ?? []).map((option) => ({
             id: option.id,
@@ -2486,7 +2483,8 @@ export function NewChatLandingScreen() {
         ? []
         : (hostPiModelOptions ?? []).map((option) => ({
             id: option.id,
-            displayName: option.displayName ?? option.id,
+            model: option.model,
+            displayName: nativeModelLabel(option),
             source: option.source,
           })),
     [hostPiModelOptions, sandboxSelected],
@@ -3271,7 +3269,7 @@ export function NewChatLandingScreen() {
               label: "Effort",
               value: routingOn
                 ? EFFORT_UNAVAILABLE_PLACEHOLDER
-                : codexPickerEffortLabel(pickedEffort) || "Default",
+                : normalizeEffortLabel(pickedEffort) || "Default",
             },
           ];
       return [
@@ -3372,7 +3370,7 @@ export function NewChatLandingScreen() {
           ? codexEffortLevelsForModel(
               codexModelOptions,
               pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-            ).map((value) => ({ value, label: codexPickerEffortLabel(value) }))
+            ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
           : [];
   const selectPickerModel = (model: string) => {
     if (!selectedNativeHarness) return;
@@ -3420,100 +3418,104 @@ export function NewChatLandingScreen() {
           <DropdownMenuSeparator />
         </>
       )}
-      {(supportsModelPicker ||
-        supportsPermissionMode ||
-        supportsDevinMode ||
-        selectedNativeHarness === "codex-native") && (
-        <div data-testid="new-chat-landing-agent-models">
-          <PickerSectionHeader>Models</PickerSectionHeader>
-          {selectedNativeHarness === "pi-native" && (
-            <Input
-              aria-label="Search models"
-              placeholder="Search models…"
-              value={pickerModelSearch}
-              onChange={(event) => setPickerModelSearch(event.target.value)}
-              onKeyDown={(event) => event.stopPropagation()}
-              data-testid="new-chat-landing-agent-model-search"
-            />
-          )}
-          {pickerModelsLoading && (
-            <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
-          )}
-          {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-            <div className="px-2 py-1 text-xs text-muted-foreground">
-              {pickerModelsError?.message ?? "Models unavailable"}
-            </div>
-          )}
-          {pickerModelOptions.length > 0 &&
-            !pickerModelOptions.some((option) => option.isDefault) && (
-              <DropdownMenuCheckboxItem
-                checked={!routingOn && pickedModel === ""}
-                onCheckedChange={() => selectPickerModel(MODEL_SELECT_DEFAULT)}
-                onSelect={(event) => event.preventDefault()}
-                data-testid="new-chat-landing-agent-model-default"
-              >
-                Harness default
-              </DropdownMenuCheckboxItem>
-            )}
-          {pickerModelOptions
-            .filter((option) =>
-              pickerModelSearch
-                .toLowerCase()
-                .trim()
-                .split(/\s+/)
-                .every((term) =>
-                  `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
+      <ComposerConfigSections
+        models={
+          supportsModelPicker ||
+          supportsPermissionMode ||
+          supportsDevinMode ||
+          selectedNativeHarness === "codex-native"
+            ? {
+                testId: "new-chat-landing-agent-models",
+                header: "Models",
+                leading: (
+                  <>
+                    {selectedNativeHarness === "pi-native" && (
+                      <Input
+                        aria-label="Search models"
+                        placeholder="Search models…"
+                        value={pickerModelSearch}
+                        onChange={(event) => setPickerModelSearch(event.target.value)}
+                        onKeyDown={(event) => event.stopPropagation()}
+                        data-testid="new-chat-landing-agent-model-search"
+                      />
+                    )}
+                    {pickerModelsLoading && (
+                      <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
+                    )}
+                    {!pickerModelsLoading && pickerModelOptions.length === 0 && (
+                      <div className="px-2 py-1 text-xs text-muted-foreground">
+                        {pickerModelsError?.message ?? "Models unavailable"}
+                      </div>
+                    )}
+                  </>
                 ),
-            )
-            .map((option) => (
-              <DropdownMenuCheckboxItem
-                key={option.id}
-                checked={
-                  !routingOn &&
-                  (pickedModel === option.id || (pickedModel === "" && option.isDefault === true))
-                }
-                onCheckedChange={() =>
-                  selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id)
-                }
-                onSelect={(event) => event.preventDefault()}
-                data-testid={`new-chat-landing-agent-model-${option.id}`}
-                title={nativeModelLabel(option)}
-                className="whitespace-normal break-words [&>span:last-child]:min-w-0"
-              >
-                {visibleModelLabel(nativeModelLabel(option))}
-              </DropdownMenuCheckboxItem>
-            ))}
-        </div>
-      )}
-      {pickerEffortOptions.length > 0 && (
-        <div data-testid="new-chat-landing-agent-efforts">
-          <DropdownMenuSeparator />
-          <PickerSectionHeader>
-            {selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort"}
-          </PickerSectionHeader>
-          <DropdownMenuCheckboxItem
-            checked={!routingOn && pickedEffort === ""}
-            disabled={routingOn}
-            onCheckedChange={() => selectPickerEffort(EFFORT_SELECT_NONE)}
-            onSelect={(event) => event.preventDefault()}
-            data-testid="new-chat-landing-agent-effort-default"
-          >
-            Default
-          </DropdownMenuCheckboxItem>
-          {pickerEffortOptions.map((option) => (
-            <DropdownMenuCheckboxItem
-              key={option.value}
-              checked={!routingOn && pickedEffort === option.value}
-              disabled={routingOn}
-              onCheckedChange={() => selectPickerEffort(option.value)}
-              onSelect={(event) => event.preventDefault()}
-              data-testid={`new-chat-landing-agent-effort-${option.value}`}
-            >
-              {option.label}
-            </DropdownMenuCheckboxItem>
-          ))}
-        </div>
-      )}
+                choices: [
+                  ...(pickerModelOptions.length > 0 &&
+                  !pickerModelOptions.some((option) => option.isDefault)
+                    ? [
+                        {
+                          key: "__default__",
+                          label: "Harness default",
+                          checked: !routingOn && pickedModel === "",
+                          onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
+                          testId: "new-chat-landing-agent-model-default",
+                        },
+                      ]
+                    : []),
+                  ...pickerModelOptions
+                    .filter((option) =>
+                      pickerModelSearch
+                        .toLowerCase()
+                        .trim()
+                        .split(/\s+/)
+                        .every((term) =>
+                          `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
+                        ),
+                    )
+                    .map((option) => ({
+                      key: option.id,
+                      label: visibleModelLabel(nativeModelLabel(option)),
+                      checked:
+                        !routingOn &&
+                        (pickedModel === option.id ||
+                          (pickedModel === "" && option.isDefault === true)),
+                      onSelect: () =>
+                        selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+                      testId: `new-chat-landing-agent-model-${option.id}`,
+                      title: nativeModelLabel(option),
+                      className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+                    })),
+                ],
+              }
+            : undefined
+        }
+        efforts={
+          pickerEffortOptions.length > 0
+            ? {
+                testId: "new-chat-landing-agent-efforts",
+                header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+                choices: [
+                  {
+                    key: "__default__",
+                    label: "Default",
+                    checked: !routingOn && pickedEffort === "",
+                    disabled: routingOn,
+                    onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
+                    testId: "new-chat-landing-agent-effort-default",
+                  },
+                  ...pickerEffortOptions.map((option) => ({
+                    key: option.value,
+                    label: option.label,
+                    checked: !routingOn && pickedEffort === option.value,
+                    disabled: routingOn,
+                    onSelect: () => selectPickerEffort(option.value),
+                    testId: `new-chat-landing-agent-effort-${option.value}`,
+                  })),
+                ],
+              }
+            : undefined
+        }
+      />
       <DropdownMenuSeparator />
       <DropdownMenuItem
         data-testid="new-chat-landing-config-gear"
@@ -3547,9 +3549,9 @@ export function NewChatLandingScreen() {
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
       const effort =
         native.iconKind === "codex"
-          ? codexPickerEffortLabel(saved.effort ?? "")
+          ? normalizeEffortLabel(saved.effort ?? "")
           : efforts.find((option) => option.value === saved.effort)?.label;
-      return [agent.id, [compactHarnessTriggerValue(label), effort].filter(Boolean).join(" ")];
+      return [agent.id, [compactModelTriggerLabel(label), effort].filter(Boolean).join(" ")];
     }),
   );
   const directModeOptions = smartRoutingHarnessSelected
@@ -3557,7 +3559,12 @@ export function NewChatLandingScreen() {
     : supportsPermissionMode
       ? CLAUDE_NATIVE_PERMISSION_MODES
       : supportsApprovalMode
-        ? CODEX_NATIVE_APPROVAL_MODES
+        ? // Codex's create-time quick picker offers the dangerous bypass choice
+          // (#7070), matching the Advanced modal; other approval harnesses keep
+          // their plain preset list.
+          selectedNativeHarness === "codex-native"
+          ? codexCreateApprovalOptions()
+          : CODEX_NATIVE_APPROVAL_MODES
         : supportsCursorMode
           ? CURSOR_NATIVE_EXEC_MODES
           : supportsAgySkipPermissions
@@ -3567,6 +3574,19 @@ export function NewChatLandingScreen() {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
     else if (supportsApprovalMode) {
+      if (selectedNativeHarness === "codex-native") {
+        // Bypass is the most-permissive Approval choice, not a separate knob:
+        // arming it keeps the underlying preset and persists the bypass token
+        // exactly as the Advanced modal does (create-time only; runtime
+        // /permissions has no bypass row).
+        const selection = applyCodexApprovalSelection(mode, approvalMode);
+        setApprovalMode(selection.approvalMode);
+        setBypassSandbox(selection.bypass);
+        writeHarnessOption(selectedNativeHarness, {
+          mode: selection.bypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : selection.approvalMode,
+        });
+        return;
+      }
       setApprovalMode(mode);
       setBypassSandbox(false);
     } else if (supportsCursorMode) setCursorExecMode(mode);
@@ -4680,6 +4700,30 @@ export function NewChatLandingScreen() {
         !smartRoutingHarnessSelected &&
         SMART_ROUTING_ARMS.some((harness) => harness === nativeAgent?.harness);
 
+      // Normalized create-time model / effort — shared by the optimistic seed
+      // and the POST body so the temp composer shows exactly what the create
+      // request pins. Never pinned alongside routing.
+      const normalizedModelOverride =
+        !smartRoutingHarnessSelected &&
+        !routingOwnsModel &&
+        (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
+        pickedModel
+          ? pickedModel
+          : null;
+      const normalizedReasoningEffort =
+        !smartRoutingHarnessSelected &&
+        !routingOwnsModel &&
+        (agentSupportsPermissionMode ||
+          selectedNativeHarness === "pi-native" ||
+          nativeAgent?.harness === "codex-native") &&
+        pickedEffort
+          ? pickedEffort
+          : null;
+      // Resolved default (shown when nothing is pinned): the catalog's default
+      // row's provider-facing model id, else its row id.
+      const defaultModelRow = pickerModelOptions.find((option) => option.isDefault);
+      const resolvedDefaultModel = defaultModelRow?.model ?? defaultModelRow?.id ?? null;
+
       // Prepend each "@"-tagged path as an attachment marker on its own line —
       // the same wording the native executors emit and that title-seeding
       // strips. The runner, rooted at this workspace, reads the on-disk file
@@ -4789,7 +4833,28 @@ export function NewChatLandingScreen() {
         // Normal path: bind to an existing registered agent.
         const provisional = newTempConversation();
         try {
-          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject);
+          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
+            // Seed the temp session with the NORMALIZED create identity so the
+            // optimistic composer shows the model/effort/harness/routing being
+            // created — not the previous session's sticky state (#7039).
+            modelOverride: normalizedModelOverride,
+            llmModel: resolvedDefaultModel,
+            reasoningEffort: normalizedReasoningEffort,
+            // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
+            // usually-null pickedHarness for a native agent — so the temp page
+            // adapter can re-derive the native model/effort/permission identity.
+            harness: smartRoutingHarnessSelected
+              ? null
+              : (selectedNativeHarness ?? pickedHarness ?? null),
+            costControlModeOverride: costControlOverride ?? null,
+            boundAgentId: effectiveAgentId,
+            // Name (not just id) so the in-session temp composer can evaluate
+            // routing eligibility (isCostRoutingSession needs a bound agent).
+            boundAgentName: agent?.display_name ?? agent?.name ?? null,
+            // Chosen host so temp routing's per-family gateway guard uses the
+            // real host (null for a sandbox create).
+            hostId: sandboxSelected ? null : selectedHostId,
+          });
           if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
         } catch {
           /* non-fatal: the response still opens the server session */
@@ -4870,22 +4935,8 @@ export function NewChatLandingScreen() {
             // the runner launches. Claude, Codex, and Pi read model_override at
             // terminal launch; an unselected ("") knob is omitted so the
             // harness keeps its own configured/default model.
-            model_override:
-              !smartRoutingHarnessSelected &&
-              !routingOwnsModel &&
-              (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
-              pickedModel
-                ? pickedModel
-                : undefined,
-            reasoning_effort:
-              !smartRoutingHarnessSelected &&
-              !routingOwnsModel &&
-              (agentSupportsPermissionMode ||
-                selectedNativeHarness === "pi-native" ||
-                nativeAgent?.harness === "codex-native") &&
-              pickedEffort
-                ? pickedEffort
-                : undefined,
+            model_override: normalizedModelOverride ?? undefined,
+            reasoning_effort: normalizedReasoningEffort ?? undefined,
             cost_control_mode_override: costControlOverride,
             // Top-level Smart Routing sends the same "auto" sentinel the bundle
             // path does; the server tells them apart by the bound agent being a

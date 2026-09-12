@@ -28,7 +28,7 @@ import {
   Loader2Icon,
   XIcon,
 } from "lucide-react";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -46,19 +46,10 @@ import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskInd
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
-  ComposerWorkspaceTrigger,
   ComposerPermissionPicker,
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuCheckboxItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
@@ -174,9 +165,7 @@ import {
   SessionSharedContext,
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useSession } from "@/hooks/useSession";
-import { useGithubInfo } from "@/hooks/useGithub";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
@@ -214,6 +203,17 @@ import {
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
+import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
+import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
+import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
+import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
+import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
+import {
+  formatStatusModelLabel,
+  formatStatusEffortLabel,
+  formatModelEffortStatusLabel,
+} from "@/lib/composerModelLabel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -276,7 +276,10 @@ function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
  */
 export function isCostRoutingEligible(
   serverInfo: ServerInfoValue,
-  session: Session | null | undefined,
+  // Only the fields the guards below read, so a temp/optimistic session can be
+  // evaluated from its seed without fabricating a whole Session. A real Session
+  // is structurally assignable.
+  session: Pick<Session, "agentName" | "parentSessionId" | "harness" | "labels"> | null | undefined,
   host?: { gateway_inference?: Record<string, boolean> | null } | null,
 ): boolean {
   if (serverInfo === "loading" || !serverInfo.smart_routing_enabled) return false;
@@ -534,6 +537,8 @@ export function ChatPage() {
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
+  const composerSessionHarness = useChatStore((s) => s.sessionHarness);
+  const composerSeededHostId = useChatStore((s) => s.sessionHostId);
   // Fallback for session-scoped agents (created by `omnigent run --server`):
   // the sessions-derived list only carries id+name, so fetch the full
   // agent object for the active session. Drives the picker's
@@ -671,9 +676,24 @@ export function ChatPage() {
   // gateway check the external router requires.
   const serverInfo = useServerInfo();
   const { data: hostRows } = useHosts();
-  const sessionHost =
-    hostRows?.find((row) => row.host_id === (activeSession?.hostId ?? null)) ?? null;
-  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession, sessionHost);
+  // During the temp window there is no server session, so fall back to the
+  // seeded chosen host so routing's per-family gateway guard runs against the
+  // real host (not the "unknown host reads as backed" default).
+  const effectiveHostId =
+    activeSession?.hostId ?? (isTempConvId(activeConversationId) ? composerSeededHostId : null);
+  const sessionHost = hostRows?.find((row) => row.host_id === effectiveHostId) ?? null;
+  // A just-created (temp) conversation has no server session row yet, so
+  // derive routing eligibility from the optimistic seed (bound agent + create
+  // harness) through the SAME guards — never assume a temp id is eligible.
+  const optimisticRoutingSession =
+    activeSession == null && isTempConvId(activeConversationId) && boundAgentName != null
+      ? { agentName: boundAgentName, parentSessionId: null, harness: composerSessionHarness }
+      : null;
+  const costRoutingEligible = isCostRoutingEligible(
+    serverInfo,
+    activeSession ?? optimisticRoutingSession,
+    sessionHost,
+  );
   // Sub-agent routing is a separate knob with a different gate: a native CLI
   // can't per-turn route itself, but the sub-agents it spawns are routed per
   // spawn — where the launch actually installed that apparatus. See
@@ -997,13 +1017,22 @@ export function ChatPage() {
   // Once present, the live session snapshot is authoritative. Memoized so the
   // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
   // stable identity across the switch's re-render burst.
-  const capabilitySource = useMemo(
-    () => ({
-      labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
-      harness: activeSession?.harness ?? null,
-    }),
-    [activeSession, activeConv],
-  );
+  const capabilitySource = useMemo(() => {
+    if (activeSession)
+      return { labels: activeSession.labels ?? {}, harness: activeSession.harness };
+    // Temp/optimistic window: no server session and the sidebar row carries no
+    // native identity, so derive the wrapper label from the SEEDED native
+    // harness (create identity) — otherwise the native model/effort/permission
+    // controls fail closed until the real snapshot arrives.
+    if (isTempConvId(urlConvId)) {
+      const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
+      return {
+        labels: nativeAgent ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel } : {},
+        harness: composerSessionHarness,
+      };
+    }
+    return { labels: activeConv?.labels ?? {}, harness: null };
+  }, [activeSession, activeConv, urlConvId, composerSessionHarness]);
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
   // reported `llmModel` — falling back to the sticky preference only
@@ -2028,113 +2057,11 @@ export function buildSlashCommandWithArgsSet(
   return s;
 }
 
-/** Circumference of the progress ring (r=5.5). */
-const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
-
-/** Circular progress ring showing how much context window is used, with the used percentage beside it. */
-function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tokensUsed: number }) {
-  const pct = Math.min(tokensUsed / contextWindow, 1);
-  // Arc, %, label, and tooltip all encode context USED: a fresh session
-  // shows an empty ring at 0% and the ring fills as context is consumed.
-  const usedArc = pct * RING_CIRCUMFERENCE;
-  const usedPct = Math.round(pct * 100);
-
-  const color =
-    pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span
-          className={cn("flex items-center gap-1.5", color)}
-          aria-label={`${usedPct}% of context used`}
-        >
-          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
-            {/* Track */}
-            <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
-            {/* Used arc — skipped at 0, where round linecaps would still paint a dot. */}
-            {usedArc > 0 && (
-              <circle
-                cx="8"
-                cy="8"
-                r="5.5"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeDasharray={`${usedArc} ${RING_CIRCUMFERENCE}`}
-                transform="rotate(-90 8 8)"
-              />
-            )}
-          </svg>
-          <span className="text-sm tabular-nums" aria-hidden="true">
-            {usedPct}%
-          </span>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-44 text-center text-sm">
-        <p className="tabular-nums">{usedPct}% of context used.</p>
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-/**
- * Model label for the composer status tray.
- *
- * @param model - Model override or bound agent model id.
- * @param codexModelOptions - Native model metadata, when available.
- * @returns The advertised display label for known native models, a
- *   version-agnostic friendly form for an alias-shaped id the catalog
- *   doesn't list, the raw model id otherwise, or ``null`` when no model
- *   is known.
- */
-export function formatStatusModelLabel(
-  model: string | null,
-  codexModelOptions: readonly NativeModelOption[] = [],
-): string | null {
-  const raw = model?.trim();
-  if (!raw) return null;
-  const lower = raw.toLowerCase();
-  const codexOption = findNativeModelOption(codexModelOptions, raw);
-  if (codexOption) return nativeModelLabel(codexOption);
-  // An alias-shaped id the session's catalog doesn't list (e.g. during
-  // the pre-catalog window): render it friendly mechanically — "sonnet"
-  // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
-  // (1M context)" — without claiming a version the client can't know.
-  // Which model an alias lands on is the harness's answer; the catalog's
-  // display name supersedes this wherever one has arrived.
-  const alias = /^([a-z]+)(?:_(\d+))?(\[1m\])?$/.exec(lower);
-  if (alias) {
-    let label = `${alias[1]!.charAt(0).toUpperCase()}${alias[1]!.slice(1)}`;
-    if (alias[2]) label += ` ${alias[2]}`;
-    if (alias[3]) label += " (1M context)";
-    return label;
-  }
-  return raw;
-}
-
-function formatStatusEffortLabel(effort: string | null): string | null {
-  if (!effort) return null;
-  return effort.toLowerCase() === "xhigh" ? "xHigh" : formatEffortLabel(effort);
-}
-
-/**
- * Compose the current model and effort for the composer status tray.
- *
- * @param model - Model override or bound model id.
- * @param effort - Current reasoning effort override, if any.
- * @returns Compact label such as ``"gpt-5.5 xhigh"``.
- */
-export function formatModelEffortStatusLabel(
-  model: string | null,
-  effort: string | null,
-  codexModelOptions: readonly NativeModelOption[] = [],
-): string | null {
-  const modelLabel = formatStatusModelLabel(model, codexModelOptions);
-  const effortLabel = formatStatusEffortLabel(effort);
-  const parts = [modelLabel, effortLabel].filter((p): p is string => p != null && p.length > 0);
-  return parts.length > 0 ? parts.join(" ") : null;
-}
+// Status-tray model/effort labels are shared with the landing composer — the
+// single source of truth lives in @/lib/composerModelLabel (imported above).
+// Re-exported here so ChatPage's existing named exports keep resolving for
+// consumers (e.g. ChatPage.statusLine.test).
+export { formatStatusModelLabel, formatModelEffortStatusLabel };
 
 /**
  * Identity label for the composer status tray: which harness/agent is
@@ -2184,65 +2111,25 @@ export function composerHarnessLabel(
  * Pulled up behind the card so a shelf peeks below; skips render when empty.
  * Session cost lives in the header agent-info popover, not here.
  */
-function ComposerStatusLine({
-  goal,
-  isSubAgentSession,
-}: {
-  goal: Goal | null;
-  isSubAgentSession: boolean;
-}) {
+function ComposerStatusLine({ goal }: { goal: Goal | null }) {
   const conversationId = useChatStore((s) => s.conversationId);
-  // A client-only temp id has no server session — gate the server-scoped hooks
-  // below on it so they never fetch `/v1/sessions/temp:*` during the create
-  // window (mirrors ChatPage's top-level `sessionConvId`).
-  const sessionId = isTempConvId(conversationId) ? null : conversationId;
-  const contextWindow = useChatStore((s) => s.contextWindow);
-  const tokensUsed = useChatStore((s) => s.tokensUsed);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  // PR link → opens the workspace rail's GitHub tab. Shares the info query's
-  // cache with the GitHub panel, so opening the tab is instant.
-  const github = useGithubInfo(sessionId ?? undefined);
-  const openGithubTab = useOpenGithubTab();
-  const prs = github.data?.prs;
-  const prNumber = prs?.[0]?.number ?? github.data?.pr?.number ?? null;
-  const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
-  const showPr = !!conversationId && !isSubAgentSession && prCount > 0 && !!openGithubTab;
 
+  // The PR link and context ring now live in the workspace bar; this line
+  // carries only the plan-mode marker and the goal pill.
   const showPlanMode = !!conversationId && codexPlanMode;
   const showGoal = !!conversationId && goal != null;
-  // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
-  const showRing =
-    !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showPr && !showPlanMode && !showGoal && !showRing) return null;
+  if (!showPlanMode && !showGoal) return null;
 
   return (
     <div
       data-testid="composer-status-line"
       className={cn(
         // -mt-4 tucks under the card; pt-5.5 keeps content below the overlap.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
+        "mx-auto -mt-4 flex w-full items-center justify-end gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
         COMPOSER_COLUMN_WIDTH,
       )}
     >
-      <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
-        {showPr && (
-          <button
-            type="button"
-            data-testid="composer-pr-link"
-            onClick={() => openGithubTab?.()}
-            title={
-              prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"
-            }
-            className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-          >
-            <GithubMono size={14} aria-hidden />
-            <span className="tabular-nums whitespace-nowrap underline underline-offset-2">
-              {prCount > 1 ? `${prCount} PRs` : `#${prNumber}`}
-            </span>
-          </button>
-        )}
-      </div>
-      {/* Right: model/effort and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
           <span
@@ -2254,7 +2141,6 @@ function ComposerStatusLine({
           </span>
         )}
         {showGoal && goal && <GoalStatusPill goal={goal} />}
-        {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
       </div>
     </div>
   );
@@ -2570,6 +2456,17 @@ function ComposerImpl(
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
   const composerWorkspace = composerSession?.workspace;
+  // Live workspace/branch/PR status for the workspace bar (lane-3 shared hook):
+  // the branch comes from the host's `git worktree list`, never a PR head.
+  const composerGit = useComposerGitStatus({
+    sessionId: composerSessionId,
+    hostId: composerSession?.hostId ?? null,
+    workspace: composerWorkspace ?? null,
+    creationBranch: composerSession?.gitBranch ?? composerBranch ?? null,
+  });
+  const composerContextWindow = useChatStore((s) => s.contextWindow);
+  const composerTokensUsed = useChatStore((s) => s.tokensUsed);
+  const openComposerGithubTab = useOpenGithubTab();
   const permissionOptions = showClaudePermissionMode
     ? CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
     : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
@@ -3447,51 +3344,31 @@ function ComposerImpl(
       {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
         <ComposerWorkspaceBar data-testid="composer-workspace-controls">
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <ComposerWorkspaceTrigger
-                kind="directory"
-                label={composerWorkspace?.split(/[\\/]/).filter(Boolean).pop() ?? "No workspace"}
-                title={composerWorkspace ?? "No workspace bound"}
-              />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="start"
-              side="top"
-              className="max-w-[min(90vw,28rem)] whitespace-normal"
-            >
-              <DropdownMenuLabel>Session workspace</DropdownMenuLabel>
-              <p className="break-all px-2 py-1 text-xs text-muted-foreground">
-                {composerWorkspace ?? "This session has no workspace binding."}
-              </p>
-              <p className="px-2 py-1 text-xs text-muted-foreground">
-                Choose a different workspace when starting a new session.
-              </p>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <ComposerWorkspaceTrigger
-                kind="worktree"
-                label={composerBranch || "No branch reported"}
-                data-testid="composer-git-branch"
-              />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="start"
-              side="top"
-              className="max-w-[min(90vw,28rem)] whitespace-normal"
-            >
-              <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
-              <p className="break-all px-2 py-1 text-xs text-muted-foreground">
-                {composerBranch || "The runner has not reported a branch for this session."}
-              </p>
-              <p className="px-2 py-1 text-xs text-muted-foreground">
-                The current session keeps its workspace and worktree.
-              </p>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <BackgroundTaskIndicator />
+          <ComposerWorkspaceStatus
+            workspacePath={composerWorkspace ?? null}
+            worktreePath={composerGit.worktreePath}
+            isWorktree={composerGit.isWorktree}
+            branch={composerGit.branch}
+            branchState={composerGit.branchState}
+            creationBranch={composerGit.creationBranch}
+            onRefreshBranch={composerGit.refresh}
+            refreshing={composerGit.refreshing}
+          />
+          {/* Trailing status cluster — the wrapper owns the right alignment so
+              it holds even when the self-nulling indicators render nothing. */}
+          <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+            <ComposerPrLink
+              prCount={composerGit.prCount}
+              prNumber={composerGit.prNumber}
+              onOpen={openComposerGithubTab}
+            />
+            <ComposerContextRing
+              contextWindow={composerContextWindow}
+              tokensUsed={composerTokensUsed}
+            />
+            <BackgroundTaskIndicator />
+            <SubagentTaskIndicator conversationId={composerSessionId} />
+          </div>
         </ComposerWorkspaceBar>
       </div>
       <ChatComposer
@@ -3879,7 +3756,7 @@ function ComposerImpl(
           />
         )
       )}
-      <ComposerStatusLine goal={goal} isSubAgentSession={subAgentLabel != null} />
+      <ComposerStatusLine goal={goal} />
     </form>
   );
 }
@@ -4316,11 +4193,6 @@ export function shouldShowPollyCodexGoalControl(
   );
 }
 
-/** Title-case an effort level for the status label (``"high"`` → ``"High"``). */
-function formatEffortLabel(effort: string): string {
-  return effort.charAt(0).toUpperCase() + effort.slice(1);
-}
-
 /**
  * Whether the session surfaces any run-config the gear modal can edit. Shared
  * render guard for the config gear and click-to-open gate for the model/effort
@@ -4385,6 +4257,7 @@ function SessionHarnessPicker({
   const sessionHarness = useChatStore((state) => state.sessionHarness);
   const subAgentName = useChatStore((state) => state.subAgentName);
   const pendingModelChange = useChatStore((state) => state.pendingModelChange);
+  const sessionModelSeeded = useChatStore((state) => state.sessionModelSeeded);
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
@@ -4474,76 +4347,73 @@ function SessionHarnessPicker({
         await store.setCostControlMode("off");
     });
   const configContent = (
-    <>
-      {showModels && (
-        <div data-testid="composer-agent-models">
-          <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
-            Models
-          </DropdownMenuLabel>
-          {!modelOptions.some((model) => model.isDefault) && (
-            <DropdownMenuCheckboxItem
-              checked={!routingOn && pickerSelectedModel === null}
-              disabled={busy || pendingModelChange !== null}
-              onSelect={(event) => event.preventDefault()}
-              onCheckedChange={() => selectModel(null)}
-              data-testid="composer-agent-model-default"
-            >
-              Default
-            </DropdownMenuCheckboxItem>
-          )}
-          {modelOptions.map((model) => (
-            <DropdownMenuCheckboxItem
-              key={model.id}
-              disabled={busy || pendingModelChange !== null}
-              checked={
-                !routingOn &&
-                (model.id === pickerSelectedModel ||
-                  (pickerSelectedModel === null && model.isDefault === true))
-              }
-              onSelect={(event) => event.preventDefault()}
-              onCheckedChange={() => selectModel(model.isDefault ? null : model.id)}
-              data-testid={`composer-agent-model-${model.id}`}
-              data-model-id={model.id}
-              className="whitespace-normal break-words"
-            >
-              {nativeModelLabel(model)}
-            </DropdownMenuCheckboxItem>
-          ))}
-          {pickerSelectedModel &&
-            !modelOptions.some((model) => model.id === pickerSelectedModel) && (
-              <DropdownMenuCheckboxItem
-                checked={!routingOn}
-                disabled
-                data-model-id={pickerSelectedModel}
-                className="whitespace-normal break-words"
-              >
-                {modelLabel ?? effectiveModel} (current)
-              </DropdownMenuCheckboxItem>
-            )}
-        </div>
-      )}
-      {showEffort && availableEfforts.length > 0 && (
-        <div data-testid="composer-agent-efforts">
-          <DropdownMenuSeparator />
-          <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
-            {modelPickerKind === "pi" ? "Thinking level" : "Effort"}
-          </DropdownMenuLabel>
-          {[null, ...availableEfforts].map((effort) => (
-            <DropdownMenuCheckboxItem
-              key={effort ?? "default"}
-              checked={!routingOn && effort === selectedEffort}
-              disabled={routingOn || busy || pendingModelChange !== null}
-              onSelect={(event) => event.preventDefault()}
-              onCheckedChange={() => void apply(() => useChatStore.getState().setEffort(effort))}
-              data-testid={`composer-agent-effort-${effort ?? "default"}`}
-              data-effort-level={effort ?? "default"}
-            >
-              {formatStatusEffortLabel(effort) ?? "Default"}
-            </DropdownMenuCheckboxItem>
-          ))}
-        </div>
-      )}
-    </>
+    <ComposerConfigSections
+      models={
+        showModels
+          ? {
+              testId: "composer-agent-models",
+              header: "Models",
+              choices: [
+                ...(!modelOptions.some((model) => model.isDefault)
+                  ? [
+                      {
+                        key: "__default__",
+                        label: "Default",
+                        checked: !routingOn && pickerSelectedModel === null,
+                        disabled: busy || pendingModelChange !== null,
+                        onSelect: () => selectModel(null),
+                        testId: "composer-agent-model-default",
+                      },
+                    ]
+                  : []),
+                ...modelOptions.map((model) => ({
+                  key: model.id,
+                  label: nativeModelLabel(model),
+                  checked:
+                    !routingOn &&
+                    (model.id === pickerSelectedModel ||
+                      (pickerSelectedModel === null && model.isDefault === true)),
+                  disabled: busy || pendingModelChange !== null,
+                  onSelect: () => selectModel(model.isDefault ? null : model.id),
+                  testId: `composer-agent-model-${model.id}`,
+                  className: "whitespace-normal break-words",
+                  data: { "data-model-id": model.id },
+                })),
+                ...(pickerSelectedModel &&
+                !modelOptions.some((model) => model.id === pickerSelectedModel)
+                  ? [
+                      {
+                        key: "__current__",
+                        label: `${modelLabel ?? effectiveModel} (current)`,
+                        checked: !routingOn,
+                        disabled: true,
+                        className: "whitespace-normal break-words",
+                        data: { "data-model-id": pickerSelectedModel },
+                      },
+                    ]
+                  : []),
+              ],
+            }
+          : undefined
+      }
+      efforts={
+        showEffort && availableEfforts.length > 0
+          ? {
+              testId: "composer-agent-efforts",
+              header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
+              choices: [null, ...availableEfforts].map((effort) => ({
+                key: effort ?? "default",
+                label: formatStatusEffortLabel(effort) ?? "Default",
+                checked: !routingOn && effort === selectedEffort,
+                disabled: routingOn || busy || pendingModelChange !== null,
+                onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
+                testId: `composer-agent-effort-${effort ?? "default"}`,
+                data: { "data-effort-level": effort ?? "default" },
+              })),
+            }
+          : undefined
+      }
+    />
   );
   return (
     <>
@@ -4564,7 +4434,7 @@ function SessionHarnessPicker({
           testIdPrefix: "composer",
           "data-testid": "composer-config-gear",
           pending:
-            pendingModelChange !== null &&
+            (sessionModelSeeded || pendingModelChange !== null) &&
             (modelPickerKind === "claude" || modelPickerKind === "codex"),
         }}
         tooltip={<ComposerConfigTooltipRows rows={summary} />}
@@ -4698,8 +4568,12 @@ function useSessionConfigSummary({
  */
 function useSessionEffort(): string | null {
   const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const seeded = useChatStore((s) => s.sessionEffortSeeded);
   const stickyEffort = useChatStore((s) => s.selectedEffort);
-  return sessionReasoningEffort ?? stickyEffort;
+  // A seeded conversation's effort is authoritative even when null (an
+  // intentional "no effort" from the create), so it never borrows the
+  // app-global sticky pick; only an unhydrated conversation falls back.
+  return seeded ? sessionReasoningEffort : (sessionReasoningEffort ?? stickyEffort);
 }
 
 /**
@@ -4716,6 +4590,7 @@ function useResolvedComposerModel(
   codexModelOptions: readonly NativeModelOption[],
 ) {
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
+  const sessionModelSeeded = useChatStore((s) => s.sessionModelSeeded);
   const llmModel = useChatStore((s) => s.llmModel);
   const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
 
@@ -4774,15 +4649,17 @@ function useResolvedComposerModel(
   const pickerSelectedModel = isReportedModelPicker
     ? (reportedRowId ?? requestedRowId)
     : sessionModelOverride;
-  const effectiveModel = nativeVendorOwnsModel
-    ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-      ? sessionModelOverride
-      : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
-        ? (sessionModelOverride ?? llmModel)
-        : null
-    : isReportedModelPicker
-      ? llmModel
-      : (sessionModelOverride ?? llmModel);
+  const effectiveModel = sessionModelSeeded
+    ? (sessionModelOverride ?? llmModel)
+    : nativeVendorOwnsModel
+      ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
+        ? sessionModelOverride
+        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
+          ? (sessionModelOverride ?? llmModel)
+          : null
+      : isReportedModelPicker
+        ? llmModel
+        : (sessionModelOverride ?? llmModel);
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
   return {
     llmModel,
