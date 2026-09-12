@@ -14,6 +14,7 @@ import json
 import logging
 
 import pytest
+from omnigent_client import PaginatedList
 from prompt_toolkit.document import Document
 
 from omnigent.repl._repl import (
@@ -1971,7 +1972,7 @@ async def test_list_all_conversation_items_paginates_past_100(
             limit: int = 100,
             after: str | None = None,
             order: str = "asc",
-        ) -> list[dict[str, object]]:
+        ) -> PaginatedList:
             del conversation_id, order
             fetch_calls.append((limit, after))
             if after is None:
@@ -1982,7 +1983,8 @@ async def test_list_all_conversation_items_paginates_past_100(
                 # semantics ("strictly after").
                 idx = next(i for i, it in enumerate(fixture) if it["id"] == after)
                 start = idx + 1
-            return fixture[start : start + limit]
+            page = fixture[start : start + limit]
+            return PaginatedList(data=page, has_more=len(page) == limit)
 
     class _FakeClient:
         sessions = _FakeConversations()
@@ -2038,10 +2040,10 @@ async def test_list_all_conversation_items_handles_empty_conversation() -> None:
     fetch_count = 0
 
     class _EmptyConversations:
-        async def list_items(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+        async def list_items(self, *args: object, **kwargs: object) -> PaginatedList:
             nonlocal fetch_count
             fetch_count += 1
-            return []
+            return PaginatedList(data=[], has_more=False)
 
     class _FakeClient:
         sessions = _EmptyConversations()
@@ -2079,14 +2081,15 @@ async def test_list_all_conversation_items_falls_back_on_error() -> None:
             limit: int = 100,
             after: str | None = None,
             order: str = "asc",
-        ) -> list[dict[str, object]]:
+        ) -> PaginatedList:
             del conversation_id, order
             nonlocal fetch_count
             fetch_count += 1
             if fetch_count == 1:
                 # First page returns 100 items so paging
                 # continues.
-                return [{"id": f"item_{i:04d}", "type": "message"} for i in range(limit)]
+                data = [{"id": f"item_{i:04d}", "type": "message"} for i in range(limit)]
+                return PaginatedList(data=data, has_more=True)
             # Second page errors — simulates a transient HTTP
             # failure mid-pagination.
             raise RuntimeError("simulated mid-pagination failure")
