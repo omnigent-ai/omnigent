@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.inner import os_env as os_env_mod
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     _child_shell_env,
@@ -401,3 +402,74 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+def test_helper_spawn_retries_transient_fork_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One fork ``EAGAIN`` while spawning the helper is retried and succeeds.
+
+    ``subprocess.Popen`` raises ``BlockingIOError`` on the first spawn only
+    — the transient shape of host fork pressure. The helper never started,
+    so the retry is side-effect free and the shell op must succeed.
+    """
+    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0, raising=False)
+    real_popen = os_env_mod.subprocess.Popen
+    attempts = 0
+
+    def _fork_blocked_once(*args: object, **kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_popen(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fork_blocked_once)
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    try:
+        result = asyncio.run(os_env.shell("echo ok"))
+    finally:
+        os_env.close()
+
+    assert "error" not in result, f"A recovered spawn must not surface an error: {result}"
+    assert result["stdout"].strip() == "ok"
+    assert attempts == 2, "Exactly one retry must follow the transient fork failure"
+
+
+def test_helper_spawn_persistent_fork_failure_raises_after_bounded_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fork ``EAGAIN`` that never clears propagates after the bounded attempts.
+
+    The caller (runner dispatch) owns converting the exception to a
+    structured tool error, so the spawn path must re-raise — not swallow —
+    once the attempt budget is exhausted, and must not loop forever.
+    """
+    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0, raising=False)
+    attempts = 0
+
+    def _fork_blocked(*_args: object, **_kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        raise BlockingIOError(35, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fork_blocked)
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    try:
+        with pytest.raises(BlockingIOError):
+            asyncio.run(os_env.shell("echo ok"))
+    finally:
+        os_env.close()
+
+    # Initial spawn plus two retries, then give up.
+    assert attempts == 3

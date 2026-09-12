@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -168,6 +169,12 @@ _MAX_TOOL_OUTPUT_CHARS = 100_000
 # context window, causing the next LLM call to fail with a context-length
 # error. 2 000 lines matches the convention used by most coding tools.
 _DEFAULT_READ_LIMIT = 2_000
+
+# Bounded retry for transient helper-spawn failures. A fork EAGAIN
+# (BlockingIOError) means the host was briefly out of process capacity;
+# the helper never started, so retrying the spawn is side-effect free.
+_SPAWN_TRANSIENT_ATTEMPTS = 3
+_SPAWN_TRANSIENT_BACKOFF_S = 0.25
 
 
 def build_helper_env(
@@ -591,17 +598,30 @@ class _HelperProcessClient:
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:
-            self._proc = subprocess.Popen(
-                spawn_argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=str(self.cwd),
-                env=env,
-                **popen_kwargs,
-            )
+            proc: subprocess.Popen[str] | None = None
+            for attempt in range(1, _SPAWN_TRANSIENT_ATTEMPTS + 1):
+                try:
+                    proc = subprocess.Popen(
+                        spawn_argv,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        cwd=str(self.cwd),
+                        env=env,
+                        **popen_kwargs,
+                    )
+                    break
+                except BlockingIOError:
+                    # Fork EAGAIN: the host is briefly out of process
+                    # capacity. Nothing spawned and the config pipe is
+                    # untouched, so retrying the spawn is side-effect free.
+                    if attempt == _SPAWN_TRANSIENT_ATTEMPTS:
+                        raise
+                    time.sleep(_SPAWN_TRANSIENT_BACKOFF_S * 2 ** (attempt - 1))
+            assert proc is not None  # the loop either breaks with a proc or raises
+            self._proc = proc
         except Exception:
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
