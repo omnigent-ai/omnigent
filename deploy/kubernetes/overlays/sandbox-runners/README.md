@@ -204,6 +204,7 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 |---|---|
 | `provider` | `kubernetes` (a Job with a fixed 7-day cap) or `agent_sandbox` (an agent-sandbox `Sandbox` that reclaims itself once idle): see [Self-reclaiming sandboxes](#self-reclaiming-sandboxes-provider-agent_sandbox). Both read this same `kubernetes:` block. |
 | `server_url` | URL the runner Pod's host dials back to (in-cluster service DNS by default). |
+| `keep_warm_s` | Optional, top-level under `sandbox:` (`agent_sandbox` only): seconds an idle sandbox stays warm (runner alive) after the last turn before it suspends — the single idle-suspend timing knob. Maps to the in-sandbox `runner.idle_timeout_s` and is authoritative over an explicit one. Unset → ~1h default. See [Watching and tuning the lifecycle](#watching-and-tuning-the-lifecycle). |
 | `host_config` | Optional, top-level under `sandbox:` (provider-agnostic, not inside `kubernetes:`): verbatim in-sandbox `~/.omnigent/config.yaml` content installed before `omnigent host` starts — e.g. a `providers:` block routing the `pi` harness through a self-hosted gateway (LiteLLM/vLLM). Server-managed: entries injected by a previous launch are replaced or removed on the next launch/resume; config created inside the sandbox survives. Keep secrets out via `api_key_ref: env:VAR`, resolved inside the runner Pod against the `secret_name` Secret. Validated at server startup. |
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
@@ -266,53 +267,45 @@ sandbox -n omnigent-sandboxes` shows suspended ones with `Ready=False`,
 
 ### Watching and tuning the lifecycle
 
-**See it happen.** The transitions the server drives log at `INFO` under the
-`omnigent.sandbox.lifecycle` logger: each keepalive-extend while a runner is live
-(`sandbox <id> kept alive: shutdownTime -> <ts>`) and the wake from an idle
-suspend (`sandbox <id> was reclaimed while idle (suspended); waking it in
-place`). Watch the `shutdownTime` march forward while the agent works, then stop
-once the runner goes idle. The Pod teardown itself is the agent-sandbox
-controller's doing, so confirm the suspend with `kubectl get sandbox -n
-omnigent-sandboxes -w` (it flips to `Ready=False` / `SandboxExpired`, keeping its
-PVC). This is a *suspend* (resumable) — distinct from the deployment-wide reaper,
-which logs its own `reaper terminated N generation(s)` when it deletes a
-long-abandoned sandbox for good.
-
-**Tune how fast idle sandboxes suspend — one knob.** Set
-`OMNIGENT_MANAGED_IDLE_SHUTDOWN_S` and a sandbox suspends about that many seconds
-after the agent goes quiet. It derives the three underlying timers together
-(runner idle timeout, keepalive interval, shutdown window) so they can't drift or
-fight each other:
+**Tune it — one knob.** Set `keep_warm_s` on the sandbox config: how long an idle
+sandbox stays warm (its runner alive, so follow-ups are instant) after the last
+turn. Once that elapses the runner exits and the pod suspends a short window
+later (~2 min), so a sandbox is reclaimed roughly `keep_warm_s` after the agent
+goes quiet:
 
 ```yaml
 sandbox:
   provider: agent_sandbox
-# server env: OMNIGENT_MANAGED_IDLE_SHUTDOWN_S=30   # suspend ~30s after idle
+  keep_warm_s: 300      # stay warm 5 min after the last turn, then suspend
 ```
 
-Finish a turn → the runner idles out → keepalive stops → the controller suspends
-the sandbox, ~30s after the agent went quiet in total. Leave it unset in
-production (sandboxes then use the 1h defaults); a short value means a paused
-session re-wakes its sandbox on the next message, which is the intended trade for
-snappy reclamation.
+It maps directly to the in-sandbox `runner.idle_timeout_s` and is authoritative
+(it wins over an explicit `host_config.runner.idle_timeout_s`). Leave it unset for
+the ~1h default. A short value reclaims aggressively; a follow-up **within**
+`keep_warm_s` is instant, while one sent after it re-wakes the sandbox on the next
+message (the CR + PVC are retained, so the workspace survives). Note the ~2-min
+window tail: a `keep_warm_s` of a few seconds still suspends ~2 min after idle.
 
-How the knob splits (roughly `runner_idle + window ≈ idle_shutdown`): the
-keepalive `interval` becomes a fraction of the value, the `window` is `2×` that
-interval (one missed-refresh of headroom), and the runner idle timeout carries
-the rest. Because keepalive runs on its **own timer** (not the fixed 30s liveness
-ping), the interval — and therefore the window — can safely go below 30s without
-a busy sandbox dying between refreshes; the initial (create/wake) deadline is
-floored separately at a boot grace so a short window never reaps a still-booting
-Pod.
+**Watch it happen.** The reliable view is the `Sandbox` CR itself:
 
-For manual control, the three underlying knobs still work (and
-`OMNIGENT_MANAGED_IDLE_SHUTDOWN_S` overrides them when set):
+```bash
+kubectl get sandbox -n omnigent-sandboxes -w
+```
 
-| Knob | What | Default |
-|---|---|---|
-| `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S` | how often the server refreshes a live sandbox's deadline | `600` |
-| `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` | the inactivity window, floored at 2× the interval | `3600` |
-| `runner.idle_timeout_s` (via `host_config`) | how long the runner lives after its last turn | `3600` |
+`spec.shutdownTime` marches forward while a runner is live (keepalive), then the
+CR flips to `Ready=False` / `SandboxExpired` and the Pod is torn down when it
+suspends — a *suspend* (resumable, PVC kept), distinct from the deployment-wide
+reaper's hard terminate. The server also logs each keepalive at `INFO` from
+`omnigent.server.managed_host_keepalive` (`kept managed sandbox <id> alive
+(provider <p>)`), but that runs on a background thread and may not surface in
+every logging setup — treat `kubectl get sandbox -w` as the source of truth.
+
+**Advanced (rarely needed).** The pod-linger window and keepalive cadence are
+internal defaults (window ~120s, refresh ~60s); `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S`
+and `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S` override them for experiments (e.g. a
+faster demo). Keepalive runs on its own timer (not the fixed 30s liveness ping),
+and the create/wake deadline is floored at a boot grace so a short window never
+reaps a still-booting Pod.
 
 ### Durable workspace (`OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE`)
 

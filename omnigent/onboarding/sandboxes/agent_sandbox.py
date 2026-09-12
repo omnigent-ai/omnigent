@@ -63,10 +63,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
-from omnigent.onboarding.sandboxes.base import (
-    resolve_managed_idle_shutdown_s,
-    resolve_managed_keepalive_interval_s,
-)
+from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
 from omnigent.onboarding.sandboxes.kubernetes import (
     _POD_READY_REQUEST_TIMEOUT_S,
     KubernetesSandboxLauncher,
@@ -95,9 +92,17 @@ SANDBOX_PLURAL: str = "sandboxes"
 """Plural resource name, as required by ``CustomObjectsApi``."""
 
 SHUTDOWN_WINDOW_ENV_VAR: str = "OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S"
-"""Environment variable overriding :data:`DEFAULT_SHUTDOWN_WINDOW_S`."""
+"""Advanced/internal override of :data:`DEFAULT_SHUTDOWN_WINDOW_S`. Operators tune
+``keep_warm_s`` (the runner idle timeout); this window is the pod-linger tail
+after the runner exits and is left at its default in normal use."""
 
-DEFAULT_SHUTDOWN_WINDOW_S: int = 3600
+DEFAULT_SHUTDOWN_WINDOW_S: int = 120
+"""How far ahead of now ``spec.shutdownTime`` is set on each keepalive, in
+seconds: how long the pod lingers after the runner exits before it suspends.
+Small by design so ``keep_warm_s`` (the runner idle timeout) governs the felt
+idle-suspend time. Must stay >= :func:`min_shutdown_window_s` (twice the refresh
+interval) so a couple of missed refreshes cannot reap a busy sandbox; the
+create/wake deadline is floored separately at :data:`_BOOT_GRACE_S` for boot."""
 
 _BOOT_GRACE_S: int = 300
 """Floor on the shutdownTime set at create/wake, decoupled from the steady
@@ -109,16 +114,6 @@ and the controller would reap the Pod mid-boot. Flooring only the INITIAL
 deadline at this grace lets the steady window (which governs how fast an idle
 sandbox suspends) be short without breaking cold start. A sandbox that boots but
 never gets a runner is genuinely unused and suspends once this grace elapses."""
-"""How far ahead of now ``spec.shutdownTime`` is set, in seconds.
-
-This is effectively the sandbox's inactivity timeout: a sandbox with no live
-runner is reclaimed within one window of its last refresh. It MUST stay
-comfortably above :func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`
-(the server's per-runner refresh rate) so a couple of missed or slow refreshes
-cannot reclaim a busy sandbox. One hour against a 10-minute refresh leaves five
-misses of headroom, and also covers the gap between a host starting and its
-first session spawning a runner (no runner yet means no refresh yet).
-"""
 
 
 WORKSPACE_SIZE_ENV_VAR: str = "OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE"
@@ -187,13 +182,8 @@ def resolve_shutdown_window_s() -> int:
     :returns: The window in seconds, always >= :func:`min_shutdown_window_s`.
     """
     floor = min_shutdown_window_s()
-    # The single idle-shutdown knob drives the window to its floor (2x interval);
-    # the runner idle timeout carries the rest of the budget. It wins over the
-    # explicit window env so the one knob stays authoritative.
-    if resolve_managed_idle_shutdown_s() is not None:
-        return floor
-    # Fallbacks (empty/malformed/non-positive) must also respect the floor: with a
-    # configurable interval, DEFAULT is no longer guaranteed >= floor.
+    # Fallbacks (empty/malformed/non-positive) must also respect the floor: the
+    # interval is configurable, so DEFAULT is not guaranteed >= floor.
     fallback = max(DEFAULT_SHUTDOWN_WINDOW_S, floor)
     raw = os.environ.get(SHUTDOWN_WINDOW_ENV_VAR, "").strip()
     if raw:

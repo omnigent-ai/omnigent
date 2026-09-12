@@ -1007,26 +1007,41 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxHostLaun
     return _reject
 
 
-def _apply_managed_idle_shutdown_runner_idle(
-    host_config: dict[str, object] | None,
-) -> dict[str, object] | None:
-    """Inject the idle-shutdown-derived runner idle timeout into *host_config*.
+def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
+    """Parse the top-level ``sandbox.keep_warm_s`` knob (positive seconds), or None.
 
-    When the single ``OMNIGENT_MANAGED_IDLE_SHUTDOWN_S`` knob is set, the runner
-    must give up in step with the (derived) shutdown window, or a large default
-    ``runner.idle_timeout_s`` would keep the sandbox warm long past the intended
-    idle-shutdown. Sets ``runner.idle_timeout_s`` only when the operator has not
-    set one explicitly (their value wins). A no-op when the knob is unset.
+    The single agent-sandbox timing knob: how long an idle sandbox stays warm
+    (its runner alive) after the last turn before it suspends.
     """
-    from omnigent.onboarding.sandboxes.base import managed_runner_idle_timeout_s
+    value = raw.get("keep_warm_s")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError("sandbox.keep_warm_s must be a positive number of seconds")
+    return int(value)
 
-    runner_idle = managed_runner_idle_timeout_s()
-    if runner_idle is None:
+
+def _apply_keep_warm(
+    host_config: dict[str, object] | None, keep_warm_s: int | None
+) -> dict[str, object] | None:
+    """Map the ``keep_warm_s`` knob onto the in-sandbox ``runner.idle_timeout_s``.
+
+    ``keep_warm_s`` is the single agent-sandbox timing knob and is authoritative:
+    it wins over an explicit ``host_config.runner.idle_timeout_s`` (logging when it
+    overrides one) so there is one source of truth. A no-op when unset.
+    """
+    if keep_warm_s is None:
         return host_config
     merged = dict(host_config or {})
     existing = merged.get("runner")
     runner = dict(existing) if isinstance(existing, dict) else {}
-    runner.setdefault("idle_timeout_s", round(runner_idle))
+    if runner.get("idle_timeout_s") not in (None, keep_warm_s):
+        _logger.info(
+            "sandbox.keep_warm_s=%s overrides host_config.runner.idle_timeout_s=%s",
+            keep_warm_s,
+            runner.get("idle_timeout_s"),
+        )
+    runner["idle_timeout_s"] = keep_warm_s
     merged["runner"] = runner
     return merged
 
@@ -1286,7 +1301,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
     if provider == "agent_sandbox":
-        host_config = _apply_managed_idle_shutdown_runner_idle(host_config)
+        host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)

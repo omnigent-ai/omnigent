@@ -55,73 +55,20 @@ _logger = logging.getLogger(__name__)
 MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
 """Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
 
-_DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
+_DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 60.0
 _MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
-
-MANAGED_IDLE_SHUTDOWN_ENV_VAR: str = "OMNIGENT_MANAGED_IDLE_SHUTDOWN_S"
-"""Single high-level knob: seconds from an agent going idle until its managed
-sandbox suspends. When set it derives the keepalive interval, the shutdown
-window, and the runner idle timeout together, so a deployment tunes idle-suspend
-timing with ONE value instead of three, and takes precedence over the individual
-interval/window knobs. See :func:`managed_runner_idle_timeout_s` for the split."""
-
-# window == 2 x interval (the floor): one whole missed refresh of headroom.
-_KEEPALIVE_WINDOW_FLOOR_MULTIPLIER: int = 2
-# The runner must not exit mid tool-call, so its idle timeout never goes below this.
-_MIN_MANAGED_RUNNER_IDLE_S: float = 5.0
-# Cap the derived interval so a long idle-shutdown does not leave a huge window.
-_MAX_IDLE_SHUTDOWN_INTERVAL_S: float = 120.0
-# The derived interval is this fraction of idle_shutdown, keeping the window
-# (2 x interval) to roughly a third of the budget and the runner idle to the rest.
-_IDLE_SHUTDOWN_INTERVAL_DIVISOR: float = 6.0
-
-
-def resolve_managed_idle_shutdown_s() -> float | None:
-    """Parse the single idle-shutdown knob, or ``None`` when unset/invalid.
-
-    A malformed, non-finite, or non-positive value falls through to ``None`` (the
-    individual interval/window/runner knobs then apply) rather than raising, so a
-    typo cannot make sandboxes unlaunchable.
-    """
-    raw = os.environ.get(MANAGED_IDLE_SHUTDOWN_ENV_VAR, "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = float(raw)
-    except ValueError:
-        _logger.warning("ignoring %s=%r (not a number)", MANAGED_IDLE_SHUTDOWN_ENV_VAR, raw)
-        return None
-    if not math.isfinite(parsed) or parsed <= 0:
-        _logger.warning(
-            "ignoring %s=%r (must be finite and positive)", MANAGED_IDLE_SHUTDOWN_ENV_VAR, raw
-        )
-        return None
-    return parsed
 
 
 def resolve_managed_keepalive_interval_s() -> float:
     """
     How often the server refreshes a live managed sandbox's liveness, in seconds.
 
-    Read from :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR` (default 600s), floored
-    at a small minimum so a typo cannot spin the refresh loop. Single source of
-    truth: the server keepalive loop throttles to this
-    (:mod:`omnigent.server.managed_host_keepalive`), and the ``agent_sandbox``
-    provider sets its shutdown-window floor to twice this, so the window can
-    never fall below what the loop can actually refresh in time. Lower it (with a
-    correspondingly low window) to watch a sandbox suspend soon after it idles.
-
-    The single :func:`resolve_managed_idle_shutdown_s` knob, when set, takes
-    precedence and drives the cadence (a fraction of the idle-shutdown budget).
+    Read from :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR` (default 60s), floored
+    at a small minimum so a typo cannot spin the refresh loop. The server
+    keepalive loop throttles to this, and the ``agent_sandbox`` provider derives
+    its shutdown-window floor as twice this. Internal advanced override;
+    ``keep_warm_s`` is the operator-facing knob.
     """
-    idle_shutdown = resolve_managed_idle_shutdown_s()
-    if idle_shutdown is not None:
-        return min(
-            _MAX_IDLE_SHUTDOWN_INTERVAL_S,
-            max(
-                _MIN_MANAGED_KEEPALIVE_INTERVAL_S, idle_shutdown / _IDLE_SHUTDOWN_INTERVAL_DIVISOR
-            ),
-        )
     raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()
     if not raw:
         return _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
@@ -155,24 +102,6 @@ def resolve_managed_keepalive_interval_s() -> float:
         )
         return _MIN_MANAGED_KEEPALIVE_INTERVAL_S
     return parsed
-
-
-def managed_runner_idle_timeout_s() -> float | None:
-    """Runner idle timeout derived from the single idle-shutdown knob, or ``None``.
-
-    Split so that ``runner_idle + shutdown_window`` (window is
-    ``2 x interval``) is about ``idle_shutdown``: the sandbox suspends
-    roughly ``idle_shutdown`` seconds after the agent goes quiet: the runner
-    gives up after ``runner_idle``, keepalive stops, and the window lapses.
-    Floored at :data:`_MIN_MANAGED_RUNNER_IDLE_S` so the runner does not exit
-    mid tool-call. ``None`` when the knob is unset (the operator's own
-    ``runner.idle_timeout_s``, if any, then stands).
-    """
-    idle_shutdown = resolve_managed_idle_shutdown_s()
-    if idle_shutdown is None:
-        return None
-    window = _KEEPALIVE_WINDOW_FLOOR_MULTIPLIER * resolve_managed_keepalive_interval_s()
-    return max(_MIN_MANAGED_RUNNER_IDLE_S, idle_shutdown - window)
 
 
 # Ceiling for the in-sandbox host restart backoff, so a host that crashes on

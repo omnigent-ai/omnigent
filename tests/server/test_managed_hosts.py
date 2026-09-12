@@ -4852,14 +4852,21 @@ def test_agent_sandbox_reuses_the_kubernetes_config_block() -> None:
     assert type(launcher).keep_alive is not SandboxHostLauncher.keep_alive
 
 
-def test_idle_shutdown_injects_runner_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The single idle-shutdown knob sets a matching runner idle timeout in
-    host_config, but never overrides an explicit operator value."""
-    from omnigent.server.managed_hosts import _apply_managed_idle_shutdown_runner_idle as apply
+def test_keep_warm_sets_runner_idle_timeout() -> None:
+    """keep_warm_s maps onto runner.idle_timeout_s and is authoritative (wins over
+    an explicit value, preserves other runner keys); a no-op when unset."""
+    from omnigent.server.managed_hosts import _apply_keep_warm, _parse_keep_warm_s
 
-    monkeypatch.setenv("OMNIGENT_MANAGED_IDLE_SHUTDOWN_S", "30")
-    assert apply(None) == {"runner": {"idle_timeout_s": 20}}
-    assert apply({"runner": {"idle_timeout_s": 999}})["runner"]["idle_timeout_s"] == 999
-    assert apply({"runner": {"foo": 1}})["runner"] == {"foo": 1, "idle_timeout_s": 20}
-    monkeypatch.delenv("OMNIGENT_MANAGED_IDLE_SHUTDOWN_S")
-    assert apply({"providers": {}}) == {"providers": {}}
+    assert _parse_keep_warm_s({"keep_warm_s": 30}) == 30
+    assert _apply_keep_warm(None, 30) == {"runner": {"idle_timeout_s": 30}}
+    assert (
+        _apply_keep_warm({"runner": {"idle_timeout_s": 999}}, 30)["runner"]["idle_timeout_s"] == 30
+    )
+    assert _apply_keep_warm({"runner": {"foo": 1}}, 30)["runner"] == {
+        "foo": 1,
+        "idle_timeout_s": 30,
+    }
+    assert _parse_keep_warm_s({}) is None
+    assert _apply_keep_warm({"x": 1}, None) == {"x": 1}
+    with pytest.raises(ValueError):
+        _parse_keep_warm_s({"keep_warm_s": -5})
