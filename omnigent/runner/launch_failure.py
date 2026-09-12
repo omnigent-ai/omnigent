@@ -177,7 +177,7 @@ def classify_terminal_failure(
 
 _RATE_LIMIT_ERROR = re.compile(
     r"\b(?:rate[ _-]limit[ _-](?:error|exceeded|reached)|request_limit_exceeded"
-    r"|too many requests)\b",
+    r"|rate[ _-]limited|too many requests)\b",
     re.IGNORECASE,
 )
 _NATIVE_ERROR_HTTP_STATUS = re.compile(

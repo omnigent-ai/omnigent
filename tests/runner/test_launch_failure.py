@@ -115,14 +115,20 @@ def test_command_path_is_matched_by_basename() -> None:
 @pytest.mark.parametrize(
     "message",
     [
-        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded "
-        "workspace input tokens per minute rate limit for databricks-test-model. "
-        "Work with your Databricks account team to request a higher FMAPI rate limit tier.",
+        (
+            "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded "
+            "workspace input tokens per minute rate limit for databricks-test-model. "
+            "Work with your Databricks account team to request a higher FMAPI rate limit tier."
+        ),
         "API Error: Request rejected (429)",
         'API Error: 429 {"error": {"type": "rate_limit_error"}}',
         "REQUEST_LIMIT_EXCEEDED: request throttled",
         "Rate limit exceeded",
         "rate-limit reached for this model",
+        "rate limited",
+        "Rate limited",
+        "rate-limited",
+        "rate_limited",
         "HTTP 429",
         "HTTP/1.1 429",
         "status_code: 429",
@@ -142,8 +148,10 @@ def test_classifies_native_429_and_rate_limit_errors(code: str, message: str) ->
         "An unexpected error occurred",
         "API Error: Request rejected (401) · UNAUTHENTICATED",
         "API Error: Request rejected (403) · PERMISSION_DENIED",
-        "API Error: Request rejected (403) · PERMISSION_DENIED: "
-        "See rate_limit_error troubleshooting",
+        (
+            "API Error: Request rejected (403) · PERMISSION_DENIED: "
+            "See rate_limit_error troubleshooting"
+        ),
         "API Error: 401 Unauthorized. Previous request: rate limit exceeded.",
         "HTTP/1.1 403: See rate_limit_exceeded troubleshooting",
         "There's an issue with the selected model. It may not exist.",
