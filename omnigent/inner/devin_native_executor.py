@@ -114,9 +114,11 @@ class DevinNativeExecutor(Executor):
             Each ``(family, effort)`` is cached so a repeated pick never re-shells
             ``devin models list``.
         """
-        if config is None or not config.model:
+        if config is None:
             return None
         family = config.model
+        if not family:
+            return None
         effort: str | None = None
         raw = (config.extra or {}).get("reasoning_effort")
         if isinstance(raw, str) and raw:
@@ -128,6 +130,10 @@ class DevinNativeExecutor(Executor):
         from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
 
         variant = await asyncio.to_thread(resolve_devin_launch_model, family, effort)
+        if variant is None:
+            # resolve_devin_launch_model only returns None for a None family,
+            # which the guard above already excludes; keep the pane's model.
+            return None
         self._variant_cache[key] = variant
         return variant
 
