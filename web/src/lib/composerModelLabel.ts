@@ -20,9 +20,11 @@ export interface NativeModelLabelFields {
 
 /** A catalog row's user-facing name: what the harness advertises, else its id.
  *
- * Claude ids fold to a `Family Major.Minor (1M context)` spelling. The
- * ` (1M context)` variant suffix is load-bearing and always preserved so a 1M
- * model reads distinctly from its 200k sibling. */
+ * For a recognized Claude family the label reflects the WIRE model's ` (1M
+ * context)` variant, which is load-bearing so a 1M model reads distinctly from
+ * its 200k sibling. The advertised displayName carries only the family/version
+ * (the harness strips `[1m]` when building it), so the variant suffix is taken
+ * from the wire model. A genuinely custom advertised name is kept verbatim. */
 export function nativeModelLabel(option: NativeModelLabelFields): string {
   const label = option.displayName ?? option.id;
   const model = option.model ?? option.id;
@@ -32,10 +34,28 @@ export function nativeModelLabel(option: NativeModelLabelFields): string {
     );
   if (!resolved) return label;
   const [, family, major, minor, context] = resolved;
-  const bareLabel = label.replace(/(?:\[1m\]| \(1M context\))$/i, "").replace(/^Claude /i, "");
-  if (bareLabel.toLowerCase() !== family!.toLowerCase() && label !== model) return label;
+  const has1M = Boolean(context);
+  // Advertised name with any harness prefix / context marker peeled off.
+  const advertised = label
+    .replace(/\s*(?:\[1m\]|\(1M context\))$/i, "")
+    .replace(/^Claude /i, "")
+    .trim();
+  // Whether the advertised name is the recognized family (optionally with a
+  // version) rather than a custom name that must be kept as-is.
+  const familyShaped =
+    advertised
+      .replace(/\s*\d{1,2}(?:\.\d{1,2})?$/, "")
+      .trim()
+      .toLowerCase() === family!.toLowerCase();
+  if (!familyShaped && label !== model) return label;
   const familyLabel = family![0]!.toUpperCase() + family!.slice(1).toLowerCase();
-  return `${familyLabel} ${major}${minor ? `.${minor}` : ""}${context ? " (1M context)" : ""}`;
+  // Keep the advertised version wording when it carries one, else synthesize it
+  // from the wire model; then always reflect the wire model's context variant.
+  const base =
+    familyShaped && /\d/.test(advertised)
+      ? advertised
+      : `${familyLabel} ${major}${minor ? `.${minor}` : ""}`;
+  return has1M ? `${base} (1M context)` : base;
 }
 
 /**

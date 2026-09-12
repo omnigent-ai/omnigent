@@ -76,6 +76,54 @@ describe("landing ↔ chat label parity", () => {
   });
 });
 
+describe("nativeModelLabel — managed catalog rows (wire model carries the variant)", () => {
+  // Exact row shapes from the harness producer: the server strips [1m] when
+  // building displayName, so the (1M context) variant lives only on the wire
+  // model and the label must recover it from there.
+  it("keeps (1M context) for a 1M row whose displayName omits it", () => {
+    expect(
+      nativeModelLabel({
+        id: "opus",
+        model: "system.ai.claude-opus-4-8[1m]",
+        displayName: "Opus 4.8",
+      }),
+    ).toBe("Opus 4.8 (1M context)");
+  });
+
+  it("has no suffix for the ordinary (non-1M) row", () => {
+    expect(
+      nativeModelLabel({ id: "opus", model: "system.ai.claude-opus-4-8", displayName: "Opus 4.8" }),
+    ).toBe("Opus 4.8");
+  });
+
+  it("catalog-free id and catalog row render identically (no suffix loss on arrival)", () => {
+    const wire = "system.ai.claude-opus-4-8[1m]";
+    const catalogFree = formatStatusModelLabel(wire, []);
+    const withCatalog = formatStatusModelLabel(wire, [
+      { id: "opus", model: wire, displayName: "Opus 4.8" },
+    ]);
+    expect(catalogFree).toBe("Opus 4.8 (1M context)");
+    expect(withCatalog).toBe("Opus 4.8 (1M context)");
+    expect(catalogFree).toBe(withCatalog);
+  });
+
+  it("keeps a genuinely custom displayName verbatim, even on a 1M wire model", () => {
+    expect(
+      nativeModelLabel({
+        id: "custom",
+        model: "system.ai.claude-sonnet-4-6[1m]",
+        displayName: "Research Brain",
+      }),
+    ).toBe("Research Brain");
+  });
+
+  it("preserves the advertised version instead of rewriting it to the wire version", () => {
+    expect(
+      nativeModelLabel({ id: "custom", model: "claude-sonnet-4-6", displayName: "Sonnet 5" }),
+    ).toBe("Sonnet 5");
+  });
+});
+
 describe("formatStatusModelLabel — Claude id folding (catalog-free)", () => {
   it("folds a full Claude id without any catalog", () => {
     expect(formatStatusModelLabel("claude-opus-4-8[1m]", [])).toBe("Opus 4.8 (1M context)");
