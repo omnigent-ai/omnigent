@@ -239,8 +239,6 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
-// The session scrollbar auto-hides this long after the last scroll event, so
-// its thumb only shows while the list is actively being scrolled.
 const SCROLLBAR_HIDE_DELAY_MS = 700;
 
 // Maps a first-class project id → its name, provided once at the list level so
@@ -718,8 +716,7 @@ function SidebarImpl({
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);
   const [hasScrolled, setHasScrolled] = useState(false);
-  // Reveal the session scrollbar only while the list is actively scrolling,
-  // fading it back out once scrolling settles.
+  // Show the scrollbar only while actively scrolling; hide it after a pause.
   const [isScrolling, setIsScrolling] = useState(false);
   const scrollIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const markScrolling = useCallback(() => {
@@ -1249,8 +1246,7 @@ function SidebarImpl({
                 // underneath it and can't be tapped.
                 className={cn(
                   "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16 md:mr-1",
-                  // Reserve a thin gutter on both engines so toggling the thumb
-                  // never reflows the list; only its color changes on scroll.
+                  // Reserve the gutter so toggling the thumb never reflows the list.
                   "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
                   isScrolling
                     ? "[scrollbar-color:var(--muted-foreground)_transparent] [&::-webkit-scrollbar-thumb]:bg-muted-foreground"

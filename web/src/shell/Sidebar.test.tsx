@@ -510,14 +510,11 @@ describe("Sidebar session list", () => {
       renderSidebar();
 
       const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-      // The gutter is always reserved (thin, on both engines) so toggling the
-      // thumb never reflows the list; only its color changes.
       expect(scroller).toHaveClass("overflow-y-auto", "md:mr-1", "[scrollbar-width:thin]");
       expect(scroller.className).toContain("[&::-webkit-scrollbar]:w-2");
       expect(scroller).not.toHaveClass("[scrollbar-width:none]");
       expect(scroller.className).not.toContain("[&::-webkit-scrollbar]:hidden");
 
-      // Idle: the thumb is transparent, so no scrollbar is visible.
       expect(scroller).toHaveClass("[scrollbar-color:transparent_transparent]");
       expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-transparent");
       expect(scroller).not.toHaveClass("[scrollbar-color:var(--muted-foreground)_transparent]");
