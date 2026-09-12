@@ -91,6 +91,47 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
 
 
 @respx.mock
+def test_import_command_sends_source_record_times(tmp_path: Path) -> None:
+    """Per-record transcript timestamps ride the payload so the server keeps them."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    transcript = tmp_path / ".claude" / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "cwd": "/repo",
+                "timestamp": "2026-06-15T09:00:00.000Z",
+                "message": {"role": "user", "content": "inspect TODO.md"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_imported", "status": "imported", "item_count": 1},
+        )
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "claude", "--session", session_id],
+            # Clear CLAUDE_CONFIG_DIR so an ambient value can't redirect the
+            # loader away from this test's transcript under HOME.
+            env={"HOME": str(tmp_path), "CLAUDE_CONFIG_DIR": None},
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(route.calls.last.request.content)
+    # 2026-06-15T09:00:00Z; the bug dropped this and the server stamped now().
+    assert payload["items"][0]["created_at"] == 1781514000
+
+
+@respx.mock
 def test_import_command_sends_force_override(tmp_path: Path) -> None:
     """The force flag asks the server to replace the previous source import."""
     session_id = "a1b2c3d4-1234-5678-9abc-def012345679"

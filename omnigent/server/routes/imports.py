@@ -62,17 +62,29 @@ def _record_local_import_failure() -> tuple[str, str]:
 
 
 class ImportItemInput(BaseModel):
-    """One normalized existing Omnigent item received from the CLI."""
+    """One normalized existing Omnigent item received from the CLI.
+
+    ``created_at`` is the source record's own creation time (Unix seconds),
+    preserved so imported history keeps when the work actually happened.
+    ``None`` when the source transcript carries no per-record time; the store
+    then stamps the import time.
+    """
 
     type: str
     response_id: str = Field(min_length=1, max_length=64)
     data: dict[str, object]
+    created_at: int | None = Field(default=None, ge=0)
 
     def to_item(self) -> NewConversationItem:
         """Validate the type-specific payload and return a new item entity."""
         try:
             data = parse_item_data(self.type, self.data)
-            return NewConversationItem(type=self.type, response_id=self.response_id, data=data)
+            return NewConversationItem(
+                type=self.type,
+                response_id=self.response_id,
+                data=data,
+                created_at=self.created_at,
+            )
         except (TypeError, ValueError) as exc:
             raise OmnigentError(
                 f"Invalid imported {self.type!r} item: {exc}",
@@ -388,6 +400,17 @@ def create_imports_router(
                 external_session_id,
             )
             await asyncio.to_thread(conversation_store.append, conversation.id, items)
+            # Stamp the source session's own activity window so imported
+            # history sorts by when the work happened, not the import run.
+            # Items without source times leave the import-time stamps.
+            source_times = [item.created_at for item in items if item.created_at is not None]
+            if source_times:
+                await asyncio.to_thread(
+                    conversation_store.set_conversation_timestamps,
+                    conversation.id,
+                    created_at=min(source_times),
+                    updated_at=max(source_times),
+                )
             labels = {
                 **native_agent.presentation_labels,
                 IMPORT_SOURCE_LABEL_KEY: source,
