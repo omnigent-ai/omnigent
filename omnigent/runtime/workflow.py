@@ -147,7 +147,7 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
+    "claude-sdk", "codex", "pi", "omp", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
 ]
 
 
@@ -212,6 +212,17 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_PI_GATEWAY_HOST",
         auth_key="HARNESS_PI_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
+        catalog_family="claude",
+    ),
+    "omp": UcodeHarnessConfig(
+        agent_name="omp",
+        model_key="HARNESS_OMP_MODEL",
+        base_url_key="HARNESS_OMP_GATEWAY_BASE_URL",
+        base_url_family="claude",
+        base_urls_key="HARNESS_OMP_GATEWAY_BASE_URLS",
+        host_key="HARNESS_OMP_GATEWAY_HOST",
+        auth_key="HARNESS_OMP_GATEWAY_AUTH_COMMAND",
+        refresh_key="HARNESS_OMP_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
         catalog_family="claude",
     ),
     "openai-agents-sdk": UcodeHarnessConfig(
@@ -414,6 +425,7 @@ _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_GATEWAY",
     "codex": "HARNESS_CODEX_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
+    "omp": "HARNESS_OMP_GATEWAY",
     "qwen": "HARNESS_QWEN_GATEWAY",
 }
 
@@ -434,6 +446,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE",
     "codex": "HARNESS_CODEX_DATABRICKS_PROFILE",
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
+    "omp": "HARNESS_OMP_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
     "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
@@ -597,13 +610,16 @@ def configure_agent_harness_with_provider(
         return
 
     if entry.kind == CLI_CONFIG_KIND:
-        # The pi harness consumes both families and can route a cli-config
-        # Databricks AI Gateway (the gateway's Anthropic Messages surface is one
-        # Pi speaks natively) — the same provider pi-native routes via
-        # ``_cli_config_pi_provider``. Translate it into the pi gateway
-        # transport rather than failing loud; a non-Databricks cli-config is
-        # never selected for pi (see ``default_provider_for_harness``), so it
-        # won't reach here.
+        # The pi/omp harnesses consume both families and can route a
+        # cli-config Databricks AI Gateway (the gateway's Anthropic Messages
+        # surface is one both speak natively) — the same provider pi-native
+        # routes via ``_cli_config_pi_provider``. Translate it into the
+        # harness gateway transport rather than failing loud; a
+        # non-Databricks cli-config is never selected for pi/omp (see
+        # ``default_provider_for_harness``), so it won't reach here.
+        if harness_type == "omp":
+            _apply_cli_config_databricks_to_omp(env, entry)
+            return
         if harness_type == "pi":
             _apply_cli_config_databricks_to_pi(env, entry)
             return
@@ -644,6 +660,9 @@ def configure_agent_harness_with_provider(
         return
 
     # Inline-family kinds: key / gateway / local.
+    if harness_type == "omp":
+        _apply_provider_to_omp(env, entry)
+        return
     if harness_type == "pi":
         _apply_provider_to_pi(env, entry)
         return
@@ -905,6 +924,73 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
         env["HARNESS_PI_MODEL"] = _catalog_default_model(auth_family)
 
 
+def _apply_provider_to_omp(env: dict[str, str], entry: ProviderEntry) -> None:
+    """Apply a provider to the omp harness, which consumes both families.
+
+    omp reads ``HARNESS_OMP_GATEWAY_BASE_URLS`` (a JSON object keyed by the
+    same ``"claude"`` / ``"openai"`` family names pi uses) and a single auth
+    command. When both families are configured with different credentials
+    omp can only carry one — it uses the ``anthropic`` family's auth when
+    present, else the ``openai`` family's. For a single-key gateway (e.g. a
+    LiteLLM proxy) this is exact.
+
+    A family whose credential env var is unset is skipped (not fatal) so a
+    user who exported only one vendor's key can still run omp on that family.
+    If neither family resolves, this fails loud, including the original
+    credential resolution error(s) so the user knows which env var to set.
+
+    :param env: Mutable spawn-env dict, modified in place.
+    :param entry: The resolved provider entry (at least one inline family).
+    :raises OmnigentError: If no configured family's credentials resolve,
+        or no model can be resolved for the chosen family.
+    """
+    anthropic, anthropic_err = _optional_provider_family(entry, ANTHROPIC_FAMILY)
+    openai, openai_err = _optional_provider_family(entry, OPENAI_FAMILY)
+    base_urls: dict[str, str] = {}
+    if anthropic is not None:
+        base_urls[_PI_FAMILY_KEY[ANTHROPIC_FAMILY]] = anthropic.base_url
+    if openai is not None:
+        base_urls[_PI_FAMILY_KEY[OPENAI_FAMILY]] = openai.base_url
+    if not base_urls:
+        # At least one family was configured (the provider passed parse-time
+        # validation) but its credential could not be resolved. Surface the
+        # original error(s) so the user knows which env var to set, rather
+        # than a generic "set the api_key env var" message that omits the name.
+        cred_errors = [str(err) for err in (anthropic_err, openai_err) if err is not None]
+        detail = (
+            f" ({'; '.join(cred_errors)})"
+            if cred_errors
+            else " — set the api_key env var for its 'anthropic' or 'openai' family in your shell"
+        )
+        raise OmnigentError(
+            f"omp harness: provider {entry.name!r} configures no family whose "
+            f"credentials resolve{detail}, then retry.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # omp carries a single credential: anthropic's when present, else openai's.
+    # The model fallback must match the family that supplied that credential.
+    auth_source: FamilyConfig | None
+    if anthropic is not None:
+        auth_source = anthropic
+        auth_family = ANTHROPIC_FAMILY
+    else:
+        auth_source = openai
+        auth_family = OPENAI_FAMILY
+    assert auth_source is not None  # base_urls non-empty ⇒ one family resolved
+    env[_HARNESS_GATEWAY_FLAG["omp"]] = "true"
+    env["HARNESS_OMP_GATEWAY_BASE_URLS"] = json.dumps(base_urls, sort_keys=True)
+    if openai is not None and openai.wire_api is not None:
+        env["HARNESS_OMP_GATEWAY_OPENAI_WIRE_API"] = openai.wire_api
+    env["HARNESS_OMP_GATEWAY_HOST"] = _origin_of(next(iter(base_urls.values())))
+    env["HARNESS_OMP_GATEWAY_AUTH_COMMAND"] = _provider_auth_command(auth_source)
+    # Model precedence: spec model > provider ``models.default`` > catalog
+    # family default (of the auth-source family) > fail loud.
+    if "HARNESS_OMP_MODEL" not in env and auth_source.default_model:
+        env["HARNESS_OMP_MODEL"] = auth_source.default_model
+    if "HARNESS_OMP_MODEL" not in env:
+        env["HARNESS_OMP_MODEL"] = _catalog_default_model(auth_family)
+
+
 def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     """Apply a cli-config Databricks AI Gateway to the pi (gateway-harness) path.
 
@@ -956,6 +1042,58 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     # gateway transport env var wants the bare shell command, so strip the "!".
     env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] = provider.api_key.lstrip("!")
     env["HARNESS_PI_MODEL"] = provider.model
+
+
+def _apply_cli_config_databricks_to_omp(env: dict[str, str], entry: ProviderEntry) -> None:
+    """Apply a cli-config Databricks AI Gateway to the omp (gateway-harness) path.
+
+    The gateway-harness omp launch (``omnigent run`` / agents) resolves the
+    same default provider (:func:`default_provider_for_harness`) as pi, so
+    when that default is a ``cli-config`` Databricks AI Gateway, this path
+    must route it rather than fail loud. We reuse the pi-native translation
+    (:func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`) — which
+    reads the codex ``[model_providers.X]`` transport, rewrites the base URL to
+    the gateway's Anthropic Messages surface (``/anthropic``) omp speaks
+    natively, and builds the per-request bearer-token ``!command`` apiKey — then
+    maps its fields onto the ``HARNESS_OMP_GATEWAY_*`` env vars the omp harness
+    wrap reads (the same vars :func:`_apply_provider_to_omp` emits).
+
+    :param env: Mutable spawn-env dict, modified in place.
+    :param entry: The resolved ``cli-config`` provider entry (a Databricks
+        gateway — selection guarantees a non-Databricks cli-config never
+        reaches here).
+    :raises OmnigentError: If the cli-config entry cannot be translated into a
+        gateway provider (its codex table can't be resolved or it is not a
+        recognized Databricks AI Gateway) — selection should prevent this, so a
+        failure here is a real misconfiguration worth surfacing.
+    """
+    # Imported lazily: pi_native_credentials is on the runner's session-create
+    # hot path and pulls onboarding-only deps; keep this off workflow import.
+    from omnigent.harnesses.pi_native.credentials import _cli_config_pi_provider
+
+    # The spec model (if any) is already in HARNESS_OMP_MODEL; thread it so the
+    # gateway translation honors an explicit override, else its default.
+    model_override = env.get("HARNESS_OMP_MODEL")
+    provider = _cli_config_pi_provider(entry, model=model_override)
+    if provider is None:
+        raise OmnigentError(
+            f"provider {entry.name!r} (kind 'cli-config') was selected for the 'omp' "
+            "harness but its codex [model_providers] table could not be resolved as a "
+            "Databricks AI Gateway. Check the [model_providers] base_url + auth in "
+            "~/.codex/config.toml, or configure a key/gateway provider for omp in "
+            "~/.omnigent/config.yaml.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # omp speaks the gateway's Anthropic Messages surface — register it under
+    # the "claude" family key (mirrors _apply_provider_to_omp's anthropic path).
+    base_urls = {_PI_FAMILY_KEY[ANTHROPIC_FAMILY]: provider.base_url}
+    env[_HARNESS_GATEWAY_FLAG["omp"]] = "true"
+    env["HARNESS_OMP_GATEWAY_BASE_URLS"] = json.dumps(base_urls, sort_keys=True)
+    env["HARNESS_OMP_GATEWAY_HOST"] = _origin_of(provider.base_url)
+    # provider.api_key is a "!command" form (omp's models.yml convention); the
+    # gateway transport env var wants the bare shell command, so strip the "!".
+    env["HARNESS_OMP_GATEWAY_AUTH_COMMAND"] = provider.api_key.lstrip("!")
+    env["HARNESS_OMP_MODEL"] = provider.model
 
 
 def _synthesize_databricks_provider(profile: str | None) -> ProviderEntry:
@@ -1431,6 +1569,56 @@ def _build_pi_spawn_env(
     if os_env_payload is not None:
         env["HARNESS_PI_OS_ENV"] = os_env_payload
     _apply_harness_path_override(env, "pi")
+    return env
+
+
+def _build_omp_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the spawn env for the omp harness (``omp --mode rpc``).
+
+    Mirrors :func:`_build_pi_spawn_env` — same per-spawn env-var
+    pattern: model override, provider/gateway translation into the
+    ``HARNESS_OMP_*`` transport, skills bridge, path override.
+
+    :param spec: The agent spec.
+    :param cwd: Runtime working directory for the omp CLI. This is the
+        session workspace, not the agent bundle workdir.
+    :param workdir: The bundle's on-disk path (extracted by the
+        agent cache). Threaded through as ``HARNESS_OMP_BUNDLE_DIR``.
+    :returns: A dict of env-var overrides for
+        :meth:`HarnessProcessManager.get_client(env=...)`.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_OMP_MODEL"] = model
+
+    # Generic-provider branch (slotted ahead of the legacy-profile /
+    # databricks-prefix path): a ProviderAuth on the spec, or — when the spec
+    # declares no auth — the per-family global default. omp consumes both
+    # families (see :func:`_apply_provider_to_omp`). Otherwise the existing
+    # path is unchanged.
+    provider = _resolve_provider_for_build(spec, harness_type="omp", for_launch=True)
+    if provider is not None:
+        configure_agent_harness_with_provider(env, provider, harness_type="omp")
+    # Skills bridge — same shape as the pi variant. Always set so the
+    # harness wrap doesn't fall back to ``"all"`` and override an explicit
+    # ``skills: none`` from the spec.
+    env["HARNESS_OMP_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    if spec.name:
+        env["HARNESS_OMP_AGENT_NAME"] = spec.name
+    if cwd is not None:
+        env["HARNESS_OMP_CWD"] = str(cwd)
+    if workdir is not None:
+        env["HARNESS_OMP_BUNDLE_DIR"] = str(workdir)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_OMP_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "omp")
     return env
 
 

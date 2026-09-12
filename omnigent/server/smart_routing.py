@@ -102,6 +102,12 @@ _HARNESS_FAMILY: dict[str, str] = {
     "claude_sdk": "claude",
     "claude-native": "claude",
     "pi": "pi",
+    # omp speaks the same gateway models as pi (same families, same
+    # models.yml provider routing), so it shares pi's family. Without this,
+    # subagent routing for omp parents degrades: catalog rows from pi-family
+    # workers never match, there is no static-model fallback, and a picked
+    # pi-family model redirects the child off "omp" instead of staying put.
+    "omp": "pi",
     "codex": "gpt",
     "codex-native": "gpt",
     "openai-agents": "gpt",

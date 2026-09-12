@@ -3919,7 +3919,7 @@ def _spec_used_families(agent_yaml: Path | None) -> list[str]:
     else:
         return []
     try:
-        from omnigent.onboarding.provider_config import PI_SURFACE, harness_family
+        from omnigent.onboarding.provider_config import OMP_SURFACE, PI_SURFACE, harness_family
         from omnigent.spec import parse
 
         spec = parse(root, expand_env=False)
@@ -3935,12 +3935,12 @@ def _spec_used_families(agent_yaml: Path | None) -> list[str]:
         fam = harness_family(harness)
         if fam is not None:
             families.add(fam)
-        elif harness == PI_SURFACE:
-            # pi spans both model families, so it has no single family —
-            # it contributes its own surface, and the header resolves that
-            # surface's effective credential (explicit pi default, else
+        elif harness in (PI_SURFACE, OMP_SURFACE):
+            # pi/omp span both model families, so neither has a single family —
+            # each contributes its own surface, and the header resolves that
+            # surface's effective credential (explicit scope default, else
             # the cross-family fallback).
-            families.add(PI_SURFACE)
+            families.add(harness)
         for child in node.sub_agents:
             _walk(child)
 

@@ -12245,7 +12245,7 @@ async def _resolve_harness_config(
 _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_MODEL",
     "codex": "HARNESS_CODEX_MODEL",
-    "pi": "HARNESS_PI_MODEL",
+    "omp": "HARNESS_OMP_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
     "cursor": "HARNESS_CURSOR_MODEL",
     # cursor-native is intentionally omitted here (and from
@@ -12380,6 +12380,7 @@ def _build_spawn_env_from_spec(
             _build_goose_spawn_env,
             _build_hermes_spawn_env,
             _build_kimi_spawn_env,
+            _build_omp_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
@@ -12391,6 +12392,8 @@ def _build_spawn_env_from_spec(
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "pi":
             env = _build_pi_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+        elif harness == "omp":
+            env = _build_omp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(effective_spec)
         elif harness == "cursor":

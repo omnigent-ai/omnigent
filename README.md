@@ -308,6 +308,7 @@ omnigent run --harness grok           # 'grok-build' also works
 curl -fsSL https://cli.devin.ai/install.sh | bash
 devin auth login
 omnigent run --harness devin
+
 ```
 
 Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
@@ -324,6 +325,22 @@ If you need the key route, pass it explicitly with
 declares the passthrough.
 
 </details>
+
+#### Oh My Pi
+
+Oh My Pi (`omp`) is a full harness backend — it runs `omp --mode rpc` with
+model override, gateway routing, and policy gates, like the `pi` harness:
+
+```bash
+npm install -g @oh-my-pi/pi-coding-agent   # or: curl -fsSL https://omp.sh/install | sh
+omp auth-broker login <provider>            # e.g. anthropic; or `/login` inside omp
+omnigent run --harness omp                  # 'oh-my-pi' also works
+omnigent run --harness omp --model anthropic/claude-opus-4-6
+```
+
+`omni setup` installs the CLI and shows the omp credential row next to Pi's.
+Without an Omnigent provider, omp runs on its own `~/.omp/agent` login; with
+one, Omnigent routes it through a generated `models.yml` gateway.
 
 #### 🐙 Polly and 🟠🔵 Debby
 

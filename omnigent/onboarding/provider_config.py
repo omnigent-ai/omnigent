@@ -103,6 +103,15 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # default, skipping the non-pi kinds (see :func:`default_provider_for_harness`).
 PI_SURFACE = "pi"
 
+# The omp harness's *default scope*. Mirrors :data:`PI_SURFACE`: omp consumes
+# the same families (anthropic/openai, gateway/local/databricks, cli-config
+# Databricks gateways — never gemini, never another CLI's subscription), but
+# defaults it independently, so ``default: ["omp"]`` pins omp without moving
+# pi. A ``kind="subscription", cli="pi"`` entry serves only :data:`PI_SURFACE`
+# (omp cannot use Pi's native auth), and ``default: true`` expands to neither
+# harness scope (both are claimed explicitly only).
+OMP_SURFACE = "omp"
+
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
 # ``chat`` is Chat Completions. Only meaningful for the ``openai`` family
 # (the ``anthropic`` family always speaks the Messages API).
@@ -802,7 +811,12 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
 
 
 def _parse_default_families(
-    name: str, default_raw: object, served: set[str], *, pi_capable: bool = False
+    name: str,
+    default_raw: object,
+    served: set[str],
+    *,
+    pi_capable: bool = False,
+    omp_capable: bool = False,
 ) -> frozenset[str]:
     """Resolve a raw ``default:`` value into the scopes it applies to.
 
@@ -813,20 +827,26 @@ def _parse_default_families(
     - a family name (``"openai"``) → just that family.
     - a list of family names (``["anthropic", "openai"]``) → those.
 
-    A pi-capable provider may additionally name the :data:`PI_SURFACE`
-    scope explicitly (``default: ["anthropic", "pi"]``). ``default: true``
-    deliberately does **not** expand to the pi scope: ``true`` means "all
-    families served", and two coexisting ``default: true`` providers (one
-    per family) are valid — if ``true`` claimed pi on both, they would
-    collide on the pi slot. The pi scope is only ever claimed explicitly.
+    A pi/omp-capable provider may additionally name the :data:`PI_SURFACE` /
+    :data:`OMP_SURFACE` scopes explicitly (``default: ["anthropic", "pi"]``).
+    ``default: true`` deliberately does **not** expand to either harness
+    scope: ``true`` means "all families served", and two coexisting
+    ``default: true`` providers (one per family) are valid — if ``true``
+    claimed a harness scope on both, they would collide on that slot. Each
+    harness scope is only ever claimed explicitly.
 
     :param name: Provider name, for error messages.
     :param default_raw: The raw ``default`` value from the entry.
     :param served: The model families this provider actually serves; a
-        default may only name these (plus ``"pi"`` when *pi_capable*).
+        default may only name these (plus ``"pi"`` / ``"omp"`` when
+        *pi_capable* / *omp_capable*).
     :param pi_capable: Whether this provider's kind can drive the pi
         harness (every kind except ``subscription``), allowing an explicit
         ``"pi"`` in the default scope.
+    :param omp_capable: Whether this provider's kind can drive the omp
+        harness (same kinds as pi, except a ``cli="pi"`` subscription —
+        omp cannot use Pi's native auth), allowing an explicit ``"omp"``
+        in the default scope.
     :returns: The (validated) scopes the provider is the default for.
     :raises OmnigentError: If ``default`` is an unsupported type, or names
         a scope the provider does not serve.
@@ -858,7 +878,8 @@ def _parse_default_families(
     # "pi"]`` at parse time (parity with how a subscription's pi scope is
     # rejected), rather than failing loudly only at pi launch.
     pi_ok = pi_capable and (bool(served & frozenset(_PI_FALLBACK_FAMILIES)) or not served)
-    allowed = served | {PI_SURFACE} if pi_ok else served
+    omp_ok = omp_capable and (bool(served & frozenset(_PI_FALLBACK_FAMILIES)) or not served)
+    allowed = served | ({PI_SURFACE} if pi_ok else set()) | ({OMP_SURFACE} if omp_ok else set())
     invalid = requested - allowed
     if invalid:
         raise OmnigentError(
@@ -888,7 +909,11 @@ def _default_raw_value(default_families: frozenset[str], served: set[str]) -> ob
     # the pi scope (see _parse_default_families), so a default set that
     # includes pi must stay explicit — rendering it as ``True`` would drop
     # the pi scope on the next parse.
-    if PI_SURFACE not in default_families and default_families == frozenset(served) - {PI_SURFACE}:
+    if (
+        PI_SURFACE not in default_families
+        and OMP_SURFACE not in default_families
+        and default_families == frozenset(served) - {PI_SURFACE, OMP_SURFACE}
+    ):
         return True
     if len(default_families) == 1:
         return next(iter(default_families))
@@ -954,7 +979,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             kind=kind,
             cli=cli_raw,
             default_families=_parse_default_families(
-                name, default_raw, served, pi_capable=(cli_raw == "pi")
+                name, default_raw, served, pi_capable=(cli_raw == "pi"), omp_capable=False
             ),
         )
 
@@ -991,11 +1016,11 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             # without reading the ambient ~/.codex/config.toml at parse — so a
             # user can pin pi→Databricks; whether the pinned provider is a *real*
             # Databricks gateway is validated at pi launch, which falls back to
-            # Pi's own login when it is not (see :func:`_cli_config_serves_pi`
+            # Pi's own login when it is not (see :func:`_cli_config_serves_pi_omp`
             # and ``resolve_pi_native_provider``). A codex subscription stays
             # pi-incapable (its ``default: pi`` is still rejected at parse).
             default_families=_parse_default_families(
-                name, default_raw, {OPENAI_FAMILY}, pi_capable=True
+                name, default_raw, {OPENAI_FAMILY}, pi_capable=True, omp_capable=True
             ),
         )
 
@@ -1015,7 +1040,11 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             kind=kind,
             profile=profile_raw,
             default_families=_parse_default_families(
-                name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
+                name,
+                default_raw,
+                set(_VALID_FAMILIES) - {GEMINI_FAMILY},
+                pi_capable=True,
+                omp_capable=True,
             ),
         )
 
@@ -1056,7 +1085,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
         kind=kind,
         families=families,
         default_families=_parse_default_families(
-            name, default_raw, served_for_default, pi_capable=True
+            name, default_raw, served_for_default, pi_capable=True, omp_capable=True
         ),
     )
 
@@ -1178,8 +1207,8 @@ def harness_family(harness: str) -> str | None:
     return _HARNESS_FAMILY.get(harness)
 
 
-def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
-    """Return whether a ``cli-config`` *entry* can drive the ``pi`` harness.
+def _cli_config_serves_pi_omp(entry: ProviderEntry) -> bool:
+    """Return whether a ``cli-config`` *entry* can drive the ``pi``/``omp`` harnesses.
 
     Most ``cli-config`` providers (a custom codex ``[model_providers.X]``) are
     unusable outside their own CLI, so they never serve pi. The exception is a
@@ -1197,7 +1226,7 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
 
     :param entry: The provider entry to classify.
     :returns: ``True`` iff *entry* is a ``cli-config`` Databricks AI Gateway
-        Pi can route through.
+        pi/omp can route through.
     """
     if entry.kind != CLI_CONFIG_KIND:
         return False
@@ -1216,18 +1245,20 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
     provider is a default *candidate* for:
 
     - ``key`` / ``gateway`` / ``local``: the families it declares inline,
-      plus the :data:`PI_SURFACE` scope (pi consumes either family).
+      plus the :data:`PI_SURFACE` / :data:`OMP_SURFACE` scopes (pi/omp
+      consume either family).
     - ``subscription`` / ``cli-config``: derived from the CLI — ``claude``
       serves the ``anthropic`` surface, ``codex`` serves the ``openai``
       surface, ``pi`` serves only the :data:`PI_SURFACE` scope (signals
-      "use Pi's own native auth"). Other CLIs serve nothing.
-    - ``databricks``: both families plus pi — ucode routes the Claude,
-      Codex, and pi surfaces.
+      "use Pi's own native auth"; omp cannot use it). Other CLIs serve
+      nothing.
+    - ``databricks``: both families plus pi/omp — ucode routes the Claude,
+      Codex, pi, and omp surfaces.
 
     :param entry: The provider entry to classify.
     :returns: The scope names this provider can be the default for, e.g.
         ``frozenset({"anthropic"})`` for a Claude subscription, or
-        ``frozenset({"anthropic", "openai", "pi"})`` for a Databricks
+        ``frozenset({"anthropic", "openai", "pi", "omp"})`` for a Databricks
         profile.
     """
     if entry.kind == BEDROCK_KIND:
@@ -1255,7 +1286,7 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         # break pi launch. A multi-family key keeps pi via its anthropic/openai
         # family.
         if served & frozenset(_PI_FALLBACK_FAMILIES):
-            return served | {PI_SURFACE}
+            return served | {PI_SURFACE, OMP_SURFACE}
         return served
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
@@ -1265,27 +1296,26 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             # only the pi scope (no model family directly).
             return frozenset({PI_SURFACE})
         if entry.cli == "codex":
-            # A codex *cli-config* provider may ALSO serve pi: a Databricks AI
-            # Gateway exposes an Anthropic Messages surface Pi speaks natively
-            # (pi-native translates it via ``_cli_config_pi_provider``; the
-            # gateway-harness pi path routes it via
-            # ``configure_agent_harness_with_provider``). This is reported at the
-            # KIND level — structurally, without reading the ambient
+            # A codex *cli-config* provider may ALSO serve pi/omp: a Databricks
+            # AI Gateway exposes an Anthropic Messages surface both speak
+            # natively (pi-native translates it via ``_cli_config_pi_provider``;
+            # the gateway-harness pi/omp paths route it via
+            # ``configure_agent_harness_with_provider``). This is reported at
+            # the KIND level — structurally, without reading the ambient
             # ~/.codex/config.toml — so ``provider_families`` stays pure (the
-            # setup menus / ``set_default_provider`` may offer/accept the pi
-            # scope for a codex cli-config). Whether the pinned provider is a
-            # *real* Databricks gateway is validated at resolution time
-            # (``default_provider_for_harness`` fallback + the pi launch), which
-            # falls back gracefully when it is not. A codex *subscription* never
-            # serves pi — a CLI login is unusable outside its own CLI.
+            # setup menus / ``set_default_provider`` may offer/accept the
+            # pi/omp scopes for a codex cli-config). Whether the pinned
+            # provider is a *real* Databricks gateway is validated at
+            # resolution time (``default_provider_for_harness`` fallback + the
+            # pi/omp launch), which falls back gracefully when it is not. A
+            # codex *subscription* never serves pi/omp — a CLI login is
+            # unusable outside its own CLI.
             if entry.kind == CLI_CONFIG_KIND:
-                return frozenset({OPENAI_FAMILY, PI_SURFACE})
+                return frozenset({OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE})
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        # ucode routes anthropic/openai + pi, never the Gemini surface (which
-        # needs the antigravity SDK + GEMINI_API_KEY, not a gateway).
-        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE}
+        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE, OMP_SURFACE}
     return frozenset()
 
 
@@ -1326,7 +1356,7 @@ def first_available_provider(config: dict[str, object], family: str) -> Provider
     Unlike :func:`get_default_provider` (which requires an explicit
     ``default:``), this returns the first provider whose served families
     include *family* regardless of default status — the credential a launch
-    falls back to when no default is configured for the family. Shared by the
+    would use even without a default. Shared by the REPL startup header, the
     runtime spawn-env builders (so a head still launches) and the REPL startup
     creds line (so the readout names exactly what the launch will use), keeping
     the two provably in agreement.
@@ -1349,14 +1379,15 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
 
     Maps the harness to its family (claude-sdk/native-claude→anthropic;
     codex/native-codex/openai-agents→openai) and returns that family's
-    default. The ``pi`` harness (and any unmapped harness) consumes both
-    families: an explicit :data:`PI_SURFACE` default wins; otherwise it
+    default. The ``pi`` / ``omp`` harnesses (and any other unmapped
+    harness) consume both families: an explicit surface default
+    (``PI_SURFACE`` for pi, ``OMP_SURFACE`` for omp) wins; otherwise it
     falls back to the ``anthropic`` then ``openai`` family default,
     skipping ``subscription`` and ``bedrock`` defaults (a CLI login is
     unusable outside its own CLI, and ``bedrock`` is native-``omnigent
     claude`` only — routing pi to either fails). A ``cli-config`` default is
     skipped UNLESS it is a pi-consumable Databricks AI Gateway (see
-    :func:`_cli_config_serves_pi`): such a gateway exposes an Anthropic
+    :func:`_cli_config_serves_pi_omp`): such a gateway exposes an Anthropic
     surface Pi speaks natively, so pi-native translates it
     (``_cli_config_pi_provider``) and the gateway-harness pi path routes it
     (``configure_agent_harness_with_provider``). A non-Databricks cli-config
@@ -1373,8 +1404,10 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     family = _HARNESS_FAMILY.get(harness)
     if family is not None:
         return get_default_provider(config, family)
-    # Unmapped (e.g. pi): an explicit pi-scope default is authoritative.
-    explicit = get_default_provider(config, PI_SURFACE)
+    # Unmapped (e.g. pi, omp): an explicit surface default is authoritative —
+    # the pi scope for pi, the omp scope for omp.
+    surface = OMP_SURFACE if harness == "omp" else PI_SURFACE
+    explicit = get_default_provider(config, surface)
     if explicit is not None:
         return explicit
     # Fall back across the pi-capable surfaces — prefer anthropic's default,
@@ -1399,7 +1432,7 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
         # by ``configure_agent_harness_with_provider`` for the gateway-harness
         # pi path). Route pi to it rather than skipping; a non-Databricks
         # cli-config still falls through (it can't serve pi).
-        if provider.kind == CLI_CONFIG_KIND and not _cli_config_serves_pi(provider):
+        if provider.kind == CLI_CONFIG_KIND and not _cli_config_serves_pi_omp(provider):
             continue
         return provider
     return None
@@ -1411,8 +1444,9 @@ def surface_default_provider(config: dict[str, object], surface: str) -> Provide
     The display-side companion to :func:`default_provider_for_harness`,
     keyed by surface name rather than harness id: the ``anthropic`` /
     ``openai`` surfaces resolve their explicit per-family default, and the
-    :data:`PI_SURFACE` surface resolves the pi harness's effective default
-    (explicit pi scope, else the cross-family fallback). Used by the
+    :data:`PI_SURFACE` / :data:`OMP_SURFACE` surfaces resolve their
+    harness's effective default (explicit scope, else the cross-family
+    fallback). Used by the
     ``setup`` harness menus and the REPL startup header so every surface
     shows the provider its harness would actually route through.
 
@@ -1423,8 +1457,8 @@ def surface_default_provider(config: dict[str, object], surface: str) -> Provide
     :raises OmnigentError: If a provider is malformed, or more than one
         default serves a scope.
     """
-    if surface == PI_SURFACE:
-        return default_provider_for_harness(config, PI_SURFACE)
+    if surface in (PI_SURFACE, OMP_SURFACE):
+        return default_provider_for_harness(config, surface)
     return get_default_provider(config, surface)
 
 
@@ -1443,7 +1477,7 @@ def surface_default_model(entry: ProviderEntry, surface: str) -> str | None:
         ``subscription`` / ``databricks`` kinds, always — the CLI /
         profile picks the model).
     """
-    if surface != PI_SURFACE:
+    if surface not in (PI_SURFACE, OMP_SURFACE):
         return entry.family_default_model(surface)
     for family_name in _PI_FALLBACK_FAMILIES:
         if family_name in entry.families:
@@ -1636,7 +1670,7 @@ def set_default_provider(
         "openrouter": {"kind": "gateway", ...}}``.
     :param name: The provider to make the default, e.g. ``"openrouter"``.
     :param family: The single scope to make the default for — ``"anthropic"``,
-        ``"openai"``, or ``"pi"`` (the per-harness path). ``None`` makes
+        ``"openai"``, ``"pi"`` or ``"omp"`` (the per-harness path). ``None`` makes
         *name* the default for **all** scopes it serves (the legacy
         whole-provider behavior), clearing those scopes from siblings.
     :returns: A new ``providers:`` mapping with *name* default for the chosen
