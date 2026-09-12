@@ -166,8 +166,9 @@ type PaletteTokenInput = Pick<
 function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
   return {
     // Selection is a translucent wash of the palette's accent under the page
-    // foreground, never an opaque block. Dark variants wash at 30% where the
-    // text stays at 4.5:1; light variants use the lightest alpha that stays visible.
+    // foreground, never an opaque block. Dark variants use the alpha that lifts
+    // the page lightness by ~18 L*, so the wash reads the same weight in every
+    // palette; light variants use the lightest alpha that stays visible.
     selectionForeground: tokens.foreground,
     cardForeground: tokens.foreground,
     tray: tokens.card,
@@ -263,7 +264,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         primaryForeground: "#11171c",
         // pink-300 rather than the sidebar's pink-400 so selected text stays
         // >= 4.5:1 over the tinted code and muted surfaces.
-        selectionBackground: "rgba(240, 1, 150, 0.3)",
+        selectionBackground: "rgba(240, 1, 150, 0.4)",
         selectionForeground: "#f9a8d4",
         secondary: "#1f272d",
         secondaryForeground: "#e8ecf0",
@@ -285,7 +286,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebarAccentForeground: "oklch(0.965 0.003 240)",
         sidebarBorder: "oklch(0.28 0.005 240)",
         sidebarRing: "oklch(0.92 0.003 240 / 0.4)",
-        sidebarActive: "rgba(240, 1, 150, 0.3)",
+        sidebarActive: "rgba(240, 1, 150, 0.4)",
         sidebarActiveForeground: "#f472b6",
         sidebarBackground:
           "linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)), linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%)",
@@ -330,7 +331,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#282a36",
-        selectionBackground: "rgba(189, 147, 249, 0.3)",
+        selectionBackground: "rgba(189, 147, 249, 0.33)",
         foreground: "#f8f8f2",
         card: "rgba(68, 71, 90, 0.5)",
         cardSolid: "#343746",
@@ -388,7 +389,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#0d1117",
-        selectionBackground: "rgba(35, 134, 54, 0.3)",
+        selectionBackground: "rgba(35, 134, 54, 0.39)",
         foreground: "#e6edf3",
         card: "rgba(22, 27, 34, 0.72)",
         cardSolid: "#161b22",
@@ -446,9 +447,9 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#1e1e2e",
-        // Pastel accents wash to a mid-tone; 30% is the most that keeps even
-        // rosewater, the lightest text, at 4.5:1 over the muted surface.
-        selectionBackground: "rgba(203, 166, 247, 0.3)",
+        // The body text sits at the 4.5:1 edge over the wash; rosewater is the
+        // lightest Catppuccin text.
+        selectionBackground: "rgba(203, 166, 247, 0.26)",
         selectionForeground: "#f5e0dc",
         foreground: "#cdd6f4",
         card: "rgba(49, 50, 68, 0.6)",
@@ -506,7 +507,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#282828",
-        selectionBackground: "rgba(254, 128, 25, 0.3)",
+        selectionBackground: "rgba(254, 128, 25, 0.34)",
         foreground: "#ebdbb2",
         card: "rgba(60, 56, 54, 0.6)",
         cardSolid: "#32302f",
@@ -572,7 +573,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#002b36",
-        selectionBackground: "rgba(38, 139, 210, 0.3)",
+        selectionBackground: "rgba(38, 139, 210, 0.42)",
         // base2, for the same reason as light mode.
         selectionForeground: "#eee8d5",
         foreground: "#839496",
@@ -633,8 +634,8 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#2e3440",
-        // 25%: the most this pastel accent allows while the body text, already
-        // the lightest Nord colour, stays at 4.5:1 over the muted surface.
+        // Capped below the ~18 L* lift: the body text, already the lightest Nord
+        // colour, only stays at 4.5:1 over the muted surface up to here.
         selectionBackground: "rgba(136, 192, 208, 0.25)",
         foreground: "#eceff4",
         card: "rgba(59, 66, 82, 0.6)",
