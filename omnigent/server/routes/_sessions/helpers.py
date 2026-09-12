@@ -2739,16 +2739,25 @@ def _merge_codex_permission_launch_args(
 
 def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], bool]:
     """
-    Drop every ``--permission-mode`` (space- or ``=``-joined) from Claude launch args.
+    Drop every permission-mode selector from Claude launch args.
+
+    Removes ``--permission-mode`` (space- or ``=``-joined) and the standalone
+    ``--dangerously-skip-permissions``, which Claude treats as
+    ``--permission-mode bypassPermissions``; leaving that flag next to a pinned
+    mode would resume the session in bypass under a restricted label.
 
     :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
-    :returns: The remaining args in order, and whether a flag was present.
+    :returns: The remaining args in order, and whether a selector was present.
     """
     stripped: list[str] = []
     had_flag = False
     index = 0
     while index < len(args):
         arg = args[index]
+        if arg == "--dangerously-skip-permissions":
+            had_flag = True
+            index += 1
+            continue
         if arg == "--permission-mode":
             had_flag = True
             index += 2  # drop the flag and its separate value token
@@ -2772,7 +2781,8 @@ def _merge_claude_permission_launch_args(
     launcher restores the mode from ``terminal_launch_args`` — not the label.
     Rewrite the existing ``--permission-mode`` entry (space- or ``=``-joined) to
     the current mode, preserving other args in order, so a cold resume reopens
-    in the mode the user last chose.
+    in the mode the user last chose. A standalone ``--dangerously-skip-permissions``
+    counts as an existing ``--permission-mode bypassPermissions``.
 
     Returns ``existing_args`` unchanged when they carry no ``--permission-mode``:
     a session launched without the flag (manual, or a ``settings.json``
