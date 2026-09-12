@@ -1026,7 +1026,9 @@ def _redacted_failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def listing_for_provider(provider: ResolvedModelProvider) -> ModelListing:
+def listing_for_provider(
+    provider: ResolvedModelProvider, *, transport: httpx.BaseTransport | None = None
+) -> ModelListing:
     """Enumerate one provider's model listing (cached, failures not cached).
 
     The public face of :func:`_listing_for_provider` for callers that already
@@ -1034,10 +1036,12 @@ def listing_for_provider(provider: ResolvedModelProvider) -> ModelListing:
     what its gateway transport serves — rather than an agent spec.
 
     :param provider: The resolved provider descriptor.
+    :param transport: Optional httpx transport override for tests, forwarded to
+        the underlying fetch.
     :returns: The provider's :class:`ModelListing`; ``verified`` is ``False``
         with a ``note`` when the fetch failed.
     """
-    return _listing_for_provider(provider, transport=None)
+    return _listing_for_provider(provider, transport=transport)
 
 
 def _listing_for_provider(
