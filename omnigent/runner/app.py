@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.client import Client as LLMClient
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.policy import PolicyVerdict
@@ -5739,6 +5740,9 @@ def create_runner_app(
         # only job is to decide whether the readiness poll below runs at all.
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
+            # A live pane can still lack its tmux advertisement; restore it
+            # so the inject below doesn't time out against an absent target.
+            await _readvertise_live_claude_tmux_target(conv_id, instance, bridge_dir=bridge_dir)
             return
         await _ensure_native_terminal_for_turn(conv_id, "claude-native")
         if terminal_registry.get(conv_id, terminal_name, "main") is None:
@@ -9826,6 +9830,70 @@ def create_runner_app(
             content=session_resource_view_to_dict(resource_view),
         )
 
+    async def _readvertise_live_claude_tmux_target(
+        conv_id: str,
+        instance: TerminalInstance,
+        *,
+        bridge_dir: Path | None = None,
+    ) -> None:
+        """Rewrite a live Claude pane's tmux advertisement when it is missing.
+
+        Pane liveness does not imply deliverability: a starved runner can
+        leave the pane alive while its ``tmux.json`` write lags behind (or
+        the file is lost), and an inject against an unadvertised target
+        hard-fails the turn once the 30s advertisement wait expires. The
+        live registry entry still knows the socket and target, so restore
+        the advertisement instead of letting the inject time out.
+        Best-effort: on failure the inject falls back to its own wait.
+
+        :param conv_id: Owning session/conversation id.
+        :param instance: The registered, alive ``claude`` pane instance.
+        :param bridge_dir: The session's bridge directory when the caller
+            already knows it; ``None`` resolves it from the relay binding
+            or, failing that, the session labels.
+        """
+        from omnigent.harnesses.claude_native.bridge import (
+            bridge_dir_for_bridge_id,
+            tmux_target_advertised,
+            write_tmux_target,
+        )
+
+        try:
+            if bridge_dir is None:
+                binding = _session_comment_relays.get(conv_id)
+                if binding is not None:
+                    # The relay already resolved the dir; deriving it from
+                    # labels costs a server round trip per turn.
+                    bridge_dir = binding.bridge_dir
+                else:
+                    bridge_dir = bridge_dir_for_bridge_id(
+                        await _claude_native_bridge_id_for_session(
+                            server_client=server_client,
+                            session_id=conv_id,
+                        )
+                    )
+            if tmux_target_advertised(bridge_dir):
+                return
+            _logger.warning(
+                "live claude pane has no tmux advertisement for conv=%s; re-advertising",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — heal is best-effort
+            _logger.warning(
+                "failed to re-advertise claude tmux target for conv=%s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
 
@@ -9861,7 +9929,11 @@ def create_runner_app(
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None:
             if await instance.is_alive():
-                return  # pane is registered and alive — nothing to heal
+                if terminal_name == "claude":
+                    # Alive is not deliverable: the tmux advertisement the
+                    # inject waits on may still be missing.
+                    await _readvertise_live_claude_tmux_target(conv_id, instance)
+                return  # pane is registered and alive — nothing to re-create
             _logger.info(
                 "native pane registered but dead for conv=%s harness=%s; closing stale entry",
                 conv_id,
