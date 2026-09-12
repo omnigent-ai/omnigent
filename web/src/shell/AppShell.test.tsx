@@ -1779,6 +1779,50 @@ describe("Chat-mode terminal panel layout", () => {
     expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
   });
 
+  it("shows an offline failure when closing an adopted draft shell", async () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:draft_shell",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    draftWorkspaceState.context = {
+      id: "context-abc",
+      workspace: "/workspace",
+      session_id: "conv_abc",
+      lease_seconds: 600,
+      hostId: "offline-host",
+      workspaceAliases: ["/workspace"],
+    };
+    draftWorkspaceState.terminals = [
+      { id: "draft_shell", name: "draft", session: "draft-1", running: true },
+    ];
+    const detail = "Host offline while closing draft shell";
+    draftWorkspaceState.deleteTerminal.mockRejectedValue(new Error(detail));
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => undefined);
+    try {
+      renderShell("/c/conv_abc");
+      expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("draft_shell");
+
+      fireEvent.click(screen.getByRole("button", { name: "Close draft" }));
+      expect(screen.getByRole("dialog")).toHaveTextContent("Close shell?");
+      expect(draftWorkspaceState.deleteTerminal).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+
+      await waitFor(() => expect(errorToast).toHaveBeenCalledWith(detail));
+      expect(draftWorkspaceState.deleteTerminal).toHaveBeenCalledWith("draft_shell");
+      expect(deleteTerminalMutate).not.toHaveBeenCalled();
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+      expect(screen.getByRole("button", { name: "Close draft" })).toBeInTheDocument();
+    } finally {
+      errorToast.mockRestore();
+    }
+  });
+
   it("does not kill the terminal when the close confirmation is cancelled", () => {
     writeSessionWorkspaceState("conv_abc", {
       open: true,
