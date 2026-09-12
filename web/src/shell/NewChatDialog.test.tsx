@@ -1488,6 +1488,7 @@ describe("NewChatLandingScreen", () => {
     cleanup();
     localStorage.clear();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("renders the inline composer with the prompt headline", () => {
@@ -1619,6 +1620,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("renders the reference two-layer composer with one in-form control row", () => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (X11; Linux x86_64)");
     vi.stubGlobal(
       "SpeechRecognition",
       class {
@@ -1718,12 +1720,11 @@ describe("NewChatLandingScreen", () => {
     );
     expect(permission.querySelectorAll("svg")[0]).toHaveClass("size-3");
     expect(permission.querySelectorAll("svg")[1]).toHaveClass("size-4");
-    expect(permission.querySelector("span")).toHaveClass("whitespace-nowrap", "text-ui");
-    expect(permission.querySelector("span")).not.toHaveClass("truncate");
+    expect(permission.querySelector("span")).toHaveClass("truncate", "text-ui");
     expect(permission.querySelector("span")).not.toHaveClass("hidden");
     expect(worktree).toHaveClass(
       "h-6",
-      "max-w-[180px]",
+      "max-w-[calc(50%-0.25rem)]",
       "gap-1",
       "rounded-md",
       "bg-transparent",
@@ -1748,13 +1749,13 @@ describe("NewChatLandingScreen", () => {
       "max-w-full",
       "gap-1",
       "rounded-lg",
-      "pl-2",
-      "pr-0",
+      "px-2",
+      "py-0",
       "text-[13px]",
       "leading-5",
       "md:min-h-7",
     );
-    expect(harness).not.toHaveClass("px-2");
+    expect(harness).not.toHaveClass("pr-0");
     expect(voice).toHaveClass("size-8", "md:size-7");
     expect(submit).toHaveClass("size-8", "md:size-7");
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
@@ -1763,10 +1764,10 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
     expect(Array.from(actions.children)).toEqual([leftControls, rightControls]);
-    expect(actions).toHaveClass("flex-wrap");
-    expect(leftControls).toHaveClass("min-w-0", "flex-auto", "gap-1", "overflow-visible");
+    expect(actions).toHaveClass("flex-nowrap");
+    expect(leftControls).toHaveClass("min-w-0", "flex-[0_1_auto]", "gap-1", "overflow-visible");
     expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "absolute");
-    expect(rightControls).toHaveClass("flex", "shrink-0", "items-center", "gap-1");
+    expect(rightControls).toHaveClass("flex", "flex-[0_1_auto]", "items-center", "gap-1");
     expect(rightControls).toHaveClass("ml-auto", "max-w-full");
     expect(rightControls).not.toHaveClass("flex-1");
     for (const control of [attach, hostChip, permission]) {
@@ -1827,6 +1828,21 @@ describe("NewChatLandingScreen", () => {
     expect(worktree).toBeDisabled();
   });
 
+  it("uses the host's advertised display name in the landing picker", () => {
+    mockClaudeModels([
+      { id: "opus", model: "system.ai.claude-opus-4-6", displayName: "Opus", isDefault: true },
+    ]);
+    renderLanding();
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Claude Code, Model Opus, Effort Default");
+    fireEvent.pointerDown(picker, { button: 0 });
+    const summary = screen.getByTestId("new-chat-landing-agent-summary-a1");
+    expect(summary).toHaveTextContent("Opus");
+    expect(summary).toHaveClass("text-right");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus");
+  });
+
   it("renders structured model and effort details in the harness picker", async () => {
     mockClaudeModels([
       {
@@ -1868,9 +1884,9 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass(
       "min-w-0",
-      "whitespace-normal",
-      "break-words",
-      "text-ui",
+      "truncate",
+      "text-[13px]",
+      "leading-5",
       "font-medium",
       "text-foreground",
     );
@@ -1879,7 +1895,7 @@ describe("NewChatLandingScreen", () => {
 
     fireEvent.pointerDown(picker, { button: 0 });
     const [rootMenu] = screen.getAllByRole("menu");
-    expect(rootMenu).toHaveClass("w-[22rem]", "min-w-0", "composer-agent-menu");
+    expect(rootMenu).toHaveClass("w-max", "min-w-[17.5rem]", "composer-agent-menu");
     expect(screen.getByTestId("new-chat-landing-agent-a1").querySelector("img")).toHaveAttribute(
       "src",
       productIcon?.getAttribute("src"),
@@ -1888,7 +1904,7 @@ describe("NewChatLandingScreen", () => {
     expect(editConfig).toHaveTextContent(/^Edit$/);
     expect(editConfig).toHaveAttribute("aria-label", "Edit Claude Code configuration");
     expect(editConfig).toHaveClass("composer-agent-edit");
-    expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveClass("text-left");
+    expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveClass("text-right");
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toContainElement(editConfig);
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
     const menus = screen.getAllByRole("menu");
@@ -1907,7 +1923,8 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
       "shrink-0",
-      "text-ui",
+      "text-[13px]",
+      "leading-5",
       "font-normal",
       "text-muted-foreground",
     );
@@ -1944,8 +1961,8 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     const summary = screen.getByTestId("new-chat-landing-agent-summary-a2");
     expect(summary).toHaveTextContent("High");
-    expect(summary).toHaveClass("flex-1", "whitespace-normal", "break-words");
-    expect(summary).not.toHaveClass("w-[5.25rem]", "truncate", "shrink-0");
+    expect(summary).toHaveClass("flex-1", "truncate");
+    expect(summary).not.toHaveClass("w-[5.25rem]", "shrink-0");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"));
     expect(screen.queryByTestId("new-chat-landing-agent-effort-low")).toBeNull();
@@ -2006,7 +2023,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
   });
 
-  it("sizes model names to content and wraps instead of truncating", () => {
+  it("sizes model names to content and compacts them only when space runs out", () => {
     vi.stubGlobal(
       "SpeechRecognition",
       class {
@@ -2033,11 +2050,11 @@ describe("NewChatLandingScreen", () => {
     const model = screen.getByTestId("new-chat-landing-agent-model-value");
     const voice = screen.getByRole("button", { name: "Voice dictation" });
     const submit = screen.getByTestId("new-chat-landing-submit");
-    expect(picker).toHaveClass("w-auto", "max-w-full", "pl-2", "pr-0");
+    expect(picker).toHaveClass("w-auto", "max-w-full", "px-2", "py-0");
     expect(picker).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
-    expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "px-2");
-    expect(model).toHaveClass("min-w-0", "whitespace-normal", "break-words");
-    expect(model).not.toHaveClass("truncate");
+    expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "pr-0");
+    expect(model).toHaveClass("min-w-0", "truncate");
+    expect(model).toHaveAttribute("title", "Extraordinarily Long Claude Model Name");
     expect(model).toHaveTextContent("Extraordinarily Long Claude Model Name");
     expect(voice).toHaveClass("shrink-0", "size-8", "md:size-7");
     expect(submit.parentElement).toHaveClass("shrink-0");
@@ -2047,7 +2064,7 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     const permission = screen.getByTestId("new-chat-landing-permission-chip");
-    expect(permission).toHaveClass("shrink-0");
+    expect(permission).toHaveClass("min-w-0");
     fireEvent.pointerDown(permission, { button: 0 });
     expect(screen.queryByRole("dialog")).toBeNull();
     const permissionMenu = screen.getByTestId("new-chat-landing-permission-menu");
@@ -2151,14 +2168,19 @@ describe("NewChatLandingScreen", () => {
     expect(notices).toContainElement(error);
   });
 
-  it("keeps compact host and working-directory controls accessibly named", () => {
+  it.each([
+    ["Mozilla/5.0 (X11; Linux x86_64)", "This machine"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "This Mac"],
+    ["unknown-browser", "machine-1"],
+  ])("keeps compact controls accessibly named for %s", (userAgent, label) => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(userAgent);
     renderLanding();
 
     const hostTrigger = screen.getByTestId("new-chat-landing-host-chip");
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
-    expect(hostTrigger).toHaveAccessibleName("Host: This machine, Online");
+    expect(hostTrigger).toHaveAccessibleName(`Host: ${label}, Online`);
     expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
-    expect(hostTrigger).toHaveAttribute("title", "Host: This machine, Online");
+    expect(hostTrigger).toHaveAttribute("title", `Host: ${label}, Online`);
     expect(within(hostTrigger).getByTestId("new-chat-landing-host-status")).toHaveClass(
       "bg-success",
     );
@@ -2349,7 +2371,9 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getAllByRole("menu")).toHaveLength(2);
     expect(picker).toHaveAccessibleName(/^Codex/);
     expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
-    fireEvent.keyDown(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" }), { key: "Escape" });
+    fireEvent.keyDown(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" }), {
+      key: "Escape",
+    });
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
     await waitFor(() => expect(picker).toHaveFocus());
   });
@@ -3261,6 +3285,7 @@ describe("NewChatLandingScreen", () => {
     expect(workspaceLabel).toHaveClass("min-w-0", "truncate", "text-left");
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveClass(
       "h-6",
+      "max-w-[calc(50%-0.25rem)]",
       "gap-1",
       "px-1",
       "text-xs",
@@ -6226,6 +6251,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(chip.textContent).not.toContain("Claude Code");
     // The routing description rides the styled tooltip, not the native hover.
     expect(chip).not.toHaveAttribute("title");
+    fireEvent.pointerEnter(chip);
     fireEvent.focus(chip);
     const chipTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
     expect(chipTooltip).toHaveTextContent("Harness and model picked per task by smart routing");

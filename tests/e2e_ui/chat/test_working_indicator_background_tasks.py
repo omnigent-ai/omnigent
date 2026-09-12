@@ -25,12 +25,24 @@ locally is covered by the chatStore unit tests.
 from __future__ import annotations
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.chat._working_labels import WORKING_LABEL_RE as _WORKING_LABEL_RE
 
 _WORKING = '[data-testid="working-indicator"]'
 _PILL = '[data-testid="background-task-pill"]'
+
+
+def _pill_badge(page: Page, count: int) -> Locator:
+    """Locate the compact count badge by its accessible name.
+
+    The badge renders only the bare count as visible text; the sentence form
+    ("N background task(s) still running") is its accessible name.
+    """
+    plural = "" if count == 1 else "s"
+    return page.get_by_role(
+        "button", name=f"{count} background task{plural} still running", exact=True
+    )
 
 
 def _publish_status(
@@ -78,21 +90,21 @@ def test_background_task_indicator_label_lifecycle(
     pill = page.locator(_PILL)
 
     # 1. Background shells outlive the turn: idle + a positive count. The turn
-    #    has ended, so the pill (not the shimmer) names them. The snapshot
+    #    has ended, so the badge (not the shimmer) counts them. The snapshot
     #    caches the count, so a fresh page load hydrates it.
     _publish_status(base_url, session_id, "idle", background_task_count=2)
     page.goto(f"{base_url}/c/{session_id}")
-    expect(pill).to_contain_text("2 background tasks", timeout=15_000)
+    expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
     expect(working).to_have_count(0)
 
     # 2. A new turn starts (the `running` edge a composer send produces): the
-    #    background shell outlives the turn boundary, so the pill STAYS lit and
+    #    background shell outlives the turn boundary, so the badge STAYS lit and
     #    the rotating "Working…" shimmer lights up beside it — both surfaces at
     #    once. Accept any label in the pool — which one shows depends on the
     #    wall-clock bucket the turn lands on.
     _publish_status(base_url, session_id, "running")
     expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
-    expect(pill).to_contain_text("2 background tasks")
+    expect(_pill_badge(page, 2)).to_have_text("2")
 
     # 3. The turn ends with the background shell finished: an authoritative
     #    Stop-hook `0` clears the tally, so both surfaces go out.
@@ -120,20 +132,19 @@ def test_working_shimmer_and_pill_coexist_while_running(
     """
     base_url, session_id = seeded_session
     working = page.locator(_WORKING)
-    pill = page.locator(_PILL)
 
     # A prior turn ended with a background shell: seed the persisted snapshot
     # before navigation so page hydration cannot race the SSE subscription.
     _publish_status(base_url, session_id, "idle", background_task_count=2)
     page.goto(f"{base_url}/c/{session_id}")
-    expect(pill).to_contain_text("2 background tasks", timeout=15_000)
+    expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
     expect(working).to_have_count(0)
 
     # A new turn starts: the shell outlives the boundary, so both light up —
-    # the shimmer for the live turn, the pill for the still-running shell.
+    # the shimmer for the live turn, the badge for the still-running shell.
     _publish_status(base_url, session_id, "running")
     expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
-    expect(pill).to_contain_text("2 background tasks", timeout=15_000)
+    expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
 
 
 def test_sidebar_spinner_ignores_background_tasks(
@@ -155,18 +166,17 @@ def test_sidebar_spinner_ignores_background_tasks(
     :returns: None.
     """
     base_url, session_id = seeded_session
-    pill = page.locator(_PILL)
     working = page.locator(_WORKING)
     # The badge sits in the row's time-marker slot (a sibling of the row link),
     # and `seeded_session` holds exactly one session — so the lone running badge
     # is this session's. Idle rows render no badge at all.
     running_badge = page.locator('[data-testid="session-state-badge"][data-state="running"]')
 
-    # 1. Background shells outlive the turn → the chat pill lights up, the
+    # 1. Background shells outlive the turn → the chat badge lights up, the
     #    sidebar row does not.
     _publish_status(base_url, session_id, "idle", background_task_count=1)
     page.goto(f"{base_url}/c/{session_id}")
-    expect(pill).to_contain_text("1 background task", timeout=15_000)
+    expect(_pill_badge(page, 1)).to_have_text("1", timeout=15_000)
     expect(running_badge).to_have_count(0)
 
     # 2. A real turn still lights the row, so the assertion above is about
@@ -179,3 +189,63 @@ def test_sidebar_spinner_ignores_background_tasks(
     _publish_status(base_url, session_id, "idle", background_task_count=0)
     expect(working).to_have_count(0, timeout=15_000)
     expect(running_badge).to_have_count(0, timeout=15_000)
+
+
+def test_badge_survives_reload_and_tracks_updates_after_reconnect(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A reload re-hydrates the tally, and post-reload SSE edges still land.
+
+    The snapshot caches the count, so a fresh page load shows the badge; the
+    re-established SSE subscription must then keep driving it (the count is
+    not frozen at page-load time), including the authoritative zero that
+    clears it.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server
+        fixture.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _publish_status(base_url, session_id, "idle", background_task_count=2)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
+
+    page.reload()
+    expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
+
+    # After the reload's SSE re-subscribe, live edges still drive the badge.
+    _publish_status(base_url, session_id, "idle", background_task_count=3)
+    expect(_pill_badge(page, 3)).to_have_text("3", timeout=15_000)
+
+    _publish_status(base_url, session_id, "idle", background_task_count=0)
+    expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
+
+
+def test_badge_count_is_scoped_to_the_active_session(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """The badge reports the ACTIVE conversation's tally, never a global one.
+
+    Session A has two lingering shells and session B has none: switching to B
+    must drop the badge (B's snapshot carries no count), and switching back
+    to A restores it from A's snapshot.
+
+    :param page: Playwright page fixture.
+    :param seeded_session_pair: ``(base_url, session_a_id, session_b_id)``
+        from the local server fixture.
+    :returns: None.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _publish_status(base_url, session_a, "idle", background_task_count=2)
+
+    page.goto(f"{base_url}/c/{session_a}")
+    expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
+
+    page.goto(f"{base_url}/c/{session_b}")
+    expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
+
+    page.goto(f"{base_url}/c/{session_a}")
+    expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)

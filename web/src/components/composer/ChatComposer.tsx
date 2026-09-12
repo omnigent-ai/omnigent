@@ -33,6 +33,7 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
   };
   slots?: {
     beforeInput?: ReactNode;
+    inputPrefix?: ReactNode;
     inputBackdrop?: ReactNode;
     inputHint?: ReactNode;
     attachments?: ReactNode;
@@ -61,24 +62,12 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       {...props}
     >
       {slots?.beforeInput}
-      <ComposerInputArea>
+      <ComposerInputArea
+        className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}
+      >
+        {slots?.inputPrefix}
         {slots?.inputBackdrop}
-        <ComposerTextarea
-          {...input}
-          onKeyDown={(event) => {
-            if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
-            const shouldSubmitFromKeyboard = isComposerSendKey(
-              { ...event, isComposing: event.nativeEvent.isComposing },
-              keyboard.submitWithModEnter,
-              keyboard.preventsKeyboardSubmit,
-            );
-            input.onKeyDown?.(event, {
-              shouldSubmitFromKeyboard,
-              shouldPreferSendOverCompletion:
-                keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
-            });
-          }}
-        />
+        <ComposerTextInput input={input} keyboard={keyboard} />
         {slots?.inputHint}
       </ComposerInputArea>
       {slots?.attachments}
@@ -93,6 +82,29 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     </div>
   );
 });
+
+export function ComposerTextInput({
+  input,
+  keyboard,
+}: Pick<ChatComposerProps, "input" | "keyboard">) {
+  return (
+    <ComposerTextarea
+      {...input}
+      onKeyDown={(event) => {
+        if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+        const shouldSubmitFromKeyboard = isComposerSendKey(
+          { ...event, isComposing: event.nativeEvent.isComposing },
+          keyboard.submitWithModEnter,
+          keyboard.preventsKeyboardSubmit,
+        );
+        input.onKeyDown?.(event, {
+          shouldSubmitFromKeyboard,
+          shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
+        });
+      }}
+    />
+  );
+}
 
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
@@ -135,7 +147,7 @@ export function ComposerActionRow({ className, ...props }: ComponentPropsWithout
   return (
     <div
       className={cn(
-        "@container/composer-actions flex min-w-0 flex-wrap items-center justify-between gap-2 px-2 pt-1 pb-2",
+        "@container/composer-actions flex min-w-0 flex-nowrap items-center justify-between gap-2 px-2 pt-1 pb-2",
         className,
       )}
       {...props}
@@ -152,7 +164,7 @@ export function ComposerActionGroup({
     <div
       className={cn(
         "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-auto overflow-visible" : "ml-auto max-w-full shrink-0",
+        side === "left" ? "flex-[0_1_auto] overflow-visible" : "ml-auto max-w-full flex-[0_1_auto]",
         className,
       )}
       {...props}

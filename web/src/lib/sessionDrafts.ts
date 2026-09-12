@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
+import { readComposerDraft, type ComposerDraft } from "./replyDraft";
 
-export interface SessionDraft {
-  text: string;
+export interface SessionDraft extends ComposerDraft {
   files: File[];
 }
 
@@ -13,10 +13,12 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
   try {
     const raw = window.sessionStorage.getItem(SESSION_DRAFTS_KEY);
     if (!raw) return new Map();
-    const entries = JSON.parse(raw) as Record<string, string>;
+    const entries: unknown = JSON.parse(raw);
+    if (typeof entries !== "object" || entries === null || Array.isArray(entries)) return new Map();
     const drafts = new Map<string, SessionDraft>();
-    for (const [id, text] of Object.entries(entries)) {
-      if (text) drafts.set(id, { text, files: [] });
+    for (const [id, entry] of Object.entries(entries)) {
+      const draft = readComposerDraft(entry);
+      if (draft?.text) drafts.set(id, { ...draft, files: [] });
     }
     return drafts;
   } catch {
@@ -27,9 +29,12 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
 function saveDraftsToStorage(): void {
   if (typeof window === "undefined") return;
   try {
-    const entries: Record<string, string> = {};
+    const entries: Record<string, string | ComposerDraft> = {};
     for (const [id, draft] of sessionDrafts) {
-      if (draft.text) entries[id] = draft.text;
+      if (draft.text)
+        entries[id] = draft.replyDraft
+          ? { text: draft.text, replyDraft: draft.replyDraft }
+          : draft.text;
     }
     if (Object.keys(entries).length === 0) {
       window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);

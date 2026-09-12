@@ -581,6 +581,10 @@ export function AppShell() {
       created_at: activeSession.createdAt,
       updated_at: activeSession.createdAt,
       labels: activeSession.labels ?? {},
+      // The snapshot is the only archived-flag carrier here: an archived
+      // session is absent from the sidebar list, so without this the header
+      // menu would offer "Archive" on an already-archived session.
+      archived: activeSession.archived ?? false,
       permission_level: activeSession.permissionLevel,
       runner_id: activeSession.runnerId ?? null,
       host_id: activeSession.hostId ?? null,

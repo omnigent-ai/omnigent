@@ -1179,6 +1179,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   const itemType = String(rec.type ?? "");
   const itemId = String(rec.id ?? "");
   const responseId = String(rec.response_id ?? "");
+  const messageId = typeof data.message_id === "string" ? data.message_id : undefined;
 
   if (itemType === "function_call") {
     const argsStr = String(rec.arguments ?? "{}");
@@ -1218,6 +1219,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
+      ...(messageId !== undefined ? { messageId } : {}),
     } satisfies MessageDone;
   }
 

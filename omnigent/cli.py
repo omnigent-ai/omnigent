@@ -4207,11 +4207,6 @@ def server(
     import uvicorn
     import uvicorn.server
 
-    from omnigent.runner.transports.ws_tunnel.limits import (
-        RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-        TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-    )
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider
     from omnigent.server.server_config import (
@@ -4225,6 +4220,7 @@ def server(
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     cfg = _load_config(config_path)
     title_server_config = cfg
@@ -4547,10 +4543,10 @@ def server(
         host=host,
         port=port,
         log_config=_server_uvicorn_log_config(server_log_path),
-        ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        # Server side of the runner/host tunnels' protocol keepalive, aligned
-        # to the 90 s app-level budget instead of uvicorn's 20 s default that
-        # drops a busy-but-healthy tunnel with 1011 — issue #1116.
+        # Tunnel frame cap + protocol keepalive (30 s/90 s, not uvicorn's 20 s
+        # default that drops a busy-but-healthy tunnel with 1011 — issue #1116).
+        # Shared with the hosted launchers via ``uvicorn_tunnel_kwargs`` so they
+        # cannot drift from ``omnigent server``.
         #
         # uvicorn's ws_ping_* is server-global (no per-route override), so this
         # 30 s/90 s budget also applies to the app's other WebSocket routes —
@@ -4565,8 +4561,7 @@ def server(
         # longer), bounded and eventually reaped, not a leak or correctness
         # change. The tunnels are the sockets that actually need the looser
         # budget (issue #1116).
-        ws_ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-        ws_ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+        **uvicorn_tunnel_kwargs(),
         timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     try:

@@ -45,6 +45,7 @@ Omnigent lets you:
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
   [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
+  [Gensee](https://gensee.ai),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
   [Boxlite](https://github.com/boxlite-ai/boxlite),
@@ -109,6 +110,20 @@ Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
 ```bash
 brew install omnigent-ai/tap/omnigent
 ```
+
+For source builds on networks that require package mirrors, replace these example
+URLs with your mirrors:
+
+```bash
+HOMEBREW_PIP_INDEX_URL='https://pypi.example.com/simple' \
+HOMEBREW_CARGO_INDEX_URL='https://cargo.example.com/index/' \
+  brew install --build-from-source omnigent-ai/tap/omnigent
+```
+
+The PyPI setting also routes pip's isolated build dependencies through the mirror.
+The Cargo setting takes a sparse registry index URL ending in `/`, without the
+`sparse+` prefix. Both overrides are optional and do not affect prebuilt-bottle
+installs.
 
 Or install straight from the repo:
 

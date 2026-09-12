@@ -60,7 +60,7 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retrySession } from "@/lib/sessionsApi";
+import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import { UserMessageNav } from "@/components/UserMessageNav";
@@ -812,13 +812,35 @@ function AssistantBubble({
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
-  const handleRetryError = useCallback(async () => {
-    if (!conversationId) throw new Error("Session is not available");
-    const result = await retrySession(conversationId);
-    if (!result.recovered) {
-      throw new Error("The session is already connected; no recovery was performed");
-    }
-  }, [conversationId]);
+  const handleRetryError = useCallback(
+    async (item: Extract<RenderItem, { kind: "error" }>) => {
+      if (!conversationId) throw new Error("Session is not available");
+      if (item.code === "rate_limit_exceeded") {
+        const current = useChatStore.getState();
+        if (current.conversationId !== conversationId) {
+          throw new Error("The selected session has changed");
+        }
+        if (!isLastAssistant) throw new Error("Only the latest failed turn can be retried");
+        if (
+          current.status === "streaming" ||
+          current.sessionStatus === "launching" ||
+          current.sessionStatus === "running" ||
+          current.sessionStatus === "waiting" ||
+          current.pendingUserMessages.length > 0 ||
+          current.blocks.some((block) => block.type === "elicitation" && block.status === "pending")
+        ) {
+          throw new Error("Wait for the current turn to finish before retrying");
+        }
+        await retryRateLimitedTurn(conversationId);
+        return;
+      }
+      const result = await retrySession(conversationId);
+      if (!result.recovered) {
+        throw new Error("The session is already connected; no recovery was performed");
+      }
+    },
+    [conversationId, isLastAssistant],
+  );
 
   if (bubble.items.length === 0) return null;
 

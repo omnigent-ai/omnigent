@@ -165,6 +165,32 @@ def test_build_claude_native_base_args_resume_prefix(
     )
 
 
+def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resume() -> None:
+    """
+    A pinned ``--permission-mode`` reaches the cold-resume argv unchanged.
+
+    The server pins a picker-confirmed mode into ``terminal_launch_args``
+    precisely because this builder is the only thing a relaunch consults;
+    the pass-through must land after ``--resume`` and survive the
+    ``--model`` default so the resumed Claude opens in the chosen mode.
+    """
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override="claude-opus-5",
+        terminal_launch_args=["--permission-mode", "auto"],
+        resume_external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+    )
+
+    assert args == (
+        "--resume",
+        "02857840-6362-408f-b41f-309e396ed7c6",
+        "--permission-mode",
+        "auto",
+        "--model",
+        "claude-opus-5",
+    )
+
+
 def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
     """An apiKeyHelper launch strips the raw key + nested-session marker.
 

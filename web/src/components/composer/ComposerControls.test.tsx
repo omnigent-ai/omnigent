@@ -24,6 +24,24 @@ describe("shared composer controls", () => {
     expect(screen.getByRole("button", { name: "This machine" })).toHaveClass("w-11", "md:h-7");
   });
 
+  it("lets workspace labels use half the bar instead of a fixed pixel cap", () => {
+    render(
+      <ComposerWorkspaceBar>
+        <ComposerWorkspaceTrigger kind="directory" label="new-composer-width" />
+        <ComposerWorkspaceTrigger kind="worktree" label="feature/new-composer-width" />
+      </ComposerWorkspaceBar>,
+    );
+
+    for (const trigger of screen.getAllByRole("button")) {
+      expect(trigger).toHaveClass("min-w-0", "max-w-[calc(50%-0.25rem)]");
+      expect(trigger).not.toHaveClass("max-w-[180px]");
+      expect(trigger.querySelector("span")).toHaveClass("min-w-0", "truncate");
+      for (const icon of trigger.querySelectorAll("svg")) {
+        expect(icon).toHaveClass("shrink-0");
+      }
+    }
+  });
+
   it("renders a product-icon model trigger instead of a separate settings gear", () => {
     render(
       <ComposerHarnessTrigger
@@ -36,9 +54,15 @@ describe("shared composer controls", () => {
     const trigger = screen.getByRole("button", { name: "Codex configuration" });
     expect(trigger).toHaveTextContent("GPT-5.6-Sol");
     expect(trigger).toHaveClass("w-auto");
+    expect(trigger).toHaveClass("px-2", "py-0", "border-0", "leading-5", "md:min-h-7");
+    expect(trigger).not.toHaveClass("pr-0");
     expect(trigger).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
     expect(trigger).toHaveTextContent("High");
-    expect(screen.getByTestId("composer-agent-model-value")).not.toHaveClass("truncate");
+    expect(screen.getByTestId("composer-agent-model-value")).toHaveClass("truncate");
+    expect(screen.getByTestId("composer-agent-model-value")).toHaveAttribute(
+      "title",
+      "GPT-5.6-Sol",
+    );
     expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
   });
@@ -57,7 +81,7 @@ describe("shared composer controls", () => {
       />,
     );
     const trigger = screen.getByRole("button", { name: "Permissions: Bypass permissions" });
-    for (const forbidden of ["hidden", "max-w-20", "truncate"]) {
+    for (const forbidden of ["hidden", "max-w-20"]) {
       expect(screen.getByText("Bypass permissions")).not.toHaveClass(forbidden);
     }
     expect(trigger).toHaveClass("w-auto", "gap-1", "px-2");

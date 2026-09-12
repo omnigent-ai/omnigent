@@ -2037,14 +2037,14 @@ def _read_contained_file(root: Path, value: str) -> str | None:
     """
     Read a bundle-relative file named by *value*, only if it stays in *root*.
 
-    The instruction-file reference comes from a spec field (``instructions:``)
-    that, for an uploaded bundle, is attacker-controlled. Resolving symlinks
-    and ``..`` and confirming the target is contained in *root* prevents a
-    crafted spec (e.g. ``instructions: ../../etc/passwd``) from reading files
+    The instruction-file reference comes from a spec field (``instructions:``
+    or ``prompt:``) or automatic context-file discovery in a bundle that may
+    be attacker-controlled. Resolving symlinks and ``..`` and confirming the
+    target is contained in *root* prevents a crafted spec
+    (e.g. ``instructions: ../../etc/passwd``) from reading files
     outside the bundle on the runner. A non-contained or non-existent path
-    returns ``None`` so the caller falls back to treating *value* as literal
-    instruction text — preserving the existing "missing file → inline text"
-    behavior for the CLI.
+    returns ``None`` so an explicit reference falls back to literal instruction
+    text, while automatic discovery skips it and tries the next context file.
 
     :param root: The bundle root directory the value is anchored to,
         e.g. ``Path("/tmp/agent-bundle")``.
@@ -2053,13 +2053,14 @@ def _read_contained_file(root: Path, value: str) -> str | None:
     :returns: The file contents if *value* names a file contained within
         *root*, else ``None``.
     """
-    candidate = root / value
     try:
-        resolved = candidate.resolve()
-        if resolved.is_relative_to(root.resolve()) and resolved.is_file():
-            return resolved.read_text()
+        root_prefix = os.path.join(os.path.realpath(root), "")
+        resolved = os.path.realpath(root / value)
+        if resolved.startswith(root_prefix):
+            candidate = Path(resolved)
+            if candidate.is_file():
+                return candidate.read_text()
     except OSError:
-        # Path too long or invalid characters — treat as inline text.
         pass
     return None
 
@@ -2069,12 +2070,11 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
     Resolve the instructions for an agent image.
 
     - If ``instructions`` is set in config.yaml and the value is
-      a path to an existing file relative to *root*, read that
-      file.
+      a path to an existing file contained in *root*, read that file.
     - If ``instructions`` is set but is not a file path, treat
       the value as inline text.
     - If ``instructions`` is not set, scan ``_CONTEXT_FILE_PRIORITY``
-      and return the first file found (first-wins, no merge).
+      and return the first file contained in *root* (first-wins, no merge).
 
     :param root: Path to the agent image directory.
     :param raw_value: The raw ``instructions`` value from
@@ -2095,12 +2095,9 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
         return text
     # Default: first-wins scan across known context files.
     for filename in _CONTEXT_FILE_PRIORITY:
-        candidate = root / filename
-        try:
-            if candidate.is_file():
-                return candidate.read_text()
-        except OSError:
-            pass
+        contained = _read_contained_file(root, filename)
+        if contained is not None:
+            return contained
     return None
 
 

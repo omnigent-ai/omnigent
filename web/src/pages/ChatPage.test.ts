@@ -39,10 +39,12 @@ import {
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
+  modelPickerKindForConv,
   unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 
 // The Composer's read-only and disabled states are derived from
 // permissionLevel. These tests pin the derivation logic so a
@@ -1149,6 +1151,37 @@ describe("subAgentComposerLabel", () => {
     // Degenerate snapshot — the tray still needs something to render.
     expect(subAgentComposerLabel(mkSession())).toBe("sub-agent");
   });
+
+  it("prefers the Task description for a Claude Code sub-agent", () => {
+    // Its title's suffix is an opaque hex id, so the title-split rule
+    // would put "a09d1dd1d8dbc0151" in the tray.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "general-purpose:a09d1dd1d8dbc0151",
+          subAgentName: "general-purpose",
+          labels: {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.description": "wave-worker-696",
+          },
+        }),
+      ),
+    ).toBe("wave-worker-696");
+  });
+
+  it("uses the bare agent name for a description-less namespaced Claude sub-agent", () => {
+    // "rpw-published:debug-lead" carries its own colon, so splitting the
+    // title on the first one left the id half showing.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "rpw-published:debug-lead:a361e6a6aa05689cb",
+          subAgentName: "rpw-published:debug-lead",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ),
+    ).toBe("debug-lead");
+  });
 });
 
 // ── containsMarkdownTable ──────────────────────────────────────────────────
@@ -1772,6 +1805,48 @@ describe("routing eligibility gates", () => {
       false,
     );
     expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
+  });
+
+  it("evaluates an optimistic (temp) seeded session by the same rules, harness-only", () => {
+    // The in-session temp composer builds this shape from the create seed:
+    // a bound-agent name + the create harness, with NO wrapper labels. Native
+    // detection falls back to the harness, so it is eligible under the judge.
+    const seededNative = {
+      agentName: "coder",
+      parentSessionId: null,
+      harness: "claude-native",
+    } as unknown as Session;
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), seededNative)).toBe(
+      true,
+    );
+    // A seed with no bound agent is NOT eligible — the guard is never bypassed
+    // just because the conversation is a fresh temp id.
+    const seededNoAgent = { ...seededNative, agentName: null } as unknown as Session;
+    expect(isCostRoutingEligible(info(true), seededNoAgent)).toBe(false);
+  });
+
+  it("derives the temp-session native model-picker kind from the seeded native harness (#7039 P1)", () => {
+    // The temp capabilitySource has no server session and no sidebar wrapper
+    // identity, so it derives the wrapper label from the SEEDED native harness
+    // (the create identity). Without this the native model/effort/permission
+    // controls fail closed on the optimistic route. Mirrors the ChatPage
+    // derivation: nativeCodingAgentForHarness(seededHarness).wrapperLabel →
+    // modelPickerKindForConv.
+    for (const [harness, kind] of [
+      ["codex-native", "codex"],
+      ["claude-native", "claude"],
+    ] as const) {
+      const native = nativeCodingAgentForHarness(harness);
+      expect(native).toBeDefined();
+      const capabilitySource = {
+        labels: { [WRAPPER_LABEL_KEY]: native!.wrapperLabel },
+        harness,
+      };
+      expect(modelPickerKindForConv(capabilitySource)).toBe(kind);
+    }
+    // A bundle/SDK harness has no native picker — controls correctly stay hidden
+    // (the seed's pickedHarness fallback for a non-native agent).
+    expect(modelPickerKindForConv({ labels: {}, harness: "claude-sdk" })).toBeNull();
   });
 
   it("a non-native SDK session is subagent-routing eligible whatever its harness", () => {
