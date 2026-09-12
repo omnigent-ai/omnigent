@@ -237,6 +237,12 @@ class AgentObject(BaseModel):
         incremented on each update.
     :param description: Optional free-text description of the
         agent's purpose.
+    :param icon: Optional agent icon from the spec: either an emoji
+        grapheme or an agent-dir-relative image path. ``None`` when
+        the spec declares none or the bundle cannot be loaded, in
+        which case the client uses its own default icon. When the
+        value is a path, its bytes are served by
+        ``GET /v1/agents/{agent_id}/icon``.
     :param created_at: Unix epoch timestamp of creation.
     :param updated_at: Unix epoch timestamp of the last update,
         or ``None`` if never updated.
@@ -291,6 +297,7 @@ class AgentObject(BaseModel):
     name: str
     version: int = 1
     description: str | None = None
+    icon: str | None = None
     created_at: int
     updated_at: int | None = None
     harness: str | None = None

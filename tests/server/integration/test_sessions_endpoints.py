@@ -11507,3 +11507,33 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+# ── GET /v1/sessions/{id}/agent — declared icon passthrough ──
+
+
+async def test_session_agent_exposes_declared_emoji_icon(
+    client: httpx.AsyncClient,
+) -> None:
+    """A spec ``icon`` flows through to the session's AgentObject payload.
+
+    Mirrors the GET /v1/agents catalog field so the Web UI's Agents rail
+    can render a custom icon for the session's own agent (the catalog
+    route already exposes it for the picker card).
+    """
+    agent = await create_test_agent(client, name="emoji-session-agent", icon="🦊")
+    assert agent["icon"] == "🦊"
+
+    # And on a fresh session bound to that same agent (the rail's read path).
+    session = await _create_session(client, agent["id"])
+    resp = await client.get(f"/v1/sessions/{session['id']}/agent")
+    assert resp.status_code == 200
+    assert resp.json()["icon"] == "🦊"
+
+
+async def test_session_agent_icon_is_null_when_unset(
+    client: httpx.AsyncClient,
+) -> None:
+    """An agent that declares no ``icon`` reports ``icon: null``."""
+    agent = await create_test_agent(client, name="iconless-session-agent")
+    assert agent["icon"] is None

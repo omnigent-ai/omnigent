@@ -1439,6 +1439,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         must be ``1``.
     :param name: Human-readable agent name, e.g. ``"code-reviewer"``.
     :param description: Short summary of the agent's purpose.
+    :param icon: Optional agent icon: an emoji grapheme, or a path
+        relative to the agent's config directory naming a bundled
+        ``.svg``/``.png``/``.jpg``/``.jpeg``/``.webp`` image.
     :param llm: LLM configuration. ``None`` means the agent does not
         declare an LLM preference.
     :param interaction: Conversational mode and modality settings.
@@ -1557,6 +1560,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     spec_version: int
     name: str | None = None
     description: str | None = None
+    # Optional agent icon: an emoji grapheme, or a path relative to the
+    # agent's config directory naming a bundled .svg/.png/.jpg/.jpeg/.webp image.
+    icon: str | None = None
     llm: LLMConfig | None = None
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)

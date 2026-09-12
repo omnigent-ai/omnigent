@@ -45,6 +45,10 @@ spec_version: 1               # required; must be 1
 
 name: my-agent                # display name
 description: Does X and Y.   # optional free-form description
+icon: 🔥                      # optional; emoji grapheme OR a path relative to
+                              # this config dir naming a bundled image
+                              # (.svg/.png/.jpg/.jpeg/.webp). Missing files and
+                              # an absent key fall back to the default icon.
 instructions: AGENTS.md       # inline text or path to file (default: AGENTS.md)
 
 llm:

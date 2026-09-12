@@ -4373,3 +4373,41 @@ def test_parse_executor_reasoning_effort_absent(tmp_path: Path) -> None:
     spec = parse(tmp_path)
 
     assert spec.executor.reasoning_effort is None
+
+
+def test_parse_icon_emoji(tmp_path: Path) -> None:
+    """An emoji ``icon`` is read verbatim from config.yaml."""
+    config = {"spec_version": 1, "name": "a", "icon": "🔥"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config, allow_unicode=True))
+    spec = parse(tmp_path)
+    assert spec.icon == "🔥"
+
+
+def test_parse_icon_relative_path_existing(tmp_path: Path) -> None:
+    """A path-valued ``icon`` pointing at a file inside the agent dir is retained."""
+    (tmp_path / "brand").mkdir()
+    (tmp_path / "brand" / "icon.svg").write_text("<svg/>")
+    config = {"spec_version": 1, "name": "a", "icon": "brand/icon.svg"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.icon == "brand/icon.svg"
+
+
+def test_parse_icon_relative_path_missing_dropped(tmp_path: Path) -> None:
+    """A path-valued ``icon`` whose target is absent is dropped to None.
+
+    Matches the parser's tolerant broken-reference policy
+    (:func:`_discover_skills` skips missing entries rather than aborting).
+    """
+    config = {"spec_version": 1, "name": "a", "icon": "brand/missing.svg"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.icon is None
+
+
+def test_parse_icon_absent(tmp_path: Path) -> None:
+    """An absent ``icon`` parses to None with no error."""
+    config = {"spec_version": 1, "name": "a"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.icon is None
