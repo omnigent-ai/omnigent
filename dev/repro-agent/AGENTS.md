@@ -327,7 +327,14 @@ retryable rather than becoming a product verdict.
   the reported failure → that sub-symptom does **not** reproduce here. If the
   report was against an older version and a later commit clearly fixed it, hunt
   for the fixing commit (`git log`) and mark it **`already_fixed`** with the
-  commit. Otherwise **`not_reproduced`** and what you'd need to see it (often a
+  commit. `already_fixed` has two preconditions, both mandatory: the fixing
+  commit must be **newer than the report** (or the report must explicitly name
+  an older build) — a fix that was already live when the user complained cannot
+  explain their report — and you must have **observed the corrected behaviour
+  live** on a surface you drove. When a candidate fix exists but you cannot
+  drive the surface to observe it, the verdict is **`needs_manual_review`**:
+  cite the candidate fix as a lead in `evidence`, never as the verdict.
+  Otherwise **`not_reproduced`** and what you'd need to see it (often a
   `needs_more_info`-style gap).
 
 **Roll up to an overall verdict, but never let it hide a live sub-symptom.** If
@@ -451,12 +458,15 @@ choice:
   This is the field the caller reads to label the issue, so it must match
   verbatim. `reproduced`/`likely_repro`/`not_reproduced`/`already_fixed`/
   `needs_more_info` are defined in Step 2; `needs_manual_review` is allowed
-  **only** when a facet's failure depends on native behaviour this environment
-  cannot exercise (for example the iOS soft keyboard, or WebKit-only rendering
-  when only desktop Chromium is available) so you can neither confirm nor clear
-  it — state that native dependency in `evidence`. It is not a substitute for
-  finishing the investigation, and never stands in for a workflow failure
-  (those stay retryable, per the `needs_more_info` rule).
+  **only** when you can neither confirm nor clear a facet yourself: its failure
+  depends on native behaviour this environment cannot exercise (for example the
+  iOS soft keyboard, or WebKit-only rendering when only desktop Chromium is
+  available) — state that native dependency in `evidence` — or a candidate
+  fixing commit exists but the surface cannot be driven here to observe the
+  corrected behaviour (the `already_fixed` preconditions in Step 2) — cite the
+  candidate fix as a lead in `evidence`. It is not a substitute for finishing
+  the investigation, and never stands in for a workflow failure (those stay
+  retryable, per the `needs_more_info` rule).
 
 ```json
 {
@@ -554,7 +564,10 @@ Field meanings:
   result is just a static error line or value with nothing to watch — say the
   evidence is textual and put the observed text in `evidence`; `recordings: []` is
   correct and not a blocker. Never substitute a synthetic fallback or test-runner
-  video.
+  video. It excuses missing *footage* only and never substitutes for observing
+  the behaviour: an `already_fixed` facet whose corrected behaviour you could
+  not watch live fails the Step 2 preconditions and is `needs_manual_review`,
+  not `already_fixed` with a reason.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +
