@@ -3162,6 +3162,7 @@ export function NewChatLandingScreen() {
     supportsCursorMode ||
     supportsAgySkipPermissions ||
     supportsModelPicker ||
+    supportsDevinMode ||
     smartRoutingEligible ||
     (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
   // Label/value pairs summarizing the selected agent's current run-config, for
@@ -3421,6 +3422,7 @@ export function NewChatLandingScreen() {
       )}
       {(supportsModelPicker ||
         supportsPermissionMode ||
+        supportsDevinMode ||
         selectedNativeHarness === "codex-native") && (
         <div data-testid="new-chat-landing-agent-models">
           <PickerSectionHeader>Models</PickerSectionHeader>
