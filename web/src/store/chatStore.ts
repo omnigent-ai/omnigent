@@ -342,6 +342,10 @@ export function beginLocalConversation(
       : {
           sessionModelOverride: model.modelOverride,
           sessionReasoningEffort: model.reasoningEffort ?? null,
+          // Authoritative only when the caller actually supplied an effort
+          // (a value or an intentional null) — an omitted effort stays a
+          // sticky-fallback, never a claimed "no effort".
+          sessionEffortSeeded: model.reasoningEffort !== undefined,
           boundAgentId: model.boundAgentId ?? null,
           boundAgentName: model.boundAgentName ?? null,
           ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
@@ -675,6 +679,14 @@ export interface ConversationState {
    * answer "what is THIS conversation at".
    */
   sessionReasoningEffort: string | null;
+  /**
+   * True when the optimistic create seeded this conversation's effort (including
+   * an intentional ``null`` "no effort"), so ``sessionReasoningEffort`` is
+   * authoritative and must NOT fall back to the app-global sticky pick. Cleared
+   * once the server hydrates the real effort. This is what distinguishes a
+   * deliberately-seeded null from an unhydrated null.
+   */
+  sessionEffortSeeded: boolean;
   /**
    * Per-session cost-control switch for the active session: ``"on"``
    * activates the spec's configured cost-control mode, ``"off"``
@@ -1701,6 +1713,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
   sessionReasoningEffort: null,
+  sessionEffortSeeded: false,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
@@ -2657,7 +2670,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Harness has no effort control: undo the optimistic session-scoped write
       // so this conversation doesn't claim an effort the server will never hold.
       if (!supportsEffortControl(session)) {
-        setterFor(conversationId)({ sessionReasoningEffort: null });
+        setterFor(conversationId)({ sessionReasoningEffort: null, sessionEffortSeeded: false });
         return;
       }
       await updateSession(conversationId, { reasoningEffort: effort });
@@ -3940,6 +3953,8 @@ async function bindStream(
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
+        // Server hydration supersedes any optimistic effort seed.
+        sessionEffortSeeded: false,
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
@@ -6084,6 +6099,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // wrong until a refresh.
       applyToNamedConversation(event.conversationId, {
         sessionReasoningEffort: event.reasoningEffort,
+        // The live report supersedes any optimistic effort seed.
+        sessionEffortSeeded: false,
       });
       // `selectedEffort` is the app-global sticky pick, so only adopt a value
       // reported by the conversation the user is actually looking at.

@@ -4631,8 +4631,12 @@ function useSessionConfigSummary({
  */
 function useSessionEffort(): string | null {
   const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const seeded = useChatStore((s) => s.sessionEffortSeeded);
   const stickyEffort = useChatStore((s) => s.selectedEffort);
-  return sessionReasoningEffort ?? stickyEffort;
+  // A seeded conversation's effort is authoritative even when null (an
+  // intentional "no effort" from the create), so it never borrows the
+  // app-global sticky pick; only an unhydrated conversation falls back.
+  return seeded ? sessionReasoningEffort : (sessionReasoningEffort ?? stickyEffort);
 }
 
 /**

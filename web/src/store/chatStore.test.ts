@@ -13806,4 +13806,70 @@ describe("beginLocalConversation — optimistic model seed", () => {
     expect(state.sessionModelOverride).toBeNull();
     expect(state.sessionHarness).toBeNull();
   });
+
+  it("marks a seeded null effort authoritative so it wins over a non-null sticky", () => {
+    seedConversationsCache([]);
+    // Another session left a sticky "high"; a create that intentionally omits
+    // effort (seeded null) must NOT borrow it.
+    useChatStore.setState({ selectedEffort: "high" });
+    beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      reasoningEffort: null,
+      harness: "claude-sdk",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionEffortSeeded).toBe(true);
+    expect(state.sessionReasoningEffort).toBeNull();
+  });
+
+  it("marks a seeded explicit effort authoritative", () => {
+    seedConversationsCache([]);
+    beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      reasoningEffort: "low",
+      harness: "claude-sdk",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionEffortSeeded).toBe(true);
+    expect(state.sessionReasoningEffort).toBe("low");
+  });
+
+  it("does NOT mark effort authoritative when the create omits it (stays a sticky fallback)", () => {
+    seedConversationsCache([]);
+    beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: "opus[1m]",
+      harness: "claude-sdk",
+    });
+    expect(useChatStore.getState().sessionEffortSeeded).toBe(false);
+  });
+
+  it("leaves effort unseeded for a 4-arg (no model) call", () => {
+    seedConversationsCache([]);
+    beginLocalConversation("hi", undefined);
+    expect(useChatStore.getState().sessionEffortSeeded).toBe(false);
+  });
+
+  it("preserves the effort-seeded authority across the temp→real rekey", () => {
+    seedSession("conv_effort_seed");
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      reasoningEffort: null,
+      harness: "claude-sdk",
+      boundAgentId: "agent_xyz",
+    })!;
+    hydrateLocalConversation(
+      begun.tempConvId,
+      "conv_effort_seed",
+      "agent_xyz",
+      "hi",
+      undefined,
+      begun.pendingMsgTempId,
+      null,
+      () => {},
+    );
+    // Authority rides through rekey (registry copies entry state) until a
+    // server snapshot supersedes it.
+    expect(useChatStore.getState().sessionEffortSeeded).toBe(true);
+  });
 });

@@ -1259,6 +1259,35 @@ describe("Composer model/effort label", () => {
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
+  it("shows no effort for a seeded null, never borrowing the cross-session sticky (#7039)", () => {
+    // Same sticky "high" as the test above, but the optimistic create seeded an
+    // intentional "no effort" (sessionEffortSeeded) — the authoritative seed
+    // must win, so the label shows the model with no effort, not "High".
+    useChatStore.setState({
+      llmModel: "opus",
+      selectedEffort: "high",
+      sessionReasoningEffort: null,
+      sessionEffortSeeded: true,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Opus");
+    expect(label()).not.toHaveTextContent("High");
+    expect(screen.queryByTestId("composer-agent-effort-value")).toBeNull();
+    // This suite shares one global store and only resets what each test sets;
+    // no other test touches the seeded flag, so restore the default here.
+    useChatStore.setState({ sessionEffortSeeded: false });
+  });
+
   it("reads 'Smart Routing' with no model/effort when routing is on", async () => {
     // The router picks model + effort per turn, so the label must not surface a
     // stale pinned model/effort — it reads "Smart Routing" instead.
