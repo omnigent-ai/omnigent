@@ -195,6 +195,18 @@ class NoLiveHarnessError(RuntimeError):
     """Raised when ``get_client`` is called with ``harness="any"`` and no subprocess is live."""
 
 
+class HarnessSpawnError(RuntimeError):
+    """
+    Raised when a harness subprocess cannot be resolved or spawned.
+
+    The message is deliberately client-safe: it names only the harness, the
+    conversation id, an exit code, or a timeout — never filesystem paths,
+    hostnames, or environment values — so the runner's error path may relay
+    it verbatim to callers and telemetry instead of redacting the cause to a
+    log pointer. Every raise site MUST keep its message within that contract.
+    """
+
+
 def _default_tmp_parent() -> Path:
     """
     Resolve the deployment-level parent for harness Unix sockets.
@@ -243,7 +255,7 @@ def _resolve_module_path(harness: str) -> str:
         ``"claude-sdk"``.
     :returns: The fully-qualified module path that exports
         ``create_app() -> FastAPI``.
-    :raises RuntimeError: If ``harness`` is not registered. The
+    :raises HarnessSpawnError: If ``harness`` is not registered. The
         message names the registered harnesses (or notes the
         registry is empty — common during Phase 1 step 2 before
         wraps land in step 4).
@@ -259,11 +271,13 @@ def _resolve_module_path(harness: str) -> str:
             return acp_module
     package = missing_install_packages().get(harness)
     if package:
-        raise RuntimeError(f"unknown harness {harness!r}; install `{package}` to add this harness")
+        raise HarnessSpawnError(
+            f"unknown harness {harness!r}; install `{package}` to add this harness"
+        )
     if _HARNESS_MODULES:
         registered = sorted(_HARNESS_MODULES)
-        raise RuntimeError(f"unknown harness {harness!r}; registered names: {registered}")
-    raise RuntimeError(
+        raise HarnessSpawnError(f"unknown harness {harness!r}; registered names: {registered}")
+    raise HarnessSpawnError(
         f"unknown harness {harness!r}; the registry is empty (no per-harness "
         f"wraps registered yet — see Phase 1 step 4 of "
         f"designs/SERVER_HARNESS_CONTRACT.md, or register a fixture "
@@ -294,7 +308,7 @@ async def _wait_for_bind(
         failure message.
     :param conversation_id: AP-allocated conversation id, used
         for the failure message.
-    :raises RuntimeError: If the subprocess exits before binding
+    :raises HarnessSpawnError: If the subprocess exits before binding
         or the deadline elapses (after killing the subprocess).
     """
     loop = asyncio.get_running_loop()
@@ -304,7 +318,7 @@ async def _wait_for_bind(
             # Subprocess inherits stderr so the failure message
             # surfaces on AP's own stderr — operators see the
             # full traceback there, not in this RuntimeError.
-            raise RuntimeError(
+            raise HarnessSpawnError(
                 f"harness {harness!r} for conversation "
                 f"{conversation_id!r} exited with "
                 f"{process.returncode} during spawn (see Omnigent stderr)"
@@ -320,7 +334,7 @@ async def _wait_for_bind(
             # than wait forever.
             process.kill()
             await process.wait()
-            raise RuntimeError(
+            raise HarnessSpawnError(
                 f"harness {harness!r} for conversation "
                 f"{conversation_id!r} did not bind its endpoint "
                 f"within {_SPAWN_READY_TIMEOUT_S:.0f}s"
@@ -735,9 +749,10 @@ class HarnessProcessManager:
             per-conversation Unix socket.
         :raises RuntimeError: If ``start()`` was not called first
             (process manager not initialized), the manager is shutting
-            down, a ``release`` invalidated this waiter, or the spawn
-            fails to produce a usable socket within the readiness
-            timeout.
+            down, or a ``release`` invalidated this waiter. Spawn
+            failures (unknown harness, subprocess exit, bind timeout)
+            raise the :class:`HarnessSpawnError` subclass, whose
+            client-safe message names the cause.
         """
         if not self._started:
             raise RuntimeError("HarnessProcessManager.get_client called before start()")
@@ -1185,7 +1200,7 @@ class HarnessProcessManager:
             See :meth:`get_client` for the rationale (per-spec config
             without polluting AP's own ``os.environ``).
         :returns: A populated :class:`_SubprocessEntry`.
-        :raises RuntimeError: If the subprocess exits during
+        :raises HarnessSpawnError: If the subprocess exits during
             spawn or fails to bind its socket within
             ``_SPAWN_READY_TIMEOUT_S``.
         """

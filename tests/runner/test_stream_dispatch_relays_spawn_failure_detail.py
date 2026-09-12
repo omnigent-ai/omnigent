@@ -209,3 +209,69 @@ async def test_stream_spawn_failure_relays_error_detail(
     assert any("harness_spawn_failed" in line for line in error_lines), (
         f"no ERROR log line carries the decoded harness error body: {error_lines!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_detail_preserves_client_safe_reason(
+    spawn_failing_manager: HarnessProcessManager,
+) -> None:
+    """The spawn-failure detail must carry the spawn cause, not only a log pointer.
+
+    ``HarnessSpawnError`` messages are curated to be client-safe (they name
+    the harness, exit code, or timeout — never paths or hosts), so the 503
+    ``harness_spawn_failed`` body and the relayed ``session.status: failed``
+    event must preserve the reason. Redacting it to the fixed
+    "Request failed on the runner" string leaves telemetry and the surfaced
+    turn failure with no attributable cause at all.
+    """
+    app = _build_app(spawn_failing_manager)
+    conv = f"conv_spawn_reason_{uuid.uuid4().hex[:8]}"
+
+    async with _runner_client(app) as http:
+        response = await _post_spawn_failing_turn(http, conv, stream=True)
+        assert response.status_code == 503
+        body = response.json()
+        assert body["error"] == "harness_spawn_failed"
+        # The cause (the real unknown-harness message) is preserved verbatim,
+        # with the log pointer still appended for the full traceback.
+        assert f"unknown harness {_UNSPAWNABLE_HARNESS!r}" in body["detail"], (
+            f"spawn cause redacted out of the client detail: {body['detail']!r}"
+        )
+        assert "see the runner log for details" in body["detail"]
+
+        failed = await _failed_relay_event(app.state.session_event_queues, conv)
+
+    # The relay subscriber (and therefore the SPA's failed-turn pill and the
+    # runner's turn-status telemetry) learns the same preserved reason.
+    assert failed is not None, "no session.status: failed event reached the relay"
+    relayed_message = str((failed.get("error") or {}).get("message", ""))
+    assert f"unknown harness {_UNSPAWNABLE_HARNESS!r}" in relayed_message, (
+        f"spawn cause redacted out of the relayed failure: {relayed_message!r}"
+    )
+
+
+def test_client_safe_detail_redacts_raw_errors_but_preserves_spawn_reasons() -> None:
+    """Only curated ``HarnessSpawnError`` messages pass the redaction boundary.
+
+    Raw exception text can embed paths, hostnames, and other server-side
+    state, so an arbitrary ``RuntimeError`` must keep producing the fixed
+    log-pointer detail. ``HarnessSpawnError`` messages are written to the
+    client-safe contract, so theirs are preserved.
+    """
+    from omnigent.runner.app import _client_safe_error_detail
+    from omnigent.runtime.harnesses.process_manager import HarnessSpawnError
+
+    raw = _client_safe_error_detail(
+        RuntimeError("/home/someone/.secret/harness exploded"), context="harness spawn"
+    )
+    assert "/home/someone" not in raw, f"raw exception text leaked to the client: {raw!r}"
+    assert raw.startswith("Request failed on the runner")
+
+    curated = _client_safe_error_detail(
+        HarnessSpawnError("unknown harness 'nope'; registered names: ['test']"),
+        context="harness spawn",
+    )
+    assert curated.startswith("unknown harness 'nope'"), (
+        f"client-safe spawn reason was redacted: {curated!r}"
+    )
+    assert "see the runner log for details" in curated
