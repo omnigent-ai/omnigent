@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -96,6 +97,11 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 _DISCOVERY_SKEW_MS = 10_000
 
 _STATE_FILE = "cursor_forwarder.json"
+
+# fd-table exhaustion (EMFILE/ENFILE) is an environmental, process-wide
+# condition, not a per-poll defect: while it lasts every poll fails the same
+# way, so the loop warns once when it starts and re-warns at most this often.
+_FD_EXHAUSTION_REWARN_S = 60.0
 
 # A sibling session's persisted claim (naming the same ``store_path``) counts as
 # a LIVE owner only if its heartbeat was refreshed within this window; an older
@@ -285,6 +291,23 @@ def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int
         if other.launch_epoch_ms == my_launch_ms and sibling.name < me:
             return True
     return False
+
+
+def _fd_exhaustion_errno(exc: BaseException) -> int | None:
+    """Return EMFILE/ENFILE if *exc* (or its cause chain) is fd exhaustion.
+
+    Walks explicit causes only (``raise … from exc``, e.g. httpx wrapping the
+    socket error), not implicit context, so an unrelated error raised while
+    handling an fd failure is not misclassified.
+    """
+    current: BaseException | None = exc
+    for _ in range(10):  # bound the walk against pathological cause cycles
+        if current is None:
+            return None
+        if isinstance(current, OSError) and current.errno in (errno.EMFILE, errno.ENFILE):
+            return current.errno
+        current = current.__cause__
+    return None
 
 
 def _get_current_rowid(store_path: Path) -> int:
@@ -923,6 +946,11 @@ async def forward_cursor_store_to_session(
     # so the cold-resume path can pass ``--resume <chatId>`` to cursor-agent.
     chat_id_patched = False
     model_state = _ModelMirrorState()
+    # fd-exhaustion window tracking: when the poll fails with EMFILE/ENFILE the
+    # loop pauses mirroring (structured, rate-limited WARNING) instead of
+    # logging an unstructured ERROR per poll, then notes recovery.
+    fd_exhausted_since: float | None = None
+    fd_exhaustion_last_warn = 0.0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -1188,14 +1216,43 @@ async def forward_cursor_store_to_session(
                     await asyncio.to_thread(
                         cursor_native_status.write_posted_count, bridge_dir, total_turn_ends
                     )
+                if fd_exhausted_since is not None:
+                    _logger.info(
+                        "cursor forwarder polling recovered after fd exhaustion (%.1fs); "
+                        "session=%s store=%s",
+                        time.monotonic() - fd_exhausted_since,
+                        session_id,
+                        store_path,
+                    )
+                    fd_exhausted_since = None
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                _logger.exception(
-                    "cursor forwarder poll failed; session=%s store=%s",
-                    session_id,
-                    store_path,
-                )
+            except Exception as exc:
+                fd_errno = _fd_exhaustion_errno(exc)
+                if fd_errno is not None:
+                    now = time.monotonic()
+                    if (
+                        fd_exhausted_since is None
+                        or now - fd_exhaustion_last_warn >= _FD_EXHAUSTION_REWARN_S
+                    ):
+                        _logger.warning(
+                            "cursor forwarder poll hit fd exhaustion (%s: %s); transcript "
+                            "mirroring paused until file descriptors free up; "
+                            "session=%s store=%s",
+                            errno.errorcode.get(fd_errno, fd_errno),
+                            exc,
+                            session_id,
+                            store_path,
+                        )
+                        fd_exhaustion_last_warn = now
+                    if fd_exhausted_since is None:
+                        fd_exhausted_since = now
+                else:
+                    _logger.exception(
+                        "cursor forwarder poll failed; session=%s store=%s",
+                        session_id,
+                        store_path,
+                    )
             await asyncio.sleep(poll_interval_s)
 
 
