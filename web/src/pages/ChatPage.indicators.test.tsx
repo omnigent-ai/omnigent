@@ -432,27 +432,50 @@ describe("HostOutdatedNotice", () => {
     status: "online" as const,
     version: "0.13.0.dev1",
     outdated: true,
+    distribution: "isaac",
   };
 
-  it("names the host, both versions and the restart remedy when the server flags it", () => {
-    render(<HostOutdatedNotice host={host} serverVersion="0.13.0.dev3" />);
-    const notice = screen.getByTestId("host-outdated-notice");
-    expect(notice).toHaveTextContent("corey-laptop is running 0.13.0.dev1; 0.13.0.dev3 is current");
-    expect(notice).toHaveTextContent("Restart the Omnigent host on that machine");
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  it("names the host and version, and words the update for its distribution", () => {
+    render(<HostOutdatedNotice host={host} />);
+    expect(screen.getByTestId("host-outdated-notice")).toHaveTextContent(
+      "Host corey-laptop is outdated (0.13.0.dev1). To update, run isaac omni host stop then isaac omni host.",
+    );
+  });
+
+  it("falls back to a plain restart for a distribution without known commands", () => {
+    render(<HostOutdatedNotice host={{ ...host, distribution: "source" }} />);
+    expect(screen.getByTestId("host-outdated-notice")).toHaveTextContent(
+      "Host corey-laptop is outdated (0.13.0.dev1). Restart it to update.",
+    );
+    cleanup();
+    render(<HostOutdatedNotice host={{ ...host, distribution: null }} />);
+    expect(screen.getByTestId("host-outdated-notice")).toHaveTextContent("Restart it to update.");
   });
 
   it("renders nothing for a current host, an unknown version, or no host", () => {
     const { container: current } = render(
-      <HostOutdatedNotice host={{ ...host, outdated: false }} serverVersion="0.13.0.dev3" />,
+      <HostOutdatedNotice host={{ ...host, outdated: false }} />,
     );
     expect(current).toBeEmptyDOMElement();
-    const { container: unknown } = render(
-      <HostOutdatedNotice host={{ ...host, version: null }} serverVersion="0.13.0.dev3" />,
-    );
+    const { container: unknown } = render(<HostOutdatedNotice host={{ ...host, version: null }} />);
     expect(unknown).toBeEmptyDOMElement();
-    const { container: unbound } = render(
-      <HostOutdatedNotice host={null} serverVersion="0.13.0.dev3" />,
-    );
+    const { container: unbound } = render(<HostOutdatedNotice host={null} />);
     expect(unbound).toBeEmptyDOMElement();
+  });
+
+  it("stays dismissed for that host and version, and returns for a newer one", () => {
+    render(<HostOutdatedNotice host={host} />);
+    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
+    expect(screen.queryByTestId("host-outdated-notice")).toBeNull();
+    cleanup();
+    render(<HostOutdatedNotice host={host} />);
+    expect(screen.queryByTestId("host-outdated-notice")).toBeNull();
+    cleanup();
+    render(<HostOutdatedNotice host={{ ...host, version: "0.13.0.dev2" }} />);
+    expect(screen.getByTestId("host-outdated-notice")).toBeInTheDocument();
   });
 });

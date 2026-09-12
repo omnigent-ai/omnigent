@@ -151,6 +151,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.update_check import DISTRIBUTION_ENV, host_distribution
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -494,6 +495,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # Distribution label the launcher sets (the isaac wrapper exports
+        # OMNIGENT_DISTRIBUTION=isaac). The daemon reports it in host.hello so
+        # the web UI can word the outdated-host notice. Not a secret.
+        DISTRIBUTION_ENV,
         # Auth provider selection. The env-unset default was flipped
         # to "accounts", so the whole CLI → daemon → local-server chain has
         # to agree on the mode. Without this, the daemon strips
@@ -3930,6 +3935,7 @@ class HostProcess:
             gateway_inference=self._gateway_inference,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            distribution=host_distribution(),
         )
         try:
             encoded_hello = encode_host_frame(hello)

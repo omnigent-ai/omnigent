@@ -608,8 +608,11 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
             ``name``, ``owner``, ``status``, ``sandbox_provider``,
-            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            no connected host has reported it to this replica).
+            ``configured_harnesses``, ``version`` and ``distribution`` (as the
+            host last reported them, ``None`` when unknown), ``outdated`` (the
+            host runs an older omnigent than this server), and
+            ``gateway_inference`` (``None`` when no connected host has reported
+            it to this replica).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -649,6 +652,7 @@ def create_hosts_router(
                     "configured_harnesses": host.configured_harnesses,
                     "version": host.version,
                     "outdated": _host_outdated(host.version),
+                    "distribution": host.distribution,
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
@@ -695,6 +699,7 @@ def create_hosts_router(
             "configured_harnesses": host.configured_harnesses,
             "version": host.version,
             "outdated": _host_outdated(host.version),
+            "distribution": host.distribution,
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),

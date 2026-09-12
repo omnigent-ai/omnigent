@@ -562,14 +562,15 @@ def test_host_badge_page_shows_outdated_host_notice(
     seeded_session: tuple[str, str],
 ) -> None:
     """
-    A host the server flags as outdated gets a restart notice above the chat.
+    A host the server flags as outdated gets an update banner over the chat.
 
     The host machine upgrades omnigent in place while the running host daemon
     keeps its old code, and nothing restarts it. The server compares the
     version each host reported at connect with its own and flags the row; the
-    web view turns that into a notice naming both versions and the remedy,
-    so the user learns about it without anyone messaging them. The current
-    version in the copy is the live server's own, read from ``/v1/info``.
+    web view turns that into a banner naming the host and its version, worded
+    for the host's ``distribution`` (here isaac), so the user learns what to
+    run without anyone messaging them. Restarting kills that host's sessions,
+    so dismissing the banner sticks for that host and version across reloads.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -578,7 +579,6 @@ def test_host_badge_page_shows_outdated_host_notice(
     :returns: None.
     """
     base_url, session_id = seeded_session
-    server_version = httpx.get(f"{base_url}/v1/info", timeout=10.0).json()["server_version"]
     _patch_host_view(
         page,
         session_id,
@@ -589,15 +589,20 @@ def test_host_badge_page_shows_outdated_host_notice(
             "sandbox_provider": None,
             "version": "0.0.1",
             "outdated": True,
+            "distribution": "isaac",
         },
         host_online=True,
     )
     page.goto(f"{base_url}/c/{session_id}")
     notice = page.get_by_test_id("host-outdated-notice")
     expect(notice).to_be_visible(timeout=15_000)
-    expect(notice).to_contain_text("stale-laptop is running 0.0.1")
-    expect(notice).to_contain_text(f"{server_version} is current")
-    expect(notice).to_contain_text("Restart the Omnigent host on that machine")
+    expect(notice).to_contain_text("Host stale-laptop is outdated (0.0.1).")
+    expect(notice).to_contain_text("To update, run isaac omni host stop then isaac omni host.")
+    page.get_by_test_id("host-outdated-dismiss").click()
+    expect(notice).to_have_count(0)
+    page.reload()
+    expect(page.get_by_test_id("composer-host-select")).to_be_visible(timeout=15_000)
+    expect(page.get_by_test_id("host-outdated-notice")).to_have_count(0)
 
 
 def test_host_badge_page_hides_notice_for_current_host(

@@ -1760,6 +1760,32 @@ def upgrade_command_for_installed() -> _UpgradeSuggestion | None:
     return _build_upgrade_suggestion(info)
 
 
+DISTRIBUTION_ENV = "OMNIGENT_DISTRIBUTION"
+
+
+def host_distribution() -> str | None:
+    """
+    Return the token for how omnigent was distributed onto this machine.
+
+    Reported in ``host.hello`` so the web UI can word the outdated-host notice
+    for the launcher in use. An operator-set ``OMNIGENT_DISTRIBUTION`` (e.g.
+    ``"isaac"`` from the isaac wrapper) wins; otherwise the token is derived
+    from the installed distribution's metadata: ``"source"`` for an editable
+    install or a bare checkout, else the detected installer (``"uv"``,
+    ``"pipx"``, ``"pip"``, ...).
+
+    :returns: The token, e.g. ``"isaac"`` or ``"uv"``; ``None`` when the
+        installer could not be identified.
+    """
+    label = os.environ.get(DISTRIBUTION_ENV, "").strip()
+    if label:
+        return label
+    info = _read_installed_wheel_info()
+    if info is None or info.is_editable:
+        return "source"
+    return info.detected_installer
+
+
 def _probe_installed_distribution() -> tuple[str | None, str | None]:
     """Read the freshly-installed version and VCS commit in a subprocess.
 

@@ -39,6 +39,14 @@ export interface Host {
    * Absent on older servers, which never flag anything.
    */
   outdated?: boolean;
+  /**
+   * How omnigent was distributed onto the host, as it reported at its last
+   * connect: an operator label such as `"isaac"`, or the detected install
+   * shape (`"uv"`, `"pipx"`, `"pip"`, `"source"`). `null`/absent when unknown
+   * (older host or server build). The outdated-host banner words its update
+   * instructions from it.
+   */
+  distribution?: string | null;
 }
 
 interface HostsResponse {

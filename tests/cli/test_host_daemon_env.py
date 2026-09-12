@@ -307,3 +307,22 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
     # Then
     assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_distribution_label(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """
+    The launcher's ``OMNIGENT_DISTRIBUTION`` reaches the daemon in both modes.
+
+    The daemon reports the label in ``host.hello`` and the web UI words the
+    outdated-host notice from it; an allowlist that dropped it would make every
+    isaac host read as an unknown install and get the generic wording.
+    """
+    monkeypatch.setenv("OMNIGENT_DISTRIBUTION", "isaac")
+
+    env = _build_host_daemon_env(server_url=server_url)
+
+    assert env["OMNIGENT_DISTRIBUTION"] == "isaac"

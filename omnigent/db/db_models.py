@@ -1341,6 +1341,9 @@ class SqlHost(OmnigentBase):
         agent picker can warn about unconfigured harnesses.
     :param version: Omnigent version the host reported in its last
         ``host.hello`` frame, e.g. ``"0.13.0.dev3"``; ``None`` when unknown.
+    :param distribution: How omnigent was distributed onto the host, from its
+        last ``host.hello`` frame, e.g. ``"isaac"`` or ``"uv"``; ``None`` when
+        unknown.
     """
 
     __tablename__ = "hosts"
@@ -1374,6 +1377,8 @@ class SqlHost(OmnigentBase):
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Omnigent version from the host's last ``host.hello`` frame.
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # How omnigent got onto the host (``"isaac"``, ``"uv"``, ...), same frame.
+    distribution: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint(

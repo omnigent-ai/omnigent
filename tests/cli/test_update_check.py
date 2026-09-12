@@ -1914,6 +1914,52 @@ def test_upgrade_command_for_installed(
     assert upgrade_command_for_installed() is None
 
 
+@pytest.mark.parametrize(
+    ("label", "installer", "editable", "expected"),
+    [
+        ("isaac", "uv", False, "isaac"),
+        ("", "uv", False, "uv"),
+        ("", "pip", False, "pip"),
+        ("", "uv", True, "source"),
+        ("", None, False, None),
+    ],
+)
+def test_host_distribution_prefers_operator_label_over_install_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    installer: str | None,
+    editable: bool,
+    expected: str | None,
+) -> None:
+    """
+    ``host_distribution`` reports the operator label, else names the install shape.
+
+    The web UI words the outdated-host notice from this token, so a wrapper such
+    as isaac must win over the wheel metadata underneath it, an editable checkout
+    must read as ``source`` (nothing to upgrade), and an installer the metadata
+    cannot name must stay unknown rather than guess.
+    """
+    from omnigent.update_check import DISTRIBUTION_ENV, host_distribution
+
+    monkeypatch.setenv(DISTRIBUTION_ENV, label)
+    direct_url = {"url": tmp_path.as_uri(), "dir_info": {"editable": True}} if editable else None
+    dist = _write_fake_dist_info(tmp_path, installer=installer, direct_url=direct_url)
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    assert host_distribution() == expected
+
+
+def test_host_distribution_reads_a_bare_checkout_as_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkout with no registered distribution has nothing to upgrade: ``source``."""
+    from omnigent.update_check import DISTRIBUTION_ENV, host_distribution
+
+    monkeypatch.delenv(DISTRIBUTION_ENV, raising=False)
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: None)
+    assert host_distribution() == "source"
+
+
 def test_wheel_info_prefers_build_info_over_uv_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1365,6 +1365,26 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
+async def test_hello_reports_the_host_distribution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The ``host.hello`` frame carries the distribution token the host resolves.
+
+    The web UI words its outdated-host notice from this token, so the hello must
+    forward the operator's label (here via ``OMNIGENT_DISTRIBUTION``) rather
+    than a fixed value.
+    """
+    monkeypatch.setenv("OMNIGENT_DISTRIBUTION", "isaac")
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.distribution == "isaac"
+
+
 async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and

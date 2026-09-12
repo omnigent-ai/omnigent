@@ -87,6 +87,8 @@ class Host:
         "nothing configured".
     :param version: Omnigent version from the host's last ``host.hello``
         frame, e.g. ``"0.13.0.dev3"``; ``None`` when never reported.
+    :param distribution: How omnigent was distributed onto the host, e.g.
+        ``"isaac"`` or ``"uv"``; ``None`` when never reported.
     """
 
     host_id: str
@@ -101,6 +103,7 @@ class Host:
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
     version: str | None = None
+    distribution: str | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -172,6 +175,7 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
         version=row.version,
+        distribution=row.distribution,
     )
 
 
@@ -234,6 +238,7 @@ class HostStore:
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
         managed_token: str | None = None,
         version: str | None = None,
+        distribution: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -279,6 +284,9 @@ class HostStore:
         :param version: Omnigent version from the host's ``host.hello`` frame,
             e.g. ``"0.13.0.dev3"``. Written on every connect like
             ``configured_harnesses``.
+        :param distribution: How omnigent was distributed onto the host, from
+            the same frame, e.g. ``"isaac"``. Written on every connect like
+            ``version``.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
@@ -308,6 +316,7 @@ class HostStore:
                             updated_at=now,
                             configured_harnesses=harnesses_json,
                             version=version,
+                            distribution=distribution,
                         )
                     ),
                 )
@@ -340,6 +349,7 @@ class HostStore:
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
                 row.version = version
+                row.distribution = distribution
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -356,6 +366,7 @@ class HostStore:
                     now=now,
                     configured_harnesses_json=harnesses_json,
                     version=version,
+                    distribution=distribution,
                 )
                 if reowned is not None:
                     return reowned
@@ -380,6 +391,7 @@ class HostStore:
                     now,
                     harnesses_json,
                     version,
+                    distribution,
                 )
                 return _row_to_host(row)
 
@@ -393,6 +405,7 @@ class HostStore:
                 updated_at=now,
                 configured_harnesses=harnesses_json,
                 version=version,
+                distribution=distribution,
             )
             session.add(row)
             return _row_to_host(row)
@@ -407,6 +420,7 @@ class HostStore:
         now: int,
         harnesses_json: str | None,
         version: str | None,
+        distribution: str | None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -428,6 +442,7 @@ class HostStore:
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
         :param version: Omnigent version reported at connect, or None.
+        :param distribution: Distribution token reported at connect, or None.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -484,6 +499,7 @@ class HostStore:
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
             version=version,
+            distribution=distribution,
         )
         session.add(new_row)
         session.flush()
@@ -511,6 +527,7 @@ class HostStore:
         now: int,
         configured_harnesses_json: str | None = None,
         version: str | None = None,
+        distribution: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -536,6 +553,7 @@ class HostStore:
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
         :param version: Omnigent version reported at connect, or ``None``.
+        :param distribution: Distribution token reported at connect, or ``None``.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -563,6 +581,7 @@ class HostStore:
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
                 version=version,
+                distribution=distribution,
             )
         )
         return Host(
@@ -576,6 +595,7 @@ class HostStore:
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
             version=version,
+            distribution=distribution,
         )
 
     def set_offline(self, host_id: str) -> None:

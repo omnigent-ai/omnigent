@@ -1421,27 +1421,32 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
 
 
-def test_upsert_on_connect_records_host_version(host_store: HostStore) -> None:
+def test_upsert_on_connect_records_host_version_and_distribution(host_store: HostStore) -> None:
     """
-    Verify the version a host reports at connect is persisted on insert and update.
+    Verify the version and distribution a host reports at connect persist on insert and update.
 
-    The web UI's outdated-host notice reads it through GET /v1/hosts; a version
-    dropped on either path would hide the notice for exactly the hosts it is for.
+    The web UI's outdated-host notice reads both through GET /v1/hosts; a value
+    dropped on either path would hide or mis-word the notice for exactly the
+    hosts it is for.
     """
     inserted = host_store.upsert_on_connect(
         host_id="bdda8ba7e34130318b54dd872eb160af",
         name="test-laptop",
         user_id="alice@example.com",
         version="0.13.0.dev1",
+        distribution="isaac",
     )
-    assert inserted.version == "0.13.0.dev1"
-    assert host_store.list_hosts("alice@example.com")[0].version == "0.13.0.dev1"
+    assert (inserted.version, inserted.distribution) == ("0.13.0.dev1", "isaac")
+    listed = host_store.list_hosts("alice@example.com")[0]
+    assert (listed.version, listed.distribution) == ("0.13.0.dev1", "isaac")
 
     updated = host_store.upsert_on_connect(
         host_id="bdda8ba7e34130318b54dd872eb160af",
         name="test-laptop",
         user_id="alice@example.com",
         version="0.13.0.dev3",
+        distribution="uv",
     )
-    assert updated.version == "0.13.0.dev3"
-    assert host_store.list_hosts("alice@example.com")[0].version == "0.13.0.dev3"
+    assert (updated.version, updated.distribution) == ("0.13.0.dev3", "uv")
+    listed = host_store.list_hosts("alice@example.com")[0]
+    assert (listed.version, listed.distribution) == ("0.13.0.dev3", "uv")
