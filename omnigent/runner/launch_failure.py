@@ -103,6 +103,45 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
+# Looser not-found phrasings (dash prints ``claude: not found`` without the
+# word "command"); safe only when the same line names the launched command.
+_MISSING_COMMAND_HINTS = (
+    "not found",
+    "no such file or directory",
+    "not recognized as an internal or external command",
+)
+
+
+def _output_names_missing_command(s: _Signal) -> bool:
+    """True when a not-found line in the output is about the launched command.
+
+    A pane can read ``command not found`` about something else entirely (e.g.
+    a stray ``--model`` line hitting the shell after a present CLI crashed);
+    that proves the CLI ran and must not be read as a missing install.
+    """
+    command = re.compile(rf"\b{re.escape(s.command)}\b") if s.command else None
+    for line in s.output.splitlines():
+        if command is None:
+            # Unknown command: fall back to the strict shell error markers.
+            if any(marker in line for marker in _MISSING_MARKERS):
+                return True
+        elif command.search(line) and any(hint in line for hint in _MISSING_COMMAND_HINTS):
+            return True
+    return False
+
+
+def _missing_binary(s: _Signal) -> bool:
+    """Missing install: the not-found error names the command, or a bare 127.
+
+    Exit 127 alone is ambiguous — the shell also uses it for any unresolved
+    line a *present* CLI leaves behind when it crashes — so when output was
+    captured, claim a missing binary only when that output blames the
+    launched command itself.
+    """
+    if _output_names_missing_command(s):
+        return True
+    return s.exit_code == 127 and not s.output.strip()
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
@@ -121,7 +160,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     ),
     _TerminalMatcher(
         "missing_binary",
-        lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),
+        _missing_binary,
         FailureDiagnosis(
             title="Agent command not found",
             cause=(
