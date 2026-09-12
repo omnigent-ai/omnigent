@@ -461,9 +461,9 @@ describe("NewChatLandingScreen create flow", () => {
       }),
     );
     beginLocalConversationMock.mockReturnValue({
-      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      tempConvId: "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       pendingMsgTempId: "pending-old",
-      createToken: "1234567890abcdef1234567890abcdef",
+      createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     });
     renderLanding();
     await waitForWorkspaceSeed();
