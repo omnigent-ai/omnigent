@@ -2800,6 +2800,8 @@ def _pin_claude_permission_launch_args(
     created without the flag: the launcher rebuilds Claude's args from
     ``terminal_launch_args`` alone and never reads the mode label, so a
     label-only record reopens the session in Claude's default (manual) mode.
+    Pinning ``"default"`` is a deliberate choice of Claude's manual mode and
+    overrides a ``permissions.defaultMode`` in the user's settings on relaunch.
 
     :param existing_args: Current launch args, e.g. ``["--model", "opus"]`` or ``None``.
     :param mode: Runner-confirmed mode, e.g. ``"auto"``.
