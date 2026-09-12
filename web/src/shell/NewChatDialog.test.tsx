@@ -1845,14 +1845,15 @@ describe("NewChatLandingScreen", () => {
     const picker = screen.getByTestId("new-chat-landing-agent-select");
     expect(picker).not.toHaveTextContent("Claude Code");
     expect(picker).not.toHaveTextContent("Default");
-    expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort Default");
+    // The managed 1M catalog row keeps its "(1M context)" variant (#7094).
+    expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8 (1M context), Effort Default");
     // The hover summary is a styled tooltip with bold keys, never the
     // unstyled native `title` hover.
     expect(picker).not.toHaveAttribute("title");
     fireEvent.focus(picker);
     const pickerTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
     expect(pickerTooltip).toHaveTextContent("Harness: Claude Code");
-    expect(pickerTooltip).toHaveTextContent("Model: Default (Opus 4.8)");
+    expect(pickerTooltip).toHaveTextContent("Model: Default (Opus 4.8 (1M context))");
     expect(pickerTooltip).toHaveTextContent("Effort: Default");
     for (const key of within(pickerTooltip).getAllByText(/^(Harness|Model|Effort):$/)) {
       expect(key).toHaveClass("font-semibold");
@@ -1868,7 +1869,9 @@ describe("NewChatLandingScreen", () => {
       "items-baseline",
       "gap-1",
     );
-    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("Opus 4.8");
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Opus 4.8 (1M context)",
+    );
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass(
       "min-w-0",
       "whitespace-normal",
@@ -1899,14 +1902,18 @@ describe("NewChatLandingScreen", () => {
     expect(menus).toHaveLength(2);
     expect(menus[0]).toBe(rootMenu);
     expect(menus[1]).toHaveClass("w-[13.75rem]", "composer-agent-config-menu");
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.8");
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Sonnet 4.6");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Opus 4.8 (1M context)",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Sonnet 4.6 (1M context)",
+    );
     expect(screen.getByTestId("new-chat-landing-agent-models").textContent).not.toContain("`");
     expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("High");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
     expect(screen.getByTestId("new-chat-landing-agent-config-value")).toHaveTextContent(
-      "Opus 4.8High",
+      "Opus 4.8 (1M context)High",
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
@@ -1917,7 +1924,7 @@ describe("NewChatLandingScreen", () => {
       "text-muted-foreground",
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).not.toHaveClass("hidden");
-    expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort High");
+    expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8 (1M context), Effort High");
   });
 
   it("does not duplicate model or effort controls in landing Advanced settings", () => {
@@ -2922,8 +2929,8 @@ describe("NewChatLandingScreen", () => {
     openAgentModels("a1");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
     expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
-    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" })).toBeVisible();
-    expect(screen.getByRole("menuitemcheckbox", { name: "Sonnet 4.6" })).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8 (1M context)" })).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Sonnet 4.6 (1M context)" })).toBeVisible();
     expect(screen.queryByText("Fable")).toBeNull();
     expect(screen.queryByText("Sonnet 5")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
@@ -5460,7 +5467,7 @@ describe("NewChatLandingScreen smart routing", () => {
   // so the pre-launch row offers only what the create call can express. With
   // the server flag off, Smart Routing is never an option.
   it.each([
-    ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
+    ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8 (1M context)"],
     ["Claude Code", "a1", false, null, "Harness default"],
     ["Codex", "a2", true, "Smart Routing", "GPT-5.5"],
   ] as const)(
@@ -5527,7 +5534,7 @@ describe("NewChatLandingScreen smart routing", () => {
         expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeNull();
         expect(
           screen.getByRole("menuitemcheckbox", {
-            name: agentId === "a2" ? "GPT-5.6" : "Opus 4.8",
+            name: agentId === "a2" ? "GPT-5.6" : "Opus 4.8 (1M context)",
           }),
         ).toBeTruthy();
       }
@@ -5583,7 +5590,7 @@ describe("NewChatLandingScreen smart routing", () => {
     });
     openAgentModels("a1");
     expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeNull();
-    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" })).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8 (1M context)" })).toBeTruthy();
   });
 
   it("offers Smart Routing on a host that reports no gateway_inference at all", () => {
@@ -5621,7 +5628,7 @@ describe("NewChatLandingScreen smart routing", () => {
     );
     openAgentModels("a1");
     // Pin a model + effort first so the routing pick has something to clear.
-    pickPrimaryOption("model", "Opus 4.8");
+    pickPrimaryOption("model", "Opus 4.8 (1M context)");
     pickPrimaryOption("effort", "High");
     pickPrimaryOption("model", "Smart Routing");
     closePrimaryPicker();
