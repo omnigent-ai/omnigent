@@ -99,8 +99,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          # Base + explicit merge below: Forgejo never creates refs/pull/N/merge.
+          ref: ${{ github.event.pull_request.base.sha || github.ref }}
           fetch-depth: 0
+      # Test the merge result, not the branch: refs/pull/N/merge does not exist on
+      # Forgejo, so merge the immutable head SHA onto the immutable base SHA here.
+      # A real conflict still fails the job.
+      - name: Construct PR merge result
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name  "ci-merge"
+          git config user.email "ci-merge@local"
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+          git checkout --detach "$BASE_SHA"
+          if ! git merge --no-edit --no-ff "$HEAD_SHA"; then
+            echo "::error::PR does not merge cleanly into its base ($BASE_SHA)"
+            git merge --abort || true
+            exit 1
+          fi
+          echo "merged $HEAD_SHA into $BASE_SHA -> $(git rev-parse HEAD)"
       - name: Run compat smoke (Config 1)
         uses: ./.github/actions/compat-smoke-run
         with:
@@ -116,8 +137,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          # Base + explicit merge below: Forgejo never creates refs/pull/N/merge.
+          ref: ${{ github.event.pull_request.base.sha || github.ref }}
           fetch-depth: 0
+      # Test the merge result, not the branch: refs/pull/N/merge does not exist on
+      # Forgejo, so merge the immutable head SHA onto the immutable base SHA here.
+      # A real conflict still fails the job.
+      - name: Construct PR merge result
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name  "ci-merge"
+          git config user.email "ci-merge@local"
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+          git checkout --detach "$BASE_SHA"
+          if ! git merge --no-edit --no-ff "$HEAD_SHA"; then
+            echo "::error::PR does not merge cleanly into its base ($BASE_SHA)"
+            git merge --abort || true
+            exit 1
+          fi
+          echo "merged $HEAD_SHA into $BASE_SHA -> $(git rev-parse HEAD)"
       - name: Run compat smoke (Config 2)
         uses: ./.github/actions/compat-smoke-run
         with:
@@ -133,8 +175,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          # Base + explicit merge below: Forgejo never creates refs/pull/N/merge.
+          ref: ${{ github.event.pull_request.base.sha || github.ref }}
           fetch-depth: 0
+      # Test the merge result, not the branch: refs/pull/N/merge does not exist on
+      # Forgejo, so merge the immutable head SHA onto the immutable base SHA here.
+      # A real conflict still fails the job.
+      - name: Construct PR merge result
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name  "ci-merge"
+          git config user.email "ci-merge@local"
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+          git checkout --detach "$BASE_SHA"
+          if ! git merge --no-edit --no-ff "$HEAD_SHA"; then
+            echo "::error::PR does not merge cleanly into its base ($BASE_SHA)"
+            git merge --abort || true
+            exit 1
+          fi
+          echo "merged $HEAD_SHA into $BASE_SHA -> $(git rev-parse HEAD)"
       - name: Run UI compat smoke (Config A)
         uses: ./.github/actions/compat-smoke-ui-run
         with:
@@ -150,8 +213,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          # Base + explicit merge below: Forgejo never creates refs/pull/N/merge.
+          ref: ${{ github.event.pull_request.base.sha || github.ref }}
           fetch-depth: 0
+      # Test the merge result, not the branch: refs/pull/N/merge does not exist on
+      # Forgejo, so merge the immutable head SHA onto the immutable base SHA here.
+      # A real conflict still fails the job.
+      - name: Construct PR merge result
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name  "ci-merge"
+          git config user.email "ci-merge@local"
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+          git checkout --detach "$BASE_SHA"
+          if ! git merge --no-edit --no-ff "$HEAD_SHA"; then
+            echo "::error::PR does not merge cleanly into its base ($BASE_SHA)"
+            git merge --abort || true
+            exit 1
+          fi
+          echo "merged $HEAD_SHA into $BASE_SHA -> $(git rev-parse HEAD)"
       - name: Run UI compat smoke (Config B)
         uses: ./.github/actions/compat-smoke-ui-run
         with:
