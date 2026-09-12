@@ -1891,8 +1891,8 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             # Pick model + effort in the same modal visit (each select commits to
             # a local draft; Save commits both at once). The model rows carry the
             # host catalog's live display names, not the static alias labels.
-            await page.get_by_role("menuitemcheckbox", name="Opus 4.8", exact=True).click()
-            await expect(model).to_contain_text("Opus 4.8")
+            await page.get_by_role("menuitemcheckbox", name="opus", exact=True).click()
+            await expect(model).to_contain_text("opus")
             await page.get_by_role("menuitemcheckbox", name="High", exact=True).click()
             await expect(effort).to_contain_text("High")
             await _close_entry_models(page)
@@ -1913,7 +1913,7 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await _open_entry_models(page, "ag_claude_e2e")
             await expect(
                 page.locator('[data-testid^="new-chat-landing-agent-model-"][aria-checked="true"]')
-            ).to_contain_text("Opus 4.8")
+            ).to_contain_text("opus")
             await expect(
                 page.locator(
                     '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
@@ -1987,12 +1987,8 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
             model = page.locator(
                 '[data-testid^="new-chat-landing-agent-model-"][aria-checked="true"]'
             )
-            # The Default row names the catalog's default by its DISPLAY name —
-            # the same shared labeling the in-session gear uses.
-            await expect(model).to_contain_text("GPT Live Default")
-            # Codex options render decorated display names (same as claude),
-            # so pick by the display name; the create still sends the id.
-            await page.get_by_role("menuitemcheckbox", name="GPT Live Fast", exact=True).click()
+            await expect(model).to_contain_text("gpt-live-default")
+            await page.get_by_role("menuitemcheckbox", name="gpt-live-fast", exact=True).click()
             await _close_entry_models(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")

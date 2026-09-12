@@ -32,8 +32,8 @@ Harness notes:
   wrapper render its tooltip. Same route-patch approach as
   ``mobile/test_composer_model_label_stop_overlap.py``. Everything else —
   the session, the runner, the turn — is the real spawned server.
-- The "existing session" variant first completes a real turn against the
-  mock LLM, so the composer hovered is one of a session with history.
+- The "existing session" variant seeds a committed exchange in the real
+  store, so tooltip verification does not depend on mock LLM routing.
 
 Red while the bug lives: two tooltip surfaces open on one hover. Green after
 a fix: exactly one surface, still carrying harness + model + connection.
@@ -47,12 +47,10 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, reset_mock_llm
+from tests.e2e_ui.conftest import fetch_with_retry, seed_committed_turn
 
 _COMPOSER_LABEL = "Message the agent"
 
-# Unique sentinel so the mock LLM's scripted reply fires only for this test's
-# turn (content-based routing), never for background LLM traffic.
 _SENTINEL = "sentinel-pill-double-tooltip please answer briefly"
 _REPLY = "Acknowledged, turn complete."
 
@@ -210,7 +208,7 @@ def test_new_session_composer_pill_shows_one_tooltip(
     try:
         page.goto(f"{base_url}/c/{session_id}")
         tooltips = _hover_pill_and_collect_tooltips(page)
-        _assert_single_merged_tooltip(tooltips, extra_needles=("Model: Fable 5.1",))
+        _assert_single_merged_tooltip(tooltips, extra_needles=(f"Model: {_MODEL_ID}",))
     finally:
         page.unroute_all(behavior="ignoreErrors")
 
@@ -218,38 +216,27 @@ def test_new_session_composer_pill_shows_one_tooltip(
 def test_existing_session_composer_pill_shows_one_tooltip(
     page: Page,
     seeded_session: tuple[str, str],
-    mock_llm_server_url: str,
 ) -> None:
     """A session with a completed turn opens exactly one pill tooltip.
 
-    Completes one real turn against the mock LLM first, so the composer
-    hovered belongs to an existing session with history.
+    Seeds a committed exchange, then verifies the hydrated history and
+    the existing session's tooltip independently of model execution.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
-    :param mock_llm_server_url: Session-scoped mock LLM server URL.
     :returns: None.
     """
     base_url, session_id = seeded_session
     _patch_session_as_databricks_claude_native(page, session_id)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": _REPLY}],
-        key="pill-double-tooltip-turn",
-        match=_SENTINEL,
-    )
+    seed_committed_turn(session_id, prompt=_SENTINEL, reply=_REPLY)
     try:
         page.goto(f"{base_url}/c/{session_id}")
         composer = page.get_by_label(_COMPOSER_LABEL)
         expect(composer).to_be_visible(timeout=30_000)
-        composer.fill(_SENTINEL)
-        page.get_by_role("button", name="Send", exact=True).click()
-        # The turn is complete once the scripted reply is rendered and the
-        # composer's action button is Send again (working → idle).
-        expect(page.get_by_text(_REPLY)).to_be_visible(timeout=90_000)
+        expect(page.get_by_text(_SENTINEL, exact=True)).to_be_visible()
+        expect(page.get_by_text(_REPLY, exact=True)).to_be_visible()
         expect(page.get_by_role("button", name="Send", exact=True)).to_be_visible(timeout=30_000)
         tooltips = _hover_pill_and_collect_tooltips(page)
-        _assert_single_merged_tooltip(tooltips)
+        _assert_single_merged_tooltip(tooltips, extra_needles=(f"Model: {_MODEL_ID}",))
     finally:
         page.unroute_all(behavior="ignoreErrors")
-        reset_mock_llm(mock_llm_server_url)

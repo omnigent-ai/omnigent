@@ -4246,6 +4246,7 @@ function SessionHarnessPicker({
   const sessionHarness = useChatStore((state) => state.sessionHarness);
   const subAgentName = useChatStore((state) => state.subAgentName);
   const pendingModelChange = useChatStore((state) => state.pendingModelChange);
+  const sessionModelSeeded = useChatStore((state) => state.sessionModelSeeded);
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
@@ -4422,7 +4423,7 @@ function SessionHarnessPicker({
           testIdPrefix: "composer",
           "data-testid": "composer-config-gear",
           pending:
-            pendingModelChange !== null &&
+            (sessionModelSeeded || pendingModelChange !== null) &&
             (modelPickerKind === "claude" || modelPickerKind === "codex"),
         }}
         tooltip={<ComposerConfigTooltipRows rows={summary} />}
@@ -4578,6 +4579,7 @@ function useResolvedComposerModel(
   codexModelOptions: readonly NativeModelOption[],
 ) {
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
+  const sessionModelSeeded = useChatStore((s) => s.sessionModelSeeded);
   const llmModel = useChatStore((s) => s.llmModel);
   const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
 
@@ -4635,15 +4637,17 @@ function useResolvedComposerModel(
   const pickerSelectedModel = isReportedModelPicker
     ? (reportedRowId ?? requestedRowId)
     : sessionModelOverride;
-  const effectiveModel = nativeVendorOwnsModel
-    ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-      ? sessionModelOverride
-      : modelPickerKind === "opencode" || modelPickerKind === "pi"
-        ? (sessionModelOverride ?? llmModel)
-        : null
-    : isReportedModelPicker
-      ? llmModel
-      : (sessionModelOverride ?? llmModel);
+  const effectiveModel = sessionModelSeeded
+    ? (sessionModelOverride ?? llmModel)
+    : nativeVendorOwnsModel
+      ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
+        ? sessionModelOverride
+        : modelPickerKind === "opencode" || modelPickerKind === "pi"
+          ? (sessionModelOverride ?? llmModel)
+          : null
+      : isReportedModelPicker
+        ? llmModel
+        : (sessionModelOverride ?? llmModel);
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
   return {
     llmModel,

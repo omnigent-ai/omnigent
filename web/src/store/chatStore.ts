@@ -344,6 +344,7 @@ export function beginLocalConversation(
       ? {}
       : {
           sessionModelOverride: model.modelOverride,
+          sessionModelSeeded: true,
           sessionReasoningEffort: model.reasoningEffort ?? null,
           // Authoritative only when the caller actually supplied an effort
           // (a value or an intentional null) — an omitted effort stays a
@@ -693,6 +694,7 @@ export interface ConversationState {
    * into the value itself.
    */
   sessionEffortSeeded: boolean;
+  sessionModelSeeded: boolean;
   /**
    * Selected host id seeded at optimistic create, so the temp composer can run
    * routing's per-family gateway guard against the real chosen host before the
@@ -1726,6 +1728,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionModelOverride: null,
   sessionReasoningEffort: null,
   sessionEffortSeeded: false,
+  sessionModelSeeded: false,
   sessionHostId: null,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
@@ -3548,6 +3551,7 @@ function sessionBindingPatch(
   ChatState,
   | "isNativeTerminalSession"
   | "nativeVendorOwnsModel"
+  | "sessionModelSeeded"
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
@@ -3579,6 +3583,7 @@ function sessionBindingPatch(
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
+    sessionModelSeeded: false,
     pendingModelChange: null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
@@ -6078,6 +6083,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // outcome of the ask.
       applyToNamedConversation(event.conversationId, {
         llmModel: event.model,
+        sessionModelSeeded: false,
         pendingModelChange: null,
       });
       return;

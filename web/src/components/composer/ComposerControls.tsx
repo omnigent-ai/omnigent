@@ -114,13 +114,13 @@ export function ComposerPermissionPicker({
         <button
           type="button"
           disabled={disabled}
-          className="flex h-8 w-auto shrink-0 cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7"
+          className="flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7"
           aria-label={`${label}: ${value}`}
           title={`${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span className="whitespace-nowrap text-ui font-normal">{value}</span>
+          <span className="min-w-0 truncate text-ui font-normal">{value}</span>
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
@@ -212,12 +212,13 @@ export const ComposerHarnessTrigger = forwardRef<
         />
       )}
       <span
-        className={cn("inline-flex min-w-0 flex-wrap items-baseline gap-1", labelClassName)}
+        className={cn("inline-flex min-w-0 flex-nowrap items-baseline gap-1", labelClassName)}
         data-testid={`${testIdPrefix}-agent-config-value`}
       >
         {model && (
           <span
-            className="min-w-0 whitespace-normal break-words text-left text-[13px] leading-5 font-medium text-foreground"
+            className="min-w-0 truncate text-left text-[13px] leading-5 font-medium text-foreground"
+            title={model}
             data-testid={`${testIdPrefix}-agent-model-value`}
           >
             {model}

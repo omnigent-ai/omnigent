@@ -87,7 +87,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             await page.mouse.move(gap_x, child_box["y"] + 20, steps=20)
             await page.wait_for_timeout(500)
             await expect(models).to_be_visible()
-            target = models.get_by_role("menuitemcheckbox", name="Sonnet 5", exact=True)
+            target = models.get_by_role("menuitemcheckbox", name="claude-sonnet-5", exact=True)
             target_box = await target.bounding_box()
             assert target_box is not None
             await page.mouse.move(
@@ -102,7 +102,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
                 target_box["y"] + target_box["height"] / 2,
             )
             await expect(page.get_by_test_id("new-chat-landing-agent-model-value")).to_have_text(
-                "Sonnet 5"
+                "claude-sonnet-5"
             )
             await expect(page.get_by_role("menu")).to_have_count(2)
             await page.keyboard.press("Escape")

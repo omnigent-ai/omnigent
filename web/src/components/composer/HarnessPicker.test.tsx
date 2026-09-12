@@ -60,7 +60,7 @@ describe("HarnessPicker", () => {
   it.each([false, true])("shares row geometry and config navigation on mobile=%s", (mobile) => {
     render(<PickerFixture mobile={mobile} />);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
-    expect(screen.getByTestId("menu")).toHaveClass("w-[17.5rem]", "p-2");
+    expect(screen.getByTestId("menu")).toHaveClass("w-max", "min-w-[17.5rem]", "p-2");
     expect(screen.getByTestId("entry")).toHaveClass("min-h-8", "gap-1", "bg-muted");
     expect(screen.getByTestId("model")).toHaveClass("text-right");
     expect(screen.getByTestId("edit")).toHaveTextContent("Edit");

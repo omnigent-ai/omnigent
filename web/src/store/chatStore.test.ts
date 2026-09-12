@@ -5524,6 +5524,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         conversationId: "conv_abc",
         selectedModel: "opus",
         sessionModelOverride: "sonnet",
+        sessionModelSeeded: true,
         llmModel: null,
       });
       handleSessionEvent({
@@ -5533,6 +5534,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       const state = useChatStore.getState();
       expect(state.llmModel).toBe("system.ai.claude-sonnet-5");
+      expect(state.sessionModelSeeded).toBe(false);
       expect(state.selectedModel).toBe("opus");
       expect(state.sessionModelOverride).toBe("sonnet");
     });
@@ -13753,6 +13755,7 @@ describe("beginLocalConversation — optimistic model seed", () => {
     expect(isTempConvId(begun.tempConvId)).toBe(true);
     const state = useChatStore.getState();
     expect(state.sessionModelOverride).toBe("opus[1m]");
+    expect(state.sessionModelSeeded).toBe(true);
     expect(state.sessionReasoningEffort).toBe("high");
     expect(state.sessionHarness).toBe("claude-sdk");
     expect(state.boundAgentId).toBe("agent_xyz");
@@ -13822,6 +13825,7 @@ describe("beginLocalConversation — optimistic model seed", () => {
     expect(state.sessionModelOverride).toBe("opus[1m]");
     expect(state.sessionHarness).toBe("claude-sdk");
     expect(state.boundAgentName).toBe("Debby");
+    expect(state.sessionModelSeeded).toBe(true);
   });
 
   it("is backward compatible: a 4-arg call seeds no model fields", () => {
@@ -13831,6 +13835,7 @@ describe("beginLocalConversation — optimistic model seed", () => {
     const state = useChatStore.getState();
     expect(state.sessionModelOverride).toBeNull();
     expect(state.sessionHarness).toBeNull();
+    expect(state.sessionModelSeeded).toBe(false);
   });
 
   it("marks a seeded null effort authoritative so it wins over a non-null sticky", () => {
