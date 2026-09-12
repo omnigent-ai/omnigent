@@ -308,4 +308,41 @@ describe("customTheme", () => {
     expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe("");
     expect(document.documentElement).not.toHaveAttribute("data-custom-translucent-sidebar");
   });
+
+  it("pins palette-token var() references to the variant's own custom variables", () => {
+    // Non-omni bases keep the palette default `sidebarBackground: var(--sidebar)`.
+    // Applied verbatim, that reference substitutes at the declaring style root —
+    // embedded, the scope root, which never carries `.dark` — so the dark opaque
+    // sidebar rendered the LIGHT palette. The applied value must reference the
+    // mode's own derived variable instead.
+    const scope = document.createElement("div");
+    const inner = document.createElement("div");
+    setEmbedScopeRoot(scope);
+    setEmbedRoot(inner);
+    applyCustomTheme({
+      basePalette: "dracula",
+      accent: "#7c3aed",
+      darkAccent: "#bd93f9",
+      tint: "#f7f5fd",
+      darkTint: "#282a36",
+      contrast: 60,
+      translucentSidebar: false,
+    });
+
+    const style = scope.style;
+    expect(style.getPropertyValue("--custom-dark-sidebar-background")).toBe(
+      "var(--custom-dark-sidebar)",
+    );
+    expect(style.getPropertyValue("--custom-light-sidebar-background")).toBe(
+      "var(--custom-light-sidebar)",
+    );
+    // Values mixing several token references are pinned per reference.
+    expect(style.getPropertyValue("--custom-dark-sidebar-active")).toBe(
+      "color-mix(in srgb, var(--custom-dark-sidebar-foreground) 7%, var(--custom-dark-sidebar))",
+    );
+    // The pinned target resolves to a concrete color on the same root.
+    expect(style.getPropertyValue("--custom-dark-sidebar")).not.toContain("var(");
+    // Concrete values pass through untouched.
+    expect(style.getPropertyValue("--custom-dark-background")).toBe("#282a36");
+  });
 });
