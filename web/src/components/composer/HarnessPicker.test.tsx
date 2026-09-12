@@ -75,3 +75,32 @@ describe("HarnessPicker", () => {
     expect(screen.queryByTestId("menu")).not.toBeInTheDocument();
   });
 });
+
+describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
+  function openConfig() {
+    render(<PickerFixture />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+    fireEvent.click(screen.getByTestId("entry"));
+    expect(screen.getByText("Model configuration")).toBeInTheDocument();
+  }
+
+  it("closes the config flyout on a second click of the open row (pointer toggle)", () => {
+    openConfig();
+    // Second click on the already-open row toggles the flyout closed rather than
+    // leaving it stuck open (pointer-move suppression blocks hover-out close).
+    fireEvent.click(screen.getByTestId("entry"));
+    expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
+    // The parent harness menu stays open so the user can pick another row.
+    expect(screen.getByTestId("menu")).toBeInTheDocument();
+  });
+
+  it("closes only the config flyout on Escape and keeps the harness menu open (keyboard)", () => {
+    openConfig();
+    const flyout = screen.getByText("Model configuration").closest('[role="menu"]');
+    expect(flyout).not.toBeNull();
+    fireEvent.keyDown(flyout as HTMLElement, { key: "Escape" });
+    expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
+    // Escape is scoped to the flyout: the parent menu must not also dismiss.
+    expect(screen.getByTestId("menu")).toBeInTheDocument();
+  });
+});

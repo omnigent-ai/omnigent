@@ -130,7 +130,20 @@ export function HarnessPickerEntry({
   if (editable && !isMobile) {
     return (
       <DropdownMenuSub open={open} onOpenChange={onOpenChange}>
-        <DropdownMenuSubTrigger {...rowProps} onPointerMove={(event) => event.preventDefault()}>
+        <DropdownMenuSubTrigger
+          {...rowProps}
+          onPointerMove={(event) => event.preventDefault()}
+          onClick={(event) => {
+            // A second click on an already-open row toggles the config flyout
+            // closed (#7069). Pointer-move is suppressed on this trigger, which
+            // blocks the natural hover-out close, so an explicit pointer
+            // dismissal is required to match the keyboard path.
+            if (open) {
+              event.preventDefault();
+              onOpenChange(false);
+            }
+          }}
+        >
           {rowContent}
         </DropdownMenuSubTrigger>
         <DropdownMenuSubContent
@@ -138,6 +151,14 @@ export function HarnessPickerEntry({
           sideOffset={16}
           collisionPadding={12}
           data-testid={configTestId}
+          onEscapeKeyDown={(event) => {
+            // Escape closes only this config flyout and returns focus to its
+            // row, rather than dismissing the whole harness menu (#7069).
+            // preventDefault stops the shared dismiss layer from also closing
+            // the parent menu.
+            event.preventDefault();
+            onOpenChange(false);
+          }}
           onFocusOutside={(event) => {
             if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
               event.preventDefault();
