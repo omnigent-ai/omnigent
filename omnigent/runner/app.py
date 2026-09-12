@@ -1815,6 +1815,27 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
     return sorted(entries, key=lambda entry: entry.created_at)
 
 
+# Harness whose sub-agents live as threads inside the parent's own app-server.
+_CODEX_NATIVE_HARNESS = "codex-native"
+
+
+def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
+    """
+    Whether a child's wrapper label marks it a codex-native sub-agent.
+
+    Covers both a codex-spawned sub-agent and a ``/side`` side chat: each is a
+    thread inside the parent's own app-server, so codex consumes its result in
+    the thread tree and the parent is never waiting on the Omnigent inbox for it.
+
+    :param wrapper_label: The child's ``omnigent.wrapper`` label, or ``None``.
+    :returns: ``True`` when the child is a codex-native sub-agent.
+    """
+    if wrapper_label is None:
+        return False
+    agent = native_coding_agent_for_harness(_CODEX_NATIVE_HARNESS)
+    return agent is not None and wrapper_label == agent.subagent_wrapper_label
+
+
 def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
     """
     Return the dispatch id of a child turn whose result the parent never drained.
@@ -1831,6 +1852,25 @@ def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None
     if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
         return None
     return dispatch_id
+
+
+def _side_chat_text_from_content(content: object) -> str:
+    """
+    Join user text from message content blocks for a Codex ``/side`` follow-up.
+
+    :param content: A message body's ``content`` list, e.g.
+        ``[{"type": "input_text", "text": "and why?"}]``.
+    :returns: The concatenated text, or ``""`` when there is none.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts).strip()
 
 
 class _SubagentRecoveryReadError(Exception):
@@ -5222,6 +5262,28 @@ def create_runner_app(
             return None
         return state
 
+    async def _codex_native_bridge_dir_for_session(conv_id: str) -> Path:
+        """
+        Bridge directory for a codex-native session.
+
+        Same resolution as :func:`_codex_native_bridge_state_for_session` — the
+        bridge id label when present, else the conversation id — so a request
+        written here lands in the directory the forwarder polls.
+
+        :param conv_id: Conversation id, e.g. ``"conv_abc123"``.
+        :returns: The session's bridge directory.
+        """
+        from omnigent.harnesses.codex_native.bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+        )
+
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        return bridge_dir_for_bridge_id(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id)
+
     codex_goal_runner = CodexGoalRunner(
         bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
@@ -7234,6 +7296,16 @@ def create_runner_app(
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
+        # A codex-native sub-agent (a /side side chat, or one codex spawned) is a
+        # thread in the parent's own app-server, so its completion is not the
+        # parent's to collect — waking the parent would inject an inbox notice
+        # into a chat the user is reading. The wrapper label is only set by the
+        # spawn-tool path, so a forwarder-registered child is caught by the
+        # parent's harness instead.
+        if is_codex_native_subagent_wrapper(entry.wrapper_label) or (
+            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
+        ):
+            return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
             return
@@ -8852,6 +8924,72 @@ def create_runner_app(
             body.get("model_override") if isinstance(body, dict) else None,
             extra={"session_id": conversation_id},
         )
+        _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
+        if _side_thread_id:
+            # Codex /side follow-up: the server redirected a side-chat child's
+            # message here (this endpoint's conversation_id is the PARENT), tagged
+            # with the child Codex thread id. Drive it on that thread via the
+            # parent's bridge, isolated from the parent's turn buffer/active-turn
+            # state on purpose so the main conversation is untouched.
+            from omnigent.harnesses.codex_native import side_chat
+            from omnigent.harnesses.codex_native.app_server import client_for_transport
+
+            _side_text = _side_chat_text_from_content(
+                body.get("content") if isinstance(body, dict) else None
+            )
+            if not _side_text:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "side chat message had no text",
+                    },
+                )
+            _side_state = await _codex_native_bridge_state_for_session(
+                conversation_id, action="side chat turn"
+            )
+            if _side_state is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_no_bridge",
+                        "detail": "Codex /side follow-up requires a loaded parent Codex bridge.",
+                    },
+                )
+            _side_client = client_for_transport(
+                _side_state.socket_path, client_name="omnigent-codex-native-runner"
+            )
+            try:
+                await _side_client.connect()
+                await side_chat.submit_side_turn(_side_client, str(_side_thread_id), _side_text)
+            finally:
+                await _side_client.close()
+            return Response(status_code=202)
+        if body_type == "message" and isinstance(body, dict):
+            # A codex /side command opens a side chat; it must not run a turn
+            # here. Starting one publishes a "running" edge for this session,
+            # and the fork's settling edges belong to the child — idle is
+            # forwarder-owned for codex-native — so nothing would ever clear it
+            # and the chat would sit on "Working…" for good.
+            from omnigent.harnesses.codex_native import side_chat as _side_chat
+
+            _side_question = _side_chat.side_chat_question_from_text(
+                _side_chat_text_from_content(body.get("content"))
+            )
+            if (
+                _side_question is not None
+                and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
+            ):
+                _side_chat.request_side_chat(
+                    await _codex_native_bridge_dir_for_session(conversation_id),
+                    _side_question,
+                )
+                _logger.info(
+                    "Codex /side recorded without starting a turn: conv=%s",
+                    conversation_id,
+                    extra={"session_id": conversation_id},
+                )
+                return Response(status_code=202)
         if body_type == "message" or body_type is None:
             if not isinstance(body, dict):
                 return JSONResponse(

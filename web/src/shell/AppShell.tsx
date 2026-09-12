@@ -77,6 +77,7 @@ import {
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
+  nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -1521,6 +1522,17 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
+  // A `/side` fork the user just opened: reveal it in the Agents rail so the
+  // move out of the main chat is visible. `ChatPage` does the navigation off
+  // `redirectToConversationId`; this only owns the rail, which lives here.
+  const sideChatRailRequest = useChatStore((s) => s.sideChatRailRequest);
+  const clearSideChatRailRequest = useChatStore((s) => s.clearSideChatRailRequest);
+  useEffect(() => {
+    if (sideChatRailRequest === null) return;
+    handleRightRailTabChange("subagents");
+    clearSideChatRailRequest();
+  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange]);
+
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
@@ -1799,7 +1811,13 @@ export function AppShell() {
     typeof createdAtS === "number" &&
     createdAtS > 0 &&
     Date.now() / 1000 - createdAtS < STARTING_GRACE_S;
+  // A native sub-agent mirror — a codex `/side` side chat, or a sub-agent codex
+  // spawned — is a thread inside the parent's CLI and never gets a terminal of
+  // its own, so this spinner would spin forever instead of resolving.
+  const isNativeSubagentMirror =
+    nativeCodingAgentForSubagentWrapper(sessionLabels[WRAPPER_LABEL_KEY]) !== undefined;
   const terminalStartingUp =
+    !isNativeSubagentMirror &&
     !terminalsAvailable &&
     (sessionStatus !== "failed" || chatStatus === "streaming" || launchPending) &&
     (livenessRowPending ||

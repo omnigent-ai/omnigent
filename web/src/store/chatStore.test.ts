@@ -6500,8 +6500,85 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("codex /side send", () => {
+    it("neither bubbles in the parent nor latches it into Working", async () => {
+      // The command is forked into a side chat, so this session runs nothing:
+      // a bubble would sit unanswered and a "streaming" latch would never clear.
+      seedSession("conv_codex_side", []);
+      await useChatStore.getState().switchTo("conv_codex_side");
+      useChatStore.setState({ sessionHarness: "codex-native", awaitingSideChatFor: null });
+
+      await useChatStore.getState().send("/side what was my last message?", "agent_xyz");
+
+      const after = useChatStore.getState();
+      expect(after.pendingUserMessages).toHaveLength(0);
+      expect(after.status).not.toBe("streaming");
+      // armed, so the fork's session.created moves the user into it
+      expect(after.awaitingSideChatFor).toBe("conv_codex_side");
+    });
+
+    it("still bubbles and latches for an ordinary message", async () => {
+      seedSession("conv_codex_plain", []);
+      await useChatStore.getState().switchTo("conv_codex_plain");
+      useChatStore.setState({ sessionHarness: "codex-native", awaitingSideChatFor: null });
+
+      await useChatStore.getState().send("hello", "agent_xyz");
+
+      const after = useChatStore.getState();
+      expect(after.pendingUserMessages).toHaveLength(1);
+      expect(after.awaitingSideChatFor).toBeNull();
+    });
+  });
+
   describe("session.created", () => {
+    it("opens the side chat the user asked for with /side", () => {
+      // `awaitingSideChatFor` is set when the command is sent; the fork's
+      // session.created then moves the user into it and reveals the rail.
+      useChatStore.setState({
+        conversationId: "conv_parent",
+        awaitingSideChatFor: "conv_parent",
+        redirectToConversationId: null,
+        sideChatRailRequest: null,
+      });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_parent",
+        childSessionId: "conv_side",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_parent",
+      } as SessionCreatedEvent);
+
+      const after = useChatStore.getState();
+      expect(after.redirectToConversationId).toBe("conv_side");
+      expect(after.sideChatRailRequest).toBe("conv_side");
+      // one-shot: a later spawn must not move the user again
+      expect(after.awaitingSideChatFor).toBeNull();
+    });
+
+    it("does not move the user for an agent-spawned sub-agent", () => {
+      useChatStore.setState({
+        conversationId: "conv_parent",
+        awaitingSideChatFor: null,
+        redirectToConversationId: null,
+        sideChatRailRequest: null,
+      });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_parent",
+      } as SessionCreatedEvent);
+
+      const after = useChatStore.getState();
+      expect(after.redirectToConversationId).toBeNull();
+      expect(after.sideChatRailRequest).toBeNull();
+    });
+
     it("is a no-op (sub-agent rendering is future work — R8)", () => {
+      useChatStore.setState({ awaitingSideChatFor: null });
       const before = useChatStore.getState();
       const event: SessionCreatedEvent = {
         type: "session_created",

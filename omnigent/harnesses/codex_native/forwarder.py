@@ -17,6 +17,7 @@ import httpx
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexMessage,
@@ -117,6 +118,10 @@ _EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
 # handlers are harmless no-ops if a build spells these differently.
 _CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
 _CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
+# How often the forwarder claims pending ``/side`` questions from the bridge dir.
+# The executor writes one and returns, so this is the delay before the side chat
+# starts; a fork is cheap, so poll fast enough to feel immediate.
+_SIDE_CHAT_POLL_SECONDS = 0.05
 # Transient reasoning (chain-of-thought) delta — the reasoning analogue of
 # ``external_output_text_delta``. Nothing is persisted; it publishes
 # ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
@@ -2104,6 +2109,10 @@ async def supervise_forwarder(
             ),
             name="codex-native-forwarder-subscribe",
         )
+        side_chat_task = asyncio.create_task(
+            _drive_side_chat_requests(client, bridge_dir=bridge_dir, target=target),
+            name="codex-native-forwarder-side-chat",
+        )
         await _sleep(0)
         try:
             async for event in client.iter_events():
@@ -2144,6 +2153,16 @@ async def supervise_forwarder(
                     # waiting forever on an idle fresh thread.
                     if not thread_active.is_set() and _event_indicates_thread_active(event):
                         thread_active.set()
+                    # Surface a /side ephemeral fork as its own sub-agent (rail)
+                    # child. No-op unless this event is a fork of the active
+                    # thread; once mapped, the fork's events route to the child.
+                    await side_chat.register_side_fork_child(
+                        ap_client,
+                        forwarder_state=forwarder_state,
+                        parent_session_id=target.session_id,
+                        parent_thread_id=target.thread_id,
+                        event=event,
+                    )
                     await _handle_event(
                         ap_client,
                         session_id=target.session_id,
@@ -2169,7 +2188,48 @@ async def supervise_forwarder(
             subscribe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await subscribe_task
+            side_chat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await side_chat_task
             await client.close()
+
+
+async def _drive_side_chat_requests(
+    codex_client: CodexAppServerClient,
+    *,
+    bridge_dir: Path,
+    target: _ForwarderTarget,
+) -> None:
+    """
+    Fork the ``/side`` questions the executor recorded, on this connection.
+
+    The fork has to happen here: whoever calls ``thread/fork`` owns the fork's
+    event stream, and the executor's client closes as soon as it submits the
+    turn, so a fork made there streams its answer into a dead connection. The
+    fork's ``thread/started`` then registers the rail child through the normal
+    event path.
+
+    :param codex_client: The forwarder's long-lived app-server client.
+    :param bridge_dir: Native Codex bridge directory holding the requests.
+    :param target: Live forwarder target, read for the current parent thread id.
+    :returns: None. Runs until cancelled.
+    """
+    while True:
+        try:
+            for question in side_chat.take_side_chat_requests(bridge_dir):
+                parent_thread_id = target.thread_id
+                if parent_thread_id is None:
+                    continue
+                child_thread_id = await side_chat.open_side_chat_on_client(
+                    codex_client,
+                    parent_thread_id=parent_thread_id,
+                    question=question,
+                )
+                if child_thread_id is None:
+                    _logger.warning("Codex /side fork returned no thread id")
+        except Exception:  # noqa: BLE001 - a bad request must not kill the loop.
+            _logger.warning("Codex /side fork failed", exc_info=True)
+        await _sleep(_SIDE_CHAT_POLL_SECONDS)
 
 
 async def _maybe_rotate_session_on_thread_started(
@@ -5300,6 +5360,12 @@ async def _register_child_session(
     tool_call_id = item.get("id")
     if isinstance(tool_call_id, str) and tool_call_id:
         data["tool_call_id"] = tool_call_id
+    # Display name for the child. Without it the server stamps its fixed
+    # fallback and the title keeps the raw thread id, which surfaces as a UUID
+    # in the sub-agent rail and the composer tray.
+    nickname = item.get("agent_nickname")
+    if isinstance(nickname, str) and nickname:
+        data["agent_nickname"] = nickname
     response = await _post_session_event(
         client,
         parent_session_id,

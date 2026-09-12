@@ -106,6 +106,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { isSideChatCommand } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
 // ids without an import cycle back to the store.
@@ -735,6 +736,19 @@ export interface ConversationState {
    */
   sessionHarness: string | null;
   /**
+   * Parent conversation whose `/side` command is waiting for its fork, or null.
+   * Set when the command is sent and consumed by the next `session_created` on
+   * that conversation, so only the user who typed `/side` is moved into it — a
+   * background sub-agent spawn must never yank anyone.
+   */
+  awaitingSideChatFor: string | null;
+  /**
+   * Side-chat child to reveal in the sub-agents rail, or null. `AppShell`
+   * observes it, switches the rail to Agents, and clears it; navigation rides
+   * the existing `redirectToConversationId` channel.
+   */
+  sideChatRailRequest: string | null;
+  /**
    * The active session's sub-agent head name (e.g. `"gpt"`), or null for a
    * top-level session. Set from the snapshot on bind; lets a head sub-agent's
    * composer identity name the head rather than the bundle orchestrator.
@@ -938,6 +952,7 @@ export interface AppChatState {
 /** Actions exposed on the root store. */
 export interface ChatActions {
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  clearSideChatRailRequest: () => void;
   /**
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
@@ -1663,6 +1678,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   llmModel: null,
   pendingModelChange: null,
   sessionHarness: null,
+  awaitingSideChatFor: null,
+  sideChatRailRequest: null,
   subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
@@ -1909,6 +1926,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  clearSideChatRailRequest: () => {
+    useChatStore.setState({ sideChatRailRequest: null });
+  },
   send: async (text, agentId, files, opts) => {
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
@@ -1936,13 +1956,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // shimmer) but has no `sendLatchedAt`. Treat it as NOT-already-streaming so
     // this send arms the latch and owns the failure-settle — otherwise a failed
     // first turn would strand the conversation in "streaming" with no watchdog.
+    // A codex `/side` command is forked into its own side chat: it gets no
+    // bubble here, and this session must not latch into "Working…" either —
+    // nothing runs here, so nothing would ever arrive to clear it.
+    const opensSideChat = get().sessionHarness === "codex-native" && isSideChatCommand(text.trim());
+    if (opensSideChat) {
+      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
+    }
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
-    if (!alreadyStreaming) {
+    if (!alreadyStreaming && !opensSideChat) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
@@ -1984,15 +2011,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const selfAuthor = getCurrentAuthorId();
     if (reuseTempId === null) {
       pinnedSetter((s) => ({
-        pendingUserMessages: [
-          ...s.pendingUserMessages,
-          {
-            tempId,
-            content,
-            createdAtS: Math.floor(Date.now() / 1000),
-            ...(selfAuthor !== null ? { author: selfAuthor } : {}),
-          },
-        ],
+        pendingUserMessages: opensSideChat
+          ? s.pendingUserMessages
+          : [
+              ...s.pendingUserMessages,
+              {
+                tempId,
+                content,
+                createdAtS: Math.floor(Date.now() / 1000),
+                ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+              },
+            ],
         // A new turn does NOT supersede the background-shell tally: shells
         // launched in an earlier turn keep running across the turn boundary, so
         // the composer pill must stay lit alongside the "Working…" shimmer rather
@@ -6528,6 +6557,19 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       finalizeCurrentActive("cancelled", event.responseId, sourceConversationId);
       return;
     case "session_created":
+      // A fork the user asked for with `/side`: follow them into it and reveal
+      // the rail, so the move out of the main chat is visible. Guarded on
+      // `awaitingSideChatFor` so an agent-spawned sub-agent never navigates
+      // anyone. Navigation reuses `redirectToConversationId` (ChatPage drives
+      // the router).
+      useChatStore.setState((s) => {
+        if (!event.childSessionId || s.awaitingSideChatFor !== event.conversationId) return {};
+        return {
+          awaitingSideChatFor: null,
+          redirectToConversationId: event.childSessionId,
+          sideChatRailRequest: event.childSessionId,
+        };
+      });
       // Sub-agent spawn signal. Invalidate the parent's child-sessions
       // query so the execution-log panel re-fetches and renders the
       // new child without waiting for the next poll or manual refresh.

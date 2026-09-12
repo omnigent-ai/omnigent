@@ -1980,6 +1980,7 @@ export function buildSlashCommandMap(
   showModel: boolean,
   showCompact = true,
   showBtw = false,
+  showSide = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -1988,6 +1989,8 @@ export function buildSlashCommandMap(
     if (name === "/compact" && !showCompact) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
+    // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
+    if (name === "/side" && !showSide) continue;
     m[name] = description;
   }
   for (const skill of skills) {
@@ -2016,12 +2019,15 @@ export function buildSlashCommandWithArgsSet(
   showEffort: boolean,
   showModel: boolean,
   showBtw = false,
+  showSide = false,
 ): Set<string> {
   const s = new Set<string>();
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
   // Selecting /btw fills "/btw " so the user types the side question after it.
   if (showBtw) s.add("/btw");
+  // Selecting /side fills "/side " so the user types the side question after it.
+  if (showSide) s.add("/side");
   for (const skill of skills) s.add(`/${skill.name}`);
   return s;
 }
@@ -2299,17 +2305,13 @@ export function subAgentComposerLabel(
 }
 
 /**
- * Peeking tray tucked behind the composer's top edge while the active
- * session is a sub-agent (child) — names the sub-agent the message is going
- * to, so the composer reads as "messaging the sub-agent", not the
- * orchestrator. Mirrors ``ComposerStatusLine`` (the worktree/context shelf
- * below the card) but rises above it: ``-mb-4`` slides the tray's square
- * bottom corners down behind the card (the 16px overlap exceeds the card's
- * ~14px corner radius, hiding them behind its straight sides) and ``pb-5.5``
- * re-reserves the hidden region so the label sits above the card's top edge.
- * The card is ``position:relative`` and paints on top, so its own top border
- * is the divider. Brand pink (``brand-accent``) marks this as a sub-agent
- * context cue, not a status.
+ * Shelf above the composer while the active session is a sub-agent (child) —
+ * names the sub-agent the message is going to, so the composer reads as
+ * "messaging the sub-agent", not the orchestrator. It sits directly on
+ * ``ComposerWorkspaceBar`` and shares that bar's ``mx-3`` inset so their edges
+ * line up; ``-mb-px`` collapses the seam. The tray owns the stack's rounded
+ * top, so the bar squares its own top corners while the tray shows. Brand pink
+ * (``brand-accent``) marks this as a sub-agent context cue, not a status.
  *
  * @param label - The sub-agent instance name, e.g.
  *   ``"check-account-eligibility"`` (from ``subAgentComposerLabel``).
@@ -2319,8 +2321,7 @@ function SubagentComposerTray({ label }: { label: string }) {
     <div
       data-testid="composer-subagent-tray"
       className={cn(
-        "mx-auto -mb-4 flex w-full items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-sm text-brand-accent",
-        COMPOSER_COLUMN_WIDTH,
+        "-mb-px mx-3 flex items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 py-1.5 text-sm text-brand-accent",
       )}
     >
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
@@ -2680,16 +2681,20 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
+  // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
+  // only on codex-native sessions. Selected/typed, it sends as plaintext to the
+  // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
+  const showSide = sessionHarness === "codex-native";
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw),
-    [skills, showEffort, showModel, showCompact, showBtw],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw, showSide),
+    [skills, showEffort, showModel, showCompact, showBtw, showSide],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
-    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw),
-    [skills, showEffort, showModel, showBtw],
+    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw, showSide),
+    [skills, showEffort, showModel, showBtw, showSide],
   );
 
   // Suggestions menu is open while the user is still typing the command
@@ -3169,7 +3174,12 @@ function ComposerImpl(
       // executed locally. It must reach the vendor TUI as plaintext so Claude
       // Code opens its side chat and the forwarder relays the answer to the
       // web overlay; fall through to the plaintext send path below.
-      if (cmd !== "/btw" && cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
+      if (
+        cmd !== "/btw" &&
+        cmd !== "/side" &&
+        cmd in BUILTIN_SLASH_COMMANDS &&
+        cmd in slashCommands
+      ) {
         executeSlashCommand(cmd, arg);
         return;
       }
@@ -3435,15 +3445,17 @@ function ComposerImpl(
         onReorder={reorderQueuedMessage}
         widthClassName={COMPOSER_COLUMN_WIDTH}
       />
-      {/* Sub-agent context tray — peeks above the card; reserves its own
-          layout slot so the card sits below it (see SubagentComposerTray).
-          Truthy (not just non-null) so an empty label never peeks a
-          nameless tray. */}
-      {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
       {/* Drop cue, spanning the chat column this composer belongs to. */}
       {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
-        <ComposerWorkspaceBar data-testid="composer-workspace-controls">
+        {/* Sub-agent context tray — the rounded top of the composer stack, in
+            the column so it shares the shelf's inset. Truthy (not just
+            non-null) so an empty label never peeks a nameless tray. */}
+        {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+        <ComposerWorkspaceBar
+          data-testid="composer-workspace-controls"
+          className={subAgentLabel ? "rounded-t-none" : undefined}
+        >
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <ComposerWorkspaceTrigger
