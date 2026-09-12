@@ -1705,7 +1705,9 @@ export function AppShell() {
       } finally {
         landingShellCreating.current = false;
       }
-    })().catch(() => toast.error("Couldn't open shell. Check the selected host and try again."));
+    })().catch((error: unknown) =>
+      toast.error(error instanceof Error ? error.message : "Couldn't open shell."),
+    );
   }, [
     landingWorkspace.selection,
     landingWorkspace.browserNamespace,

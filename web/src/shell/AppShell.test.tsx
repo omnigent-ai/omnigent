@@ -17,6 +17,7 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ReactNode, useEffect } from "react";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -4324,6 +4325,36 @@ describe("new-chat workspace rail", () => {
     );
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
     expect(readLandingWorkspaceState().panel.selectedTerminalKey).not.toBe("terminal:late");
+  });
+
+  it("shows the host upgrade detail when the new-shell shortcut fails", async () => {
+    const { publishLandingWorkspaceSelection } = await import("@/lib/landingWorkspaceState");
+    publishLandingWorkspaceSelection({
+      hostId: "older-host",
+      workspace: "/workspace-a",
+      available: true,
+      reason: "",
+    });
+    const detail = "draft workspace create failed: 409 Conflict — upgrade this host";
+    draftWorkspaceState.ensureContext.mockRejectedValue(new Error(detail));
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => undefined);
+    try {
+      mockConversations([]);
+      renderShell("/");
+
+      const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+      fireEvent.keyDown(window, {
+        code: "KeyT",
+        altKey: true,
+        metaKey: isMac,
+        ctrlKey: !isMac,
+      });
+
+      await waitFor(() => expect(errorToast).toHaveBeenCalledWith(detail));
+      expect(draftWorkspaceState.createTerminal).not.toHaveBeenCalled();
+    } finally {
+      errorToast.mockRestore();
+    }
   });
 
   it("starts collapsed despite an open saved draft and global preference, preserving draft tools", async () => {
