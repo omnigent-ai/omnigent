@@ -86,6 +86,18 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
+# Posted in place of the "Working on it…" ack when shutdown cancels a turn
+# mid-flight: the restarted bot is no longer listening for that turn, so its
+# result will never land here — say so instead of leaving the ack up forever.
+_RESTART_ABANDONED_TEXT = (
+    ":warning: I was restarted while working on this and lost track of it, so "
+    "I won't be replying here. Please send your message again."
+)
+
+# How long a cancelled turn may spend replacing its ack with the notice above.
+# Shutdown's gather waits on every cancelled turn, so this bounds the restart.
+_SHUTDOWN_NOTICE_GRACE_SECONDS = 5.0
+
 # Shown when a MANAGED session has no runner: usually the server is still
 # provisioning its sandbox (tens of seconds on a first message), but the server
 # raises the SAME 503 ``runner_unavailable`` when the sandbox launch failed
@@ -470,20 +482,36 @@ class SlackOmnigentService:
                 )
                 activity = await omnigent.get_session_activity(record.session_id)
                 if activity.needs_user_action or activity.is_busy:
-                    self._logger.info(
-                        "Server busy thread=%s status=%s pending=%s; deflecting",
-                        key.display(),
-                        activity.status,
-                        activity.pending_elicitation,
-                    )
-                    await self._notifier.notify_thread_busy(
-                        client,
-                        key,
-                        requester,
-                        needs_action=activity.needs_user_action,
-                        session_id=record.session_id,
-                    )
-                    return
+                    # A busy verdict can be a dead promise: a still-set inflight
+                    # marker with no local stream means a restart abandoned this
+                    # thread's turn, so nobody would ever deliver the promised
+                    # reply. Run the follow-up instead (the server safely buffers
+                    # a message that races the orphaned turn). A pending
+                    # elicitation still deflects — answering it (here or in the
+                    # web UI) works across a restart.
+                    if record.turn_inflight and not activity.needs_user_action:
+                        self._logger.info(
+                            "Server busy thread=%s status=%s but the turn was "
+                            "abandoned by a restart; running follow-up",
+                            key.display(),
+                            activity.status,
+                        )
+                        await self._notifier.notify_stale_turn_dropped(client, key, requester)
+                    else:
+                        self._logger.info(
+                            "Server busy thread=%s status=%s pending=%s; deflecting",
+                            key.display(),
+                            activity.status,
+                            activity.pending_elicitation,
+                        )
+                        await self._notifier.notify_thread_busy(
+                            client,
+                            key,
+                            requester,
+                            needs_action=activity.needs_user_action,
+                            session_id=record.session_id,
+                        )
+                        return
                 self._spawn_turn(
                     SlackTurn(
                         key=key,
@@ -599,42 +627,61 @@ class SlackOmnigentService:
         # flush, and is cleared once the reply is actually on screen.
         reply.set_ack(await self._notifier.post_ack(turn.slack_client, turn.key, _ACK_TEXT))
 
-        # Baseline the newest assistant message BEFORE the turn runs, so the
-        # no-delta fallback below can tell this turn's answer from a prior one.
-        baseline = await omnigent.latest_assistant_message(session_id)
-
+        cancelled = False
         try:
-            errored = await self._stream_turn(turn, omnigent, session_id, reply)
-        except _TurnAborted:
-            # A known mid-stream error already delivered its message and stopped
-            # the reply; nothing left to finalize.
-            return
+            # Baseline the newest assistant message BEFORE the turn runs, so the
+            # no-delta fallback below can tell this turn's answer from a prior one.
+            baseline = await omnigent.latest_assistant_message(session_id)
 
-        if reply.needs_fallback_text():
-            # Last-resort safety net: the turn delivered no answer text on the
-            # stream at all. Recover the server's newest assistant message, but
-            # only when it's genuinely new: it must differ from the pre-turn
-            # baseline (else a no-answer turn like a denied approval would
-            # resurrect the PREVIOUS turn's message) AND not be something an
-            # earlier sealed segment this turn already showed (else a trailing
-            # notice would re-post the answer we just streamed). Compare the whole
-            # (id, text) tuple so an id-less message is judged by its text.
-            # (The pure-push elicitation model keeps the stream reading across a
-            # park, so a post-approval answer now streams normally rather than
-            # relying on this fetch.)
-            latest = await omnigent.latest_assistant_message(session_id)
-            if (
-                latest is not None
-                and latest != baseline
-                and not reply.already_delivered(latest[1])
-            ):
-                reply.set_fallback_text(latest[1])
-        delivered_answer = await reply.finalize(errored=errored)
-        if errored and delivered_answer:
-            # An answer streamed AND the turn errored — post the generic failure
-            # as a separate reply so the answer stays intact. The detail was
-            # already logged in _stream_turn; never echo it to the channel.
-            await self._notifier.post_failure_reply(turn.slack_client, turn.key)
+            # Persist that this process owns the thread's live stream before the
+            # turn reaches the server. Cleared on every ending except a mid-flight
+            # cancellation, where the surviving marker tells the next follow-up
+            # that nobody is streaming this turn anymore (see _route_turn).
+            await self._mark_turn_inflight(turn.key, True)
+
+            try:
+                errored = await self._stream_turn(turn, omnigent, session_id, reply)
+            except _TurnAborted:
+                # A known mid-stream error already delivered its message and stopped
+                # the reply; nothing left to finalize.
+                return
+
+            if reply.needs_fallback_text():
+                # Last-resort safety net: the turn delivered no answer text on the
+                # stream at all. Recover the server's newest assistant message, but
+                # only when it's genuinely new: it must differ from the pre-turn
+                # baseline (else a no-answer turn like a denied approval would
+                # resurrect the PREVIOUS turn's message) AND not be something an
+                # earlier sealed segment this turn already showed (else a trailing
+                # notice would re-post the answer we just streamed). Compare the whole
+                # (id, text) tuple so an id-less message is judged by its text.
+                # (The pure-push elicitation model keeps the stream reading across a
+                # park, so a post-approval answer now streams normally rather than
+                # relying on this fetch.)
+                latest = await omnigent.latest_assistant_message(session_id)
+                if (
+                    latest is not None
+                    and latest != baseline
+                    and not reply.already_delivered(latest[1])
+                ):
+                    reply.set_fallback_text(latest[1])
+            delivered_answer = await reply.finalize(errored=errored)
+            if errored and delivered_answer:
+                # An answer streamed AND the turn errored — post the generic failure
+                # as a separate reply so the answer stays intact. The detail was
+                # already logged in _stream_turn; never echo it to the channel.
+                await self._notifier.post_failure_reply(turn.slack_client, turn.key)
+        except asyncio.CancelledError:
+            # Bot shutdown (deploy/restart) cancelled the turn mid-flight: swap
+            # the stranded "Working on it…" ack for an honest notice. The
+            # inflight marker stays set so a follow-up isn't deflected with a
+            # "still working" promise nobody will keep.
+            cancelled = True
+            await self._deliver_restart_notice(turn, reply)
+            raise
+        finally:
+            if not cancelled:
+                await self._mark_turn_inflight(turn.key, False)
 
         self._logger.info(
             "Completed Slack turn thread=%s session=%s streamed_chars=%s segments=%s errored=%s",
@@ -644,6 +691,36 @@ class SlackOmnigentService:
             reply.segments,
             errored,
         )
+
+    async def _mark_turn_inflight(self, key: ThreadKey, inflight: bool) -> None:
+        # Best-effort: marker bookkeeping must never fail or abort a turn. A
+        # missed write only degrades to the old deflection behavior.
+        try:
+            await self._store.set_turn_inflight(key, inflight)
+        except Exception:
+            self._logger.warning(
+                "Failed to persist turn-inflight=%s thread=%s", inflight, key.display()
+            )
+
+    async def _deliver_restart_notice(self, turn: SlackTurn, reply: _AnswerReply) -> None:
+        """Replace the stranded ack with an honest notice for a cancelled turn.
+
+        Best-effort and time-bounded: shutdown's gather waits on the cancelled
+        turn, so a slow or failing Slack call must not stall the restart, and
+        the caller re-raises the cancellation either way.
+        """
+        try:
+            await asyncio.wait_for(
+                reply.stop_with(_RESTART_ABANDONED_TEXT), _SHUTDOWN_NOTICE_GRACE_SECONDS
+            )
+        except asyncio.CancelledError:
+            # A second cancel arrived during the grace window: give up quietly
+            # (the caller re-raises the original cancellation).
+            self._logger.warning(
+                "Restart notice cancelled mid-delivery thread=%s", turn.key.display()
+            )
+        except Exception:
+            self._logger.warning("Failed to deliver restart notice thread=%s", turn.key.display())
 
     async def _notify_auth_expired(self, turn: SlackTurn, reply: _AnswerReply) -> None:
         """Deliver the expired-login re-login prompt as a DM with a setup button.

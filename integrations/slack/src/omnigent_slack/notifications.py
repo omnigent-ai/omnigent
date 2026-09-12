@@ -215,6 +215,25 @@ class SlackNotifier:
             text += f", or wait / interrupt in the <{link}|web UI>." if link else "."
         await self.post_ephemeral(client, key, user_id, text)
 
+    async def notify_stale_turn_dropped(
+        self, client: SlackClientProtocol, key: ThreadKey, user_id: str
+    ) -> None:
+        """Tell the owner their earlier message died with a bot restart.
+
+        The honest counterpart of :meth:`notify_thread_busy` for a turn a
+        restart abandoned mid-stream: the server may still report the session
+        busy, but no process is listening for that turn, so the new message
+        runs instead of being deflected with a promise the bot can't keep.
+        """
+        await self.post_ephemeral(
+            client,
+            key,
+            user_id,
+            ":wave: I lost my connection to your previous message in this "
+            "thread when I restarted, so I've stopped working on it — picking "
+            "up this one instead.",
+        )
+
     def _session_web_link(self, session_id: str) -> str:
         # Link to the session's conversation page in the Omnigent web UI, where a
         # user can continue a thread that's mid-turn in Slack (the web UI accepts
