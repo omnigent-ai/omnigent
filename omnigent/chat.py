@@ -3361,13 +3361,23 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     if overrides.model is not None:
         executor_block["model"] = overrides.model
     if overrides.harness is not None:
+        prior_harness = _spec_declared_harness(raw, executor_block)
         _apply_harness_override_to_executor(raw, executor_block, overrides.harness)
         # A harness-only override drops any prior model pin so the new
         # harness resolves its provider default — e.g. ``omnigent run
         # examples/polly --harness pi`` must not keep Polly's Claude-only
         # a Claude-only ``executor.model``. An explicit ``--model``
         # (applied above) wins and is left alone.
-        if overrides.model is None:
+        #
+        # Exception: when the override resolves to the harness the
+        # spec already pins, it is a no-op — e.g. the harness filled from
+        # ``harness.default`` in the global config on ``omnigent run
+        # <agent>`` with no ``--harness`` flag. Dropping the model there
+        # silently discards a pin the user set for exactly this harness.
+        overrides_a_different_harness = prior_harness != (
+            canonicalize_harness(overrides.harness) or overrides.harness
+        )
+        if overrides.model is None and overrides_a_different_harness:
             executor_block.pop("model", None)
             llm_block = raw.get("llm")
             if isinstance(llm_block, dict):
@@ -3430,6 +3440,30 @@ def _apply_harness_override_to_executor(
         config = {}
         executor_block["config"] = config
     config["harness"] = canonical
+
+
+def _spec_declared_harness(raw: _YamlMapping, executor_block: _YamlMapping) -> str | None:
+    """
+    Read the harness the spec already pins, in canonical form.
+
+    Mirrors the read side of :func:`_apply_harness_override_to_executor`:
+    the flat ``executor.harness`` key for single-file omnigent YAMLs and
+    ``executor.config.harness`` for ``spec_version`` bundles.
+
+    :param raw: Parsed top-level YAML mapping (format discriminator via
+        ``spec_version``).
+    :param executor_block: The ``executor:`` mapping inside *raw*.
+    :returns: The canonical harness id, or ``None`` when the spec
+        declares no harness.
+    """
+    if "spec_version" not in raw:
+        harness = executor_block.get("harness")
+    else:
+        config = executor_block.get("config")
+        harness = config.get("harness") if isinstance(config, dict) else None
+    if not isinstance(harness, str) or not harness.strip():
+        return None
+    return canonicalize_harness(harness.strip()) or harness.strip()
 
 
 def _validate_agent_spec(agent_path: Path) -> None:
