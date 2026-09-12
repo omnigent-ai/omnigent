@@ -3633,8 +3633,8 @@ function ComposerImpl(
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
                 <ComposerPermissionPicker
-                  label="Permissions"
-                  value={permissionLabel || "Permissions"}
+                  label="Permission mode"
+                  value={permissionLabel || "Permission mode"}
                   options={permissionOptions}
                   disabled={isReadOnly || unreachable || configBusy}
                   onSelect={(mode) => void changePermission(mode)}
@@ -4382,14 +4382,14 @@ function SessionHarnessPicker({
           ? {
               testId: "composer-agent-efforts",
               header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
-              choices: [null, ...availableEfforts].map((effort) => ({
-                key: effort ?? "default",
-                label: formatStatusEffortLabel(effort) ?? "Default",
+              choices: availableEfforts.map((effort) => ({
+                key: effort,
+                label: formatStatusEffortLabel(effort) ?? effort,
                 checked: !routingOn && effort === selectedEffort,
                 disabled: routingOn || busy || pendingModelChange !== null,
                 onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
-                testId: `composer-agent-effort-${effort ?? "default"}`,
-                data: { "data-effort-level": effort ?? "default" },
+                testId: `composer-agent-effort-${effort}`,
+                data: { "data-effort-level": effort },
               })),
             }
           : undefined
@@ -4527,7 +4527,7 @@ function useSessionConfigSummary({
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort);
-    rows.push({ label: "Effort", value: effortValue ?? "Default" });
+    if (effortValue) rows.push({ label: "Effort", value: effortValue });
   }
   if (!routingOn) {
     const source =

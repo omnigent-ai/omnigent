@@ -73,7 +73,6 @@ import {
   PI_NATIVE_EFFORTS,
   ConfigRow,
   DescribedSelect,
-  EFFORT_SELECT_NONE,
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
@@ -1930,20 +1929,20 @@ function HarnessConfigModal({
 
         <div className="flex flex-col gap-5 py-1">
           {!autoRouting && hasPermission && (
-            <ConfigRow label="Permissions" description="What the agent can do without asking">
+            <ConfigRow label="Permission mode" description="What the agent can do without asking">
               <DescribedSelect
                 value={draftPermission}
                 onValueChange={setDraftPermission}
                 options={CLAUDE_NATIVE_PERMISSION_MODES}
                 testId="new-chat-landing-config-permission"
-                ariaLabel="Permissions"
+                ariaLabel="Permission mode"
                 componentId="new_chat.config.permission"
               />
             </ConfigRow>
           )}
 
           {!autoRouting && hasApproval && (
-            <ConfigRow label="Approval" description="What the agent can do without asking">
+            <ConfigRow label="Permission mode" description="What the agent can do without asking">
               <DescribedSelect
                 // Codex adds the DANGEROUS full-bypass as a 4th option; when
                 // armed the select shows it (draftBypass wins over the preset).
@@ -1962,7 +1961,7 @@ function HarnessConfigModal({
                     : CODEX_NATIVE_APPROVAL_MODES
                 }
                 testId="new-chat-landing-config-approval"
-                ariaLabel="Approval"
+                ariaLabel="Permission mode"
                 componentId="new_chat.config.approval"
               />
             </ConfigRow>
@@ -1983,13 +1982,13 @@ function HarnessConfigModal({
 
           {!autoRouting && hasAgySkip && (
             <>
-              <ConfigRow label="Permissions" description="What the agent can do without asking">
+              <ConfigRow label="Permission mode" description="What the agent can do without asking">
                 <DescribedSelect
                   value={draftAgySkip}
                   onValueChange={setDraftAgySkip}
                   options={AGY_NATIVE_SKIP_MODES}
                   testId="new-chat-landing-config-agy-skip"
-                  ariaLabel="Permissions"
+                  ariaLabel="Permission mode"
                   componentId="new_chat.config.permission"
                 />
               </ConfigRow>
@@ -2075,13 +2074,13 @@ function HarnessConfigModal({
           create call (claude-sdk) never carries a permission field, so the row
           would only be decoration on top of the Agent Harness pick. */}
           {autoNative && (
-            <ConfigRow label="Permissions" description="What the agent can do without asking">
+            <ConfigRow label="Permission mode" description="What the agent can do without asking">
               <DescribedSelect
                 value={CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE}
                 onValueChange={() => {}}
                 options={AUTO_PERMISSION_MODE_OPTIONS}
                 testId="new-chat-landing-config-permission"
-                ariaLabel="Permissions"
+                ariaLabel="Permission mode"
                 disabled
               />
             </ConfigRow>
@@ -3169,17 +3168,15 @@ export function NewChatLandingScreen() {
       // Top-level Smart Routing's modal is the locked Permissions row alone, so
       // mirror it. Report the constant — never a mode left over in state from a
       // previously selected native harness.
-      return [{ label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
+      return [{ label: "Permission mode", value: AUTO_PERMISSION_MODE.label }];
     }
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
-      const thinkingLevelValue = !pickedEffort
-        ? "Default"
-        : (PI_NATIVE_EFFORTS.find((effort) => effort.value === pickedEffort)?.label ?? "Default");
+      const thinkingLevelValue = normalizeEffortLabel(pickedEffort);
       return [
         { label: "Model", value: modelValue },
-        ...(selectedNativeHarness === "pi-native"
+        ...(selectedNativeHarness === "pi-native" && thinkingLevelValue
           ? [{ label: "Thinking level", value: thinkingLevelValue }]
           : []),
         ...sourceRows(piModelOptions),
@@ -3196,16 +3193,14 @@ export function NewChatLandingScreen() {
       // Effort row: an em-dash when routing is on, else the picked level.
       const effortValue = routingOn
         ? EFFORT_UNAVAILABLE_PLACEHOLDER
-        : !pickedEffort
-          ? "Default"
-          : (CLAUDE_NATIVE_EFFORTS.find((e) => e.value === pickedEffort)?.label ?? "Default");
+        : normalizeEffortLabel(pickedEffort);
       const permissionValue =
         CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ??
         permissionMode;
       return [
         { label: "Model", value: modelValue },
-        { label: "Effort", value: effortValue },
-        { label: "Permissions", value: permissionValue },
+        ...(effortValue ? [{ label: "Effort", value: effortValue }] : []),
+        { label: "Permission mode", value: permissionValue },
         ...sourceRows(claudeModelOptions),
       ];
     }
@@ -3239,20 +3234,21 @@ export function NewChatLandingScreen() {
                 ),
               },
             ];
-      const effortRows = !isCodex
-        ? []
-        : [
-            {
-              label: "Effort",
-              value: routingOn
-                ? EFFORT_UNAVAILABLE_PLACEHOLDER
-                : normalizeEffortLabel(pickedEffort) || "Default",
-            },
-          ];
+      const effortRows =
+        !isCodex || (!routingOn && !pickedEffort)
+          ? []
+          : [
+              {
+                label: "Effort",
+                value: routingOn
+                  ? EFFORT_UNAVAILABLE_PLACEHOLDER
+                  : normalizeEffortLabel(pickedEffort),
+              },
+            ];
       return [
         ...modelRows,
         ...effortRows,
-        { label: "Approval", value: approvalValue },
+        { label: "Permission mode", value: approvalValue },
         ...(isCodex ? sourceRows(codexModelOptions) : []),
       ];
     }
@@ -3264,7 +3260,7 @@ export function NewChatLandingScreen() {
     if (supportsAgySkipPermissions) {
       const skipValue =
         AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
-      return [{ label: "Permissions", value: skipValue }, ...routingRow];
+      return [{ label: "Permission mode", value: skipValue }, ...routingRow];
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
@@ -3301,7 +3297,7 @@ export function NewChatLandingScreen() {
     (row) => row.label === "Model" || row.label === "Effort" || row.label === "Thinking level",
   );
   const permissionConfigRow = configSummary.find(
-    (row) => row.label === "Permissions" || row.label === "Approval" || row.label === "Mode",
+    (row) => row.label === "Permission mode" || row.label === "Mode",
   );
   const pickerModelOptions: readonly NativeModelOption[] = supportsPermissionMode
     ? claudeModelOptions
@@ -3364,9 +3360,8 @@ export function NewChatLandingScreen() {
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectedNativeHarness) return;
-    const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
-    setPickedEffort(picked);
-    writeHarnessOption(selectedNativeHarness, { effort: picked });
+    setPickedEffort(effort);
+    writeHarnessOption(selectedNativeHarness, { effort });
   };
   const selectedConfigContent = selectedAgentHasKnobs ? (
     <>
@@ -3457,24 +3452,14 @@ export function NewChatLandingScreen() {
             ? {
                 testId: "new-chat-landing-agent-efforts",
                 header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
-                choices: [
-                  {
-                    key: "__default__",
-                    label: "Default",
-                    checked: !routingOn && pickedEffort === "",
-                    disabled: routingOn,
-                    onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
-                    testId: "new-chat-landing-agent-effort-default",
-                  },
-                  ...pickerEffortOptions.map((option) => ({
-                    key: option.value,
-                    label: option.label,
-                    checked: !routingOn && pickedEffort === option.value,
-                    disabled: routingOn,
-                    onSelect: () => selectPickerEffort(option.value),
-                    testId: `new-chat-landing-agent-effort-${option.value}`,
-                  })),
-                ],
+                choices: pickerEffortOptions.map((option) => ({
+                  key: option.value,
+                  label: option.label,
+                  checked: !routingOn && pickedEffort === option.value,
+                  disabled: routingOn,
+                  onSelect: () => selectPickerEffort(option.value),
+                  testId: `new-chat-landing-agent-effort-${option.value}`,
+                })),
               }
             : undefined
         }

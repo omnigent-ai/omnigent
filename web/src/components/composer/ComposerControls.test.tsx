@@ -71,7 +71,7 @@ describe("shared composer controls", () => {
     const onSelect = vi.fn();
     render(
       <ComposerPermissionPicker
-        label="Permissions"
+        label="Permission mode"
         value="Bypass permissions"
         options={[
           { value: "manual", label: "Manual" },
@@ -80,7 +80,7 @@ describe("shared composer controls", () => {
         onSelect={onSelect}
       />,
     );
-    const trigger = screen.getByRole("button", { name: "Permissions: Bypass permissions" });
+    const trigger = screen.getByRole("button", { name: "Permission mode: Bypass permissions" });
     for (const forbidden of ["hidden", "max-w-20"]) {
       expect(screen.getByText("Bypass permissions")).not.toHaveClass(forbidden);
     }
