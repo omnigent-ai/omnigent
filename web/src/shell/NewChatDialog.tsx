@@ -17,6 +17,7 @@ import {
   COMPOSER_HARNESS_MENU_SIZE,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
+import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
@@ -3386,99 +3387,101 @@ export function NewChatLandingScreen() {
           <DropdownMenuSeparator />
         </>
       )}
-      {(supportsModelPicker ||
-        supportsPermissionMode ||
-        selectedNativeHarness === "codex-native") && (
-        <div data-testid="new-chat-landing-agent-models">
-          <PickerSectionHeader>Models</PickerSectionHeader>
-          {selectedNativeHarness === "pi-native" && (
-            <Input
-              aria-label="Search models"
-              placeholder="Search models…"
-              value={pickerModelSearch}
-              onChange={(event) => setPickerModelSearch(event.target.value)}
-              onKeyDown={(event) => event.stopPropagation()}
-              data-testid="new-chat-landing-agent-model-search"
-            />
-          )}
-          {pickerModelsLoading && (
-            <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
-          )}
-          {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-            <div className="px-2 py-1 text-xs text-muted-foreground">
-              {pickerModelsError?.message ?? "Models unavailable"}
-            </div>
-          )}
-          {pickerModelOptions.length > 0 &&
-            !pickerModelOptions.some((option) => option.isDefault) && (
-              <DropdownMenuCheckboxItem
-                checked={!routingOn && pickedModel === ""}
-                onCheckedChange={() => selectPickerModel(MODEL_SELECT_DEFAULT)}
-                onSelect={(event) => event.preventDefault()}
-                data-testid="new-chat-landing-agent-model-default"
-              >
-                Harness default
-              </DropdownMenuCheckboxItem>
-            )}
-          {pickerModelOptions
-            .filter((option) =>
-              pickerModelSearch
-                .toLowerCase()
-                .trim()
-                .split(/\s+/)
-                .every((term) =>
-                  `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
+      <ComposerConfigSections
+        models={
+          supportsModelPicker || supportsPermissionMode || selectedNativeHarness === "codex-native"
+            ? {
+                testId: "new-chat-landing-agent-models",
+                header: "Models",
+                leading: (
+                  <>
+                    {selectedNativeHarness === "pi-native" && (
+                      <Input
+                        aria-label="Search models"
+                        placeholder="Search models…"
+                        value={pickerModelSearch}
+                        onChange={(event) => setPickerModelSearch(event.target.value)}
+                        onKeyDown={(event) => event.stopPropagation()}
+                        data-testid="new-chat-landing-agent-model-search"
+                      />
+                    )}
+                    {pickerModelsLoading && (
+                      <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
+                    )}
+                    {!pickerModelsLoading && pickerModelOptions.length === 0 && (
+                      <div className="px-2 py-1 text-xs text-muted-foreground">
+                        {pickerModelsError?.message ?? "Models unavailable"}
+                      </div>
+                    )}
+                  </>
                 ),
-            )
-            .map((option) => (
-              <DropdownMenuCheckboxItem
-                key={option.id}
-                checked={
-                  !routingOn &&
-                  (pickedModel === option.id || (pickedModel === "" && option.isDefault === true))
-                }
-                onCheckedChange={() =>
-                  selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id)
-                }
-                onSelect={(event) => event.preventDefault()}
-                data-testid={`new-chat-landing-agent-model-${option.id}`}
-                title={nativeModelLabel(option)}
-                className="whitespace-normal break-words [&>span:last-child]:min-w-0"
-              >
-                {visibleModelLabel(nativeModelLabel(option))}
-              </DropdownMenuCheckboxItem>
-            ))}
-        </div>
-      )}
-      {pickerEffortOptions.length > 0 && (
-        <div data-testid="new-chat-landing-agent-efforts">
-          <DropdownMenuSeparator />
-          <PickerSectionHeader>
-            {selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort"}
-          </PickerSectionHeader>
-          <DropdownMenuCheckboxItem
-            checked={!routingOn && pickedEffort === ""}
-            disabled={routingOn}
-            onCheckedChange={() => selectPickerEffort(EFFORT_SELECT_NONE)}
-            onSelect={(event) => event.preventDefault()}
-            data-testid="new-chat-landing-agent-effort-default"
-          >
-            Default
-          </DropdownMenuCheckboxItem>
-          {pickerEffortOptions.map((option) => (
-            <DropdownMenuCheckboxItem
-              key={option.value}
-              checked={!routingOn && pickedEffort === option.value}
-              disabled={routingOn}
-              onCheckedChange={() => selectPickerEffort(option.value)}
-              onSelect={(event) => event.preventDefault()}
-              data-testid={`new-chat-landing-agent-effort-${option.value}`}
-            >
-              {option.label}
-            </DropdownMenuCheckboxItem>
-          ))}
-        </div>
-      )}
+                choices: [
+                  ...(pickerModelOptions.length > 0 &&
+                  !pickerModelOptions.some((option) => option.isDefault)
+                    ? [
+                        {
+                          key: "__default__",
+                          label: "Harness default",
+                          checked: !routingOn && pickedModel === "",
+                          onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
+                          testId: "new-chat-landing-agent-model-default",
+                        },
+                      ]
+                    : []),
+                  ...pickerModelOptions
+                    .filter((option) =>
+                      pickerModelSearch
+                        .toLowerCase()
+                        .trim()
+                        .split(/\s+/)
+                        .every((term) =>
+                          `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
+                        ),
+                    )
+                    .map((option) => ({
+                      key: option.id,
+                      label: visibleModelLabel(nativeModelLabel(option)),
+                      checked:
+                        !routingOn &&
+                        (pickedModel === option.id ||
+                          (pickedModel === "" && option.isDefault === true)),
+                      onSelect: () =>
+                        selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+                      testId: `new-chat-landing-agent-model-${option.id}`,
+                      title: nativeModelLabel(option),
+                      className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+                    })),
+                ],
+              }
+            : undefined
+        }
+        efforts={
+          pickerEffortOptions.length > 0
+            ? {
+                testId: "new-chat-landing-agent-efforts",
+                header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+                choices: [
+                  {
+                    key: "__default__",
+                    label: "Default",
+                    checked: !routingOn && pickedEffort === "",
+                    disabled: routingOn,
+                    onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
+                    testId: "new-chat-landing-agent-effort-default",
+                  },
+                  ...pickerEffortOptions.map((option) => ({
+                    key: option.value,
+                    label: option.label,
+                    checked: !routingOn && pickedEffort === option.value,
+                    disabled: routingOn,
+                    onSelect: () => selectPickerEffort(option.value),
+                    testId: `new-chat-landing-agent-effort-${option.value}`,
+                  })),
+                ],
+              }
+            : undefined
+        }
+      />
       <DropdownMenuSeparator />
       <DropdownMenuItem
         data-testid="new-chat-landing-config-gear"

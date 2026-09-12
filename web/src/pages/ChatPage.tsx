@@ -54,7 +54,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuCheckboxItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
@@ -214,6 +213,7 @@ import {
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
+import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -4462,76 +4462,73 @@ function SessionHarnessPicker({
         await store.setCostControlMode("off");
     });
   const configContent = (
-    <>
-      {showModels && (
-        <div data-testid="composer-agent-models">
-          <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
-            Models
-          </DropdownMenuLabel>
-          {!modelOptions.some((model) => model.isDefault) && (
-            <DropdownMenuCheckboxItem
-              checked={!routingOn && pickerSelectedModel === null}
-              disabled={busy || pendingModelChange !== null}
-              onSelect={(event) => event.preventDefault()}
-              onCheckedChange={() => selectModel(null)}
-              data-testid="composer-agent-model-default"
-            >
-              Default
-            </DropdownMenuCheckboxItem>
-          )}
-          {modelOptions.map((model) => (
-            <DropdownMenuCheckboxItem
-              key={model.id}
-              disabled={busy || pendingModelChange !== null}
-              checked={
-                !routingOn &&
-                (model.id === pickerSelectedModel ||
-                  (pickerSelectedModel === null && model.isDefault === true))
-              }
-              onSelect={(event) => event.preventDefault()}
-              onCheckedChange={() => selectModel(model.isDefault ? null : model.id)}
-              data-testid={`composer-agent-model-${model.id}`}
-              data-model-id={model.id}
-              className="whitespace-normal break-words"
-            >
-              {nativeModelLabel(model)}
-            </DropdownMenuCheckboxItem>
-          ))}
-          {pickerSelectedModel &&
-            !modelOptions.some((model) => model.id === pickerSelectedModel) && (
-              <DropdownMenuCheckboxItem
-                checked={!routingOn}
-                disabled
-                data-model-id={pickerSelectedModel}
-                className="whitespace-normal break-words"
-              >
-                {modelLabel ?? effectiveModel} (current)
-              </DropdownMenuCheckboxItem>
-            )}
-        </div>
-      )}
-      {showEffort && availableEfforts.length > 0 && (
-        <div data-testid="composer-agent-efforts">
-          <DropdownMenuSeparator />
-          <DropdownMenuLabel className="px-2 text-xs font-normal text-muted-foreground">
-            {modelPickerKind === "pi" ? "Thinking level" : "Effort"}
-          </DropdownMenuLabel>
-          {[null, ...availableEfforts].map((effort) => (
-            <DropdownMenuCheckboxItem
-              key={effort ?? "default"}
-              checked={!routingOn && effort === selectedEffort}
-              disabled={routingOn || busy || pendingModelChange !== null}
-              onSelect={(event) => event.preventDefault()}
-              onCheckedChange={() => void apply(() => useChatStore.getState().setEffort(effort))}
-              data-testid={`composer-agent-effort-${effort ?? "default"}`}
-              data-effort-level={effort ?? "default"}
-            >
-              {formatStatusEffortLabel(effort) ?? "Default"}
-            </DropdownMenuCheckboxItem>
-          ))}
-        </div>
-      )}
-    </>
+    <ComposerConfigSections
+      models={
+        showModels
+          ? {
+              testId: "composer-agent-models",
+              header: "Models",
+              choices: [
+                ...(!modelOptions.some((model) => model.isDefault)
+                  ? [
+                      {
+                        key: "__default__",
+                        label: "Default",
+                        checked: !routingOn && pickerSelectedModel === null,
+                        disabled: busy || pendingModelChange !== null,
+                        onSelect: () => selectModel(null),
+                        testId: "composer-agent-model-default",
+                      },
+                    ]
+                  : []),
+                ...modelOptions.map((model) => ({
+                  key: model.id,
+                  label: nativeModelLabel(model),
+                  checked:
+                    !routingOn &&
+                    (model.id === pickerSelectedModel ||
+                      (pickerSelectedModel === null && model.isDefault === true)),
+                  disabled: busy || pendingModelChange !== null,
+                  onSelect: () => selectModel(model.isDefault ? null : model.id),
+                  testId: `composer-agent-model-${model.id}`,
+                  className: "whitespace-normal break-words",
+                  data: { "data-model-id": model.id },
+                })),
+                ...(pickerSelectedModel &&
+                !modelOptions.some((model) => model.id === pickerSelectedModel)
+                  ? [
+                      {
+                        key: "__current__",
+                        label: `${modelLabel ?? effectiveModel} (current)`,
+                        checked: !routingOn,
+                        disabled: true,
+                        className: "whitespace-normal break-words",
+                        data: { "data-model-id": pickerSelectedModel },
+                      },
+                    ]
+                  : []),
+              ],
+            }
+          : undefined
+      }
+      efforts={
+        showEffort && availableEfforts.length > 0
+          ? {
+              testId: "composer-agent-efforts",
+              header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
+              choices: [null, ...availableEfforts].map((effort) => ({
+                key: effort ?? "default",
+                label: formatStatusEffortLabel(effort) ?? "Default",
+                checked: !routingOn && effort === selectedEffort,
+                disabled: routingOn || busy || pendingModelChange !== null,
+                onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
+                testId: `composer-agent-effort-${effort ?? "default"}`,
+                data: { "data-effort-level": effort ?? "default" },
+              })),
+            }
+          : undefined
+      }
+    />
   );
   return (
     <>
