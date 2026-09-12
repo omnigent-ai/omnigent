@@ -347,7 +347,8 @@ def test_non_finite_interval_falls_back_instead_of_crashing(
     from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
 
     monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", bad)
-    assert resolve_managed_keepalive_interval_s() == 60.0
+    # falls back to the provider-scoped default (agent_sandbox: 60)
+    assert resolve_managed_keepalive_interval_s("agent_sandbox") == 60.0
     assert min_shutdown_window_s() == 120  # no OverflowError / ValueError
 
 
@@ -372,7 +373,10 @@ def test_keep_alive_extend_is_logged_at_debug(
     """
     with caplog.at_level(logging.DEBUG, logger="omnigent.onboarding.sandboxes.agent_sandbox"):
         _launcher().keep_alive(_SANDBOX_ID)
-    assert any("extended agent-sandbox" in r.getMessage() for r in caplog.records)
+    matching = [r for r in caplog.records if "extended agent-sandbox" in r.getMessage()]
+    # pins the level, not just the text: an INFO here would double-log with the
+    # server-layer INFO, so the provider line must stay at DEBUG.
+    assert matching and all(r.levelno == logging.DEBUG for r in matching)
 
 
 # ── keep_alive ─────────────────────────────────────────

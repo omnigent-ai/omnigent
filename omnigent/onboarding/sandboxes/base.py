@@ -55,23 +55,37 @@ _logger = logging.getLogger(__name__)
 MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
 """Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
 
-_DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 60.0
+# Global default keepalive cadence, used by every managed provider except
+# agent_sandbox. Providers whose keep_alive is idempotent ("configure once")
+# don't need a fast cadence, so the default stays cheap.
+_DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
+# agent_sandbox pushes an absolute shutdownTime forward and runs a SHORT window,
+# so it must refresh fast (its window floor is twice this). Scoped to the
+# provider so lowering it does not multiply every other provider's write load.
+_AGENT_SANDBOX_KEEPALIVE_INTERVAL_S: float = 60.0
 _MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
 
 
-def resolve_managed_keepalive_interval_s() -> float:
+def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
     """
     How often the server refreshes a live managed sandbox's liveness, in seconds.
 
-    Read from :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR` (default 60s), floored
-    at a small minimum so a typo cannot spin the refresh loop. The server
-    keepalive loop throttles to this, and the ``agent_sandbox`` provider derives
-    its shutdown-window floor as twice this. Internal advanced override;
-    ``keep_warm_s`` is the operator-facing knob.
+    Provider-scoped default: ``agent_sandbox`` refreshes fast (60s) because it
+    pushes an absolute deadline forward under a short window; every other
+    provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
+    overrides both when set (advanced/experimental — the operator-facing knob is
+    ``keep_warm_s``), floored at a small minimum so a typo cannot spin the loop.
+    Resolved live from the env on each call (no snapshot), so the server loop
+    cadence and the ``agent_sandbox`` window floor cannot disagree.
     """
+    default = (
+        _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S
+        if provider == "agent_sandbox"
+        else _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+    )
     raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()
     if not raw:
-        return _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+        return default
     try:
         parsed = float(raw)
     except ValueError:
@@ -79,9 +93,9 @@ def resolve_managed_keepalive_interval_s() -> float:
             "ignoring %s=%r (not a number); using %ss",
             MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
             raw,
-            _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S,
+            default,
         )
-        return _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+        return default
     if not math.isfinite(parsed):
         # "nan"/"inf" parse cleanly but blow up downstream in int/ceil(2 * x);
         # a non-finite typo must fail safe like any other bad value.
@@ -89,9 +103,9 @@ def resolve_managed_keepalive_interval_s() -> float:
             "ignoring %s=%r (not a finite number); using %ss",
             MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
             raw,
-            _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S,
+            default,
         )
-        return _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+        return default
     if parsed < _MIN_MANAGED_KEEPALIVE_INTERVAL_S:
         _logger.warning(
             "%s=%r is below the %ss minimum; using %ss",

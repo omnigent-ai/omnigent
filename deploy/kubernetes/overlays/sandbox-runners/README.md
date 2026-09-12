@@ -300,12 +300,14 @@ reaper's hard terminate. The server also logs each keepalive at `INFO` from
 (provider <p>)`), but that runs on a background thread and may not surface in
 every logging setup — treat `kubectl get sandbox -w` as the source of truth.
 
-**Advanced (rarely needed).** The pod-linger window and keepalive cadence are
-internal defaults (window ~120s, refresh ~60s); `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S`
-and `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S` override them for experiments (e.g. a
-faster demo). Keepalive runs on its own timer (not the fixed 30s liveness ping),
-and the create/wake deadline is floored at a boot grace so a short window never
-reaps a still-booting Pod.
+**Advanced (rarely needed).** agent_sandbox refreshes its deadline every ~60s
+under a short ~120s pod-linger window; other managed providers keep a cheaper
+~600s cadence, so agent_sandbox's fast refresh doesn't multiply their write load.
+`OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` and `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S`
+override the window and cadence for experiments (e.g. a faster demo). Keepalive
+runs on its own timer (not the fixed 30s liveness ping), and the create/wake
+deadline is floored at a boot grace so a short window never reaps a still-booting
+Pod.
 
 ### Durable workspace (`OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE`)
 

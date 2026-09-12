@@ -159,6 +159,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import posixpath
 import re
 import secrets
@@ -1016,8 +1017,16 @@ def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
     value = raw.get("keep_warm_s")
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        raise ValueError("sandbox.keep_warm_s must be a positive number of seconds")
+    # Must be >= 1: it becomes runner.idle_timeout_s, where a value that rounds to
+    # 0 DISABLES the idle watchdog (sandbox never suspends) — the opposite of a
+    # short keep-warm. Reject non-finite too, which would otherwise crash int().
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 1
+    ):
+        raise ValueError("sandbox.keep_warm_s must be a finite number of seconds >= 1")
     return int(value)
 
 

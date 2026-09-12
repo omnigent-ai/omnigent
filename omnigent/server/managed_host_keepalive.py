@@ -17,10 +17,11 @@ Providers that cannot extend a sandbox (``kubernetes`` today) raise
 :class:`SandboxCapabilityError` and are skipped, leaving their behaviour exactly
 as it is now.
 
-Rate-limited per runner (:data:`_min_interval_s`): stamping ``runner_last_seen``
-is a local write, but ``keep_alive`` is a provider API call: on Kubernetes-style
-backends it is an apiserver write that also wakes a controller reconcile, so it
-must not run at the 30s ping cadence.
+Rate-limited per runner at a provider-scoped cadence
+(:func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`):
+``keep_alive`` is a provider API call — on Kubernetes-style backends an apiserver
+write that wakes a controller reconcile — so agent_sandbox refreshes fast (short
+window) while other providers stay on the cheap default.
 """
 
 from __future__ import annotations
@@ -44,12 +45,12 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# How often one runner may trigger a provider keep_alive, resolved from
-# base.resolve_managed_keepalive_interval_s (env-overridable, default 600s) at
-# import and again in configure(). agent_sandbox derives its window floor from
-# the same resolver (2x this), so lowering the interval also lowers the floor and
-# the two cannot drift.
-_min_interval_s: float = resolve_managed_keepalive_interval_s()
+# runner_id -> its provider's keepalive cadence (seconds), filled by
+# _keep_alive_for_runner once the runner's provider is resolved. Until then the
+# fast agent_sandbox cadence is used (see _interval_for) so an agent_sandbox's
+# short window is never under-refreshed; a slower provider self-corrects to its
+# own cadence after its first keepalive, at the cost of one early refresh.
+_runner_interval_s: dict[str, float] = {}
 
 # Cap on the per-runner throttle map before stale entries are pruned. Runners
 # are transient, so without this a long-lived server accumulates one dead key
@@ -89,28 +90,33 @@ def configure(
     :param sandbox_config: The deployment's provider set, or ``None`` when
         managed sandboxes are not configured.
     """
-    global _conversation_store, _host_store, _sandbox_config, _executor, _min_interval_s
+    global _conversation_store, _host_store, _sandbox_config, _executor
     _conversation_store = conversation_store
     _host_store = host_store
     _sandbox_config = sandbox_config
-    _min_interval_s = resolve_managed_keepalive_interval_s()
     if sandbox_config is not None and host_store is not None and _executor is None:
         _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="managed-keepalive")
 
 
-def keepalive_interval_s() -> float:
-    """Current per-runner keepalive cadence, in seconds.
+def _interval_for(runner_id: str) -> float:
+    """The keepalive cadence for *runner_id*: its provider's, once cached, else
+    the fast agent_sandbox cadence so a short-window sandbox is never under-refreshed."""
+    return _runner_interval_s.get(runner_id, resolve_managed_keepalive_interval_s("agent_sandbox"))
 
-    The runner tunnel's keepalive loop sleeps this between refreshes; it is the
-    same value :func:`touch` throttles to, so the loop cannot outrun the
-    throttle. Set by :func:`configure` from
-    :func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`.
+
+def keepalive_interval_s(runner_id: str) -> float:
+    """Seconds the runner tunnel's keepalive loop sleeps between refreshes for
+    *runner_id* (and the per-runner throttle in :func:`touch`).
+
+    Provider-scoped: agent_sandbox refreshes fast because its window is short;
+    other providers keep the cheaper default so they are not over-called. The loop
+    sleep and the throttle read the same value, so they cannot disagree.
     """
-    return _min_interval_s
+    return _interval_for(runner_id)
 
 
 def touch(runner_id: str) -> None:
-    """Keep the sandbox behind *runner_id* warm, at most every :data:`_min_interval_s`.
+    """Keep the sandbox behind *runner_id* warm, at most every :func:`keepalive_interval_s`.
 
     Non-blocking and fail-safe: the provider call runs on a worker thread so a
     slow backend cannot delay the tunnel ping loop that calls this, and every
@@ -133,7 +139,7 @@ def touch(runner_id: str) -> None:
         return
     now = time.monotonic()
     last = _last_kept.get(runner_id)
-    if last is not None and now - last < _min_interval_s:
+    if last is not None and now - last < _interval_for(runner_id):
         return
     with _inflight_lock:
         if runner_id in _inflight:
@@ -150,10 +156,11 @@ def touch(runner_id: str) -> None:
 
 
 def _prune_throttle(now: float) -> None:
-    """Drop throttle entries older than two intervals (their runners are gone)."""
-    cutoff = now - 2 * _min_interval_s
+    """Drop throttle entries older than two slow intervals (their runners are gone)."""
+    cutoff = now - 2 * resolve_managed_keepalive_interval_s()
     for runner_id in [rid for rid, seen in _last_kept.items() if seen < cutoff]:
         _last_kept.pop(runner_id, None)
+        _runner_interval_s.pop(runner_id, None)
 
 
 def _keep_alive_for_runner(runner_id: str) -> None:
@@ -191,6 +198,11 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                     host.sandbox_id,
                 )
                 continue
+            # Cache the provider's cadence so the loop sleep and throttle settle
+            # onto it (agent_sandbox stays fast; others fall back to the default).
+            _runner_interval_s[runner_id] = resolve_managed_keepalive_interval_s(
+                host.sandbox_provider
+            )
             try:
                 config.launcher_factory().keep_alive(host.sandbox_id)
                 # INFO from the server layer so the keepalive is visible in the

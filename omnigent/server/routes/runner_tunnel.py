@@ -739,8 +739,13 @@ async def _keepalive_loop(runner_id: str) -> None:
     :returns: None (runs until cancelled).
     """
     while True:
-        managed_host_keepalive.touch(runner_id)
-        await asyncio.sleep(managed_host_keepalive.keepalive_interval_s())
+        try:
+            managed_host_keepalive.touch(runner_id)
+        except Exception:
+            # touch is already fail-safe, but a bug here must not silently stop
+            # refreshes for the tunnel's remaining life.
+            _logger.exception("managed keepalive touch failed for runner %s", runner_id)
+        await asyncio.sleep(managed_host_keepalive.keepalive_interval_s(runner_id))
 
 
 async def _ping_loop(

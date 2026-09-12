@@ -146,14 +146,13 @@ def min_shutdown_window_s() -> int:
 
     A window shorter than the refresh interval is a footgun that looks like it
     works: the deadline lapses before anything pushes it forward, so every
-    sandbox suspends mid-run. Twice the interval leaves a full missed refresh of
-    headroom. Both this floor and the server loop's throttle read the same
-    :func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`,
-    so lowering the interval to experiment lowers this floor with it. They read the
-    same value for a fixed, uniform environment (the realistic case). A configured
-    window below the floor is clamped up to it.
+    sandbox suspends mid-run. Twice the interval leaves close to a missed refresh
+    of headroom. Both this floor and the server loop's throttle read the same
+    provider-scoped keepalive interval (base.resolve_managed_keepalive_interval_s,
+    here for ``agent_sandbox``), resolved live, so they cannot disagree. A
+    configured window below the floor is clamped up to it.
     """
-    return math.ceil(2 * resolve_managed_keepalive_interval_s())
+    return math.ceil(2 * resolve_managed_keepalive_interval_s("agent_sandbox"))
 
 
 def resolve_workspace_volume() -> tuple[str, str | None] | None:
