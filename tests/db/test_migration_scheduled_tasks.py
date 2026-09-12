@@ -66,6 +66,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "base_branch",
         "execution_target",
         "host_id",
+        "project_id",
         "timezone",
         "state",
         "last_run_at",
@@ -123,12 +124,20 @@ def test_expected_indexes(db_engine: Engine) -> None:
     insp = sa.inspect(db_engine)
     scheduled_tasks_idx = {i["name"] for i in insp.get_indexes("scheduled_tasks")}
     assert "ix_scheduled_tasks_user_scope" in scheduled_tasks_idx
+    assert "ix_scheduled_tasks_project_id" in scheduled_tasks_idx
     scheduled_tasks_idx_cols = {
         i["name"]: list(i["column_names"]) for i in insp.get_indexes("scheduled_tasks")
     }
     assert scheduled_tasks_idx_cols["ix_scheduled_tasks_user_scope"] == [
         "workspace_id",
         "user_id",
+        "created_at",
+        "id",
+    ]
+    assert scheduled_tasks_idx_cols["ix_scheduled_tasks_project_id"] == [
+        "workspace_id",
+        "user_id",
+        "project_id",
         "created_at",
         "id",
     ]

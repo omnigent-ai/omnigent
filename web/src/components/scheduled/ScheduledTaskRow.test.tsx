@@ -26,6 +26,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     permissionMode: null,
     workspace: null,
     hostId: null,
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -74,6 +75,23 @@ describe("next-run text (server-sourced, relative delta)", () => {
   it("renders NO next-run text when nextRunAt is null (paused / unarmed)", () => {
     renderRow(task({ nextRunAt: null }));
     expect(screen.queryByTestId("task-next-run")).toBeNull();
+  });
+});
+
+describe("Project chip", () => {
+  it("renders a resolved Project name", () => {
+    renderRow(task({ projectId: "p_a" }), { project: { name: "Project A" } });
+    expect(screen.getByTestId("task-project-chip")).toHaveTextContent("Project A");
+  });
+
+  it("renders no chip for a stored null", () => {
+    renderRow(task({ projectId: null }));
+    expect(screen.queryByTestId("task-project-chip")).toBeNull();
+  });
+
+  it("renders no chip for an unresolved non-null id", () => {
+    renderRow(task({ projectId: "deleted" }));
+    expect(screen.queryByTestId("task-project-chip")).toBeNull();
   });
 });
 

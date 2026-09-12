@@ -9,10 +9,18 @@ from __future__ import annotations
 import uuid
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
+from omnigent.db.db_models import SqlConversationMetadata, SqlScheduledTask, workspace_scope
+from omnigent.db.enum_codecs import (
+    encode_scheduled_task_execution_target,
+    encode_scheduled_task_state,
+)
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
 # projects.id is a Uuid16 column (16 raw bytes) read back as bare 32-char hex.
@@ -356,3 +364,86 @@ def test_delete_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     deleted = store.delete(_uid("p1"), user_id="bob@example.com")
     assert deleted is False
     assert store.get(_uid("p1"), user_id="alice@example.com") is not None
+
+
+def test_exists_is_owner_agnostic_and_workspace_scoped(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    project_id = _uid("exists")
+    store.create(project_id, "Exists", "alice@example.com")
+
+    assert store.exists(project_id) is True
+    assert store.exists(_uid("absent")) is False
+    with workspace_scope(1):
+        assert store.exists(project_id) is False
+
+
+def test_delete_removes_only_project_row_and_leaves_member_pointers_untouched(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    project_id = _uid("project-with-members")
+    store.create(project_id, "Members", "alice@example.com")
+    task_store = SqlAlchemyScheduledTaskStore(store.storage_location)
+    task = task_store.create(
+        _uid("member-task"),
+        "task",
+        "p",
+        "FREQ=DAILY",
+        "alice@example.com",
+        _uid("agent"),
+        "UTC",
+        project_id=project_id,
+    )
+    conversation_store = SqlAlchemyConversationStore(store.storage_location)
+    conversation = conversation_store.create_conversation(project_id=project_id)
+
+    assert store.delete(project_id, user_id="alice@example.com") is True
+    assert store.get(project_id, user_id="alice@example.com") is None
+    assert task_store.get(task.id).project_id == project_id
+    assert conversation_store.get_conversation(conversation.id).project_id == project_id
+
+
+def test_delete_succeeds_with_10001_references(store: SqlAlchemyProjectStore) -> None:
+    project_id = _uid("large-project")
+    store.create(project_id, "Large", "alice@example.com")
+    task_rows = [
+        {
+            "id": uuid.UUID(int=index + 1).hex,
+            "name": "task",
+            "prompt": "p",
+            "rrule": "FREQ=DAILY",
+            "user_id": "alice@example.com",
+            "agent_id": _uid("agent"),
+            "timezone": "UTC",
+            "state": encode_scheduled_task_state("paused"),
+            "execution_target": encode_scheduled_task_execution_target("connected_host"),
+            "project_id": project_id,
+            "created_at": index,
+        }
+        for index in range(5_001)
+    ]
+    metadata_rows = [
+        {
+            "id": uuid.UUID(int=20_000 + index).hex,
+            "kind": 1,
+            "project_id": project_id,
+        }
+        for index in range(5_000)
+    ]
+    with store._engine.begin() as conn:
+        conn.execute(sa.insert(SqlScheduledTask), task_rows)
+        conn.execute(sa.insert(SqlConversationMetadata), metadata_rows)
+
+    assert store.delete(project_id, user_id="alice@example.com") is True
+    with store._engine.connect() as conn:
+        task_count = conn.execute(
+            sa.select(sa.func.count())
+            .select_from(SqlScheduledTask)
+            .where(SqlScheduledTask.project_id == project_id)
+        ).scalar_one()
+        metadata_count = conn.execute(
+            sa.select(sa.func.count())
+            .select_from(SqlConversationMetadata)
+            .where(SqlConversationMetadata.project_id == project_id)
+        ).scalar_one()
+    assert task_count + metadata_count == 10_001

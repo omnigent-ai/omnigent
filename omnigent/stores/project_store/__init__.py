@@ -6,8 +6,8 @@ the ``projects`` table. Session→project membership lives on the conversation's
 metadata row (``project_id``) and is managed by the conversation store, not
 here.
 
-Projects have no ACL of their own (PRD §9): every method is scoped by
-``user_id`` so a caller only ever sees and mutates their own projects.
+Projects have no ACL of their own (PRD §9): user-facing operations are scoped
+by ``user_id`` so a caller only ever sees and mutates their own projects.
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ class ProjectStore(ABC):
     """
     Abstract base for project persistence.
 
-    Manages the lifecycle of projects (CRUD). All reads and writes are scoped
-    by ``user_id`` because projects are owner-private.
+    Manages the lifecycle of projects (CRUD). User-facing reads and writes are
+    scoped by ``user_id`` because projects are owner-private.
     """
 
     def __init__(self, storage_location: str) -> None:
@@ -67,6 +67,15 @@ class ProjectStore(ABC):
         :param user_id: The requesting owner; a project owned by someone
             else is treated as not found.
         :returns: The :class:`Project` if found and owned, else ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def exists(self, project_id: str) -> bool:
+        """Return whether a Project id exists in the current workspace.
+
+        This owner-agnostic probe is for internal integrity checks only. User-facing
+        authorization must continue to use :meth:`get`.
         """
         ...
 

@@ -129,6 +129,13 @@ class SysScheduledTaskCreateTool(Tool):
                                 "is online."
                             ),
                         },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional Project id for organizational filing. Omit or pass "
+                                "an empty string to create the task unfiled."
+                            ),
+                        },
                     },
                     "required": ["name", "prompt", "rrule", "agent_id"],
                     "additionalProperties": False,
@@ -243,6 +250,13 @@ class SysScheduledTaskUpdateTool(Tool):
                         "state": {
                             "type": "string",
                             "description": "'active' or 'paused'.",
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "New Project id. Omit to preserve the assignment or pass an "
+                                "empty string to unfile."
+                            ),
                         },
                     },
                     "required": ["scheduled_task_id"],

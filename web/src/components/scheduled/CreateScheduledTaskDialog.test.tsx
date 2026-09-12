@@ -9,7 +9,7 @@
 import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CreateScheduledTaskDialog,
@@ -19,6 +19,7 @@ import {
 import * as agentsHook from "@/hooks/useAvailableAgents";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
+import * as conversationsHook from "@/hooks/useConversations";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
@@ -33,6 +34,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useCreateScheduledTask: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
 }));
+vi.mock("@/hooks/useConversations", () => ({ useProjects: vi.fn() }));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
@@ -147,10 +149,12 @@ const AGENTS: AvailableAgent[] = [
 
 const mutateAsync = vi.fn();
 const updateMutateAsync = vi.fn();
+const refetchProjects = vi.fn();
 
 beforeEach(() => {
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
+  refetchProjects.mockReset().mockResolvedValue(undefined);
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
     data: AGENTS,
   } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
@@ -165,6 +169,17 @@ beforeEach(() => {
     mutateAsync: updateMutateAsync,
     isPending: false,
   } as unknown as ReturnType<typeof scheduledHooks.useUpdateScheduledTask>);
+  vi.mocked(conversationsHook.useProjects).mockReturnValue({
+    // Project A carries an emoji icon; Project B has none (folder fallback).
+    data: [
+      { id: "p_a", name: "Project A", icon: "📊" },
+      { id: "p_b", name: "Project B" },
+      { id: null, name: "Legacy only" },
+    ],
+    isLoading: false,
+    isError: false,
+    refetch: refetchProjects,
+  } as unknown as ReturnType<typeof conversationsHook.useProjects>);
 });
 
 afterEach(() => cleanup());
@@ -189,6 +204,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     permissionMode: null,
     workspace: null,
     hostId: null,
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -239,6 +255,150 @@ describe("CreateScheduledTaskDialog validation", () => {
     expect(submit).toBeDisabled();
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
     expect(submit).toBeEnabled();
+  });
+});
+
+describe("CreateScheduledTaskDialog Project picker", () => {
+  it("defaults create to No project and omits the field", async () => {
+    renderDialog();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("projectId");
+  });
+
+  it("uses a selected-page Project as the create default", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialProjectId="p_a" />);
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Project A");
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].projectId).toBe("p_a");
+  });
+
+  it("unfiles an assigned edit with an explicit empty id", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "p_a" })}
+      />,
+    );
+    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "No project" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.projectId).toBe("");
+  });
+
+  it("omits an unchanged edit assignment", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "p_a" })}
+      />,
+    );
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Project A");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("projectId");
+  });
+
+  it("treats an unresolved stored id as No project without unfiling on save", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "deleted" })}
+      />,
+    );
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("projectId");
+  });
+
+  it("shows loading, label-only empty, and retryable error states", async () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      isError: false,
+      refetch: refetchProjects,
+    } as unknown as ReturnType<typeof conversationsHook.useProjects>);
+    const { rerender } = render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(screen.getByTestId("task-project-trigger")).toBeDisabled();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Loading projects…");
+
+    vi.mocked(conversationsHook.useProjects).mockReturnValue({
+      data: [{ id: null, name: "Legacy only" }],
+      isLoading: false,
+      isError: false,
+      refetch: refetchProjects,
+    } as unknown as ReturnType<typeof conversationsHook.useProjects>);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(
+      screen.getByText(
+        "No assignable Projects. Legacy label-only folders can’t be assigned; create a Project from the sidebar.",
+      ),
+    ).toBeInTheDocument();
+
+    vi.mocked(conversationsHook.useProjects).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      refetch: refetchProjects,
+    } as unknown as ReturnType<typeof conversationsHook.useProjects>);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetchProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers only first-class Projects", async () => {
+    renderDialog();
+    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
+    expect(await screen.findByTestId("task-project-option-p_a")).toBeInTheDocument();
+    expect(screen.getByTestId("task-project-option-p_b")).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Legacy only" })).toBeNull();
+  });
+
+  it("shows each project's emoji (or folder fallback) in the selector options", async () => {
+    renderDialog();
+    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
+    // Emoji is aria-hidden — the option's accessible name stays "Project A".
+    const optionA = await screen.findByRole("option", { name: "Project A" });
+    expect(within(optionA).getByTestId("project-label-icon")).toHaveTextContent("📊");
+    const optionB = screen.getByRole("option", { name: "Project B" });
+    expect(within(optionB).getByTestId("project-label-fallback")).toBeInTheDocument();
+    expect(within(optionB).queryByTestId("project-label-icon")).toBeNull();
+  });
+
+  it("project selection does not change agent, host, or workspace", async () => {
+    const editingTask = scheduledTask({
+      agentId: "ag_1",
+      hostId: "host_1",
+      workspace: "/home/me/repo",
+      projectId: "p_a",
+    });
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />);
+    expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
+    expect(screen.getByText("/home/me/repo")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Project B" }));
+    expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
+    expect(screen.getByText("/home/me/repo")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(input.projectId).toBe("p_b");
+    expect(input.hostId).toBe("host_1");
+    expect(input.workspace).toBe("/home/me/repo");
+    expect(input).not.toHaveProperty("agentId");
   });
 });
 
