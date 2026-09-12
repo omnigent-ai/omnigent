@@ -21,7 +21,7 @@ from omnigent.server.routes._host_filesystem import (
     HostFsUnavailableError,
     read_workspace_from_host,
 )
-from omnigent.server.routes._host_launch import host_absent_error
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._workspace_validation import (
     WorkspaceValidationError,
     _ask_host_stat,
@@ -56,11 +56,9 @@ def register_host_workspace_resource_routes(
         workspace: str,
     ) -> tuple[HostConnection, str]:
         user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+        )
         workspace = _validate_workspace(workspace)
         conn = host_registry.get(host.host_id)
         if conn is None:

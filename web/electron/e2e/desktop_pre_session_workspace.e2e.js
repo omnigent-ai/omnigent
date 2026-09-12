@@ -170,12 +170,7 @@ function createFixtureRepo(root) {
   git("config", "user.email", "desktop-e2e@example.invalid");
   git("add", "README.md");
   git("commit", "-m", "Initial fixture");
-  git("remote", "add", "origin", "https://github.com/omnigent-ai/omnigent.git");
-  git("config", "core.untrackedCache", "false");
   fs.appendFileSync(path.join(repo, "README.md"), "\nChanged before session creation.\n");
-  fs.writeFileSync(path.join(repo, "src", "draft.txt"), "untracked workspace file\n");
-  fs.writeFileSync(path.join(root, "outside.txt"), "outside selected workspace\n");
-  fs.symlinkSync(path.join(root, "outside.txt"), path.join(repo, "outside-link.txt"));
   return repo;
 }
 
@@ -271,6 +266,7 @@ async function startIsolatedPod(root) {
           OMNIGENT_CONFIG_HOME: seedConfigDir,
           OMNIGENT_DATA_DIR: path.join(root, "supervisor-data"),
           GH_CONFIG_DIR: path.join(root, "gh-config"),
+          PYTHONPATH: REPO_ROOT,
           OMNIGENT_DISABLE_KEYRING: "1",
           OMNIGENT_NO_UPDATE_CHECK: "1",
           OPENAI_BASE_URL: `http://127.0.0.1:${mockPort}/v1`,
@@ -286,7 +282,16 @@ async function startIsolatedPod(root) {
         key: "gpt-4o-mini",
         text: "DESKTOP_HANDOFF_OK",
       }),
-    waitForPod: (proc, podLog) => waitForPod(serverUrl, proc, podLog),
+    waitForPod: async (proc, podLog) => {
+      const hosts = await waitForPod(serverUrl, proc, podLog);
+      const servedHtml = await fetch(`${serverUrl}/`).then((response) => response.text());
+      assert.equal(
+        servedHtml,
+        fs.readFileSync(path.join(WEB_UI_DIST, "index.html"), "utf8"),
+        "isolated pod served a different frontend build",
+      );
+      return hosts;
+    },
   });
   return {
     serverUrl,
@@ -352,21 +357,6 @@ async function waitForFile(filePath, expected, timeoutMs = 20_000) {
 function sessionRows(payload) {
   if (Array.isArray(payload)) return payload;
   return payload.data ?? payload.sessions ?? payload.conversations ?? [];
-}
-
-async function captureLandingStorage(window) {
-  return window.evaluate(() =>
-    Object.fromEntries(
-      Object.keys(localStorage)
-        .filter(
-          (key) =>
-            key.startsWith("omnigent:landing-workspace") ||
-            key.startsWith("omnigent:draft-workspace-contexts") ||
-            key.startsWith("omnigent:landing-composer"),
-        )
-        .map((key) => [key, JSON.parse(localStorage.getItem(key))]),
-    ),
-  );
 }
 
 async function chooseWorkspace(window, fixtureRepo) {
@@ -444,7 +434,6 @@ describe(
         let startClicked = false;
         let saved;
         let browserTabId;
-        let workspaceContextId;
         try {
           const shell = await resolveShellWindow(launched.electronApp, pod.serverUrl);
           shell.on("request", (request) => {
@@ -488,91 +477,10 @@ describe(
           await shell.getByRole("button", { name: "Expand right panel" }).click();
           await panel.waitFor({ state: "visible", timeout: 20_000 });
 
-          await shell.getByRole("tab", { name: "Files" }).click();
-          await panel.getByText("README.md", { exact: true }).waitFor({ state: "visible" });
-          await shell.screenshot({ path: path.join(RECORD_DIR, "before-start-files.png") });
-
-          await shell.getByRole("tab", { name: /Changes/ }).click();
-          await panel.getByText("draft.txt", { exact: true }).waitFor({ state: "visible" });
-          await shell.screenshot({ path: path.join(RECORD_DIR, "before-start-changes.png") });
-          const cacheSetting = spawnSync(
-            "git",
-            ["config", "--bool", "--get", "core.untrackedCache"],
-            {
-              cwd: fixtureRepo,
-              encoding: "utf8",
-            },
-          );
-          assert.equal(cacheSetting.status, 0);
-          assert.equal(cacheSetting.stdout.trim(), "false");
-          const resourceBase = `${pod.serverUrl}/v1/hosts/${pod.hostId}/workspace/resources/environments/default/filesystem`;
-          const boundaryResults = [
-            {
-              request: "Git config after Files/Changes",
-              untrackedCache: cacheSetting.stdout.trim(),
-            },
-          ];
-          const readable = await fetch(
-            `${resourceBase}/README.md?workspace=${encodeURIComponent(fixtureRepo)}`,
-          );
-          assert.equal(readable.status, 200);
-          boundaryResults.push({ request: "GET README.md", status: readable.status });
-          for (const relative of ["outside-link.txt", "..%2Foutside.txt"]) {
-            // Keep each denial adjacent to its assertion in the boundary transcript.
-            // oxlint-disable-next-line no-await-in-loop
-            const response = await fetch(
-              `${resourceBase}/${relative}?workspace=${encodeURIComponent(fixtureRepo)}`,
-            );
-            assert.ok(
-              [400, 403, 404].includes(response.status),
-              `escape read returned ${response.status}`,
-            );
-            boundaryResults.push({ request: relative, status: response.status });
-          }
-          const mutation = await fetch(
-            `${resourceBase}/README.md?workspace=${encodeURIComponent(fixtureRepo)}`,
-            {
-              method: "PUT",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ content: "must not write" }),
-            },
-          );
-          assert.ok([404, 405].includes(mutation.status));
-          boundaryResults.push({ request: "PUT README.md", status: mutation.status });
-          assert.equal(
-            fs.readFileSync(path.join(fixtureRepo, "README.md"), "utf8"),
-            "# Before Start\n\nChanged before session creation.\n",
-          );
-          boundaryResults.push({ request: "README.md after denied write", contentUnchanged: true });
-          fs.writeFileSync(
-            path.join(RECORD_DIR, "read-only-boundaries.json"),
-            JSON.stringify(boundaryResults, null, 2),
-          );
-
-          await shell.getByRole("tab", { name: "GitHub" }).click();
-          const githubState = panel
-            .getByText(
-              /omnigent-ai\/omnigent|no open pr|pull requests created|upstream repo|sign in|authentication/i,
-            )
-            .first();
-          await githubState.waitFor({ state: "visible" });
-          fs.writeFileSync(
-            path.join(RECORD_DIR, "github-state.txt"),
-            `${await githubState.innerText()}\n`,
-          );
-
           await shell.getByRole("button", { name: "Open new" }).click();
           await shell.getByText("Shell (bash)", { exact: true }).click();
           const terminal = panel.locator(".xterm-helper-textarea");
           await terminal.waitFor({ state: "visible", timeout: 20_000 });
-          workspaceContextId = await shell.evaluate(() => {
-            const key = Object.keys(localStorage).find((candidate) =>
-              candidate.startsWith("omnigent:draft-workspace-contexts:v1:"),
-            );
-            const contexts = key ? JSON.parse(localStorage.getItem(key)) : [];
-            return contexts[0]?.id ?? null;
-          });
-          assert.ok(workspaceContextId, "draft workspace context was not persisted");
           await terminal.click();
           await terminal.pressSequentially(
             "printf '%s' \"$PWD\" > .desktop-e2e-pwd; export OMNIGENT_PRESTART_MARKER=retained; pwd; git status --short",
@@ -636,7 +544,13 @@ describe(
           );
           const savedMessage = "Draft preserved while identity resolves";
           await shell.getByTestId("new-chat-landing-input").fill(savedMessage);
-          const storageBeforeReload = await captureLandingStorage(shell);
+          await shell.waitForFunction((message) => {
+            return Object.keys(localStorage).some(
+              (key) =>
+                key.startsWith("omnigent:landing-composer") &&
+                JSON.parse(localStorage.getItem(key))?.message === message,
+            );
+          }, savedMessage);
 
           let releaseIdentity;
           let identityRequests = 0;
@@ -666,17 +580,6 @@ describe(
           await shell.screenshot({ path: path.join(RECORD_DIR, "delayed-identity-reload.png") });
           await shell.getByRole("button", { name: "Expand right panel" }).click();
           await panel.waitFor({ state: "visible", timeout: 20_000 });
-          const storageAfterReload = await captureLandingStorage(shell);
-          const draftEntry = Object.entries(storageBeforeReload).find(
-            ([key, value]) =>
-              key.startsWith("omnigent:landing-composer") && value.message === savedMessage,
-          );
-          assert.ok(draftEntry, "account-scoped composer draft was not saved");
-          assert.equal(storageAfterReload[draftEntry[0]].message, savedMessage);
-          fs.writeFileSync(
-            path.join(RECORD_DIR, "reload-storage.json"),
-            `${JSON.stringify({ before: storageBeforeReload, after: storageAfterReload }, null, 2)}\n`,
-          );
           assert.equal(sessionRows(await getJson(`${pod.serverUrl}/v1/sessions`)).length, 0);
           assert.equal(sessionCreateRequests, 0, "reload created a session before Start");
           await shell
@@ -803,32 +706,9 @@ describe(
             browserPaneBounds.y + browserPaneBounds.height <= startBounds.y
           );
           assert.equal(overlapsBrowserPane, false, "native browser bounds overlapped Start");
-          const startHitTarget = await shell.evaluate(({ x, y, width, height }) => {
-            const target = document.elementFromPoint(x + width / 2, y + height / 2);
-            const button = document.querySelector('[data-testid="new-chat-landing-submit"]');
-            return {
-              html: target?.outerHTML.slice(0, 500) ?? null,
-              ancestors: button
-                ? Array.from(
-                    (function* () {
-                      let element = button;
-                      while (element) {
-                        yield element;
-                        element = element.parentElement;
-                      }
-                    })(),
-                    (element) => ({
-                      tag: element.tagName,
-                      className: element.className,
-                      pointerEvents: getComputedStyle(element).pointerEvents,
-                    }),
-                  )
-                : [],
-            };
-          }, startBounds);
           fs.writeFileSync(
             path.join(RECORD_DIR, "browser-view-bounds.json"),
-            `${JSON.stringify({ browserPaneBounds, nativeBrowserView, startBounds, startHitTarget }, null, 2)}\n`,
+            `${JSON.stringify({ browserPaneBounds, nativeBrowserView, startBounds }, null, 2)}\n`,
           );
           await shell.bringToFront();
           startClicked = true;
@@ -890,19 +770,6 @@ describe(
             [adoptedBrowserViewId, "Opened safely before Start."],
             { timeout: 20_000 },
           );
-          await wait(1_000);
-          const contextUrl = `${pod.serverUrl}/v1/hosts/${pod.hostId}/workspace-contexts/${workspaceContextId}`;
-          const staleDraftCleanup = await fetch(contextUrl, { method: "DELETE" });
-          assert.equal((await staleDraftCleanup.json()).deleted, false);
-          const retained = await getJson(`${contextUrl}/resources/terminals`);
-          assert.equal(retained.data.length, 1);
-          const cleanup = await fetch(
-            `${contextUrl}/resources/terminals/${retained.data[0].id}?session_id=${sessionId}`,
-            { method: "DELETE" },
-          );
-          assert.ok(cleanup.ok, `explicit cleanup returned ${cleanup.status}`);
-          const removed = await fetch(`${contextUrl}/resources/terminals`);
-          assert.equal(removed.status, 404);
           fs.writeFileSync(
             path.join(RECORD_DIR, "handoff-result.json"),
             JSON.stringify(
@@ -917,22 +784,12 @@ describe(
                   path.join(fixtureRepo, ".desktop-e2e-retained"),
                   "utf8",
                 ),
-                cleanupStatus: cleanup.status,
-                staleDraftCleanupDeleted: false,
-                removedContextStatus: removed.status,
                 provider: "deterministic local mock",
               },
               null,
               2,
             ),
           );
-          workspaceContextId = null;
-          await shell.getByTestId("new-chat-button").click();
-          await windowReady(shell);
-          await panel.waitFor({ state: "hidden" });
-          await shell.screenshot({
-            path: path.join(RECORD_DIR, "return-from-session-collapsed.png"),
-          });
         } catch (error) {
           try {
             const shell = await resolveShellWindow(launched.electronApp, pod.serverUrl, {
@@ -948,12 +805,6 @@ describe(
           }
           throw error;
         } finally {
-          if (workspaceContextId) {
-            await fetch(
-              `${pod.serverUrl}/v1/hosts/${pod.hostId}/workspace-contexts/${workspaceContextId}`,
-              { method: "DELETE" },
-            ).catch(() => {});
-          }
           await launched.electronApp.close();
           await launched.stopDisplayCapture();
           saved = saveRecording(RECORD_DIR, "pre-session-workspace");

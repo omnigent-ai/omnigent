@@ -47,6 +47,14 @@ function terminal(id = "terminal_bash_draft") {
   };
 }
 
+function restoreContexts(...contexts: object[]) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(contexts));
+}
+
+function storedContext(id: string, workspace = "/repo", sessionId: string | null = null) {
+  return { id, workspace, hostId: "host_1", leaseSeconds: 600, sessionId };
+}
+
 beforeEach(() => {
   localStorage.clear();
   fetchMock.mockReset();
@@ -183,12 +191,7 @@ describe("useDraftWorkspace", () => {
   );
 
   it("reconciles a stale draft close while allowing the session's confirmed close", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        { id: "shared", workspace: "/repo", hostId: "host_1", leaseSeconds: 600, sessionId: null },
-      ]),
-    );
+    restoreContexts(storedContext("shared"));
     let owner: string | null = null;
     let running = true;
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
@@ -238,12 +241,7 @@ describe("useDraftWorkspace", () => {
   });
 
   it("cleans a retried shell when its initiating view changes before creation completes", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        { id: "shared", workspace: "/repo", hostId: "host_1", leaseSeconds: 600, sessionId: null },
-      ]),
-    );
+    restoreContexts(storedContext("shared"));
     let adopted = false;
     let resolveCreate!: (value: Response) => void;
     const creation = new Promise<Response>((resolve) => {
@@ -426,12 +424,7 @@ describe("useDraftWorkspace", () => {
   });
 
   it("forgets an empty context retired by handoff without failing Start", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        { id: "empty", workspace: "/repo", hostId: "host_1", leaseSeconds: 600, sessionId: null },
-      ]),
-    );
+    restoreContexts(storedContext("empty"));
     fetchMock.mockImplementation(async (url: string) => {
       if (url.endsWith("/heartbeat")) return response(context("empty", "/repo"));
       if (url.endsWith("/resources/terminals")) return response({ object: "list", data: [] });
@@ -458,18 +451,7 @@ describe("useDraftWorkspace", () => {
   });
 
   it("treats a restored context inventory as unknown until its first successful list", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        {
-          id: "context_restored",
-          workspace: "/repo",
-          hostId: "host_1",
-          leaseSeconds: 600,
-          sessionId: null,
-        },
-      ]),
-    );
+    restoreContexts(storedContext("context_restored"));
     let resolveList: ((value: Response) => void) | undefined;
     const listResponse = new Promise<Response>((resolve) => {
       resolveList = resolve;
@@ -652,18 +634,7 @@ describe("useDraftWorkspace", () => {
   });
 
   it("forgets an adopted context when its final terminal deletion retires it", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        {
-          id: "context_final",
-          workspace: "/repo",
-          hostId: "host_1",
-          leaseSeconds: 600,
-          sessionId: "conv_1",
-        },
-      ]),
-    );
+    restoreContexts(storedContext("context_final", "/repo", "conv_1"));
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       if (url === "/v1/hosts/host_1/workspace-contexts/context_final/heartbeat") {
         return response(context("context_final", "/repo", "conv_1"));
@@ -695,18 +666,7 @@ describe("useDraftWorkspace", () => {
   });
 
   it("forgets an adopted context when another viewer removes its final terminal", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        {
-          id: "context_remote_final",
-          workspace: "/repo",
-          hostId: "host_1",
-          leaseSeconds: 600,
-          sessionId: "conv_1",
-        },
-      ]),
-    );
+    restoreContexts(storedContext("context_remote_final", "/repo", "conv_1"));
     fetchMock.mockImplementation(async (url: string) => {
       if (url === "/v1/hosts/host_1/workspace-contexts/context_remote_final/heartbeat") {
         return response(context("context_remote_final", "/repo", "conv_1"));
@@ -952,18 +912,7 @@ describe("useDraftWorkspace", () => {
   });
 
   it("does not resurrect a discarded context from a late heartbeat", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        {
-          id: "context_heartbeat",
-          workspace: "/repo",
-          hostId: "host_1",
-          leaseSeconds: 600,
-          sessionId: null,
-        },
-      ]),
-    );
+    restoreContexts(storedContext("context_heartbeat"));
     let resolveHeartbeat: ((value: Response) => void) | undefined;
     const heartbeatResponse = new Promise<Response>((resolve) => {
       resolveHeartbeat = resolve;
@@ -1001,18 +950,7 @@ describe("useDraftWorkspace", () => {
   });
 
   it("does not undo a successful handoff with a late pre-handoff heartbeat", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([
-        {
-          id: "context_handoff",
-          workspace: "/repo",
-          hostId: "host_1",
-          leaseSeconds: 600,
-          sessionId: null,
-        },
-      ]),
-    );
+    restoreContexts(storedContext("context_handoff"));
     let resolveHeartbeat: ((value: Response) => void) | undefined;
     const heartbeatResponse = new Promise<Response>((resolve) => {
       resolveHeartbeat = resolve;

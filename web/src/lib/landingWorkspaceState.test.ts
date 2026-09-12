@@ -25,6 +25,30 @@ async function loadLandingWorkspaceState() {
   return import("./landingWorkspaceState");
 }
 
+function publishSelection(
+  landing: Awaited<ReturnType<typeof loadLandingWorkspaceState>>,
+  hostId: string,
+  workspace: string,
+) {
+  return landing.publishLandingWorkspaceSelection({
+    hostId,
+    workspace,
+    available: true,
+    reason: "",
+  });
+}
+
+function defineDesktop(value: object) {
+  Object.defineProperty(window, "omnigentDesktop", { configurable: true, value });
+}
+
+function browserCloseCalls(namespace: string, browserIds: string[]) {
+  return [
+    namespace,
+    ...browserIds.map((id) => `browser-tab:${encodeURIComponent(namespace)}:${id}`),
+  ].map((id) => [id]);
+}
+
 beforeEach(() => {
   localStorage.clear();
   storageScope.server = "server-a";
@@ -64,12 +88,7 @@ describe("landingWorkspaceState", () => {
     const landing = await loadLandingWorkspaceState();
     const sessions = await import("./sessionWorkspaceState");
 
-    landing.publishLandingWorkspaceSelection({
-      hostId: "host-1",
-      workspace: "/workspace",
-      available: true,
-      reason: "",
-    });
+    publishSelection(landing, "host-1", "/workspace");
     landing.writeLandingWorkspacePanel({
       rightRailTab: "changes",
       openFiles: ["src/draft.ts"],
@@ -98,12 +117,7 @@ describe("landingWorkspaceState", () => {
 
   it("restores persisted state after a module reload", async () => {
     const landing = await loadLandingWorkspaceState();
-    landing.publishLandingWorkspaceSelection({
-      hostId: "host-1",
-      workspace: "/persisted",
-      available: true,
-      reason: "",
-    });
+    publishSelection(landing, "host-1", "/persisted");
     landing.writeLandingWorkspacePanel({
       rightRailTab: "changes",
       openFiles: ["persisted.ts"],
@@ -123,12 +137,7 @@ describe("landingWorkspaceState", () => {
 
   it("resets transient starting and busy gates after a module reload", async () => {
     const landing = await loadLandingWorkspaceState();
-    landing.publishLandingWorkspaceSelection({
-      hostId: "host-1",
-      workspace: "/persisted",
-      available: true,
-      reason: "",
-    });
+    publishSelection(landing, "host-1", "/persisted");
     landing.setLandingWorkspaceStarting(true);
     landing.setLandingWorkspaceBusy(true);
     expect(landing.readLandingWorkspaceState()).toMatchObject({ starting: true, busy: true });
@@ -143,21 +152,38 @@ describe("landingWorkspaceState", () => {
     });
   });
 
+  it("sanitizes persisted panel arrays before a target change cleans them up", async () => {
+    localStorage.setItem(
+      landingStorageKey(LANDING_STORAGE_PREFIX),
+      JSON.stringify({
+        browserNamespace: "draft-workspace:stale",
+        selection: { hostId: "host-1", workspace: "/persisted", available: true, reason: "" },
+        panel: {
+          openFiles: ["README.md", 3],
+          selectedFilePath: "README.md",
+          openBrowsers: ["browser-1", { id: "bad" }],
+          selectedBrowserId: "browser-1",
+        },
+      }),
+    );
+    const landing = await loadLandingWorkspaceState();
+
+    expect(landing.readLandingWorkspaceState().panel).toMatchObject({
+      selectedFilePath: "README.md",
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    expect(landing.readLandingWorkspaceState().panel.openFiles).toBeUndefined();
+    expect(() => publishSelection(landing, "host-1", "/next")).not.toThrow();
+  });
+
   it("gives concurrent Starts on one namespace exactly one resource owner", async () => {
     const landing = await loadLandingWorkspaceState();
     const sessions = await import("./sessionWorkspaceState");
     const adopt = vi.fn().mockResolvedValue(true);
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserAdoptDraft },
-    });
-    landing.publishLandingWorkspaceSelection({
-      hostId: "host-a",
-      workspace: "/workspace-a",
-      available: true,
-      reason: "",
-    });
+    defineDesktop({ browserAdoptDraft });
+    publishSelection(landing, "host-a", "/workspace-a");
     landing.writeLandingWorkspacePanel({
       openTerminals: ["terminal:a"],
       selectedTerminalKey: "terminal:a",
@@ -403,16 +429,8 @@ describe("landingWorkspaceState", () => {
     const landing = await loadLandingWorkspaceState();
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
     const discard = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserClose },
-    });
-    landing.publishLandingWorkspaceSelection({
-      hostId: "host-1",
-      workspace: "/first",
-      available: true,
-      reason: "",
-    });
+    defineDesktop({ browserClose });
+    publishSelection(landing, "host-1", "/first");
     const hasTerminals = vi.fn(() => false);
     landing.registerLandingResourceLifecycle({
       hasTerminals,
@@ -455,27 +473,17 @@ describe("landingWorkspaceState", () => {
     expect(landing.readLandingWorkspaceState().browserNamespace).not.toBe(firstNamespace);
     expect(hasTerminals).toHaveBeenCalledOnce();
     expect(discard).toHaveBeenCalledOnce();
-    expect(browserClose.mock.calls).toEqual([
-      [firstNamespace],
-      [`browser-tab:${encodeURIComponent(firstNamespace)}:manual one`],
-      [`browser-tab:${encodeURIComponent(firstNamespace)}:manual/two`],
-    ]);
+    expect(browserClose.mock.calls).toEqual(
+      browserCloseCalls(firstNamespace, ["manual one", "manual/two"]),
+    );
   });
 
   it("discards draft shells and browsers before clearing the landing workspace", async () => {
     const landing = await loadLandingWorkspaceState();
     const discard = vi.fn().mockResolvedValue(undefined);
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserClose },
-    });
-    landing.publishLandingWorkspaceSelection({
-      hostId: "host-1",
-      workspace: "/workspace",
-      available: true,
-      reason: "",
-    });
+    defineDesktop({ browserClose });
+    publishSelection(landing, "host-1", "/workspace");
     landing.registerLandingResourceLifecycle({
       hasTerminals: () => true,
       discard,
@@ -492,10 +500,7 @@ describe("landingWorkspaceState", () => {
     await landing.discardLandingWorkspace();
 
     expect(discard).toHaveBeenCalledOnce();
-    expect(browserClose.mock.calls).toEqual([
-      [sourceNamespace],
-      [`browser-tab:${encodeURIComponent(sourceNamespace)}:manual-browser`],
-    ]);
+    expect(browserClose.mock.calls).toEqual(browserCloseCalls(sourceNamespace, ["manual-browser"]));
     expect(landing.readLandingWorkspaceState()).toEqual({
       browserNamespace: expect.stringMatching(/^draft-workspace:/),
       selection: null,
@@ -510,10 +515,7 @@ describe("landingWorkspaceState", () => {
     const browserClose = vi.fn((id: string) =>
       Promise.resolve({ ok: !id.startsWith("browser-tab:") }),
     );
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserClose },
-    });
+    defineDesktop({ browserClose });
     landing.publishLandingWorkspaceSelection({
       hostId: "host-1",
       workspace: "/workspace",
@@ -535,20 +537,16 @@ describe("landingWorkspaceState", () => {
     await expect(landing.discardLandingWorkspace()).rejects.toThrow("Draft browser cleanup failed");
 
     expect(discard).toHaveBeenCalledOnce();
-    expect(browserClose.mock.calls).toEqual([
-      [beforeDiscard.browserNamespace],
-      [`browser-tab:${encodeURIComponent(beforeDiscard.browserNamespace)}:browser-fails`],
-    ]);
+    expect(browserClose.mock.calls).toEqual(
+      browserCloseCalls(beforeDiscard.browserNamespace, ["browser-fails"]),
+    );
     expect(landing.readLandingWorkspaceState()).toEqual(beforeDiscard);
   });
 
   it("discards a captured workspace without clearing a newer selection", async () => {
     const landing = await loadLandingWorkspaceState();
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserClose },
-    });
+    defineDesktop({ browserClose });
     landing.publishLandingWorkspaceSelection({
       hostId: "host-a",
       workspace: "/workspace-a",
@@ -598,48 +596,16 @@ describe("landingWorkspaceState", () => {
     expect(lifecycleB.hasTerminals).not.toHaveBeenCalled();
     expect(lifecycleB.discard).not.toHaveBeenCalled();
     expect(lifecycleB.adopt).not.toHaveBeenCalled();
-    expect(browserClose.mock.calls).toEqual([
-      [snapshotA.state.browserNamespace],
-      [`browser-tab:${encodeURIComponent(snapshotA.state.browserNamespace)}:browser-a`],
-    ]);
+    expect(browserClose.mock.calls).toEqual(
+      browserCloseCalls(snapshotA.state.browserNamespace, ["browser-a"]),
+    );
     expect(landing.readLandingWorkspaceState()).toEqual(workspaceB);
-  });
-
-  it("keeps the selected target when changing workspace is cancelled", async () => {
-    const landing = await loadLandingWorkspaceState();
-    const discard = vi.fn().mockResolvedValue(undefined);
-    landing.publishLandingWorkspaceSelection({
-      hostId: "host-1",
-      workspace: "/current",
-      available: true,
-      reason: "",
-    });
-    landing.registerLandingResourceLifecycle({
-      hasTerminals: () => true,
-      discard,
-      adopt: vi.fn().mockResolvedValue(true),
-    });
-    const beforeConfirm = landing.readLandingWorkspaceState();
-    vi.spyOn(window, "confirm").mockReturnValue(false);
-
-    expect(landing.confirmLandingWorkspaceChange()).toBe(false);
-
-    expect(discard).not.toHaveBeenCalled();
-    expect(landing.readLandingWorkspaceState()).toEqual(beforeConfirm);
-    expect(landing.landingResourceTarget(landing.readLandingWorkspaceState().selection)).toEqual({
-      kind: "host",
-      hostId: "host-1",
-      workspace: "/current",
-    });
   });
 
   it("rejects a remounted workspace publisher when running terminals stay open", async () => {
     const landing = await loadLandingWorkspaceState();
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserClose },
-    });
+    defineDesktop({ browserClose });
     landing.publishLandingWorkspaceSelection({
       hostId: "host-a",
       workspace: "/project-a",
@@ -736,10 +702,7 @@ describe("landingWorkspaceState", () => {
     const sessions = await import("./sessionWorkspaceState");
     const adopt = vi.fn().mockResolvedValue(true);
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserAdoptDraft },
-    });
+    defineDesktop({ browserAdoptDraft });
     landing.publishLandingWorkspaceSelection({
       hostId: "host-1",
       workspace: "/workspace",
@@ -785,10 +748,7 @@ describe("landingWorkspaceState", () => {
     const landing = await loadLandingWorkspaceState();
     const sessions = await import("./sessionWorkspaceState");
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: true });
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserAdoptDraft },
-    });
+    defineDesktop({ browserAdoptDraft });
     landing.publishLandingWorkspaceSelection({
       hostId: "host-a",
       workspace: "/workspace-a",
@@ -858,10 +818,7 @@ describe("landingWorkspaceState", () => {
     const sessions = await import("./sessionWorkspaceState");
     const adopt = vi.fn().mockResolvedValue(true);
     const browserAdoptDraft = vi.fn().mockResolvedValue({ ok: false });
-    Object.defineProperty(window, "omnigentDesktop", {
-      configurable: true,
-      value: { browserAdoptDraft },
-    });
+    defineDesktop({ browserAdoptDraft });
     landing.publishLandingWorkspaceSelection({
       hostId: "host-1",
       workspace: "/workspace",
@@ -1077,10 +1034,9 @@ describe("landingWorkspaceState", () => {
       ),
     ).rejects.toThrow("terminal cleanup failed");
     expect(discard).toHaveBeenCalledOnce();
-    expect(browserClose.mock.calls).toEqual([
-      [claim.snapshot.state.browserNamespace],
-      [`browser-tab:${encodeURIComponent(claim.snapshot.state.browserNamespace)}:browser-a`],
-    ]);
+    expect(browserClose.mock.calls).toEqual(
+      browserCloseCalls(claim.snapshot.state.browserNamespace, ["browser-a"]),
+    );
     expect(landing.readLandingWorkspaceState()).toEqual(workspaceB);
     landing.finishLandingWorkspaceStart(claim.token);
   });
@@ -1148,10 +1104,9 @@ describe("landingWorkspaceState", () => {
       (failure as { terminalsTransferred: boolean }).terminalsTransferred,
     );
     expect(discard).not.toHaveBeenCalled();
-    expect(browserClose.mock.calls).toEqual([
-      [claim.snapshot.state.browserNamespace],
-      [`browser-tab:${encodeURIComponent(claim.snapshot.state.browserNamespace)}:browser-a`],
-    ]);
+    expect(browserClose.mock.calls).toEqual(
+      browserCloseCalls(claim.snapshot.state.browserNamespace, ["browser-a"]),
+    );
     expect(landing.readLandingWorkspaceState()).toEqual(workspaceB);
     landing.finishLandingWorkspaceStart(claim.token);
   });

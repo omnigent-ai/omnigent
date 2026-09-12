@@ -3,7 +3,7 @@ import { randomUUID } from "./randomUUID";
 import { landingStorageKey } from "./landingStorage";
 import { useSyncExternalStore } from "react";
 import type { SessionWorkspaceState } from "./sessionWorkspaceState";
-import { writeSessionWorkspaceState } from "./sessionWorkspaceState";
+import { sanitizeWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
 import type { WorkspaceResourceTarget } from "./workspaceTarget";
 
 const STORAGE_KEY = "omnigent:landing-workspace";
@@ -33,7 +33,7 @@ function initialState(): LandingWorkspaceState {
   try {
     const saved = JSON.parse(localStorage.getItem(landingStorageKey(STORAGE_KEY)) ?? "null");
     if (saved?.browserNamespace?.startsWith("draft-workspace:") && saved.panel)
-      return { ...saved, starting: false, busy: false };
+      return { ...saved, panel: sanitizeWorkspaceState(saved.panel), starting: false, busy: false };
   } catch {
     /* Storage is optional. */
   }

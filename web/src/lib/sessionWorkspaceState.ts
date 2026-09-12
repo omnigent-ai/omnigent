@@ -8,7 +8,7 @@
 
 import type { RightRailTab } from "@/shell/railTabs";
 
-const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "subagents", "browser"];
+const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "github", "subagents", "browser"];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
@@ -61,7 +61,7 @@ interface StoredEntry {
 
 type Store = StoredEntry[];
 
-function sanitize(entry: unknown): SessionWorkspaceState {
+export function sanitizeWorkspaceState(entry: unknown): SessionWorkspaceState {
   if (typeof entry !== "object" || entry === null) return {};
   const record = entry as Record<string, unknown>;
   const state: SessionWorkspaceState = {};
@@ -110,7 +110,7 @@ function readStore(): Store {
       if (typeof item !== "object" || item === null) continue;
       const record = item as Record<string, unknown>;
       if (typeof record.id !== "string") continue;
-      store.push({ id: record.id, state: sanitize(record.state) });
+      store.push({ id: record.id, state: sanitizeWorkspaceState(record.state) });
     }
     return store;
   } catch {
