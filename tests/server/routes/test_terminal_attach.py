@@ -551,6 +551,38 @@ async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> Non
     ]
 
 
+async def test_attach_terminal_proxy_forwards_validated_palette(app: FastAPI) -> None:
+    """
+    The browser's ``fg``/``bg`` palette params ride the proxied runner path.
+
+    Only a validated hex pair is forwarded — junk never reaches the runner's
+    query string — and a read-only attach forwards no palette at all, since
+    viewers must not restyle the owner's pane.
+
+    :param app: The FastAPI app fixture.
+    """
+    for query, expected_qs in [
+        ("?fg=%2318181b&bg=%23ffffff", "?read_only=false&fg=%2318181b&bg=%23ffffff"),
+        # Invalid colors are dropped wholesale, not forwarded raw.
+        ("?fg=red&bg=%23ffffff", "?read_only=false"),
+        # Read-only viewers report no palette even when they send one.
+        ("?read_only=true&fg=%2318181b&bg=%23ffffff", "?read_only=true"),
+    ]:
+        conn = _FakeRunnerWSConn()
+        factory = _FakeRunnerWSFactory(conn)
+        set_runner_ws_factory(factory)
+
+        with TestClient(app).websocket_connect(
+            f"/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach{query}"
+        ) as ws:
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_bytes()
+
+        assert factory.calls == [
+            f"/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach{expected_qs}"
+        ], f"palette forwarding mismatch for browser query {query!r}"
+
+
 async def test_attach_terminal_proxy_forwards_browser_bytes_to_runner(
     app: FastAPI,
 ) -> None:
@@ -658,8 +690,9 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        palette: tuple[str, str] | None = None,
     ) -> None:
-        del websocket
+        del websocket, palette
         calls.append((socket_path, tmux_target, read_only))
 
     monkeypatch.setattr(

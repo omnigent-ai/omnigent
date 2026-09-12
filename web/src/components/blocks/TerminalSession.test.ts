@@ -19,7 +19,9 @@ import {
   loadWebglRenderer,
   openTerminalLink,
   parseTerminalClipboardMessage,
+  isPaletteQuery,
   sgrWheelReports,
+  terminalPalette,
   terminalTheme,
   terminalKeyEventPayload,
   type ConnectionState,
@@ -202,6 +204,29 @@ describe("terminalTheme", () => {
     expect(theme.background).toBe("#131517");
     expect(theme.foreground).toBe("#e4e4e7");
     expect(theme.brightBlack).toBe("#71717a");
+  });
+});
+
+describe("terminalPalette", () => {
+  it("reports the exact default colors the canvas renders for each mode", () => {
+    // These are what tmux answers pane palette probes (OSC 10/11) with, so
+    // they must match the ITheme the terminal actually paints.
+    expect(terminalPalette(false)).toEqual({ fg: "#18181b", bg: "#ffffff" });
+    expect(terminalPalette(true)).toEqual({ fg: "#e4e4e7", bg: "#131517" });
+  });
+});
+
+describe("isPaletteQuery", () => {
+  it("treats '?' payloads (single or multi-part) as queries", () => {
+    expect(isPaletteQuery("?")).toBe(true);
+    expect(isPaletteQuery("?;?")).toBe(true);
+  });
+
+  it("leaves color assignments to xterm's own handling", () => {
+    expect(isPaletteQuery("#ffffff")).toBe(false);
+    expect(isPaletteQuery("rgb:ff/ff/ff")).toBe(false);
+    expect(isPaletteQuery("?;#ffffff")).toBe(false);
+    expect(isPaletteQuery("")).toBe(false);
   });
 });
 
@@ -596,6 +621,53 @@ describe("TerminalSession", () => {
       (m) => typeof m === "string" && m.includes('"type":"resize"'),
     );
     expect(resizeFrames).toHaveLength(1);
+    session.dispose();
+  });
+
+  it("sends a theme control frame with the rendered palette on setTheme", () => {
+    // WHY: pane programs probe tmux for the palette, so a live theme switch
+    // must re-report the new colors or probes after the switch see stale ones.
+    const { socket, session } = makeSession();
+    socket.open();
+
+    session.setTheme(true);
+
+    const frame = socket.sent.find((m) => typeof m === "string" && m.includes('"type":"theme"'));
+    expect(frame).toBe(JSON.stringify({ type: "theme", fg: "#e4e4e7", bg: "#131517" }));
+    session.dispose();
+  });
+
+  it("xterm itself would reply to a palette query (the reply we suppress)", async () => {
+    // Positive control for the suppression test below: without our OSC
+    // handlers, an opened xterm answers a forwarded OSC 11 query via onData.
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const term = new Terminal({ allowProposedApi: true });
+    term.open(container);
+    const data: string[] = [];
+    term.onData((d) => data.push(d));
+    await new Promise<void>((resolve) => {
+      term.write("\x1b]11;?\x07", resolve);
+    });
+    term.dispose();
+    container.remove();
+
+    expect(data.join("")).toContain("]11;rgb:");
+  });
+
+  it("consumes forwarded OSC 10/11 palette queries instead of auto-replying", async () => {
+    // WHY: tmux forwards the pane's own palette query to attached clients;
+    // xterm's auto-reply would ride the input path back into the pane as
+    // stray, late keystrokes on top of tmux's authoritative answer.
+    const { socket, session } = makeSession();
+    socket.open();
+    const sentBefore = socket.sent.length;
+    const term = (session as unknown as { term: Terminal }).term;
+    await new Promise<void>((resolve) => {
+      term.write("\x1b]10;?\x07\x1b]11;?\x07", resolve);
+    });
+
+    expect(socket.sent.length).toBe(sentBefore);
     session.dispose();
   });
 

@@ -139,6 +139,16 @@ describe("direct attach URL helpers", () => {
     expect(withAttachParams(base, true)).toBe(`${base}&read_only=true`);
   });
 
+  it("withAttachParams reports the rendered palette as encoded fg/bg", () => {
+    // Mirrors buildAttachPath: the direct (loopback) attach must report the
+    // same palette as the relay path, or a TUI probing on a direct attach
+    // still caches the wrong colors.
+    const base = "ws://127.0.0.1:54321/v1/x/attach?token=t";
+    expect(withAttachParams(base, false, { fg: "#18181b", bg: "#ffffff" })).toBe(
+      `${base}&fg=%2318181b&bg=%23ffffff`,
+    );
+  });
+
   it("directProbeUrl swaps the path for /probe and keeps the token", () => {
     expect(directProbeUrl("ws://127.0.0.1:54321/v1/x/attach?token=t&read_only=true")).toBe(
       "ws://127.0.0.1:54321/probe?token=t&read_only=true",

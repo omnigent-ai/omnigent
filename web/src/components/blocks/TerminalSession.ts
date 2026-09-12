@@ -72,6 +72,39 @@ export function terminalTheme(isDark: boolean): ITheme {
       };
 }
 
+/** The browser terminal's rendered default colors, reported to tmux. */
+export interface TerminalPalette {
+  fg: string;
+  bg: string;
+}
+
+/**
+ * The default colors the terminal canvas actually renders for *isDark*,
+ * as ``#rrggbb`` values suitable for the attach URL's ``fg``/``bg`` params
+ * and the ``{type: "theme"}`` control frame. tmux answers pane palette
+ * probes (OSC 10/11) with these, so TUIs started in the pane cache the
+ * palette the user really sees.
+ */
+export function terminalPalette(isDark: boolean): TerminalPalette {
+  const theme = terminalTheme(isDark);
+  return { fg: theme.foreground as string, bg: theme.background as string };
+}
+
+/**
+ * Whether an OSC 10/11 payload is a color *query* (every ``;``-separated
+ * part is ``?``) rather than a color assignment.
+ *
+ * tmux forwards a pane program's own palette query to attached clients, so
+ * xterm's built-in handler would answer it with the ITheme colors through
+ * ``onData`` — typed back into the pane as keystrokes, a late duplicate on
+ * top of tmux's authoritative answer. Queries are consumed to suppress that
+ * auto-reply; assignments still fall through to xterm's dynamic-color
+ * handling.
+ */
+export function isPaletteQuery(data: string): boolean {
+  return data.split(";").every((part) => part === "?");
+}
+
 /**
  * Activation handler for clickable links in terminal output.
  *
@@ -498,6 +531,8 @@ export class TerminalSession {
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
+  /** OSC 10/11 query suppression (see {@link isPaletteQuery}). */
+  private readonly oscPaletteDisposes: { dispose: () => void }[];
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
@@ -575,6 +610,12 @@ export class TerminalSession {
     // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
     // writes can only arrive through validated tmux `clipboard-write` frames.
     this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
+    // Consume forwarded OSC 10/11 palette *queries* so xterm doesn't type a
+    // duplicate color reply back into the pane; tmux answers the pane itself
+    // from the palette this attach reported (see isPaletteQuery).
+    this.oscPaletteDisposes = [10, 11].map((code) =>
+      this.term.parser.registerOscHandler(code, (data) => isPaletteQuery(data)),
+    );
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links. Without
@@ -729,9 +770,17 @@ export class TerminalSession {
   /**
    * Update the terminal's color theme without reconnecting the WebSocket.
    * Safe to call at any point after construction.
+   *
+   * Also re-reports the rendered default colors to tmux (a ``theme``
+   * control frame) so pane palette probes after the switch see the new
+   * colors. The attach URL carried the initial palette; this keeps a live
+   * session's palette in step. Dropped server-side on read-only attaches.
    */
   setTheme(isDark: boolean): void {
     this.term.options.theme = terminalTheme(isDark);
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    const { fg, bg } = terminalPalette(isDark);
+    this.ws.send(JSON.stringify({ type: "theme", fg, bg }));
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */
@@ -779,6 +828,7 @@ export class TerminalSession {
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
+    for (const handler of this.oscPaletteDisposes) handler.dispose();
     try {
       this.ws.close();
     } catch {
