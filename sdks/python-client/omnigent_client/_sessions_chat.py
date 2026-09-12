@@ -377,6 +377,14 @@ class SessionsChat:
         bundle: bytes,
         *,
         filename: str = "agent.tar.gz",
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: str = "external",
+        sandbox_provider: str | None = None,
+        terminal_launch_args: list[str] | None = None,
+        host_id: str | None = None,
         files_uploader: _FilesUploader | None = None,
         files_getter: _FilesGetter | None = None,
         files_namespace: FilesNamespace | None = None,
@@ -396,6 +404,24 @@ class SessionsChat:
             multipart ``POST /v1/sessions``.
         :param filename: Filename for the multipart upload, e.g.
             ``"agent.tar.gz"``.
+        :param title: Optional human-readable title forwarded to
+            :meth:`SessionsNamespace.create`.
+        :param labels: Initial guardrails labels forwarded to
+            :meth:`SessionsNamespace.create`. ``None`` starts with
+            no labels.
+        :param reasoning_effort: Optional per-session reasoning
+            effort forwarded to :meth:`SessionsNamespace.create`.
+        :param workspace: Optional starting workspace forwarded to
+            :meth:`SessionsNamespace.create`.
+        :param host_type: Forwarded to :meth:`SessionsNamespace.create`.
+            ``"external"`` (default) or ``"managed"``.
+        :param sandbox_provider: Forwarded to
+            :meth:`SessionsNamespace.create` for ``host_type="managed"``.
+        :param terminal_launch_args: Optional native-terminal CLI args
+            forwarded to :meth:`SessionsNamespace.create`, e.g.
+            ``["--permission-mode", "bypassPermissions"]``.
+        :param host_id: Optional host id forwarded to
+            :meth:`SessionsNamespace.create`.
         :param files_uploader: Optional file-upload callable, e.g.
             ``client.files.for_session(session_id).upload``.
             ``None`` (the default) means ``files=`` arguments to
@@ -419,7 +445,18 @@ class SessionsChat:
             session.
         :raises OmnigentError: If session creation fails.
         """
-        session = await namespace.create(bundle, filename=filename)
+        session = await namespace.create(
+            bundle,
+            filename=filename,
+            title=title,
+            labels=labels,
+            reasoning_effort=reasoning_effort,
+            workspace=workspace,
+            host_type=host_type,
+            sandbox_provider=sandbox_provider,
+            terminal_launch_args=terminal_launch_args,
+            host_id=host_id,
+        )
         if files_namespace is not None:
             session_files = files_namespace.for_session(session.id)
             files_uploader = session_files.upload
