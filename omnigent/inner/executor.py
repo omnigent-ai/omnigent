@@ -327,6 +327,27 @@ class TurnCancelled(ExecutorEvent):
 
 
 @dataclass
+class TurnNotice(ExecutorEvent):
+    """An expected, user-remediable outcome the user must see — not a failure.
+
+    Yielded (before :class:`TurnComplete`) when the executor answers the
+    turn with guidance instead of doing the work — e.g. a native harness
+    intercepting ``/login`` and pointing at the host command that actually
+    re-authenticates. The adapter surfaces it as a neutral notice (an
+    ``error`` conversation item with ``level: "info"``), so the guidance
+    reaches the user without the turn being classified as failed.
+
+    :param message: The guidance text shown to the user, e.g. ``"Run omni
+        setup on the host to sign in again — or to sign out — then retry."``.
+    :param code: Stable classifier for the notice, e.g.
+        ``"claude_native_auth_command"``.
+    """
+
+    message: str
+    code: str = "notice"
+
+
+@dataclass
 class ExecutorError(ExecutorEvent):
     """Something went wrong.
 
