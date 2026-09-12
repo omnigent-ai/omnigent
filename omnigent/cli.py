@@ -2675,6 +2675,24 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
     return result.body.get("status") == "online"
 
 
+def _daemon_reports_registered(record: _HostDaemonRecord) -> bool:
+    """
+    Whether the daemon's own registry record shows a completed registration.
+
+    The daemon stamps ``registered_at`` once its tunnel hello lands on an
+    accepted, authenticated connection — the registration transport itself.
+    That is ground truth even when the secondary ``GET /v1/hosts/{id}`` status
+    read diverges (stale/cached read, proxy-split transports), so a healthy,
+    registered daemon is never mistaken for one that failed to register.
+
+    :param record: Daemon record whose target registry entry to re-read.
+    :returns: ``True`` when the current record still belongs to the same
+        daemon process and carries a registration stamp.
+    """
+    current = _read_daemon_record(_daemon_record_path(record.target))
+    return current is not None and current.pid == record.pid and current.registered_at is not None
+
+
 def _daemon_registry_dir() -> Path:
     """
     Return the directory containing per-target daemon registry records.
@@ -2728,6 +2746,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
     host_id = raw.get("host_id")
     resolved_server_url = raw.get("resolved_server_url")
     config_sig = raw.get("config_sig")
+    registered_at = raw.get("registered_at")
     return _HostDaemonRecord(
         pid=pid,
         target=target,
@@ -2742,6 +2761,11 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
             else None
         ),
         config_sig=config_sig if isinstance(config_sig, str) and config_sig else None,
+        registered_at=(
+            int(registered_at)
+            if isinstance(registered_at, int) and not isinstance(registered_at, bool)
+            else None
+        ),
     )
 
 
@@ -8600,6 +8624,12 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
                 "The host daemon exited before registering with the server."
                 f"{_background_host_log_detail(record.log_path)}"
             )
+        # Primary: the daemon's own registration stamp, written on the tunnel
+        # transport itself. The secondary server status read below can diverge
+        # from it, so it must never be the sole reason to declare failure and
+        # tear down a daemon that did register.
+        if _daemon_reports_registered(record):
+            return
         if _daemon_host_online(record, timeout_s=1.0):
             return
         if time.monotonic() >= deadline:

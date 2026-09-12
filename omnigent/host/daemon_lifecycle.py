@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -53,6 +54,8 @@ class HostDaemonRecord:
     :param host_id: Stable host id advertised to the server.
     :param resolved_server_url: Concrete URL owned by a local-mode daemon.
     :param config_sig: Signature of server-affecting launch configuration.
+    :param registered_at: Unix epoch seconds when this daemon last completed
+        server registration over its tunnel, or ``None`` before the first one.
     """
 
     pid: int
@@ -64,6 +67,7 @@ class HostDaemonRecord:
     host_id: str | None = None
     resolved_server_url: str | None = None
     config_sig: str | None = None
+    registered_at: int | None = None
 
 
 def normalize_daemon_target(server_url: str | None) -> str:
@@ -137,6 +141,36 @@ def write_daemon_record(
     path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n")
     if update_legacy_pidfile:
         (root / "host.pid").write_text(f"{record.pid}\n{record.target}\n")
+
+
+def mark_daemon_registered(record_path: Path, *, pid: int | None = None) -> bool:
+    """Stamp the owning daemon's record with a completed registration.
+
+    The daemon calls this once its tunnel hello has landed on an accepted,
+    authenticated connection — the registration transport itself — giving the
+    CLI's background-spawn readiness gate ground truth even when the secondary
+    ``GET /v1/hosts/{id}`` status read diverges. Rewrites the record in place
+    (same inode) so the daemon's lifecycle flock survives.
+
+    :param record_path: The daemon's ``<hash>.json`` registry record.
+    :param pid: Owning pid to verify; defaults to the current process.
+    :returns: ``True`` when the record was stamped; ``False`` when it is
+        missing, malformed, unwritable, or owned by another pid — best-effort,
+        never raises.
+    """
+    owner = os.getpid() if pid is None else pid
+    try:
+        data = json.loads(record_path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get("pid") != owner:
+        return False
+    data["registered_at"] = int(time.time())
+    try:
+        record_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    except OSError:
+        return False
+    return True
 
 
 def record_flock_is_held(record_path: Path) -> bool | None:
@@ -222,6 +256,11 @@ class DaemonLifecycleLock:
     def target(self) -> str:
         """Return the daemon target this lock guards."""
         return self._target
+
+    @property
+    def record_path(self) -> Path:
+        """Return the registry record path this lock guards."""
+        return self._record_path
 
     def acquire(self) -> bool:
         """Take the exclusive lifetime lock on the record file.

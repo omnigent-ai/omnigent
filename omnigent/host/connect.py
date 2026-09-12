@@ -3970,6 +3970,14 @@ class HostProcess:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
         self._ws = ws
+        # The hello landed on an accepted, authenticated tunnel — registration
+        # is complete on the transport itself. Stamp the registry record so the
+        # CLI's background-spawn readiness gate has ground truth even when its
+        # secondary GET /v1/hosts/{id} status read diverges.
+        if self._lifecycle_lock is not None:
+            from omnigent.host.daemon_lifecycle import mark_daemon_registered
+
+            mark_daemon_registered(self._lifecycle_lock.record_path)
         # Reports raised while disconnected must wait until registration; the
         # server cannot route them before this connection owns the host.
         for runner_id, error in list(self._unreported_exits.items()):

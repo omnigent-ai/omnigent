@@ -908,6 +908,86 @@ def test_host_background_fails_when_daemon_never_registers(
     assert terminated == [4242]
 
 
+def test_host_background_trusts_daemon_registration_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon-stamped registration survives a divergent server status read.
+
+    The daemon registers over its WebSocket tunnel and stamps its registry
+    record; the CLI's secondary ``GET /v1/hosts/{id}`` probe can diverge
+    (stale, cached, or differently-routed read). The stamp is ground truth:
+    the CLI must report success and leave the healthy daemon running instead
+    of declaring a registration timeout and force-terminating it.
+    """
+    from omnigent.host.daemon_lifecycle import mark_daemon_registered
+
+    _spawned, _log_path = _patch_background_host_spawn(monkeypatch, tmp_path)
+    # The divergent secondary read: the status probe never reports online.
+    monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: False)
+    # Keep the failure mode fast if the stamp were ignored.
+    monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.2)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_databricks_server_auth", lambda *args, **kwargs: None
+    )
+
+    def _claim_and_stamp(target: str, spawned: object, **kwargs: object) -> object:
+        """Persist the fake claim, then stamp it like a registered daemon."""
+        result = _persist_fake_daemon_claim(target, spawned, **kwargs)
+        assert mark_daemon_registered(cli_module._daemon_record_path(target), pid=4242)
+        return result
+
+    monkeypatch.setattr("omnigent.cli._wait_for_daemon_claim", _claim_and_stamp)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: terminated.append(record.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "--background", "--server", "https://example.databricksapps.com"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Started the host daemon" in result.output
+    assert "did not register with the server" not in result.output
+    assert terminated == []
+
+
+def test_daemon_record_rewrite_preserves_registration_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI-side record rewrites carry the daemon's ``registered_at`` through.
+
+    ``_update_daemon_resolved_server_url`` re-writes the record from the
+    parsed dataclass; a parse that dropped the stamp would erase the daemon's
+    registration evidence mid-startup.
+    """
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    target = "https://example.databricksapps.com"
+    cli_module._write_daemon_record(
+        cli_module._HostDaemonRecord(
+            pid=4242,
+            target=target,
+            mode="server",
+            server_url=target,
+            log_path=None,
+            started_at=int(time.time()),
+            registered_at=123456789,
+        )
+    )
+
+    read = cli_module._find_daemon_record(target)
+    assert read is not None and read.registered_at == 123456789
+
+    cli_module._update_daemon_resolved_server_url(target, "http://127.0.0.1:6767")
+
+    again = cli_module._find_daemon_record(target)
+    assert again is not None and again.registered_at == 123456789
+
+
 def test_host_background_does_not_block(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
