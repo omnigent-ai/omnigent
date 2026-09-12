@@ -148,22 +148,26 @@ export function isPdfFile(path: string, contentType?: string | null): boolean {
 }
 
 // 3D model formats we render in an interactive WebGL preview (three.js). Scoped
-// deliberately to the three loaders we ship — STL, 3MF, OBJ — and nothing else.
-export type ModelFormat = "stl" | "3mf" | "obj";
+// deliberately to the four loaders we ship — STL, 3MF, OBJ, glTF/GLB — and
+// nothing else.
+export type ModelFormat = "stl" | "3mf" | "obj" | "gltf";
 
-// Model file extensions → the loader format they select.
+// Model file extensions → the loader format they select. The GLTF loader sniffs
+// the container (JSON vs binary), so .gltf and .glb share one format.
 const MODEL_EXTENSION_FORMATS: Record<string, ModelFormat> = {
   stl: "stl",
   "3mf": "3mf",
   obj: "obj",
+  gltf: "gltf",
+  glb: "gltf",
 };
 
 // MIME types servers commonly report for these formats → the loader format.
 // Extension-driven `guess_type` and some toolchains disagree on the canonical
 // value (STL in particular has several historical types), so match a small
-// explicit set rather than a `model/` prefix — `model/gltf+json` etc. are NOT
-// in scope. Generic types (`application/octet-stream`, `text/plain`) are
-// deliberately absent so they fall through to the extension.
+// explicit set rather than a `model/` prefix. Generic types
+// (`application/octet-stream`, `text/plain`) are deliberately absent so they
+// fall through to the extension.
 const MODEL_CONTENT_TYPE_FORMATS: Record<string, ModelFormat> = {
   "model/stl": "stl",
   "application/sla": "stl",
@@ -171,6 +175,8 @@ const MODEL_CONTENT_TYPE_FORMATS: Record<string, ModelFormat> = {
   "model/3mf": "3mf",
   "application/vnd.ms-package.3dmanufacturing-3dmodel+xml": "3mf",
   "model/obj": "obj",
+  "model/gltf+json": "gltf",
+  "model/gltf-binary": "gltf",
 };
 
 /**
@@ -212,7 +218,7 @@ export function isModelFile(path: string, contentType?: string | null): boolean 
  * resolved light/dark mode.
  *
  * Mirrors `resolvedThemeToMonaco`: one pure map from the concrete theme mode to
- * the values the viewer needs, so STL/3MF/OBJ all share a single source of
+ * the values the viewer needs, so every model format shares a single source of
  * theme truth instead of hardcoding a neutral scene. WebGL wants numeric colors
  * (`0xRRGGBB`), and the values track the app's `--background`/`--foreground`
  * tokens so the canvas sits flush with the surrounding panel in both modes.

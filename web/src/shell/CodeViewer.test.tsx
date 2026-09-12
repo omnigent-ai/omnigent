@@ -34,8 +34,8 @@ vi.mock("./PdfViewer", () => ({
 // (which has no WebGL); its presence in the DOM is the signal that a model file
 // was routed to the 3D preview instead of the binary-rejection placeholder.
 vi.mock("./ModelViewer", () => ({
-  ModelViewer: ({ path }: { path: string }) => (
-    <div data-testid="model-viewer-stub" data-path={path} />
+  ModelViewer: ({ path, conversationId }: { path: string; conversationId: string }) => (
+    <div data-testid="model-viewer-stub" data-path={path} data-conversation-id={conversationId} />
   ),
 }));
 
@@ -711,6 +711,26 @@ describe("CodeViewer 3D model routing", () => {
     renderModel("download", "base64", "model/3mf");
     expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
     expect(screen.queryByText(/binary file/i)).toBeNull();
+  });
+
+  it("routes a .glb to the 3D model viewer", async () => {
+    renderModel("scene.glb", "base64", "application/octet-stream");
+    expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
+    expect(screen.queryByText(/binary file/i)).toBeNull();
+  });
+
+  it("routes a utf-8 .gltf to the 3D model viewer, not raw source", async () => {
+    renderModel("scene.gltf", "utf-8", "text/plain");
+    expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("threads the conversation id to the model viewer", async () => {
+    renderModel("parts/widget.stl", "base64", "application/octet-stream");
+    expect(await screen.findByTestId("model-viewer-stub")).toHaveAttribute(
+      "data-conversation-id",
+      "conv_1",
+    );
   });
 });
 
