@@ -10227,6 +10227,8 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
         return await real_ensure(*args, **kwargs)
 
     monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_on_first_call)
+    monkeypatch.setattr(forwarder._logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(forwarder._logger, "propagate", False)
 
     with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder"):
         task = asyncio.create_task(
