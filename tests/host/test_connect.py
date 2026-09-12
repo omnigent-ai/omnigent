@@ -249,6 +249,55 @@ async def test_handle_model_options_uses_host_pi_configuration(
     )
 
 
+async def test_handle_model_options_serves_the_pi_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The headless ``pi`` harness gets the same launch picker as ``pi-native``.
+
+    ``omnigent run`` agents execute on the ``pi`` harness (the gateway-wrapped
+    headless Pi); their session picker asks the host for model options and was
+    answered ``model options are unsupported for harness 'pi'`` — so every
+    such session carried an empty picker while an identical pi-native session
+    listed its models. Both harness spellings resolve the same configured
+    inventory.
+    """
+    from omnigent.harnesses.pi_native import credentials as pi_native_credentials
+
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "pi_native_model_options",
+        lambda: [
+            {
+                "id": "omnigent/glm-5.3",
+                "model": "omnigent/glm-5.3",
+                "displayName": "glm-5.3",
+            }
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_pi", harness="pi"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_pi",
+        status="ok",
+        models=[
+            {
+                "id": "omnigent/glm-5.3",
+                "model": "omnigent/glm-5.3",
+                "displayName": "glm-5.3",
+                "source": {
+                    "kind": "subscription",
+                    "label": "Subscription",
+                    "name": "pi",
+                },
+            }
+        ],
+    )
+
+
 @pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
 async def test_handle_model_options_codex_probe_failure_is_failed(
     monkeypatch: pytest.MonkeyPatch, failure: str
