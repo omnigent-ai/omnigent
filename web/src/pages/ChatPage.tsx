@@ -89,7 +89,11 @@ import {
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
-import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
+import {
+  codexEffortLevelsForModel,
+  displayModelId,
+  findNativeModelOption,
+} from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
@@ -2083,8 +2087,8 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
  * @param codexModelOptions - Native model metadata, when available.
  * @returns The advertised display label for known native models, a
  *   version-agnostic friendly form for an alias-shaped id the catalog
- *   doesn't list, the raw model id otherwise, or ``null`` when no model
- *   is known.
+ *   doesn't list, the catalog-folded id (gateway prefix and ``[1m]`` suffix
+ *   dropped) otherwise, or ``null`` when no model is known.
  */
 export function formatStatusModelLabel(
   model: string | null,
@@ -2108,7 +2112,13 @@ export function formatStatusModelLabel(
     if (alias[3]) label += " (1M context)";
     return label;
   }
-  return raw;
+  // A catalog-shaped id with no catalog row (an SDK/bundle session, or the
+  // pre-catalog window): fold off the gateway prefix and `[1m]` suffix so the
+  // chip is spelling-stable no matter which field or event fed it. The launch
+  // id `system.ai.claude-opus-5[1m]` and the harness's bare report
+  // `claude-opus-5` then collapse to one label instead of flickering between
+  // them.
+  return displayModelId(raw) || raw;
 }
 
 function formatStatusEffortLabel(effort: string | null): string | null {

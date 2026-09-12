@@ -76,7 +76,12 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
-import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
+import {
+  Composer,
+  composerHarnessLabel,
+  formatModelEffortStatusLabel,
+  formatStatusModelLabel,
+} from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
 // it shows the worktree branch (truncated so the tray never wraps), current
@@ -486,11 +491,17 @@ describe("formatModelEffortStatusLabel", () => {
     ).toBe("codex says GPT-5.5 xHigh");
   });
 
-  it("leaves unknown model ids raw", () => {
+  it("leaves an unprefixed unknown id as-is", () => {
     expect(formatModelEffortStatusLabel("gpt-5.5", "xhigh")).toBe("gpt-5.5 xHigh");
-    expect(formatModelEffortStatusLabel("databricks-gpt-5-5", "xhigh")).toBe(
-      "databricks-gpt-5-5 xHigh",
-    );
+  });
+
+  it("folds a catalog id's gateway prefix and [1m] suffix so the chip can't flicker", () => {
+    // The fully-qualified launch id and the harness's bare report are the same
+    // model in two spellings; both must render identically or the composer chip
+    // flickers between them as the events carrying each interleave.
+    expect(formatStatusModelLabel("system.ai.claude-opus-5[1m]")).toBe("claude-opus-5");
+    expect(formatStatusModelLabel("claude-opus-5")).toBe("claude-opus-5");
+    expect(formatModelEffortStatusLabel("databricks-gpt-5-5", "xhigh")).toBe("gpt-5-5 xHigh");
   });
 
   it("prefers the catalog display name for a Claude [1m] alias", () => {

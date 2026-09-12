@@ -30,6 +30,29 @@ function comparableModelId(model: string | null | undefined): string {
 }
 
 /**
+ * Display fold: drop the gateway catalog prefix (`system.ai.` / `databricks-`)
+ * and the `[1m]` context-variant suffix, keeping the rest of the id verbatim.
+ *
+ * Unlike {@link comparableModelId} this preserves dots and case, so it stays a
+ * readable label (`gpt-5.6`, not `gpt-5-6`). The composer's model chip folds
+ * through here so a model's two spellings (the fully-qualified launch id
+ * `system.ai.claude-opus-5[1m]` and the harness's bare report `claude-opus-5`)
+ * render as one stable label instead of flickering as the events carrying each
+ * interleave. The `[1m]` capacity still shows in the context ring, which reads
+ * the stable `contextWindow` field, so folding it off the label hides nothing.
+ */
+export function displayModelId(model: string): string {
+  let bare = model.trim();
+  for (const prefix of CATALOG_PREFIXES) {
+    if (bare.toLowerCase().startsWith(prefix)) {
+      bare = bare.slice(prefix.length);
+      break;
+    }
+  }
+  return bare.toLowerCase().endsWith("[1m]") ? bare.slice(0, -"[1m]".length) : bare;
+}
+
+/**
  * Find a native picker option by its UI alias or provider-facing model id.
  *
  * Falls back to comparing folded spellings so a session bound to a catalog id
