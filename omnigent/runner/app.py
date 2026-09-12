@@ -465,6 +465,43 @@ def resolve_subagent_launch_timeout_s() -> float:
     return value
 
 
+# Budget for awaiting REPL-terminal auto-create inline in a request handler.
+# Session init blocks on it, so an unbounded stall wedges ``POST /v1/sessions``
+# forever (the web UI never leaves "Starting up…"); bound the await and
+# continue without the terminal instead.
+_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S_ENV = "OMNIGENT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S"
+_DEFAULT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S = 60.0
+
+
+def resolve_repl_terminal_autocreate_timeout_s() -> float:
+    """
+    Resolve the REPL-terminal auto-create budget in seconds.
+
+    Unlike the sub-agent launch budget, ``<= 0`` does not disable the bound —
+    the await must stay finite because session init blocks on it — so
+    non-positive, non-finite, and non-numeric overrides all fall back to the
+    default with a warning.
+
+    :returns: The budget in seconds, e.g. ``60.0``.
+    """
+    raw = os.environ.get(_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is None or not math.isfinite(value) or value <= 0:
+        _logger.warning(
+            "Invalid %s=%r; using default %ss",
+            _REPL_TERMINAL_AUTOCREATE_TIMEOUT_S_ENV,
+            raw,
+            _DEFAULT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S,
+        )
+        return _DEFAULT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S
+    return value
+
+
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
 _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
@@ -4222,12 +4259,24 @@ def create_runner_app(
                     except OmnigentError:
                         repl_agent_spec = None
                     try:
-                        await _auto_create_repl_terminal(
+                        # Session init blocks on this await; keep it bounded so a
+                        # stalled terminal launch degrades to "no auto terminal"
+                        # instead of wedging init (web UI stuck on "Starting up…").
+                        await asyncio.wait_for(
+                            _auto_create_repl_terminal(
+                                session_id,
+                                resource_registry,
+                                _publish_event,
+                                server_client=server_client,
+                                agent_spec=repl_agent_spec,
+                            ),
+                            timeout=resolve_repl_terminal_autocreate_timeout_s(),
+                        )
+                    except TimeoutError:
+                        _logger.warning(
+                            "Auto-create of the omnigent REPL terminal for %s timed "
+                            "out; continuing session init without it",
                             session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            agent_spec=repl_agent_spec,
                         )
                     except Exception:
                         _logger.exception(
@@ -10046,13 +10095,25 @@ def create_runner_app(
                 except OmnigentError:
                     repl_agent_spec = None
                 try:
-                    await _auto_create_repl_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                        agent_spec=repl_agent_spec,
+                    # Bounded like the init-path auto-create: a stall here would
+                    # wedge this request AND hold the per-session ensure lock,
+                    # blocking every later init of the same session.
+                    await asyncio.wait_for(
+                        _auto_create_repl_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            agent_spec=repl_agent_spec,
+                        ),
+                        timeout=resolve_repl_terminal_autocreate_timeout_s(),
                     )
+                except TimeoutError:
+                    _logger.warning(
+                        "Recreate of the omnigent REPL terminal for %s timed out",
+                        session_id,
+                    )
+                    return None
                 except Exception:
                     _logger.exception(
                         "Failed to recreate omnigent REPL terminal for %s",

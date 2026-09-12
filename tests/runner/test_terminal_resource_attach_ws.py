@@ -9,6 +9,7 @@ lookup while stubbing the control bridge itself.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
@@ -523,6 +524,123 @@ def test_runner_resource_attach_dead_non_repl_terminal_keeps_4404(
         with pytest.raises(WebSocketDisconnect) as exc_info:
             ws.receive_bytes()
 
+    assert exc_info.value.code == 4404
+
+
+def test_repl_autocreate_timeout_resolver_rejects_invalid_and_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The REPL auto-create budget must always resolve to a finite bound.
+
+    Session init and the attach recreate block on the auto-create await, so
+    unlike the sub-agent launch budget there is no ``<= 0`` "disabled" mode:
+    non-positive, non-finite, and non-numeric overrides all fall back to the
+    default rather than reintroducing an unbounded await.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+
+    env = "OMNIGENT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S"
+    default = runner_app._DEFAULT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S
+
+    monkeypatch.delenv(env, raising=False)
+    assert runner_app.resolve_repl_terminal_autocreate_timeout_s() == default
+
+    for bad in ("nan", "inf", "-inf", "bogus", "0", "-5"):
+        monkeypatch.setenv(env, bad)
+        assert runner_app.resolve_repl_terminal_autocreate_timeout_s() == default, bad
+
+    monkeypatch.setenv(env, "45.5")
+    assert runner_app.resolve_repl_terminal_autocreate_timeout_s() == 45.5
+
+
+@pytest.mark.timeout(30)
+def test_runner_resource_attach_recreate_bounded_when_autocreate_hangs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A hung REPL auto-create must not wedge the attach recreate forever.
+
+    The dead-REPL recreate awaits the auto-create inline while holding the
+    per-session ensure lock; unbounded, a stalled terminal launch would hang
+    this attach forever AND block every later session init on the same lock
+    (the same class of hang as the init path's "Starting up…" wedge, which
+    ``tests/e2e/test_repl_autocreate_hang_does_not_wedge_init.py`` covers
+    end-to-end). The await is capped by the auto-create budget: on timeout
+    the attach closes 4404 instead of hanging.
+
+    :param tmp_path: Pytest tmp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S", "0.2")
+
+    registry = TerminalRegistry()
+    stale = _make_running_instance("tui", "main", tmp_path)
+
+    async def dead_tmux() -> bool:
+        """
+        Simulate ``tmux has-session`` reporting the REPL pane gone.
+
+        :returns: ``False`` after flipping the optimistic running flag.
+        """
+        stale.running = False
+        return False
+
+    stale.is_alive = dead_tmux  # type: ignore[method-assign]
+    _seed_registry(registry, "conv_abc", stale)
+
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    resource_registry._terminal_roles[("conv_abc", "terminal_tui_main")] = (
+        OMNIGENT_REPL_TERMINAL_ROLE
+    )
+
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    auto_create_sessions: list[str] = []
+
+    async def hanging_auto_create(
+        session_id: str,
+        rr: SessionResourceRegistry,
+        publish_event: object,
+        *,
+        server_client: object,
+        agent_spec: object = None,
+    ) -> SessionResourceView:
+        """
+        Stand-in for ``_auto_create_repl_terminal`` that never completes.
+
+        :param session_id: Session being recreated, e.g. ``"conv_abc"``.
+        :param rr: The runner's resource registry (unused).
+        :param publish_event: Per-session SSE emitter (unused).
+        :param server_client: Omnigent server client (unused).
+        :param agent_spec: Resolved session agent spec (unused).
+        :returns: Never returns; parked until cancelled by the bound.
+        """
+        del rr, publish_event, server_client, agent_spec
+        auto_create_sessions.append(session_id)
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_repl_terminal", hanging_auto_create)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+
+    # Sanity: the hung auto-create was actually reached (the recreate path
+    # ran); 4404 without it would mean the test never exercised the bound.
+    assert auto_create_sessions == ["conv_abc"]
+    # The bound aborted the hang and the route closed terminal-not-found
+    # instead of wedging the attach (and the session's ensure lock) forever.
     assert exc_info.value.code == 4404
 
 
