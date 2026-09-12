@@ -128,7 +128,9 @@ function saveTokens(origin, tokens) {
       enc: safeStorage.encryptString(JSON.stringify(tokens)).toString("base64"),
     };
   } else {
-    console.warn("[omnigent] safeStorage unavailable; storing Databricks tokens unencrypted (0600)");
+    console.warn(
+      "[omnigent] safeStorage unavailable; storing Databricks tokens unencrypted (0600)",
+    );
     store[storeKey(origin)] = { plain: tokens };
   }
   writeStore(store);
@@ -237,7 +239,7 @@ async function runInteractiveLogin(origin) {
       }
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(
-        "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">" +
+        '<html><body style="font-family:system-ui;text-align:center;padding:60px">' +
           "<h2>Signed in to Databricks</h2>" +
           "<p>You can close this tab and return to Omnigent.</p></body></html>",
       );

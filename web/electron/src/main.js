@@ -2545,7 +2545,9 @@ function pickWorkspaceForBridge(parent, workspaces) {
     // A closed window (user hit the OS close button) resolves as cancelled.
     picker.on("closed", () => finish(null));
 
-    console.log(`[omnigent] databricks workspace picker: showing ${workspaces.length} workspace(s)`);
+    console.log(
+      `[omnigent] databricks workspace picker: showing ${workspaces.length} workspace(s)`,
+    );
     void picker.loadFile(WORKSPACE_PICKER_PAGE);
   });
 }
@@ -2642,7 +2644,9 @@ function registerIpc() {
         } catch (err) {
           // Best-effort: on any failure fall through to a plain load and let the
           // workspace's own SSO gate handle sign-in in the window.
-          console.warn(`[omnigent] databricks pre-auth failed; loading without a pre-seeded session: ${err.message}`);
+          console.warn(
+            `[omnigent] databricks pre-auth failed; loading without a pre-seeded session: ${err.message}`,
+          );
         }
       }
       win

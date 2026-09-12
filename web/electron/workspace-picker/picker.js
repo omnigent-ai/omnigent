@@ -38,7 +38,9 @@ function render() {
   });
   const total = filtered.length;
   countEl.textContent =
-    total > MAX_ROWS ? `Showing ${MAX_ROWS} of ${total} — refine your search` : `${total} workspace(s)`;
+    total > MAX_ROWS
+      ? `Showing ${MAX_ROWS} of ${total} — refine your search`
+      : `${total} workspace(s)`;
 }
 
 function setActive(next) {

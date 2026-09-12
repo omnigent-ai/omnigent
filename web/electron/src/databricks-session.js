@@ -91,7 +91,9 @@ async function mintSessionCookie(ses, origin, accessToken, nextPath) {
 
   const jar = await ses.cookies.get({ url: origin, name: "DBAUTH" });
   if (jar.length === 0) {
-    throw new Error(`${SESSION_CREATE_PATH}: no DBAUTH cookie stored in the session (final HTTP ${status})`);
+    throw new Error(
+      `${SESSION_CREATE_PATH}: no DBAUTH cookie stored in the session (final HTTP ${status})`,
+    );
   }
   console.log(`[omnigent] databricks session: signed in to ${origin}`);
 }

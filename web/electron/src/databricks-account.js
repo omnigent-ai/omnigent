@@ -53,7 +53,9 @@ async function listRunningWorkspaces(account, accessToken) {
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
-    throw new Error(`account workspaces lookup failed: ${resp.status} ${url} ${body.slice(0, 200)}`);
+    throw new Error(
+      `account workspaces lookup failed: ${resp.status} ${url} ${body.slice(0, 200)}`,
+    );
   }
   const body = await resp.json();
   // The API returns a bare array; accept an object wrapper defensively.
