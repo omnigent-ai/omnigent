@@ -3,17 +3,17 @@ import { defaultModelLabel, nativeModelLabel } from "./HarnessConfigControls";
 
 describe("nativeModelLabel", () => {
   it.each([
-    ["system.ai.claude-opus-4-6", "Opus", "Opus 4.6"],
-    ["system.ai.claude-opus-4-8[1m]", "Opus", "Opus 4.8 (1M context)"],
-    ["databricks-claude-sonnet-4-6", "Sonnet", "Sonnet 4.6"],
-    ["claude-haiku-4-5-20251001", "Haiku", "Haiku 4.5"],
-    ["claude-sonnet-5[1m]", "Sonnet (1M context)", "Sonnet 5 (1M context)"],
-  ])("completes the family label using %s", (model, displayName, expected) => {
-    expect(nativeModelLabel({ id: "alias", model, displayName })).toBe(expected);
+    ["system.ai.claude-opus-4-6", "Opus"],
+    ["system.ai.claude-opus-4-8[1m]", "Opus"],
+    ["databricks-claude-sonnet-4-6", "Sonnet"],
+    ["claude-haiku-4-5-20251001", "Haiku"],
+    ["claude-sonnet-5[1m]", "Sonnet (1M context)"],
+  ])("shows the advertised display name for %s", (model, displayName) => {
+    expect(nativeModelLabel({ id: "alias", model, displayName })).toBe(displayName);
   });
 
-  it("uses the versioned id when the catalog omits model", () => {
-    expect(nativeModelLabel({ id: "claude-opus-4-6", displayName: "Opus" })).toBe("Opus 4.6");
+  it("uses the display name when the catalog omits model", () => {
+    expect(nativeModelLabel({ id: "claude-opus-4-6", displayName: "Opus" })).toBe("Opus");
   });
 
   it("does not guess the version of an unresolved alias", () => {
@@ -36,6 +36,6 @@ describe("nativeModelLabel", () => {
       defaultModelLabel([
         { id: "opus", model: "claude-opus-4-6", displayName: "Opus", isDefault: true },
       ]),
-    ).toBe("Default (Opus 4.6)");
+    ).toBe("Default (Opus)");
   });
 });

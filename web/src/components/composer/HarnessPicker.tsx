@@ -130,7 +130,19 @@ export function HarnessPickerEntry({
   if (editable && !isMobile) {
     return (
       <DropdownMenuSub open={open} onOpenChange={onOpenChange}>
-        <DropdownMenuSubTrigger {...rowProps} onPointerMove={(event) => event.preventDefault()}>
+        <DropdownMenuSubTrigger
+          {...rowProps}
+          onPointerMove={(event) => event.preventDefault()}
+          onClick={(event) => {
+            // Pointer-move is suppressed on this trigger to keep the flyout
+            // stable, which also blocks hover-out close; a second click on an
+            // open row is the explicit pointer dismissal.
+            if (open) {
+              event.preventDefault();
+              onOpenChange(false);
+            }
+          }}
+        >
           {rowContent}
         </DropdownMenuSubTrigger>
         <DropdownMenuSubContent

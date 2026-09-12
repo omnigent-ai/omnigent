@@ -29,45 +29,12 @@ export interface RoutingModelOption {
   label: string;
 }
 
-/** The native-catalog fields the Model row's copy is built from. */
-interface NativeModelLabelFields {
-  id: string;
-  model?: string;
-  displayName?: string;
-  isDefault?: boolean;
-}
-
-/** A catalog row's user-facing name: what the harness advertises, else its id. */
-export function nativeModelLabel(option: NativeModelLabelFields): string {
-  const label = option.displayName ?? option.id;
-  const model = option.model ?? option.id;
-  const resolved =
-    /^(?:system\.ai\.|databricks-)?claude-(opus|sonnet|haiku|fable)-(\d{1,2})(?:[-.](\d{1,2}))?(?:-\d{8})?(\[1m\])?$/i.exec(
-      model,
-    );
-  if (!resolved) return label;
-  const [, family, major, minor, context] = resolved;
-  const bareLabel = label.replace(/(?:\[1m\]| \(1M context\))$/i, "").replace(/^Claude /i, "");
-  if (bareLabel.toLowerCase() !== family!.toLowerCase() && label !== model) return label;
-  const familyLabel = family![0]!.toUpperCase() + family!.slice(1).toLowerCase();
-  return `${familyLabel} ${major}${minor ? `.${minor}` : ""}${context ? " (1M context)" : ""}`;
-}
-
-/**
- * Label for the Model row's "Default" choice, naming the model it resolves to
- * when the catalog marks one.
- *
- * Shared by the landing dialog and the in-session composer: read from one place
- * so the same session can't read "Default" in one gear and
- * "Default (GPT-5.6-Luna)" in the other.
- *
- * @param options Harness catalog rows; at most one is marked default.
- * @returns ``Default (<name>)``, or plain ``Default`` when unmarked.
- */
-export function defaultModelLabel(options: readonly NativeModelLabelFields[]): string {
-  const dflt = options.find((option) => option.isDefault);
-  return dflt ? `Default (${nativeModelLabel(dflt)})` : "Default";
-}
+// The model-label helpers are canonical in the shared leaf module so the
+// landing dialog, the chat status line, and this file all format a model the
+// same way. Re-exported here so callers that import them from
+// HarnessConfigControls keep working.
+export { defaultModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
+export type { NativeModelLabelFields } from "@/lib/composerModelLabel";
 
 /**
  * The Model row's Select: the Smart Routing sentinel (when offered), the

@@ -374,6 +374,7 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         expect.any(Object),
         project,
+        expect.objectContaining({ boundAgentId: "ag_hello", reasoningEffort: null }),
       ),
     );
     await waitFor(() =>

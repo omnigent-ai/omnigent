@@ -29,6 +29,7 @@ from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
@@ -46,6 +47,7 @@ _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
+_AUTH_DISCOVERY_RETRY_INTERVAL_S = 5.0
 # The runner offloads short native-CLI/IPC ops via asyncio.to_thread. Python's
 # default executor sizes to min(32, cpu+4) threads, which on a many-core host
 # inflates RSS (thread stacks + glibc arenas) for little benefit. Cap it small.
@@ -283,7 +285,7 @@ async def _run_inactivity_monitor(
         await asyncio.sleep(min(poll_interval_s, idle_timeout_s - elapsed_s))
 
 
-class _RunnerDatabricksAuth(httpx.Auth):
+class _RunnerDatabricksAuth(ThreadedAuth):
     """httpx Auth that mints a fresh Databricks OAuth token per request.
 
     Used by the runner's HTTP client for callbacks to the Omnigent server
@@ -471,7 +473,7 @@ class _InitialAuthTokenFactory:
         self._last_initial_token: str = token  # retained for managed-mint proxy auth
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
-        self._fallback_resolved = False
+        self._retry_discovery_at = 0.0
         self._no_credential_logged = False
         self._lock = threading.Lock()
 
@@ -487,13 +489,14 @@ class _InitialAuthTokenFactory:
         """
         if self._initial_token is not None:
             return self._initial_token
-        if not self._fallback_resolved:
+        if self._fallback_factory is None:
+            if time.monotonic() < self._retry_discovery_at:
+                return None
             self._fallback_factory = _make_auth_token_factory(
                 self._server_url,
                 _allow_initial_token=False,
                 _proxy_bearer=self._last_initial_token,
             )
-            self._fallback_resolved = True
         token = self._fallback_factory() if self._fallback_factory is not None else None
         # Managed mint cannot renew itself when its proxy bearer expires —
         # the injected host bearer before a first mint, or the minted JWT
@@ -506,15 +509,17 @@ class _InitialAuthTokenFactory:
                 _allow_delegated_mint=False,
             )
             token = self._fallback_factory() if self._fallback_factory is not None else None
-        if self._fallback_factory is None and not self._no_credential_logged:
-            # This state is terminal for the process, so say it once
-            # rather than on every subsequent callback.
-            self._no_credential_logged = True
-            _logger.error(
-                "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                "to renew it; run `databricks auth login` to re-authenticate",
-                extra={"session_id": runner_primary_session_id()},
-            )
+        if self._fallback_factory is None:
+            self._retry_discovery_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
+            if not self._no_credential_logged:
+                self._no_credential_logged = True
+                _logger.error(
+                    "host bootstrap bearer expired and no SDK/OIDC credential is available "
+                    "to renew it; run `databricks auth login` to re-authenticate",
+                    extra={"session_id": runner_primary_session_id()},
+                )
+        elif token:
+            self._no_credential_logged = False
         return token
 
     @property
@@ -555,10 +560,11 @@ class _InitialAuthTokenFactory:
                 reset()
 
     def invalidate(self) -> bool:
-        """Discard the host bearer so the next call resolves local auth."""
+        """Invalidate the host bearer or the resolved fallback credential."""
         with self._lock:
             if self._initial_token is None:
-                return False
+                invalidate = getattr(self._fallback_factory, "invalidate", None)
+                return bool(invalidate()) if callable(invalidate) else False
             self._initial_token = None
             _logger.info(
                 "host bootstrap bearer rejected; resolving runner-local auth",
@@ -1007,6 +1013,22 @@ class _ManagedMintTokenFactory:
         with self._lock:
             self.declined = False
             self.declined_by_server_error = False
+
+    def invalidate(self) -> bool:
+        """Discard the cached JWT so the next call re-mints.
+
+        Called when the server rejects the minted credential mid-session
+        (e.g. a signing-key rotation revoked it); without this the cache
+        still looks valid locally and is re-sent on every retry.
+
+        :returns: ``True`` when a cached token was discarded.
+        """
+        with self._lock:
+            if self._cached_token is None:
+                return False
+            self._cached_token = None
+            self._cached_expires_at = 0.0
+            return True
 
     def _still_valid_cached_token(self, now: float) -> str | None:
         """Return the cached token if it hasn't expired outright.

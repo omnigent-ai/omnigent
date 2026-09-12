@@ -5442,6 +5442,43 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("refreshSessionState", () => {
+    it("retains an optimistic model through a snapshot without a native report", async () => {
+      useChatStore.setState({
+        conversationId: "conv_model_seed",
+        sessionModelSeeded: true,
+        sessionModelOverride: "system.ai.claude-opus-4-8[1m]",
+        llmModel: "system.ai.claude-opus-4-8[1m]",
+      });
+      fetchMock.mockImplementation(() =>
+        mockResponse({
+          id: "conv_model_seed",
+          agent_id: "agent_xyz",
+          agent_name: "Claude Code",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          harness: "claude",
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          llm_model: null,
+        }),
+      );
+      await useChatStore.getState().refreshSessionState("conv_model_seed");
+      expect(useChatStore.getState()).toMatchObject({
+        sessionModelSeeded: true,
+        sessionModelOverride: "system.ai.claude-opus-4-8[1m]",
+        llmModel: "system.ai.claude-opus-4-8[1m]",
+      });
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_model_seed",
+        model: "claude-sonnet-5",
+      });
+      expect(useChatStore.getState()).toMatchObject({
+        sessionModelSeeded: false,
+        llmModel: "claude-sonnet-5",
+      });
+    });
+
     it("forces a fresh snapshot and applies runner-backed Codex model options", async () => {
       useChatStore.setState({
         conversationId: "conv_codex",
@@ -5524,6 +5561,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         conversationId: "conv_abc",
         selectedModel: "opus",
         sessionModelOverride: "sonnet",
+        sessionModelSeeded: true,
         llmModel: null,
       });
       handleSessionEvent({
@@ -5533,6 +5571,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       const state = useChatStore.getState();
       expect(state.llmModel).toBe("system.ai.claude-sonnet-5");
+      expect(state.sessionModelSeeded).toBe(false);
       expect(state.selectedModel).toBe("opus");
       expect(state.sessionModelOverride).toBe("sonnet");
     });
@@ -5698,6 +5737,32 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         "low",
       );
       // The visible conversation's sticky pick is untouched.
+      expect(useChatStore.getState().selectedEffort).toBe("high");
+    });
+
+    it("keeps a backgrounded reset-to-null authoritative so a warm switch won't leak sticky (#7039)", () => {
+      // A resets to agent default (null) in the background; another session left
+      // the app-global sticky at "high". A's explicit null must stay
+      // AUTHORITATIVE on its entry (sessionEffortSeeded=true) so a warm switch
+      // back reads null — not the leaked "high" sticky. Regression for the
+      // background-null A→B→A leak.
+      bindConversationForTest("conv_effort_null_bg");
+      bindConversationForTest("conv_effort_null_fg");
+      useChatStore.setState({ selectedEffort: "high" });
+
+      handleSessionEvent(
+        {
+          type: "session_reasoning_effort",
+          conversationId: "conv_effort_null_bg",
+          reasoningEffort: null,
+        },
+        "conv_effort_null_bg",
+      );
+
+      const entry = conversationRegistry.peek("conv_effort_null_bg")!.getState();
+      expect(entry.sessionReasoningEffort).toBeNull();
+      expect(entry.sessionEffortSeeded).toBe(true);
+      // The background reset never touches the app-global sticky.
       expect(useChatStore.getState().selectedEffort).toBe("high");
     });
   });
@@ -13708,5 +13773,171 @@ describe("chatStore — interaction_phase analytics", () => {
         status: "cancelled",
       },
     ]);
+  });
+});
+
+describe("beginLocalConversation — optimistic model seed", () => {
+  it("seeds the selected model + effort + harness + identity, not the previous model", () => {
+    seedConversationsCache([]);
+    // A previous session left a cross-session sticky pick; it must NOT leak into
+    // the optimistic view — the seed is authoritative.
+    useChatStore.setState({ selectedModel: "claude-sonnet-4-6" });
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: "opus[1m]",
+      reasoningEffort: "high",
+      harness: "claude-sdk",
+      boundAgentId: "agent_xyz",
+      boundAgentName: "Debby",
+    })!;
+    expect(isTempConvId(begun.tempConvId)).toBe(true);
+    const state = useChatStore.getState();
+    expect(state.sessionModelOverride).toBe("opus[1m]");
+    expect(state.sessionModelSeeded).toBe(true);
+    expect(state.sessionReasoningEffort).toBe("high");
+    expect(state.sessionHarness).toBe("claude-sdk");
+    expect(state.boundAgentId).toBe("agent_xyz");
+    expect(state.boundAgentName).toBe("Debby");
+  });
+
+  it("shows the resolved default model via llmModel when there is no override", () => {
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      llmModel: "claude-opus-4-8",
+      harness: "claude-sdk",
+      boundAgentId: "agent_default",
+      boundAgentName: "Polly",
+    })!;
+    expect(begun).not.toBeNull();
+    const state = useChatStore.getState();
+    // No override, but the resolved default is visible so the temp view reads
+    // the real model rather than "agent default" / a stale pick.
+    expect(state.sessionModelOverride).toBeNull();
+    expect(state.llmModel).toBe("claude-opus-4-8");
+    expect(state.sessionHarness).toBe("claude-sdk");
+    expect(state.boundAgentName).toBe("Polly");
+  });
+
+  it("carries the routing flag + identity so the composer renders routing, not a model", () => {
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      costControlModeOverride: "on",
+      harness: "claude-sdk",
+      boundAgentId: "agent_auto",
+      boundAgentName: "Auto",
+    })!;
+    expect(begun).not.toBeNull();
+    const state = useChatStore.getState();
+    // routingOn === costControlModeOverride === "on" drives the routing label,
+    // and the model stays unpinned — matching the normalized routing create.
+    expect(state.costControlModeOverride).toBe("on");
+    expect(state.sessionModelOverride).toBeNull();
+    expect(state.sessionHarness).toBe("claude-sdk");
+    expect(state.boundAgentId).toBe("agent_auto");
+  });
+
+  it("preserves the seeded model + identity across the temp→real rekey", () => {
+    seedSession("conv_real");
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: "opus[1m]",
+      harness: "claude-sdk",
+      boundAgentId: "agent_xyz",
+      boundAgentName: "Debby",
+    })!;
+    hydrateLocalConversation(
+      begun.tempConvId,
+      "conv_real",
+      "agent_xyz",
+      "hi",
+      undefined,
+      begun.pendingMsgTempId,
+      null,
+      () => {},
+    );
+    // The registry rekey copies entry state, so the real entry carries the seed
+    // until the server snapshot binds authoritative values.
+    const state = useChatStore.getState();
+    expect(state.sessionModelOverride).toBe("opus[1m]");
+    expect(state.sessionHarness).toBe("claude-sdk");
+    expect(state.boundAgentName).toBe("Debby");
+    expect(state.sessionModelSeeded).toBe(true);
+  });
+
+  it("is backward compatible: a 4-arg call seeds no model fields", () => {
+    seedConversationsCache([]);
+    useChatStore.setState({ selectedModel: "claude-sonnet-4-6" });
+    beginLocalConversation("hi", undefined);
+    const state = useChatStore.getState();
+    expect(state.sessionModelOverride).toBeNull();
+    expect(state.sessionHarness).toBeNull();
+    expect(state.sessionModelSeeded).toBe(false);
+  });
+
+  it("marks a seeded null effort authoritative so it wins over a non-null sticky", () => {
+    seedConversationsCache([]);
+    // Another session left a sticky "high"; a create that intentionally omits
+    // effort (seeded null) must NOT borrow it.
+    useChatStore.setState({ selectedEffort: "high" });
+    beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      reasoningEffort: null,
+      harness: "claude-sdk",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionEffortSeeded).toBe(true);
+    expect(state.sessionReasoningEffort).toBeNull();
+  });
+
+  it("marks a seeded explicit effort authoritative", () => {
+    seedConversationsCache([]);
+    beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      reasoningEffort: "low",
+      harness: "claude-sdk",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionEffortSeeded).toBe(true);
+    expect(state.sessionReasoningEffort).toBe("low");
+  });
+
+  it("does NOT mark effort authoritative when the create omits it (stays a sticky fallback)", () => {
+    seedConversationsCache([]);
+    beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: "opus[1m]",
+      harness: "claude-sdk",
+    });
+    expect(useChatStore.getState().sessionEffortSeeded).toBe(false);
+  });
+
+  it("leaves effort unseeded for a 4-arg (no model) call", () => {
+    seedConversationsCache([]);
+    beginLocalConversation("hi", undefined);
+    expect(useChatStore.getState().sessionEffortSeeded).toBe(false);
+  });
+
+  it("preserves the effort-seeded authority across the temp→real rekey", () => {
+    seedSession("conv_effort_seed");
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      reasoningEffort: null,
+      harness: "claude-sdk",
+      boundAgentId: "agent_xyz",
+    })!;
+    hydrateLocalConversation(
+      begun.tempConvId,
+      "conv_effort_seed",
+      "agent_xyz",
+      "hi",
+      undefined,
+      begun.pendingMsgTempId,
+      null,
+      () => {},
+    );
+    // Authority rides through rekey (registry copies entry state) until a
+    // server snapshot supersedes it.
+    expect(useChatStore.getState().sessionEffortSeeded).toBe(true);
   });
 });

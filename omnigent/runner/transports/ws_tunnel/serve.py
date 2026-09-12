@@ -440,13 +440,7 @@ async def serve_tunnel(
             redirect_url = _websocket_auth_redirect_url(exc)
             if redirect_url is not None:
                 login_redirect_streak += 1
-                _reset_server_error_decline(auth_token_factory)
-                if _invalidate_auth_token_factory(auth_token_factory):
-                    auth_token = await _handle_refreshable_auth_failure(
-                        auth_token_factory, 302, exc
-                    )
-                    delay_s = _INITIAL_RECONNECT_DELAY_S
-                    continue
+                await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
                 # The websockets library auto-followed a redirect away
                 # from our ws:// endpoint to an http(s):// URL —
                 # typically the Databricks App login page. On a runner
@@ -511,8 +505,7 @@ async def serve_tunnel(
                     # so we don't call the factory directly here. Also clear a
                     # 5xx-latched mint decline: the rejection proves the server
                     # requires auth, so the next refresh must re-mint.
-                    _reset_server_error_decline(auth_token_factory)
-                    _invalidate_auth_token_factory(auth_token_factory)
+                    await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
                     if ever_connected:
                         # Escalate the backoff rather than resetting it: a rejection
@@ -603,6 +596,19 @@ async def serve_tunnel(
             delay_s = min(delay_s * 2, _MAX_RECONNECT_DELAY_S)
 
 
+def _prepare_auth_retry(factory: Callable[[], str | None] | None) -> None:
+    """Reset rejected credentials without making transient failures fatal."""
+    try:
+        _reset_server_error_decline(factory)
+        _invalidate_auth_token_factory(factory)
+    except (ValueError, OSError, ImportError):
+        _logger.warning(
+            "auth token invalidation failed; retrying credential lookup",
+            exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
+        )
+
+
 def _invalidate_auth_token_factory(factory: Callable[[], str | None] | None) -> bool:
     """Invalidate a host-bootstrap bearer when the factory supports it.
 
@@ -664,48 +670,6 @@ async def _refresh_auth_token(
             extra={"session_id": runner_primary_session_id()},
         )
     return current_token
-
-
-async def _handle_refreshable_auth_failure(
-    factory: Callable[[], str | None] | None,
-    http_status: int,
-    exc: WebSocketException,
-) -> str | None:
-    """
-    Attempt a token refresh after an HTTP 302 login-page redirect.
-
-    If the factory produces a new token, returns it so the caller
-    can retry immediately. If no factory is available or the refresh
-    fails, raises a fatal ``RuntimeError``.
-
-    :param factory: Sync callable returning a fresh token.
-    :param http_status: The HTTP status that triggered this call,
-        e.g. ``302`` for a login-page redirect.
-    :param exc: The original ``WebSocketException``.
-    :returns: A refreshed token string.
-    :raises RuntimeError: When no factory is available or refresh
-        fails.
-    """
-    if factory is not None:
-        try:
-            fresh = await asyncio.to_thread(factory)
-            if fresh is not None:
-                _logger.info(
-                    "auth token refreshed after HTTP %d; retrying",
-                    http_status,
-                    extra={"session_id": runner_primary_session_id()},
-                )
-                return fresh
-        except (ValueError, OSError, ImportError):
-            _logger.warning(
-                "auth token refresh failed after HTTP %d",
-                http_status,
-                exc_info=True,
-                extra={"session_id": runner_primary_session_id()},
-            )
-    raise RuntimeError(
-        f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP {http_status}); check remote server authentication"
-    ) from exc
 
 
 def _websocket_http_status(exc: BaseException) -> int | None:
