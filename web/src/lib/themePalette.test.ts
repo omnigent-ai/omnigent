@@ -191,11 +191,12 @@ describe("themePalette", () => {
   it.each(PALETTES)("keeps $label selected text readable and its highlight visible", (palette) => {
     for (const mode of ["light", "dark"] as const) {
       const { background, selectionBackground, selectionForeground } = palette.tokens[mode];
+      const label = `${palette.label} ${mode}`;
       const page = parseColor(background).rgb;
+      expect(parseColor(selectionBackground).alpha, label).toBeLessThan(1);
       // Measure the highlight as painted (a tint composited over the page),
       // whether the palette uses an opaque pair or a translucent wash.
       const highlight = composite(parseColor(selectionBackground), page);
-      const label = `${palette.label} ${mode}`;
       expect(
         contrast(parseColor(selectionForeground).rgb, highlight),
         label,

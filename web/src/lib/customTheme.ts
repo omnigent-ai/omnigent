@@ -334,9 +334,8 @@ function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
 
 /**
  * A custom accent tints the selection the way it tints the sidebar's active
- * row (a translucent wash of the accent under the page foreground), so a
- * recolored theme never keeps its base palette's off-accent selection block.
- * With the accent unchanged, each palette keeps its stock pair.
+ * row: a wash of the accent, at the stock wash's alpha, under the page
+ * foreground. With the accent unchanged, each palette keeps its stock wash.
  */
 function rebaseSelection(
   base: PaletteTokens,
@@ -349,11 +348,8 @@ function rebaseSelection(
       selectionForeground: base.selectionForeground,
     };
   }
-  const baseAlpha = parseCssColor(base.selectionBackground)?.alpha ?? 1;
-  return {
-    selectionBackground: setAlpha(primary, baseAlpha < 1 ? baseAlpha : 0.12),
-    selectionForeground: foreground,
-  };
+  const alpha = parseCssColor(base.selectionBackground)?.alpha ?? 0.12;
+  return { selectionBackground: setAlpha(primary, alpha), selectionForeground: foreground };
 }
 
 function rebaseVariant(

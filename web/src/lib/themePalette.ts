@@ -148,6 +148,7 @@ type PaletteTokenInput = Pick<
   | "cardSolid"
   | "primary"
   | "primaryForeground"
+  | "selectionBackground"
   | "secondary"
   | "muted"
   | "mutedForeground"
@@ -164,8 +165,10 @@ type PaletteTokenInput = Pick<
 
 function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
   return {
-    selectionBackground: tokens.primary,
-    selectionForeground: tokens.primaryForeground,
+    // Selection is a translucent wash of the palette's accent under the page
+    // foreground, never an opaque block; each variant picks the alpha that
+    // keeps the wash clearly visible on every surface.
+    selectionForeground: tokens.foreground,
     cardForeground: tokens.foreground,
     tray: tokens.card,
     popover: tokens.cardSolid,
@@ -306,6 +309,7 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#f7f5fd",
+        selectionBackground: "rgba(124, 58, 237, 0.15)",
         foreground: "#1e1a2b",
         card: "#ffffff",
         cardSolid: "#ffffff",
@@ -326,6 +330,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#282a36",
+        selectionBackground: "rgba(189, 147, 249, 0.15)",
         foreground: "#f8f8f2",
         card: "rgba(68, 71, 90, 0.5)",
         cardSolid: "#343746",
@@ -363,6 +368,7 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#f6f8fa",
+        selectionBackground: "rgba(31, 136, 61, 0.15)",
         foreground: "#1f2328",
         card: "#ffffff",
         cardSolid: "#ffffff",
@@ -382,14 +388,13 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#0d1117",
+        selectionBackground: "rgba(35, 134, 54, 0.15)",
         foreground: "#e6edf3",
         card: "rgba(22, 27, 34, 0.72)",
         cardSolid: "#161b22",
         popover: "rgba(22, 27, 34, 0.9)",
         primary: "#238636",
         primaryForeground: "#ffffff",
-        selectionBackground: "#3fb950",
-        selectionForeground: "#0d1117",
         secondary: "#21262d",
         muted: "#21262d",
         mutedForeground: "#8b949e",
@@ -420,6 +425,7 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#eff1f5",
+        selectionBackground: "rgba(136, 57, 239, 0.15)",
         foreground: "#4c4f69",
         card: "#ffffff",
         cardSolid: "#ffffff",
@@ -440,6 +446,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#1e1e2e",
+        selectionBackground: "rgba(203, 166, 247, 0.15)",
         foreground: "#cdd6f4",
         card: "rgba(49, 50, 68, 0.6)",
         cardSolid: "#282938",
@@ -476,12 +483,12 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#fbf1c7",
+        selectionBackground: "rgba(214, 93, 14, 0.18)",
         foreground: "#3c3836",
         card: "#fffdf2",
         cardSolid: "#fffdf2",
         primary: "#d65d0e",
         primaryForeground: "#ffffff",
-        selectionBackground: "#af3a03",
         secondary: "#ebdbb2",
         muted: "#ebdbb2",
         mutedForeground: "#7c6f64",
@@ -496,6 +503,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#282828",
+        selectionBackground: "rgba(254, 128, 25, 0.15)",
         foreground: "#ebdbb2",
         card: "rgba(60, 56, 54, 0.6)",
         cardSolid: "#32302f",
@@ -538,12 +546,14 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#fdf6e3",
+        selectionBackground: "rgba(38, 139, 210, 0.15)",
+        // base02: the body text (base00) is too light over the wash.
+        selectionForeground: "#073642",
         foreground: "#657b83",
         card: "#eee8d5",
         cardSolid: "#eee8d5",
         primary: "#268bd2",
         primaryForeground: "#fdf6e3",
-        selectionBackground: "#00659a",
         secondary: "#eee8d5",
         muted: "#eee8d5",
         mutedForeground: "#586e75",
@@ -559,14 +569,15 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#002b36",
+        selectionBackground: "rgba(38, 139, 210, 0.2)",
+        // base2, for the same reason as light mode.
+        selectionForeground: "#eee8d5",
         foreground: "#839496",
         card: "#073642",
         cardSolid: "#073642",
         popover: "#073642",
         primary: "#268bd2",
         primaryForeground: "#fdf6e3",
-        selectionBackground: "#65b5ed",
-        selectionForeground: "#002b36",
         secondary: "#073642",
         muted: "#073642",
         mutedForeground: "#93a1a1",
@@ -598,12 +609,12 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#eceff4",
+        selectionBackground: "rgba(94, 129, 172, 0.25)",
         foreground: "#2e3440",
         card: "#e5e9f0",
         cardSolid: "#e5e9f0",
         primary: "#5e81ac",
         primaryForeground: "#eceff4",
-        selectionBackground: "#466a94",
         secondary: "#d8dee9",
         muted: "#d8dee9",
         mutedForeground: "#4c566a",
@@ -619,6 +630,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#2e3440",
+        selectionBackground: "rgba(136, 192, 208, 0.2)",
         foreground: "#eceff4",
         card: "rgba(59, 66, 82, 0.6)",
         cardSolid: "#3b4252",

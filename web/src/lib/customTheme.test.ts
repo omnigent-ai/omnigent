@@ -128,8 +128,7 @@ describe("customTheme", () => {
       );
 
       for (const mode of ["light", "dark"] as const) {
-        // A translucent stock pair keeps its alpha; opaque pairs take the
-        // sidebar active row's 12%.
+        // The wash keeps the stock alpha for this palette and mode.
         const alpha = /, ([\d.]+)\)$/.exec(palette.tokens[mode].selectionBackground)?.[1] ?? "0.12";
         expect(variants[mode].selectionBackground).toBe(`rgba(${r}, ${g}, ${b}, ${alpha})`);
         expect(variants[mode].selectionForeground).toBe(variants[mode].foreground);
