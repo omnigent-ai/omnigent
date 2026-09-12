@@ -69,6 +69,9 @@ _MCP_ERROR_PREFIX = "Error: "
 #: and the bare ``data``/``mimeType`` form MCP persists.
 _IMAGE_TYPE_KEY_RE = re.compile(r'"type"\s*:\s*"image"')
 _IMAGE_DATA_KEY_RE = re.compile(r'"data"\s*:')
+_COMPACTION_IMAGE_MARKER_RE = re.compile(
+    r"\[(image/[^\s\]]+) content omitted from the compaction snapshot\]"
+)
 
 
 def _holds_clipped_image_payload(body: str) -> bool:
@@ -533,16 +536,15 @@ def _image_block_has_valid_payload(block: JsonObject) -> bool:
 
 
 def sanitize_replayed_image_blocks(content: object) -> object:
-    """Downgrade image blocks whose base64 payload is no longer usable.
+    """Downgrade image blocks whose persisted payload is no longer usable.
 
     A compaction snapshot replaces each image block's base64 with a short marker
     (``[image/png content omitted from the compaction snapshot]``). Replayed
     verbatim into a ``--resume`` transcript that marker reaches the provider as
-    ``source.data`` and the whole request is rejected (``invalid base64 image
-    data: Invalid symbol 91, offset 0`` — the leading ``[``). Any image block
-    whose payload no longer validates is turned into the omitted-image text
-    placeholder; a still-valid one is canonicalized so a wrapped or unpadded
-    spelling cannot fail the resume either.
+    ``source.data`` or ``input_image.image_url`` and the whole request is
+    rejected. Affected blocks become omitted-image text placeholders; a
+    still-valid base64 image is canonicalized so a wrapped or unpadded spelling
+    cannot fail the resume either.
 
     Traversal is deliberately narrow — a message content list and, within it, a
     ``tool_result``'s ``content`` list. It does not descend into a
@@ -572,6 +574,15 @@ def _sanitize_replayed_block(block: object) -> object:
     block_type = parsed.get("type")
     if block_type == "image":
         return _sanitize_image_block(parsed)
+    if block_type == "input_image":
+        image_url = parsed.get("image_url")
+        marker = (
+            _COMPACTION_IMAGE_MARKER_RE.fullmatch(image_url)
+            if isinstance(image_url, str)
+            else None
+        )
+        if marker is not None:
+            return {"type": "input_text", "text": image_omitted_placeholder(marker.group(1))}
     if block_type == "tool_result":
         inner = parsed.get("content")
         if isinstance(inner, list):
