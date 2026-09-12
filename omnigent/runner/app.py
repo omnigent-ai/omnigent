@@ -314,6 +314,12 @@ _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
 
+# An unexpectedly exited REPL terminal is recreated so a live SDK session
+# never silently loses its embedded main terminal. The cap bounds the
+# exit→recreate loop when something keeps killing the recreated tmux server.
+_REPL_TERMINAL_AUTO_RECREATE_LIMIT = 3
+_REPL_TERMINAL_AUTO_RECREATE_WINDOW_S = 300.0
+
 
 def _version_supports_waiting_status(server_version: str) -> bool:
     """
@@ -2894,6 +2900,8 @@ def create_runner_app(
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    # Monotonic stamps of recent exit-driven REPL recreates, per session.
+    _repl_terminal_auto_recreates: dict[str, list[float]] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
     # Conversations whose claude-sdk `/compact` published an up-front
@@ -3294,6 +3302,70 @@ def create_runner_app(
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)
 
+    def _claim_repl_terminal_auto_recreate(session_id: str) -> bool:
+        """Claim one exit-driven REPL recreate inside the rate window.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``True`` when a recreate may run now.
+        """
+        now = time.monotonic()
+        stamps = [
+            stamp
+            for stamp in _repl_terminal_auto_recreates.get(session_id, [])
+            if now - stamp < _REPL_TERMINAL_AUTO_RECREATE_WINDOW_S
+        ]
+        allowed = len(stamps) < _REPL_TERMINAL_AUTO_RECREATE_LIMIT
+        if allowed:
+            stamps.append(now)
+        _repl_terminal_auto_recreates[session_id] = stamps
+        return allowed
+
+    def _recover_repl_terminal_after_exit(event: TerminalExitEvent) -> None:
+        """Recreate the embedded REPL terminal after an unexpected exit.
+
+        ``tui:main`` is a live SDK session's main terminal. When its tmux
+        backing dies, the resource would silently vanish and the web view
+        would claim the harness is not running while the session is still
+        alive — so rebuild the terminal instead. Deliberate closes never
+        reach the exit publisher, so an exit seen here is an unexpected
+        death.
+
+        :param event: The auxiliary REPL terminal's exit event.
+        """
+        if not _claim_repl_terminal_auto_recreate(event.session_id):
+            _logger.warning(
+                "REPL terminal %s keeps exiting for %s; not auto-recreating "
+                "again (max %d per %.0fs). A fresh terminal attach still "
+                "recreates it.",
+                event.terminal_name,
+                event.session_id,
+                _REPL_TERMINAL_AUTO_RECREATE_LIMIT,
+                _REPL_TERMINAL_AUTO_RECREATE_WINDOW_S,
+            )
+            return
+        # "Terminal coming up" keeps the web view on its starting state
+        # instead of the misleading resume fallback while we rebuild.
+        _publish_terminal_pending(_publish_event, event.session_id, True)
+
+        async def _recover() -> None:
+            try:
+                entry = await _recreate_repl_terminal(event.session_id, event.terminal_id)
+                if entry is None:
+                    _logger.error(
+                        "Could not recover REPL terminal %s for %s after its tmux backing died",
+                        event.terminal_name,
+                        event.session_id,
+                    )
+            finally:
+                _publish_terminal_pending(_publish_event, event.session_id, False)
+
+        task = asyncio.create_task(
+            _recover(),
+            name=f"repl-terminal-recover:{event.session_id}",
+        )
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
     def _publish_terminal_exit(event: TerminalExitEvent) -> None:
         _publish_event(
             event.session_id,
@@ -3307,7 +3379,14 @@ def create_runner_app(
         # Auxiliary terminals do not own the session control plane. In
         # particular, losing Codex's streamable TUI must not cancel an active
         # app-server turn; the native-terminal ensure path can recreate it.
+        # The embedded REPL terminal is the one auxiliary pane a live SDK
+        # session cannot lose, so its unexpected death triggers a rebuild.
         if event.lifecycle != TerminalLifecycle.REQUIRED:
+            if (
+                event.terminal_name == _REPL_TERMINAL_NAME
+                and event.session_key == _REPL_TERMINAL_SESSION_KEY
+            ):
+                _recover_repl_terminal_after_exit(event)
             return
 
         # A required terminal exit ends the session. Tear down any registered
@@ -4495,6 +4574,7 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        _repl_terminal_auto_recreates.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
 
@@ -11391,6 +11471,7 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        _repl_terminal_auto_recreates.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         await _delete_native_bridge_dirs(
             server_client=server_client,
@@ -11418,6 +11499,7 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        _repl_terminal_auto_recreates.pop(session_id, None)
         await _teardown_session_terminals(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))
