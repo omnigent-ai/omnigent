@@ -12,7 +12,8 @@ Three behaviours are pinned:
 1. Opening the GitHub rail tab renders the associated PR (title + number), its
    CI checks as labeled pills, and the branch-vs-base file tree — with a
    single-child directory chain (``src`` → ``app``) compacted into one row.
-2. The composer status line's ``#<pr>`` link opens that tab.
+2. The composer's PR link matches adjacent metadata text and opens GitHub on
+   desktop and mobile, with one or several PRs and default or large UI text.
 3. A host predating the ``/resources/github`` route 404s "Resource 'github'
    not found", which the panel renders as an actionable "update your host"
    empty state rather than the generic "unavailable" one.
@@ -24,10 +25,12 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
-from playwright.sync_api import Page, expect
+import pytest
+from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
 
 _PR_NUMBER = 4242
 
@@ -115,7 +118,7 @@ _PR_DIFF = {
 }
 
 
-def _stub_github(page: Page) -> None:
+def _stub_github(page: Page, *, pr_count: int = 1) -> None:
     """Answer the runner-backed GitHub endpoints with canned JSON — no real
     ``gh``/``git`` runs. Register before navigating so the first fetch is caught.
 
@@ -123,7 +126,24 @@ def _stub_github(page: Page) -> None:
     at the query/string boundary, so they never swallow ``/github/changes`` or
     the per-file ``/github/diff/<path>``.
     """
-    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda r: r.fulfill(json=_INFO))
+    info = _INFO
+    if pr_count > 1:
+        info = {
+            **_INFO,
+            "tracking_available": True,
+            "selected_pr_url": _INFO["pr"]["url"],
+            "prs": [
+                {
+                    "url": f"https://example.com/pr/{_PR_NUMBER + index}",
+                    "host": "example.com",
+                    "repository": "acme/app",
+                    "number": _PR_NUMBER + index,
+                    "relationship": "created",
+                }
+                for index in range(pr_count)
+            ],
+        }
+    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda r: r.fulfill(json=info))
     page.route(re.compile(r"/resources/github/changes"), lambda r: r.fulfill(json=_CHANGES))
     page.route(re.compile(r"/resources/github/diff(?:\?|$)"), lambda r: r.fulfill(json=_PR_DIFF))
     page.route(
@@ -175,24 +195,97 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_role("button", name=re.compile(r"main\.py")).first).to_be_visible()
 
 
+@pytest.mark.parametrize(
+    "viewport_width",
+    [1280, pytest.param(390, marks=pytest.mark.browser_context_args(has_touch=True))],
+    ids=["desktop", "mobile"],
+)
+@pytest.mark.parametrize("font_size", [13, 18], ids=["default-font", "large-font"])
+@pytest.mark.parametrize("pr_count", [1, 2], ids=["single-pr", "multiple-pr"])
 def test_composer_pr_link_opens_github_tab(
     page: Page,
     seeded_session: tuple[str, str],
+    tmp_path: Path,
+    viewport_width: int,
+    font_size: int,
+    pr_count: int,
 ) -> None:
-    """The composer status line's #<pr> link opens the GitHub tab."""
+    """PR metadata uses the caption size and opens the appropriate GitHub surface."""
     base_url, session_id = seeded_session
-    _stub_github(page)
+    is_mobile = viewport_width < 768
+    workspace = "/workspace/demo-app"
+    branch = "feature/pr-link"
+
+    def session_details(route: Route) -> None:
+        response = fetch_with_retry(route)
+        snapshot = response.json()
+        snapshot.update(workspace=workspace, git_branch=branch, host_id="composer-pr-host")
+        route.fulfill(response=response, json=snapshot)
+
+    page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
+    page.route(
+        "**/v1/hosts/composer-pr-host/worktrees?*",
+        lambda route: route.fulfill(
+            json={
+                "data": [{"path": workspace, "branch": branch, "is_main": True, "detached": False}]
+            }
+        ),
+    )
+    _stub_github(page, pr_count=pr_count)
+    page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
+    page.set_viewport_size({"width": viewport_width, "height": 844 if is_mobile else 900})
     page.goto(f"{base_url}/c/{session_id}")
 
-    # The link appears once GitHub info resolves (a PR is associated).
     pr_link = page.get_by_test_id("composer-pr-link")
     expect(pr_link).to_be_visible(timeout=30_000)
-    expect(pr_link).to_contain_text(f"#{_PR_NUMBER}")
+    expect(pr_link).to_have_accessible_name(f"#{_PR_NUMBER}" if pr_count == 1 else "2 PRs")
+    expect(page.get_by_test_id("composer-workspace-dir")).to_have_text("demo-app")
+    expect(page.get_by_test_id("composer-git-branch")).to_have_text(branch)
+    font_sizes = {}
+    for test_id in ("composer-pr-link", "composer-workspace-dir", "composer-git-branch"):
+        label = page.get_by_test_id(test_id).locator("span")
+        expect(label).to_be_visible()
+        font_sizes[test_id] = label.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
+    print(f"Composer fonts ({viewport_width}px, {font_size}px preference): {font_sizes}")
+    page.screenshot(path=tmp_path / "composer-pr-link.png", animations="disabled")
 
-    # Clicking it opens the rail on the GitHub tab with the PR loaded.
-    pr_link.click()
-    rail = page.get_by_role("complementary", name="Workspace")
-    expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
+    # Mobile has a full-screen drawer, not the desktop workspace tab strip.
+    if is_mobile:
+        pr_link.tap()
+    else:
+        pr_link.click()
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if is_mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    try:
+        if is_mobile:
+            expect(panel).to_have_attribute("data-state", "open")
+        else:
+            expect(panel.get_by_role("tab", name="GitHub")).to_have_attribute(
+                "aria-selected", "true"
+            )
+        expect(panel.get_by_text("Add the GitHub tab", exact=True)).to_be_visible(timeout=30_000)
+        expect(panel.get_by_label("Pull request status: Open")).to_be_visible()
+        expect(panel.get_by_text("Nice work!", exact=True)).to_be_visible()
+        if pr_count > 1:
+            expect(panel.get_by_role("combobox", name="Session pull request")).to_have_text(
+                f"example.com/acme/app #{_PR_NUMBER}"
+            )
+    finally:
+        page.screenshot(path=tmp_path / "composer-pr-link-after-click.png", animations="disabled")
+
+    if is_mobile:
+        panel.get_by_role("button", name="Close", exact=True).click()
+        expect(panel).to_have_attribute("data-state", "closed")
+        expect(pr_link).to_be_in_viewport()
+
+    for test_id in ("composer-workspace-dir", "composer-git-branch"):
+        assert font_sizes["composer-pr-link"] == pytest.approx(font_sizes[test_id], abs=0.01), (
+            f"PR label should match adjacent composer metadata at {font_size}px preference: "
+            f"{font_sizes}"
+        )
 
 
 def _stub_github_outdated_host(page: Page) -> None:

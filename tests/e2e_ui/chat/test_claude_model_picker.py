@@ -448,9 +448,9 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # The composer label already shows the concrete routable id.
+    # The composer names the routable model using its advertised label.
     expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(
-        "Sonnet 4.5", timeout=15_000
+        "databricks-claude-sonnet-4-5", timeout=15_000
     )
     _screenshot(page, "unpinned-gateway-composer")
 

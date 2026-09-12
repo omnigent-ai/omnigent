@@ -4,6 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,6 +32,27 @@ vi.mock("@/hooks/useGithub", () => ({
 vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
   ...(await importOriginal<typeof FileViewerContextModule>()),
   useOpenGithubTab: () => openGithubTabMock,
+}));
+// PR/context/branch now render in the workspace bar via these shared hooks
+// (their own component + hook tests cover the variations); stub them so the
+// composer renders in isolation with a neutral empty status.
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: () => ({
+    branch: null,
+    branchState: "unknown",
+    isWorktree: null,
+    worktreePath: null,
+    creationBranch: null,
+    repoNameWithOwner: null,
+    prCount: 0,
+    prNumber: null,
+    refresh: () => {},
+    refreshing: false,
+  }),
+}));
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: () => ({ children: [] }),
 }));
 
 // HostBadge now lives in the status-line tray (left of the worktree branch).
@@ -187,48 +209,15 @@ describe("Composer status line (branch + context ring)", () => {
     expect(statusLine()).toBeNull();
   });
 
-  it.each([
-    {
-      scenario: "a single PR from an older host",
-      data: { pr: { number: 42 } },
-      label: "#42",
-    },
-    {
-      scenario: "one tracked PR without fetched metadata",
-      data: { prs: [{ number: 42 }], pr: null },
-      label: "#42",
-    },
-    {
-      scenario: "multiple PRs with a selected PR",
-      data: { prs: [{ number: 42 }, { number: 42 }], pr: { number: 42 } },
-      label: "2 PRs",
-    },
-    {
-      scenario: "multiple PRs without fetched metadata",
-      data: { prs: [{ number: 42 }, { number: 43 }, { number: 44 }], pr: null },
-      label: "3 PRs",
-    },
-  ])("links $scenario to the GitHub panel", ({ data, label }) => {
-    useGithubInfoMock.mockReturnValue({ data });
-    renderComposer();
-    const indicator = screen.getByRole("button", { name: label });
-    expect(indicator).toHaveTextContent(label);
-    fireEvent.click(indicator);
-    expect(openGithubTabMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("hides the PR indicator when the tracked list is empty", () => {
-    useGithubInfoMock.mockReturnValue({ data: { prs: [], pr: null } });
-    renderComposer();
-    expect(screen.queryByTestId("composer-pr-link")).not.toBeInTheDocument();
-  });
+  // The PR link moved from the status line into the workspace bar's shared
+  // ComposerPrLink (fed by useComposerGitStatus); its PR-count variations and
+  // click-through are covered by ComposerPrLink.test + useComposerGitStatus.test.
 
   it("shows the context ring with the correct used percentage", () => {
     useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000 });
     renderComposer();
-    expect(statusLine()).not.toBeNull();
-    // 25k of 100k → 25% used; a wrong value means the ring wired the
-    // wrong store fields through its props.
+    // The ring moved to the workspace bar (ComposerContextRing); assert it
+    // renders the used percentage wherever it now lives — 25k of 100k → 25%.
     expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
   });
 
@@ -299,34 +288,11 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.queryByLabelText(/context used/)).toBeNull();
   });
 
-  it("shows the worktree branch on the left and truncates it", () => {
-    useChatStore.setState({
-      gitBranch: "feature/a-very-long-worktree-branch-name-that-would-wrap",
-    });
-    renderComposer();
-    const branch = screen.getByTestId("composer-git-branch");
-    expect(branch).toHaveTextContent("feature/a-very-long-worktree-branch-name-that-would-wrap");
-    // `truncate` (overflow-hidden + ellipsis + nowrap) is the guard that
-    // keeps a long branch from wrapping the tray onto a second line.
-    expect(branch.querySelector(".truncate")).toBeTruthy();
-    expect(branch.closest('[data-testid="composer-workspace-controls"]')).toBeTruthy();
-  });
-
-  it("keeps the branch in the shared top bar without an empty footer", () => {
-    // The branch alone is enough to surface the tray — the visibility
-    // guard must not key off the ring only.
-    useChatStore.setState({ gitBranch: "main" });
-    renderComposer();
-    expect(statusLine()).toBeNull();
-    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("main");
-  });
-
-  it("shows an honest placeholder before a branch is reported", () => {
-    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000, gitBranch: null });
-    renderComposer();
-    expect(statusLine()).not.toBeNull();
-    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("No branch reported");
-  });
+  // The worktree branch (live text, truncation, honest placeholder) moved into
+  // the shared ComposerWorkspaceStatus, fed by useComposerGitStatus's
+  // host-derived branch state — covered by ComposerWorkspaceStatus.test +
+  // useComposerGitStatus.test. The composer parity test asserts the bar still
+  // renders the shared branch control.
 
   it("shows a persistent Plan mode badge when Codex Plan mode is active", () => {
     useChatStore.setState({ codexPlanMode: true });
@@ -336,16 +302,9 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByTestId("composer-plan-mode")).toHaveTextContent("Plan mode");
   });
 
-  it("places Plan mode to the left of the context ring", () => {
-    useChatStore.setState({ codexPlanMode: true, contextWindow: 100_000, tokensUsed: 25_000 });
-    renderComposer({ modelPickerKind: "codex" });
-
-    const plan = screen.getByTestId("composer-plan-mode");
-    const ring = screen.getByLabelText("25% of context used");
-    expect(plan.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
-  });
+  // "Plan mode left of the context ring" retired: the ring moved to the
+  // workspace bar (above the status line), so their in-line ordering no longer
+  // applies. The plan-mode badge itself is covered by the test above.
 
   it("keeps a bound host visible in the shared toolbar without an empty footer", () => {
     // Regression: removing the harness label from the tray must not take the
@@ -466,7 +425,7 @@ describe("composerHarnessLabel", () => {
 });
 
 describe("formatModelEffortStatusLabel", () => {
-  it("uses Codex display names exactly as returned in model metadata", () => {
+  it("uses the Codex display name from model metadata", () => {
     expect(
       formatModelEffortStatusLabel("gpt-5.5", "xhigh", [
         {
@@ -493,7 +452,7 @@ describe("formatModelEffortStatusLabel", () => {
     );
   });
 
-  it("prefers the catalog display name for a Claude [1m] alias", () => {
+  it("resolves an exact Claude alias to its catalog display name", () => {
     expect(
       formatModelEffortStatusLabel("sonnet[1m]", "high", [
         { id: "sonnet[1m]", model: "claude-sonnet-5[1m]", displayName: "Sonnet 5 (1M context)" },
@@ -501,19 +460,19 @@ describe("formatModelEffortStatusLabel", () => {
     ).toBe("Sonnet 5 (1M context) High");
   });
 
-  it("renders a catalog-less Claude [1m] alias friendly without claiming a version", () => {
-    expect(formatModelEffortStatusLabel("sonnet[1m]", "high")).toBe("Sonnet (1M context) High");
-    expect(formatModelEffortStatusLabel("opus[1m]", null)).toBe("Opus (1M context)");
+  it("preserves a catalog-less Claude alias without claiming a version", () => {
+    expect(formatModelEffortStatusLabel("sonnet[1m]", "high")).toBe("sonnet[1m] High");
+    expect(formatModelEffortStatusLabel("opus[1m]", null)).toBe("opus[1m]");
   });
 
-  it("title-cases catalog-less alias-shaped ids mechanically", () => {
-    expect(formatModelEffortStatusLabel("sonnet", null)).toBe("Sonnet");
-    expect(formatModelEffortStatusLabel("sonnet_5", null)).toBe("Sonnet 5");
-    expect(formatModelEffortStatusLabel("fable", null)).toBe("Fable");
+  it("preserves catalog-less IDs verbatim", () => {
+    expect(formatModelEffortStatusLabel("sonnet", null)).toBe("sonnet");
+    expect(formatModelEffortStatusLabel("sonnet_5", null)).toBe("sonnet_5");
+    expect(formatModelEffortStatusLabel("fable", null)).toBe("fable");
   });
 
   it("omits missing pieces", () => {
-    expect(formatModelEffortStatusLabel("opus", null)).toBe("Opus");
+    expect(formatModelEffortStatusLabel("opus", null)).toBe("opus");
     expect(formatModelEffortStatusLabel(null, "low")).toBe("Low");
     expect(formatModelEffortStatusLabel(null, null)).toBeNull();
   });

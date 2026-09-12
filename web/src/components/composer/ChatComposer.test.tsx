@@ -38,18 +38,19 @@ describe("ChatComposer", () => {
     expect(onSubmit).toHaveBeenCalledOnce();
   });
 
-  it("uses the settings-driven chat typography for the draft and input area", () => {
+  it("scopes responsive draft typography to the input area, not the toolbar", () => {
     render(
       <ChatComposer
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         input={{ "aria-label": "Draft" }}
-        actions={{ leading: null, trailing: null }}
+        actions={{ leading: <span>Composer actions</span>, trailing: null }}
       />,
     );
     const input = screen.getByRole("textbox");
-    expect(input).toHaveClass("text-ui");
-    expect(input.parentElement).toHaveClass("text-ui");
+    expect(input).toHaveClass("composer-input-text", "text-ui");
+    expect(input.parentElement).toHaveClass("composer-input-text", "text-ui");
     expect(input).not.toHaveClass("text-[13px]", "leading-[20.8px]");
+    expect(screen.getByText("Composer actions").closest(".composer-input-text")).toBeNull();
   });
 
   it("preserves interrupt and pending-creation states", () => {

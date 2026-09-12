@@ -59,7 +59,11 @@ describe("shared composer controls", () => {
     expect(trigger).not.toHaveClass("pr-0");
     expect(trigger).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
     expect(trigger).toHaveTextContent("High");
-    expect(screen.getByTestId("composer-agent-model-value")).not.toHaveClass("truncate");
+    expect(screen.getByTestId("composer-agent-model-value")).toHaveClass("truncate");
+    expect(screen.getByTestId("composer-agent-model-value")).toHaveAttribute(
+      "title",
+      "GPT-5.6-Sol",
+    );
     expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
     expect(screen.getByTestId("composer-agent-config-value")).toHaveClass(
@@ -88,7 +92,7 @@ describe("shared composer controls", () => {
       />,
     );
     const trigger = screen.getByRole("button", { name: "Permissions: Bypass permissions" });
-    for (const forbidden of ["hidden", "max-w-20", "truncate"]) {
+    for (const forbidden of ["hidden", "max-w-20"]) {
       expect(screen.getByText("Bypass permissions")).not.toHaveClass(forbidden);
     }
     expect(screen.getByText("Bypass permissions")).toHaveClass(COMPOSER_COLLAPSED_LABEL_CLASS);

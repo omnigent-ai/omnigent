@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils";
 export const HARNESS_MENU_CLASS_NAME =
   "composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[17.5rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2";
 
-export const COMPOSER_HARNESS_MENU_SIZE = "w-[17.5rem] min-w-0";
+export const COMPOSER_HARNESS_MENU_SIZE = "w-max min-w-[17.5rem]";
 
 export const HARNESS_MENU_ROW_CLASS_NAME =
   "composer-agent-row group/agent relative flex min-h-8 w-full items-center gap-1 rounded-lg pr-3 transition-colors hover:bg-muted focus:bg-muted [&>svg]:hidden";
@@ -68,8 +68,9 @@ export function HarnessMenuRowContent({
         ) : (
           <span
             data-testid={summaryTestId}
+            title={summary}
             className={cn(
-              "ml-auto min-w-0 flex-1 whitespace-normal break-words text-right text-xs leading-4 text-muted-foreground",
+              "ml-auto min-w-0 flex-1 truncate text-right text-xs leading-4 text-muted-foreground",
               summaryVisibility,
             )}
           >

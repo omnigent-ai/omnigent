@@ -1098,6 +1098,13 @@ aside[aria-label="Workspace"][data-maximized] {
     --text-ui: var(--mobile-ui-font-size);
   }
 
+  /* Keep draft text and its mirrors above Safari's input-focus zoom threshold.
+   * Native inputs must also preserve larger Appearance sizes. */
+  .composer-input-text,
+  [data-ios-native] textarea.composer-input-text {
+    font-size: max(16px, var(--text-ui));
+  }
+
   /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
   .conversations-sidebar {
     --sidebar-icon-size-mobile: 16px;
