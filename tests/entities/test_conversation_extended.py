@@ -8,6 +8,7 @@ _validate_type_matches_data, and Conversation field defaults.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from omnigent.entities.conversation import (
     ConversationItem,
     ErrorData,
     FunctionCallData,
+    FunctionCallOutputData,
     MessageData,
     NativeToolData,
     NewConversationItem,
@@ -305,6 +307,122 @@ def test_binary_payload_marker_names_the_media_type() -> None:
     assert _binary_payload_omitted("", 4011) == (
         "[binary content omitted from the compaction snapshot]"
     )
+
+
+# ── FunctionCallOutputData binary strip ────────────────────
+
+_TOOL_RESULT_MARKER = "[image/png content omitted from the persisted tool result]"
+
+
+def _image_tool_result_output() -> str:
+    """The canonical image-bearing tool result: text + Anthropic image block."""
+    return json.dumps(
+        [
+            {"type": "text", "text": "read-image-ok screenshot.png"},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": _IMAGE_BASE64,
+                },
+            },
+        ]
+    )
+
+
+def test_tool_result_strips_anthropic_source_base64() -> None:
+    """An image returned by a tool is persisted without its base64 payload."""
+    data = parse_item_data(
+        "function_call_output",
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": _image_tool_result_output(),
+        },
+    )
+
+    assert isinstance(data, FunctionCallOutputData)
+    assert _IMAGE_BASE64 not in data.output
+    blocks = json.loads(data.output)
+    # Non-binary content survives so the transcript stays readable.
+    assert blocks[0] == {"type": "text", "text": "read-image-ok screenshot.png"}
+    assert blocks[1]["source"]["media_type"] == "image/png"
+    assert blocks[1]["source"]["data"] == _TOOL_RESULT_MARKER
+
+
+def test_tool_result_strips_block_level_data_field() -> None:
+    """The MCP image shape carries bare base64 under a top-level ``data``."""
+    output = json.dumps([{"type": "image", "data": _IMAGE_BASE64, "mimeType": "image/png"}])
+
+    fco = FunctionCallOutputData(call_id="call_1", output=output)
+
+    assert _IMAGE_BASE64 not in fco.output
+    assert json.loads(fco.output)[0]["mimeType"] == "image/png"
+
+
+def test_tool_result_strips_data_uri_in_plain_text() -> None:
+    """A non-JSON result can still embed the payload as a data: URI."""
+    output = f"here is the screenshot: data:image/png;base64,{_IMAGE_BASE64}"
+
+    fco = FunctionCallOutputData(call_id="call_1", output=output)
+
+    assert _IMAGE_BASE64 not in fco.output
+    assert fco.output.startswith("here is the screenshot: ")
+
+
+def test_tool_result_preserves_plain_text_output() -> None:
+    """Ordinary tool results round-trip byte-identical."""
+    output = "total 8\ndrwxr-xr-x 2 user user 4096 ."
+
+    fco = FunctionCallOutputData(call_id="call_1", output=output)
+
+    assert fco.output == output
+
+
+def test_tool_result_preserves_json_with_ordinary_data_key() -> None:
+    """A ``data`` list key (paginated API results) is not a payload — keep the
+    producer's exact serialization, spacing included."""
+    output = '{"object": "list", "data": [{"id": "row_1"}, {"id": "row_2"}]}'
+
+    fco = FunctionCallOutputData(call_id="call_1", output=output)
+
+    assert fco.output == output
+
+
+def test_tool_result_strip_is_idempotent() -> None:
+    """Rows are re-validated on every read; re-stripping is a no-op."""
+    once = FunctionCallOutputData(call_id="call_1", output=_image_tool_result_output())
+    twice = FunctionCallOutputData(call_id="call_1", output=once.output)
+
+    assert twice.output == once.output
+
+
+def test_tool_result_strips_uppercase_scheme_data_uri() -> None:
+    """The data: scheme is case-insensitive; an uppercase DATA: URI must
+    not slip past the fast-path guard and persist inline."""
+    output = f"here is the screenshot: DATA:image/png;base64,{_IMAGE_BASE64}"
+
+    fco = FunctionCallOutputData(call_id="call_1", output=output)
+
+    assert _IMAGE_BASE64 not in fco.output
+    assert fco.output.startswith("here is the screenshot: ")
+
+
+def test_tool_result_pathological_nesting_does_not_fail_validation() -> None:
+    """A deeply nested output must degrade gracefully, never raise out of
+    the validator — the row is re-validated on read, so a raise would make
+    the stored conversation unloadable."""
+    depth = sys.getrecursionlimit() + 100
+    output = "[" * depth + '{"type": "image", "data": "payload"}' + "]" * depth
+
+    data = parse_item_data(
+        "function_call_output",
+        {"type": "function_call_output", "call_id": "call_1", "output": output},
+    )
+
+    assert isinstance(data, FunctionCallOutputData)
+    assert isinstance(data.output, str)
 
 
 # ── NativeToolData ────────────────────────────────────

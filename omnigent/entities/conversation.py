@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
-from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.llms.adapters._content import redact_binary_payloads, redact_inline_data_uris
 
 # Attachment markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
@@ -375,6 +376,21 @@ class FunctionCallData(BaseModel):
     call_id: str
 
 
+def _tool_result_payload_omitted(media_type: str, _payload_length: int) -> str:
+    """
+    Build the marker written over a dropped tool-result payload.
+
+    Length-free for the same reason as :func:`_binary_payload_omitted`:
+    the row is re-validated on every read, so the strip must be
+    idempotent.
+
+    :param media_type: The block's declared media type, if any.
+    :param _payload_length: Unused.
+    :returns: The replacement text.
+    """
+    return f"[{media_type or 'binary'} content omitted from the persisted tool result]"
+
+
 class FunctionCallOutputData(BaseModel):
     """
     Data for a function_call_output item.
@@ -386,6 +402,50 @@ class FunctionCallOutputData(BaseModel):
 
     call_id: str
     output: str
+
+    @field_validator("output")
+    @classmethod
+    def strip_binary_payloads(cls, value: str) -> str:
+        """
+        Drop base64 payloads from the persisted tool result.
+
+        A tool that returns an image (an image read, an MCP image
+        block, a computer-use screenshot) would otherwise persist the
+        full inline base64 in the conversation row for the life of the
+        conversation — the bloat compaction snapshots already strip via
+        :meth:`CompactionData.strip_binary_payloads`. The live turn has
+        consumed the full result before this mirror is persisted, and
+        replay feeds the output back as text (where base64 is token
+        bloat, never vision), so only the marker is worth storing.
+
+        :param value: The tool's string result, possibly JSON-encoded
+            content blocks carrying base64 payloads.
+        :returns: The result with binary payloads replaced by a marker.
+        """
+        # Fast path: no bare-payload key and no data: URI anywhere. The
+        # data: scheme (and the redactor regex) is case-insensitive, so
+        # guard against a lowercased copy.
+        lowered = value.lower()
+        if '"data"' not in lowered and "data:" not in lowered:
+            return value
+        try:
+            parsed = json.loads(value)
+        except (ValueError, RecursionError):
+            parsed = None
+        if not isinstance(parsed, (dict, list)):
+            # Plain-text output: only data: URIs can carry a payload.
+            return cast(str, redact_inline_data_uris(value, _tool_result_payload_omitted))
+        try:
+            redacted = redact_binary_payloads(parsed, _tool_result_payload_omitted)
+            if redacted == parsed:
+                # Preserve the producer's exact serialization when clean.
+                return value
+            return json.dumps(redacted)
+        except RecursionError:
+            # Pathologically nested output: redact what the regex reaches
+            # rather than raising — the row is re-validated on every read,
+            # so a raise here would make the stored conversation unloadable.
+            return cast(str, redact_inline_data_uris(value, _tool_result_payload_omitted))
 
 
 class ErrorData(BaseModel):
