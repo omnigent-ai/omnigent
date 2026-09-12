@@ -290,6 +290,9 @@ direct Gemini API authentication takes precedence over agy's saved OAuth login.
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
+Using Tencent CodeBuddy? See the [CodeBuddy integration guide](docs/codebuddy.md)
+to use your existing CLI login with `omnigent run --harness codebuddy`.
+
 <details>
 <summary>Grok Build and Devin</summary>
 
