@@ -1,4 +1,4 @@
-import { type ComponentProps, type ReactNode, useEffect, useId, useRef, useState } from "react";
+import { type ComponentProps, type ReactNode, useEffect, useRef, useState } from "react";
 import { ChevronLeftIcon } from "lucide-react";
 import { ComposerHarnessTrigger } from "./ComposerControls";
 import {
@@ -120,15 +120,11 @@ export function HarnessPickerEntry({
   configTestId?: string;
 }) {
   const rowContent = <HarnessMenuRowContent {...row} editable={editable} isMobile={isMobile} />;
-  // Stable handle for restoring focus to this row after a scoped Escape close;
-  // the UI DropdownMenuSubTrigger wrapper doesn't forward a ref.
-  const rowFocusId = useId();
   const rowProps = {
     className: cn(HARNESS_MENU_ROW_CLASS_NAME, row.active && "bg-muted"),
     "data-harness-menu-row": "",
     "data-active": row.active ? "true" : undefined,
     "data-testid": testId,
-    "data-escape-id": rowFocusId,
     disabled,
   };
   if (editable && !isMobile) {
@@ -154,16 +150,6 @@ export function HarnessPickerEntry({
           sideOffset={16}
           collisionPadding={12}
           data-testid={configTestId}
-          onEscapeKeyDown={(event) => {
-            // Scope Escape to this flyout: preventDefault stops the shared
-            // dismiss layer from closing the whole menu; close just the sub and
-            // return focus to its row.
-            event.preventDefault();
-            onOpenChange(false);
-            document
-              .querySelector<HTMLElement>(`[data-escape-id="${CSS.escape(rowFocusId)}"]`)
-              ?.focus();
-          }}
           onFocusOutside={(event) => {
             if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
               event.preventDefault();

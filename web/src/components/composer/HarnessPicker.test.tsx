@@ -94,20 +94,19 @@ describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
     expect(screen.getByTestId("menu")).toBeInTheDocument();
   });
 
-  it("closes only the config flyout on Escape and keeps the harness menu open (keyboard)", () => {
+  it("dismisses the config flyout on Escape from a focused option (keyboard)", () => {
     openConfig();
     const flyout = screen.getByText("Model configuration").closest<HTMLElement>('[role="menu"]');
     expect(flyout).not.toBeNull();
-    // Put focus inside the flyout and assert containment BEFORE Escape, so the
-    // keyboard path is exercised from a genuinely-focused flyout, not an
-    // unfocused container.
+    // Drive Escape from a genuinely-focused flyout, not an unfocused container.
     flyout!.focus();
     expect(flyout!.contains(document.activeElement)).toBe(true);
     fireEvent.keyDown(document.activeElement as HTMLElement, { key: "Escape" });
-    // Flyout closes, the parent harness menu stays open (Escape is scoped)…
+    // Escape dismisses the flyout. NOTE: Radix nested-menu Escape closes the
+    // whole menu tree by design (the root + sub dismiss layers both fire) and
+    // returns focus to the trigger — it is NOT scoped to the sub. The
+    // parent-stays-open "close just this flyout" affordance is the second-click
+    // pointer toggle above (verified in the browser against Radix, not just jsdom).
     expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
-    expect(screen.getByTestId("menu")).toBeInTheDocument();
-    // …and focus returns to the harness row it was opened from.
-    expect(screen.getByTestId("entry")).toHaveFocus();
   });
 });
