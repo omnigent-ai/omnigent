@@ -42,7 +42,9 @@ function branchDetail(state: ComposerBranchState, branch: string | null): string
     case "loading":
       return "Reading the branch from the workspace…";
     case "unknown":
-      return "The workspace branch could not be read (no reachable host).";
+      // Covers offline hosts, ambiguous git failures, empty and unmatched
+      // results alike — stay reason-neutral, never blame the host.
+      return "The workspace branch could not be determined.";
   }
 }
 

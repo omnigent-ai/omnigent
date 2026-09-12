@@ -100,6 +100,37 @@ describe("useComposerGitStatus", () => {
     expect(run({ workspace: "/home/a/repo/packages/web" }).result.current.branch).toBe("main");
   });
 
+  it("matches a Windows nested workspace across separator and case differences", () => {
+    // Host returns `git worktree list` paths verbatim (forward slash, its own
+    // case); the session workspace can use backslashes and different case.
+    setWorktrees({ status: "ok", worktrees: [wt({ path: "C:/repo", branch: "main" })] });
+    setGithub(undefined);
+    const { result } = run({ workspace: "C:\\Repo\\packages\\web" });
+    expect(result.current.branchState).toBe("branch");
+    expect(result.current.branch).toBe("main");
+    expect(result.current.isWorktree).toBe(false);
+  });
+
+  it("matches a Windows worktree exactly despite separator/case skew", () => {
+    setWorktrees({ status: "ok", worktrees: [wt({ path: "C:\\Repo", branch: "feat" })] });
+    setGithub(undefined);
+    expect(run({ workspace: "c:/repo" }).result.current.branch).toBe("feat");
+  });
+
+  it("does not match a sibling whose path is a mere prefix", () => {
+    setWorktrees({ status: "ok", worktrees: [wt({ path: "/home/a/repo", branch: "main" })] });
+    setGithub(undefined);
+    expect(run({ workspace: "/home/a/repo-sibling" }).result.current.branchState).toBe("unknown");
+  });
+
+  it("does not treat a backslash as a separator on POSIX", () => {
+    // On POSIX `\` is a legal filename char, so `/home/a/repo\evil` is not a
+    // child of `/home/a/repo`.
+    setWorktrees({ status: "ok", worktrees: [wt({ path: "/home/a/repo", branch: "main" })] });
+    setGithub(undefined);
+    expect(run({ workspace: "/home/a/repo\\evil" }).result.current.branchState).toBe("unknown");
+  });
+
   it("models detached HEAD as detached, not a fake branch", () => {
     setWorktrees({ status: "ok", worktrees: [wt({ branch: null, detached: true })] });
     setGithub(undefined);

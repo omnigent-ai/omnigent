@@ -64,6 +64,13 @@ describe("ComposerWorkspaceStatus", () => {
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("Checking branch…");
   });
 
+  it("uses reason-neutral wording for the unavailable state (no host blame)", () => {
+    render(<ComposerWorkspaceStatus {...base} branch={null} branchState="unknown" />);
+    openBranch();
+    expect(screen.getByText(/could not be determined/i)).toBeInTheDocument();
+    expect(screen.queryByText(/host/i)).toBeNull();
+  });
+
   it("surfaces the creation-time branch separately, never as the live label", () => {
     render(
       <ComposerWorkspaceStatus
