@@ -1040,3 +1040,62 @@ def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> Non
     assert refresh_stored_token("http://localhost:6767") == "fresh"
     entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
     assert entry["expires_at"] < time.time() + 4000
+
+
+@pytest.fixture
+def reset_tls_context_cache():
+    """Reset the shared client-TLS context cache around a test."""
+    import omnigent.util.tls as tls_module
+
+    tls_module._client_ssl_context = None
+    yield
+    tls_module._client_ssl_context = None
+
+
+def test_open_server_client_survives_stale_tls_ca_env(
+    token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache
+) -> None:
+    """A stale ``SSL_CERT_FILE``/``SSL_CERT_DIR`` must not crash construction.
+
+    Non-loopback server URLs honor env config (``trust_env=True``), and httpx
+    0.28 builds its SSL context eagerly in ``AsyncClient.__init__`` — even for
+    plain-http base URLs. A CA bundle path that no longer exists (e.g. a
+    rotated-away bundle) used to raise ``FileNotFoundError`` here, so every
+    caller of this factory died at startup — the Claude transcript forwarder
+    crash-restarted forever and never mirrored the transcript.
+    """
+    import asyncio
+
+    import omnigent.util.tls as tls_module
+    from omnigent.cli_auth import open_server_client
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "rotated-away-ca.pem"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "rotated-away-certs"))
+
+    client = open_server_client("http://server.internal.example:6767")
+    try:
+        # Trust came from the shared validated context (OS bundle or certifi
+        # fallback), not from the stale env vars httpx would have loaded.
+        assert tls_module._client_ssl_context is not None
+    finally:
+        asyncio.run(client.aclose())
+
+
+def test_open_server_client_loopback_skips_shared_trust_context(
+    token_dir, reset_tls_context_cache
+) -> None:
+    """Loopback targets keep httpx defaults: no CA-bundle resolution or read.
+
+    ``trust_env`` is off for loopback (proxy bypass), so httpx never loads the
+    CA env vars there; the factory must not force a bundle read either.
+    """
+    import asyncio
+
+    import omnigent.util.tls as tls_module
+    from omnigent.cli_auth import open_server_client
+
+    client = open_server_client("http://127.0.0.1:6767")
+    try:
+        assert tls_module._client_ssl_context is None
+    finally:
+        asyncio.run(client.aclose())
