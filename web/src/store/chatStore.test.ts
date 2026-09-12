@@ -5442,6 +5442,43 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("refreshSessionState", () => {
+    it("retains an optimistic model through a snapshot without a native report", async () => {
+      useChatStore.setState({
+        conversationId: "conv_model_seed",
+        sessionModelSeeded: true,
+        sessionModelOverride: "system.ai.claude-opus-4-8[1m]",
+        llmModel: "system.ai.claude-opus-4-8[1m]",
+      });
+      fetchMock.mockImplementation(() =>
+        mockResponse({
+          id: "conv_model_seed",
+          agent_id: "agent_xyz",
+          agent_name: "Claude Code",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          harness: "claude",
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          llm_model: null,
+        }),
+      );
+      await useChatStore.getState().refreshSessionState("conv_model_seed");
+      expect(useChatStore.getState()).toMatchObject({
+        sessionModelSeeded: true,
+        sessionModelOverride: "system.ai.claude-opus-4-8[1m]",
+        llmModel: "system.ai.claude-opus-4-8[1m]",
+      });
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_model_seed",
+        model: "claude-sonnet-5",
+      });
+      expect(useChatStore.getState()).toMatchObject({
+        sessionModelSeeded: false,
+        llmModel: "claude-sonnet-5",
+      });
+    });
+
     it("forces a fresh snapshot and applies runner-backed Codex model options", async () => {
       useChatStore.setState({
         conversationId: "conv_codex",

@@ -4,6 +4,7 @@ import asyncio
 import re
 from pathlib import Path
 
+import pytest
 from playwright.async_api import async_playwright, expect
 
 from tests.e2e_ui.start_session.test_start_session import (
@@ -15,13 +16,16 @@ from tests.e2e_ui.start_session.test_start_session import (
 )
 
 
+@pytest.mark.parametrize("report_available", [True, False])
 def test_selected_model_survives_delayed_create(
-    seeded_session_pair: tuple[str, str, str], tmp_path: Path
+    seeded_session_pair: tuple[str, str, str], tmp_path: Path, report_available: bool
 ) -> None:
-    _run_in_fresh_loop(_drive(*seeded_session_pair, tmp_path))
+    _run_in_fresh_loop(_drive(*seeded_session_pair, tmp_path, report_available))
 
 
-async def _drive(base_url: str, session_id: str, previous_id: str, output: Path) -> None:
+async def _drive(
+    base_url: str, session_id: str, previous_id: str, output: Path, report_available: bool
+) -> None:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         page = await browser.new_page(viewport={"width": 1920, "height": 1000})
@@ -44,7 +48,13 @@ async def _drive(base_url: str, session_id: str, previous_id: str, output: Path)
                 response = await route.fetch()
                 body = await response.json()
                 body.update(
-                    llm_model=previous if previous_id in route.request.url else selected,
+                    llm_model=(
+                        previous
+                        if previous_id in route.request.url
+                        else selected
+                        if report_available
+                        else None
+                    ),
                     model_options=rows,
                     harness="claude",
                     reasoning_effort="high",
@@ -110,6 +120,7 @@ async def _drive(base_url: str, session_id: str, previous_id: str, output: Path)
             samples = await page.evaluate("window.composerSamples")
             assert any("/c/temp" in sample["path"] for sample in samples), samples
             assert all(previous not in sample["text"] for sample in samples), samples
+            assert all(selected in sample["text"] for sample in samples), samples
         finally:
             release.set()
             await page.unroute_all(behavior="wait")

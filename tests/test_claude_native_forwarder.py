@@ -3799,7 +3799,10 @@ async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status_model", [None, "system.ai.claude-opus-4-8[1m]"])
+async def test_forwarder_reports_the_launch_model_then_a_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status_model: str | None
+) -> None:
     """
     EVERY observation posts, verbatim: the first is the launch report.
 
@@ -3810,6 +3813,8 @@ async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) 
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
+    status = {"model": status_model}
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _: status)
 
     def _assistant(uuid: str, model: str, text: str) -> str:
         """
@@ -3867,12 +3872,14 @@ async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) 
         )
         # The first observation IS the launch report — posted verbatim.
         launch_posts = [r for r in requests if r["type"] == "external_model_change"]
-        assert [p["data"] for p in launch_posts] == [{"model": "claude-opus-4-8"}]
-        assert dedupe.posted_model == "claude-opus-4-8"
+        expected_model = status_model or "claude-opus-4-8"
+        assert [p["data"] for p in launch_posts] == [{"model": expected_model}]
+        assert dedupe.posted_model == expected_model
 
         # User switches model inside the terminal.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_assistant("a2", "claude-sonnet-5", "switched") + "\n")
+        status["model"] = "claude-sonnet-5" if status_model else None
         requests.clear()
         await forwarder._forward_available_items(
             client=client,

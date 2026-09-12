@@ -3545,7 +3545,10 @@ function mcpStartupSnapshotPatch(
  */
 function sessionBindingPatch(
   session: Session,
-  state: Pick<ConversationState, "mcpStartupLaunch">,
+  state: Pick<
+    ConversationState,
+    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+  >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Pick<
   ChatState,
@@ -3573,6 +3576,7 @@ function sessionBindingPatch(
   | "mcpStartup"
   | "mcpStartupLaunch"
 > {
+  const retainModelSeed = state.sessionModelSeeded && session.llmModel == null;
   return {
     isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
@@ -3582,10 +3586,12 @@ function sessionBindingPatch(
       isNativeTerminalSessionFn(session) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
-    llmModel: session.llmModel ?? null,
-    sessionModelSeeded: false,
+    llmModel: retainModelSeed ? state.llmModel : (session.llmModel ?? null),
+    sessionModelSeeded: retainModelSeed,
     pendingModelChange: null,
-    sessionModelOverride: session.modelOverride ?? null,
+    sessionModelOverride: retainModelSeed
+      ? state.sessionModelOverride
+      : (session.modelOverride ?? null),
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
@@ -3973,10 +3979,6 @@ async function bindStream(
         sessionReasoningEffort: effectiveEffort,
         // Server hydration supersedes any optimistic effort seed.
         sessionEffortSeeded: false,
-        // Session truth for the `/model` readout — overrides the snapshot
-        // value spread via `...bindingPatch` so the claude-native sticky
-        // handoff (fired above, silent) shows immediately.
-        sessionModelOverride: session.modelOverride ?? null,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
