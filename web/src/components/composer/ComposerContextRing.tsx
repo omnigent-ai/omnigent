@@ -38,7 +38,7 @@ export function ComposerContextRing({
       <TooltipTrigger asChild>
         <span
           data-testid="composer-context-ring"
-          className={cn("flex items-center gap-1 text-muted-foreground", className)}
+          className={cn("flex shrink-0 items-center gap-1 text-muted-foreground", className)}
           aria-label={`${usedPct}% of context used`}
         >
           {/* Tight stroke bounds keep the visible icon-to-label gap consistent. */}

@@ -14,20 +14,40 @@ from tests.e2e_ui.conftest import fetch_with_retry
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
 @pytest.mark.parametrize(
-    ("viewport_width", "font_size"),
+    ("viewport_width", "font_size", "pr_number", "font_family"),
     [
-        pytest.param(1280, 13, id="desktop-default"),
+        pytest.param(1280, 13, 1234, None, id="desktop-default"),
         pytest.param(
             390,
             18,
+            1234,
+            None,
             marks=pytest.mark.browser_context_args(has_touch=True),
             id="mobile-crowded",
         ),
         pytest.param(
             375,
             18,
+            1234,
+            None,
             marks=pytest.mark.browser_context_args(has_touch=True),
             id="mobile-narrow-crowded",
+        ),
+        pytest.param(
+            375,
+            18,
+            1234567,
+            None,
+            marks=pytest.mark.browser_context_args(has_touch=True),
+            id="mobile-long-pr",
+        ),
+        pytest.param(
+            375,
+            18,
+            1234,
+            "Verdana",
+            marks=pytest.mark.browser_context_args(has_touch=True),
+            id="mobile-wide-font",
         ),
     ],
 )
@@ -38,6 +58,8 @@ def test_status_counts_and_pr_share_workspace_bar(
     theme: str,
     viewport_width: int,
     font_size: int,
+    pr_number: int,
+    font_family: str | None,
 ) -> None:
     base_url, session_id = seeded_session
     is_mobile = viewport_width < 768
@@ -72,9 +94,9 @@ def test_status_counts_and_pr_share_workspace_bar(
                 "repo": {"name_with_owner": "example/repo"},
                 "branch": "pr-head-not-checkout",
                 "pr": {
-                    "number": 1234,
+                    "number": pr_number,
                     "title": "Acceptance PR",
-                    "url": "https://github.com/example/repo/pull/1234",
+                    "url": f"https://github.com/example/repo/pull/{pr_number}",
                     "state": "OPEN",
                     "is_draft": False,
                     "checks": {"passing": 0, "failing": 0, "pending": 0, "total": 0, "runs": []},
@@ -102,15 +124,23 @@ def test_status_counts_and_pr_share_workspace_bar(
     page.emulate_media(color_scheme=theme)
     page.add_init_script(f"localStorage.setItem('web-theme', '{theme}')")
     page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
+    if font_family is not None:
+        page.add_init_script(
+            f"localStorage.setItem('omnigent:ui-font-family', JSON.stringify('{font_family}'))"
+        )
     page.set_viewport_size({"width": viewport_width, "height": 844 if is_mobile else 900})
     _publish_status(base_url, session_id, "idle", background_task_count=2)
     page.goto(f"{base_url}/c/{session_id}")
     bar = page.get_by_test_id("composer-workspace-controls")
-    expect(bar.get_by_test_id("composer-pr-link").locator("span").last).to_have_text(
-        "#1234", timeout=30_000
-    )
+    pr_link = bar.get_by_test_id("composer-pr-link")
+    pr_label = pr_link.locator("span").last
+    expect(pr_label).to_have_text(f"#{pr_number}", timeout=30_000)
+    expect(pr_link).to_have_accessible_name(f"#{pr_number}")
     context = bar.get_by_test_id("composer-context-ring")
     expect(context).to_have_text("100%")
+    if font_family is not None:
+        applied_family = context.evaluate("el => getComputedStyle(el).fontFamily")
+        assert applied_family.split(",")[0].strip("\"' ") == font_family
     expect(bar.get_by_test_id("background-task-pill")).to_have_text("2")
     expect(bar.get_by_test_id("subagent-task-pill")).to_have_text("1")
     expect(bar).to_contain_text("live-branch")
@@ -140,7 +170,8 @@ def test_status_counts_and_pr_share_workspace_bar(
     )
     print(
         f"Status bar ({viewport_width}px, {font_size}px preference, {theme}): "
-        f"bar={bounds}, controls={control_bounds}, icons={icon_bounds}, font={measured_font}"
+        f"bar={bounds}, controls={control_bounds}, icons={icon_bounds}, "
+        f"font={measured_font}, family={font_family or 'system'}"
     )
     bar.screenshot(path=tmp_path / f"status-bar-{theme}.png", animations="disabled")
     page.screenshot(path=tmp_path / f"status-page-{theme}.png", animations="disabled")
@@ -155,6 +186,11 @@ def test_status_counts_and_pr_share_workspace_bar(
     assert trailing["x"] + trailing["width"] == pytest.approx(
         bounds["x"] + bounds["width"] - 9, abs=0.5
     )
+    if pr_number == 1234567:
+        assert pr_label.evaluate("el => el.scrollWidth > el.clientWidth")
+        expect(pr_label).to_have_attribute("title", f"#{pr_number}")
+    elif viewport_width >= 390:
+        assert pr_label.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
     for test_id in status_ids:
         rect = control_bounds[test_id]
         assert rect["y"] + rect["height"] / 2 == pytest.approx(center_y, abs=0.5)
@@ -192,6 +228,15 @@ def test_status_counts_and_pr_share_workspace_bar(
         bar.get_by_test_id("subagent-task-pill").click()
     expect(page.get_by_role("dialog")).to_contain_text("Review changes")
     page.keyboard.press("Escape")
+    if is_mobile and (pr_number == 1234567 or font_family is not None):
+        pr_link.tap()
+        panel = page.get_by_test_id("github-panel-drawer")
+        expect(panel).to_have_attribute("data-state", "open")
+        expect(panel).to_be_visible()
+        panel.screenshot(path=tmp_path / "truncated-pr-open.png", animations="disabled")
+        panel.get_by_role("button", name="Close", exact=True).tap()
+        expect(panel).to_have_attribute("data-state", "closed")
+        expect(pr_link).to_be_in_viewport()
     _publish_status(base_url, session_id, "idle", background_task_count=0)
     expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
     page.unroute_all(behavior="wait")

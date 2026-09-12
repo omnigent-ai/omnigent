@@ -27,7 +27,7 @@ describe("ComposerContextRing", () => {
   it("shows the used percentage, rounded", () => {
     renderRing(1000, 123);
     expect(screen.getByTestId("composer-context-ring")).toHaveTextContent("12%");
-    expect(screen.getByTestId("composer-context-ring")).toHaveClass("gap-1");
+    expect(screen.getByTestId("composer-context-ring")).toHaveClass("gap-1", "shrink-0");
     expect(screen.getByLabelText("12% of context used")).toBeInTheDocument();
   });
 

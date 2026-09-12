@@ -3343,10 +3343,10 @@ function ComposerImpl(
             onRefreshBranch={composerGit.refresh}
             refreshing={composerGit.refreshing}
           />
-          {/* Trailing status cluster — the wrapper owns the right alignment so
-              it holds even when the self-nulling indicators render nothing. */}
-          <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
-            <div className="flex items-center gap-2 empty:hidden">
+          {/* Reserve two workspace triggers' icon-safe minima and two gaps;
+              only PR text truncates when the remaining status space runs out. */}
+          <div className="ml-auto flex min-w-0 max-w-[calc(100%-5.25rem)] shrink-0 items-center gap-1 md:max-w-[calc(100%-6.5rem)]">
+            <div className="flex min-w-0 items-center gap-2 empty:hidden">
               <ComposerPrLink
                 prCount={composerGit.prCount}
                 prNumber={composerGit.prNumber}
