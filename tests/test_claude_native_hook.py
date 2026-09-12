@@ -1087,20 +1087,19 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
         "PreToolUse hook not registered — native tools bypass TOOL_CALL policy evaluation"
     )
     assert "PermissionRequest" in hooks
-    # PreToolUse has two entries: the AskUserQuestion-specific hook first,
-    # then the catch-all policy evaluation hook.
-    assert len(hooks["PreToolUse"]) == 2, (
-        f"Expected 2 PreToolUse entries (AskUserQuestion + catch-all policy), "
-        f"got {len(hooks['PreToolUse'])}"
+    # PreToolUse carries only the catch-all policy hook. AskUserQuestion rides
+    # the PermissionRequest hook; a dedicated PreToolUse forwarder parked a
+    # second elicitation for the same question and the web showed two cards.
+    assert len(hooks["PreToolUse"]) == 1, (
+        f"Expected 1 PreToolUse entry (catch-all policy), got {len(hooks['PreToolUse'])}"
     )
-    # First entry: AskUserQuestion-specific hook with matcher.
-    ask_uq_entry = hooks["PreToolUse"][0]
-    assert ask_uq_entry.get("matcher") == "AskUserQuestion"
-    ask_uq_cmd = ask_uq_entry["hooks"][0]["command"]
-    assert "ask-user-question" in ask_uq_cmd
-    assert str(bridge_dir) in ask_uq_cmd
-    # Second entry: catch-all policy evaluation hook (no matcher).
-    policy_entry = hooks["PreToolUse"][1]
+    assert not any(
+        "ask-user-question" in str(hook.get("command", ""))
+        for groups in hooks.values()
+        for group in groups
+        for hook in group["hooks"]
+    ), "an AskUserQuestion forwarder hook would surface the question twice"
+    policy_entry = hooks["PreToolUse"][0]
     assert "matcher" not in policy_entry
     pre_tool_use_cmd = policy_entry["hooks"][0]["command"]
     assert "evaluate-policy" in pre_tool_use_cmd
@@ -1504,296 +1503,22 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
     assert captured.err == ""
 
 
-def test_ask_user_question_hook_noop_in_non_bypass_mode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_ask_user_question_subcommand_is_a_silent_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """
-    ``ask-user-question`` subcommand is a no-op when not in bypassPermissions mode.
+    The retired ``ask-user-question`` forwarder exits 0 with no output.
 
-    In default / acceptEdits / plan modes the ``PermissionRequest`` hook fires
-    and owns the elicitation.  The ``ask-user-question`` PreToolUse hook must
-    return empty output (no opinion) so the form is not shown twice.
-
-    This fails if the handler forwards the payload to Omnigent in non-bypass mode —
-    which would cause a duplicate elicitation card in the web UI and race for
-    the same answer.
+    Settings written before it was retired still invoke it until the
+    terminal restarts. It must never reach the server — that parked a
+    second elicitation for the question — and must not block the tool,
+    so Claude Code proceeds to the PermissionRequest hook.
     """
-    calls: list[str] = []
-
-    class _RaisesIfCalled:
-        """HTTP client stub that fails the test if called unexpectedly."""
-
-        def __init__(self, **_kwargs: object) -> None:
-            """
-            Record unexpected construction.
-
-            :param _kwargs: Ignored constructor args.
-            :returns: None.
-            """
-            calls.append("constructed")
-
-        def __enter__(self) -> _RaisesIfCalled:
-            """
-            Enter context — should not be reached.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context — should not be reached.
-
-            :param _args: Ignored exception args.
-            :returns: None.
-            """
-
-        def post(self, *_args: object, **_kwargs: object) -> object:
-            """
-            Fail if Omnigent is called — must not happen in non-bypass mode.
-
-            :param _args: Ignored.
-            :param _kwargs: Ignored.
-            :returns: Never.
-            :raises AssertionError: Always, so the test fails visibly.
-            """
-            raise AssertionError(
-                "AP was called for ask-user-question in non-bypass mode — "
-                "PermissionRequest hook should own the elicitation instead"
-            )
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
-    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="b1", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_abc")
-    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
-
-    for mode in ("default", "acceptEdits", "plan", None):
-        payload: dict[str, object] = {
-            "hook_event_name": "PreToolUse",
-            "tool_name": "AskUserQuestion",
-            "tool_input": {"questions": []},
-        }
-        if mode is not None:
-            payload["permission_mode"] = mode
-        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-        exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
-        captured = capsys.readouterr()
-        # No Omnigent call, no output — "no opinion" so PermissionRequest takes over.
-        assert exit_code == 0, f"Non-zero exit for mode={mode!r}"
-        assert captured.out == "", f"Unexpected output for mode={mode!r}: {captured.out!r}"
-        assert calls == [], f"AP client was constructed for mode={mode!r}"
-
-
-def test_ask_user_question_hook_posts_and_returns_pre_tool_use_output_in_bypass_mode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """
-    In bypassPermissions mode the hook posts to Omnigent and returns PreToolUse output.
-
-    In bypass mode ``PermissionRequest`` never fires, so this PreToolUse hook
-    is the only opportunity to surface ``AskUserQuestion`` in the web UI.  It
-    must POST the payload to the Omnigent session's permission-request endpoint, then
-    convert the ``PermissionRequest``-format response to ``PreToolUse`` format
-    (lifting ``decision.updatedInput`` to the top-level ``updatedInput`` field).
-
-    Fails if: Omnigent is not called in bypass mode, the URL targets the wrong session,
-    the response is not converted from PermissionRequest to PreToolUse format,
-    or the user's answers are not surfaced in ``updatedInput``.
-    """
-    posted: dict[str, object] = {}
-    answers = {"q1": "Option A"}
-    server_response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {
-                "behavior": "allow",
-                "updatedInput": {
-                    "questions": [{"question": "Pick one", "options": [{"label": "Option A"}]}],
-                    "answers": answers,
-                },
-            },
-        }
-    }
-
-    class _FakeHttpxClient:
-        """
-        Minimal sync HTTP client stub for the ask-user-question hook.
-
-        :param headers: Headers passed to :class:`httpx.Client`.
-        :param timeout: Timeout passed to :class:`httpx.Client`.
-        """
-
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
-            """
-            Capture constructor inputs.
-
-            :param headers: HTTP headers.
-            :param timeout: Request timeout.
-            :returns: None.
-            """
-            posted["headers"] = headers
-            posted["timeout"] = timeout
-
-        def __enter__(self) -> _FakeHttpxClient:
-            """
-            Enter context manager.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context manager.
-
-            :param _args: Ignored.
-            :returns: None.
-            """
-
-        def post(self, url: str, *, json: dict[str, object]) -> object:
-            """
-            Record the Omnigent request and return a canned PermissionRequest response.
-
-            :param url: Target URL.
-            :param json: Request body.
-            :returns: Fake HTTP response.
-            """
-            import httpx as _httpx
-
-            posted["url"] = url
-            posted["json"] = json
-            import json as _json
-
-            return _httpx.Response(
-                200,
-                text=_json.dumps(server_response),
-                request=_httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
-    bridge_dir = prepare_bridge_dir("conv_bypass", bridge_id="b2", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_bypass")
-    build_hook_settings(
-        bridge_dir,
-        ap_server_url="http://127.0.0.1:8787",
-        ap_auth_headers={"Authorization": "Bearer token"},
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_post_hook_with_reattach",
+        lambda *_args, **_kwargs: pytest.fail("retired ask-user-question hook posted"),
     )
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "AskUserQuestion",
-        "tool_input": {
-            "questions": [{"question": "Pick one", "options": [{"label": "Option A"}]}]
-        },
-        "permission_mode": "bypassPermissions",
-    }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-
-    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    # Omnigent must be called with the active session's URL.
-    assert posted["url"] == (
-        "http://127.0.0.1:8787/v1/sessions/conv_bypass/hooks/permission-request"
-    )
-    # The full PreToolUse payload (including permission_mode) is
-    # forwarded verbatim, plus the minted re-attach id.
-    sent = posted["json"]
-    assert isinstance(sent, dict)
-    assert {k: v for k, v in sent.items() if k != "_omnigent_elicitation_id"} == payload
-    assert re.fullmatch(r"elicit_claude_[0-9a-f]{32}", sent["_omnigent_elicitation_id"])
-    # Auth headers from bridge config are forwarded.
-    assert posted["headers"] == {"Authorization": "Bearer token"}
-    # Output must be PreToolUse-format, NOT PermissionRequest-format.
-    result = json.loads(captured.out)
-    hs = result["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PreToolUse", (
-        "Response was not converted from PermissionRequest to PreToolUse format"
-    )
-    assert hs["permissionDecision"] == "allow"
-    # User answers must be lifted into top-level updatedInput so Claude skips
-    # its TUI picker and uses the web form's selections.
-    assert hs["updatedInput"]["answers"] == answers, (
-        "User answers were not propagated in updatedInput — Claude will fall back "
-        "to its TUI picker and ignore the web form selection"
-    )
-    assert captured.err == ""
-
-
-def test_ask_user_question_hook_returns_deny_without_updated_input(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """
-    When the user denies AskUserQuestion in bypass mode, hook output is deny with no updatedInput.
-
-    A denial blocks the tool call entirely.  There are no answers to inject, so
-    ``updatedInput`` must be absent from the PreToolUse output.
-
-    Fails if ``updatedInput`` is included on a deny (which would produce a
-    malformed output and confuse Claude), or if the denial is not surfaced.
-    """
-    server_response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {"behavior": "deny"},
-        }
-    }
-
-    class _FakeHttpxClient:
-        """Fake HTTP client returning a deny response."""
-
-        def __init__(self, **_kwargs: object) -> None:
-            """
-            Accept constructor kwargs.
-
-            :param _kwargs: Ignored.
-            :returns: None.
-            """
-
-        def __enter__(self) -> _FakeHttpxClient:
-            """
-            Enter context.
-
-            :returns: self.
-            """
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            """
-            Exit context.
-
-            :param _args: Ignored.
-            :returns: None.
-            """
-
-        def post(self, url: str, *, json: object) -> object:
-            """
-            Return the canned deny response.
-
-            :param url: Ignored.
-            :param json: Ignored.
-            :returns: Fake HTTP response.
-            """
-            import json as _json
-
-            import httpx as _httpx
-
-            return _httpx.Response(
-                200,
-                text=_json.dumps(server_response),
-                request=_httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
-    bridge_dir = prepare_bridge_dir("conv_deny", bridge_id="b3", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_deny")
-    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
     payload = {
         "hook_event_name": "PreToolUse",
         "tool_name": "AskUserQuestion",
@@ -1802,18 +1527,10 @@ def test_ask_user_question_hook_returns_deny_without_updated_input(
     }
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
-    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(bridge_dir)])
+    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(tmp_path)])
 
-    captured = capsys.readouterr()
     assert exit_code == 0
-    result = json.loads(captured.out)
-    hs = result["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PreToolUse"
-    assert hs["permissionDecision"] == "deny"
-    # No updatedInput on deny — answers are meaningless when the tool is blocked.
-    assert "updatedInput" not in hs, (
-        "updatedInput must not appear on a deny response — there are no answers to inject"
-    )
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
