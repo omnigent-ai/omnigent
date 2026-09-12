@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from typing import Any
 from unittest.mock import AsyncMock
@@ -2125,6 +2126,100 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.host_id == _HOST_ID
+
+
+@pytest.mark.parametrize(
+    ("refusal_code", "refusal_error"),
+    [
+        (WORKSPACE_MISSING_ERROR_CODE, _WORKSPACE_MISSING_ERROR),
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "claude-native is not configured on this host",
+        ),
+    ],
+)
+async def test_message_relaunch_refusal_logs_warning_not_error_funnel(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    refusal_code: str,
+    refusal_error: str,
+) -> None:
+    """A categorical launch refusal is logged as a WARNING, not an ERROR.
+
+    The host deterministically refuses the relaunch (deleted workspace,
+    unconfigured harness); the user gets a structured error card and the
+    remediation is theirs. Error dashboards attribute the generic
+    ERROR-level ``session turn failed for <id>`` funnel in
+    ``_publish_status`` to server defects, so an expected refusal must
+    instead log the categorical ``session turn refused`` WARNING.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+
+    set_runner_client(None)
+    relaunch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=refusal_error,
+            launch_error_code=refusal_code,
+        )
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+            msg_resp = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+            )
+    finally:
+        await relaunch_responder
+        set_runner_client(None)
+    assert msg_resp.status_code == 202, (
+        f"expected 202, got {msg_resp.status_code}: {msg_resp.text}"
+    )
+
+    records = [r for r in caplog.records if r.name == "omnigent.server.routes.sessions"]
+    funnel = [
+        r.getMessage()
+        for r in records
+        if r.levelno >= logging.ERROR
+        and r.getMessage().startswith(f"session turn failed for {session_id}")
+    ]
+    assert not funnel, (
+        f"expected categorical refusal was logged through the ERROR-level "
+        f"turn-failure funnel: {funnel!r}"
+    )
+    refused = [
+        r
+        for r in records
+        if r.levelno == logging.WARNING
+        and r.getMessage().startswith(f"session turn refused for {session_id} ({refusal_code})")
+    ]
+    assert len(refused) == 1, (
+        f"expected exactly one categorical refusal WARNING, got "
+        f"{[r.getMessage() for r in records]!r}"
+    )
 
 
 async def test_retry_session_relaunches_dead_runner_without_mutating_history(
