@@ -1,8 +1,8 @@
 /**
- * Per-conversation WebContentsView registry.
+ * Session and draft-workspace WebContentsView registry.
  *
- * Keyed by `conversationId` for Omnigent's session model. Each entry owns its
- * own bounds controller so per-conversation state never cross-contaminates.
+ * Keyed by opaque browser view IDs. Each entry owns its bounds controller
+ * so session and draft-workspace views never share positioning state.
  *
  * Pure factory — no Electron imports at module scope. All deps are injected
  * so a unit test can drive create/swap/close/closeAll/cap behavior with a
@@ -14,7 +14,7 @@
  *    through `getOrCreate` / `openOrNavigate`, both cap-enforcing and non-throwing.
  *  - The old active entry is detached before the new one attaches. Inactive
  *    entries stay alive (JS + agent IPCs still run), just not painting. Draft
- *    entries expire ten minutes after their renderer heartbeat stops.
+ *    entries expire when their renderer stops renewing the draft lease.
  */
 
 const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
@@ -39,7 +39,7 @@ function draftWorkspaceIdFor(conversationId) {
 }
 
 /**
- * Storage partition for one conversation's browser view. Every view MUST get
+ * Storage partition for one session or draft browser view. Every view MUST get
  * its own partition: with none, Electron places the view on
  * `session.defaultSession`, sharing one cookie/localStorage/cache store across
  * all agents and the main window (agent A's login bleeds into agent B's view).
@@ -53,8 +53,8 @@ function draftWorkspaceIdFor(conversationId) {
  * server — two windows connected to different servers could carry the same
  * conversationId and would otherwise share a cookie jar.
  *
- * `conversationId` is interpolated raw. Production ids are opaque 32-character
- * UUID hex strings; encode them if that contract ever loosens.
+ * `conversationId` is an opaque session, draft-workspace, or manual-tab view ID.
+ * Adoption keeps the original partition so the live page retains its login.
  *
  * @param {string} scope Registry-unique namespace (one per shell window).
  * @param {string} conversationId

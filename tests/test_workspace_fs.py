@@ -432,9 +432,7 @@ def test_pre_session_git_reads_do_not_enable_untracked_cache(
         def start(self) -> None:
             self._target()
 
-    monkeypatch.setattr(
-        "omnigent.runtime.filesystem_registry.threading.Thread", SynchronousThread
-    )
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.threading.Thread", SynchronousThread)
     reader = WorkspaceReader(tmp_path)
 
     def untracked_cache_setting() -> bytes:

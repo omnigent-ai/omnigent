@@ -14,7 +14,8 @@
  *  The agent relay is NOT here (it must listen before the first browser_navigate
  *  auto-selects the tab) — it's hoisted to the always-mounted AppShell. On
  *  unmount the view DETACHES, not destroys (background agent pages survive a tab
- *  switch; destroy only on explicit close). Renders nothing outside Electron. */
+ *  switch). The main-process registry owns cleanup, including draft lease
+ *  expiry. Renders nothing outside Electron. */
 import {
   ChevronLeftIcon,
   ChevronRightIcon,

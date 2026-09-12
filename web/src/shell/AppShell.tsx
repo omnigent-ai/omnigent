@@ -1763,9 +1763,11 @@ export function AppShell() {
     });
     const adopted = draftWorkspace.terminals.find((terminal) => terminalTabKey(terminal) === key);
     if (adopted) {
-      void draftWorkspace.deleteTerminal(adopted.id).catch((error: unknown) =>
-        toast.error(error instanceof Error ? error.message : "Couldn't close shell."),
-      );
+      void draftWorkspace
+        .deleteTerminal(adopted.id)
+        .catch((error: unknown) =>
+          toast.error(error instanceof Error ? error.message : "Couldn't close shell."),
+        );
       return;
     }
     const info = terminals.find((t) => terminalTabKey(t) === key);
