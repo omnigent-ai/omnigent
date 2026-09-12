@@ -5253,6 +5253,28 @@ def create_runner_app(
             return None
         return state
 
+    async def _codex_native_bridge_dir_for_session(conv_id: str) -> Path:
+        """
+        Bridge directory for a codex-native session.
+
+        Same resolution as :func:`_codex_native_bridge_state_for_session` — the
+        bridge id label when present, else the conversation id — so a request
+        written here lands in the directory the forwarder polls.
+
+        :param conv_id: Conversation id, e.g. ``"conv_abc123"``.
+        :returns: The session's bridge directory.
+        """
+        from omnigent.harnesses.codex_native.bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+        )
+
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        return bridge_dir_for_bridge_id(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id)
+
     codex_goal_runner = CodexGoalRunner(
         bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
@@ -8776,6 +8798,31 @@ def create_runner_app(
             finally:
                 await _side_client.close()
             return Response(status_code=202)
+        if body_type == "message" and isinstance(body, dict):
+            # A codex /side command opens a side chat; it must not run a turn
+            # here. Starting one publishes a "running" edge for this session,
+            # and the fork's settling edges belong to the child — idle is
+            # forwarder-owned for codex-native — so nothing would ever clear it
+            # and the chat would sit on "Working…" for good.
+            from omnigent.harnesses.codex_native import side_chat as _side_chat
+
+            _side_question = _side_chat.side_chat_question_from_text(
+                _side_chat_text_from_content(body.get("content"))
+            )
+            if (
+                _side_question is not None
+                and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
+            ):
+                _side_chat.request_side_chat(
+                    await _codex_native_bridge_dir_for_session(conversation_id),
+                    _side_question,
+                )
+                _logger.info(
+                    "Codex /side recorded without starting a turn: conv=%s",
+                    conversation_id,
+                    extra={"session_id": conversation_id},
+                )
+                return Response(status_code=202)
         if body_type == "message" or body_type is None:
             if not isinstance(body, dict):
                 return JSONResponse(
