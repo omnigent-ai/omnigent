@@ -38,7 +38,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -154,9 +153,7 @@ def _role(node: Mapping[str, object]) -> str:
     return ""
 
 
-def reconstruct_transcript_nodes(
-    nodes: Sequence[_JsonObject], task: str
-) -> list[_JsonObject]:
+def reconstruct_transcript_nodes(nodes: Sequence[_JsonObject], task: str) -> list[_JsonObject]:
     """Return the canonical node chain for the sub-agent whose task is *task*.
 
     Walks ``parent_node_id`` up from every leaf and keeps the longest chain whose
@@ -173,7 +170,9 @@ def reconstruct_transcript_nodes(
         when no chain matches (e.g. the sub-agent has not run yet).
     """
     by_id: dict[object, _JsonObject] = {n["node_id"]: n for n in nodes}
-    has_child: set[object] = {n["parent_node_id"] for n in nodes if n["parent_node_id"] is not None}
+    has_child: set[object] = {
+        n["parent_node_id"] for n in nodes if n["parent_node_id"] is not None
+    }
     leaves = [node_id for node_id in by_id if node_id not in has_child]
 
     def chain_up(leaf: object) -> list[object]:
@@ -196,7 +195,11 @@ def reconstruct_transcript_nodes(
     if best is None:
         return []
     start = next(
-        (i for i, x in enumerate(best) if _role(by_id[x]) == "user" and _content(by_id[x]) == task),
+        (
+            i
+            for i, x in enumerate(best)
+            if _role(by_id[x]) == "user" and _content(by_id[x]) == task
+        ),
         0,
     )
     return [by_id[x] for x in best[start:]]
@@ -231,7 +234,10 @@ def transcript_items(
         if role == "user":
             if content.strip():
                 items.append(
-                    ("message", {"role": "user", "content": [{"type": "input_text", "text": content}]})
+                    (
+                        "message",
+                        {"role": "user", "content": [{"type": "input_text", "text": content}]},
+                    )
                 )
         elif role == "assistant":
             thinking = message.get("thinking")

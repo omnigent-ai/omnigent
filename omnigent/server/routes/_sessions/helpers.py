@@ -160,6 +160,11 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CURSOR_FORK_HISTORY_HARNESSES,
     _CURSOR_NATIVE_HARNESS,
     _DENY_SENTINEL_PREFIX,
+    _DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY,
+    _DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+    _DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY,
+    _DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY,
+    _DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
     _ELICITATION_MODE,
     _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
     _FORK_HISTORY_NATIVE_HARNESSES,
@@ -4047,6 +4052,132 @@ async def _create_and_publish_codex_child(
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     _publish_session_created(parent_id, child.id, parent_conv.agent_id)
     return child.id
+
+
+def _find_devin_native_subagent_child(
+    conversation_store: ConversationStore,
+    parent_id: str,
+    agent_id: str,
+) -> Conversation | None:
+    """Look up an existing devin-native sub-agent child by Devin's ``agent_id``.
+
+    Makes :func:`_persist_external_devin_subagent_start` idempotent: the forwarder
+    re-posts a sub-agent whenever it reconstructs the (already finished, stable)
+    transcript, so a redelivery must resolve to the same child row.
+
+    :param conversation_store: Store to query.
+    :param parent_id: Parent devin-native conversation id, e.g. ``"conv_parent987"``.
+    :param agent_id: Devin sub-agent id, e.g. ``"690d786b"``.
+    :returns: Matching child :class:`Conversation`, or ``None``.
+    """
+    after: str | None = None
+    while True:
+        page = conversation_store.list_conversations(
+            kind="sub_agent",
+            parent_conversation_id=parent_id,
+            limit=100,
+            after=after,
+        )
+        for child in page.data:
+            if child.labels.get(_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY) == agent_id:
+                return child
+        if not page.has_more or page.last_id is None:
+            return None
+        after = page.last_id
+
+
+def _devin_subagent_labels_from_body(agent_id: str, body: SessionEventInput) -> dict[str, str]:
+    """Build the label dict for a devin-native sub-agent child row.
+
+    :param agent_id: Devin sub-agent id (idempotency key + display source).
+    :param body: Validated ``external_devin_subagent_start`` event body.
+    :returns: Labels to upsert on the child conversation row.
+    """
+    labels: dict[str, str] = {
+        _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+        _DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY: agent_id,
+    }
+    for data_key, label_key in (
+        ("title", _DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY),
+        ("tool_use_id", _DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY),
+    ):
+        value = body.data.get(data_key)
+        if isinstance(value, str) and value:
+            labels[label_key] = value
+    return labels
+
+
+async def _create_and_publish_devin_child(
+    parent_id: str,
+    parent_conv: Conversation,
+    agent_id: str,
+    labels: dict[str, str],
+    conversation_store: ConversationStore,
+) -> str:
+    """Create a new devin-native sub-agent child row and publish ``session.created``.
+
+    :param parent_id: Parent devin-native conversation id.
+    :param parent_conv: Parent row whose ``agent_id`` + ``runner_id`` the child inherits.
+    :param agent_id: Devin sub-agent id, the title's unique half.
+    :param labels: Labels to stamp on the new child row.
+    :param conversation_store: Store used to create the child row.
+    :returns: New child conversation id.
+    """
+    # Stable title so the (parent, title) unique index prevents duplicate rows
+    # when the forwarder retries a registration.
+    title = f"{_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE}:{agent_id}"
+    try:
+        child = await asyncio.to_thread(
+            conversation_store.create_conversation,
+            kind="sub_agent",
+            title=title,
+            parent_conversation_id=parent_id,
+            agent_id=parent_conv.agent_id,
+            runner_id=parent_conv.runner_id,
+            sub_agent_name=_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+        )
+    except NameAlreadyExistsError:
+        existing = await asyncio.to_thread(
+            _find_devin_native_subagent_child, conversation_store, parent_id, agent_id
+        )
+        if existing is None:
+            existing = await asyncio.to_thread(
+                _find_subagent_child_by_title, conversation_store, parent_id, title
+            )
+        if existing is not None:
+            await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+            return existing.id
+        raise
+    await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
+    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    return child.id
+
+
+def _is_devin_native_subagent(conv: Conversation) -> bool:
+    """Return whether a child conversation tracks a Devin sub-agent.
+
+    :param conv: Conversation row to inspect.
+    :returns: ``True`` when the row carries the devin-native sub-agent wrapper label.
+    """
+    return (
+        conv.kind == "sub_agent"
+        and conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        == _DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
+    )
+
+
+def _devin_subagent_display_tool(labels: dict[str, str]) -> str:
+    """Return the UI-facing label for a Devin sub-agent child.
+
+    Uses the ``run_subagent`` title Devin assigned (e.g. "Write alpha.txt"), else
+    a generic ``"Devin"`` fallback.
+
+    :param labels: Conversation labels from a Devin child row.
+    :returns: Display label.
+    """
+    title = labels.get(_DEVIN_NATIVE_SUBAGENT_TITLE_LABEL_KEY)
+    return title or _DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK
 
 
 def _is_kiro_native_session(conv: Conversation) -> bool:
@@ -9910,6 +10041,12 @@ def _child_session_summary_from_conversation(
         # ``session_name`` for correlation.
         tool = _claude_subagent_display_tool(conv, labels)
         session_name = labels.get(_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY)
+    elif _is_devin_native_subagent(conv):
+        # Devin-native child: the title is "devin-native-ui-subagent:{agent_id}",
+        # an opaque uniqueness key. Surface the run_subagent title as ``tool`` and
+        # the raw Devin agent_id as ``session_name`` for correlation.
+        tool = _devin_subagent_display_tool(labels)
+        session_name = labels.get(_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY)
     elif display_title and ":" in display_title:
         head, _, tail = display_title.partition(":")
         if head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail:
@@ -10761,10 +10898,13 @@ __all__ = [
     "_consume_pre_resolved_harness_elicitation",
     "_create_and_publish_antigravity_child",
     "_create_and_publish_codex_child",
+    "_create_and_publish_devin_child",
     "_create_session_worktree",
     "_delete_stored_session_bundle_after_failure",
     "_derive_terminal_launch_args_from_spec",
     "_descendant_sessions",
+    "_devin_subagent_display_tool",
+    "_devin_subagent_labels_from_body",
     "_discovery_key",
     "_dispatch_skill_slash_command_to_runner",
     "_emit_server_routing_decision",
@@ -10778,6 +10918,7 @@ __all__ = [
     "_file_content_etag",
     "_find_claude_native_subagent_child",
     "_find_codex_native_subagent_child",
+    "_find_devin_native_subagent_child",
     "_find_subagent_child_by_title",
     "_flush_relay_text",
     "_format_sse",
@@ -10793,6 +10934,7 @@ __all__ = [
     "_invalidate_runner_backed_snapshot_state",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",
+    "_is_devin_native_subagent",
     "_is_kiro_native_session",
     "_last_task_error_from_labels",
     "_latest_assistant_text_from_store",

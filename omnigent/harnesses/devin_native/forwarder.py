@@ -11,10 +11,17 @@ they carry correlation ids the other native harnesses have to reconstruct:
   transcript parsing.
 
 So this forwarder tails the bridge's ``hooks.jsonl`` (written by
-:mod:`omnigent.harnesses.devin_native.hook`) rather than scraping the pane or a vendor DB.
+:mod:`omnigent.harnesses.devin_native.hook`) rather than scraping the pane.
 The one thing hooks do not carry is reasoning text and token counts; those come
 from the ATIF transcript Devin rewrites after every turn (``--export``), read
 opportunistically on each turn-end edge.
+
+Sub-agents are the one thing neither the hooks nor the export attribute: Devin
+runs each ``run_subagent`` delegate as its own chain inside the parent session's
+message forest. So on each turn-end this forwarder reads Devin's own session
+store (``sessions.db``, read-only) and mirrors every newly-completed sub-agent's
+reconstructed transcript into an Omnigent child session — see
+:mod:`omnigent.harnesses.devin_native.subagents`.
 
 The read offset and cumulative usage are persisted into the bridge dir so a
 supervisor restart resumes without re-posting items or double-counting tokens.
@@ -26,7 +33,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +45,14 @@ from omnigent.harnesses.devin_native.bridge import (
     export_path,
     iter_hook_events,
     write_forwarder_ready,
+)
+from omnigent.harnesses.devin_native.subagents import (
+    completed_agent_ids,
+    devin_sessions_db_path,
+    load_message_nodes,
+    parse_spawned_agent_id,
+    reconstruct_transcript_nodes,
+    transcript_items,
 )
 from omnigent.native._native_post_delivery import post_external_session_status
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -67,6 +84,10 @@ class _ForwardState:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
+    #: ``run_subagent`` spawns seen this session, keyed by Devin ``agent_id`` ->
+    #: ``{"task", "title", "tool_use_id", "mirrored"}``. Persisted so a
+    #: supervisor restart does not re-mirror an already-posted sub-agent.
+    subagents: dict[str, _JsonObject] = field(default_factory=dict)
 
     def as_dict(self) -> _JsonObject:
         """Return a JSON-serializable view for persistence."""
@@ -76,6 +97,7 @@ class _ForwardState:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cached_tokens": self.cached_tokens,
+            "subagents": self.subagents,
         }
 
 
@@ -121,6 +143,11 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
         value = parsed.get(key)
         if isinstance(value, int) and value >= 0:
             setattr(state, key, value)
+    subagents = parsed.get("subagents")
+    if isinstance(subagents, dict):
+        for agent_id, info in subagents.items():
+            if isinstance(agent_id, str) and isinstance(info, dict):
+                state.subagents[agent_id] = info
     return state
 
 
@@ -310,6 +337,136 @@ async def _close_turn(
     turn.reset()
 
 
+def _record_subagent_spawn(state: _ForwardState, payload: _JsonObject) -> None:
+    """Note a ``run_subagent`` spawn from its ``PostToolUse`` payload.
+
+    The spawned ``agent_id`` rides only the tool-result text; the ``task`` (which
+    equals the sub-agent's first user message, so it keys the transcript chain)
+    and ``title`` come from ``tool_input``. A spawn with no parseable id or task
+    is ignored — it just will not be mirrored as a child.
+    """
+    response = payload.get("tool_response")
+    output = response.get("output") if isinstance(response, Mapping) else None
+    agent_id = parse_spawned_agent_id(output if isinstance(output, str) else None)
+    if not agent_id or agent_id in state.subagents:
+        return
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, Mapping):
+        return
+    task = tool_input.get("task")
+    if not isinstance(task, str) or not task:
+        return
+    title = tool_input.get("title")
+    tool_use_id = payload.get("tool_use_id")
+    state.subagents[agent_id] = {
+        "task": task,
+        "title": title if isinstance(title, str) else "",
+        "tool_use_id": tool_use_id if isinstance(tool_use_id, str) else "",
+        "mirrored": False,
+    }
+
+
+async def _start_subagent_child(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    agent_id: str,
+    title: str,
+    tool_use_id: str,
+) -> str | None:
+    """Mint (or idempotently resolve) the Omnigent child session for a sub-agent.
+
+    :returns: The child conversation id, or ``None`` if the server returned none
+        (the mirror is then retried on a later turn-end).
+    """
+    data: _JsonObject = {"agent_id": agent_id}
+    if title:
+        data["title"] = title
+    if tool_use_id:
+        data["tool_use_id"] = tool_use_id
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_devin_subagent_start", "data": data},
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    child_id = body.get("child_session_id") if isinstance(body, Mapping) else None
+    return child_id if isinstance(child_id, str) and child_id else None
+
+
+async def _mirror_completed_subagents(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    agent_name: str,
+    state: _ForwardState,
+) -> None:
+    """Mirror every newly-completed sub-agent's transcript into a child session.
+
+    Runs on each turn-end. Devin persists a background sub-agent's full chain in
+    its session store and injects a ``<subagent_completion_notification>`` into
+    the parent when it finishes, so once that notification is present the chain
+    is complete and stable — reconstruct it and post it once.
+
+    Best-effort per sub-agent: one child's POST failure is suppressed so it never
+    kills the main mirror, and ``mirrored`` is set only on full success.
+
+    # ponytail: a failure after the child is minted but mid-transcript re-posts
+    # that sub-agent's items on the next turn-end (external_conversation_item is
+    # not idempotent). Rare and cosmetic; add a per-item cursor if it bites.
+    """
+    pending = {aid: info for aid, info in state.subagents.items() if not info.get("mirrored")}
+    if not pending or not state.devin_session_id:
+        return
+    db_path = devin_sessions_db_path(os.environ)
+    if db_path is None:
+        return
+    nodes = load_message_nodes(db_path, state.devin_session_id)
+    if not nodes:
+        return
+    completed: set[str] = set()
+    for node in nodes:
+        message = node.get("chat_message")
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str) and "subagent_completion_notification" in content:
+            completed.update(completed_agent_ids(content))
+    for agent_id, info in pending.items():
+        if agent_id not in completed:
+            continue
+        task = info.get("task")
+        if not isinstance(task, str):
+            continue
+        chain = reconstruct_transcript_nodes(nodes, task)
+        if not chain:
+            continue
+        try:
+            child_id = await _start_subagent_child(
+                client,
+                session_id=session_id,
+                agent_id=agent_id,
+                title=str(info.get("title") or ""),
+                tool_use_id=str(info.get("tool_use_id") or ""),
+            )
+            if child_id is None:
+                continue
+            response_id = f"devin:subagent:{agent_id}"
+            for item_type, item_data in transcript_items(chain, agent_name):
+                await _post_item(
+                    client,
+                    session_id=child_id,
+                    item_type=item_type,
+                    item_data=item_data,
+                    response_id=response_id,
+                )
+            await post_external_session_status(
+                client, session_id=child_id, status="idle", response_id=response_id
+            )
+        except httpx.HTTPError as exc:
+            _logger.warning("devin-native: could not mirror sub-agent %s: %s", agent_id, exc)
+            continue
+        info["mirrored"] = True
+
+
 async def _handle_event(
     client: httpx.AsyncClient,
     *,
@@ -401,6 +558,10 @@ async def _handle_event(
             },
             response_id=turn.response_id,
         )
+        # A run_subagent spawn is also a normal tool card above; additionally
+        # note it so its transcript can be mirrored as a child once it finishes.
+        if tool_name == "run_subagent":
+            _record_subagent_spawn(state, payload)
         return
 
     if event == _POST_COMPACTION:
@@ -464,11 +625,17 @@ async def _handle_event(
             )
         await _post_usage(client, session_id=session_id, bridge_dir=bridge_dir, state=state)
         await _close_turn(client, session_id=session_id, turn=turn)
+        await _mirror_completed_subagents(
+            client, session_id=session_id, agent_name=agent_name, state=state
+        )
         return
 
     if event == _SESSION_END:
         await _post_usage(client, session_id=session_id, bridge_dir=bridge_dir, state=state)
         await _close_turn(client, session_id=session_id, turn=turn)
+        await _mirror_completed_subagents(
+            client, session_id=session_id, agent_name=agent_name, state=state
+        )
         return
 
 

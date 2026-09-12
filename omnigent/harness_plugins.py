@@ -223,6 +223,7 @@ DEVIN_NATIVE_CODING_AGENT = NativeCodingAgent(
     agent_name="devin-native-ui",
     harness="devin-native",
     wrapper_label=DEVIN_NATIVE_WRAPPER_VALUE,
+    subagent_wrapper_label="devin-native-ui-subagent",
     terminal_name="devin",
 )
 
@@ -535,7 +536,11 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _EF.ANTHROPIC,
         _MF.MULTI,
         _AU.OWN_AUTH,
-        subagents=False,
+        # Devin's run_subagent delegates are mirrored as child sessions: the
+        # forwarder reconstructs each one's full transcript from Devin's own
+        # session store (message_nodes) on completion — see
+        # omnigent.harnesses.devin_native.subagents.
+        subagents=True,
         interrupt=True,
         streaming=False,
         steering=True,

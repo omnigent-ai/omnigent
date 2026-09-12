@@ -65,8 +65,14 @@ _STOP = {
 class _FakeResponse:
     status_code = 200
 
+    def __init__(self, body: dict[str, Any] | None = None) -> None:
+        self._body = body or {}
+
     def raise_for_status(self) -> None:
         return None
+
+    def json(self) -> dict[str, Any]:
+        return self._body
 
 
 class _FakeClient:
@@ -77,23 +83,40 @@ class _FakeClient:
         self.patches: list[tuple[str, dict[str, Any]]] = []
 
     async def post(self, url: str, json: dict[str, Any] | None = None) -> _FakeResponse:
-        self.posts.append((url, json or {}))
+        body = json or {}
+        self.posts.append((url, body))
+        # Mirror the server's external_devin_subagent_start reply so the
+        # forwarder can address the child's transcript to the minted id.
+        if body.get("type") == "external_devin_subagent_start":
+            agent_id = body["data"]["agent_id"]
+            return _FakeResponse({"child_session_id": f"conv_child_{agent_id}"})
         return _FakeResponse()
 
     async def patch(self, url: str, json: dict[str, Any] | None = None) -> _FakeResponse:
         self.patches.append((url, json or {}))
         return _FakeResponse()
 
-    def items(self, item_type: str) -> list[dict[str, Any]]:
+    def _items(self, session_id: str, item_type: str) -> list[dict[str, Any]]:
         return [
             body["data"]["item_data"]
-            for _url, body in self.posts
-            if body.get("type") == "external_conversation_item"
+            for url, body in self.posts
+            if url == f"/v1/sessions/{session_id}/events"
+            and body.get("type") == "external_conversation_item"
             and body["data"]["item_type"] == item_type
         ]
 
-    def events(self, event_type: str) -> list[dict[str, Any]]:
-        return [body["data"] for _url, body in self.posts if body.get("type") == event_type]
+    def items(self, item_type: str) -> list[dict[str, Any]]:
+        return self._items("conv_abc", item_type)
+
+    def child_items(self, child_id: str, item_type: str) -> list[dict[str, Any]]:
+        return self._items(child_id, item_type)
+
+    def events(self, event_type: str, *, session_id: str = "conv_abc") -> list[dict[str, Any]]:
+        return [
+            body["data"]
+            for url, body in self.posts
+            if url == f"/v1/sessions/{session_id}/events" and body.get("type") == event_type
+        ]
 
 
 async def _drive(
@@ -303,3 +326,126 @@ class TestStatePersistence:
     def test_corrupt_state_starts_at_the_beginning(self, tmp_path: Path) -> None:
         (tmp_path / "devin_forwarder_state.json").write_text("{not json", encoding="utf-8")
         assert _read_state(tmp_path).hooks_offset == 0
+
+
+# The one.txt sub-agent's task, verbatim as the run_subagent hook delivers it and
+# as it appears as that sub-agent's first user node in the captured fixture.
+_ONE_TASK = (
+    "Write a file at /tmp/devin-sub2/work/one.txt whose contents are exactly:\n\n"
+    "ONE\n\nUse your file-writing tool to create it. Report back when done."
+)
+_SUBAGENT_FIXTURE = json.loads(
+    (Path(__file__).parent / "data" / "devin_subagent_nodes.json").read_text()
+)
+
+
+def _run_subagent_post(agent_id: str, task: str, title: str) -> dict[str, Any]:
+    return {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "run_subagent",
+        "tool_input": {"title": title, "task": task, "is_background": True},
+        "tool_use_id": "run_subagent_0",
+        "tool_response": {
+            "success": True,
+            "output": f"Background subagent started with agent_id={agent_id}. You can wait…",
+            "error": None,
+        },
+        "session_id": "possible-umbra",
+        "prompt_id": "p1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_subagent_spawn_is_recorded(tmp_path: Path) -> None:
+    # The agent_id rides the tool-result text; the task/title come from the input.
+    client = _FakeClient()
+    state, _turn = await _drive(
+        client, [_run_subagent_post("690d786b", _ONE_TASK, "Write one.txt")], tmp_path
+    )
+    assert "690d786b" in state.subagents
+    assert state.subagents["690d786b"]["task"] == _ONE_TASK
+    assert state.subagents["690d786b"]["title"] == "Write one.txt"
+    assert state.subagents["690d786b"]["mirrored"] is False
+
+
+@pytest.mark.asyncio
+async def test_completed_subagent_is_mirrored_as_a_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Point the forwarder's session-store read at the captured fixture instead of
+    # a live Devin DB, so the mirror runs end-to-end deterministically.
+    import omnigent.harnesses.devin_native.forwarder as fwd
+
+    monkeypatch.setattr(fwd, "devin_sessions_db_path", lambda _env: tmp_path / "sessions.db")
+    monkeypatch.setattr(fwd, "load_message_nodes", lambda _db, _sid: _SUBAGENT_FIXTURE)
+
+    client = _FakeClient()
+    payloads = [
+        {"hook_event_name": "SessionStart", "source": "startup", "session_id": "possible-umbra"},
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "spawn a sub-agent",
+            "session_id": "possible-umbra",
+            "prompt_id": "p1",
+        },
+        _run_subagent_post("690d786b", _ONE_TASK, "Write one.txt"),
+        {
+            "hook_event_name": "Stop",
+            "last_assistant_message": "done",
+            "session_id": "possible-umbra",
+            "prompt_id": "p1",
+        },
+    ]
+    state, _turn = await _drive(client, payloads, tmp_path)
+
+    # A child session was minted for the sub-agent, keyed on Devin's agent_id.
+    starts = [
+        body["data"]
+        for _u, body in client.posts
+        if body.get("type") == "external_devin_subagent_start"
+    ]
+    assert [s["agent_id"] for s in starts] == ["690d786b"]
+    assert starts[0]["title"] == "Write one.txt"
+
+    child_id = "conv_child_690d786b"
+    # Its full internal transcript landed in the child: the task prompt, the write
+    # tool call with its real arguments, and the sub-agent's final message.
+    messages = client.child_items(child_id, "message")
+    assert messages[0]["role"] == "user" and "one.txt" in messages[0]["content"][0]["text"]
+    assert messages[-1]["role"] == "assistant" and "one.txt" in messages[-1]["content"][0]["text"]
+    calls = client.child_items(child_id, "function_call")
+    write = next(c for c in calls if c["name"] == "write")
+    assert json.loads(write["arguments"])["file_path"].endswith("one.txt")
+    assert any(
+        o["call_id"] == write["call_id"]
+        for o in client.child_items(child_id, "function_call_output")
+    )
+
+    # The child is closed idle under the sub-agent's own turn id, and the mirror
+    # is marked done so a re-run does not duplicate it.
+    statuses = client.events("external_session_status", session_id=child_id)
+    assert len(statuses) == 1 and statuses[0]["status"] == "idle"
+    assert statuses[0]["response_id"] == "devin:subagent:690d786b"
+    assert state.subagents["690d786b"]["mirrored"] is True
+
+
+@pytest.mark.asyncio
+async def test_subagent_not_mirrored_until_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A spawn whose completion notification is absent from the store must not be
+    # mirrored yet — the transcript may still be growing.
+    import omnigent.harnesses.devin_native.forwarder as fwd
+
+    monkeypatch.setattr(fwd, "devin_sessions_db_path", lambda _env: tmp_path / "sessions.db")
+    monkeypatch.setattr(fwd, "load_message_nodes", lambda _db, _sid: [])
+
+    client = _FakeClient()
+    payloads = [
+        {"hook_event_name": "SessionStart", "source": "startup", "session_id": "possible-umbra"},
+        _run_subagent_post("690d786b", _ONE_TASK, "Write one.txt"),
+        {"hook_event_name": "Stop", "session_id": "possible-umbra", "prompt_id": "p1"},
+    ]
+    state, _turn = await _drive(client, payloads, tmp_path)
+    assert not [b for _u, b in client.posts if b.get("type") == "external_devin_subagent_start"]
+    assert state.subagents["690d786b"]["mirrored"] is False

@@ -132,7 +132,8 @@ class TestTranscriptItems:
         assert items[-1][1]["agent"] == "devin-native-ui"
 
     def test_system_boilerplate_is_dropped(self) -> None:
-        items = transcript_items(reconstruct_transcript_nodes(_NODES, _ONE_TASK), "devin-native-ui")
+        chain = reconstruct_transcript_nodes(_NODES, _ONE_TASK)
+        items = transcript_items(chain, "devin-native-ui")
         assert "You are a subagent" not in json.dumps(items)
 
     def test_empty_chain_yields_no_items(self) -> None:

@@ -127,9 +127,10 @@ export const NATIVE_CODING_AGENTS = [
   },
   {
     // Devin's native TUI (Cognition). Added ALONGSIDE Devin's ACP harness
-    // (`devin-acp`, see omnigent/inner/devin) — they are distinct rows, and only
-    // the ACP one surfaces Devin's sub-agents as child sessions today. The bare
-    // `devin` harness spelling resolves to this native wrap.
+    // (`devin-acp`, see omnigent/inner/devin) — they are distinct rows. Both now
+    // surface Devin's `run_subagent` delegates as child sessions: the native
+    // forwarder reconstructs each one's transcript from Devin's session store.
+    // The bare `devin` harness spelling resolves to this native wrap.
     //
     // `devinMode` owns Devin's own Model + Effort rows. It is deliberately the
     // ONLY capability here:
@@ -143,6 +144,7 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "devin-native-ui",
     harness: "devin-native",
     wrapperLabel: "devin-native-ui",
+    subagentWrapperLabel: "devin-native-ui-subagent",
     displayName: "Devin",
     iconKind: "devin",
     sortRank: 28,
