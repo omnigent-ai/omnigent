@@ -453,7 +453,7 @@ function AgentPinDialog({ open, onOpenChange, hostId, agent, providers }: AgentP
           <div className="grid gap-2">
             <Label>Provider</Label>
             <Select value={provider} onValueChange={setProvider}>
-              <SelectTrigger>
+              <SelectTrigger aria-label="Pin provider">
                 <SelectValue placeholder="Host default" />
               </SelectTrigger>
               <SelectContent>
