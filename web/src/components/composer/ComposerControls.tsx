@@ -16,6 +16,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { COMPOSER_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 
 export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
@@ -120,7 +121,11 @@ export function ComposerPermissionPicker({
           data-testid={`${testIdPrefix}-permission-chip`}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span className="whitespace-nowrap text-ui font-normal">{value}</span>
+          <span
+            className={cn("whitespace-nowrap text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+          >
+            {value}
+          </span>
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
@@ -211,8 +216,14 @@ export const ComposerHarnessTrigger = forwardRef<
           data-testid={`${testIdPrefix}-model-pending`}
         />
       )}
+      {/* Without an icon the text is the only identification, so it stays put
+          when the row collapses. */}
       <span
-        className={cn("inline-flex min-w-0 flex-wrap items-baseline gap-1", labelClassName)}
+        className={cn(
+          "inline-flex min-w-0 flex-wrap items-baseline gap-1",
+          icon != null && COMPOSER_COLLAPSED_LABEL_CLASS,
+          labelClassName,
+        )}
         data-testid={`${testIdPrefix}-agent-config-value`}
       >
         {model && (

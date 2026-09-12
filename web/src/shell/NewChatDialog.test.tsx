@@ -1750,9 +1750,11 @@ describe("NewChatLandingScreen", () => {
     const card = screen.getByTestId("new-chat-landing-composer");
     expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
-    expect(Array.from(actions.children)).toEqual([leftControls, rightControls]);
+    const [widthProbe, ...groups] = Array.from(actions.children);
+    expect(widthProbe).toHaveClass("h-0");
+    expect(groups).toEqual([leftControls, rightControls]);
     expect(actions).toHaveClass("flex-wrap");
-    expect(leftControls).toHaveClass("min-w-0", "flex-auto", "gap-1", "overflow-visible");
+    expect(leftControls).toHaveClass("min-w-0", "flex-none", "gap-1", "overflow-visible");
     expect(leftControls).not.toHaveClass("overflow-hidden", "shrink-0", "absolute");
     expect(rightControls).toHaveClass("flex", "shrink-0", "items-center", "gap-1");
     expect(rightControls).toHaveClass("ml-auto", "max-w-full");

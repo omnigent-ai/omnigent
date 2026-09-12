@@ -7,6 +7,7 @@ import {
   ComposerHarnessTrigger,
   ComposerPermissionPicker,
 } from "./ComposerControls";
+import { COMPOSER_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 
 describe("shared composer controls", () => {
   it("uses the same workspace header and host geometry in either context", () => {
@@ -61,6 +62,16 @@ describe("shared composer controls", () => {
     expect(screen.getByTestId("composer-agent-model-value")).not.toHaveClass("truncate");
     expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-agent-config-value")).toHaveClass(
+      COMPOSER_COLLAPSED_LABEL_CLASS,
+    );
+  });
+
+  it("keeps an icon-less model label visible when the action row collapses", () => {
+    render(<ComposerHarnessTrigger label="Agent" model="No agents" />);
+    expect(screen.getByTestId("composer-agent-config-value")).not.toHaveClass(
+      COMPOSER_COLLAPSED_LABEL_CLASS,
+    );
   });
 
   it("dispatches permission selections through the caller's handler", () => {
@@ -80,6 +91,7 @@ describe("shared composer controls", () => {
     for (const forbidden of ["hidden", "max-w-20", "truncate"]) {
       expect(screen.getByText("Bypass permissions")).not.toHaveClass(forbidden);
     }
+    expect(screen.getByText("Bypass permissions")).toHaveClass(COMPOSER_COLLAPSED_LABEL_CLASS);
     expect(trigger).toHaveClass("w-auto", "gap-1", "px-2");
     fireEvent.keyDown(trigger, {
       key: "ArrowDown",

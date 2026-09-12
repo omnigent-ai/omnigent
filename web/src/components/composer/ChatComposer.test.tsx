@@ -1,7 +1,12 @@
-import { createRef, type FormEvent } from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
-import { ChatComposer, ComposerTextarea, ComposerSendButton } from "./ChatComposer";
+import { createRef, type FormEvent, type ReactNode } from "react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  ChatComposer,
+  ComposerTextarea,
+  ComposerSendButton,
+  COMPOSER_LABELS_MIN_GAP_PX,
+} from "./ChatComposer";
 
 describe("ChatComposer", () => {
   it("keeps route-owned input and submit handlers on the shared surface", () => {
@@ -141,5 +146,104 @@ describe("ChatComposer", () => {
     );
     expect(fireEvent.keyDown(input, { key: "Enter", ctrlKey: true })).toBe(true);
     expect(onKeyDown).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatComposer label collapse", () => {
+  class StubResizeObserver {
+    static callbacks: ResizeObserverCallback[] = [];
+    constructor(callback: ResizeObserverCallback) {
+      StubResizeObserver.callbacks.push(callback);
+    }
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  const fireResize = () => {
+    for (const callback of StubResizeObserver.callbacks) callback([], {} as ResizeObserver);
+  };
+  // Width of a group once its label is hidden and only the icon remains.
+  const ICON_WIDTH = 40;
+  const ROW_PADDING = 16;
+
+  afterEach(() => {
+    StubResizeObserver.callbacks = [];
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * jsdom does no layout, so stand in for it: the row is `layout.rowWidth`
+   * wide with 8px side padding, and each group's natural width follows the
+   * text inside it (10px per character) — except that, exactly like the real
+   * CSS, a collapsed row hides the labels and leaves each group its icon width.
+   */
+  function renderMeasuredComposer(actions: { leading: ReactNode; trailing: ReactNode }) {
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    const layout = { rowWidth: 0 };
+    const composer = (next: typeof actions) => (
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Message" }}
+        actions={{ ...next, testId: "row", leadingTestId: "leading", trailingTestId: "trailing" }}
+      />
+    );
+    const view = render(composer(actions));
+    const row = screen.getByTestId("row");
+    row.style.paddingLeft = "8px";
+    row.style.paddingRight = "8px";
+    Object.defineProperty(row, "clientWidth", { configurable: true, get: () => layout.rowWidth });
+    for (const group of [screen.getByTestId("leading"), screen.getByTestId("trailing")]) {
+      Object.defineProperty(group, "scrollWidth", {
+        configurable: true,
+        get: () =>
+          row.dataset.labels === "collapsed" ? ICON_WIDTH : (group.textContent?.length ?? 0) * 10,
+      });
+    }
+    return { row, layout, rerender: (next: typeof actions) => view.rerender(composer(next)) };
+  }
+
+  it("collapses the labels to icons once both groups stop fitting on one line with a gap", () => {
+    const { row, layout } = renderMeasuredComposer({
+      leading: <span>Bypass permissions</span>,
+      trailing: <span>Fable 5.1 xHigh</span>,
+    });
+    const needed = 180 + 150 + COMPOSER_LABELS_MIN_GAP_PX;
+    layout.rowWidth = needed + ROW_PADDING;
+    fireResize();
+    expect(row).not.toHaveAttribute("data-labels");
+    layout.rowWidth = needed + ROW_PADDING - 1;
+    fireResize();
+    expect(row).toHaveAttribute("data-labels", "collapsed");
+  });
+
+  it("judges the expanded labels while collapsed, so icon-width room never brings them back", () => {
+    const { row, layout } = renderMeasuredComposer({
+      leading: <span>Bypass permissions</span>,
+      trailing: <span>Fable 5.1 xHigh</span>,
+    });
+    layout.rowWidth = 200;
+    fireResize();
+    expect(row).toHaveAttribute("data-labels", "collapsed");
+    // Plenty of room for two icons (2 × 40 + 24), none for the labels (354).
+    layout.rowWidth = 300;
+    fireResize();
+    expect(row).toHaveAttribute("data-labels", "collapsed");
+    layout.rowWidth = 180 + 150 + COMPOSER_LABELS_MIN_GAP_PX + ROW_PADDING;
+    fireResize();
+    expect(row).not.toHaveAttribute("data-labels");
+  });
+
+  it("re-measures when the controls inside the row change", async () => {
+    const { row, layout, rerender } = renderMeasuredComposer({
+      leading: <span>Manual</span>,
+      trailing: <span>Sonnet 5</span>,
+    });
+    layout.rowWidth = 300;
+    fireResize();
+    expect(row).not.toHaveAttribute("data-labels");
+    rerender({ leading: <span>Manual</span>, trailing: <span>Fable 5.1 (1M context) xHigh</span> });
+    await waitFor(() => expect(row).toHaveAttribute("data-labels", "collapsed"));
+    rerender({ leading: <span>Manual</span>, trailing: <span>Sonnet 5</span> });
+    await waitFor(() => expect(row).not.toHaveAttribute("data-labels"));
   });
 });
