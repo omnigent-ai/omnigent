@@ -44,6 +44,7 @@ import re
 from collections.abc import Iterator
 from urllib.parse import urlparse
 
+import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
@@ -554,3 +555,87 @@ def test_host_badge_switches_the_session_to_another_host(
     launch_body = calls[1]["body"] or {}
     assert launch_body.get("session_id") == session_id, launch_body
     assert launch_body.get("workspace") == "/home/e2e/repo", launch_body
+
+
+def test_host_badge_page_shows_outdated_host_notice(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A host the server flags as outdated gets an update banner over the chat.
+
+    The host machine upgrades omnigent in place while the running host daemon
+    keeps its old code, and nothing restarts it. The server compares the
+    version each host reported at connect with its own and flags the row; the
+    web view turns that into a banner naming the host and its version, worded
+    for the host's ``distribution`` (here isaac), so the user learns what to
+    run without anyone messaging them. Restarting kills that host's sessions,
+    so dismissing the banner sticks for that host and version across reloads.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser view is patched to a host-bound shape whose host
+        row carries the server's ``outdated`` verdict.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _patch_host_view(
+        page,
+        session_id,
+        host={
+            "name": "stale-laptop",
+            "owner": "e2e",
+            "status": "online",
+            "sandbox_provider": None,
+            "version": "0.0.1",
+            "outdated": True,
+            "distribution": "isaac",
+        },
+        host_online=True,
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    notice = page.get_by_test_id("host-outdated-notice")
+    expect(notice).to_be_visible(timeout=15_000)
+    expect(notice).to_contain_text("Host stale-laptop is outdated (0.0.1).")
+    expect(notice).to_contain_text("To update, run isaac omni host stop then isaac omni host.")
+    page.get_by_test_id("host-outdated-dismiss").click()
+    expect(notice).to_have_count(0)
+    page.reload()
+    expect(page.get_by_test_id("composer-host-select")).to_be_visible(timeout=15_000)
+    expect(page.get_by_test_id("host-outdated-notice")).to_have_count(0)
+
+
+def test_host_badge_page_hides_notice_for_current_host(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A host at the server's version shows no restart notice.
+
+    The notice keys off the server's ``outdated`` verdict, never off a version
+    string alone, so a current host renders the ordinary host badge and
+    nothing above the chat.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser view is patched to a host-bound, current shape.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    server_version = httpx.get(f"{base_url}/v1/info", timeout=10.0).json()["server_version"]
+    _patch_host_view(
+        page,
+        session_id,
+        host={
+            "name": "current-laptop",
+            "owner": "e2e",
+            "status": "online",
+            "sandbox_provider": None,
+            "version": server_version,
+            "outdated": False,
+        },
+        host_online=True,
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_test_id("composer-host-select")).to_be_visible(timeout=15_000)
+    expect(page.get_by_test_id("host-outdated-notice")).to_have_count(0)

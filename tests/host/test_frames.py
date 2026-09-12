@@ -234,6 +234,7 @@ def test_hello_frame_round_trip() -> None:
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
         interactive_shells=["zsh", "bash"],
+        distribution="isaac",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -242,6 +243,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.interactive_shells == ["zsh", "bash"]
+    assert decoded.distribution == "isaac"
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -511,6 +513,7 @@ def test_hello_frame_legacy_payload_decodes_unknown_harnesses() -> None:
     decoded = decode_host_frame(legacy)
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.configured_harnesses is None
+    assert decoded.distribution is None
 
 
 def test_hello_frame_non_dict_configured_harnesses_decodes_as_none() -> None:

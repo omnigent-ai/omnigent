@@ -85,6 +85,10 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param version: Omnigent version from the host's last ``host.hello``
+        frame, e.g. ``"0.13.0.dev3"``; ``None`` when never reported.
+    :param distribution: How omnigent was distributed onto the host, e.g.
+        ``"isaac"`` or ``"uv"``; ``None`` when never reported.
     """
 
     host_id: str
@@ -98,6 +102,8 @@ class Host:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
+    version: str | None = None
+    distribution: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -172,6 +178,8 @@ def _row_to_host(row: SqlHost) -> Host:
         terminating_sandbox_id=row.terminating_sandbox_id,
         deleted_at=row.deleted_at,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        version=row.version,
+        distribution=row.distribution,
     )
 
 
@@ -233,6 +241,8 @@ class HostStore:
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
         managed_token: str | None = None,
+        version: str | None = None,
+        distribution: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -275,6 +285,12 @@ class HostStore:
         :param managed_token: Raw launch token for a managed host. When set,
             registration atomically revalidates the current credential instead
             of performing the external-host upsert path.
+        :param version: Omnigent version from the host's ``host.hello`` frame,
+            e.g. ``"0.13.0.dev3"``. Written on every connect like
+            ``configured_harnesses``.
+        :param distribution: How omnigent was distributed onto the host, from
+            the same frame, e.g. ``"isaac"``. Written on every connect like
+            ``version``.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
@@ -303,6 +319,8 @@ class HostStore:
                             status=encode_host_status("online"),
                             updated_at=now,
                             configured_harnesses=harnesses_json,
+                            version=version,
+                            distribution=distribution,
                         )
                     ),
                 )
@@ -334,6 +352,8 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                row.version = version
+                row.distribution = distribution
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -349,6 +369,8 @@ class HostStore:
                     user_id=user_id,
                     now=now,
                     configured_harnesses_json=harnesses_json,
+                    version=version,
+                    distribution=distribution,
                 )
                 if reowned is not None:
                     return reowned
@@ -372,6 +394,8 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
+                    version,
+                    distribution,
                 )
                 return _row_to_host(row)
 
@@ -384,6 +408,8 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                version=version,
+                distribution=distribution,
             )
             session.add(row)
             return _row_to_host(row)
@@ -397,6 +423,8 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        version: str | None,
+        distribution: str | None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -417,6 +445,8 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
+        :param version: Omnigent version reported at connect, or None.
+        :param distribution: Distribution token reported at connect, or None.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -472,6 +502,8 @@ class HostStore:
             sandbox_id=sandbox_id,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
+            version=version,
+            distribution=distribution,
         )
         session.add(new_row)
         session.flush()
@@ -498,6 +530,8 @@ class HostStore:
         user_id: str,
         now: int,
         configured_harnesses_json: str | None = None,
+        version: str | None = None,
+        distribution: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -522,6 +556,8 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
+        :param version: Omnigent version reported at connect, or ``None``.
+        :param distribution: Distribution token reported at connect, or ``None``.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -548,6 +584,8 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                version=version,
+                distribution=distribution,
             )
         )
         return Host(
@@ -560,6 +598,8 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            version=version,
+            distribution=distribution,
         )
 
     def set_offline(self, host_id: str) -> None:

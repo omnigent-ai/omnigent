@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from alembic import command
 from sqlalchemy import Engine, inspect, text
 
 from omnigent.db.cockroachdb import (
@@ -13,6 +14,7 @@ from omnigent.db.cockroachdb import (
     _prepare_crdb_schema_transaction,
 )
 from omnigent.db.utils import (
+    _build_alembic_config,
     _get_current_db_revision,
     _get_head_db_revision,
     _initialize_or_verify_schema,
@@ -60,11 +62,15 @@ def test_cockroachdb_upgrades_from_supported_baseline(db_uri: str) -> None:
     if head == CRDB_BASELINE_REVISION:
         pytest.skip("requires a migration after the CRDB baseline")
 
-    with engine.begin() as connection:
-        connection.execute(
-            text("UPDATE alembic_version SET version_num = :revision"),
-            {"revision": CRDB_BASELINE_REVISION},
-        )
+    # Downgrade for real: stamping the revision back would keep the head
+    # schema, so a replayed ADD COLUMN migration collides with its own column.
+    config = _build_alembic_config(db_uri)
+    with engine.connect() as connection:
+        _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        command.downgrade(config, CRDB_BASELINE_REVISION)
+        connection.commit()
+    assert _get_current_db_revision(engine) == CRDB_BASELINE_REVISION
 
     _initialize_or_verify_schema(engine, db_uri)
 

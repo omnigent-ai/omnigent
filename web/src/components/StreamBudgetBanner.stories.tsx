@@ -8,8 +8,15 @@ const meta = {
   tags: ["visual-snapshot"],
   decorators: [
     (Story) => (
+      // Same floating column Transcript mounts the card in, so the snapshot
+      // matches the live placement.
       <div className="relative h-48 w-[720px] overflow-hidden rounded-xl border bg-background">
-        <Story />
+        <div
+          style={{ top: "calc(56px + var(--omnigent-inset-top, 0px))" }}
+          className="pointer-events-none absolute inset-x-0 z-40 flex flex-col items-end gap-2 px-3"
+        >
+          <Story />
+        </div>
       </div>
     ),
   ],

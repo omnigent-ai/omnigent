@@ -1339,6 +1339,11 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param version: Omnigent version the host reported in its last
+        ``host.hello`` frame, e.g. ``"0.13.0.dev3"``; ``None`` when unknown.
+    :param distribution: How omnigent was distributed onto the host, from its
+        last ``host.hello`` frame, e.g. ``"isaac"`` or ``"uv"``; ``None`` when
+        unknown.
     """
 
     __tablename__ = "hosts"
@@ -1370,6 +1375,10 @@ class SqlHost(OmnigentBase):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Omnigent version from the host's last ``host.hello`` frame.
+    version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # How omnigent got onto the host (``"isaac"``, ``"uv"``, ...), same frame.
+    distribution: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint(

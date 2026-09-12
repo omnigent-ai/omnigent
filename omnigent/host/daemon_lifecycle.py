@@ -53,6 +53,8 @@ class HostDaemonRecord:
     :param host_id: Stable host id advertised to the server.
     :param resolved_server_url: Concrete URL owned by a local-mode daemon.
     :param config_sig: Signature of server-affecting launch configuration.
+    :param version: Omnigent version the daemon runs, e.g. ``"0.13.0.dev3"``;
+        ``None`` for records written by older daemons.
     """
 
     pid: int
@@ -64,6 +66,7 @@ class HostDaemonRecord:
     host_id: str | None = None
     resolved_server_url: str | None = None
     config_sig: str | None = None
+    version: str | None = None
 
 
 def normalize_daemon_target(server_url: str | None) -> str:

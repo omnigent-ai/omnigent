@@ -25,9 +25,14 @@ import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import type { Host } from "@/hooks/useHosts";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-import { RunnerStartingIndicator, McpStartupIndicator } from "@/pages/ChatIndicators";
+import {
+  HostOutdatedNotice,
+  McpStartupIndicator,
+  RunnerStartingIndicator,
+} from "@/pages/ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import {
   type ConversationScroller,
@@ -78,6 +83,8 @@ export interface TranscriptProps {
   terminalFirst: { isTerminalFirst: boolean; terminalStartingUp?: boolean } | null | undefined;
   /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
   spacerMeasureRef: React.RefObject<(() => void) | null>;
+  /** The session's host row, for the outdated-host banner; null when unbound or unknown. */
+  host: Host | null;
 }
 
 export function isNativeFindShortcut(
@@ -116,6 +123,7 @@ function TranscriptImpl({
   sandboxLaunching,
   terminalFirst,
   spacerMeasureRef,
+  host,
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
@@ -418,8 +426,17 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs warning, a sibling of Conversation. */}
-        <StreamBudgetBanner />
+        {/* Floating notices below the h-14 (56px) header, right-aligned and
+        stacked: the too-many-tabs warning and the outdated-host banner. A
+        sibling of Conversation, positioned like JumpToTopButton (z-40 clears
+        the z-30 header; the inset var follows the iOS safe-area shift). */}
+        <div
+          style={{ top: "calc(56px + var(--omnigent-inset-top, 0px))" }}
+          className="pointer-events-none absolute inset-x-0 z-40 flex flex-col items-end gap-2 px-3"
+        >
+          <StreamBudgetBanner />
+          <HostOutdatedNotice host={host} />
+        </div>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
         {!isMobileViewport && (
           <TurnRail

@@ -1,7 +1,9 @@
-import { Loader2Icon, WifiOffIcon } from "lucide-react";
+import { Fragment, useState } from "react";
+import { AlertTriangleIcon, Loader2Icon, WifiOffIcon, XIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
+import type { Host } from "@/hooks/useHosts";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -261,5 +263,110 @@ export function McpStartupIndicator() {
         </span>
       </MessageContent>
     </Message>
+  );
+}
+
+/**
+ * Update commands per `Host.distribution`, the token a host reports for how
+ * omnigent got onto it, in the order to run them on that machine. Tokens not
+ * listed (`source`, unknown, or an older host that reports nothing) get the
+ * plain restart wording instead.
+ */
+const HOST_UPDATE_COMMANDS: Record<string, readonly string[]> = {
+  // The isaac wrapper rebuilds its omnigent runtime on any invocation, so the
+  // restart is the update.
+  isaac: ["isaac omni host stop", "isaac omni host"],
+  // Arca boxes run the host as a user service whose ExecStartPre upgrades it.
+  arca: ["systemctl --user restart omnigent-host.service"],
+  // Wheel installs: `omnigent upgrade` stops the host but does not restart it.
+  uv: ["omnigent upgrade", "omnigent host"],
+  pipx: ["omnigent upgrade", "omnigent host"],
+  pip: ["omnigent upgrade", "omnigent host"],
+};
+
+function hostOutdatedDismissKey(host: Host): string {
+  return `omnigent:host-outdated-dismissed:${host.host_id}:${host.version}`;
+}
+
+function readDismissed(key: string): boolean {
+  try {
+    return window.localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeDismissed(key: string): void {
+  try {
+    window.localStorage.setItem(key, "1");
+  } catch {
+    /* storage unavailable — the in-memory dismissal still holds for this mount */
+  }
+}
+
+/**
+ * Amber banner that the session's host runs an older omnigent than the server.
+ * The install on the host machine upgrades in place while the running host
+ * daemon keeps its old code, and nothing restarts it, so the user has to act;
+ * the wording comes from the host's `distribution` (see HOST_UPDATE_COMMANDS).
+ * Restarting stops every session on that host, so the banner is dismissable
+ * and stays dismissed for that host and version. Renders as a card; the caller
+ * floats it (see the notice column in Transcript).
+ */
+export function HostOutdatedNotice({ host }: { host: Host | null }) {
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null);
+  if (!host?.outdated || !host.version) return null;
+  const key = hostOutdatedDismissKey(host);
+  if (dismissedKey === key || readDismissed(key)) return null;
+  const commands = host.distribution ? HOST_UPDATE_COMMANDS[host.distribution] : undefined;
+  const dismiss = () => {
+    writeDismissed(key);
+    setDismissedKey(key);
+  };
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      data-testid="host-outdated-notice"
+      className={cn(
+        "pointer-events-auto flex max-w-2xl items-center gap-2.5 rounded-xl px-3.5 py-2 text-ui shadow-lg",
+        "border border-amber-300 bg-amber-100 text-amber-900",
+        "dark:border-amber-700/60 dark:bg-amber-950 dark:text-amber-100",
+        "animate-in fade-in-0 slide-in-from-top-1 duration-200",
+      )}
+    >
+      <AlertTriangleIcon className="size-4 shrink-0" aria-hidden="true" />
+      <span className="min-w-0 flex-1">
+        Host <span className="font-medium">{host.name}</span> is outdated ({host.version}).{" "}
+        {commands ? (
+          <>
+            To update, run{" "}
+            {commands.map((command, index) => (
+              <Fragment key={command}>
+                {index > 0 && " then "}
+                <code className="rounded bg-amber-200/70 px-1 py-0.5 font-mono text-[0.9em] dark:bg-amber-900/70">
+                  {command}
+                </code>
+              </Fragment>
+            ))}
+            .
+          </>
+        ) : (
+          "Restart it to update."
+        )}
+      </span>
+      <button
+        type="button"
+        onClick={dismiss}
+        aria-label="Dismiss"
+        data-testid="host-outdated-dismiss"
+        className={cn(
+          "-mr-1 shrink-0 rounded p-0.5 text-amber-900/60 hover:bg-amber-200 hover:text-amber-900",
+          "dark:text-amber-100/60 dark:hover:bg-amber-900 dark:hover:text-amber-100",
+        )}
+      >
+        <XIcon className="size-4" aria-hidden="true" />
+      </button>
+    </div>
   );
 }

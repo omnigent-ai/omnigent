@@ -2728,6 +2728,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
     host_id = raw.get("host_id")
     resolved_server_url = raw.get("resolved_server_url")
     config_sig = raw.get("config_sig")
+    version = raw.get("version")
     return _HostDaemonRecord(
         pid=pid,
         target=target,
@@ -2742,6 +2743,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
             else None
         ),
         config_sig=config_sig if isinstance(config_sig, str) and config_sig else None,
+        version=version if isinstance(version, str) and version else None,
     )
 
 
@@ -3358,6 +3360,41 @@ def _load_or_create_host_id() -> str | None:
         return None
 
 
+def _warn_if_host_daemon_outdated(target: str, server_url: str | None) -> None:
+    """
+    Print a restart hint when the reused host daemon runs an older omnigent.
+
+    An upgrade rewrites the install on disk while the running daemon keeps the
+    version it imported, and nothing restarts it. The restart stops that host's
+    runners, so the hint leaves the timing to the user.
+
+    :param target: Normalized daemon target, e.g. ``"local"`` or a server URL.
+    :param server_url: The ``--server`` value as spelled, or ``None`` in local mode.
+    :returns: None.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    from omnigent.version import VERSION
+
+    record = _find_daemon_record(target)
+    if record is None or not record.version or record.version == VERSION:
+        return
+    try:
+        if Version(record.version) >= Version(VERSION):
+            return
+    except InvalidVersion:
+        return
+    start_command = f"{cli_invocation()} host"
+    if server_url:
+        start_command = f"{start_command} --server {server_url}"
+    click.echo(
+        f"Omnigent was updated ({record.version} -> {VERSION}) but the running host still "
+        "uses the old version. When you are between tasks, restart it: "
+        f"`{_host_stop_command(server_url)}` then `{start_command}`",
+        err=True,
+    )
+
+
 def _ensure_host_daemon(server_url: str | None) -> bool:
     """Start or reuse a host daemon for one target.
 
@@ -3373,6 +3410,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     target = _normalize_daemon_target(server_url)
     decision = _reuse_existing_daemon_record(target)
     if decision.reuse:
+        _warn_if_host_daemon_outdated(target, server_url)
         return False
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
         return False

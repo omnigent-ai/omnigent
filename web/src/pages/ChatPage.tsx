@@ -200,7 +200,7 @@ import {
   hostBacksHarnessWithGateway,
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
-import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { type Host, useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
@@ -1089,6 +1089,7 @@ export function ChatPage() {
       showsWorking={showsWorking}
       runnerOnline={runnerOnline}
       liveness={liveness}
+      sessionHost={sessionHost}
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
       onSend={onSend}
@@ -1322,6 +1323,8 @@ interface MainAgentSurfaceProps {
   runnerOnline: boolean | undefined;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
   liveness: SessionLiveness;
+  /** The session's host row, for the outdated-host banner; null when unbound or unknown. */
+  sessionHost: Host | null;
   agentsError: unknown;
   disabled: boolean;
   onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
@@ -1481,6 +1484,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   showsWorking,
   runnerOnline,
   liveness,
+  sessionHost,
   agentsError,
   disabled,
   onSend,
@@ -1769,6 +1773,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             sandboxLaunching={sandboxLaunching}
             terminalFirst={terminalFirst}
             spacerMeasureRef={spacerMeasureRef}
+            host={sessionHost}
           />
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
