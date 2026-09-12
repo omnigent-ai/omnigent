@@ -11,10 +11,16 @@
 "use strict";
 
 const { net } = require("electron");
-const { databricksOAuthConfigured, getValidAccessToken } = require("./databricks-oauth");
+const {
+  databricksOAuthConfigured,
+  getValidAccessToken,
+  isTrustedDatabricksOrigin,
+} = require("./databricks-oauth");
 const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
 
 const SESSION_CREATE_PATH = "/auth/session/create";
+// Bound on the session-create request so a stalled socket can't hang connect.
+const NETWORK_TIMEOUT_MS = 20_000;
 
 /**
  * Ensure ``ses`` holds a live DBAUTH cookie for ``origin``: get (or refresh, or
@@ -61,6 +67,13 @@ async function ensureDatabricksSession(
     console.log(`[omnigent] databricks session: bridging to workspace ${bridgeOrigin}`);
   }
 
+  // Never send the bearer to a non-Databricks host. bridgeOrigin is either the
+  // token issuer (already validated) or a workspace FQDN from the account API
+  // (validated here) — gate it before the session-create call carries the token.
+  if (!isTrustedDatabricksOrigin(bridgeOrigin)) {
+    throw new Error(`refusing to send credentials to untrusted workspace origin: ${bridgeOrigin}`);
+  }
+
   await mintSessionCookie(ses, bridgeOrigin, accessToken, nextPath);
   return bridgeOrigin;
 }
@@ -81,14 +94,27 @@ async function mintSessionCookie(ses, origin, accessToken, nextPath) {
     // (committing DBAUTH into the jar) before landing on next_url.
     const request = net.request({ method: "GET", url, session: ses, useSessionCookies: true });
     request.setHeader("Authorization", `Bearer ${accessToken}`);
+    const timer = setTimeout(() => request.abort(), NETWORK_TIMEOUT_MS);
     request.on("response", (response) => {
       response.on("data", () => {});
-      response.on("end", () => resolve(response.statusCode));
+      response.on("end", () => {
+        clearTimeout(timer);
+        resolve(response.statusCode);
+      });
     });
-    request.on("error", reject);
+    request.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
     request.end();
   });
 
+  // A successful bridge follows the 302 to next_url and ends < 400. An error
+  // (e.g. 401/403 when the endpoint isn't enabled for this account) ends >= 400
+  // and must NOT be reported as success just because a stale DBAUTH lingers.
+  if (status >= 400) {
+    throw new Error(`${SESSION_CREATE_PATH} returned HTTP ${status}`);
+  }
   const jar = await ses.cookies.get({ url: origin, name: "DBAUTH" });
   if (jar.length === 0) {
     throw new Error(

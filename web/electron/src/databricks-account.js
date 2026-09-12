@@ -7,6 +7,11 @@
 
 "use strict";
 
+const { isTrustedDatabricksOrigin } = require("./databricks-oauth");
+
+// Bound on the account-workspaces lookup so a stalled socket can't hang connect.
+const NETWORK_TIMEOUT_MS = 20_000;
+
 /** Decode a JWT's `iss` claim. No verification — the server verifies on use;
  * we read only the public issuer to route the follow-up account API call. */
 function decodeJwtIssuer(token) {
@@ -47,9 +52,17 @@ function parseAccountFromToken(accessToken) {
  * @returns {Promise<Array<{ workspaceId: string, name: string, fqdn: string }>>}
  */
 async function listRunningWorkspaces(account, accessToken) {
+  // Never send the bearer to a non-Databricks host. accountOrigin comes from the
+  // token's own `iss`, but that claim isn't verified here, so gate it.
+  if (!isTrustedDatabricksOrigin(account.accountOrigin)) {
+    throw new Error(
+      `refusing to send credentials to untrusted account origin: ${account.accountOrigin}`,
+    );
+  }
   const url = `${account.accountOrigin}/api/2.0/accounts/${account.accountId}/workspaces`;
   const resp = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");

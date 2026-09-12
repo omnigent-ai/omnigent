@@ -37,8 +37,22 @@ const DEFAULT_SCOPES = "all-apis offline_access";
 const OAUTH_CLIENT_ID = (process.env.OMNIGENT_DATABRICKS_OAUTH_CLIENT_ID || "omnigent").trim();
 // Bound on how long we wait for the human to finish logging in in the browser.
 const AUTH_TIMEOUT_MS = 300_000;
+// Per-request network timeout for the token endpoint (and other back-channel
+// calls) so a stalled socket can't hang the awaited connect flow.
+const NETWORK_TIMEOUT_MS = 20_000;
 // Renew a little before real expiry so a mint isn't racing the clock.
 const EXPIRY_SKEW_SECONDS = 60;
+
+/** True for an http(s) URL bound to a loopback host (localhost / 127.0.0.1 / ::1). */
+function isLoopbackUrl(rawUrl) {
+  try {
+    const { protocol, hostname } = new URL(rawUrl);
+    const host = hostname.replace(/^\[|\]$/g, "");
+    return protocol === "http:" && (host === "localhost" || host === "127.0.0.1" || host === "::1");
+  } catch {
+    return false;
+  }
+}
 
 // Hostname suffixes that mark a trusted Databricks origin. The leading dot stops
 // look-alikes (evil-databricks.com, databricks.com.attacker.net) from matching.
@@ -160,6 +174,7 @@ async function postToken(origin, body) {
       Accept: "application/json",
     },
     body: body.toString(),
+    signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
   });
   const text = await resp.text();
   if (!resp.ok) {
@@ -213,6 +228,14 @@ async function refreshTokens(origin, refreshToken) {
 
 async function runInteractiveLogin(origin) {
   const { redirectBase, scopes } = config();
+  // The redirect (and thus the local listener) must be loopback-only — never a
+  // wildcard/public bind like http://0.0.0.0, and never a non-http scheme the
+  // server can't serve. RFC 8252 §7.3.
+  if (!isLoopbackUrl(redirectBase)) {
+    throw new Error(
+      `OMNIGENT_DATABRICKS_OAUTH_REDIRECT must be an http loopback URL, got: ${redirectBase}`,
+    );
+  }
   const { verifier, challenge } = makePkce();
   const state = base64url(crypto.randomBytes(24));
   const base = new URL(redirectBase);
@@ -294,8 +317,15 @@ async function runInteractiveLogin(origin) {
       // workspace-scoped token; an account/SPOG host issues an account-scoped one
       // (the workspace is chosen afterward from the account workspaces API).
       const authorizeUrl = `${origin}/oidc/v1/authorize?${authQuery}`;
-      void shell.openExternal(authorizeUrl);
-      console.log("[omnigent] databricks oauth: opened system browser for sign-in");
+      shell.openExternal(authorizeUrl).then(
+        () => console.log("[omnigent] databricks oauth: opened system browser for sign-in"),
+        (e) => {
+          // Can't hand off to the browser — fail fast instead of waiting out the
+          // auth timeout with a window the user can't complete.
+          cleanup();
+          reject(new Error(`could not open the system browser: ${e.message}`));
+        },
+      );
     });
   });
 
@@ -357,4 +387,5 @@ module.exports = {
   runInteractiveLogin,
   refreshTokens,
   loadTokens,
+  isTrustedDatabricksOrigin,
 };

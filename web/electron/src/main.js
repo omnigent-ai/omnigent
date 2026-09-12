@@ -2502,6 +2502,29 @@ const WORKSPACE_PICKER_PAGE = path.join(__dirname, "..", "workspace-picker", "in
  * @param {Array<{workspaceId: string, name: string, fqdn: string}>} workspaces
  * @returns {Promise<{workspaceId: string, name: string, fqdn: string} | null>}
  */
+// In-flight workspace pickers, keyed by their window's webContents id. The IPC
+// handlers (registered once, in registerWorkspacePickerIpc) dispatch on
+// event.sender.id, so concurrent pickers don't collide and a foreign renderer
+// (not a picker window) is ignored — it isn't in this map.
+const workspacePickers = new Map();
+
+/** Register the workspace-picker IPC once. Handlers look the sender up in
+ * workspacePickers, so only the picker that owns a webContents can read its
+ * list or resolve it. */
+function registerWorkspacePickerIpc() {
+  ipcMain.handle(
+    "workspacePicker:list",
+    (event) => workspacePickers.get(event.sender.id)?.workspaces ?? [],
+  );
+  ipcMain.on("workspacePicker:choose", (event, workspaceId) => {
+    const entry = workspacePickers.get(event.sender.id);
+    if (entry) entry.finish(entry.workspaces.find((w) => w.workspaceId === workspaceId) ?? null);
+  });
+  ipcMain.on("workspacePicker:cancel", (event) =>
+    workspacePickers.get(event.sender.id)?.finish(null),
+  );
+}
+
 function pickWorkspaceForBridge(parent, workspaces) {
   return new Promise((resolve) => {
     const picker = new BrowserWindow({
@@ -2520,28 +2543,16 @@ function pickWorkspaceForBridge(parent, workspaces) {
       },
     });
 
+    const id = picker.webContents.id;
     let settled = false;
-    const provideList = () => workspaces;
-    const onChoose = (_event, workspaceId) =>
-      finish(workspaces.find((w) => w.workspaceId === workspaceId) ?? null);
-    const onCancel = () => finish(null);
-
-    function cleanup() {
-      ipcMain.removeHandler("workspacePicker:list");
-      ipcMain.removeListener("workspacePicker:choose", onChoose);
-      ipcMain.removeListener("workspacePicker:cancel", onCancel);
-    }
-    function finish(value) {
+    const finish = (value) => {
       if (settled) return;
       settled = true;
-      cleanup();
+      workspacePickers.delete(id);
       if (!picker.isDestroyed()) picker.close();
       resolve(value);
-    }
-
-    ipcMain.handle("workspacePicker:list", provideList);
-    ipcMain.on("workspacePicker:choose", onChoose);
-    ipcMain.on("workspacePicker:cancel", onCancel);
+    };
+    workspacePickers.set(id, { workspaces, finish });
     // A closed window (user hit the OS close button) resolves as cancelled.
     picker.on("closed", () => finish(null));
 
@@ -2553,6 +2564,7 @@ function pickWorkspaceForBridge(parent, workspaces) {
 }
 
 function registerIpc() {
+  registerWorkspacePickerIpc();
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
