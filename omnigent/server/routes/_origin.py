@@ -23,8 +23,10 @@ WebSocket share exactly one trust boundary:
   ``"omnigent://internal"``) and any origin in
   ``OMNIGENT_WS_ALLOWED_ORIGINS`` pass;
 - in single-user **local mode** (no cookie / proxy auth) a present
-  ``Origin`` must be a loopback host — this is where the guard actually
-  bites, since that deployment has no other CSRF defense;
+  ``Origin`` must be a loopback host, or explicitly allowlisted via
+  ``OMNIGENT_WS_ALLOWED_ORIGINS`` (e.g. for a mobile/LAN WebView origin such
+  as Android emulator ``http://10.0.2.2:8000``) — this is where the guard
+  actually bites, since that deployment has no other CSRF defense;
 - in authenticated (cookie / proxy) modes a present ``Origin`` passes
   unless an explicit allowlist is configured.
 
