@@ -154,6 +154,15 @@ HERMES_KEY = "hermes"
 
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
+# Devin (Cognition) ships via a curl installer rather than npm and authenticates
+# through its own ``devin auth login``, which writes a credential file it reads
+# back at spawn — Omnigent stores no Devin credential. ``devin auth status``
+# exits 0 only while logged in, giving the same revocation-aware status probe
+# Codex gets from ``codex login status``.
+DEVIN_KEY = "devin"
+
+_DEVIN_INSTALL_HINT = "curl -fsSL https://cli.devin.ai/install.sh | bash"
+
 # Anthropic recommends its native installer over ``npm install -g``: it writes
 # to a user-writable ``~/.local/bin`` and self-updates, so it sidesteps the
 # EACCES failure on a root-owned npm global prefix.
@@ -312,6 +321,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
         min_version=_HERMES_MIN_VERSION,
     ),
+    DEVIN_KEY: HarnessInstallSpec(
+        "Devin",
+        "devin",
+        package=None,
+        login_args=("auth", "login"),
+        status_args=("auth", "status"),
+        install_hint=_DEVIN_INSTALL_HINT,
+        install_command=("bash", "-c", _DEVIN_INSTALL_HINT),
+        auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
+    ),
 }
 
 
@@ -377,6 +396,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # Native Devin TUI (``devin-native``, via ``omni devin``) wraps the ``devin``
+    # CLI; ``native-devin`` gates on the same binary. The bare ``devin`` spelling
+    # canonicalizes to ``devin-native``, so it lands here too, and the ACP row
+    # (``devin-acp``) gates on the same binary through the catalog.
+    "devin-native": DEVIN_KEY,
+    "native-devin": DEVIN_KEY,
 }
 
 

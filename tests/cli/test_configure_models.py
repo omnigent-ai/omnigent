@@ -1744,9 +1744,13 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Antigravity",
         "Qwen Code",
         "Goose",
-        # Builtin ACP CLI rows (ACP_CLI_HARNESSES) render after Goose, the other
-        # ACP-family builtin, sorted by id, before the non-ACP harnesses.
+        # Devin's NATIVE row (devin-native) renders in the slot its former builtin
+        # ACP row held, so this ordering is unchanged by that migration. Its ACP
+        # harness is still shipped, now labelled "Devin (ACP)", and joins the
+        # builtin ACP CLI rows (ACP_CLI_HARNESSES) that follow — sorted by id,
+        # before the non-ACP harnesses.
         "Devin",
+        "Devin (ACP)",
         "Grok Build",
         "Jcode",
         "Copilot",
@@ -1811,35 +1815,41 @@ def test_overview_shows_one_row_when_acp_agent_shadows_builtin(
 ) -> None:
     """A configured agent named after a builtin ACP row replaces it, not doubles it.
 
-    "Devin" slugifies to ``devin``, which is also an ``ACP_CLI_HARNESSES`` id, so
+    "Grok" slugifies to ``grok``, which is also an ``ACP_CLI_HARNESSES`` id, so
     both sources want a row. The configured one wins — it names the exact command,
     which the fixed row argv cannot express — and the builtin is dropped so the
-    list never shows two identically labeled "Devin" rows from different sources.
+    list never shows two identically labeled rows from different sources.
+
+    Devin is the contrast: its ACP row is keyed ``devin-acp`` and the bare
+    ``devin`` spelling belongs to the native wrap, so a configured ``acp:devin``
+    agent adds its own row rather than shadowing either.
     """
     from rich.text import Text
 
     config_path = os.path.join(isolated_config, "config.yaml")
     with open(config_path, "w") as f:
         yaml.safe_dump(
-            {
-                "acp": {
-                    "agents": [{"name": "Devin", "command": "devin acp --model swe-1-7-medium"}]
-                }
-            },
+            {"acp": {"agents": [{"name": "Grok", "command": "grok agent stdio --verbose"}]}},
             f,
         )
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
     names = _overview_row_names(options, selectable)
-    assert names.count("Devin") == 1, f"expected exactly one Devin row, got {names}"
-    # A non-colliding builtin row is untouched.
-    assert "Grok Build" in names
+    assert names.count("Grok") == 1, f"expected exactly one Grok row, got {names}"
+    # The builtin row it shadowed is gone: the ``grok`` row's own label is
+    # "Grok Build", so its absence proves the row was dropped rather than
+    # rendered alongside the user's.
+    assert "Grok Build" not in names, f"builtin grok row should be shadowed, got {names}"
+    # Devin is unaffected by a collision elsewhere: its native row and its
+    # separately-keyed ACP row both stay.
+    assert names.count("Devin") == 1, f"expected the native Devin row, got {names}"
+    assert "Devin (ACP)" in names
     # The surviving row is the user's: its status carries the configured command,
     # not the builtin's "own auth" label.
     # (the status is width-capped, so match its head rather than the full command)
-    devin_row = next(o for o in options if Text.from_markup(o).plain.startswith("Devin "))
-    assert "ACP · devin acp" in Text.from_markup(devin_row).plain
+    grok_row = next(o for o in options if Text.from_markup(o).plain.startswith("Grok "))
+    assert "ACP · grok agent" in Text.from_markup(grok_row).plain
 
 
 def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
@@ -1912,7 +1922,7 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["16", "", "", "q"]) + "\n"
+    stdin = "\n".join(["17", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1934,7 +1944,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1951,7 +1961,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2142,16 +2152,18 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("5", "_manage_hermes_harness"),
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
-        # 10-12 are the builtin ACP CLI rows (Devin, Grok Build, Jcode;
-        # sorted by id) every row after them shifted down by three when the
-        # jcode row landed.
-        ("10", "_show_acp_cli_harness"),
+        # 10 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
+        # row used to hold. 11-13 are the builtin ACP CLI rows (Devin (ACP),
+        # Grok Build, Jcode; sorted by id), so every row after them sits one
+        # lower than before devin-native landed.
+        ("10", "_manage_devin_harness"),
         ("11", "_show_acp_cli_harness"),
         ("12", "_show_acp_cli_harness"),
-        ("13", "_manage_copilot_harness"),
-        ("14", "_manage_kiro_harness"),
-        ("15", "_manage_kimi_harness"),
-        ("17", "_add_acp_agent"),
+        ("13", "_show_acp_cli_harness"),
+        ("14", "_manage_copilot_harness"),
+        ("15", "_manage_kiro_harness"),
+        ("16", "_manage_kimi_harness"),
+        ("18", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(

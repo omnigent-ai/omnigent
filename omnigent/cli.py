@@ -1699,6 +1699,7 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "codex",
         "cursor",
         "debby",
+        "devin",
         "goose",
         "hermes",
         "kimi",
@@ -2044,6 +2045,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "cursor",
         "debby",
         "debug",
+        "devin",
         "diagnose",
         "doctor",
         "extensions",
@@ -7380,6 +7382,13 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         module="omnigent.harnesses.kimi_native.main",
         function="run_kimi_native",
         args_param="extra_args",
+    ),
+    "devin": _NativeTerminalDispatchSpec(
+        module="omnigent.harnesses.devin_native.main",
+        function="run_devin_native",
+        args_param="extra_args",
+        model_strategy="first_class",
+        prompt_param="prompt",
     ),
     "kiro": _NativeTerminalDispatchSpec(
         module="omnigent.harnesses.kiro_native.main",
@@ -12941,6 +12950,22 @@ def _bundled_brain_fallback_applies(run_args: tuple[str, ...]) -> bool:
     if isinstance(configured, str) and configured and not _is_local_server_request(configured):
         return False
     return True
+
+
+def _reject_reserved_devin_resume_args(devin_args: tuple[str, ...]) -> None:
+    """Reject Devin-owned resume/session flags in passthrough args.
+
+    Omnigent owns resume: it maps a conversation id to Devin's own session id
+    and passes ``--resume <devin_session_id>`` itself, so a user-supplied
+    ``--resume``/``-c`` would fight it and reattach the wrong session. Same for
+    ``--config``/``--export``, which carry the Omnigent hook wiring.
+    """
+    reserved = {"--resume", "-r", "--continue", "-c", "--config", "--export"}
+    if any(arg == flag or arg.startswith(f"{flag}=") for arg in devin_args for flag in reserved):
+        raise click.UsageError(
+            "Devin resume/config flags are reserved for Omnigent handling; use "
+            "`omnigent devin --resume [CONVERSATION]` instead."
+        )
 
 
 def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:

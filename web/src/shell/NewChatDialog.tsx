@@ -298,6 +298,7 @@ function createdHarnessOptions({
   supportsApprovalMode,
   supportsCursorMode,
   supportsAgySkipPermissions,
+  supportsDevinMode,
   supportsModelPicker,
   supportsEffortPicker,
   permissionMode,
@@ -315,6 +316,7 @@ function createdHarnessOptions({
   supportsApprovalMode: boolean;
   supportsCursorMode: boolean;
   supportsAgySkipPermissions: boolean;
+  supportsDevinMode: boolean;
   supportsModelPicker: boolean;
   supportsEffortPicker: boolean;
   permissionMode: string;
@@ -341,6 +343,12 @@ function createdHarnessOptions({
     options.mode = cursorExecMode;
   } else if (supportsAgySkipPermissions) {
     options.mode = agySkipMode;
+  } else if (supportsDevinMode) {
+    // Model + effort only: Devin's permission mode is not a session field (the
+    // server gates permission_mode to claude-native), so there is no `mode` to
+    // remember here.
+    options.model = pickedModel;
+    options.effort = pickedEffort;
   }
 
   if (smartRoutingEligible) {
@@ -2437,6 +2445,11 @@ export function NewChatLandingScreen() {
     "pi-native",
     !sandboxSelected,
   );
+  const {
+    data: hostDevinModelOptions,
+    isLoading: hostDevinModelsLoading,
+    error: hostDevinModelsError,
+  } = useHostModelOptions(selectedHostId, "devin-native", !sandboxSelected);
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -2458,6 +2471,14 @@ export function NewChatLandingScreen() {
   const codexModelOptions = useMemo(
     () => (sandboxSelected ? [] : (hostCodexModelOptions ?? [])),
     [hostCodexModelOptions, sandboxSelected],
+  );
+  // Devin model *families* (claude-opus-5, swe-2, …). Effort is a separate
+  // axis Omnigent carries as reasoning_effort and the runner recombines onto
+  // the id at launch (resolve_devin_launch_model), so the list stays short
+  // instead of enumerating every effort variant.
+  const devinModelOptions = useMemo(
+    () => (sandboxSelected ? [] : (hostDevinModelOptions ?? [])),
+    [hostDevinModelOptions, sandboxSelected],
   );
   const piModelOptions = useMemo(
     () =>
@@ -3093,6 +3114,7 @@ export function NewChatLandingScreen() {
   );
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
+  const supportsDevinMode = nativeAgentHasCapability(selectedAgent, "devinMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
@@ -3307,11 +3329,13 @@ export function NewChatLandingScreen() {
   );
   const pickerModelOptions: readonly NativeModelOption[] = supportsPermissionMode
     ? claudeModelOptions
-    : selectedNativeHarness === "pi-native"
-      ? piModelOptions
-      : selectedNativeHarness === "codex-native"
-        ? codexModelOptions
-        : [];
+    : selectedNativeHarness === "devin-native"
+      ? devinModelOptions
+      : selectedNativeHarness === "pi-native"
+        ? piModelOptions
+        : selectedNativeHarness === "codex-native"
+          ? codexModelOptions
+          : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     !sandboxSelected &&
@@ -3322,13 +3346,17 @@ export function NewChatLandingScreen() {
         ? hostCodexModelsLoading
         : selectedNativeHarness === "pi-native"
           ? hostPiModelsLoading
-          : false);
+          : selectedNativeHarness === "devin-native"
+            ? hostDevinModelsLoading
+            : false);
   const pickerModelsError =
     selectedNativeHarness === "claude-native"
       ? hostClaudeModelsError
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
-        : null;
+        : selectedNativeHarness === "devin-native"
+          ? hostDevinModelsError
+          : null;
   useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
@@ -3504,7 +3532,9 @@ export function NewChatLandingScreen() {
             ? codexModelOptions
             : native.iconKind === "pi"
               ? piModelOptions
-              : [];
+              : native.iconKind === "devin"
+                ? devinModelOptions
+                : [];
       const model = catalog.find((option) => option.id === saved.model);
       const label = visibleModelLabel(model ? nativeModelLabel(model) : defaultModelLabel(catalog));
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
@@ -3582,9 +3612,11 @@ export function NewChatLandingScreen() {
       ? piModelOptions
       : selectedNativeHarness === "claude-native"
         ? claudeModelOptions
-        : selectedNativeHarness === "codex-native"
-          ? codexModelOptions
-          : [];
+        : selectedNativeHarness === "devin-native"
+          ? devinModelOptions
+          : selectedNativeHarness === "codex-native"
+            ? codexModelOptions
+            : [];
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
@@ -4918,6 +4950,7 @@ export function NewChatLandingScreen() {
         const launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
           supportsPermissionMode: agentSupportsPermissionMode,
+          supportsDevinMode,
           supportsApprovalMode: agentSupportsApprovalMode,
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,

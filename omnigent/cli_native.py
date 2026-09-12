@@ -36,6 +36,11 @@ from omnigent.cli_common import (
     reject_native_on_windows as _reject_native_on_windows,
 )
 
+# Decorator-time vocabulary for ``omnigent devin``'s ``click.Choice`` options.
+# Sourced from the stdlib-only bridge leaf, so importing it here adds no
+# launcher/runner imports to CLI startup.
+from omnigent.harnesses.devin_native.bridge import DEVIN_EFFORTS, DEVIN_PERMISSION_MODES
+
 _Args = ParamSpec("_Args")
 _Return = TypeVar("_Return")
 
@@ -69,6 +74,9 @@ def register_native_commands(cli: click.Group) -> None:
     _ensure_backend = _late_bound(lambda: _cli._ensure_backend)
     _load_effective_config = _late_bound(lambda: _cli._load_effective_config)
     _reject_reserved_kiro_resume_args = _late_bound(lambda: _cli._reject_reserved_kiro_resume_args)
+    _reject_reserved_devin_resume_args = _late_bound(
+        lambda: _cli._reject_reserved_devin_resume_args
+    )
     _resolve_auto_open_conversation_from_config = _late_bound(
         lambda: _cli._resolve_auto_open_conversation_from_config
     )
@@ -753,6 +761,145 @@ def register_native_commands(cli: click.Group) -> None:
             model=model,
             auto_open_conversation=auto_open_conversation,
             mode=mode,
+        )
+
+    @cli.command(
+        context_settings={
+            "ignore_unknown_options": True,
+            "allow_extra_args": True,
+        }
+    )
+    @click.option(
+        "--server",
+        default=None,
+        help=(
+            "Remote omnigent URL. Ensures the host daemon, asks the "
+            "daemon-spawned runner to launch the Devin TUI, and attaches this TTY. "
+            'Pass --server "" to auto-spawn a persistent local server in the '
+            "background and use that instead of a remote one."
+        ),
+    )
+    @click.option(
+        "-r",
+        "--resume",
+        "resume",
+        is_flag=False,
+        flag_value=_RESUME_PICKER_SENTINEL,
+        default=None,
+        help=(
+            "Resume a prior Omnigent conversation. With a conversation id "
+            "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+            "opens an interactive picker scoped to devin-native sessions."
+        ),
+    )
+    @click.option(
+        "--session",
+        "session_id",
+        metavar="SESSION_ID",
+        default=None,
+        hidden=True,
+        help="Deprecated alias for ``--resume <id>``; kept for one release.",
+    )
+    @click.option(
+        "--model",
+        default=None,
+        help=(
+            "Devin model for the native chat — any family slug or alias from "
+            "`devin models list` (e.g. ``opus``, ``gpt``, ``swe``). Combined with "
+            "--effort into Devin's variant id."
+        ),
+    )
+    @click.option(
+        "--effort",
+        default=None,
+        type=click.Choice(DEVIN_EFFORTS),
+        help=(
+            "Reasoning effort. Devin encodes effort as a model-variant suffix, so "
+            "this is composed onto --model (family + rung) rather than sent as its "
+            "own flag. Ignored when the chosen family has no such rung."
+        ),
+    )
+    @click.option(
+        "--permission-mode",
+        "permission_mode",
+        default=None,
+        type=click.Choice(DEVIN_PERMISSION_MODES),
+        help="Devin permission mode for this launch.",
+    )
+    @click.option(
+        "--sandbox",
+        is_flag=True,
+        default=False,
+        help="Enable Devin's OS-level process sandbox for its exec tool.",
+    )
+    @click.option(
+        "-p",
+        "--prompt",
+        default=None,
+        help="Send this as the initial Devin chat input when the TUI starts.",
+    )
+    @click.argument("devin_args", nargs=-1, type=click.UNPROCESSED)
+    def devin(
+        server: str | None,
+        resume: str | None,
+        session_id: str | None,
+        model: str | None,
+        effort: str | None,
+        permission_mode: str | None,
+        sandbox: bool,
+        prompt: str | None,
+        devin_args: tuple[str, ...],
+    ) -> None:
+        """Launch Devin with Omnigent.
+
+        \b
+        Examples:
+          omnigent devin
+          omnigent devin --resume conv_abc123
+          omnigent devin --resume                       # interactive picker
+          omnigent devin --model opus --effort xhigh
+          omnigent devin --permission-mode smart -p "review this repo"
+        """
+        choice = _split_resume_value(resume)
+        if session_id is not None and (choice.picker or choice.conversation_id is not None):
+            raise click.UsageError(
+                "--session and --resume are mutually exclusive; "
+                "prefer --resume (--session is deprecated).",
+            )
+        _reject_reserved_devin_resume_args(devin_args)
+
+        from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.devin_native.main import run_devin_native
+
+        cfg = _load_effective_config()
+        # Thread ``--command`` / ``harness.devin-native.command`` config into the
+        # runner via the canonical ``OMNIGENT_DEVIN_PATH`` env var (set before
+        # ``_ensure_backend`` so a locally-spawned daemon inherits it).
+        _resolved = resolve_harness_command("devin-native", default="", explicit=None, cfg=cfg)
+        if _resolved:
+            os.environ["OMNIGENT_DEVIN_PATH"] = _resolved
+        if server is None:
+            server = cfg.get("server")
+        if model is None:
+            model = cfg.get("model")
+        auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+        server = _ensure_backend(server)
+        resolved_session_id = (
+            choice.conversation_id if choice.conversation_id is not None else session_id
+        )
+
+        run_devin_native(
+            server=server,
+            session_id=resolved_session_id,
+            resume_picker=choice.picker,
+            extra_args=_resolve_harness_startup_args(cfg, "devin-native", devin_args),
+            model=model,
+            effort=effort,
+            permission_mode=permission_mode,
+            sandbox=sandbox,
+            prompt=prompt,
+            auto_open_conversation=auto_open_conversation,
         )
 
     @cli.command(

@@ -46,9 +46,15 @@ export type NativeCodingAgentIconKind =
   | "qwen"
   | "antigravity"
   | "kimi"
-  | "hermes";
+  | "hermes"
+  | "devin";
 export type NativeCodingAgentCapability =
-  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
+  | "permissionMode"
+  | "approvalMode"
+  | "cursorMode"
+  | "skipPermissions"
+  | "modelPicker"
+  | "devinMode";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -118,6 +124,30 @@ export const NATIVE_CODING_AGENTS = [
     // `approvalMode`, whose `--sandbox`/`--ask-for-approval` presets aren't
     // understood by `opencode attach` and crashed the TUI on any non-default
     // pick.)
+  },
+  {
+    // Devin's native TUI (Cognition). Added ALONGSIDE Devin's ACP harness
+    // (`devin-acp`, see omnigent/inner/devin) — they are distinct rows, and only
+    // the ACP one surfaces Devin's sub-agents as child sessions today. The bare
+    // `devin` harness spelling resolves to this native wrap.
+    //
+    // `devinMode` owns Devin's own Model + Effort rows. It is deliberately the
+    // ONLY capability here:
+    //   * `permissionMode` would render Claude's vocabulary AND the server
+    //     hard-gates `permission_mode` to claude-native agents
+    //     (_PERMISSION_MODE_HARNESS in routes/_session_create_validation.py),
+    //     so a Devin session created with one is rejected 4xx. Devin's
+    //     `--permission-mode` stays reachable via `omnigent devin`.
+    //   * `modelPicker` would render pi's model list.
+    key: "devin",
+    agentName: "devin-native-ui",
+    harness: "devin-native",
+    wrapperLabel: "devin-native-ui",
+    displayName: "Devin",
+    iconKind: "devin",
+    sortRank: 28,
+    capabilities: ["devinMode"],
+    fullySupported: true,
   },
   {
     key: "cursor",

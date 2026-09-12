@@ -164,6 +164,9 @@ export function RoutingModelSelect({
 // picker's `null` state uses. Mirrors ANTHROPIC_EFFORTS server-side. Lives here
 // (a leaf module, no heavy imports) so both NewChatDialog and the scheduled-task
 // dialog can share the single source of truth.
+// Also Devin's ladder: Devin encodes effort as a model-variant suffix
+// (`<family>-<rung>`) over exactly this rung set, so devin-native shares this
+// list rather than duplicating it.
 export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },

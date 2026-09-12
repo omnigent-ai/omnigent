@@ -65,6 +65,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
+    DEVIN_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
     HERMES_NATIVE_TERMINAL_ROLE,
     KIMI_NATIVE_TERMINAL_ROLE,
@@ -3333,6 +3334,147 @@ async def _auto_create_kiro_terminal(
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
         "Auto-created kiro terminal + forwarder/permission-mirror for session %s; task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
+async def _auto_create_devin_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
+) -> SessionResourceView:
+    """Auto-create the Devin TUI terminal for a devin-native session.
+
+    Writes the session-scoped Devin config (which registers Omnigent's
+    lifecycle hooks and so is what makes policy, elicitation and the transcript
+    mirror work), launches the TUI in a runner-owned tmux pane, then starts the
+    hook forwarder.
+    """
+    from omnigent.harnesses.devin_native.bridge import (
+        DEVIN_NATIVE_ENV_UNSET,
+        build_devin_native_terminal_env,
+        export_path,
+        prepare_bridge_dir,
+        session_config_path,
+        write_hook_wrapper,
+        write_tmux_target,
+    )
+    from omnigent.harnesses.devin_native.main import build_devin_launch, resolve_devin_launch_model
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args + model_override); reused here, not
+    # Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace_path = launch_config.workspace
+    if not workspace_path.exists():
+        raise RuntimeError(f"Devin workspace does not exist for session {session_id!r}.")
+    workspace = str(workspace_path)
+    bridge_dir = prepare_bridge_dir(session_id)
+
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    # The hook wrapper carries a one-shot Omnigent bearer, so it must be written
+    # before the TUI starts — Devin reads its hook config once at launch.
+    hook_command = write_hook_wrapper(bridge_dir, server_url=server_url, session_id=session_id)
+    from omnigent.harnesses.devin_native.bridge import write_devin_session_config
+
+    # Devin has no --effort flag: a (model, effort) pick from the New Chat dialog
+    # composes into one variant id here, the same way the CLI's --model/--effort
+    # pair does, so both entry points land on the same Devin model.
+    launch_model = await asyncio.to_thread(
+        resolve_devin_launch_model,
+        launch_config.model_override,
+        launch_config.reasoning_effort,
+    )
+    write_devin_session_config(
+        bridge_dir,
+        hook_command=str(hook_command),
+        model=launch_model,
+    )
+
+    devin_launch = build_devin_launch(
+        launch_config.terminal_launch_args or [],
+        bridge_dir=bridge_dir,
+        config_path=session_config_path(bridge_dir),
+        export_file=export_path(bridge_dir),
+        model=launch_model,
+        resume_id=launch_config.external_session_id,
+    )
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="devin",
+        session_key="main",
+        resource_role=DEVIN_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=devin_launch.executable,
+            args=devin_launch.argv[1:],
+            env=build_devin_native_terminal_env(session_id),
+            env_unset=list(DEVIN_NATIVE_ENV_UNSET),
+            inherit_env=False,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "devin", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+                requires_forwarder_ready=launch_config.external_session_id is not None,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+
+    # Start the Omnigent builtin-tool relay so Devin's MCP-declared Omnigent
+    # tools route back through the session's policy/elicitation gate.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    from omnigent.harnesses.devin_native.forwarder import supervise_devin_forwarder
+
+    _forwarder_task = asyncio.create_task(
+        supervise_devin_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="devin-native-ui",
+            auth=_runner_auth,
+            # A cold resume replays the prior hook log; skip to its end so
+            # history is not re-published as new conversation items.
+            start_at_end=launch_config.external_session_id is not None,
+        ),
+        name=f"devin-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created devin terminal + hook forwarder for session %s; task=%s",
         session_id,
         _forwarder_task.get_name(),
     )
@@ -7991,6 +8133,17 @@ async def _launch_cursor(ctx: NativeLaunchContext) -> SessionResourceView:
 async def _launch_kiro(ctx: NativeLaunchContext) -> SessionResourceView:
     """Adapter: build the kiro-native terminal from a launch context."""
     return await _auto_create_kiro_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_devin(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the devin-native terminal from a launch context."""
+    return await _auto_create_devin_terminal(
         ctx.session_id,
         ctx.resource_registry,
         ctx.publish_event,

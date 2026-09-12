@@ -20,6 +20,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
+    DEVIN_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
@@ -209,6 +210,22 @@ GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="goose",
 )
 
+
+# Devin spawns its own sub-agents in-TUI via the `run_subagent` tool. Those
+# calls are mirrored as ordinary tool cards (the PreToolUse/PostToolUse hooks
+# carry them), but they are NOT promoted to Omnigent sub-agent sessions, so no
+# `subagent_wrapper_label` — which is also what keeps `capabilities.subagents`
+# False (tests/test_harness_capabilities.py derives one from the other). The
+# ACP row (`devin-acp`) does surface them, via `omnigent.inner.devin`.
+DEVIN_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="devin",
+    display_name="Devin",
+    agent_name="devin-native-ui",
+    harness="devin-native",
+    wrapper_label=DEVIN_NATIVE_WRAPPER_VALUE,
+    terminal_name="devin",
+)
+
 ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="antigravity",
     display_name="Antigravity",
@@ -301,6 +318,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        DEVIN_NATIVE_CODING_AGENT,
     )
 )
 
@@ -493,6 +511,45 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         # shell_tool_* stay None.
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
+    # devin-native wraps the resident `devin` TUI. Every axis below was
+    # live-verified against devin 3000.10.21:
+    #   * HOOK elicitation — a PreToolUse hook returning
+    #     `hookSpecificOutput.permissionDecision: "deny"` blocks the tool EVEN
+    #     under `--permission-mode bypass`, and the reason reaches the model; the
+    #     PermissionRequest hook accepts `{"decision": "approve"}`. So Devin
+    #     honours the same output contract claude-native uses, and the shared
+    #     omnigent.native.native_policy_hook seam drives it unmodified.
+    #   * interrupt — Devin's own hint is "esc twice to interrupt"; two Escapes
+    #     yield "✱ Canceled." (one only clears the composer draft).
+    #   * steering — the composer stays writable mid-turn (its placeholder
+    #     becomes "Guide Devin while it works").
+    #   * effort — ANTHROPIC's low/medium/high/xhigh/max is exactly the rung set
+    #     Devin encodes as a model-variant suffix, which
+    #     omnigent.harnesses.devin_native.main.compose_devin_model recombines.
+    #   * streaming=False by construction: the forwarder mirrors whole hook
+    #     events, so it posts no external_output_text_delta at all.
+    "devin-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.HOOK,
+        _RS.WARM_REATTACH,
+        _EF.ANTHROPIC,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=False,
+        steering=True,
+        live_queue=True,
+        images=True,
+        compaction=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="exec",
+        shell_tool_prompt=_SHELL_PROMPT,
+        # The wrap launches the vendor TUI and mirrors it; AgentSpec.instructions
+        # are not threaded into Devin (no --prompt-file / rules injection yet),
+        # matching the other native TUI wraps.
+        instruction_delivery=_ID.NOT_DELIVERED,
+    ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
@@ -681,11 +738,11 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
 
-# Devin is the one row that diverges: its own wrap injects a vendor extension
+# Devin (the ACP row) is the one row that diverges: its own wrap injects a vendor extension
 # (omnigent.inner.devin), so it surfaces the agent's sub-agents as child sessions
 # where a generic ACP agent cannot. Derived from the extension so this declared
 # capability cannot drift from the dialect that implements it.
-_BUILTIN_CAPABILITIES["devin"] = dataclasses.replace(
+_BUILTIN_CAPABILITIES["devin-acp"] = dataclasses.replace(
     _BUILTIN_CAPABILITIES["acp"],
     subagents=DEVIN_ACP_EXTENSION.surfaces_subagents,
 )
@@ -705,6 +762,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "copilot",
             "cursor",
             "cursor-native",
+            "devin-native",
             "goose",
             "goose-native",
             "hermes",
@@ -730,7 +788,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "acp": "omnigent.inner.acp_harness",
         # ...except a row with vendor behavior, which runs its own thin wrap to
         # inject an AcpExtension into the same shared executor.
-        "devin": "omnigent.inner.devin.harness",
+        "devin-acp": "omnigent.inner.devin.harness",
+        "devin-native": "omnigent.inner.devin_native_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
@@ -759,11 +818,16 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "agy": "antigravity",
         "agy-native": "antigravity-native",
         "claude": "claude-sdk",
+        # The bare vendor name resolves to the native wrap, mirroring
+        # ``opencode`` -> ``opencode-native``. Devin's ACP path keeps its own
+        # id (``devin-acp``) so both stay addressable.
+        "devin": "devin-native",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
         "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
+        "native-devin": "devin-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
         "native-kimi": "kimi-native",
@@ -782,6 +846,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "claude-native",
             "codex-native",
             "cursor-native",
+            "devin-native",
             "goose-native",
             "hermes-native",
             "kimi-native",
@@ -791,6 +856,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-claude",
             "native-codex",
             "native-cursor",
+            "native-devin",
             "native-goose",
             "native-hermes",
             "native-kimi",
@@ -815,6 +881,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        DEVIN_NATIVE_CODING_AGENT,
     ),
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
     # Catalog rows gate readiness on their vendor binary; the install spec also
@@ -860,6 +927,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
+        "devin-native": "Devin",
         "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free

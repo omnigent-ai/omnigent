@@ -38,6 +38,7 @@ import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
+import { DevinIcon } from "@/components/icons/DevinIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
@@ -318,6 +319,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   if (nativeAgent?.iconKind === "hermes") return HermesIcon;
+  if (nativeAgent?.iconKind === "devin") return DevinIcon;
   // Exact match — substring checks would false-match names like "pipeline".
   if (child.tool === PI_AGENT_NAME) return PiIcon;
   return null;
@@ -512,6 +514,7 @@ function iconForWrapperOrHarness(
   if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
   if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
   if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;
+  if (iconKind === "devin" || harness?.includes("devin")) return DevinIcon;
   // Exact match — a substring check would false-match e.g. "openapi".
   if (iconKind === "pi" || harness === "pi") return PiIcon;
   if (isNessie) return NessieIcon;

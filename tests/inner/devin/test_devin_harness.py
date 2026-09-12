@@ -62,12 +62,17 @@ def test_shared_builder_defaults_to_no_vendor_behavior(monkeypatch: pytest.Monke
 
 
 def test_registry_points_devin_at_its_own_wrap() -> None:
-    """``harness: devin`` resolves to this wrap, not the shared one.
+    """``harness: devin-acp`` resolves to this wrap, not the shared one.
 
     The registry entry is what makes the injection happen at all — without it
     Devin gets the generic wrap and the extension is never constructed.
+
+    Keyed ``devin-acp``: the bare ``devin`` spelling canonicalizes to the native
+    TUI wrap (``devin-native``), so this ACP path carries its own id.
     """
-    assert harness_modules()["devin"] == "omnigent.inner.devin.harness"
+    assert harness_modules()["devin-acp"] == "omnigent.inner.devin.harness"
+    # The bare vendor spelling belongs to the native wrap.
+    assert harness_modules()["devin-native"] == "omnigent.inner.devin_native_harness"
     # Sibling ACP rows keep the shared wrap.
     assert harness_modules()["grok"] == "omnigent.inner.acp_harness"
     assert harness_modules()["acp"] == "omnigent.inner.acp_harness"
@@ -80,7 +85,7 @@ def test_declared_capability_is_derived_from_the_extension() -> None:
     without updating the declaration would publish a false capability.
     """
     caps = harness_capabilities()
-    assert caps["devin"].subagents is DEVIN_ACP_EXTENSION.surfaces_subagents is True
+    assert caps["devin-acp"].subagents is DEVIN_ACP_EXTENSION.surfaces_subagents is True
     # Only Devin diverges from the shared generic ACP profile, and only there.
     assert caps["grok"] == caps["acp"]
-    assert caps["devin"] != caps["acp"]
+    assert caps["devin-acp"] != caps["acp"]

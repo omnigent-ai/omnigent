@@ -294,6 +294,7 @@ for _builder_name in (
     "_auto_create_claude_terminal",
     "_auto_create_codex_terminal",
     "_auto_create_cursor_terminal",
+    "_auto_create_devin_terminal",
     "_auto_create_goose_terminal",
     "_auto_create_hermes_terminal",
     "_auto_create_kimi_terminal",
@@ -10931,6 +10932,30 @@ def create_runner_app(
             status_code=200,
             content={"models": _with_model_configuration_source(session_id, models)},
         )
+
+    @app.get("/v1/sessions/{session_id}/devin-model-options")
+    async def get_session_devin_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "devin-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
+
+        try:
+            models = await asyncio.to_thread(list_devin_cli_model_options)
+        except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+            _logger.warning(
+                "Devin-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_model_options_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native model options"),
+                },
+            )
+        return JSONResponse(status_code=200, content={"models": models})
 
     @app.get("/v1/sessions/{session_id}/cursor-model-options")
     async def get_session_cursor_model_options(session_id: str) -> JSONResponse:

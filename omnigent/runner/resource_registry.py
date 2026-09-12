@@ -69,6 +69,7 @@ ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
 KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
+DEVIN_NATIVE_TERMINAL_ROLE = "devin-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses

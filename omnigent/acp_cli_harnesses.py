@@ -94,9 +94,16 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
     # a row carries no per-user model, and ``DEVIN_MODEL`` cannot reach the agent
     # (see the env note above), so pinning a model needs a user-configured
     # ``acp:<slug>`` agent whose command passes ``--model``.
-    "devin": AcpCliHarness(
+    #
+    # Keyed ``devin-acp``, not ``devin``: the bare vendor spelling now
+    # canonicalizes to the native wrap (``devin-native``, see ``aliases`` in
+    # omnigent/harness_plugins.py), the way ``opencode`` resolves to
+    # ``opencode-native``. This row keeps Devin's ACP path — and the sub-agent
+    # dialect in ``omnigent.inner.devin`` that only it surfaces — reachable as
+    # ``--harness devin-acp``.
+    "devin-acp": AcpCliHarness(
         install=HarnessInstallSpec(
-            "Devin",
+            "Devin (ACP)",
             "devin",
             None,
             login_args=("auth", "login"),
