@@ -1224,9 +1224,9 @@ def approval_wait_marker_path(session_id: str, *, bridge_dir: Path | None = None
     """
     Return the marker path a parked permission hook keeps fresh.
 
-    One marker per hook process: concurrent prompts on one session (a
-    permission request and an AskUserQuestion, or parallel tool calls) each
-    own a file, so the first to finish never clears another's evidence.
+    One marker per hook process: concurrent prompts on one session (parallel
+    tool calls each raising a permission request) own separate files, so the
+    first to finish never clears another's evidence.
 
     :param session_id: Omnigent session id whose verdict a hook is waiting
         on, e.g. ``"conv_abc123"``.

@@ -3079,11 +3079,10 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
         "omnigent.harnesses.claude_native.hook"
         in settings["hooks"]["PreCompact"][0]["hooks"][0]["command"]
     )
-    # No built-in tools are disabled anymore: ``AskUserQuestion``
-    # routes through its dedicated PreToolUse hook (answers injected
-    # via ``updatedInput.answers``) and ``ExitPlanMode`` surfaces
-    # through the standard PermissionRequest elicitation card, so the
-    # wrapper must not inject a ``--disallowedTools`` flag of its own.
+    # No built-in tools are disabled anymore: ``AskUserQuestion`` and
+    # ``ExitPlanMode`` both surface through the standard PermissionRequest
+    # elicitation card (question answers ride back via ``updatedInput``),
+    # so the wrapper must not inject a ``--disallowedTools`` flag of its own.
     assert "--disallowedTools" not in args
 
 
@@ -10387,8 +10386,8 @@ def test_approval_wait_marker_tracks_a_parked_permission_hook(
     # One session's parked prompt must not spare another session's pane.
     assert not claude_native_bridge.approval_wait_is_fresh("conv_other")
 
-    # Each hook owns its own marker, so one finishing (an AskUserQuestion beside
-    # a permission request, or parallel tool calls) leaves the other's evidence.
+    # Each hook owns its own marker, so one finishing (parallel tool calls each
+    # raising a permission request) leaves the other's evidence.
     sibling = marker.with_name(marker.name.replace(f".{os.getpid()}.", f".{os.getpid() + 1}."))
     assert sibling != marker
     claude_native_bridge.touch_approval_wait_marker(sibling)

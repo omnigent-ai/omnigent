@@ -1529,8 +1529,10 @@ def test_ask_user_question_subcommand_is_a_silent_noop(
 
     exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(tmp_path)])
 
+    captured = capsys.readouterr()
     assert exit_code == 0
-    assert capsys.readouterr().out == ""
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
