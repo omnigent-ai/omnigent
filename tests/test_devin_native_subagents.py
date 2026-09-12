@@ -87,9 +87,7 @@ class TestReconstruct:
         assert "one.txt" in chain[-1]["chat_message"]["content"]
         # The full internal tool work is present — this is the whole point.
         tool_names = [
-            tc["name"]
-            for node in chain
-            for tc in (node["chat_message"].get("tool_calls") or [])
+            tc["name"] for node in chain for tc in (node["chat_message"].get("tool_calls") or [])
         ]
         assert "write" in tool_names
 
