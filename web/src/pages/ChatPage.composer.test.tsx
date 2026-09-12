@@ -4,6 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
@@ -36,6 +37,28 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
+}));
+// The workspace bar's git-status hook uses TanStack Query; stub it so the
+// composer renders in isolation (no QueryClient) with a neutral empty status.
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: () => ({
+    branch: null,
+    branchState: "unknown",
+    isWorktree: null,
+    worktreePath: null,
+    creationBranch: null,
+    repoNameWithOwner: null,
+    prCount: 0,
+    prNumber: null,
+    refresh: () => {},
+    refreshing: false,
+  }),
+}));
+// SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
+// so the indicator self-hides (no active children) in isolated composer renders.
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: () => ({ children: [] }),
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
@@ -1674,23 +1697,9 @@ describe("Composer shared visible controls", () => {
     vi.restoreAllMocks();
   });
 
-  it.each([
-    ["Session workspace", 0],
-    ["Session worktree", 1],
-  ])("wraps text inside the %s popover", (label, triggerIndex) => {
-    renderWithTooltips(<Composer {...composerProps()} />);
-
-    const controls = screen.getByTestId("composer-workspace-controls");
-    fireEvent.keyDown(within(controls).getAllByRole("button")[triggerIndex], {
-      key: "ArrowDown",
-    });
-
-    const popover = screen.getByRole("menu");
-    expect(within(popover).getByText(label)).toBeVisible();
-    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,28rem)]");
-    expect(popover).not.toHaveClass("whitespace-nowrap");
-    expect(popover.querySelector("p")).toHaveClass("break-all");
-  });
+  // The workspace/worktree popover markup moved into the shared
+  // ComposerWorkspaceStatus component (its own tests cover the popover text
+  // wrapping); the two page-local inline-dropdown popover cases retired with it.
 
   it("renders the same workspace, host, permission and model controls as landing", () => {
     useChatStore.setState({
@@ -1717,9 +1726,10 @@ describe("Composer shared visible controls", () => {
     expect(actions.parentElement).toBe(card);
     expect(actions.children).toHaveLength(2);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
-    expect(within(workspace).getByTestId("composer-git-branch")).toHaveTextContent(
-      "feature/shared-composer",
-    );
+    // The branch text now flows through the shared ComposerWorkspaceStatus +
+    // useComposerGitStatus (covered by their own tests); here assert the shared
+    // branch control renders in the bar.
+    expect(within(workspace).getByTestId("composer-git-branch")).toBeInTheDocument();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
     expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask for approval");
     const trigger = screen.getByTestId("composer-config-gear");

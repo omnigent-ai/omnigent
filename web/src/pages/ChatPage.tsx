@@ -28,7 +28,7 @@ import {
   Loader2Icon,
   XIcon,
 } from "lucide-react";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -46,18 +46,10 @@ import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskInd
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
-  ComposerWorkspaceTrigger,
   ComposerPermissionPicker,
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
@@ -173,9 +165,7 @@ import {
   SessionSharedContext,
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useSession } from "@/hooks/useSession";
-import { useGithubInfo } from "@/hooks/useGithub";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
@@ -214,6 +204,11 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
+import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
+import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
+import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
+import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import {
   formatStatusModelLabel,
   formatStatusEffortLabel,
@@ -2046,56 +2041,6 @@ export function buildSlashCommandWithArgsSet(
   return s;
 }
 
-/** Circumference of the progress ring (r=5.5). */
-const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
-
-/** Circular progress ring showing how much context window is used, with the used percentage beside it. */
-function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tokensUsed: number }) {
-  const pct = Math.min(tokensUsed / contextWindow, 1);
-  // Arc, %, label, and tooltip all encode context USED: a fresh session
-  // shows an empty ring at 0% and the ring fills as context is consumed.
-  const usedArc = pct * RING_CIRCUMFERENCE;
-  const usedPct = Math.round(pct * 100);
-
-  const color =
-    pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span
-          className={cn("flex items-center gap-1.5", color)}
-          aria-label={`${usedPct}% of context used`}
-        >
-          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
-            {/* Track */}
-            <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
-            {/* Used arc — skipped at 0, where round linecaps would still paint a dot. */}
-            {usedArc > 0 && (
-              <circle
-                cx="8"
-                cy="8"
-                r="5.5"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeDasharray={`${usedArc} ${RING_CIRCUMFERENCE}`}
-                transform="rotate(-90 8 8)"
-              />
-            )}
-          </svg>
-          <span className="text-sm tabular-nums" aria-hidden="true">
-            {usedPct}%
-          </span>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-44 text-center text-sm">
-        <p className="tabular-nums">{usedPct}% of context used.</p>
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
 // Status-tray model/effort labels are shared with the landing composer — the
 // single source of truth lives in @/lib/composerModelLabel (imported above).
 // Re-exported here so ChatPage's existing named exports keep resolving for
@@ -2149,65 +2094,25 @@ export function composerHarnessLabel(
  * Pulled up behind the card so a shelf peeks below; skips render when empty.
  * Session cost lives in the header agent-info popover, not here.
  */
-function ComposerStatusLine({
-  goal,
-  isSubAgentSession,
-}: {
-  goal: Goal | null;
-  isSubAgentSession: boolean;
-}) {
+function ComposerStatusLine({ goal }: { goal: Goal | null }) {
   const conversationId = useChatStore((s) => s.conversationId);
-  // A client-only temp id has no server session — gate the server-scoped hooks
-  // below on it so they never fetch `/v1/sessions/temp:*` during the create
-  // window (mirrors ChatPage's top-level `sessionConvId`).
-  const sessionId = isTempConvId(conversationId) ? null : conversationId;
-  const contextWindow = useChatStore((s) => s.contextWindow);
-  const tokensUsed = useChatStore((s) => s.tokensUsed);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  // PR link → opens the workspace rail's GitHub tab. Shares the info query's
-  // cache with the GitHub panel, so opening the tab is instant.
-  const github = useGithubInfo(sessionId ?? undefined);
-  const openGithubTab = useOpenGithubTab();
-  const prs = github.data?.prs;
-  const prNumber = prs?.[0]?.number ?? github.data?.pr?.number ?? null;
-  const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
-  const showPr = !!conversationId && !isSubAgentSession && prCount > 0 && !!openGithubTab;
 
+  // The PR link and context ring now live in the workspace bar; this line
+  // carries only the plan-mode marker and the goal pill.
   const showPlanMode = !!conversationId && codexPlanMode;
   const showGoal = !!conversationId && goal != null;
-  // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
-  const showRing =
-    !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showPr && !showPlanMode && !showGoal && !showRing) return null;
+  if (!showPlanMode && !showGoal) return null;
 
   return (
     <div
       data-testid="composer-status-line"
       className={cn(
         // -mt-4 tucks under the card; pt-5.5 keeps content below the overlap.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
+        "mx-auto -mt-4 flex w-full items-center justify-end gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
         COMPOSER_COLUMN_WIDTH,
       )}
     >
-      <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
-        {showPr && (
-          <button
-            type="button"
-            data-testid="composer-pr-link"
-            onClick={() => openGithubTab?.()}
-            title={
-              prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"
-            }
-            className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-          >
-            <GithubMono size={14} aria-hidden />
-            <span className="tabular-nums whitespace-nowrap underline underline-offset-2">
-              {prCount > 1 ? `${prCount} PRs` : `#${prNumber}`}
-            </span>
-          </button>
-        )}
-      </div>
-      {/* Right: model/effort and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
           <span
@@ -2219,7 +2124,6 @@ function ComposerStatusLine({
           </span>
         )}
         {showGoal && goal && <GoalStatusPill goal={goal} />}
-        {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
       </div>
     </div>
   );
@@ -2535,6 +2439,17 @@ function ComposerImpl(
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
   const composerWorkspace = composerSession?.workspace;
+  // Live workspace/branch/PR status for the workspace bar (lane-3 shared hook):
+  // the branch comes from the host's `git worktree list`, never a PR head.
+  const composerGit = useComposerGitStatus({
+    sessionId: composerSessionId,
+    hostId: composerSession?.hostId ?? null,
+    workspace: composerWorkspace ?? null,
+    creationBranch: composerSession?.gitBranch ?? composerBranch ?? null,
+  });
+  const composerContextWindow = useChatStore((s) => s.contextWindow);
+  const composerTokensUsed = useChatStore((s) => s.tokensUsed);
+  const openComposerGithubTab = useOpenGithubTab();
   const permissionOptions = showClaudePermissionMode
     ? CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
     : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
@@ -3411,51 +3326,31 @@ function ComposerImpl(
       {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
         <ComposerWorkspaceBar data-testid="composer-workspace-controls">
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <ComposerWorkspaceTrigger
-                kind="directory"
-                label={composerWorkspace?.split(/[\\/]/).filter(Boolean).pop() ?? "No workspace"}
-                title={composerWorkspace ?? "No workspace bound"}
-              />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="start"
-              side="top"
-              className="max-w-[min(90vw,28rem)] whitespace-normal"
-            >
-              <DropdownMenuLabel>Session workspace</DropdownMenuLabel>
-              <p className="break-all px-2 py-1 text-xs text-muted-foreground">
-                {composerWorkspace ?? "This session has no workspace binding."}
-              </p>
-              <p className="px-2 py-1 text-xs text-muted-foreground">
-                Choose a different workspace when starting a new session.
-              </p>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <ComposerWorkspaceTrigger
-                kind="worktree"
-                label={composerBranch || "No branch reported"}
-                data-testid="composer-git-branch"
-              />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="start"
-              side="top"
-              className="max-w-[min(90vw,28rem)] whitespace-normal"
-            >
-              <DropdownMenuLabel>Session worktree</DropdownMenuLabel>
-              <p className="break-all px-2 py-1 text-xs text-muted-foreground">
-                {composerBranch || "The runner has not reported a branch for this session."}
-              </p>
-              <p className="px-2 py-1 text-xs text-muted-foreground">
-                The current session keeps its workspace and worktree.
-              </p>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <BackgroundTaskIndicator />
+          <ComposerWorkspaceStatus
+            workspacePath={composerWorkspace ?? null}
+            worktreePath={composerGit.worktreePath}
+            isWorktree={composerGit.isWorktree}
+            branch={composerGit.branch}
+            branchState={composerGit.branchState}
+            creationBranch={composerGit.creationBranch}
+            onRefreshBranch={composerGit.refresh}
+            refreshing={composerGit.refreshing}
+          />
+          {/* Trailing status cluster — the wrapper owns the right alignment so
+              it holds even when the self-nulling indicators render nothing. */}
+          <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+            <ComposerPrLink
+              prCount={composerGit.prCount}
+              prNumber={composerGit.prNumber}
+              onOpen={openComposerGithubTab}
+            />
+            <ComposerContextRing
+              contextWindow={composerContextWindow}
+              tokensUsed={composerTokensUsed}
+            />
+            <BackgroundTaskIndicator />
+            <SubagentTaskIndicator conversationId={conversationId} />
+          </div>
         </ComposerWorkspaceBar>
       </div>
       <ChatComposer
@@ -3843,7 +3738,7 @@ function ComposerImpl(
           />
         )
       )}
-      <ComposerStatusLine goal={goal} isSubAgentSession={subAgentLabel != null} />
+      <ComposerStatusLine goal={goal} />
     </form>
   );
 }
