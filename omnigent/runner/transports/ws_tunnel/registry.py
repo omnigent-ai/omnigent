@@ -59,6 +59,12 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 _logger = logging.getLogger(__name__)
 _connection_generations = count(1)
 
+# Tunnel frames cannot be dropped or coalesced without stranding an RPC, so a
+# full sender queue waits briefly for drain and then fails the send loudly.
+_OUTBOUND_QUEUE_MAX_FRAMES = 1024
+_OUTBOUND_SEND_STALL_S = 10.0
+_OUTBOUND_SEND_POLL_S = 0.05
+
 
 class WebSocketLike(Protocol):
     """Minimal WebSocket protocol used by the registry + transport.
@@ -324,7 +330,7 @@ class TunnelRegistry:
             ws=ws,
             hello=hello,
             loop=loop,
-            outbound_queue=asyncio.Queue(),
+            outbound_queue=asyncio.Queue(maxsize=_OUTBOUND_QUEUE_MAX_FRAMES),
             connected_at=now,
             last_frame_at=now,
             owner=owner,
@@ -881,9 +887,10 @@ class TunnelRegistry:
 
         def _finalize_enqueue(task: asyncio.Task[None]) -> None:
             """Settle sends whose enqueue task was cancelled before starting."""
-            if not task.cancelled():
+            if task.cancelled():
+                _resolve(_replaced_error())
+            else:
                 _ = task.exception()
-            _resolve(_replaced_error())
 
         def _start_enqueue() -> None:
             task = asyncio.get_running_loop().create_task(_enqueue())
@@ -991,7 +998,11 @@ def _retire_session_writer(session: RunnerSession, *, code: int, reason: str) ->
 
     def _retire() -> None:
         """Run on the WebSocket owner loop."""
-        session.outbound_queue.put_nowait(None)
+        try:
+            session.outbound_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            session.outbound_queue.get_nowait()
+            session.outbound_queue.put_nowait(None)
         close = getattr(session.ws, "close", None)
         if close is not None:
             with contextlib.suppress(Exception):
