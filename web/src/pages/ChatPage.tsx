@@ -214,6 +214,11 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import {
+  formatStatusModelLabel,
+  formatStatusEffortLabel,
+  formatModelEffortStatusLabel,
+} from "@/lib/composerModelLabel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -2076,63 +2081,11 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
   );
 }
 
-/**
- * Model label for the composer status tray.
- *
- * @param model - Model override or bound agent model id.
- * @param codexModelOptions - Native model metadata, when available.
- * @returns The advertised display label for known native models, a
- *   version-agnostic friendly form for an alias-shaped id the catalog
- *   doesn't list, the raw model id otherwise, or ``null`` when no model
- *   is known.
- */
-export function formatStatusModelLabel(
-  model: string | null,
-  codexModelOptions: readonly NativeModelOption[] = [],
-): string | null {
-  const raw = model?.trim();
-  if (!raw) return null;
-  const lower = raw.toLowerCase();
-  const codexOption = findNativeModelOption(codexModelOptions, raw);
-  if (codexOption) return nativeModelLabel(codexOption);
-  // An alias-shaped id the session's catalog doesn't list (e.g. during
-  // the pre-catalog window): render it friendly mechanically — "sonnet"
-  // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
-  // (1M context)" — without claiming a version the client can't know.
-  // Which model an alias lands on is the harness's answer; the catalog's
-  // display name supersedes this wherever one has arrived.
-  const alias = /^([a-z]+)(?:_(\d+))?(\[1m\])?$/.exec(lower);
-  if (alias) {
-    let label = `${alias[1]!.charAt(0).toUpperCase()}${alias[1]!.slice(1)}`;
-    if (alias[2]) label += ` ${alias[2]}`;
-    if (alias[3]) label += " (1M context)";
-    return label;
-  }
-  return raw;
-}
-
-function formatStatusEffortLabel(effort: string | null): string | null {
-  if (!effort) return null;
-  return effort.toLowerCase() === "xhigh" ? "xHigh" : formatEffortLabel(effort);
-}
-
-/**
- * Compose the current model and effort for the composer status tray.
- *
- * @param model - Model override or bound model id.
- * @param effort - Current reasoning effort override, if any.
- * @returns Compact label such as ``"gpt-5.5 xhigh"``.
- */
-export function formatModelEffortStatusLabel(
-  model: string | null,
-  effort: string | null,
-  codexModelOptions: readonly NativeModelOption[] = [],
-): string | null {
-  const modelLabel = formatStatusModelLabel(model, codexModelOptions);
-  const effortLabel = formatStatusEffortLabel(effort);
-  const parts = [modelLabel, effortLabel].filter((p): p is string => p != null && p.length > 0);
-  return parts.length > 0 ? parts.join(" ") : null;
-}
+// Status-tray model/effort labels are shared with the landing composer — the
+// single source of truth lives in @/lib/composerModelLabel (imported above).
+// Re-exported here so ChatPage's existing named exports keep resolving for
+// consumers (e.g. ChatPage.statusLine.test).
+export { formatStatusModelLabel, formatModelEffortStatusLabel };
 
 /**
  * Identity label for the composer status tray: which harness/agent is
@@ -4302,11 +4255,6 @@ export function shouldShowPollyCodexGoalControl(
     session?.agentName?.toLowerCase() === "polly" &&
     session?.harness === "codex"
   );
-}
-
-/** Title-case an effort level for the status label (``"high"`` → ``"High"``). */
-function formatEffortLabel(effort: string): string {
-  return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
 /**

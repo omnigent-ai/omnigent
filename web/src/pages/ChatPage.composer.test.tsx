@@ -1507,7 +1507,10 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("claude-opus-4-8");
+    // The shared status formatter folds full Claude ids to their friendly name
+    // (#7094 consistency), so the applied override renders as "Opus 4.8" — still
+    // the session's own model, never the stale cross-session sticky.
+    expect(label()).toHaveTextContent("Opus 4.8");
     expect(label()).not.toHaveTextContent("gpt-5.5");
   });
 
@@ -3442,7 +3445,9 @@ describe("Composer config gear", () => {
 
     it("names the model the session is on instead of rendering blank", async () => {
       await openModalOnRoutedSession();
-      expect(screen.getByTestId("composer-agent-models")).toHaveTextContent(ROUTED);
+      // The shared status formatter folds the databricks-/full Claude id to its
+      // friendly name (#7094): the routed model is named, never blank.
+      expect(screen.getByTestId("composer-agent-models")).toHaveTextContent("Opus 4.8");
     });
 
     it("pins nothing when opening and closing the model picker", async () => {
