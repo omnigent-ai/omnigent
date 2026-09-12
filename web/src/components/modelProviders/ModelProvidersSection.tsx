@@ -96,23 +96,23 @@ function formStateFrom(entry: HostProvider): {
   kind: string;
   family: string;
   baseUrl: string;
-  secretMode: SecretMode;
+  keySource: SecretMode;
   secretValue: string;
   wireApi: string;
   defaultModel: string;
   isDefault: boolean;
 } {
   const block = familyBlock(entry) ?? {};
-  let secretMode: SecretMode = "env";
+  let keySource: SecretMode = "env";
   let secretValue = "";
   if (typeof block.api_key_ref === "string") {
-    secretMode = block.api_key_ref.startsWith("keychain:") ? "keychain" : "env";
+    keySource = block.api_key_ref.startsWith("keychain:") ? "keychain" : "env";
     secretValue = block.api_key_ref;
   } else if (block.api_key_set === true) {
-    secretMode = "inline";
+    keySource = "inline";
     secretValue = ""; // the value never came back; leave blank unless replaced
   } else if (typeof block.auth_command === "string") {
-    secretMode = "env"; // not editable here; treated as-is
+    keySource = "env"; // not editable here; treated as-is
     secretValue = String(block.auth_command);
   }
   const wireApi = typeof block.wire_api === "string" ? block.wire_api : "chat";
@@ -121,7 +121,7 @@ function formStateFrom(entry: HostProvider): {
     kind: typeof entry.kind === "string" ? entry.kind : "gateway",
     family: familyOf(entry),
     baseUrl: baseUrlOf(entry),
-    secretMode,
+    keySource,
     secretValue,
     wireApi,
     defaultModel: defaultModelOf(entry),
@@ -133,7 +133,7 @@ function buildEntry(form: {
   kind: string;
   family: string;
   baseUrl: string;
-  secretMode: SecretMode;
+  keySource: SecretMode;
   secretValue: string;
   wireApi: string;
   defaultModel: string;
@@ -144,15 +144,15 @@ function buildEntry(form: {
   if (form.kind === "subscription") return entry;
   const block: Record<string, unknown> = {};
   if (form.baseUrl.trim()) block.base_url = form.baseUrl.trim();
-  if (form.secretMode === "env" && form.secretValue.trim()) {
+  if (form.keySource === "env" && form.secretValue.trim()) {
     block.api_key_ref = form.secretValue.trim().startsWith("env:")
       ? form.secretValue.trim()
       : `env:${form.secretValue.trim()}`;
-  } else if (form.secretMode === "keychain" && form.secretValue.trim()) {
+  } else if (form.keySource === "keychain" && form.secretValue.trim()) {
     block.api_key_ref = form.secretValue.trim().startsWith("keychain:")
       ? form.secretValue.trim()
       : `keychain:${form.secretValue.trim()}`;
-  } else if (form.secretMode === "inline" && form.secretValue.trim()) {
+  } else if (form.keySource === "inline" && form.secretValue.trim()) {
     block.api_key = form.secretValue.trim();
   }
   if (form.family === "openai") block.wire_api = form.wireApi;
@@ -175,7 +175,7 @@ function ProviderFormDialog({ open, onOpenChange, hostId, editing }: ProviderFor
   const [kind, setKind] = useState<string>("gateway");
   const [family, setFamily] = useState<string>("openai");
   const [baseUrl, setBaseUrl] = useState("");
-  const [secretMode, setSecretMode] = useState<SecretMode>("env");
+  const [keySource, setSecretMode] = useState<SecretMode>("env");
   const [secretValue, setSecretValue] = useState("");
   const [wireApi, setWireApi] = useState("chat");
   const [defaultModel, setDefaultModel] = useState("");
@@ -192,7 +192,7 @@ function ProviderFormDialog({ open, onOpenChange, hostId, editing }: ProviderFor
       setKind(state.kind);
       setFamily(state.family);
       setBaseUrl(state.baseUrl);
-      setSecretMode(state.secretMode);
+      setSecretMode(state.keySource);
       setSecretValue(state.secretValue);
       setWireApi(state.wireApi);
       setDefaultModel(state.defaultModel);
@@ -220,7 +220,7 @@ function ProviderFormDialog({ open, onOpenChange, hostId, editing }: ProviderFor
       kind,
       family,
       baseUrl,
-      secretMode,
+      keySource,
       secretValue,
       wireApi,
       defaultModel,
@@ -306,7 +306,7 @@ function ProviderFormDialog({ open, onOpenChange, hostId, editing }: ProviderFor
               <div className="grid grid-cols-2 gap-4">
                 <div className="grid gap-2">
                   <Label>API key source</Label>
-                  <Select value={secretMode} onValueChange={(v) => setSecretMode(v as SecretMode)}>
+                  <Select value={keySource} onValueChange={(v) => setSecretMode(v as SecretMode)}>
                     <SelectTrigger>
                       <SelectValue />
                     </SelectTrigger>
@@ -319,9 +319,9 @@ function ProviderFormDialog({ open, onOpenChange, hostId, editing }: ProviderFor
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="provider-secret">
-                    {secretMode === "env"
+                    {keySource === "env"
                       ? "Variable name"
-                      : secretMode === "keychain"
+                      : keySource === "keychain"
                         ? "Secret name"
                         : "API key"}
                   </Label>
@@ -330,9 +330,9 @@ function ProviderFormDialog({ open, onOpenChange, hostId, editing }: ProviderFor
                     value={secretValue}
                     onChange={(e) => setSecretValue(e.target.value)}
                     placeholder={
-                      secretMode === "env"
+                      keySource === "env"
                         ? "OPENROUTER_API_KEY"
-                        : secretMode === "keychain"
+                        : keySource === "keychain"
                           ? "anthropic"
                           : "sk-…"
                     }
@@ -370,7 +370,7 @@ function ProviderFormDialog({ open, onOpenChange, hostId, editing }: ProviderFor
               </div>
             </>
           )}
-          {editing && secretMode === "inline" && secretValue === "" && (
+          {editing && keySource === "inline" && secretValue === "" && (
             <p className="text-muted-foreground text-xs">
               The stored key is never shown. Leave blank to keep it, or type a new key to replace
               it.
