@@ -136,6 +136,7 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
+    parse_repo_workspace,
     read_managed_repo_workspaces,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -3637,6 +3638,46 @@ async def ensure_runner_connected(
     return runner_client, conv
 
 
+def _recorded_repo_workspace(
+    session_id: str, labels: dict[str, str], *, invalid_label_fallback: str
+) -> RepoWorkspace | None:
+    raw_repo = labels.get(MANAGED_REPO_LABEL_KEY)
+    if raw_repo is None:
+        return None
+    try:
+        return parse_repo_workspace(raw_repo)
+    except ValueError:
+        _logger.warning(
+            "Session %s has an unparseable %s label (%r); %s",
+            session_id,
+            MANAGED_REPO_LABEL_KEY,
+            raw_repo,
+            invalid_label_fallback,
+            extra={"session_id": session_id},
+        )
+        return None
+
+
+def _recorded_repo_workspaces(
+    session_id: str, labels: dict[str, str], *, invalid_label_fallback: str
+) -> list[RepoWorkspace]:
+    """Parse the repositories recorded on a managed session label."""
+    raw_workspaces = read_managed_repo_workspaces(labels)
+    if not raw_workspaces:
+        return []
+    try:
+        return [parse_repo_workspace(workspace) for workspace in raw_workspaces]
+    except ValueError:
+        _logger.warning(
+            "Session %s has an unparseable sandbox repo label (%r); %s",
+            session_id,
+            raw_workspaces,
+            invalid_label_fallback,
+            extra={"session_id": session_id},
+        )
+        return []
+
+
 def _kick_managed_relaunch(
     *,
     session_id: str,
@@ -3672,30 +3713,11 @@ def _kick_managed_relaunch(
     :param app_state: ``request.app.state`` — supplies the registries and the
         agent store the classifier is re-derived from.
     """
-    from omnigent.server.managed_hosts import (
-        parse_repo_workspace,
-        read_managed_repo_workspaces,
+    repos = _recorded_repo_workspaces(
+        session_id,
+        conv.labels,
+        invalid_label_fallback="relaunching with an empty workspace",
     )
-
-    # Re-clone the repositories the session was created with so the fresh
-    # generation's workspace matches the create-time state. The per-repo labels
-    # hold the raw create-time values, already validated by the create's parse —
-    # a parse failure here means a label was tampered with, and the relaunch
-    # proceeds with an empty workspace rather than dying.
-    repos: list[RepoWorkspace] = []
-    raw_workspaces = read_managed_repo_workspaces(conv.labels)
-    if raw_workspaces:
-        try:
-            repos = [parse_repo_workspace(w) for w in raw_workspaces]
-        except ValueError:
-            _logger.warning(
-                "Session %s has an unparseable sandbox repo label (%r); "
-                "relaunching with an empty workspace",
-                session_id,
-                raw_workspaces,
-                extra={"session_id": session_id},
-            )
-            repos = []
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
@@ -3911,10 +3933,16 @@ async def _run_managed_wake(
                 agent_id,
                 session_id=session_id,
             )
+        repos = _recorded_repo_workspaces(
+            session_id,
+            conv.labels,
+            invalid_label_fallback="waking without a repository",
+        )
         await resume_managed_host(
             host_id,
             host_store,
             sandbox_config,
+            repos=repos,
             force=True,
             on_stage=_on_stage,
             agent_name=agent_name,

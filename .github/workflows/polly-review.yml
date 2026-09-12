@@ -8,8 +8,7 @@ name: Polly AI Review
 #
 # Triggers:
 #   - pull_request opened/reopened/ready_for_review (automatic, once per PR)
-#   - `/review` comment on a PR (manual retrigger by write-access users, or
-#     any login in the REVIEW_ALLOWLIST repo variable, a JSON array of strings)
+#   - `/review` comment on a PR (manual retrigger by write-access users)
 #   - workflow_dispatch with a PR number (manual retrigger from Actions tab,
 #     also used by the maintainer-approval relay)
 #
@@ -44,10 +43,10 @@ env:
 
 jobs:
   # Security precondition gate (security-gate.yml): untrusted PRs wait for
-  # the scan; trusted authors pass through. Only runs on pull_request events.
-  # issue_comment and workflow_dispatch are gated by write-access or the
-  # REVIEW_ALLOWLIST (author_association / login check, plus GitHub's dispatch
-  # auth) and never check out PR code, so the scan is not applicable.
+  # the scan; trusted authors pass through. Only runs on pull_request events
+  # — issue_comment and workflow_dispatch are already gated by write-access
+  # (author_association check + GitHub's own dispatch auth) and never check
+  # out PR code, so the scan is not applicable.
   gate:
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/security-gate.yml
@@ -55,10 +54,9 @@ jobs:
   review:
     name: Polly AI Review
     needs: gate
-    # Fire on non-draft PRs (after gate passes), `/review` comments by write-
-    # access users or REVIEW_ALLOWLIST logins, or workflow_dispatch. The
-    # `!cancelled()` ensures the job runs when gate is skipped (non-PR events)
-    # but not when it fails.
+    # Fire on non-draft PRs (after gate passes), `/review` comments by
+    # write-access users, or workflow_dispatch. The `!cancelled()` ensures
+    # the job runs when gate is skipped (non-PR events) but not when it fails.
     if: >-
       !cancelled() && (
         (
@@ -74,8 +72,7 @@ jobs:
           (
             github.event.comment.author_association == 'OWNER' ||
             github.event.comment.author_association == 'MEMBER' ||
-            github.event.comment.author_association == 'COLLABORATOR' ||
-            contains(fromJSON(vars.REVIEW_ALLOWLIST || '[]'), github.event.comment.user.login)
+            github.event.comment.author_association == 'COLLABORATOR'
           )
         ) ||
         github.event_name == 'workflow_dispatch'
