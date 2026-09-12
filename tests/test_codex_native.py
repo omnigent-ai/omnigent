@@ -1921,16 +1921,31 @@ def test_wait_for_thread_started_times_out_when_no_thread_event() -> None:
         )
 
 
-def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
+def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     tmp_path: Path,
 ) -> None:
     """
     Fresh Codex sessions pass the listener used to discover
     ``thread/started``. Once the thread id is known, the forwarder
     subscribes that connection so TUI-originated turn/item events are
-    mirrored into the web session.
+    mirrored into the web session. Dead-letter recovery belongs to cold-resume
+    rollout reconstruction, so starting the live forwarder must not replay it
+    again after that snapshot has already been built.
     """
     fake_client = _FakeCodexAppServerClient()
+    codex_native_forwarder.append_dead_letter(
+        tmp_path,
+        session_id="conv_123",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="http 503",
+        http_status=503,
+    )
+    ap_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ap_requests.append(request)
+        return httpx.Response(200)
 
     async def run() -> None:
         """
@@ -1946,6 +1961,7 @@ def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
             app_server_url=str(tmp_path / "app-server.sock"),
             thread_id="thread_123",
             client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(handler),
         )
 
     asyncio.run(run())
@@ -1954,6 +1970,8 @@ def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
     ]
     assert fake_client.closed
+    assert ap_requests == []
+    assert (tmp_path / "dead_letter.jsonl").exists()
 
 
 def test_supervise_forwarder_resumes_when_it_opens_client(
@@ -10995,6 +11013,72 @@ def test_clone_codex_rollout_returns_none_for_unsafe_target_id(
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
+    tmp_path: Path,
+) -> None:
+    """A successful dead-letter replay is included in the rebuilt snapshot."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    replay_data = {
+        "item_type": "message",
+        "item_data": {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "recovered reply"}],
+        },
+        "response_id": "turn_recovered",
+        "source_id": "codex:item:recovered",
+    }
+    codex_native_forwarder.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex",
+        event_type="external_conversation_item",
+        payload=replay_data,
+        reason="http 503",
+        http_status=503,
+    )
+    request_order: list[str] = []
+    server_items: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_order.append(request.method)
+        if request.method == "POST":
+            body = json.loads(request.content)
+            assert body == {"type": "external_conversation_item", "data": replay_data}
+            server_items.append(
+                {
+                    "id": "msg_recovered",
+                    "response_id": replay_data["response_id"],
+                    "type": "message",
+                    **replay_data["item_data"],
+                }
+            )
+            return httpx.Response(200)
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": server_items, "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=tmp_path.resolve(),
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert request_order == ["POST", "GET"]
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+    assert any(
+        record["type"] == "response_item" and record["payload"].get("id") == "msg_recovered"
+        for record in records
+    )
 
 
 @pytest.mark.asyncio
