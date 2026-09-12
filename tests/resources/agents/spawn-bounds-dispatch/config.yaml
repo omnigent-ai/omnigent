@@ -1,0 +1,40 @@
+spec_version: 1
+name: spawn-bounds-dispatch
+description: >
+  Fixture bundle for the spawn_bounds sub-agent dispatch e2e test. The
+  parent orchestrator declares a spawn_bounds guardrail capping worker
+  dispatches per turn; the test scripts the parent to dispatch MORE
+  workers than the cap in a single turn and asserts the excess
+  dispatches are denied.
+
+# executor.model and an executor.auth api-key block are stamped per-test so
+# the openai-agents harness hits the mock LLM server.
+executor:
+  type: omnigent
+  model: mock-parent-model
+  config:
+    harness: openai-agents
+
+prompt: |
+  You are an orchestrator. When asked to run, dispatch the worker
+  sub-agent with sys_session_send once per requested task.
+
+tools:
+  agents:
+    - worker
+
+# The per-turn dispatch cap is stamped per-test (see
+# tests/e2e/test_spawn_bounds_subagent_dispatch_e2e.py). Dispatches beyond
+# max_dispatches_per_turn within one orchestrator turn must be DENIED.
+guardrails:
+  policies:
+    spawn_bounds:
+      type: function
+      function:
+        path: omnigent.policies.builtins.orchestration.spawn_bounds
+        arguments:
+          max_dispatches_per_turn: 1
+
+os_env:
+  type: caller_process
+  cwd: .

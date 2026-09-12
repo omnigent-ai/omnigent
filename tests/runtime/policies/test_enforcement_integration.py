@@ -44,8 +44,11 @@ from omnigent.runtime.policies import (
     build_policy_engine,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
-from omnigent.spec import load
+from omnigent.spec import AgentSpec, load
 from omnigent.spec.types import (
+    FunctionPolicySpec,
+    FunctionRef,
+    GuardrailsSpec,
     Phase,
     PolicyAction,
 )
@@ -92,6 +95,49 @@ def _tool_ctx(
         content={"name": name, "arguments": args or {}},
         tool_name=name,
     )
+
+
+@pytest.mark.asyncio
+async def test_spawn_bounds_survives_fresh_policy_engines(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The deployed per-tool engine rebuild must not reset the turn cap."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="spawn-bounds-test",
+        guardrails=GuardrailsSpec(
+            policies=[
+                FunctionPolicySpec(
+                    name="spawn_bounds",
+                    on=None,
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.orchestration.spawn_bounds",
+                        arguments={"max_dispatches_per_turn": 2},
+                    ),
+                )
+            ]
+        ),
+    )
+    conversation_id = conversation_store.create_conversation().id
+
+    def fresh_engine() -> PolicyEngine:
+        return build_policy_engine(
+            spec=spec,
+            conversation_id=conversation_id,
+            conversation_store=conversation_store,
+        )
+
+    reset = EvaluationContext(phase=Phase.REQUEST, content="go")
+    await fresh_engine().evaluate(reset)
+    actions = [
+        (await fresh_engine().evaluate(_tool_ctx("sys_session_send"))).action for _ in range(3)
+    ]
+    assert actions == [PolicyAction.ALLOW, PolicyAction.ALLOW, PolicyAction.DENY]
+
+    await fresh_engine().evaluate(reset)
+    assert (
+        await fresh_engine().evaluate(_tool_ctx("sys_session_send"))
+    ).action == PolicyAction.ALLOW
 
 
 # ──────────────────────────────────────────────────────────
