@@ -4,8 +4,9 @@ import { showNotification } from "@/lib/browserNotifications";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { useLocation } from "@/lib/routing";
 
-// ponytail: 5min polling caps scheduled checks at 12/hour; upgrade to a socket build signal.
+// Routine checks run every five minutes, with one short follow-up for confirmation.
 const POLL_MS = 5 * 60 * 1000;
+const CONFIRM_MS = 1_000;
 
 /** Mount once per page: compare deploys to the first observed build, never auto-reload. */
 export function useWebUpdateNotifications() {
@@ -15,15 +16,32 @@ export function useWebUpdateNotifications() {
   const baseline = useRef<string | null>(null);
   const candidate = useRef<string | null>(null);
   const notified = useRef(new Set<string>());
+  const pendingNativeBuild = useRef<string | null>(null);
   const [availableBuildId, setAvailableBuildId] = useState<string | null>(null);
 
   useEffect(() => {
     let disposed = false;
     let request: AbortController | null = null;
+    let confirmation: number | undefined;
     let focused = document.hasFocus();
 
-    const poll = async () => {
+    const notifyIfUnfocused = () => {
+      const id = pendingNativeBuild.current;
+      if (!id || (focused && document.visibilityState !== "hidden")) return;
+      pendingNativeBuild.current = null;
+      showNotification({
+        title: "Update available",
+        body: "Reload Omnigent to use the latest web app.",
+        tag: `omnigent:web-update:${id}`,
+        // Android requires a path to attach its existing tap-to-foreground intent.
+        navigatePath: currentPath.current,
+      });
+    };
+
+    const poll = async (isConfirmation = false) => {
       if (disposed || request) return;
+      window.clearTimeout(confirmation);
+      confirmation = undefined;
       const controller = new AbortController();
       request = controller;
       const timeout = window.setTimeout(() => controller.abort(), 30_000);
@@ -41,28 +59,22 @@ export function useWebUpdateNotifications() {
           return;
         }
         if (baseline.current === null) baseline.current = id;
-        if (id === baseline.current) {
+        if (id === baseline.current || notified.current.has(id)) {
           candidate.current = null;
           return;
         }
-        // ponytail: two matching reads limit replica flapping, with up to 10min detection;
-        // upgrade to an authoritative deploy signal if replicas remain mixed longer.
+        // Confirm once promptly; mixed replicas must not create a rapid polling loop.
         if (candidate.current !== id) {
           candidate.current = id;
+          if (!isConfirmation) {
+            confirmation = window.setTimeout(() => void poll(true), CONFIRM_MS);
+          }
           return;
         }
-        if (notified.current.has(id)) return;
         notified.current.add(id);
         setAvailableBuildId(id);
-        if (!focused || document.visibilityState === "hidden") {
-          showNotification({
-            title: "Update available",
-            body: "Reload Omnigent to use the latest web app.",
-            tag: `omnigent:web-update:${id}`,
-            // Android requires a path to attach its existing tap-to-foreground intent.
-            navigatePath: currentPath.current,
-          });
-        }
+        pendingNativeBuild.current = id;
+        notifyIfUnfocused();
       } catch {
         if (!disposed) candidate.current = null;
       } finally {
@@ -70,8 +82,9 @@ export function useWebUpdateNotifications() {
         request = null;
       }
     };
-    const onVisible = () => {
+    const onVisibilityChange = () => {
       if (document.visibilityState === "visible") void poll();
+      else notifyIfUnfocused();
     };
     const onOnline = () => void poll();
     const onFocus = () => {
@@ -79,12 +92,13 @@ export function useWebUpdateNotifications() {
     };
     const onBlur = () => {
       focused = false;
+      notifyIfUnfocused();
     };
     const unsubscribe = sessionUpdatesSocket.subscribeStatus(() => {
       if (sessionUpdatesSocket.isConnected()) void poll();
     });
-    const interval = window.setInterval(onVisible, POLL_MS);
-    document.addEventListener("visibilitychange", onVisible);
+    const interval = window.setInterval(() => void poll(), POLL_MS);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("online", onOnline);
     window.addEventListener("focus", onFocus);
     window.addEventListener("blur", onBlur);
@@ -94,9 +108,10 @@ export function useWebUpdateNotifications() {
     return () => {
       disposed = true;
       request?.abort();
+      window.clearTimeout(confirmation);
       window.clearInterval(interval);
       unsubscribe();
-      document.removeEventListener("visibilitychange", onVisible);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("focus", onFocus);
       window.removeEventListener("blur", onBlur);
@@ -105,5 +120,11 @@ export function useWebUpdateNotifications() {
     };
   }, []);
 
-  return { availableBuildId, dismiss: () => setAvailableBuildId(null) };
+  return {
+    availableBuildId,
+    dismiss: () => {
+      pendingNativeBuild.current = null;
+      setAvailableBuildId(null);
+    },
+  };
 }
