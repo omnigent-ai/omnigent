@@ -96,6 +96,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -2206,10 +2207,20 @@ def _codex_rollout_records_from_session_items(
         # replacement_history replaces them.
         if item.get("type") == "compaction":
             compacted_msgs = item.get("compacted_messages")
-            if compacted_msgs:
+            if isinstance(compacted_msgs, list) and compacted_msgs:
                 compacted_payload: _JsonObject = {
                     "message": item.get("summary", ""),
-                    "replacement_history": compacted_msgs,
+                    "replacement_history": [
+                        {
+                            **message,
+                            "content": sanitize_replayed_image_blocks(message["content"]),
+                        }
+                        if isinstance(message, dict)
+                        and message.get("type") == "message"
+                        and "content" in message
+                        else message
+                        for message in compacted_msgs
+                    ],
                 }
                 compacted_record: _JsonObject = {
                     "timestamp": timestamp,
