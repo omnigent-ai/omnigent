@@ -2,6 +2,7 @@ import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { HarnessPicker, HarnessPickerConfigPage, HarnessPickerEntry } from "./HarnessPicker";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 
 afterEach(cleanup);
 
@@ -14,7 +15,11 @@ function PickerFixture({
 }) {
   const [open, setOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
-  const config = <span>Model configuration</span>;
+  // A real focusable option (role=menuitem) so the Escape test can start focus
+  // on an actual flyout option, not the menu container.
+  const config = (
+    <DropdownMenuItem data-testid="config-option">Model configuration</DropdownMenuItem>
+  );
   return (
     <HarnessPicker
       open={open}
@@ -94,19 +99,21 @@ describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
     expect(screen.getByTestId("menu")).toBeInTheDocument();
   });
 
-  it("dismisses the config flyout on Escape from a focused option (keyboard)", () => {
+  it("dismisses the whole menu on Escape from a focused flyout option (keyboard)", () => {
     openConfig();
+    // Start focus on an actual flyout OPTION, not the menu container.
+    const option = screen.getByTestId("config-option");
+    option.focus();
     const flyout = screen.getByText("Model configuration").closest<HTMLElement>('[role="menu"]');
     expect(flyout).not.toBeNull();
-    // Drive Escape from a genuinely-focused flyout, not an unfocused container.
-    flyout!.focus();
     expect(flyout!.contains(document.activeElement)).toBe(true);
     fireEvent.keyDown(document.activeElement as HTMLElement, { key: "Escape" });
-    // Escape dismisses the flyout. NOTE: Radix nested-menu Escape closes the
-    // whole menu tree by design (the root + sub dismiss layers both fire) and
-    // returns focus to the trigger — it is NOT scoped to the sub. The
-    // parent-stays-open "close just this flyout" affordance is the second-click
-    // pointer toggle above (verified in the browser against Radix, not just jsdom).
+    // Accepted #7069 behavior: Escape dismisses the flyout AND the parent menu
+    // (Radix's nested-menu Escape) — it is not scoped to the sub. The
+    // parent-stays-open "close just this flyout" path is the second-click
+    // pointer toggle above. Root-close + focus-to-root-trigger is confirmed in
+    // the real-browser CDP check.
     expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("menu")).not.toBeInTheDocument();
   });
 });
