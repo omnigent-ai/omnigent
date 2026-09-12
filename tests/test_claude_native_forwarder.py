@@ -4180,7 +4180,7 @@ async def test_relay_permission_mode_mirrors_switch_and_dedupes() -> None:
         # The launch mode is posted, so the picker has a mode to show.
         await _relay("default")
         assert [p["type"] for p in posts] == ["external_permission_mode_change"]
-        assert posts[0]["data"] == {"permission_mode": "default"}
+        assert posts[0]["data"] == {"permission_mode": "default", "initial_observation": True}
         assert dedupe.posted_permission_mode == "default"
 
         # Unchanged footer is a no-op, not a repeat POST.
@@ -4189,7 +4189,7 @@ async def test_relay_permission_mode_mirrors_switch_and_dedupes() -> None:
 
         # The user presses shift+tab into auto mode.
         await _relay("auto")
-        assert posts[-1]["data"] == {"permission_mode": "auto"}
+        assert posts[-1]["data"] == {"permission_mode": "auto", "initial_observation": False}
         assert dedupe.posted_permission_mode == "auto"
 
         # Still auto — the switch isn't re-posted every poll.
@@ -4230,7 +4230,10 @@ async def test_relay_permission_mode_posts_manual_launch_mode() -> None:
         )
 
     assert posts == [
-        {"type": "external_permission_mode_change", "data": {"permission_mode": "default"}}
+        {
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": "default", "initial_observation": True},
+        }
     ]
     assert dedupe.posted_permission_mode == "default"
 
@@ -4279,11 +4282,62 @@ async def test_relay_permission_mode_retries_after_transient_failure() -> None:
 
         await _relay("plan")
         assert [p["data"] for p in posts] == [
-            {"permission_mode": "default"},
-            {"permission_mode": "plan"},
-            {"permission_mode": "plan"},
+            {"permission_mode": "default", "initial_observation": True},
+            {"permission_mode": "plan", "initial_observation": False},
+            {"permission_mode": "plan", "initial_observation": False},
         ]
         assert dedupe.posted_permission_mode == "plan"  # now committed
+
+
+@pytest.mark.parametrize(
+    ("modes", "statuses", "expected"),
+    [
+        pytest.param(
+            [None, "auto", None, "auto", "auto"],
+            [503, 202],
+            [("auto", True), ("auto", True)],
+            id="startup-retry-remains-passive",
+        ),
+        pytest.param(
+            ["default", "auto", "auto"],
+            [503, 503, 202],
+            [("default", True), ("auto", False), ("auto", False)],
+            id="switch-before-first-successful-post",
+        ),
+        pytest.param(
+            ["default", "auto", None, "default", "default"],
+            [202, 503, 503, 202],
+            [("default", True), ("auto", False), ("default", False), ("default", False)],
+            id="switch-back-to-posted-mode-is-still-a-selection",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_relay_permission_mode_provenance_survives_delivery_failures(
+    modes: list[str | None],
+    statuses: list[int],
+    expected: list[tuple[str, bool]],
+) -> None:
+    """Unreadable panes and failed POSTs must not erase an observed selection."""
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content)["data"])
+        return httpx.Response(statuses[len(posts) - 1], json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        for mode in modes:
+            await forwarder._relay_permission_mode(
+                client, session_id="conv_abc", mode=mode, dedupe=dedupe
+            )
+
+    assert posts == [
+        {"permission_mode": mode, "initial_observation": initial} for mode, initial in expected
+    ]
+    assert dedupe.posted_permission_mode == expected[-1][0]
 
 
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(

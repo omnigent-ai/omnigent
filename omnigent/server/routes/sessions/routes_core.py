@@ -2402,15 +2402,12 @@ def register_core_routes(
                 _mode_result,
             )
             labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
-            # The launcher restores the mode from terminal_launch_args, not the
-            # label above, so reflect the confirmed mode there too — otherwise a
-            # relaunch reverts to the launch --permission-mode. Merge against
-            # ``updated`` (the post-write row), not the pre-update snapshot, so a
-            # combined PATCH that also set terminal_launch_args keeps those. Only
-            # rewrites an existing --permission-mode; mirrors the shift+tab path.
+            # Persist explicit selections for relaunch even without a launch
+            # flag. Use the updated row to preserve other args in this PATCH.
             _merged_permission_args = _merge_claude_permission_launch_args(
                 updated.terminal_launch_args,
                 _confirmed_permission_mode,
+                add_if_missing=True,
             )
             if updated.terminal_launch_args != _merged_permission_args:
                 await asyncio.to_thread(
