@@ -114,8 +114,8 @@ describe("customTheme", () => {
     expect(deriveCustomTheme({ ...theme, contrast: 50 })).toEqual(palette.tokens);
   });
 
-  it.each(PALETTES)("keeps $label's opaque selection pair when customizing accents", (palette) => {
-    for (const accent of ["#000000", "#777777", "#ffffff"]) {
+  it.each(PALETTES)("tints $label's selection with a custom accent", (palette) => {
+    for (const accent of ["#2563eb", "#777777", "#f59e0b"]) {
       const variants = deriveCustomTheme({
         ...createCustomThemeFromPalette(palette),
         accent,
@@ -123,12 +123,16 @@ describe("customTheme", () => {
         contrast: 100,
         translucentSidebar: true,
       });
+      const [r, g, b] = [1, 3, 5].map((offset) =>
+        Number.parseInt(accent.slice(offset, offset + 2), 16),
+      );
 
       for (const mode of ["light", "dark"] as const) {
-        // Translucent tints follow the accent instead; see the Omnigent cases.
-        if (!palette.tokens[mode].selectionBackground.startsWith("#")) continue;
-        expect(variants[mode].selectionBackground).toBe(palette.tokens[mode].selectionBackground);
-        expect(variants[mode].selectionForeground).toBe(palette.tokens[mode].selectionForeground);
+        // A translucent stock pair keeps its alpha; opaque pairs take the
+        // sidebar active row's 12%.
+        const alpha = /, ([\d.]+)\)$/.exec(palette.tokens[mode].selectionBackground)?.[1] ?? "0.12";
+        expect(variants[mode].selectionBackground).toBe(`rgba(${r}, ${g}, ${b}, ${alpha})`);
+        expect(variants[mode].selectionForeground).toBe(variants[mode].foreground);
       }
     }
   });
