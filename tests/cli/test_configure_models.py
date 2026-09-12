@@ -1519,15 +1519,63 @@ def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
     assert get_default_provider(cfg, "openai") is None
 
 
-def test_configure_harnesses_add_databricks_fails_loud_when_ucode_records_no_state(
+def test_configure_harnesses_add_databricks_survives_failed_ucode_configure(
+    isolated_config, monkeypatch
+) -> None:
+    """A failing ``ucode configure`` aborts only the add — setup itself survives.
+
+    The reported shape: ucode's Databricks CLI self-upgrade cannot replace an
+    existing ``/usr/local/bin/databricks`` (setup-cli refuses to overwrite it),
+    so ``ucode configure`` exits non-zero and
+    :func:`~omnigent.onboarding.ucode_setup.configure_ucode_for_workspace`
+    raises ``ClickException``. Before the fix that exception propagated out of
+    the menu loop and killed the whole setup TUI with no in-product recovery.
+    Now the add returns a ✗ status with manual-upgrade guidance, the credential
+    menu re-renders (the follow-up ``q``/``q`` inputs are consumed by live
+    menus, exit 0), and no half-configured provider is persisted.
+    """
+    from click import ClickException
+
+    def _failing_configure_ucode(url: str, *, agents: list[str] | None = None) -> None:
+        raise ClickException(
+            "`ucode configure` exited with code 1; see the command output above for details."
+        )
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.setup.login_databricks_workspace",
+        lambda url, *, console=None: "my-ws",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_setup.configure_ucode_for_workspace",
+        _failing_configure_ucode,
+    )
+
+    db = _databricks_add_menu_index()
+    stdin = "\n".join(["1", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    # Setup survived the failed add and exited cleanly through the menus.
+    assert result.exit_code == 0, result.output
+    assert "exited with code 1" in result.output
+    # The user gets the manual Databricks CLI upgrade escape in-product. (The
+    # transient ✗ status renders only on the TTY menu frame, not this numbered
+    # fallback — the e2e PTY test covers it.)
+    assert "sudo rm /usr/local/bin/databricks" in result.output
+    assert "setup-cli/main/install.sh" in result.output
+    # Nothing was persisted — no half-configured databricks provider.
+    cfg = _config_yaml(isolated_config)
+    assert "databricks" not in cfg.get("providers", {})
+
+
+def test_configure_harnesses_add_databricks_aborts_add_when_ucode_records_no_state(
     isolated_config, monkeypatch
 ) -> None:
     """If ``ucode configure`` records no state for the workspace, the add aborts
-    loudly and persists NO databricks provider.
+    with a ✗ status and persists NO databricks provider — without killing setup.
 
     Guards against a half-configured provider: routing would otherwise silently
-    fall back. With ``ucode_workspace_exists`` → False the branch must raise, so
-    the command exits non-zero and ``providers`` stays empty.
+    fall back. With ``ucode_workspace_exists`` → False the branch reports the
+    missing state and returns to the credential menu (exit 0 via ``q``/``q``).
     """
     monkeypatch.setattr(
         "omnigent.onboarding.setup.login_databricks_workspace",
@@ -1546,8 +1594,8 @@ def test_configure_harnesses_add_databricks_fails_loud_when_ucode_records_no_sta
     stdin = "\n".join(["1", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
-    # The branch raised ClickException → non-zero exit with an explanatory message.
-    assert result.exit_code != 0
+    # The add aborted with the explanatory message, but setup itself survived.
+    assert result.exit_code == 0, result.output
     assert "recorded no state" in result.output
     # Nothing was persisted — no half-configured databricks provider.
     cfg = _config_yaml(isolated_config)
