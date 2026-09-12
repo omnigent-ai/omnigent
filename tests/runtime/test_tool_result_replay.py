@@ -394,3 +394,19 @@ def test_sanitize_replayed_image_blocks_downgrades_responses_compaction_marker()
     assert sanitized[2:] == content[2:]
     assert content == original
     assert trc.sanitize_replayed_image_blocks(sanitized) == sanitized
+
+
+def test_sanitize_replayed_image_blocks_downgrades_typeless_compaction_marker() -> None:
+    """A marker stripped from a data URI with no declared media type still downgrades."""
+    content = [
+        {
+            "type": "input_image",
+            "image_url": "[binary content omitted from the compaction snapshot]",
+        }
+    ]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    assert sanitized[0]["type"] == "input_text"
+    assert "image omitted" in sanitized[0]["text"]
+    assert "binary" not in sanitized[0]["text"]

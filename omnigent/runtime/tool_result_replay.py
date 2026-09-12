@@ -69,9 +69,10 @@ _MCP_ERROR_PREFIX = "Error: "
 #: and the bare ``data``/``mimeType`` form MCP persists.
 _IMAGE_TYPE_KEY_RE = re.compile(r'"type"\s*:\s*"image"')
 _IMAGE_DATA_KEY_RE = re.compile(r'"data"\s*:')
-_COMPACTION_IMAGE_MARKER_RE = re.compile(
-    r"\[(image/[^\s\]]+) content omitted from the compaction snapshot\]"
-)
+#: The exact sentence the compaction storage seam writes over a stripped
+#: payload. The leading token is the block's declared media type, or
+#: ``binary`` when the data URI carried none.
+_COMPACTION_MARKER_RE = re.compile(r"\[([^\s\]]+) content omitted from the compaction snapshot\]")
 
 
 def _holds_clipped_image_payload(body: str) -> bool:
@@ -576,13 +577,13 @@ def _sanitize_replayed_block(block: object) -> object:
         return _sanitize_image_block(parsed)
     if block_type == "input_image":
         image_url = parsed.get("image_url")
-        marker = (
-            _COMPACTION_IMAGE_MARKER_RE.fullmatch(image_url)
-            if isinstance(image_url, str)
-            else None
-        )
+        marker = _COMPACTION_MARKER_RE.fullmatch(image_url) if isinstance(image_url, str) else None
         if marker is not None:
-            return {"type": "input_text", "text": image_omitted_placeholder(marker.group(1))}
+            media_type = marker.group(1)
+            return {
+                "type": "input_text",
+                "text": image_omitted_placeholder(media_type if "/" in media_type else None),
+            }
     if block_type == "tool_result":
         inner = parsed.get("content")
         if isinstance(inner, list):
