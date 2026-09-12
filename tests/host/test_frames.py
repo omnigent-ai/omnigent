@@ -37,6 +37,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostProviderOpFrame,
+    HostProviderOpResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -53,6 +55,43 @@ from omnigent.host.frames import (
     encode_host_frame,
     workspace_missing_message,
 )
+
+
+def test_provider_op_frames_round_trip() -> None:
+    """``host.provider_op`` survives encode → decode unchanged."""
+    frame = HostProviderOpFrame(
+        request_id="req-1",
+        op="provider_upsert",
+        params={"name": "gw", "entry": {"kind": "gateway", "openai": {"base_url": "https://x/v1"}}},
+    )
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert decoded == frame
+
+
+def test_provider_op_result_frames_round_trip() -> None:
+    """``host.provider_op_result`` survives both shapes — ok and failed."""
+    ok = HostProviderOpResultFrame(request_id="req-1", status="ok", payload={"providers": []})
+    assert decode_host_frame(encode_host_frame(ok)) == ok
+
+    failed = HostProviderOpResultFrame(
+        request_id="req-2",
+        status="failed",
+        error="no provider named 'nope'",
+        error_status=404,
+        error_code="not_found",
+    )
+    assert decode_host_frame(encode_host_frame(failed)) == failed
+
+
+def test_provider_op_rejects_non_object_params() -> None:
+    """A ``params`` that is not a JSON object is a decode error, not a crash."""
+    import json as _json
+
+    raw = _json.dumps(
+        {"kind": "host.provider_op", "request_id": "r", "op": "providers_list", "params": [1, 2]}
+    )
+    with pytest.raises(ValueError):
+        decode_host_frame(raw)
 
 
 def test_import_local_frames_round_trip() -> None:
