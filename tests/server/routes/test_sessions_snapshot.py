@@ -563,6 +563,15 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "message",
+    [
+        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED",
+        'API Error: 429 {"error": {"code": "insufficient_quota"}}',
+        "HTTP 429: billing_hard_limit_reached",
+        "API Error: 429: Your credit balance is too low to access the API.",
+    ],
+)
+@pytest.mark.parametrize(
     ("stored_code", "expected_code"),
     [
         ("native_turn_error", "rate_limit_exceeded"),
@@ -571,12 +580,12 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
     ],
 )
 async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
+    message: str,
     stored_code: str,
     expected_code: str,
 ) -> None:
     """Failures saved without a rate-limit code become retryable on reload."""
     session_id = "319c3d34a4ab4e6d983872bf898a19b4"
-    message = "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED"
     conv = Conversation(
         id=session_id,
         created_at=1,

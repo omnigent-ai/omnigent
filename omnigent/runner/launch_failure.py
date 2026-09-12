@@ -185,11 +185,6 @@ _NATIVE_ERROR_HTTP_STATUS = re.compile(
     r"\s*[:=(]?\s*(\d{3})\b",
     re.IGNORECASE,
 )
-_PERMANENT_QUOTA_MARKERS = (
-    "insufficient_quota",
-    "billing_hard_limit_reached",
-    "credit balance is too low",
-)
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
@@ -204,8 +199,6 @@ def classify_native_turn_error(code: str, message: str) -> str:
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:
-        return code
-    if any(marker in message.lower() for marker in _PERMANENT_QUOTA_MARKERS):
         return code
     if status == "429" or _RATE_LIMIT_ERROR.search(message):
         return "rate_limit_exceeded"
@@ -237,7 +230,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
     "native_turn_error": "The agent ran into an error during this turn.",
-    "rate_limit_exceeded": "The model's rate limit was reached. Wait a moment, then retry.",
+    "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",
 }
 
 

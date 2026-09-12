@@ -226,7 +226,7 @@ def test_databricks_rate_limit_is_retryable_live_and_after_reload(
         output=message if status_includes_output else None,
     )
     pill = page.get_by_test_id("error-pill")
-    headline = "The model's rate limit was reached. Wait a moment, then retry."
+    headline = "The model's rate limit was reached. You can retry this turn."
     expect(pill).to_contain_text(headline, timeout=15_000)
     expect(pill.get_by_role("button", name="Retry", exact=True)).to_be_visible()
     pill.get_by_role("button", name=headline, exact=False).click()

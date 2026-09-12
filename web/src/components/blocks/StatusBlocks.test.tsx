@@ -428,7 +428,7 @@ describe("ErrorBanner", () => {
     );
 
     expect(screen.getByTestId("error-headline")).toHaveTextContent(
-      "The model's rate limit was reached. Wait a moment, then retry.",
+      "The model's rate limit was reached. You can retry this turn.",
     );
     fireEvent.click(screen.getByRole("button", { name: /model's rate limit was reached/i }));
     expect(screen.getByTestId("error-message-content")).toHaveTextContent(RATE_LIMIT_ERROR);

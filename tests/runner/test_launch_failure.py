@@ -127,9 +127,12 @@ def test_command_path_is_matched_by_basename() -> None:
         "HTTP/1.1 429",
         "status_code: 429",
         "Too Many Requests",
+        'API Error: 429 {"error": {"code": "insufficient_quota"}}',
+        "HTTP 429: billing_hard_limit_reached",
+        "API Error: 429: Your credit balance is too low to access the API.",
     ],
 )
-def test_classifies_native_rate_limit_errors(code: str, message: str) -> None:
+def test_classifies_native_429_and_rate_limit_errors(code: str, message: str) -> None:
     assert classify_native_turn_error(code, message) == "rate_limit_exceeded"
 
 
@@ -145,14 +148,11 @@ def test_classifies_native_rate_limit_errors(code: str, message: str) -> None:
         "HTTP/1.1 403: See rate_limit_exceeded troubleshooting",
         "There's an issue with the selected model. It may not exist.",
         "You've hit your usage limit.",
-        'API Error: 429 {"error": {"code": "insufficient_quota"}}',
-        "HTTP 429: billing_hard_limit_reached",
-        "API Error: 429: Your credit balance is too low to access the API.",
         "Error loading model-429",
         "Request rejected (4290)",
     ],
 )
-def test_preserves_unrecognized_and_permanent_native_turn_errors(message: str) -> None:
+def test_preserves_other_native_turn_errors(message: str) -> None:
     assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
 
 
@@ -170,7 +170,7 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
         ("runner_disconnected", "host dropped"),
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
-        ("rate_limit_exceeded", "Wait a moment, then retry"),
+        ("rate_limit_exceeded", "You can retry this turn"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

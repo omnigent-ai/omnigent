@@ -75,7 +75,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
   codex_turn_error: "Codex ran into an error during this turn.",
   native_turn_error: "The agent ran into an error during this turn.",
-  rate_limit_exceeded: "The model's rate limit was reached. Wait a moment, then retry.",
+  rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
