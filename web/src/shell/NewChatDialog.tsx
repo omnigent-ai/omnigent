@@ -3526,6 +3526,17 @@ export function NewChatLandingScreen() {
           : supportsAgySkipPermissions
             ? AGY_NATIVE_SKIP_MODES
             : [];
+  // The wire value behind permissionConfigRow's label; marks the current row
+  // in the direct-mode picker.
+  const directModeCurrent = supportsPermissionMode
+    ? permissionMode
+    : supportsApprovalMode
+      ? approvalMode
+      : supportsCursorMode
+        ? cursorExecMode
+        : supportsAgySkipPermissions
+          ? agySkipMode
+          : undefined;
   const selectDirectMode = (mode: string) => {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
@@ -5787,6 +5798,7 @@ export function NewChatLandingScreen() {
                       <ComposerPermissionPicker
                         label={permissionConfigRow.label}
                         value={permissionConfigRow.value}
+                        current={directModeCurrent}
                         options={directModeOptions}
                         onSelect={selectDirectMode}
                         testIdPrefix="new-chat-landing"
