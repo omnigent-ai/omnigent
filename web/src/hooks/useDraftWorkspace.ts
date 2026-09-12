@@ -62,14 +62,28 @@ function contextBasePath(hostId: string, contextId: string): string {
 class DraftWorkspaceHttpError extends Error {
   readonly status: number;
 
-  constructor(prefix: string, status: number, statusText: string) {
-    super(`${prefix}: ${status} ${statusText}`);
+  constructor(prefix: string, status: number, statusText: string, detail?: string) {
+    super(`${prefix}: ${status} ${statusText}${detail ? ` — ${detail}` : ""}`);
     this.status = status;
   }
 }
 
-function httpError(prefix: string, response: Response): DraftWorkspaceHttpError {
-  return new DraftWorkspaceHttpError(prefix, response.status, response.statusText);
+async function httpError(prefix: string, response: Response): Promise<DraftWorkspaceHttpError> {
+  let detail: string | undefined;
+  try {
+    const body: unknown = await response.json();
+    if (
+      body !== null &&
+      typeof body === "object" &&
+      "detail" in body &&
+      typeof body.detail === "string"
+    ) {
+      detail = body.detail;
+    }
+  } catch {
+    // Proxies may return an empty or non-JSON error response.
+  }
+  return new DraftWorkspaceHttpError(prefix, response.status, response.statusText, detail);
 }
 
 function isWorkspaceContextWire(value: unknown): value is WorkspaceContextWire {
@@ -212,7 +226,7 @@ export async function createDraftWorkspaceContext(
       body: JSON.stringify({ workspace }),
     },
   );
-  if (!response.ok) throw httpError("draft workspace create failed", response);
+  if (!response.ok) throw await httpError("draft workspace create failed", response);
   const body: unknown = await response.json();
   if (!isWorkspaceContextWire(body)) {
     throw new Error("draft workspace create returned an unrecognized context shape");
@@ -229,7 +243,7 @@ export async function heartbeatDraftWorkspaceContext(
       method: "POST",
     },
   );
-  if (!response.ok) throw httpError("draft workspace heartbeat failed", response);
+  if (!response.ok) throw await httpError("draft workspace heartbeat failed", response);
   const body: unknown = await response.json();
   if (!isWorkspaceContextWire(body)) {
     throw new Error("draft workspace heartbeat returned an unrecognized context shape");
@@ -244,7 +258,7 @@ export async function fetchDraftTerminals(
   const response = await authenticatedFetch(
     `${contextBasePath(hostId, contextId)}/resources/terminals`,
   );
-  if (!response.ok) throw httpError("draft terminals fetch failed", response);
+  if (!response.ok) throw await httpError("draft terminals fetch failed", response);
   const body = (await response.json()) as { data?: unknown };
   const rows = Array.isArray(body.data) ? body.data : [];
   const terminals: DraftTerminalInfo[] = [];
@@ -274,7 +288,7 @@ export async function createDraftTerminal(
       }),
     },
   );
-  if (!response.ok) throw httpError("draft terminal create failed", response);
+  if (!response.ok) throw await httpError("draft terminal create failed", response);
   const body = (await response.json()) as Record<string, unknown>;
   const terminal = terminalInfoFromResource(body);
   if (terminal === null) {
@@ -295,7 +309,7 @@ export async function deleteDraftTerminal(
     { method: "DELETE" },
   );
   if (!response.ok && response.status !== 404) {
-    throw httpError("draft terminal delete failed", response);
+    throw await httpError("draft terminal delete failed", response);
   }
   if (response.status === 404) return null;
   const body: unknown = await response.json();
@@ -314,7 +328,7 @@ export async function discardDraftWorkspaceContext(
     method: "DELETE",
   });
   if (!response.ok && response.status !== 404) {
-    throw httpError("draft workspace discard failed", response);
+    throw await httpError("draft workspace discard failed", response);
   }
   if (response.status === 404) return null;
   const body: unknown = await response.json();
@@ -336,7 +350,7 @@ export async function adoptDraftWorkspaceContext(
       body: JSON.stringify({ session_id: sessionId }),
     },
   );
-  if (!response.ok) throw httpError("draft workspace handoff failed", response);
+  if (!response.ok) throw await httpError("draft workspace handoff failed", response);
   const body: unknown = await response.json();
   if (!isWorkspaceContextWire(body)) {
     throw new Error("draft workspace handoff returned an unrecognized context shape");

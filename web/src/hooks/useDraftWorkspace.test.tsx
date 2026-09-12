@@ -6,6 +6,7 @@ import { markHostKeyless, clearHostKeyless } from "@/lib/sessionHost";
 import { landingStorageKey } from "@/lib/landingStorage";
 import {
   buildDraftTerminalAttachPath,
+  createDraftWorkspaceContext,
   useDraftWorkspace,
   type DraftWorkspaceContext,
 } from "./useDraftWorkspace";
@@ -73,6 +74,29 @@ describe("buildDraftTerminalAttachPath", () => {
     } finally {
       clearHostKeyless("draft_keyless");
     }
+  });
+});
+
+describe("draft workspace errors", () => {
+  it("shows the host upgrade instruction while preserving the HTTP status", async () => {
+    fetchMock.mockResolvedValue(
+      response({ detail: "upgrade this host to enable workspace contexts" }, 409),
+    );
+    await expect(createDraftWorkspaceContext("older-host", "/repo")).rejects.toMatchObject({
+      status: 409,
+      message:
+        "draft workspace create failed: 409 Failed — upgrade this host to enable workspace contexts",
+    });
+  });
+
+  it("preserves an HTTP error when a proxy returns non-JSON", async () => {
+    fetchMock.mockResolvedValue(
+      new Response("Bad gateway", { status: 502, statusText: "Bad Gateway" }),
+    );
+    await expect(createDraftWorkspaceContext("host", "/repo")).rejects.toMatchObject({
+      status: 502,
+      message: "draft workspace create failed: 502 Bad Gateway",
+    });
   });
 });
 
