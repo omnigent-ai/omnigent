@@ -2357,6 +2357,8 @@ class HostProcess:
                         "type": item.type,
                         "response_id": item.response_id,
                         "data": item.data.model_dump(mode="json", exclude_none=True),
+                        # Source record time; the server preserves it on the row.
+                        **({"created_at": item.created_at} if item.created_at is not None else {}),
                     }
                     for item in local.items
                 ],
