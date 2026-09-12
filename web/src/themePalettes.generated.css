@@ -57,7 +57,7 @@
   --popover-foreground: oklch(0.965 0.003 240);
   --primary: #e8ecf0;
   --primary-foreground: #11171c;
-  --selection-background: rgba(240, 1, 150, 0.4);
+  --selection-background: rgba(240, 1, 150, 0.15);
   --selection-foreground: #f9a8d4;
   --secondary: #1f272d;
   --secondary-foreground: #e8ecf0;
@@ -80,7 +80,7 @@
   --sidebar-accent-foreground: oklch(0.965 0.003 240);
   --sidebar-border: oklch(0.28 0.005 240);
   --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
-  --sidebar-active: rgba(240, 1, 150, 0.4);
+  --sidebar-active: rgba(240, 1, 150, 0.15);
   --sidebar-active-foreground: #f472b6;
 }
 

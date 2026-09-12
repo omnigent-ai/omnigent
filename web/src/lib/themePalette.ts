@@ -166,9 +166,9 @@ type PaletteTokenInput = Pick<
 function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
   return {
     // Selection is a translucent wash of the palette's accent under the page
-    // foreground, never an opaque block. Dark variants use the alpha that lifts
-    // the page lightness by ~18 L*, so the wash reads the same weight in every
-    // palette; light variants use the lightest alpha that stays visible.
+    // foreground, never an opaque block. Dark alphas are tuned per accent: a
+    // saturated one reads heavy at low alpha, a pastel needs more; light
+    // variants use the lightest alpha that stays visible.
     selectionForeground: tokens.foreground,
     cardForeground: tokens.foreground,
     tray: tokens.card,
@@ -264,7 +264,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         primaryForeground: "#11171c",
         // pink-300 rather than the sidebar's pink-400 so selected text stays
         // >= 4.5:1 over the tinted code and muted surfaces.
-        selectionBackground: "rgba(240, 1, 150, 0.4)",
+        selectionBackground: "rgba(240, 1, 150, 0.15)",
         selectionForeground: "#f9a8d4",
         secondary: "#1f272d",
         secondaryForeground: "#e8ecf0",
@@ -286,7 +286,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebarAccentForeground: "oklch(0.965 0.003 240)",
         sidebarBorder: "oklch(0.28 0.005 240)",
         sidebarRing: "oklch(0.92 0.003 240 / 0.4)",
-        sidebarActive: "rgba(240, 1, 150, 0.4)",
+        sidebarActive: "rgba(240, 1, 150, 0.15)",
         sidebarActiveForeground: "#f472b6",
         sidebarBackground:
           "linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)), linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%)",
@@ -634,8 +634,8 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#2e3440",
-        // Capped below the ~18 L* lift: the body text, already the lightest Nord
-        // colour, only stays at 4.5:1 over the muted surface up to here.
+        // The body text, already the lightest Nord colour, only stays at 4.5:1
+        // over the muted surface up to here.
         selectionBackground: "rgba(136, 192, 208, 0.25)",
         foreground: "#eceff4",
         card: "rgba(59, 66, 82, 0.6)",
