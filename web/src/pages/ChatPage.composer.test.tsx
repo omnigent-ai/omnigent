@@ -907,7 +907,7 @@ describe("Composer slash-command submit routing", () => {
     );
 
     const pill = screen.getByTestId("composer-config-gear");
-    expect(pill).toHaveTextContent("sonnet");
+    expect(pill).toHaveTextContent("Sonnet 4.6");
     expect(pill).not.toHaveTextContent("Workspace");
     fireEvent.focus(pill);
     const gearTooltip = await screen.findByTestId("composer-config-gear-tooltip");
@@ -1237,7 +1237,7 @@ describe("Composer model/effort label", () => {
 
   const label = () => screen.getByTestId("composer-agent-config-value");
 
-  it("shows the resolved model beside Edit in the shared harness row", () => {
+  it("shows the catalog display name beside Edit in the shared harness row", () => {
     useChatStore.setState({
       llmModel: "system.ai.claude-opus-4-6",
       sessionHarness: "claude-native",
@@ -1253,17 +1253,15 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("system.ai.claude-opus-4-6");
+    expect(label()).toHaveTextContent("Opus");
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
     const row = screen.getByTestId("composer-agent-edit");
     expect(row).toHaveClass("composer-agent-row");
     expect(row).toHaveAttribute("data-active", "true");
-    expect(within(row).getByText("system.ai.claude-opus-4-6")).toHaveClass("text-right");
+    expect(within(row).getByText("Opus")).toHaveClass("text-right");
     expect(within(row).getByText("Edit")).toHaveClass("composer-agent-edit");
     fireEvent.keyDown(row, { key: "ArrowRight" });
-    expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent(
-      "system.ai.claude-opus-4-6",
-    );
+    expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus");
   });
 
   it("shows the model in the foreground and effort muted", () => {
@@ -1281,12 +1279,12 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("opus");
+    expect(label()).toHaveTextContent("Opus");
     expect(label()).toHaveTextContent("High");
     // The harness identity ("Claude") is NOT in the label — it lives in the gear tooltip.
     expect(label()).not.toHaveTextContent("Claude");
     // Model black, effort grey.
-    expect(within(label()).getByText("opus")).toHaveClass("text-foreground");
+    expect(within(label()).getByText("Opus")).toHaveClass("text-foreground");
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
@@ -1311,7 +1309,7 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("opus");
+    expect(label()).toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
     expect(screen.queryByTestId("composer-agent-effort-value")).toBeNull();
     // This suite shares one global store and only resets what each test sets;
@@ -1344,7 +1342,7 @@ describe("Composer model/effort label", () => {
       />,
     );
     expect(label()).toHaveTextContent("Smart Routing");
-    expect(label()).not.toHaveTextContent("opus");
+    expect(label()).not.toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
     // Routing picks the connection per turn, so the pill tooltip must not
     // surface a stale pinned provenance row.
@@ -1375,9 +1373,9 @@ describe("Composer model/effort label", () => {
     // The harness's report ("haiku") is the display authority: neither the
     // pending request ("sonnet") nor the cross-session sticky ("opus") may
     // render as if it were the session's model.
-    expect(label()).toHaveTextContent("haiku");
-    expect(label()).not.toHaveTextContent("opus");
-    expect(label()).not.toHaveTextContent("sonnet");
+    expect(label()).toHaveTextContent("Haiku");
+    expect(label()).not.toHaveTextContent("Opus");
+    expect(label()).not.toHaveTextContent("Sonnet 4.6");
   });
 
   const CLAUDE_LIVE_OPTIONS = [
@@ -1385,7 +1383,7 @@ describe("Composer model/effort label", () => {
     { id: "sonnet", model: "system.ai.claude-sonnet-5", displayName: "Sonnet 5", isDefault: true },
   ];
 
-  it("preserves a Claude concrete model ID in the read-only label", () => {
+  it("uses the catalog display name for an exact Claude model ID in the read-only label", () => {
     useChatStore.setState({
       selectedModel: null,
       sessionModelOverride: null,
@@ -1404,8 +1402,8 @@ describe("Composer model/effort label", () => {
       />,
     );
 
-    expect(label()).toHaveTextContent("system.ai.claude-sonnet-5");
-    expect(label()).not.toHaveTextContent("Sonnet 5");
+    expect(label()).toHaveTextContent("Sonnet 5");
+    expect(label()).not.toHaveTextContent("system.ai.claude-sonnet-5");
     // The modal's catalog-default fallback (isDefault row when no concrete
     // model) is exercised in the real browser by the claude model-picker e2e
     // tests, where the Radix Select actually mounts its option rows.
@@ -1537,12 +1535,12 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("composer-2.5");
+    expect(label()).toHaveTextContent("Composer 2.5");
     // Neither the stale sticky, the meaningless vendor default, nor any effort leaks in.
-    expect(label()).not.toHaveTextContent("opus-4.5");
+    expect(label()).not.toHaveTextContent("Opus 4.5");
     expect(label()).not.toHaveTextContent("fable");
     expect(label()).not.toHaveTextContent("Low");
-    expect(within(label()).getByText("composer-2.5")).toHaveClass("text-foreground");
+    expect(within(label()).getByText("Composer 2.5")).toHaveClass("text-foreground");
   });
 
   it("surfaces an SDK/bundle session's model from the override, not the cross-session sticky", () => {
@@ -3215,7 +3213,7 @@ describe("Composer config gear", () => {
     // A bare "Default" was the bug: this gear and the new-session gear named
     // the same unpinned session's model differently, so neither told the user
     // which model Codex would actually run.
-    expect(screen.getByRole("menuitemcheckbox", { name: "gpt-5.6-luna" })).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6-Luna" })).toBeTruthy();
   });
 
   it("names the model Claude's Default resolves to, like Codex", async () => {
@@ -3244,7 +3242,7 @@ describe("Composer config gear", () => {
 
     await openSessionModels();
     await screen.findByTestId("composer-agent-config-menu");
-    expect(screen.getByRole("menuitemcheckbox", { name: "claude-opus-4-8[1m]" })).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8 (1M context)" })).toBeTruthy();
   });
 
   it("does not open the modal via bare /model when the gear is disabled (unreachable)", async () => {
@@ -3534,7 +3532,7 @@ describe("Composer config gear", () => {
 
     it("still commits a real pick made from the catalog", async () => {
       const setModel = await openModalOnRoutedSession();
-      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "sonnet" }));
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
       await waitFor(() =>
         expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
       );

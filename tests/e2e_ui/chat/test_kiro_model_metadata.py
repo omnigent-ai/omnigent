@@ -100,7 +100,7 @@ def test_kiro_native_picker_lists_models_and_persists_pick(
     # The discovered Kiro catalog renders with its display names.
     haiku_row = page.locator('[role="menuitemcheckbox"][data-model-id="claude-haiku-4.5"]')
     expect(haiku_row).to_be_visible()
-    expect(haiku_row).to_contain_text("claude-haiku-4.5")
+    expect(haiku_row).to_contain_text("Claude Haiku 4.5")
     expect(page.locator('[role="menuitemcheckbox"][data-model-id="glm-5"]')).to_be_visible()
 
     # Picking a model drafts it; Save PATCHes model_override (consumed at

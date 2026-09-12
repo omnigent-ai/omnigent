@@ -31,8 +31,9 @@ async def _drive(
         page = await browser.new_page(viewport={"width": 1920, "height": 1000})
         release = asyncio.Event()
         selected = "claude-opus-4-8[1m]"
+        selected_label = "Opus 4.8 (1M context)"
         previous = "claude-sonnet-5"
-        rows = [{"id": selected, "model": selected, "displayName": "Opus"}]
+        rows = [{"id": selected, "model": selected, "displayName": selected_label}]
         try:
             await _register_common_routes(page, created_session_id=session_id, create_bodies=[])
             await page.route(
@@ -86,7 +87,7 @@ async def _drive(
             )
             await page.get_by_test_id("new-chat-button").click()
             await _open_entry_models(page, "ag_claude_e2e")
-            await page.get_by_role("menuitemcheckbox", name=selected, exact=True).click()
+            await page.get_by_role("menuitemcheckbox", name=selected_label, exact=True).click()
             await page.get_by_role("menuitemcheckbox", name="High", exact=True).click()
             await _close_entry_models(page)
             await page.evaluate("""() => {
@@ -112,7 +113,7 @@ async def _drive(
             )
             release.set()
             await page.wait_for_url(f"{base_url}/c/{session_id}")
-            await expect(label).to_contain_text(selected)
+            await expect(label).to_contain_text(selected_label)
             await page.locator("[data-composer-card]").screenshot(
                 path=output / "bound-model.png", animations="disabled"
             )
@@ -120,7 +121,10 @@ async def _drive(
             samples = await page.evaluate("window.composerSamples")
             assert any("/c/temp" in sample["path"] for sample in samples), samples
             assert all(previous not in sample["text"] for sample in samples), samples
-            assert all(selected in sample["text"] for sample in samples), samples
+            assert all(
+                selected in sample["text"] or selected_label in sample["text"]
+                for sample in samples
+            ), samples
         finally:
             release.set()
             await page.unroute_all(behavior="wait")

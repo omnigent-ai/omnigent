@@ -138,7 +138,7 @@ async def _drive_codex_effort_prelaunch(base_url: str, session_id: str) -> None:
             await _open_entry_models(page, "ag_codex_e2e")
 
             await expect(page.get_by_test_id("new-chat-landing-agent-models")).to_contain_text(
-                "gpt-live-default"
+                "GPT Live Default"
             )
             effort = page.get_by_test_id("new-chat-landing-agent-effort-high")
             await expect(effort).to_be_visible()

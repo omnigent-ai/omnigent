@@ -208,7 +208,7 @@ def test_new_session_composer_pill_shows_one_tooltip(
     try:
         page.goto(f"{base_url}/c/{session_id}")
         tooltips = _hover_pill_and_collect_tooltips(page)
-        _assert_single_merged_tooltip(tooltips, extra_needles=(f"Model: {_MODEL_ID}",))
+        _assert_single_merged_tooltip(tooltips, extra_needles=("Model: Fable 5.1",))
     finally:
         page.unroute_all(behavior="ignoreErrors")
 
@@ -237,6 +237,6 @@ def test_existing_session_composer_pill_shows_one_tooltip(
         expect(page.get_by_text(_REPLY, exact=True)).to_be_visible()
         expect(page.get_by_role("button", name="Send", exact=True)).to_be_visible(timeout=30_000)
         tooltips = _hover_pill_and_collect_tooltips(page)
-        _assert_single_merged_tooltip(tooltips, extra_needles=(f"Model: {_MODEL_ID}",))
+        _assert_single_merged_tooltip(tooltips, extra_needles=("Model: Fable 5.1",))
     finally:
         page.unroute_all(behavior="ignoreErrors")

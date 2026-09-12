@@ -106,7 +106,7 @@ async def _drive_claude_default_label(base_url: str, session_id: str) -> None:
             model = page.get_by_test_id("new-chat-landing-agent-models")
             # The design's row 6: the untouched select names the model a
             # Default launch truly runs, for claude exactly as for codex.
-            await expect(model).to_contain_text("claude-opus-4-8[1m]")
+            await expect(model).to_contain_text("Opus 4.8 (1M context)")
         finally:
             await browser.close()
 

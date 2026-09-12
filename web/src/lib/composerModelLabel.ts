@@ -18,7 +18,7 @@ export interface NativeModelLabelFields {
 }
 
 export function nativeModelLabel(option: NativeModelLabelFields): string {
-  return option.model ?? option.id;
+  return option.displayName ?? option.model ?? option.id;
 }
 
 export function defaultModelLabel(options: readonly NativeModelLabelFields[]): string {
@@ -36,7 +36,9 @@ export function formatStatusModelLabel(
 ): string | null {
   const raw = model?.trim();
   if (!raw) return null;
-  const option = codexModelOptions.find((candidate) => candidate.id === raw);
+  const option =
+    codexModelOptions.find((candidate) => candidate.id === raw) ??
+    codexModelOptions.find((candidate) => candidate.model === raw);
   return option ? nativeModelLabel(option) : raw;
 }
 

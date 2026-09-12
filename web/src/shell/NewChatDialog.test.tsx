@@ -1814,23 +1814,19 @@ describe("NewChatLandingScreen", () => {
     expect(worktree).toBeDisabled();
   });
 
-  it("resolves family-only host labels in the landing picker", () => {
+  it("uses the host's advertised display name in the landing picker", () => {
     mockClaudeModels([
       { id: "opus", model: "system.ai.claude-opus-4-6", displayName: "Opus", isDefault: true },
     ]);
     renderLanding();
     const picker = screen.getByTestId("new-chat-landing-agent-select");
-    expect(picker).toHaveAccessibleName(
-      "Claude Code, Model system.ai.claude-opus-4-6, Effort Default",
-    );
+    expect(picker).toHaveAccessibleName("Claude Code, Model Opus, Effort Default");
     fireEvent.pointerDown(picker, { button: 0 });
     const summary = screen.getByTestId("new-chat-landing-agent-summary-a1");
-    expect(summary).toHaveTextContent("system.ai.claude-opus-4-6");
+    expect(summary).toHaveTextContent("Opus");
     expect(summary).toHaveClass("text-right");
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
-      "system.ai.claude-opus-4-6",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus");
   });
 
   it("renders structured model and effort details in the harness picker", async () => {
@@ -1848,17 +1844,14 @@ describe("NewChatLandingScreen", () => {
     const picker = screen.getByTestId("new-chat-landing-agent-select");
     expect(picker).not.toHaveTextContent("Claude Code");
     expect(picker).not.toHaveTextContent("Default");
-    // The managed 1M catalog row keeps its "(1M context)" variant (#7094).
-    expect(picker).toHaveAccessibleName(
-      "Claude Code, Model system.ai.claude-opus-4-8[1m], Effort Default",
-    );
+    expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort Default");
     // The hover summary is a styled tooltip with bold keys, never the
     // unstyled native `title` hover.
     expect(picker).not.toHaveAttribute("title");
     fireEvent.focus(picker);
     const pickerTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
     expect(pickerTooltip).toHaveTextContent("Harness: Claude Code");
-    expect(pickerTooltip).toHaveTextContent("Model: Default (system.ai.claude-opus-4-8[1m])");
+    expect(pickerTooltip).toHaveTextContent("Model: Default (Opus 4.8)");
     expect(pickerTooltip).toHaveTextContent("Effort: Default");
     for (const key of within(pickerTooltip).getAllByText(/^(Harness|Model|Effort):$/)) {
       expect(key).toHaveClass("font-semibold");
@@ -1874,9 +1867,7 @@ describe("NewChatLandingScreen", () => {
       "items-baseline",
       "gap-1",
     );
-    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
-      "system.ai.claude-opus-4-8[1m]",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass(
       "min-w-0",
       "truncate",
@@ -1906,18 +1897,14 @@ describe("NewChatLandingScreen", () => {
     expect(menus).toHaveLength(2);
     expect(menus[0]).toBe(rootMenu);
     expect(menus[1]).toHaveClass("w-[13.75rem]", "composer-agent-config-menu");
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
-      "system.ai.claude-opus-4-8[1m]",
-    );
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
-      "system.ai.claude-sonnet-4-6[1m]",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.8");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Sonnet 4.6");
     expect(screen.getByTestId("new-chat-landing-agent-models").textContent).not.toContain("`");
     expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("High");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
     expect(screen.getByTestId("new-chat-landing-agent-config-value")).toHaveTextContent(
-      "system.ai.claude-opus-4-8[1m]High",
+      "Opus 4.8High",
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
@@ -1928,9 +1915,7 @@ describe("NewChatLandingScreen", () => {
       "text-muted-foreground",
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).not.toHaveClass("hidden");
-    expect(picker).toHaveAccessibleName(
-      "Claude Code, Model system.ai.claude-opus-4-8[1m], Effort High",
-    );
+    expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort High");
   });
 
   it("does not duplicate model or effort controls in landing Advanced settings", () => {
@@ -2055,8 +2040,8 @@ describe("NewChatLandingScreen", () => {
     expect(picker).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
     expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "pr-0");
     expect(model).toHaveClass("min-w-0", "truncate");
-    expect(model).toHaveAttribute("title", "system.ai.claude-extraordinarily-long-model-name[1m]");
-    expect(model).toHaveTextContent("system.ai.claude-extraordinarily-long-model-name[1m]");
+    expect(model).toHaveAttribute("title", "Extraordinarily Long Claude Model Name");
+    expect(model).toHaveTextContent("Extraordinarily Long Claude Model Name");
     expect(voice).toHaveClass("shrink-0", "size-8", "md:size-7");
     expect(submit.parentElement).toHaveClass("shrink-0");
   });
@@ -2299,9 +2284,9 @@ describe("NewChatLandingScreen", () => {
     expect(picker).toHaveAccessibleName("Claude Code, Model Default, Effort Default");
 
     selectAgent("a2");
-    expect(picker).toHaveAccessibleName("Codex, Model databricks-gpt-5-5, Effort Default");
+    expect(picker).toHaveAccessibleName("Codex, Model GPT-5.5, Effort Default");
     expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
-      "databricks-gpt-5-5",
+      "GPT-5.5",
     );
   });
 
@@ -2332,12 +2317,10 @@ describe("NewChatLandingScreen", () => {
     expect(menu).toContainElement(harness);
     expect(harness).toHaveAttribute("data-state", "open");
     expect(harness).toContainElement(screen.getByTestId("new-chat-landing-agent-config-a2"));
-    const model = screen.getByRole("menuitemcheckbox", { name: "databricks-gpt-5-6" });
+    const model = screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" });
     fireEvent.pointerMove(model, { pointerType: "mouse" });
     fireEvent.click(model);
-    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
-      "databricks-gpt-5-6",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("GPT-5.6");
     expect(screen.getAllByRole("menu")).toHaveLength(2);
     fireEvent.keyDown(model, { key: "ArrowLeft" });
     expect(screen.queryByTestId("new-chat-landing-agent-models")).not.toBeInTheDocument();
@@ -2354,7 +2337,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     fireEvent.focus(parent);
     expect(screen.getAllByRole("menu")).toHaveLength(2);
-    expect(screen.getByRole("menuitemcheckbox", { name: "databricks-gpt-5-6" })).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
     expect(screen.getAllByRole("menu")).toHaveLength(2);
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
@@ -2373,8 +2356,8 @@ describe("NewChatLandingScreen", () => {
     fireEvent.keyDown(codex, { key: "ArrowRight" });
     expect(screen.getAllByRole("menu")).toHaveLength(2);
     expect(picker).toHaveAccessibleName(/^Codex/);
-    expect(screen.getByRole("menuitemcheckbox", { name: "databricks-gpt-5-6" })).toBeVisible();
-    fireEvent.keyDown(screen.getByRole("menuitemcheckbox", { name: "databricks-gpt-5-6" }), {
+    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
+    fireEvent.keyDown(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" }), {
       key: "Escape",
     });
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
@@ -2393,11 +2376,11 @@ describe("NewChatLandingScreen", () => {
 
     const models = within(screen.getByTestId("new-chat-landing-agent-models"));
     expect(models.queryByText("Default")).not.toBeInTheDocument();
-    expect(models.getAllByText("databricks-gpt-5-5")).toHaveLength(1);
-    const defaultModel = models.getByRole("menuitemcheckbox", { name: "databricks-gpt-5-5" });
+    expect(models.getAllByText("GPT-5.5")).toHaveLength(1);
+    const defaultModel = models.getByRole("menuitemcheckbox", { name: "GPT-5.5" });
     expect(defaultModel).toHaveAttribute("aria-checked", "true");
 
-    fireEvent.click(models.getByRole("menuitemcheckbox", { name: "databricks-gpt-5-6" }));
+    fireEvent.click(models.getByRole("menuitemcheckbox", { name: "GPT-5.6" }));
     expect(defaultModel).toHaveAttribute("aria-checked", "false");
     fireEvent.click(defaultModel);
     expect(defaultModel).toHaveAttribute("aria-checked", "true");
@@ -2939,12 +2922,8 @@ describe("NewChatLandingScreen", () => {
     openAgentModels("a1");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
     expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
-    expect(
-      screen.getByRole("menuitemcheckbox", { name: "system.ai.claude-opus-4-8[1m]" }),
-    ).toBeVisible();
-    expect(
-      screen.getByRole("menuitemcheckbox", { name: "system.ai.claude-sonnet-4-6[1m]" }),
-    ).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" })).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Sonnet 4.6" })).toBeVisible();
     expect(screen.queryByText("Fable")).toBeNull();
     expect(screen.queryByText("Sonnet 5")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
@@ -2962,8 +2941,8 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     renderLanding();
     openAgentModels("a1");
-    pickPrimaryOption("model", "system.ai.claude-haiku-4-5");
-    expect(selectedPickerModel().textContent).toContain("system.ai.claude-haiku-4-5");
+    pickPrimaryOption("model", "Haiku 4.5");
+    expect(selectedPickerModel().textContent).toContain("Haiku 4.5");
 
     // The host's provider changes under the open modal: its next poll of the
     // catalog no longer lists the pick.
@@ -2983,7 +2962,7 @@ describe("NewChatLandingScreen", () => {
     });
     const trigger = selectedPickerModel();
     expect(trigger.textContent).toContain("Harness default");
-    expect(trigger.textContent).not.toContain("system.ai.claude-haiku-4-5");
+    expect(trigger.textContent).not.toContain("Haiku 4.5");
 
     // Saving the fallback sends no override, so the launch uses the provider's default.
     closePrimaryPicker();
@@ -3042,13 +3021,13 @@ describe("NewChatLandingScreen", () => {
     openAgentModels("a2");
     // Pin GPT-5.6: the Effort row follows the DRAFTED model, so its ladder
     // swaps in (xhigh appears, low disappears).
-    pickPrimaryOption("model", "databricks-gpt-5-6");
+    pickPrimaryOption("model", "GPT-5.6");
     expect(screen.queryByRole("menuitemcheckbox", { name: "Low" })).toBeNull();
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "xHigh" }));
     expect(selectedPickerEffort().textContent).toContain("xHigh");
     // Back to GPT-5.5, whose ladder has no xhigh: the stale rung
     // resets so Save can't commit a level the model rejects.
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "databricks-gpt-5-5" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "GPT-5.5" }));
     expect(selectedPickerEffort().textContent).toContain("Default");
     closePrimaryPicker();
 
@@ -3087,20 +3066,20 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     openAgentModels("a2");
-    expect(screen.getAllByText("databricks-gpt-5-5").length).toBeGreaterThan(0);
-    expect(screen.getByText("databricks-gpt-5-6")).toBeTruthy();
-    fireEvent.click(screen.getByText("databricks-gpt-5-6"));
+    expect(screen.getAllByText("GPT-5.5").length).toBeGreaterThan(0);
+    expect(screen.getByText("GPT-5.6")).toBeTruthy();
+    fireEvent.click(screen.getByText("GPT-5.6"));
     closePrimaryPicker();
 
     // The Codex model is remembered under codex-native only; Claude Code's
     // picker should reopen on its own Default instead of inheriting the GPT id.
     openAgentModels("a1");
     expect(selectedPickerModel().textContent).toContain("Harness default");
-    expect(selectedPickerModel().textContent).not.toContain("databricks-gpt-5-6");
+    expect(selectedPickerModel().textContent).not.toContain("GPT-5.6");
     closePrimaryPicker();
 
     openAgentModels("a2");
-    expect(selectedPickerModel().textContent).toContain("databricks-gpt-5-6");
+    expect(selectedPickerModel().textContent).toContain("GPT-5.6");
     closePrimaryPicker();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
@@ -5121,7 +5100,7 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     // Clicking a2 (Codex) commits the pick — the trigger reflects it.
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
-      "Codex, Model databricks-gpt-5-5, Effort Default",
+      "Codex, Model GPT-5.5, Effort Default",
     );
   });
 
@@ -5385,7 +5364,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     const menu = screen.getByRole("menu");
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     expect(screen.getAllByRole("menu")).toEqual([menu]);
-    expect(screen.getByRole("menuitemcheckbox", { name: "databricks-gpt-5-6" })).toBeVisible();
+    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
     expect(screen.queryByTestId("new-chat-landing-agent-a2")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
     expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeVisible();
@@ -5481,9 +5460,9 @@ describe("NewChatLandingScreen smart routing", () => {
   // so the pre-launch row offers only what the create call can express. With
   // the server flag off, Smart Routing is never an option.
   it.each([
-    ["Claude Code", "a1", true, "Smart Routing", "system.ai.claude-opus-4-8[1m]"],
+    ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
     ["Claude Code", "a1", false, null, "Harness default"],
-    ["Codex", "a2", true, "Smart Routing", "databricks-gpt-5-5"],
+    ["Codex", "a2", true, "Smart Routing", "GPT-5.5"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
     (_label, agentId, flag, routingOption, siblingOption) => {
@@ -5548,7 +5527,7 @@ describe("NewChatLandingScreen smart routing", () => {
         expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeNull();
         expect(
           screen.getByRole("menuitemcheckbox", {
-            name: agentId === "a2" ? "databricks-gpt-5-6" : "system.ai.claude-opus-4-8[1m]",
+            name: agentId === "a2" ? "GPT-5.6" : "Opus 4.8",
           }),
         ).toBeTruthy();
       }
@@ -5604,9 +5583,7 @@ describe("NewChatLandingScreen smart routing", () => {
     });
     openAgentModels("a1");
     expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" })).toBeNull();
-    expect(
-      screen.getByRole("menuitemcheckbox", { name: "system.ai.claude-opus-4-8[1m]" }),
-    ).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" })).toBeTruthy();
   });
 
   it("offers Smart Routing on a host that reports no gateway_inference at all", () => {
@@ -5644,7 +5621,7 @@ describe("NewChatLandingScreen smart routing", () => {
     );
     openAgentModels("a1");
     // Pin a model + effort first so the routing pick has something to clear.
-    pickPrimaryOption("model", "system.ai.claude-opus-4-8[1m]");
+    pickPrimaryOption("model", "Opus 4.8");
     pickPrimaryOption("effort", "High");
     pickPrimaryOption("model", "Smart Routing");
     closePrimaryPicker();
@@ -6285,7 +6262,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     );
     selectAgent("a2");
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
-      "Codex, Model databricks-gpt-5-5, Effort Default",
+      "Codex, Model GPT-5.5, Effort Default",
     );
   });
 

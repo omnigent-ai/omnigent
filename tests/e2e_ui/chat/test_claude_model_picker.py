@@ -19,9 +19,9 @@ from omnigent.harnesses.claude_native.main import (
 from tests.e2e_ui.conftest import fetch_with_retry, seed_committed_turn
 
 _EXPECTED_ROWS = [
-    ("opus", "system.ai.claude-opus-4-10"),
-    ("sonnet", "system.ai.claude-sonnet-5"),
-    ("haiku", "system.ai.claude-haiku-4-5"),
+    ("opus", "Opus 4.10"),
+    ("sonnet", "Sonnet 5"),
+    ("haiku", "Haiku 4.5"),
 ]
 
 
@@ -254,7 +254,7 @@ def test_claude_native_picker_updates_after_delayed_catalog(
 
     # The catalog labels the reported model; the sticky ("opus") is never
     # silently written as a request.
-    expect(label).to_contain_text("system.ai.claude-sonnet-5", timeout=10_000)
+    expect(label).to_contain_text("Sonnet 5", timeout=10_000)
     assert not any("model_override" in body for body in patch_bodies)
     page.get_by_test_id("composer-config-gear").click()
     page.get_by_test_id("composer-agent-edit").click()
@@ -301,9 +301,7 @@ def test_claude_native_alias_selection_persists(
     assert patch_bodies[-1] == {"model_override": "opus"}
     # The read-only composer label keeps the reported model — a request is
     # not truth until the harness confirms it.
-    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(
-        "system.ai.claude-sonnet-5"
-    )
+    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text("Sonnet 5")
 
 
 def _force_asleep_liveness(page: Page, session_id: str) -> None:
@@ -450,7 +448,7 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # The composer label already shows the concrete routable id.
+    # The composer names the routable model using its advertised label.
     expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(
         "databricks-claude-sonnet-4-5", timeout=15_000
     )
@@ -623,7 +621,7 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
     # Open the Codex session FIRST and only — binding it makes gpt-5.5 the
     # sticky pick, and leaves Claude never-visited so its open is cold.
     page.goto(f"{base_url}/c/{codex_session}")
-    expect(label).to_contain_text("databricks-gpt-5-5", timeout=15_000)
+    expect(label).to_contain_text(_CODEX_MODEL_LABEL, timeout=15_000)
     expect(page.locator("main[data-session-id]")).to_have_attribute(
         "data-session-id", codex_session
     )
@@ -634,11 +632,11 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
     page.evaluate("window.__modelLabelLog = []")
     page.locator(f'a[href="/c/{claude_session}"]').click()
     page.wait_for_url(re.compile(rf"/c/{re.escape(claude_session)}"))
-    expect(label).to_contain_text("system.ai.claude-sonnet-5", timeout=15_000)
+    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
 
     page.wait_for_function(
         """sessionId => window.__modelLabelLog.some(entry =>
-            entry.path === `/c/${sessionId}` && entry.text.includes("system.ai.claude-sonnet-5")
+            entry.path === `/c/${sessionId}` && entry.text.includes("Sonnet 5")
         )""",
         arg=claude_session,
     )
@@ -737,7 +735,7 @@ def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
         """,
         {"sessionId": session_id},
     )
-    expect(label).to_contain_text("system.ai.claude-sonnet-5[1m]", timeout=10_000)
+    expect(label).to_contain_text("Sonnet 5 (1M context)", timeout=10_000)
 
     log = page.evaluate("window.__modelLabelLog")
     labels = [entry["text"] for entry in log if entry["text"]]
@@ -809,7 +807,7 @@ def test_union_catalog_pick_patches_the_row_id_verbatim(
     gear.click()
     page.get_by_test_id("composer-agent-edit").click()
     bracket_row = page.locator('[role="menuitemcheckbox"][data-model-id="sonnet[1m]"]')
-    expect(bracket_row).to_contain_text("databricks-claude-sonnet-5[1m]")
+    expect(bracket_row).to_contain_text("Sonnet 5 (1M context)")
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -823,9 +821,7 @@ def test_union_catalog_pick_patches_the_row_id_verbatim(
     # The label keeps the reported model ("Sonnet 5" — the bound
     # databricks-claude-sonnet-5); the request flips nothing until the
     # harness confirms.
-    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(
-        "databricks-claude-sonnet-5"
-    )
+    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text("Sonnet 5")
 
 
 def test_claude_native_picker_highlights_the_reported_model(

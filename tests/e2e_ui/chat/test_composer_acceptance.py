@@ -102,17 +102,18 @@ def test_long_model_and_permission_remain_single_row(
 ) -> None:
     base_url, session_id = seeded_session
     model = "system.ai.claude-opus-4-8[1m]"
+    display_name = "Opus 4.8 (1M context)"
     _patch_session_as_claude_native(
         page,
         session_id,
         llm_model=model,
         permission_mode="bypassPermissions",
-        model_options=[{"id": model, "model": model, "displayName": "Opus 4.8 (1M context)"}],
+        model_options=[{"id": model, "model": model, "displayName": display_name}],
     )
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     label = page.get_by_test_id("composer-agent-config-value")
-    expect(label).to_contain_text(model, timeout=30_000)
+    expect(label).to_contain_text(display_name, timeout=30_000)
     permission = page.get_by_test_id("composer-permission-chip")
     expect(permission).to_be_visible()
     if width == 3200:
@@ -127,7 +128,7 @@ def test_long_model_and_permission_remain_single_row(
     assert permission_bounds is not None and send_bounds is not None
     page.get_by_test_id("composer-config-gear").click()
     summary = page.get_by_test_id("composer-agent-model-summary")
-    expect(summary).to_contain_text(model)
+    expect(summary).to_contain_text(display_name)
     page.get_by_test_id("composer-agent-menu").screenshot(
         path=tmp_path / f"harness-row-{width}.png", animations="disabled"
     )
@@ -142,9 +143,11 @@ def test_long_model_and_permission_remain_single_row(
         "harness_summary_single_line": len(summary_dimensions["lines"]) == 1,
         "send_on_screen": send_bounds["x"] + send_bounds["width"] <= width,
     }
-    expect(page.get_by_test_id("composer-agent-model-value")).to_have_attribute("title", model)
-    expect(summary).to_have_attribute("title", model)
+    expect(page.get_by_test_id("composer-agent-model-value")).to_have_attribute(
+        "title", display_name
+    )
+    expect(summary).to_have_attribute("title", display_name)
     page.get_by_test_id("composer-agent-edit").click()
-    expect(page.get_by_role("menuitemcheckbox", name=model, exact=True)).to_be_visible()
+    expect(page.get_by_role("menuitemcheckbox", name=display_name, exact=True)).to_be_visible()
     page.unroute_all(behavior="wait")
     assert all(results.values()), results

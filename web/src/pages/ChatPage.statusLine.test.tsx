@@ -425,7 +425,7 @@ describe("composerHarnessLabel", () => {
 });
 
 describe("formatModelEffortStatusLabel", () => {
-  it("uses the actual Codex model ID from model metadata", () => {
+  it("uses the Codex display name from model metadata", () => {
     expect(
       formatModelEffortStatusLabel("gpt-5.5", "xhigh", [
         {
@@ -442,7 +442,7 @@ describe("formatModelEffortStatusLabel", () => {
           isDefault: true,
         },
       ]),
-    ).toBe("databricks-gpt-5-5 xHigh");
+    ).toBe("codex says GPT-5.5 xHigh");
   });
 
   it("leaves unknown model ids raw", () => {
@@ -452,12 +452,12 @@ describe("formatModelEffortStatusLabel", () => {
     );
   });
 
-  it("resolves an exact Claude alias to its catalog model ID", () => {
+  it("resolves an exact Claude alias to its catalog display name", () => {
     expect(
       formatModelEffortStatusLabel("sonnet[1m]", "high", [
         { id: "sonnet[1m]", model: "claude-sonnet-5[1m]", displayName: "Sonnet 5 (1M context)" },
       ]),
-    ).toBe("claude-sonnet-5[1m] High");
+    ).toBe("Sonnet 5 (1M context) High");
   });
 
   it("preserves a catalog-less Claude alias without claiming a version", () => {

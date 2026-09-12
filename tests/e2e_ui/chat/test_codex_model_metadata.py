@@ -6,6 +6,7 @@ import json
 import re
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry
@@ -16,6 +17,7 @@ def _patch_session_as_codex_native(
     session_id: str,
     *,
     custom_agent: bool = False,
+    reported_model: str = "gpt-5.5",
 ) -> list[dict]:
     """Patch the browser's session snapshot into a codex-native response.
 
@@ -29,6 +31,7 @@ def _patch_session_as_codex_native(
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
     :param custom_agent: Remove the presentation wrapper label and report the
         resolved ``codex-native`` harness, matching a YAML custom agent.
+    :param reported_model: Catalog id, wire model, or an unlisted report.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
@@ -81,7 +84,7 @@ def _patch_session_as_codex_native(
             labels["omnigent.wrapper"] = "codex-native-ui"
         payload["labels"] = labels
         payload["harness"] = "codex-native" if custom_agent else "codex"
-        payload["llm_model"] = "gpt-5.5"
+        payload["llm_model"] = reported_model
         payload["reasoning_effort"] = "xhigh"
         payload["model_options"] = [
             {
@@ -112,9 +115,18 @@ def _patch_session_as_codex_native(
     return patch_bodies
 
 
+@pytest.mark.parametrize(
+    ("reported_model", "expected_label"),
+    [
+        pytest.param("gpt-5.5", "Codex Pretty 5.5", id="catalog-id"),
+        pytest.param("databricks-gpt-5-5", "Codex Pretty 5.5", id="wire-model"),
+    ],
+)
 def test_codex_native_picker_uses_raw_model_metadata(
     page: Page,
     seeded_session: tuple[str, str],
+    reported_model: str,
+    expected_label: str,
 ) -> None:
     """Render Codex's display name and effort id without local conversion.
 
@@ -126,17 +138,19 @@ def test_codex_native_picker_uses_raw_model_metadata(
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
         session; the browser snapshot is patched to codex-native.
+    :param reported_model: Exact catalog id or wire model.
+    :param expected_label: Advertised name of the matching catalog row.
     :returns: None.
     """
     base_url, session_id = seeded_session
-    _patch_session_as_codex_native(page, session_id)
+    _patch_session_as_codex_native(page, session_id, reported_model=reported_model)
 
     page.goto(f"{base_url}/c/{session_id}")
 
     # The read-only composer label shows the resolved model + effort; the
     # harness identity moved into the config gear's hover tooltip.
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
-        "databricks-gpt-5-5", timeout=15_000
+        expected_label, timeout=15_000
     )
     expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
@@ -150,7 +164,7 @@ def test_codex_native_picker_uses_raw_model_metadata(
 
     model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.5"]')
     expect(model_row).to_be_visible()
-    expect(model_row).to_contain_text("databricks-gpt-5-5")
+    expect(model_row).to_contain_text("Codex Pretty 5.5")
     # Re-select the current model to close the listbox without sending Escape
     # to the surrounding dialog.
 
@@ -163,6 +177,31 @@ def test_codex_native_picker_uses_raw_model_metadata(
     expect(effort_row).to_contain_text("xHigh")
     # Codex effort ids render raw (not title-cased) even in the shared Select.
     assert effort_row.evaluate("el => getComputedStyle(el).textTransform") == "none"
+
+
+def test_codex_native_unknown_model_keeps_raw_label(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """An unlisted report stays raw despite a populated, unrelated catalog."""
+    base_url, session_id = seeded_session
+    _patch_session_as_codex_native(page, session_id, reported_model="gpt-unlisted")
+    page.goto(f"{base_url}/c/{session_id}")
+
+    label = page.get_by_test_id("composer-agent-model-value")
+    expect(label).to_have_text("gpt-unlisted", timeout=15_000)
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_count(0)
+    page.reload()
+    expect(label).to_have_text("gpt-unlisted", timeout=15_000)
+
+    page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    unknown_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-unlisted"]')
+    expect(unknown_row).to_have_text("gpt-unlisted (current)")
+    expect(unknown_row).to_have_attribute("aria-checked", "true")
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.5"]')).to_contain_text(
+        "Codex Pretty 5.5"
+    )
 
 
 def test_custom_codex_native_agent_keeps_model_and_effort_controls(
@@ -187,7 +226,7 @@ def test_custom_codex_native_agent_keeps_model_and_effort_controls(
     page.goto(f"{base_url}/c/{session_id}")
 
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
-        "databricks-gpt-5-5", timeout=15_000
+        "Codex Pretty 5.5", timeout=15_000
     )
     expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
@@ -381,7 +420,7 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
 
     model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]')
     expect(model_row).to_be_visible()
-    expect(model_row).to_contain_text("gpt-5.6-luna")
+    expect(model_row).to_contain_text("GPT-5.6-Luna")
     # Re-select the current model to close the listbox without sending
     # Escape to the surrounding dialog.
 
