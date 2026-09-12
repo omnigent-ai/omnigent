@@ -519,6 +519,8 @@ async def test_wait_for_runner_zero_timeout_just_checks() -> None:
     assert await reg.wait_for_runner("r1", timeout_s=0) is None
     session = reg.register("r1", _NoopWS(), _hello())
     assert await reg.wait_for_runner("r1", timeout_s=-1) is session
+
+
 def _fill_outbound(session: registry_mod.RunnerSession) -> None:
     for _ in range(registry_mod._OUTBOUND_QUEUE_MAX_FRAMES):
         session.outbound_queue.put_nowait("frame")

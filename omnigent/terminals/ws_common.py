@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -20,6 +20,15 @@ _WS_COALESCE_MAX_BYTES: Final[int] = 64 * 1024
 # Keep these in sync with web's synchronous-echo limits.
 _INTERACTIVE_WS_COALESCE_MAX_BYTES: Final[int] = 2048
 _INTERACTIVE_ECHO_WINDOW_S: Final[float] = 0.75
+
+# Bound queued terminal output by bytes and objects so stalled clients cannot
+# grow an unbounded backlog of output chunks.
+_OUTPUT_QUEUE_MAX_BYTES: Final[int] = 16 * 1024 * 1024
+_OUTPUT_QUEUE_MAX_ITEMS: Final[int] = 32768
+_OUTPUT_DROP_WARN_INTERVAL_S: Final[float] = 30.0
+# CAN aborts a partial CSI and ST terminates a dangling OSC/DCS string.
+_OUTPUT_GAP_RESYNC: Final[bytes] = b"\x18\x1b\\"
+_REPAINT_MIN_INTERVAL_S: Final[float] = 2.0
 
 # Application-level WebSocket close codes (RFC 6455 reserves 4xxx).
 WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = 4404
@@ -234,6 +243,7 @@ class _GapRepainter:
         if self._task is task:
             self._task = None
         self._trailing = False
+
 
 async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
     """Return whether the targeted tmux pane still has a live process.
