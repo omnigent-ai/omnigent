@@ -477,7 +477,7 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     meta = await _capture_pane_metadata(tmux, socket_path, tmux_target)
     # Only extend the capture into history when on the primary screen; on the
     # alternate screen ``-S -`` leaks stale primary history (see docstring).
-    capture_args = ["capture-pane", "-e", "-p", "-t", tmux_target]
+    capture_args = ["capture-pane", "-J", "-e", "-p", "-t", tmux_target]
     if meta is not None and not meta.alternate_on:
         capture_args += ["-S", "-"]
     try:
