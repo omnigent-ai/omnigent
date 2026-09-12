@@ -12,7 +12,7 @@ vi.mock("@/lib/projectsApi", () => ({
 }));
 // Hoisted so the vi.mock factory can reference it; per-test overrides let
 // cases control the host-resolved model catalog (default: empty, so the
-// Claude static-alias fallback is what populates the picker).
+// model control degrades to its disabled no-catalog state).
 const { hostModelOptionsMock } = vi.hoisted(() => ({ hostModelOptionsMock: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }] }),
@@ -354,6 +354,24 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("offers no hardcoded model rows when no catalog has resolved", async () => {
+    // No host catalog anywhere: the control must degrade to its disabled
+    // "no catalog" state instead of offering a static alias list (Fable)
+    // nothing established the host's CLI can launch.
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
+
+    expect(screen.getByTestId("project-settings-model")).toBeDisabled();
+    expect(screen.queryByText("Fable")).not.toBeInTheDocument();
+    expect(screen.getByText(/no model catalog available/i)).toBeInTheDocument();
+  });
+
   it("round-trips a stored model default on save", async () => {
     availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
     getProjectMock.mockResolvedValue({
@@ -363,7 +381,8 @@ describe("ProjectSettingsDialog", () => {
     });
     renderDialog();
     await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
-    // The stored alias seeds the control (the static Claude vocab labels it).
+    // The stored alias seeds the control (kept as a labeled fallback row
+    // even though no catalog lists it).
     await waitFor(() =>
       expect(screen.getByTestId("project-settings-model")).toHaveTextContent(/opus/i),
     );

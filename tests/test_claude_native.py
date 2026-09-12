@@ -10303,6 +10303,174 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     ]
 
 
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        pytest.param(
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "model": "claude-sonnet-5",
+                    "models": [
+                        {"id": "claude-sonnet-5", "displayName": "Sonnet 5"},
+                        {"id": "acme-gateway-sonnet"},
+                        {"id": "", "displayName": "nameless"},
+                        "garbage",
+                    ],
+                }
+            ),
+            [
+                {"id": "claude-sonnet-5", "displayName": "Sonnet 5"},
+                {"id": "acme-gateway-sonnet", "displayName": "acme-gateway-sonnet"},
+            ],
+            id="entries-read-verbatim-malformed-dropped",
+        ),
+        pytest.param(
+            json.dumps({"type": "system", "subtype": "init", "model": "claude-sonnet-5"}),
+            [],
+            id="init-without-menu",
+        ),
+        pytest.param(
+            "Usage: /model <name>. Available: sonnet, or a full model ID.",
+            [],
+            id="no-stream-json-events",
+        ),
+    ],
+)
+def test_parse_claude_visible_models(stdout: str, expected: list[dict[str, str]]) -> None:
+    """The init event's menu parses verbatim; anything unusable yields []."""
+    assert claude_native._parse_claude_visible_models(stdout) == expected
+
+
+async def test_probe_claude_model_options_offers_only_the_visible_menu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The visible ``models`` menu decides which rows the probe offers.
+
+    The usage line advertises every settable alias, but the init event's
+    menu is what the CLI's own picker shows: a help-only alias loses its
+    row, a ``[1m]`` variant folds onto its listed base model and stays,
+    and a managed entry the usage line never mentions becomes its own row
+    under the menu's exact id and label.
+    """
+    resolutions = {
+        "sonnet": ("claude-sonnet-5", "Sonnet 5"),
+        "opus": ("claude-opus-5", "Opus 5"),
+        "fable": ("claude-fable-5", "Fable 5"),
+        "sonnet[1m]": ("claude-sonnet-5[1m]", "Sonnet 5"),
+    }
+
+    class _Run:
+        def __init__(self, stdout: bytes) -> None:
+            self.returncode = 0
+            self._stdout = stdout
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._stdout, b""
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
+        if "--model" not in args:
+            events = [
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "model": "claude-sonnet-5",
+                    "models": [
+                        {"id": "claude-sonnet-5", "displayName": "Sonnet 5"},
+                        {"id": "claude-opus-5", "displayName": "Opus 5"},
+                        {"id": "acme-gateway-sonnet", "displayName": "Acme Managed Sonnet"},
+                    ],
+                },
+                {
+                    "type": "result",
+                    "result": "Current model: Sonnet 5 (default)\n"
+                    "Usage: /model <name>. Available: sonnet, opus, fable, "
+                    "sonnet[1m], default, or a full model ID.",
+                },
+            ]
+            return _Run("\n".join(json.dumps(event) for event in events).encode())
+        alias = args[args.index("--model") + 1]
+        model, label = resolutions[alias]
+        events = [
+            {"type": "system", "subtype": "init", "model": model},
+            {"type": "result", "result": f"Current model: {label}"},
+        ]
+        return _Run("\n".join(json.dumps(event) for event in events).encode())
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    assert probe.alias_rows == [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+        {
+            "id": "sonnet[1m]",
+            "model": "claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+        },
+        {
+            "id": "acme-gateway-sonnet",
+            "model": "acme-gateway-sonnet",
+            "displayName": "Acme Managed Sonnet",
+        },
+    ]
+    assert probe.default_model == "claude-sonnet-5"
+
+
+async def test_probe_claude_model_options_keeps_alias_rows_without_a_menu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An init event that reports no ``models`` menu filters nothing.
+
+    Older harness releases omit the menu; the printed aliases keep their
+    rows rather than being judged against knowledge that never arrived.
+    """
+    resolutions = {
+        "sonnet": ("claude-sonnet-5", "Sonnet 5"),
+        "fable": ("claude-fable-5", "Fable 5"),
+    }
+
+    class _Run:
+        def __init__(self, stdout: bytes) -> None:
+            self.returncode = 0
+            self._stdout = stdout
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._stdout, b""
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
+        if "--model" not in args:
+            events = [
+                {"type": "system", "subtype": "init", "model": "claude-sonnet-5"},
+                {
+                    "type": "result",
+                    "result": "Usage: /model <name>. Available: sonnet, fable, "
+                    "or a full model ID.",
+                },
+            ]
+            return _Run("\n".join(json.dumps(event) for event in events).encode())
+        alias = args[args.index("--model") + 1]
+        model, label = resolutions[alias]
+        events = [
+            {"type": "system", "subtype": "init", "model": model},
+            {"type": "result", "result": f"Current model: {label}"},
+        ]
+        return _Run("\n".join(json.dumps(event) for event in events).encode())
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    assert probe.alias_rows == [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+        {"id": "fable", "model": "claude-fable-5", "displayName": "Fable 5"},
+    ]
+
+
 async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
