@@ -2642,6 +2642,95 @@ def test_pi_own_login_options_tolerate_malformed_files(tmp_path: Path) -> None:
     assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
 
 
+def _seed_pi_multi_login(agent_dir: Path) -> None:
+    """Seed a Pi agent dir logged into two providers, openrouter among them."""
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "auth.json").write_text(
+        json.dumps(
+            {
+                "anthropic": {"type": "api_key", "key": "sk-own"},
+                "openrouter": {"type": "api_key", "key": "sk-or-own"},
+            }
+        )
+    )
+    (agent_dir / "models-store.json").write_text(
+        json.dumps(
+            {
+                "anthropic": {
+                    "models": [
+                        {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5"},
+                        {"id": "claude-opus-4-6", "name": "Claude Opus 4.6"},
+                    ],
+                },
+                # The multi-vendor catalog an openrouter login maintains: the
+                # rows a curated picker must not be flooded with.
+                "openrouter": {
+                    "models": [
+                        {"id": "ai21/jamba-large-1.7", "name": "AI21: Jamba Large 1.7"},
+                        {"id": "z-ai/glm-5.3:batch", "name": "Z.ai: GLM 5.3 (batch)"},
+                    ],
+                },
+            }
+        )
+    )
+
+
+def test_pi_own_login_options_honor_enabled_models(tmp_path: Path) -> None:
+    """Pi's ``enabledModels`` curation scopes the own-login picker catalog.
+
+    With Pi logged into several providers but curated to one model in its
+    ``settings.json``, the pre-launch picker must offer exactly that scope —
+    what Pi's own Ctrl+P picker cycles — not the union of every logged-in
+    provider's full catalog.
+    """
+    _seed_pi_multi_login(tmp_path)
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"enabledModels": ["anthropic/claude-sonnet-4-5"]})
+    )
+
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == [
+        {
+            "id": "anthropic/claude-sonnet-4-5",
+            "model": "anthropic/claude-sonnet-4-5",
+            "displayName": "Claude Sonnet 4.5",
+        },
+    ]
+
+
+def test_pi_own_login_options_enabled_models_globs_scope_by_provider(tmp_path: Path) -> None:
+    """A ``provider/*`` curation keeps that provider and drops the others."""
+    _seed_pi_multi_login(tmp_path)
+    (tmp_path / "settings.json").write_text(json.dumps({"enabledModels": ["anthropic/*"]}))
+
+    ids = [option["id"] for option in creds.pi_own_login_model_options(agent_dir=tmp_path)]
+    assert ids == ["anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-5"]
+
+
+def test_pi_own_login_options_unmatched_enabled_models_keep_catalog(tmp_path: Path) -> None:
+    """A curation matching nothing is "no curation" to Pi: keep the catalog.
+
+    Pi treats an entirely unmatched scope as unscoped (every available model
+    usable), so the picker must fall back to the full catalog rather than
+    going empty on stale ``enabledModels`` entries.
+    """
+    _seed_pi_multi_login(tmp_path)
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"enabledModels": ["mistral/devstral-large"]})
+    )
+
+    assert len(creds.pi_own_login_model_options(agent_dir=tmp_path)) == 4
+
+
+def test_pi_own_login_options_malformed_enabled_models_keep_catalog(tmp_path: Path) -> None:
+    """A malformed ``enabledModels`` (wrong type, junk entries) never scopes."""
+    _seed_pi_multi_login(tmp_path)
+    (tmp_path / "settings.json").write_text(json.dumps({"enabledModels": "anthropic"}))
+    assert len(creds.pi_own_login_model_options(agent_dir=tmp_path)) == 4
+
+    (tmp_path / "settings.json").write_text(json.dumps({"enabledModels": [42, "", "  "]}))
+    assert len(creds.pi_own_login_model_options(agent_dir=tmp_path)) == 4
+
+
 def test_pi_own_login_model_arg_strips_managed_prefix_only() -> None:
     """A managed provider-qualified pick degrades to the bare model id.
 
