@@ -17,6 +17,7 @@ import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
+import { landingStorageKey } from "@/lib/landingStorage";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -32,6 +33,10 @@ const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
 const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
+const identityState = vi.hoisted(() => ({
+  userId: null as string | null,
+  resolveIdentity: () => Promise.resolve(null as string | null),
+}));
 let searchParams = new URLSearchParams();
 let projects: { id: string | null; name: string }[] = [];
 let projectConfigs: Record<string, { host_id?: string; workspace?: string; agent_id?: string }> =
@@ -84,7 +89,11 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn(), getCurrentUserId: () => null }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: () => identityState.userId,
+  resolveIdentity: () => identityState.resolveIdentity(),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({
@@ -320,6 +329,8 @@ beforeEach(() => {
   removeLocalConversationMock.mockReturnValue(false);
   pushMatchers.length = 0;
   announcePushedSession = null;
+  identityState.userId = null;
+  identityState.resolveIdentity = () => Promise.resolve(identityState.userId);
   vi.mocked(authenticatedFetch).mockReset();
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
@@ -2441,6 +2452,102 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string).agent_id).toBe("ag_two");
+  });
+
+  it("hydrates the resolved account draft after delayed identity discovery", async () => {
+    const viewerId = "viewer@example.test";
+    const restoredWorkspace = "/Users/corey/restored-project";
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": { model: "opus", effort: "high" } }),
+    );
+    setHosts([host(), host({ host_id: "restored-host", name: "restored-host" })]);
+    setAgents([
+      agent(),
+      agent({
+        id: "ag_native",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+    ]);
+    identityState.userId = viewerId;
+    const viewerDraftKey = landingStorageKey("omnigent:landing-composer");
+    const savedDraft = {
+      project: "",
+      message: "restore this account draft",
+      files: [],
+      pickedAgentId: "ag_native",
+      selectedHostId: "restored-host",
+      sandboxSelected: false,
+      sandboxProvider: null,
+      sandboxRepoSelections: [],
+      workspace: restoredWorkspace,
+      branchName: "",
+      autoSeededBranch: "",
+      prefilledBranch: "",
+      permissionMode: "default",
+      approvalMode: "on-request",
+      bypassSandbox: false,
+      cursorExecMode: "ask",
+      agySkipMode: "default",
+      pickedHarness: null,
+      pickedModel: "opus",
+      pickedEffort: "high",
+      costControlMode: null,
+      agentFromConfig: false,
+      workspaceFromConfig: false,
+    };
+    localStorage.setItem(viewerDraftKey, JSON.stringify(savedDraft));
+    identityState.userId = null;
+    let resolveIdentity: (viewer: string | null) => void = () => {};
+    const identityResolved = new Promise<string | null>((resolve) => {
+      resolveIdentity = resolve;
+    });
+    identityState.resolveIdentity = () => identityResolved;
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+
+    await act(async () => {
+      identityState.userId = viewerId;
+      resolveIdentity(viewerId);
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(savedDraft.message),
+    );
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+      "Host: restored-host, Online",
+    );
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+      "restored-project",
+    );
+    expect(JSON.parse(localStorage.getItem(viewerDraftKey) ?? "null")).toMatchObject(savedDraft);
+    cleanup();
+    expect(JSON.parse(localStorage.getItem(viewerDraftKey) ?? "null")).toMatchObject(savedDraft);
+
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(savedDraft.message),
+    );
+
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      agent_id: "ag_native",
+      host_id: "restored-host",
+      workspace: restoredWorkspace,
+      model_override: "opus",
+      reasoning_effort: "high",
+    });
   });
 
   it("falls back to the default agent when the remembered id is no longer listed", async () => {

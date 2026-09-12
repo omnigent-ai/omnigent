@@ -110,6 +110,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
+import { useViewerId } from "@/hooks/useViewerId";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { randomUUID } from "@/lib/randomUUID";
@@ -2165,11 +2166,9 @@ interface LandingDraft {
 }
 
 const LANDING_COMPOSER_KEY = "omnigent:landing-composer";
-function readSavedLandingDraft(): LandingDraft | null {
+function readSavedLandingDraft(scope: string): LandingDraft | null {
   try {
-    const saved = JSON.parse(
-      localStorage.getItem(landingStorageKey(LANDING_COMPOSER_KEY)) ?? "null",
-    );
+    const saved = JSON.parse(localStorage.getItem(scope) ?? "null");
     return saved && typeof saved.message === "string" && typeof saved.workspace === "string"
       ? { ...saved, files: [] }
       : null;
@@ -2178,22 +2177,23 @@ function readSavedLandingDraft(): LandingDraft | null {
   }
 }
 let landingDraftScope = landingStorageKey(LANDING_COMPOSER_KEY);
-let landingDraft: LandingDraft | null = readSavedLandingDraft();
+let landingDraft: LandingDraft | null = readSavedLandingDraft(landingDraftScope);
 let landingDraftRevision = 0;
 
-function writeLandingDraft(draft: LandingDraft | null): void {
-  landingDraft = draft;
+function writeLandingDraft(
+  draft: LandingDraft | null,
+  scope = landingStorageKey(LANDING_COMPOSER_KEY),
+): void {
+  if (scope === landingDraftScope) {
+    landingDraft = draft;
+    landingDraftRevision += 1;
+  }
   try {
-    if (draft)
-      localStorage.setItem(
-        landingStorageKey(LANDING_COMPOSER_KEY),
-        JSON.stringify({ ...draft, files: [] }),
-      );
-    else localStorage.removeItem(landingStorageKey(LANDING_COMPOSER_KEY));
+    if (draft) localStorage.setItem(scope, JSON.stringify({ ...draft, files: [] }));
+    else localStorage.removeItem(scope);
   } catch {
     /* Storage is optional. */
   }
-  landingDraftRevision += 1;
 }
 
 // Test-only: clears the preserved landing draft so each case starts from a
@@ -2206,6 +2206,13 @@ export function resetLandingDraft(): void {
 }
 
 export function NewChatLandingScreen() {
+  useViewerId();
+  useLandingWorkspaceState();
+  const draftScope = landingStorageKey(LANDING_COMPOSER_KEY);
+  return <NewChatLandingComposer key={draftScope} draftScope={draftScope} />;
+}
+
+function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
   const landingResources = useLandingWorkspaceState();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -2325,9 +2332,10 @@ export function NewChatLandingScreen() {
   // visit (or a plain one) must not beat THIS visit's project defaults —
   // strip them so the prefill machine (fill-empty-only) can seed. Read once
   // per mount; only the lazy state initializers below consume it.
-  if (landingDraftScope !== landingStorageKey(LANDING_COMPOSER_KEY)) {
-    landingDraftScope = landingStorageKey(LANDING_COMPOSER_KEY);
-    landingDraft = readSavedLandingDraft();
+  if (landingDraftScope !== draftScope) {
+    landingDraftScope = draftScope;
+    landingDraft = readSavedLandingDraft(draftScope);
+    landingDraftRevision += 1;
   }
   const restoredDraft: LandingDraft | null =
     landingDraft === null || landingDraft.project === projectParam
@@ -2761,10 +2769,7 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     if (!submittedRef.current) {
       try {
-        localStorage.setItem(
-          landingStorageKey(LANDING_COMPOSER_KEY),
-          JSON.stringify({ ...draftRef.current, files: [] }),
-        );
+        localStorage.setItem(draftScope, JSON.stringify({ ...draftRef.current, files: [] }));
       } catch {
         /* Storage is optional. */
       }
@@ -2777,12 +2782,12 @@ export function NewChatLandingScreen() {
     return () => {
       onScreenRef.current = false;
       if (!submittedRef.current) {
-        writeLandingDraft(draftRef.current);
+        writeLandingDraft(draftRef.current, draftScope);
       } else if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null);
+        writeLandingDraft(null, draftScope);
       }
     };
-  }, []);
+  }, [draftScope]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -4702,7 +4707,7 @@ export function NewChatLandingScreen() {
   function returnDraftToUser() {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
-    if (!onScreenRef.current) writeLandingDraft(draftRef.current);
+    if (!onScreenRef.current) writeLandingDraft(draftRef.current, draftScope);
   }
 
   async function handleCreate() {
@@ -5216,7 +5221,7 @@ export function NewChatLandingScreen() {
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
       if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null);
+        writeLandingDraft(null, draftScope);
       }
       void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
 

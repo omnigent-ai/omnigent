@@ -24,7 +24,11 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn(), getCurrentUserId: () => null }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: () => null,
+  resolveIdentity: async () => null,
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
