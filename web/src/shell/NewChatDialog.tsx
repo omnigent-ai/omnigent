@@ -18,6 +18,7 @@ import {
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
@@ -288,10 +289,6 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // landing composer. Deliberately an allowlist while the pattern proves
 // out — other agents keep the "/" menu as the only skill surface.
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
-
-function codexPickerEffortLabel(effort: string): string {
-  return effort === "xhigh" ? "xHigh" : effort.charAt(0).toUpperCase() + effort.slice(1);
-}
 
 function createdHarnessOptions({
   harness,
@@ -1268,11 +1265,6 @@ function visibleModelLabel(label: string): string {
   return label.replaceAll("`", "");
 }
 
-function compactHarnessTriggerValue(value: string): string {
-  const defaultModel = /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
-  return defaultModel.replace(/ \([^()]*context[^()]*\)$/i, "");
-}
-
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 
 /**
@@ -1398,13 +1390,13 @@ export function AgentHarnessPicker({
   const triggerEffort = triggerDetails.find(
     (detail) => detail.label === "Effort" || detail.label === "Thinking level",
   );
-  const triggerModelText = triggerModel ? compactHarnessTriggerValue(triggerModel.value) : "";
-  const triggerEffortText = triggerEffort ? compactHarnessTriggerValue(triggerEffort.value) : "";
+  const triggerModelText = triggerModel ? compactModelTriggerLabel(triggerModel.value) : "";
+  const triggerEffortText = triggerEffort ? compactModelTriggerLabel(triggerEffort.value) : "";
   const visibleModelText = triggerModelText === "Default" ? "Models unavailable" : triggerModelText;
   const visibleEffortText =
     triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
   const triggerAccessibleDetails = triggerDetails
-    .map((detail) => `${detail.label} ${compactHarnessTriggerValue(detail.value)}`)
+    .map((detail) => `${detail.label} ${compactModelTriggerLabel(detail.value)}`)
     .join(", ");
   const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerAccessibleDetails]
     .filter(Boolean)
@@ -1427,7 +1419,7 @@ export function AgentHarnessPicker({
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
     const details = active
       ? triggerDetails
-          .map((detail) => compactHarnessTriggerValue(detail.value))
+          .map((detail) => compactModelTriggerLabel(detail.value))
           .filter((value) => value !== "Default" && value !== EFFORT_UNAVAILABLE_PLACEHOLDER)
           .join(" ")
       : "";
@@ -3249,7 +3241,7 @@ export function NewChatLandingScreen() {
               label: "Effort",
               value: routingOn
                 ? EFFORT_UNAVAILABLE_PLACEHOLDER
-                : codexPickerEffortLabel(pickedEffort) || "Default",
+                : normalizeEffortLabel(pickedEffort) || "Default",
             },
           ];
       return [
@@ -3339,7 +3331,7 @@ export function NewChatLandingScreen() {
         ? codexEffortLevelsForModel(
             codexModelOptions,
             pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-          ).map((value) => ({ value, label: codexPickerEffortLabel(value) }))
+          ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
         : [];
   const selectPickerModel = (model: string) => {
     if (!selectedNativeHarness) return;
@@ -3513,9 +3505,9 @@ export function NewChatLandingScreen() {
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
       const effort =
         native.iconKind === "codex"
-          ? codexPickerEffortLabel(saved.effort ?? "")
+          ? normalizeEffortLabel(saved.effort ?? "")
           : efforts.find((option) => option.value === saved.effort)?.label;
-      return [agent.id, [compactHarnessTriggerValue(label), effort].filter(Boolean).join(" ")];
+      return [agent.id, [compactModelTriggerLabel(label), effort].filter(Boolean).join(" ")];
     }),
   );
   const directModeOptions = smartRoutingHarnessSelected
