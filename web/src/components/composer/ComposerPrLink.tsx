@@ -31,7 +31,7 @@ export function ComposerPrLink({
       onClick={() => onOpen()}
       title={prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"}
       className={cn(
-        "flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+        "flex shrink-0 items-center gap-1.5 rounded text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
         className,
       )}
     >

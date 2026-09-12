@@ -6,7 +6,7 @@ import { createContext, useContext } from "react";
 
 interface FileViewerContextType {
   openFile: (path: string) => void;
-  /** Reveal the workspace rail and switch it to the GitHub tab. */
+  /** Open GitHub in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
   /**
    * Returns true when `path` is a known workspace file (present in the
@@ -45,7 +45,7 @@ export function useFileViewer(): ((path: string) => void) | null {
 }
 
 /**
- * Returns a callback that reveals the workspace rail's GitHub tab, or `null`
+ * Returns a callback that opens the GitHub rail tab or mobile drawer, or `null`
  * when used outside AppShell (tests, Storybook).
  */
 export function useOpenGithubTab(): (() => void) | null {

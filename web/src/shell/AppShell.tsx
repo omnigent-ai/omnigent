@@ -1005,6 +1005,7 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
+    setGithubPanelOpen(false);
     setFilesPanelShowHidden(true);
     // Drop shell interaction state carried from the outgoing session: a
     // still-armed create ref would otherwise auto-focus an unrelated shell in
@@ -1193,21 +1194,6 @@ export function AppShell() {
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
   );
-
-  // Reveal the rail on the GitHub tab (from the composer's PR link). Mirrors
-  // openFileViewer's rail-reveal, but deselects any file/shell so the tab's
-  // own content (the stacked diff) shows rather than the FileViewer.
-  const openGithubTab = useCallback(() => {
-    setSelectedFilePath(null);
-    setSelectedTerminalKey(null);
-    if (!terminalFirst) setPanelInitialKey(null);
-    setExecutionLogsKey(null);
-    setFilesPanelOpen(false);
-    setSubagentsPanelOpen(false);
-    setRightRailTab("github");
-    setRightPanelOpen(true);
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-  }, [conversationId, terminalFirst, setPanelInitialKey]);
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
@@ -1698,7 +1684,7 @@ export function AppShell() {
   // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
   // (matches the desktop rail's GitHub tab; the panel handles all states —
   // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
-  function openGithubPanel() {
+  const openGithubPanel = useCallback(() => {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
     setPanelInitialKey(null); // close terminals panel
@@ -1707,7 +1693,25 @@ export function AppShell() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(true);
-  }
+  }, [clearFileViewerUrl, setPanelInitialKey]);
+
+  // Composer links open the mobile drawer or reveal the desktop GitHub tab.
+  // Deselect files/shells so the chosen panel owns its content slot.
+  const openGithubTab = useCallback(() => {
+    if (isMobileViewport()) {
+      openGithubPanel();
+      return;
+    }
+    setSelectedFilePath(null);
+    setSelectedTerminalKey(null);
+    if (!terminalFirst) setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setRightRailTab("github");
+    setRightPanelOpen(true);
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+  }, [conversationId, terminalFirst, setPanelInitialKey, openGithubPanel]);
 
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.
