@@ -26,6 +26,23 @@ _SKILL_NAME_MAX_LEN = 64
 _SKILL_DESC_MAX_LEN = 1024
 _VALID_INPUT_MODALITIES = {"text", "image", "audio", "video", "file"}
 _VALID_OUTPUT_MODALITIES = {"text", "image", "audio"}
+# Image suffixes an ``icon`` path may use (lowercase, leading dot).
+_ICON_IMAGE_SUFFIXES = (".svg", ".png", ".jpg", ".jpeg", ".webp")
+
+
+def icon_looks_path_like(value: str) -> bool:
+    """
+    Whether an ``icon`` string should be treated as a path rather than
+    an emoji grapheme.
+
+    A value is path-like if it contains a path separator (``/`` or
+    ``\\``) or ends with a known image suffix. Everything else is
+    treated as an emoji.
+
+    :param value: The raw icon string.
+    :returns: ``True`` if the value should be validated as a path.
+    """
+    return "/" in value or "\\" in value or value.lower().endswith(_ICON_IMAGE_SUFFIXES)
 
 
 @dataclass
@@ -89,6 +106,7 @@ def validate(spec: AgentSpec) -> ValidationResult:
     _validate_llm(spec, result)
     _validate_reasoning_effort(spec, result)
     _validate_interaction(spec, result)
+    _validate_icon(spec, result)
     _validate_skills(spec, result)
     _validate_mcp_servers(spec, result)
     _validate_local_tools(spec, result)
@@ -262,6 +280,45 @@ def _validate_interaction(spec: AgentSpec, result: ValidationResult) -> None:
                 "interaction.modalities.output",
                 f"unsupported output modality: {m!r}",
             )
+
+
+def _validate_icon(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate the optional ``icon`` field (syntax only).
+
+    ``icon`` is either an emoji grapheme or a path relative to the
+    agent's config directory. This check receives only the spec (no
+    directory), so it validates syntax alone: an emoji is any
+    non-empty string; a path-like value must be relative, free of
+    ``..`` components, and use an allowed image suffix. The parser
+    performs the on-disk existence check.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    icon = spec.icon
+    if icon is None:
+        return
+    if not isinstance(icon, str):
+        result.add("icon", f"must be a string, got {type(icon).__name__}")
+        return
+    if not icon_looks_path_like(icon):
+        # Treated as an emoji grapheme; any non-empty string is accepted.
+        if not icon:
+            result.add("icon", "must be a non-empty string")
+        return
+    # Path-like: enforce relative, no traversal, allowed suffix.
+    normalized = icon.replace("\\", "/")
+    is_absolute = normalized.startswith("/") or re.match(r"^[A-Za-z]:", icon) is not None
+    if is_absolute:
+        result.add("icon", f"path must be relative to the agent directory, got {icon!r}")
+        return
+    if ".." in normalized.split("/"):
+        result.add("icon", f"path must not contain '..', got {icon!r}")
+        return
+    if not icon.lower().endswith(_ICON_IMAGE_SUFFIXES):
+        allowed = ", ".join(_ICON_IMAGE_SUFFIXES)
+        result.add("icon", f"path must use an allowed image suffix ({allowed}), got {icon!r}")
 
 
 def _validate_skills(spec: AgentSpec, result: ValidationResult) -> None:

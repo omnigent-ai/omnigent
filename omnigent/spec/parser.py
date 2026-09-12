@@ -285,6 +285,8 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     if raw_instructions is None:
         raw_instructions = raw.get("prompt")
     instructions = _resolve_instructions(root, raw_instructions)
+    raw_icon = raw.get("icon")
+    icon = _resolve_icon(root, raw_icon) if isinstance(raw_icon, str) else raw_icon
     skills = _discover_skills(root / "skills")
     skills_filter = _parse_skills_filter(raw.get("skills"))
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
@@ -296,6 +298,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         spec_version=spec_version,
         name=raw.get("name"),
         description=raw.get("description"),
+        icon=icon,
         llm=llm,
         interaction=interaction,
         tools=tools_config,
@@ -2098,6 +2101,39 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
         contained = _read_contained_file(root, filename)
         if contained is not None:
             return contained
+    return None
+
+
+def _resolve_icon(root: Path, value: str) -> str | None:
+    """
+    Resolve an agent ``icon`` value against the image directory.
+
+    The value is read verbatim except for one tolerant transform: a
+    well-formed, agent-dir-relative path whose target file does not
+    exist under *root* is dropped to ``None``. This matches the
+    parser's broken-reference policy elsewhere — :func:`_discover_skills`
+    silently skips missing entries rather than aborting the parse.
+
+    Syntactically invalid path-like values (absolute, containing
+    ``..``, or an unsupported suffix) are returned unchanged so the
+    validator can surface them; emoji values are returned unchanged.
+
+    :param root: Path to the agent image directory.
+    :param value: The raw ``icon`` string from config.yaml.
+    :returns: The icon value, or ``None`` when a clean relative path
+        points at a missing file.
+    """
+    from omnigent.spec.validator import icon_looks_path_like
+
+    if not icon_looks_path_like(value):
+        return value  # emoji grapheme — keep verbatim
+    normalized = value.replace("\\", "/")
+    # Leave invalid paths for the validator to reject; only a clean
+    # relative path is subject to the existence check.
+    if value.startswith("/") or re.match(r"^[A-Za-z]:", value) or ".." in normalized.split("/"):
+        return value
+    if (root / normalized).is_file():
+        return value
     return None
 
 
