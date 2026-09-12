@@ -94,6 +94,13 @@ The pane is still used to *deliver* the verdict. Two gotchas, both handled in
   doesn't park at the reason input. (The `AskQuestion` picker's "Esc to skip" dismisses
   cleanly, so the question decline is a single key.)
 
+A parked verdict can also outlive the pane entirely — the hook holds it for up to a day, and
+the tmux server backing the pane can die in the meantime (terminal teardown, temp cleanup,
+machine sleep). Delivery (`_deliver_verdict_keys`) therefore re-checks pane liveness on
+verdict receipt and, when the pane is gone or the send fails, posts an
+`external_assistant_message` telling the user their response never reached cursor — the card
+has already settled as answered by then, so without the notice the drop would be invisible.
+
 ### Yolo sessions (Run Everything)
 
 A session launched with `--yolo` / `--force` / `-f` (`cursor_launch_args_enable_yolo`) still
