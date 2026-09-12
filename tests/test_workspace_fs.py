@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -399,6 +400,62 @@ def test_changes_lists_git_working_tree_modifications(tmp_path: Path) -> None:
     assert by_path["committed.txt"]["lines_removed"] == 1
     assert by_path["new.txt"]["lines_added"] is None
     assert by_path["new.txt"]["lines_removed"] is None
+
+
+def test_pre_session_git_reads_do_not_enable_untracked_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    untracked_cache_start: None,
+) -> None:
+    """Host-backed Files and Changes reads leave Git configuration unchanged."""
+    _git_repo(tmp_path)
+    probe = subprocess.run(
+        ["git", "update-index", "--test-untracked-cache"],
+        cwd=tmp_path,
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip("Git does not support the untracked-cache probe on this filesystem")
+    subprocess.run(
+        ["git", "config", "core.untrackedCache", "false"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "committed.txt").write_text("modified\n")
+    (tmp_path / "new.txt").write_text("added\n")
+
+    class SynchronousThread:
+        def __init__(self, *, target: Callable[[], None], **_: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            self._target()
+
+    monkeypatch.setattr(
+        "omnigent.runtime.filesystem_registry.threading.Thread", SynchronousThread
+    )
+    reader = WorkspaceReader(tmp_path)
+
+    def untracked_cache_setting() -> bytes:
+        return subprocess.run(
+            ["git", "config", "--bool", "--get", "core.untrackedCache"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        ).stdout.strip()
+
+    assert untracked_cache_setting() == b"false"
+    files = reader.list_or_read("", limit=100, order="asc")
+    assert {entry["path"] for entry in files["data"]} >= {"committed.txt", "new.txt"}
+    assert untracked_cache_setting() == b"false"
+
+    changes = reader.changes("")
+    assert {entry["path"]: entry["status"] for entry in changes["data"]} == {
+        "committed.txt": "modified",
+        "new.txt": "created",
+    }
+    assert untracked_cache_setting() == b"false"
 
 
 def test_diff_returns_before_and_after_for_modified_file(tmp_path: Path) -> None:
