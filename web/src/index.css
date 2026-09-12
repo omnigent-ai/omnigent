@@ -1146,6 +1146,14 @@ aside[aria-label="Workspace"][data-maximized] {
   display: none;
 }
 
+/* The virtualized transcript holds its own read position across history
+ * prepends and in-flow changes above the list (Transcript.tsx). Its rows are
+ * absolutely positioned, so native anchoring can't see them and would only
+ * double-count the in-flow part. */
+[data-virtualized-transcript] {
+  overflow-anchor: none;
+}
+
 /* Streamdown hard-codes `content-visibility: auto` with a flat 200px intrinsic
  * size on every code block, so offscreen blocks lay out at 200px and snap to
  * their real height (100–1700px) as they scroll in — shifting the transcript

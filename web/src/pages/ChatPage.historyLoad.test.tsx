@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
+import { TRANSCRIPT_SCROLLBAR_DRAG_EVENT } from "@/pages/TranscriptScrollbar";
 import { useChatStore } from "@/store/chatStore";
 import {
   HistoryAutoLoader,
@@ -257,15 +258,15 @@ describe("HistoryAutoLoader", () => {
   });
 
   it("renders no visible control", () => {
-    const { container } = render(<HistoryAutoLoader />);
+    const { container } = render(<HistoryAutoLoader rowCount={1} />);
 
     expect(container).toBeEmptyDOMElement();
   });
 
-  // Position across a prepend belongs to native scroll anchoring. These pin
-  // the loader to writing nothing: an imperative scrollTop write cancels
-  // in-flight momentum, so a page landing mid-flick used to yank the
-  // transcript out from under the reader.
+  // Position across a prepend belongs to the transcript's own hold
+  // (VirtualBubbleList), never to this loader: an imperative scrollTop write
+  // here cancels in-flight momentum, so a page landing mid-flick used to yank
+  // the transcript out from under the reader. These pin it to writing nothing.
   it("leaves the scroll offset alone when a page prepends", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
@@ -276,8 +277,9 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
-    // Scroll near the top to trigger an older-history fetch.
+    render(<HistoryAutoLoader rowCount={1} />);
+    // Wheel up near the top to trigger an older-history fetch.
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 24;
     fireEvent.scroll(scrollRoot);
     metrics.scrollHeight = 180;
@@ -302,9 +304,11 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 0;
     fireEvent.scroll(scrollRoot);
 
@@ -332,7 +336,8 @@ describe("HistoryAutoLoader", () => {
     });
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
     expect(metrics.scrollTop).toBe(499);
@@ -353,7 +358,7 @@ describe("HistoryAutoLoader", () => {
     expect(metrics.scrollTop).toBe(20);
   });
 
-  it("loads older history when the user scrolls near the top", () => {
+  it("loads older history when the reader wheels up near the top", () => {
     const loadMoreHistory = vi.fn(async () => {});
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
@@ -361,7 +366,8 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
 
@@ -379,8 +385,9 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
     // 2.5 viewports = 5000px. Still outside it on a tall pane.
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 6000;
     fireEvent.scroll(scrollRoot);
     expect(loadMoreHistory).not.toHaveBeenCalled();
@@ -405,10 +412,11 @@ describe("HistoryAutoLoader", () => {
       useEffect(() => {
         setScrollElement(scrollRoot);
       }, []);
-      return <HistoryAutoLoader scrollElement={scrollElement} />;
+      return <HistoryAutoLoader scrollElement={scrollElement} rowCount={1} />;
     }
 
     render(<DeferredScroller />);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
 
@@ -433,7 +441,7 @@ describe("HistoryAutoLoader", () => {
       useEffect(() => {
         setScrollElement(scrollRoot);
       }, []);
-      return <HistoryAutoLoader scrollElement={scrollElement} />;
+      return <HistoryAutoLoader scrollElement={scrollElement} rowCount={1} />;
     }
 
     render(<DeferredScroller />);
@@ -453,11 +461,14 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
+    // Still wheeling while the page is in flight.
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 0;
     fireEvent.scroll(scrollRoot);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
@@ -489,7 +500,7 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, { scrollTop: 2000, scrollHeight: 4000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
@@ -512,13 +523,14 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
     metrics.scrollTop = 100; // downward: stick-to-bottom settling the view
     fireEvent.scroll(scrollRoot);
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
 
-    // The reader then scrolls up, which IS a request for older history.
+    // The reader then wheels up, which IS a request for older history.
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
     metrics.scrollTop = 40;
     fireEvent.scroll(scrollRoot);
 
@@ -540,12 +552,329 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 900 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
     expect(loadMoreHistory).not.toHaveBeenCalled();
 
     fireEvent.wheel(scrollRoot, { deltaY: -120 });
 
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores an upward scroll the reader did not make", () => {
+    // A row above the viewport re-measuring, or the bottom lock letting go,
+    // moves scrollTop upward with nobody touching the trackpad. Reading that
+    // as a scroll-up fetched a page whose settle moved it again — page after
+    // page until history ran out.
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 800, scrollHeight: 3000, clientHeight: 700 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    for (const top of [600, 400, 200]) {
+      metrics.scrollTop = top;
+      fireEvent.scroll(scrollRoot);
+    }
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    // The reader's own wheel is what asks.
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("pages when the scrollbar thumb is dragged up and withdraws when dragged back down", () => {
+    // The transcript draws its own scrollbar; it reports the drag direction
+    // rather than leaving this component to guess from scroll movement, which
+    // the transcript's own hold also produces.
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 800, scrollHeight: 3000, clientHeight: 700 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+    const drag = (direction: "up" | "down") =>
+      scrollRoot.dispatchEvent(
+        new CustomEvent(TRANSCRIPT_SCROLLBAR_DRAG_EVENT, { detail: { direction } }),
+      );
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    // Scroll movement on its own (a correction, a restore) is not a request.
+    metrics.scrollTop = 600;
+    fireEvent.scroll(scrollRoot);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    act(() => {
+      drag("up");
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // Dragging back down before the page lands withdraws: the page lands, but
+    // nothing chains after it.
+    act(() => {
+      drag("down");
+    });
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_49" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("pages on a keyboard scroll-up aimed at the transcript", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    document.body.appendChild(scrollRoot);
+    setScrollMetrics(scrollRoot, { scrollTop: 800, scrollHeight: 3000, clientHeight: 700 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    // Nothing points the keyboard at the transcript yet: arrowing through a
+    // menu elsewhere must not fetch history.
+    fireEvent.keyDown(document.body, { key: "PageUp" });
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    // After a click on the transcript the browser scrolls it with these keys.
+    fireEvent.pointerDown(scrollRoot);
+    fireEvent.pointerUp(scrollRoot);
+    const textarea = document.createElement("textarea");
+    document.body.appendChild(textarea);
+    // Arrow keys inside the composer edit text; they are not a scroll.
+    fireEvent.keyDown(textarea, { key: "ArrowUp" });
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(document.body, { key: "PageUp" });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // Shift+Space pages up too; a shortcut with a modifier is not a scroll,
+    // and Shift+Arrow extends a selection.
+    fireEvent.keyDown(document.body, { key: "ArrowUp", metaKey: true, altKey: true });
+    fireEvent.keyDown(document.body, { key: "ArrowUp", shiftKey: true });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(document.body, { key: " ", shiftKey: true });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+
+    // A key some control already consumed scrolled nothing.
+    const consumed = new KeyboardEvent("keydown", {
+      key: "PageUp",
+      bubbles: true,
+      cancelable: true,
+    });
+    consumed.preventDefault();
+    document.body.dispatchEvent(consumed);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+
+    // Focus moving elsewhere (Tab to a button) takes keyboard scrolling with it.
+    const button = document.createElement("button");
+    document.body.appendChild(button);
+    fireEvent.focusIn(button);
+    fireEvent.keyDown(button, { key: "PageUp" });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+    button.remove();
+    textarea.remove();
+    scrollRoot.remove();
+  });
+
+  it("withdraws the request when the reader scrolls back down", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // The reader scrolls down before the page lands: it still lands, but the
+    // seek does not chain another page after it.
+    fireEvent.wheel(scrollRoot, { deltaY: 120 });
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_49" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a sustained scrollbar drag on one gesture's budget", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_999", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+    const dragUp = () =>
+      scrollRoot.dispatchEvent(
+        new CustomEvent(TRANSCRIPT_SCROLLBAR_DRAG_EVENT, { detail: { direction: "up" } }),
+      );
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    let now = 1000;
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => now);
+    act(() => {
+      dragUp();
+    });
+    let cursor = 998;
+    let stalled = false;
+    while (!stalled && cursor > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      // The thumb keeps moving while pages land: the same gesture.
+      now += 100;
+      act(() => {
+        dragUp();
+      });
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${cursor}` });
+      });
+      cursor -= 1;
+      stalled = loadMoreHistory.mock.calls.length === before;
+    }
+    nowSpy.mockRestore();
+    expect(stalled).toBe(true);
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
+  });
+
+  it("opens a new window with a fresh gesture budget", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_999", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    let now = 1000;
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => now);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    // Exhaust this gesture's budget on fold-hidden pages.
+    let cursor = 998;
+    let stalled = false;
+    while (!stalled && cursor > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${cursor}` });
+      });
+      cursor -= 1;
+      stalled = loadMoreHistory.mock.calls.length === before;
+    }
+    const spent = loadMoreHistory.mock.calls.length;
+
+    // Another conversation opens right away; its first wheel tick is a new
+    // gesture with a full budget, not the tail of the exhausted one.
+    act(() => {
+      useChatStore.setState({
+        historyGeneration: useChatStore.getState().historyGeneration + 1,
+        hasMoreHistory: true,
+        oldestItemId: "other_999",
+      });
+    });
+    now += 100;
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    expect(loadMoreHistory.mock.calls.length).toBe(spent + 1);
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "other_998" });
+    });
+    expect(loadMoreHistory.mock.calls.length).toBe(spent + 2);
+    nowSpy.mockRestore();
+  });
+
+  it("counts momentum ticks against the same gesture's budget", () => {
+    // A hard flick keeps ticking while pages land; those pages belong to the
+    // one gesture and may not page past its cap.
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_999", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const { rerender } = render(<HistoryAutoLoader rowCount={1} />);
+    let now = 1000;
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => now);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    let cursor = 998;
+    let rows = 1;
+    let stalled = false;
+    while (!stalled && cursor > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      // Another tick inside the quiet window, then the page settles — every
+      // other page adding a row, which ends a seek but not the gesture.
+      now += 100;
+      fireEvent.wheel(scrollRoot, { deltaY: -40 });
+      if (cursor % 2 === 0) rerender(<HistoryAutoLoader rowCount={(rows += 1)} />);
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${cursor}` });
+      });
+      cursor -= 1;
+      stalled = loadMoreHistory.mock.calls.length === before;
+    }
+    nowSpy.mockRestore();
+    expect(stalled).toBe(true);
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
+  });
+
+  it("withdraws when a finger reverses mid-drag, short of where it started", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 400 }] });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // Back up the screen by more than the slop, still below the start point.
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 380 }] });
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_49" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps how many fold-hidden pages one gesture may chain", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_999", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    let now = 1000;
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => now);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    // One enormous turn: no page ever adds a row. The chain must end on its own.
+    let cursor = 998;
+    let stalled = false;
+    while (!stalled && cursor > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${cursor}` });
+      });
+      cursor -= 1;
+      stalled = loadMoreHistory.mock.calls.length === before;
+    }
+    expect(stalled).toBe(true);
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(31);
+    expect(loadMoreHistory.mock.calls.length).toBeGreaterThan(10);
+
+    // The next flick, after a quiet gap, is a new gesture and continues from there.
+    now += 1000;
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    nowSpy.mockRestore();
+    expect(loadMoreHistory.mock.calls.length).toBe(32);
   });
 
   it("ignores a wheel-down, which is not a request for older history", () => {
@@ -560,7 +889,7 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 900 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
     fireEvent.wheel(scrollRoot, { deltaY: 120 });
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
@@ -580,7 +909,7 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, { scrollTop: 2000, scrollHeight: 4000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
 
     // A prepend landing (new cursor) is not a reason to fetch again on its
     // own — that self-feeding loop is what made one page turn into many.
@@ -604,7 +933,7 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 100, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
@@ -616,47 +945,111 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 100, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
+    render(<HistoryAutoLoader rowCount={1} />);
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
 
-  it("bounds the prepend-fed chain from a single touch drag", () => {
+  it("keeps paging while pages land inside an existing fold, until a row appears", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
     useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
     const scrollRoot = document.createElement("div");
-    // Folded tool-heavy transcript: one short screen, no scroll range, parked
-    // under the load threshold. Height-neutral prepends keep it that way.
+    // Folded tool-heavy transcript: one short screen, no scroll range.
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
-    expect(loadMoreHistory).not.toHaveBeenCalled();
+    const { rerender } = render(<HistoryAutoLoader rowCount={1} />);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
-    // One small downward finger drag — "peek at what's above".
+    // Page after page folds into the turn already on screen and shows the
+    // reader nothing; each settle asks for the next.
+    for (const cursor of ["item_49", "item_48", "item_47", "item_46", "item_45"]) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: cursor });
+      });
+      expect(loadMoreHistory).toHaveBeenCalledTimes(before + 1);
+    }
+
+    // The page that brings the previous turn adds a row: there is something new
+    // to read, so paging waits for the next gesture.
+    const before = loadMoreHistory.mock.calls.length;
+    // In the app the page's prepend and the row it adds arrive in one render;
+    // standalone, the store notification renders on its own, so the row first.
+    rerender(<HistoryAutoLoader rowCount={2} />);
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_44" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(before);
+  });
+
+  it("seeks from a touch drag within a small budget and stops at the first new row", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const { rerender } = render(<HistoryAutoLoader rowCount={1} />);
     fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
     fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
-    // Each settled page moves the cursor without adding height. The chain may
-    // follow for a bounded number of pages, then must wait for a new gesture
-    // instead of paging in the entire transcript.
-    let settled = 49;
-    while (loadMoreHistory.mock.calls.length < 8 && settled > 0) {
-      const before = loadMoreHistory.mock.calls.length;
-      act(() => {
-        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
-      });
-      settled -= 1;
-      if (loadMoreHistory.mock.calls.length === before) break;
-    }
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_49" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
 
-    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
+    // In the app the page's prepend and the row it adds arrive in one render;
+    // standalone, the store notification renders on its own, so the row first.
+    rerender(<HistoryAutoLoader rowCount={2} />);
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_48" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+
+    // Further settles without a gesture are not a request.
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_47" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
   });
 
-  it("holds the bound when pages settle mid-drag between touchmoves", () => {
+  it("bounds a touch drag to a few pages even when nothing new appears", () => {
+    // A phone reader peeking at what is above, on a giant folded turn: a page
+    // or two, not the whole transcript.
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_99", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader rowCount={1} />);
+    // A finger also raises pointer events; those must not lend it the wheel's budget.
+    fireEvent.pointerDown(scrollRoot, { pointerType: "touch" });
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+    let cursor = 98;
+    let stalled = false;
+    while (!stalled && cursor > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${cursor}` });
+      });
+      cursor -= 1;
+      stalled = loadMoreHistory.mock.calls.length === before;
+    }
+    expect(loadMoreHistory).toHaveBeenCalledTimes(3);
+  });
+
+  it("resumes seeking on the reader's next gesture", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
@@ -665,63 +1058,31 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader />);
-    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
-
-    // A sustained drag on a fast connection: pages settle while the finger is
-    // still moving, so every settle is followed by another touchmove from the
-    // SAME gesture. Those mid-drag touchmoves must not refill the budget.
-    let settled = 49;
-    let fingerY = 320;
-    let stalled = 0;
-    while (stalled < 2 && settled > 0) {
-      const before = loadMoreHistory.mock.calls.length;
-      fireEvent.touchMove(scrollRoot, { touches: [{ clientY: fingerY }] });
-      fingerY += 10;
-      act(() => {
-        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
-      });
-      settled -= 1;
-      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
-      else stalled = 0;
-    }
-
-    expect(loadMoreHistory.mock.calls.length).toBeGreaterThanOrEqual(1);
-    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
-  });
-
-  it("re-grants the chain budget on the reader's next gesture", () => {
-    const loadMoreHistory = vi.fn(async () => {
-      useChatStore.setState({ loadingMoreHistory: true });
+    const { rerender } = render(<HistoryAutoLoader rowCount={1} />);
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    // In the app the page's prepend and the row it adds arrive in one render;
+    // standalone, the store notification renders on its own, so the row first.
+    rerender(<HistoryAutoLoader rowCount={2} />);
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_49" });
     });
-    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
-    const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
-    stickContext.scrollRef.current = scrollRoot;
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
-    render(<HistoryAutoLoader />);
-    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
-    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
-
-    // Exhaust the first gesture's budget with height-neutral prepends.
-    let settled = 49;
-    let stalled = 0;
-    while (stalled < 1 && settled > 0) {
-      const before = loadMoreHistory.mock.calls.length;
-      act(() => {
-        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
-      });
-      settled -= 1;
-      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
-    }
-    const afterFirstGesture = loadMoreHistory.mock.calls.length;
-
-    // The chain stopped, but older history is not stranded: the next drag
-    // asks again and pages resume.
-    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
-    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
-
-    expect(loadMoreHistory.mock.calls.length).toBe(afterFirstGesture + 1);
+    // The next gesture seeks from the rows now on screen: a fold-hidden page
+    // chains, the page that adds a row stops it.
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_48" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(3);
+    // In the app the page's prepend and the row it adds arrive in one render;
+    // standalone, the store notification renders on its own, so the row first.
+    rerender(<HistoryAutoLoader rowCount={3} />);
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_47" });
+    });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(3);
   });
 });
 
