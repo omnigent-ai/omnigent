@@ -49,12 +49,31 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
+    private lateinit var sharedFileReceiver: SharedFileReceiver
     private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
     private var pendingNavigatePath: String? = null
+    // An OS-share text payload (ACTION_SEND EXTRA_TEXT, no attached file),
+    // waiting for the same page-ready gate as pendingNavigatePath above. No
+    // retry needed once emitted: the web layer persists it to sessionStorage
+    // synchronously inside the same callback (see shareIntake.ts), so a
+    // single delivery attempt is durable even if that page then navigates
+    // away — unlike the file payload below, which has no such durable copy.
+    private var pendingSharedTextValue: String? = null
+    // An OS-share file payload already read off a worker thread, waiting for
+    // the same page-ready gate as pendingNavigatePath above. NOT cleared on
+    // emit — only on an explicit web-layer acknowledgement (see
+    // flushPendingSharedFiles) — because a base64 file payload has no
+    // sessionStorage-durable copy the way text does: if the page this was
+    // emitted into turns out to be mid-navigation (e.g. the unauthenticated
+    // -share login redirect) and never actually runs the web callback that
+    // acks it, the share must survive to be retried on the next page load,
+    // not be dropped. Bounded by pendingSharedFilesRetries below.
+    private var pendingSharedFilesJson: String? = null
+    private var pendingSharedFilesRetries = 0
     private var lastInsets: Insets? = null
     private var pageLoaded = false
     private var bridgeTransportInstalled = false
@@ -124,9 +143,13 @@ class MainActivity : AppCompatActivity() {
         // reference chain can't pin this Activity.
         notifications = NativeNotificationManager(applicationContext)
         blobSaver = BlobSaver(applicationContext)
+        sharedFileReceiver = SharedFileReceiver(applicationContext)
 
         // Capture (don't replay yet) a notification tap that cold-started us.
         pendingNavigatePath = navigatePathOf(intent)
+        // An OS share (ACTION_SEND/ACTION_SEND_MULTIPLE) that cold-started us —
+        // read async; queued for emit once both the file read and page load finish.
+        handleShareIntent(intent)
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
@@ -308,6 +331,7 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onSharedFilesAcknowledged = ::onSharedFilesAcknowledged,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -481,6 +505,7 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest = null
         loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
+        if (::sharedFileReceiver.isInitialized) sharedFileReceiver.shutdown()
         if (::webView.isInitialized) {
             removeBridge()
             webView.destroy()
@@ -491,6 +516,7 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        handleShareIntent(intent)
 
         // Detect a server change: ConnectActivity re-enters us via
         // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
@@ -617,6 +643,8 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         flushPendingActivation()
+        flushPendingSharedText()
+        flushPendingSharedFiles()
         emitInsets()
     }
 
@@ -642,6 +670,115 @@ class MainActivity : AppCompatActivity() {
                 "window.__omnigentNativeEmitNotificationActivated(${jsString(path)});",
             null,
         )
+    }
+
+    /**
+     * Extract an OS Share (ACTION_SEND/ACTION_SEND_MULTIPLE) intent's payload
+     * and start it toward the web layer: a file (EXTRA_STREAM) is read on
+     * [sharedFileReceiver]'s worker; a text-only share (EXTRA_TEXT, no
+     * EXTRA_STREAM) is queued directly. Both wait for the same page-ready
+     * gate as [pendingNavigatePath]. A share carrying neither is a no-op.
+     */
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent == null || !::sharedFileReceiver.isInitialized) return
+        val uris: List<Uri> =
+            when (intent.action) {
+                Intent.ACTION_SEND -> {
+                    val single =
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                        }
+                    listOfNotNull(single)
+                }
+
+                Intent.ACTION_SEND_MULTIPLE -> {
+                    val list =
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+                        }
+                    list.orEmpty()
+                }
+
+                else -> emptyList()
+            }
+        if (uris.isNotEmpty()) {
+            sharedFileReceiver.readAndQueue(uris) { json ->
+                pendingSharedFilesJson = json
+                pendingSharedFilesRetries = 0
+                if (pageLoaded) flushPendingSharedFiles()
+            }
+            return
+        }
+        // No file URI — fall back to a plain-text share (e.g. ACTION_SEND
+        // with mimeType text/plain and EXTRA_TEXT, no EXTRA_STREAM). Only
+        // reachable for ACTION_SEND; ACTION_SEND_MULTIPLE has no EXTRA_TEXT
+        // equivalent in the platform contract.
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        if (text.isNullOrEmpty()) return
+        handleSharedText(text)
+    }
+
+    private fun handleSharedText(text: String) {
+        pendingSharedTextValue = text
+        if (pageLoaded) flushPendingSharedText()
+    }
+
+    private fun flushPendingSharedText() {
+        val text = pendingSharedTextValue ?: return
+        if (originOf(webView.url) != pinnedOrigin) return
+        pendingSharedTextValue = null
+        emitSharedText(text)
+    }
+
+    private fun emitSharedText(text: String) {
+        webView.evaluateJavascript(
+            "window.__omnigentNativeEmitSharedText && " +
+                "window.__omnigentNativeEmitSharedText(${jsString(text)});",
+            null,
+        )
+    }
+
+    private fun flushPendingSharedFiles() {
+        // Same reasoning as flushPendingActivation: don't emit into a page
+        // that's off pinned-origin (mid re-login) — the next pinned-origin
+        // onPageReady flushes it instead.
+        val json = pendingSharedFilesJson ?: return
+        if (originOf(webView.url) != pinnedOrigin) return
+        if (pendingSharedFilesRetries >= MAX_SHARED_FILES_RETRIES) {
+            // The web layer never acknowledged after several page loads —
+            // most likely an old build with no shareFileIntake.ts to ack
+            // with. Give up rather than retry forever; no user-facing
+            // expiration UI, this is simply a bound on native-side retention.
+            pendingSharedFilesJson = null
+            pendingSharedFilesRetries = 0
+            return
+        }
+        pendingSharedFilesRetries++
+        emitSharedFiles(json)
+    }
+
+    private fun emitSharedFiles(json: String) {
+        webView.evaluateJavascript(
+            "window.__omnigentNativeEmitSharedFiles && " +
+                "window.__omnigentNativeEmitSharedFiles(${jsString(json)});",
+            null,
+        )
+    }
+
+    /**
+     * The web layer has taken ownership of the last [emitSharedFiles]
+     * delivery (see `shareFileIntake.ts`'s `acknowledgeNativeSharedFiles`,
+     * dispatched here via [OmnigentBridgeListener]). Stop retrying it.
+     */
+    fun onSharedFilesAcknowledged() {
+        pendingSharedFilesJson = null
+        pendingSharedFilesRetries = 0
     }
 
     private fun emitInsets() {
@@ -790,5 +927,11 @@ class MainActivity : AppCompatActivity() {
         // (a few ms) always wins the race, short enough to not feel stuck if it
         // doesn't answer. Only the timer ever fires when the renderer is gone.
         const val BACK_FALLBACK_MS = 600L
+
+        /**
+         * Cap on flushPendingSharedFiles retries across page loads before
+         * giving up on an unacknowledged file share.
+         */
+        const val MAX_SHARED_FILES_RETRIES = 5
     }
 }

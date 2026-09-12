@@ -5,6 +5,8 @@ import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useShareIntake } from "@/lib/shareIntake";
+import { useSharedFileIntake } from "@/lib/shareFileIntake";
 import { AppShell } from "@/shell/AppShell";
 import { DocloopChatLayout } from "@/components/docloop/DocloopChatLayout";
 
@@ -125,6 +127,8 @@ function App({ basename }: AppProps = {}) {
   // (no basename): `prefix` is empty, so every `path` below is identical to
   // the original relative route table.
   const prefix = basename ?? "";
+  useShareIntake();
+  useSharedFileIntake();
   const info = useServerInfo();
   // While the probe is in flight, render nothing — first paint is
   // ~30ms after boot anyway, and flashing the chrome we may

@@ -104,7 +104,8 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
-import { setPendingInitialPrompt } from "@/store/chatStore";
+import { composerAttachmentKey, setPendingInitialPrompt, useChatStore } from "@/store/chatStore";
+import { takePendingShareText } from "@/lib/shareIntake";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
@@ -231,6 +232,7 @@ import {
   buildMentionPreamble,
   detectMentionAt,
   mentionItemPath,
+  type MentionItem,
   type MentionState,
   parseMentionToken,
   rankMentionEntries,
@@ -2190,6 +2192,65 @@ export function NewChatLandingScreen() {
     setAttachmentError(null);
   };
 
+  // OS-share hand-off into the first message (see lib/shareIntake.ts /
+  // lib/shareFileIntake.ts). This screen -- not ChatPage.tsx's in-session
+  // Composer -- is the actual "new chat" composer in this product: the
+  // Composer only ever renders for an EXISTING conversationId (ChatPage.tsx
+  // shows THIS screen instead whenever there isn't one, since sessions here
+  // are CLI-launched, not created by posting a first message from the web
+  // UI). A share's "intended recipient" is conversationId === null, i.e.
+  // exactly this screen -- wiring only the Composer left every share
+  // silently stranded in the store until switchTo's reset (on the next real
+  // conversation) wiped it, unseen.
+  const pendingComposerText = useChatStore((s) => s.pendingComposerText);
+  const [shareBannerText, setShareBannerText] = useState<string | null>(null);
+  const pendingComposerFiles = useChatStore((s) => s.pendingComposerFiles);
+  // Read inside the effect below without making its dependency array fire
+  // on every keystroke / viewport change -- it should only run when a new
+  // share actually arrives.
+  const messageRef = useRef(message);
+  messageRef.current = message;
+  const isMobileViewportRef = useRef(isMobileViewport);
+  isMobileViewportRef.current = isMobileViewport;
+
+  useEffect(() => {
+    if (pendingComposerText === null) return;
+    if (messageRef.current.trim() === "") {
+      setMessage(pendingComposerText);
+      if (!isMobileViewportRef.current) textareaRef.current?.focus();
+      takePendingShareText();
+    } else {
+      // Recoverable offer instead of silently discarding either the share
+      // or the draft -- same convention as ChatPage.tsx's Composer.
+      setShareBannerText(pendingComposerText);
+    }
+    useChatStore.getState().clearPendingComposerText();
+  }, [pendingComposerText]);
+
+  const acceptShareBanner = useCallback(() => {
+    if (shareBannerText === null) return;
+    setMessage((prev) => (prev.trim() === "" ? shareBannerText : `${prev}\n${shareBannerText}`));
+    if (!isMobileViewportRef.current) textareaRef.current?.focus();
+    takePendingShareText();
+    setShareBannerText(null);
+  }, [shareBannerText]);
+
+  const dismissShareBanner = useCallback(() => {
+    takePendingShareText();
+    setShareBannerText(null);
+  }, []);
+
+  useEffect(() => {
+    if (pendingComposerFiles === null) return;
+    // Drains through the SAME validated upload flow as a manual attach or
+    // drag-drop above: rejected files surface the same attachmentError
+    // banner, accepted ones just append -- no autosend, no new UI beyond
+    // the recoverable text banner above, cancellation is the existing
+    // remove-attachment button.
+    addFiles(pendingComposerFiles);
+    useChatStore.getState().clearPendingComposerFiles();
+  }, [pendingComposerFiles]);
+
   // Drag-and-drop onto the composer — same behavior as the in-session
   // composer (drop files anywhere on the box; an inset ring + overlay
   // signal the drop target).
@@ -3735,6 +3796,7 @@ export function NewChatLandingScreen() {
   const {
     mentionIndex,
     mentionedItems,
+    setMentionedItems,
     attachMention,
     openMentionDir,
     removeMentionedItem,
@@ -3748,6 +3810,38 @@ export function NewChatLandingScreen() {
     setText: setMessage,
     textareaRef,
   });
+
+  // Drain externally-queued attachments (file viewer "Attach to agent" button)
+  // into the local mention chips -- the same pendingComposerAttachments queue
+  // ChatPage.tsx's in-session Composer drains, wired here too since THIS
+  // screen, not that Composer, is what actually renders for conversationId
+  // === null (see the OS-share drain effects above for why). Without this,
+  // an attachment queued while looking at the landing screen sat inert in
+  // the store until switchTo's reset silently wiped it. Mirrors ChatPage.tsx's
+  // identical effect exactly (dedup, focus, cleanup-on-unmount).
+  const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
+  useEffect(() => {
+    if (pendingComposerAttachments.length === 0) return;
+    setMentionedItems((prev) => {
+      const seen = new Set(prev.map(composerAttachmentKey));
+      const fresh: MentionItem[] = [];
+      for (const a of pendingComposerAttachments) {
+        const k = composerAttachmentKey(a);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        fresh.push(a);
+      }
+      return fresh.length > 0 ? [...prev, ...fresh] : prev;
+    });
+    useChatStore.getState().clearPendingComposerAttachments();
+    if (!isMobileViewportRef.current) textareaRef.current?.focus();
+    // Defense-in-depth against a cross-session leak, matching ChatPage.tsx:
+    // if this screen unmounts (route change) while an entry is still
+    // queued, clear it so the next-mounted composer doesn't drain a stale
+    // chip. switchTo also resets the queue; this closes non-switch unmounts.
+    return () => useChatStore.getState().clearPendingComposerAttachments();
+    // setMentionedItems is a stable useState setter (from useMentionBrowser).
+  }, [pendingComposerAttachments, setMentionedItems]);
 
   const canSubmit =
     message.trim().length > 0 &&
@@ -4773,11 +4867,16 @@ export function NewChatLandingScreen() {
                       @{item.path}
                       {item.isDir ? "/" : ""}
                     </span>
+                    {item.lineRange && (
+                      <span className="shrink-0">
+                        :{item.lineRange.start}-{item.lineRange.end}
+                      </span>
+                    )}
                     <button
                       type="button"
                       onClick={() => removeMentionedItem(i)}
                       className="ml-0.5 rounded-full hover:text-foreground"
-                      aria-label={`Remove ${item.path}`}
+                      aria-label={`Remove ${mentionItemPath(item)}`}
                     >
                       <XIcon className="size-3" />
                     </button>
@@ -4818,6 +4917,33 @@ export function NewChatLandingScreen() {
                 data-testid="new-chat-landing-attachment-error"
               >
                 {attachmentError}
+              </div>
+            )}
+            {/* Recoverable OS-share offer: shown instead of silently discarding
+                shared text when it arrived while this draft already held
+                something. Insert appends to the existing draft; Dismiss is an
+                explicit discard, not a silent one. */}
+            {shareBannerText !== null && (
+              <div className="flex items-center justify-between gap-2 px-4 pb-2 text-sm">
+                <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                  Shared text available: &ldquo;{shareBannerText}&rdquo;
+                </span>
+                <span className="flex shrink-0 gap-3">
+                  <button
+                    type="button"
+                    onClick={acceptShareBanner}
+                    className="font-medium text-primary hover:underline"
+                  >
+                    Insert
+                  </button>
+                  <button
+                    type="button"
+                    onClick={dismissShareBanner}
+                    className="text-muted-foreground hover:underline"
+                  >
+                    Dismiss
+                  </button>
+                </span>
               </div>
             )}
             {/* No own bg — the pill paints the surface. An explicit bg-card

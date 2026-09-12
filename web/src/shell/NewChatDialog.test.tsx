@@ -55,7 +55,7 @@ import {
   onHostStatusChanged,
 } from "@/lib/nativeBridge";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
-import { setPendingInitialPrompt } from "@/store/chatStore";
+import { setPendingInitialPrompt, useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Only authenticatedFetch is stubbed (the create POST under test);
@@ -3264,6 +3264,241 @@ describe("NewChatLandingScreen attachments", () => {
     });
 
     expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
+});
+
+// This screen -- not ChatPage.tsx's in-session Composer -- is the actual
+// "new chat" composer in this product (see NewChatDialog.tsx's comment by
+// the drain effects): a share's intended recipient (conversationId === null)
+// lands HERE. Mirrors ChatPage.shareIntake.test.tsx / .shareFileIntake.test.tsx.
+describe("NewChatLandingScreen OS-share intake", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    useChatStore.setState({ pendingComposerText: null, pendingComposerFiles: null });
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    useChatStore.setState({ pendingComposerText: null, pendingComposerFiles: null });
+  });
+
+  function queueShareText(text: string): void {
+    act(() => {
+      useChatStore.getState().setPendingComposerText(text);
+    });
+  }
+
+  function queueSharedFiles(files: File[]): void {
+    act(() => {
+      useChatStore.getState().setPendingComposerFiles(files);
+    });
+  }
+
+  it("inserts shared text into an empty draft", () => {
+    renderLanding();
+
+    queueShareText("hello from share");
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("hello from share");
+    expect(useChatStore.getState().pendingComposerText).toBeNull();
+  });
+
+  it("does not create a session just from a queued share (no autosend)", () => {
+    renderLanding();
+
+    queueShareText("hello from share");
+
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("offers a recoverable banner instead of silently discarding when the draft is non-empty", () => {
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "already typing something" },
+    });
+
+    queueShareText("hello from share");
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("already typing something");
+    expect(screen.getByText(/hello from share/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Insert" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+  });
+
+  it("banner Insert appends the shared text to the existing draft", () => {
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "already typing something" },
+    });
+    queueShareText("hello from share");
+
+    fireEvent.click(screen.getByRole("button", { name: "Insert" }));
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "already typing something\nhello from share",
+    );
+    expect(screen.queryByRole("button", { name: "Insert" })).not.toBeInTheDocument();
+  });
+
+  it("banner Dismiss is an explicit discard, leaving the draft alone", () => {
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "already typing something" },
+    });
+    queueShareText("hello from share");
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("already typing something");
+    expect(screen.queryByText(/hello from share/)).not.toBeInTheDocument();
+  });
+
+  it("attaches a shared file through the existing validated upload flow", () => {
+    renderLanding();
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+
+    queueSharedFiles([file]);
+
+    expect(screen.getByText("shot.png")).toBeInTheDocument();
+    expect(useChatStore.getState().pendingComposerFiles).toBeNull();
+  });
+
+  it("rejects an unsupported shared file the same way a manual attach would", () => {
+    renderLanding();
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+
+    queueSharedFiles([bad]);
+
+    expect(screen.queryByText("clip.mp4")).not.toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeInTheDocument();
+  });
+
+  it("a shared attachment can be removed like any other (cancellation)", () => {
+    renderLanding();
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    queueSharedFiles([file]);
+    expect(screen.getByText("shot.png")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove shot.png" }));
+
+    expect(screen.queryByText("shot.png")).not.toBeInTheDocument();
+  });
+});
+
+// pendingComposerAttachments (the file viewer's "Attach to agent" button) has
+// the exact same landing-screen drain gap the OS-share queues above had:
+// ChatPage.tsx's in-session Composer drains it, but that Composer never
+// renders for conversationId === null -- this screen does. Mirrors the
+// existing ChatPage.tsx behavior (dedup, focus, cleanup-on-unmount).
+describe("NewChatLandingScreen externally-queued attachments", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    useChatStore.setState({ pendingComposerAttachments: [] });
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    useChatStore.setState({ pendingComposerAttachments: [] });
+  });
+
+  function queueAttachment(path: string, isDir = false): void {
+    act(() => {
+      useChatStore.getState().addComposerAttachment({ path, isDir });
+    });
+  }
+
+  it("drains a queued attachment into a mention chip", () => {
+    renderLanding();
+
+    queueAttachment("src/foo.ts");
+
+    expect(screen.getByText("@src/foo.ts")).toBeInTheDocument();
+    expect(useChatStore.getState().pendingComposerAttachments).toEqual([]);
+  });
+
+  it("does not duplicate a chip already tagged", () => {
+    renderLanding();
+    queueAttachment("src/foo.ts");
+
+    queueAttachment("src/foo.ts");
+
+    expect(screen.getAllByText("@src/foo.ts")).toHaveLength(1);
+  });
+
+  it("appends to, rather than replaces, existing mention chips", () => {
+    renderLanding();
+    queueAttachment("src/foo.ts");
+
+    queueAttachment("src/bar.ts");
+
+    expect(screen.getByText("@src/foo.ts")).toBeInTheDocument();
+    expect(screen.getByText("@src/bar.ts")).toBeInTheDocument();
+  });
+
+  it("clears the queue on unmount so a stale chip can't leak into the next mount", () => {
+    const { unmount } = renderLanding();
+    queueAttachment("src/foo.ts");
+    // Drained already, but simulate an entry still queued at unmount time
+    // (e.g. queued and unmounted in the same tick) via a direct store set.
+    act(() => {
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/late.ts", isDir: false }],
+      });
+    });
+
+    unmount();
+
+    expect(useChatStore.getState().pendingComposerAttachments).toEqual([]);
+  });
+
+  // Luna's finding (luna-landing-attachments-0803/REVIEW.md): the drain
+  // itself always kept two ranges of the same file distinct (the store key
+  // and the outbound "[Attached: ...]" marker both include the range), but
+  // the landing chip rendered only "@path" for every range of a file, with
+  // an identical "Remove path" accessible name on both -- a sighted user
+  // couldn't tell the chips apart, and a screen-reader user couldn't tell
+  // which "Remove" button removed which range.
+  it("shows a distinct visible range and remove label for two ranges of the same file", () => {
+    renderLanding();
+
+    act(() => {
+      useChatStore.getState().addComposerAttachment({
+        path: "src/a.ts",
+        isDir: false,
+        lineRange: { start: 2, end: 9 },
+      });
+      useChatStore.getState().addComposerAttachment({
+        path: "src/a.ts",
+        isDir: false,
+        lineRange: { start: 20, end: 30 },
+      });
+    });
+
+    expect(screen.getByText(":2-9")).toBeInTheDocument();
+    expect(screen.getByText(":20-30")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove src/a.ts:2-9" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove src/a.ts:20-30" })).toBeInTheDocument();
+  });
+
+  it("removing one range chip leaves the other range of the same file intact", () => {
+    renderLanding();
+    act(() => {
+      useChatStore.getState().addComposerAttachment({
+        path: "src/a.ts",
+        isDir: false,
+        lineRange: { start: 2, end: 9 },
+      });
+      useChatStore.getState().addComposerAttachment({
+        path: "src/a.ts",
+        isDir: false,
+        lineRange: { start: 20, end: 30 },
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove src/a.ts:2-9" }));
+
+    expect(screen.queryByText(":2-9")).not.toBeInTheDocument();
+    expect(screen.getByText(":20-30")).toBeInTheDocument();
   });
 });
 

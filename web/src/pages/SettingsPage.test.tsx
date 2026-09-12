@@ -854,6 +854,23 @@ describe("SettingsPage", () => {
     expect(screen.getByRole("button", { name: /Sign out/ })).toBeInTheDocument();
   });
 
+  it("clears a durably-pending OS-share on sign out, so it can't leak to the next identity", async () => {
+    // This app has no in-session account switcher -- sign out is the one
+    // supported identity transition. Its hard navigation resets in-memory
+    // state but NOT sessionStorage, so a share still awaiting a decision
+    // (see lib/shareIntake.ts) would otherwise survive into whatever
+    // session authenticates next in this same tab.
+    window.sessionStorage.setItem("omnigent:pendingShareText", "still awaiting a decision");
+    renderPage("/settings/account");
+    await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /Sign out/ }));
+
+    await waitFor(() => {
+      expect(window.sessionStorage.getItem("omnigent:pendingShareText")).toBeNull();
+    });
+  });
+
   it("renders the Members section at /settings/members when accounts is on", async () => {
     renderPage("/settings/members");
     expect(await screen.findByText("members-page-stub")).toBeInTheDocument();

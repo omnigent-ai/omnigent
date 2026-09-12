@@ -630,6 +630,32 @@ export interface AppChatState {
    */
   pendingComposerAttachments: ComposerAttachment[];
   /**
+   * Text queued into the active composer from outside it — e.g. an OS Share
+   * intent handed off via a `#shared-text=` URL fragment (see
+   * `lib/shareIntake.ts`). This is a transient signal only: the durable copy
+   * lives in `sessionStorage` (survives the hard navigation an unauthenticated
+   * share round-trips through `/login`), and `useShareIntake` re-populates
+   * this field from there whenever `conversationId` becomes `null` again. The
+   * composer drains it into its own input state on mount/change — inserting
+   * into an empty draft, or offering a recoverable banner over a non-empty
+   * one (never silently discarding either) — the same way it drains
+   * {@link ChatState.pendingComposerAttachments}.
+   */
+  pendingComposerText: string | null;
+  /**
+   * Files queued into the active composer from an OS Share (ACTION_SEND /
+   * ACTION_SEND_MULTIPLE) hand-off delivered live by the native Android shell
+   * (see `lib/shareFileIntake.ts`). Unlike {@link pendingComposerText} there
+   * is no URL-fragment equivalent to persist durably, so this relies on the
+   * native side deferring emission until the page is loaded (and the
+   * bridge's own pending-until-first-subscriber queue) to survive an
+   * Android app cold start — it does not survive the SPA's own
+   * unauthenticated-share hard-navigation the way text does. The composer
+   * drains this into its existing upload/attachment flow (`addFiles`), so
+   * type/size validation and no-autosend semantics come for free.
+   */
+  pendingComposerFiles: File[] | null;
+  /**
    * True when this tab could not take an origin-wide stream slot for a
    * conversation it needed to open: every slot is held by other tabs and this
    * tab had no background stream of its own to reclaim. The active conversation
@@ -789,6 +815,14 @@ export interface ChatActions {
   addComposerAttachment: (attachment: ComposerAttachment) => void;
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
+  /** Queue text into the active composer from outside it. */
+  setPendingComposerText: (text: string) => void;
+  /** Drain the queued composer text (called by the composer). */
+  clearPendingComposerText: () => void;
+  /** Queue files into the active composer from outside it (an OS share). */
+  setPendingComposerFiles: (files: File[]) => void;
+  /** Drain the queued composer files (called by the composer). */
+  clearPendingComposerFiles: () => void;
   /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
    *  successful `launchRunner` for the open session. */
   markRunnerLaunched: () => void;
@@ -1328,6 +1362,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
+  pendingComposerText: null,
+  pendingComposerFiles: null,
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
@@ -1989,6 +2025,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // drained yet, so it can't bleed into the incoming composer (which drains
       // the store on mount).
       pendingComposerAttachments: [],
+      // This transient flag is harmless to drop on a switch: the durable
+      // copy lives in sessionStorage (see shareIntake.ts's takePendingShareText),
+      // untouched by this reset, and useShareIntake re-queues it from there
+      // the next time conversationId becomes null again (a share's intended
+      // recipient is always the new-chat composer, never whatever
+      // conversation this switch happens to land on).
+      pendingComposerText: null,
+      // Same reasoning as pendingComposerText above: shareFileIntake.ts holds
+      // any files that arrived for a non-null conversationId in its own ref
+      // and re-queues them the next time conversationId becomes null, so
+      // dropping the store field here loses nothing.
+      pendingComposerFiles: null,
     });
     conversationRegistry.setActive(conversationId);
 
@@ -2131,6 +2179,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   clearPendingComposerAttachments: () => setActive({ pendingComposerAttachments: [] }),
+
+  setPendingComposerText: (text) => setActive({ pendingComposerText: text }),
+
+  clearPendingComposerText: () => setActive({ pendingComposerText: null }),
+
+  setPendingComposerFiles: (files) => setActive({ pendingComposerFiles: files }),
+
+  clearPendingComposerFiles: () => setActive({ pendingComposerFiles: null }),
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
 

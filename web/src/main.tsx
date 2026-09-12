@@ -15,6 +15,7 @@ import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { initNativeInsets } from "./lib/nativeInsets";
+import { captureIncomingShareFragment } from "./lib/shareIntake";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
   applyDesktopUiFontSize,
@@ -50,6 +51,13 @@ const queryClient = new QueryClient({
 // invalidate cached queries (e.g. the conversations list when a new
 // conversation is created server-side).
 initChatStore(queryClient);
+
+// Capture any OS-share hand-off fragment into sessionStorage before the
+// identity probe below can possibly redirect to /login: that redirect (and
+// the post-login return) are both hard navigations that wipe every
+// in-memory value, so this MUST run first, synchronously, or an
+// unauthenticated share is lost the moment the login gate fires.
+captureIncomingShareFragment();
 
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
