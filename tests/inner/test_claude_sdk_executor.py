@@ -3962,6 +3962,152 @@ async def test_result_message_is_error_yields_executor_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_error_result_surfaces_reason_derived_from_subtype() -> None:
+    """An ``is_error`` ``ResultMessage`` with no ``result`` must carry a real reason.
+
+    The SDK's empty-result failure subtypes (``error_during_execution``,
+    ``error_max_turns``) set ``is_error=True`` but leave ``result`` unset. The
+    executor used to fall back to the detail-free literal
+    ``"claude-sdk harness error"``, discarding the subtype and captured
+    diagnostics — the surfaced reason must name the real cause instead.
+    """
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    class _Sentinel:
+        pass
+
+    sdk_result = SDKResultMessage(
+        subtype="error_during_execution",
+        session_id="s1",
+        result=None,
+        total_cost_usd=0.0,
+        duration_ms=100,
+        duration_api_ms=80,
+        is_error=True,
+        num_turns=1,
+        usage=None,
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [sdk_result]
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    executor = ClaudeSDKExecutor()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+            )
+        ]
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors, "Expected an ExecutorError for is_error=True with an empty result"
+    reason = errors[0].message
+    assert reason != "claude-sdk harness error", (
+        "The executor surfaced its detail-free fallback literal for an empty-result "
+        "failure, discarding the ResultMessage subtype."
+    )
+    assert "error_during_execution" in reason, (
+        f"ExecutorError.message {reason!r} does not name the failure subtype."
+    )
+
+
+class TestErrorResultFailureReason(unittest.TestCase):
+    """Reason composition for an ``is_error`` ``ResultMessage`` with an empty ``result``."""
+
+    def _reason(self, **kwargs):
+        from omnigent.inner.claude_sdk_executor import _error_result_failure_reason
+
+        defaults = {
+            "result": None,
+            "subtype": None,
+            "api_error_status": None,
+            "errors": None,
+            "system_diagnostics": [],
+            "stderr_lines": [],
+        }
+        defaults.update(kwargs)
+        return _error_result_failure_reason(**defaults)
+
+    def test_descriptive_result_wins_verbatim(self):
+        self.assertEqual(
+            self._reason(result="API Error: 401 unauthorized", subtype="error_during_execution"),
+            "API Error: 401 unauthorized",
+        )
+
+    def test_known_subtypes_get_a_human_hint(self):
+        reason = self._reason(subtype="error_during_execution")
+        self.assertIn("error_during_execution", reason)
+        self.assertIn("aborted", reason)
+        reason = self._reason(subtype="error_max_turns")
+        self.assertIn("error_max_turns", reason)
+        self.assertIn("maximum turn count", reason)
+
+    def test_unknown_subtype_is_still_named(self):
+        self.assertIn("error_new_kind", self._reason(subtype="error_new_kind"))
+
+    def test_success_subtype_with_api_status_names_the_status(self):
+        # is_error=True with subtype "success" means a failing API call; the
+        # CLI reports its HTTP status separately.
+        self.assertIn("429", self._reason(subtype="success", api_error_status=429))
+
+    def test_cli_errors_and_diagnostics_are_appended(self):
+        reason = self._reason(
+            subtype="error_during_execution",
+            errors=["watchdog abort"],
+            system_diagnostics=["Claude CLI API retry 1/3: overloaded (status=529)"],
+        )
+        self.assertIn("watchdog abort", reason)
+        self.assertIn("overloaded", reason)
+
+    def test_stderr_tail_is_capped_and_blank_lines_dropped(self):
+        lines = ["", "   "] + [f"line-{i}" for i in range(10)]
+        reason = self._reason(subtype="error_during_execution", stderr_lines=lines)
+        self.assertNotIn("line-4", reason)
+        for kept in ("line-5", "line-9"):
+            self.assertIn(kept, reason)
+
+    def test_no_detail_anywhere_is_stated_explicitly(self):
+        reason = self._reason()
+        self.assertNotEqual(reason, "claude-sdk harness error")
+        self.assertIn("no detail", reason)
+
+
+@pytest.mark.asyncio
 async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_turn() -> None:
     """``context_tokens`` must reflect the LAST API call, not the cumulative sum.
 
