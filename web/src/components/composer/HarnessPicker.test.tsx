@@ -96,16 +96,18 @@ describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
 
   it("closes only the config flyout on Escape and keeps the harness menu open (keyboard)", () => {
     openConfig();
-    const flyout = screen.getByText("Model configuration").closest('[role="menu"]');
+    const flyout = screen.getByText("Model configuration").closest<HTMLElement>('[role="menu"]');
     expect(flyout).not.toBeNull();
-    // Radix moves focus into the flyout on open; drive Escape from the actually
-    // focused node rather than an unfocused container.
-    const focused = (document.activeElement as HTMLElement | null) ?? (flyout as HTMLElement);
-    fireEvent.keyDown(focused, { key: "Escape" });
+    // Put focus inside the flyout and assert containment BEFORE Escape, so the
+    // keyboard path is exercised from a genuinely-focused flyout, not an
+    // unfocused container.
+    flyout!.focus();
+    expect(flyout!.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: "Escape" });
+    // Flyout closes, the parent harness menu stays open (Escape is scoped)…
     expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
-    // Escape is scoped to the flyout: the parent menu must not also dismiss.
     expect(screen.getByTestId("menu")).toBeInTheDocument();
-    // Focus returns to the harness row it was opened from.
+    // …and focus returns to the harness row it was opened from.
     expect(screen.getByTestId("entry")).toHaveFocus();
   });
 });
