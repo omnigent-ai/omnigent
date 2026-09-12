@@ -56,12 +56,14 @@ from the same ``sandbox.kubernetes`` block as the Job provider, so switching
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
 from omnigent.onboarding.sandboxes.kubernetes import (
     _POD_READY_REQUEST_TIMEOUT_S,
     KubernetesSandboxLauncher,
@@ -90,19 +92,28 @@ SANDBOX_PLURAL: str = "sandboxes"
 """Plural resource name, as required by ``CustomObjectsApi``."""
 
 SHUTDOWN_WINDOW_ENV_VAR: str = "OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S"
-"""Environment variable overriding :data:`DEFAULT_SHUTDOWN_WINDOW_S`."""
+"""Advanced/internal override of :data:`DEFAULT_SHUTDOWN_WINDOW_S`. Operators tune
+``keep_warm_s`` (the runner idle timeout); this window is the pod-linger tail
+after the runner exits and is left at its default in normal use."""
 
-DEFAULT_SHUTDOWN_WINDOW_S: int = 3600
-"""How far ahead of now ``spec.shutdownTime`` is set, in seconds.
+DEFAULT_SHUTDOWN_WINDOW_S: int = 120
+"""How far ahead of now ``spec.shutdownTime`` is set on each keepalive, in
+seconds: how long the pod lingers after the runner exits before it suspends.
+Small by design so ``keep_warm_s`` (the runner idle timeout) governs the felt
+idle-suspend time. Must stay >= :func:`min_shutdown_window_s` (twice the refresh
+interval) so a couple of missed refreshes cannot reap a busy sandbox; the
+create/wake deadline is floored separately at :data:`_BOOT_GRACE_S` for boot."""
 
-This is effectively the sandbox's inactivity timeout: a sandbox with no live
-runner is reclaimed within one window of its last refresh. It MUST stay
-comfortably above :data:`omnigent.server.managed_host_keepalive._MIN_INTERVAL_S`
-(the server's per-runner refresh rate) so a couple of missed or slow refreshes
-cannot reclaim a busy sandbox. One hour against a 10-minute refresh leaves five
-misses of headroom, and also covers the gap between a host starting and its
-first session spawning a runner (no runner yet means no refresh yet).
-"""
+_BOOT_GRACE_S: int = 300
+"""Floor on the shutdownTime set at create/wake, decoupled from the steady
+window. A freshly created or woken Pod cannot get its first keepalive until it
+has booted, its host has started, and a session's runner has connected and
+dialed back (tens of seconds, longer on a cold image pull). If the steady window
+is shorter than that, the initial deadline would lapse before the first refresh
+and the controller would reap the Pod mid-boot. Flooring only the INITIAL
+deadline at this grace lets the steady window (which governs how fast an idle
+sandbox suspends) be short without breaking cold start. A sandbox that boots but
+never gets a runner is genuinely unused and suspends once this grace elapses."""
 
 
 WORKSPACE_SIZE_ENV_VAR: str = "OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE"
@@ -128,24 +139,20 @@ the workspace, ``~/.omnigent``, and harness caches) survive a suspend.
 """
 
 
-MIN_SHUTDOWN_WINDOW_S: int = 1200
-"""Floor on the resolved window, in seconds.
+def min_shutdown_window_s() -> int:
+    """
+    Floor on the resolved shutdown window, in seconds: twice the server's
+    keepalive refresh interval.
 
-A window shorter than the server's keepalive refresh interval is a footgun that
-looks like it works: the deadline lapses before anything ever pushes it forward,
-so every sandbox suspends mid-run. A configured value below this is clamped up
-rather than honoured.
-
-Declared here rather than imported from
-``omnigent.server.managed_host_keepalive._MIN_INTERVAL_S`` on purpose: this
-module is in the onboarding layer and the server imports IT, so reading the
-server's constant here would invert that dependency. The test suite pins this
-floor at >= 2x that interval instead, so the two cannot drift apart silently.
-
-To watch a suspend happen quickly in a lab, patch ``spec.shutdownTime`` into the
-past directly (``kubectl patch sandbox … shutdownTime``) rather than shortening
-the window below this floor.
-"""
+    A window shorter than the refresh interval is a footgun that looks like it
+    works: the deadline lapses before anything pushes it forward, so every
+    sandbox suspends mid-run. Twice the interval leaves close to a missed refresh
+    of headroom. Both this floor and the server loop's throttle read the same
+    provider-scoped keepalive interval (base.resolve_managed_keepalive_interval_s,
+    here for ``agent_sandbox``), resolved live, so they cannot disagree. A
+    configured window below the floor is clamped up to it.
+    """
+    return math.ceil(2 * resolve_managed_keepalive_interval_s("agent_sandbox"))
 
 
 def resolve_workspace_volume() -> tuple[str, str | None] | None:
@@ -169,10 +176,14 @@ def resolve_shutdown_window_s() -> int:
     A non-positive or unparseable value falls through to the default rather
     than raising: a malformed knob must not make sandboxes unlaunchable, and a
     zero window would expire every sandbox at birth. A positive value below
-    :data:`MIN_SHUTDOWN_WINDOW_S` is clamped up to it.
+    :func:`min_shutdown_window_s` is clamped up to it.
 
-    :returns: The window in seconds, always >= :data:`MIN_SHUTDOWN_WINDOW_S`.
+    :returns: The window in seconds, always >= :func:`min_shutdown_window_s`.
     """
+    floor = min_shutdown_window_s()
+    # Fallbacks (empty/malformed/non-positive) must also respect the floor: the
+    # interval is configurable, so DEFAULT is not guaranteed >= floor.
+    fallback = max(DEFAULT_SHUTDOWN_WINDOW_S, floor)
     raw = os.environ.get(SHUTDOWN_WINDOW_ENV_VAR, "").strip()
     if raw:
         try:
@@ -182,10 +193,10 @@ def resolve_shutdown_window_s() -> int:
                 "ignoring %s=%r (not an integer); using %ss",
                 SHUTDOWN_WINDOW_ENV_VAR,
                 raw,
-                DEFAULT_SHUTDOWN_WINDOW_S,
+                fallback,
             )
         else:
-            if parsed >= MIN_SHUTDOWN_WINDOW_S:
+            if parsed >= floor:
                 return parsed
             if parsed > 0:
                 _logger.warning(
@@ -193,17 +204,28 @@ def resolve_shutdown_window_s() -> int:
                     "deadline that short in time); using %ss",
                     SHUTDOWN_WINDOW_ENV_VAR,
                     raw,
-                    MIN_SHUTDOWN_WINDOW_S,
-                    MIN_SHUTDOWN_WINDOW_S,
+                    floor,
+                    floor,
                 )
-                return MIN_SHUTDOWN_WINDOW_S
+                return floor
             _logger.warning(
                 "ignoring %s=%r (must be positive); using %ss",
                 SHUTDOWN_WINDOW_ENV_VAR,
                 raw,
-                DEFAULT_SHUTDOWN_WINDOW_S,
+                fallback,
             )
-    return DEFAULT_SHUTDOWN_WINDOW_S
+    return fallback
+
+
+def initial_shutdown_window_s() -> int:
+    """Window for the shutdownTime set at create/wake time.
+
+    The steady :func:`resolve_shutdown_window_s`, floored at :data:`_BOOT_GRACE_S`
+    so a short steady window cannot expire the Pod before its first keepalive.
+    Once the runner connects, keepalive brings the deadline down to the steady
+    window.
+    """
+    return max(resolve_shutdown_window_s(), _BOOT_GRACE_S)
 
 
 def _shutdown_time(window_s: int, *, now: datetime | None = None) -> str:
@@ -348,7 +370,7 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
 
         body = build_sandbox_manifest(
             manifest,
-            shutdown_time=_shutdown_time(resolve_shutdown_window_s()),
+            shutdown_time=_shutdown_time(initial_shutdown_window_s()),
             workspace_volume=resolve_workspace_volume(),
         )
         custom = self._load_custom()
@@ -376,6 +398,12 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
             body["metadata"]["name"],  # type: ignore[index]
             {"spec": spec},
             _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+        )
+        # Debug detail; the user-visible "waking" INFO is the server-layer resume
+        # log. Logged after the patch lands so a failed wake never reads as success.
+        _logger.debug(
+            "patched agent-sandbox '%s' back to Running (idle wake)",
+            body["metadata"]["name"],  # type: ignore[index]
         )
 
     def _find_job_pod(self, namespace: str, job_name: str) -> str | None:

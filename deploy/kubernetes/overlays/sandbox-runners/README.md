@@ -204,6 +204,7 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 |---|---|
 | `provider` | `kubernetes` (a Job with a fixed 7-day cap) or `agent_sandbox` (an agent-sandbox `Sandbox` that reclaims itself once idle): see [Self-reclaiming sandboxes](#self-reclaiming-sandboxes-provider-agent_sandbox). Both read this same `kubernetes:` block. |
 | `server_url` | URL the runner Pod's host dials back to (in-cluster service DNS by default). |
+| `keep_warm_s` | Optional, top-level under `sandbox:` (`agent_sandbox` only): seconds an idle sandbox stays warm (runner alive) after the last turn before it suspends — the single idle-suspend timing knob. Maps to the in-sandbox `runner.idle_timeout_s` and is authoritative over an explicit one. Unset → ~1h default. See [Watching and tuning the lifecycle](#watching-and-tuning-the-lifecycle). |
 | `host_config` | Optional, top-level under `sandbox:` (provider-agnostic, not inside `kubernetes:`): verbatim in-sandbox `~/.omnigent/config.yaml` content installed before `omnigent host` starts — e.g. a `providers:` block routing the `pi` harness through a self-hosted gateway (LiteLLM/vLLM). Server-managed: entries injected by a previous launch are replaced or removed on the next launch/resume; config created inside the sandbox survives. Keep secrets out via `api_key_ref: env:VAR`, resolved inside the runner Pod against the `secret_name` Secret. Validated at server startup. |
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
@@ -263,6 +264,50 @@ Deleting for good stays explicit: deleting the session terminates it, and a
 deployment-wide reaper handles sandboxes abandoned long-term. `kubectl get
 sandbox -n omnigent-sandboxes` shows suspended ones with `Ready=False`,
 `Reason=SandboxExpired`.
+
+### Watching and tuning the lifecycle
+
+**Tune it — one knob.** Set `keep_warm_s` on the sandbox config: how long an idle
+sandbox stays warm (its runner alive, so follow-ups are instant) after the last
+turn. Once that elapses the runner exits and the pod suspends a short window
+later (~2 min), so a sandbox is reclaimed roughly `keep_warm_s` after the agent
+goes quiet:
+
+```yaml
+sandbox:
+  provider: agent_sandbox
+  keep_warm_s: 300      # stay warm 5 min after the last turn, then suspend
+```
+
+It maps directly to the in-sandbox `runner.idle_timeout_s` and is authoritative
+(it wins over an explicit `host_config.runner.idle_timeout_s`). Leave it unset for
+the ~1h default. A short value reclaims aggressively; a follow-up **within**
+`keep_warm_s` is instant, while one sent after it re-wakes the sandbox on the next
+message (the CR + PVC are retained, so the workspace survives). Note the ~2-min
+window tail: a `keep_warm_s` of a few seconds still suspends ~2 min after idle.
+
+**Watch it happen.** The reliable view is the `Sandbox` CR itself:
+
+```bash
+kubectl get sandbox -n omnigent-sandboxes -w
+```
+
+`spec.shutdownTime` marches forward while a runner is live (keepalive), then the
+CR flips to `Ready=False` / `SandboxExpired` and the Pod is torn down when it
+suspends — a *suspend* (resumable, PVC kept), distinct from the deployment-wide
+reaper's hard terminate. The server also logs each keepalive at `INFO` from
+`omnigent.server.managed_host_keepalive` (`kept managed sandbox <id> alive
+(provider <p>)`), but that runs on a background thread and may not surface in
+every logging setup — treat `kubectl get sandbox -w` as the source of truth.
+
+**Advanced (rarely needed).** agent_sandbox refreshes its deadline every ~60s
+under a short ~120s pod-linger window; other managed providers keep a cheaper
+~600s cadence, so agent_sandbox's fast refresh doesn't multiply their write load.
+`OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` and `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S`
+override the window and cadence for experiments (e.g. a faster demo). Keepalive
+runs on its own timer (not the fixed 30s liveness ping), and the create/wake
+deadline is floored at a boot grace so a short window never reaps a still-booting
+Pod.
 
 ### Durable workspace (`OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE`)
 
