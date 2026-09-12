@@ -29,17 +29,18 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 import yaml
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.provider_config import (
+    _VALID_FAMILIES,
     _config_path,
     _parse_provider,
-    _VALID_FAMILIES,
     resolve_secret,
 )
 
@@ -184,7 +185,9 @@ def providers_list(config_path: str | None = None) -> dict[str, Any]:
     return {"providers": entries, "config_path": config_path or _config_path()}
 
 
-def provider_upsert(name: str, entry: Mapping[str, Any], config_path: str | None = None) -> dict[str, Any]:
+def provider_upsert(
+    name: str, entry: Mapping[str, Any], config_path: str | None = None
+) -> dict[str, Any]:
     """Insert or replace one provider entry after full validation.
 
     The whole entry is replaced (no field-level merge): the panel edits a
@@ -236,7 +239,11 @@ def provider_delete(name: str, config_path: str | None = None) -> dict[str, Any]
     removed = providers.pop(name)
     backup = _write_config(config, config_path)
     _logger.info("provider %r deleted via control plane (backup %s)", name, backup or "n/a")
-    return {"name": name, "removed": _redact_entry(name, removed) if isinstance(removed, dict) else None, "backup": backup}
+    return {
+        "name": name,
+        "removed": _redact_entry(name, removed) if isinstance(removed, dict) else None,
+        "backup": backup,
+    }
 
 
 def provider_test(name: str, config_path: str | None = None) -> dict[str, Any]:
@@ -564,14 +571,14 @@ def agent_pin_clear(
 # exist for tests (which call the functions directly) and for future
 # in-process callers under the same trust boundary.
 _PROVIDER_OPS = {
-    "providers_list": lambda params: providers_list(),
+    "providers_list": lambda _params: providers_list(),
     "provider_upsert": lambda params: provider_upsert(
         params.get("name"),
         params.get("entry") if isinstance(params.get("entry"), dict) else {},
     ),
     "provider_delete": lambda params: provider_delete(params.get("name")),
     "provider_test": lambda params: provider_test(params.get("name")),
-    "agents_list": lambda params: agents_list(),
+    "agents_list": lambda _params: agents_list(),
     "agent_pin_set": lambda params: agent_pin_set(
         params.get("agent"),
         provider=params.get("provider") if isinstance(params.get("provider"), str) else None,

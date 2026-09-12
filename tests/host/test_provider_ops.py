@@ -18,6 +18,16 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host import provider_ops
 
 
+def _load_yaml(path):
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def _dump_yaml(path, data):
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False)
+
+
 def _write_config(tmp_path, providers: dict) -> str:
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump({"providers": providers}, sort_keys=False))
@@ -68,7 +78,7 @@ class TestProviderUpsert:
         path = str(tmp_path / "config.yaml")
         result = provider_ops.provider_upsert("gw", _gateway_entry(), config_path=path)
         assert result["name"] == "gw"
-        raw = yaml.safe_load(open(path))
+        raw = _load_yaml(path)
         assert raw["providers"]["gw"]["openai"]["base_url"] == "https://gw.example/v1"
         # key order of the entry survives the round trip
         assert list(raw["providers"]["gw"]) == list(_gateway_entry())
@@ -82,7 +92,7 @@ class TestProviderUpsert:
                 config_path=path,
             )
         assert err.value.code == ErrorCode.INVALID_INPUT
-        assert yaml.safe_load(open(path))["providers"] == {}
+        assert _load_yaml(path)["providers"] == {}
 
     def test_upsert_rejects_bad_name(self, tmp_path) -> None:
         path = _write_config(tmp_path, {})
@@ -103,7 +113,7 @@ class TestProviderDelete:
         path = _write_config(tmp_path, {"gw": _gateway_entry()})
         result = provider_ops.provider_delete("gw", config_path=path)
         assert result["name"] == "gw"
-        assert yaml.safe_load(open(path))["providers"] == {}
+        assert _load_yaml(path)["providers"] == {}
 
     def test_delete_unknown_is_not_found(self, tmp_path) -> None:
         path = _write_config(tmp_path, {})
@@ -221,9 +231,7 @@ class TestAgentPin:
         )
         assert result["spec"]["auth"] == {"type": "provider", "name": "openrouter"}
         assert result["spec"]["model"] == "gpt-x"
-        raw = yaml.safe_load(
-            open(f"{agents_dir}/my-agent/config.yaml")
-        )
+        raw = _load_yaml(f"{agents_dir}/my-agent/config.yaml")
         # sibling keys untouched
         assert raw["executor"]["config"]["harness"] == "pi"
         assert raw["executor"]["skills"] == []
@@ -257,9 +265,9 @@ class TestAgentPin:
         provider_ops.agent_pin_set("my-agent", provider="openrouter", agents_dir=agents_dir)
         # a spec with an inline api_key auth block must keep it
         path = f"{agents_dir}/my-agent/config.yaml"
-        raw = yaml.safe_load(open(path))
+        raw = _load_yaml(path)
         raw["executor"]["auth"] = {"type": "api_key", "api_key": "sk-inline"}
-        open(path, "w").write(yaml.safe_dump(raw, sort_keys=False))
+        _dump_yaml(path, raw)
 
         provider_ops.agent_pin_set("my-agent", provider="9router", agents_dir=agents_dir)
         result = provider_ops.agent_pin_clear("my-agent", agents_dir=agents_dir)
@@ -308,7 +316,7 @@ class TestRunProviderOp:
             {"name": "gw", "entry": _gateway_entry(), "config_path": str(evil)},
         )
         # the write landed in the host's config, not the attacker-named file
-        written = yaml.safe_load(open(real_home / ".omnigent" / "config.yaml"))
+        written = _load_yaml(real_home / ".omnigent" / "config.yaml")
         assert "gw" in written["providers"]
         assert yaml.safe_load(evil.read_text()) == {}
 
@@ -335,6 +343,6 @@ class TestRunProviderOp:
             )
         assert err.value.code == ErrorCode.NOT_FOUND
         assert list(evil.rglob("*.bak-*")) == []
-        assert yaml.safe_load(open(evil / "my-agent" / "config.yaml"))["executor"].get(
+        assert _load_yaml(evil / "my-agent" / "config.yaml")["executor"].get(
             "model"
         ) is None
