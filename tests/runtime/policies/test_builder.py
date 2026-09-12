@@ -1408,6 +1408,115 @@ def test_agent_rebind_after_spec_resolution_fails_closed(
         )
 
 
+def test_initial_label_seed_does_not_clobber_a_concurrent_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Seeding declared initials must not overwrite a value another writer
+    persisted before the seed lands.
+
+    The race is constructed, not simulated: a store proxy commits a policy
+    write at the instant the seeding helper hands the declared initials to
+    the store — after the helper decided to seed, before the insert runs.
+    Insert-if-absent leaves the persisted value alone because the database
+    decides which keys are missing inside the same statement; the previous
+    diff-then-upsert path recomputed "missing" from a snapshot that is
+    stale by then and reset the live value to its initial.
+    """
+    from omnigent.runtime.policies.builder import _seed_and_load_labels
+    from omnigent.spec.types import LabelDef
+
+    conv = conversation_store.create_conversation()
+
+    class _WriteBeforeSeed:
+        """Commits a competing label write just before the seed insert."""
+
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+            self._fired = False
+
+        def seed_labels_if_absent(self, conversation_id: str, defaults, updated_at=None):
+            if not self._fired:
+                self._fired = True
+                self._inner.set_labels(conversation_id, {"integrity": "7"})
+            return self._inner.seed_labels_if_absent(conversation_id, defaults, updated_at)
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+    result = _seed_and_load_labels(
+        conversation_id=conv.id,
+        label_defs={"integrity": LabelDef(initial="0")},
+        conversation_store=_WriteBeforeSeed(conversation_store),  # type: ignore[arg-type]
+    )
+
+    assert result["integrity"] == "7", "seed overwrote a concurrent write"
+    persisted = dict(conversation_store.get_conversation(conv.id).labels)
+    assert persisted["integrity"] == "7"
+
+
+def test_increments_from_independent_snapshots_merge(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two engines holding independent snapshots each INCREMENT one key, and
+    both increments survive. A blind whole-blob write persisted 1.
+
+    Sequential by construction, and named for what it proves: the MERGE, not
+    the race. Serialisation of overlapping transactions is a store-level
+    property and is pinned there, against each dialect's own mechanism
+    (``test_two_real_writers_race_on_one_metadata_row``) — this test stays
+    green with the row lock removed and should not be read as covering it.
+    """
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-race")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine_a = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine_b = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    op = StateUpdate(key="risk", action=StateUpdateAction.INCREMENT, value=1)
+    engine_a.apply_state_updates([op])
+    engine_b.apply_state_updates([op])
+
+    persisted = conversation_store.get_conversation(conv.id)
+    assert dict(persisted.session_state)["risk"] == 2
+
+
+def test_sets_from_independent_snapshots_preserve_other_keys(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A second engine's SET must not drop a key the first one wrote.
+
+    Sequential, like its sibling above: the merge is the contract here.
+    """
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-keys")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine_a = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine_b = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    engine_a.apply_state_updates(
+        [StateUpdate(key="from_a", action=StateUpdateAction.SET, value="a")]
+    )
+    engine_b.apply_state_updates(
+        [StateUpdate(key="from_b", action=StateUpdateAction.SET, value="b")]
+    )
+
+    state = dict(conversation_store.get_conversation(conv.id).session_state)
+    assert state["from_a"] == "a", state
+    assert state["from_b"] == "b", state
+
+
 def test_delete_survives_the_hot_cache_overlay(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
