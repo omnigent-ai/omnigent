@@ -1802,7 +1802,7 @@ describe("Chat-mode terminal panel layout", () => {
     ];
     const detail = "Host offline while closing draft shell";
     draftWorkspaceState.deleteTerminal.mockRejectedValue(new Error(detail));
-    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => undefined);
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "error-toast");
     try {
       renderShell("/c/conv_abc");
       expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("draft_shell");
@@ -4381,7 +4381,7 @@ describe("new-chat workspace rail", () => {
     });
     const detail = "draft workspace create failed: 409 Conflict — upgrade this host";
     draftWorkspaceState.ensureContext.mockRejectedValue(new Error(detail));
-    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => undefined);
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "error-toast");
     try {
       mockConversations([]);
       renderShell("/");
