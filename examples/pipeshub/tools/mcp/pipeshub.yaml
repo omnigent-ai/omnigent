@@ -1,0 +1,25 @@
+# PipesHub MCP server — search, chat, and read across your org's connected
+# knowledge sources (Slack, Drive, Confluence, etc.) through PipesHub's
+# governed connector layer.
+# Auto-discovered by omnigent (omnigent/spec/parser.py:_discover_mcp_servers);
+# no need to reference it from config.yaml.
+name: pipeshub
+description: Search and chat over your organization's PipesHub-connected knowledge sources.
+transport: http
+
+# Your PipesHub deployment's MCP endpoint, e.g. https://my-org.pipeshub.com/mcp.
+# ${VAR} is expanded at parse time, so this file can be committed as-is.
+url: ${PIPESHUB_MCP_URL}
+
+headers:
+  # Mint this from PipesHub: workspace → Developer settings → Personal
+  # Access Tokens → New token. Runs as you, so results respect your own
+  # per-user permissions (unlike an OAuth app's client-credentials flow).
+  Authorization: "Bearer ${PIPESHUB_MCP_TOKEN}"
+
+# NOTE: this `tools:` allow-list only applies to inline MCP entries in
+# config.yaml — directory configs like this one currently expose every tool
+# the server advertises. PipesHub's MCP surface is seven tools today
+# (sources, chat, search, download_record, get_record_content, directory,
+# agents), so this isn't limiting anything yet; worth revisiting if that
+# surface grows.
