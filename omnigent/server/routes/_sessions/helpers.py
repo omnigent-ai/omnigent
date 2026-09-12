@@ -2579,10 +2579,9 @@ async def _persist_external_permission_mode_change(
     """
     Persist a pane-observed claude-native permission mode as a session label.
 
-    The forwarder posts this when the pane's mode footer differs from what it
-    last reported — i.e. the user pressed shift+tab in the TUI. Unlike the
-    PATCH path this needs no runner confirmation: the pane IS the source, so
-    the mode is already in effect.
+    The forwarder reports startup and observed shifts separately: a saved
+    label can outlive the process that observed it. Unlike the PATCH path,
+    this needs no runner confirmation because the pane is the source.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row for ``session_id`` at the route boundary.
@@ -2605,13 +2604,18 @@ async def _persist_external_permission_mode_change(
             f"{sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}; got {mode!r}",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Persist live transitions for relaunch, but leave the initial observation
-    # of a settings-derived mode unpinned when no launch flag was supplied.
-    previous_mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    # Legacy forwarders omit provenance; their reports may be passive startup
+    # observations, so only explicitly observed transitions add a launch flag.
+    initial_observation = body.data.get("initial_observation", True)
+    if not isinstance(initial_observation, bool):
+        raise OmnigentError(
+            "external_permission_mode_change requires data.initial_observation to be a boolean",
+            code=ErrorCode.INVALID_INPUT,
+        )
     merged_args = _merge_claude_permission_launch_args(
         conv.terminal_launch_args,
         mode,
-        add_if_missing=previous_mode in _CLAUDE_NATIVE_PERMISSION_MODES and previous_mode != mode,
+        add_if_missing=not initial_observation,
     )
     if conv.terminal_launch_args != merged_args:
         await asyncio.to_thread(
@@ -2748,6 +2752,7 @@ def _merge_claude_permission_launch_args(
     Explicit selections and observed live transitions add the flag even if
     launch used a settings default. An initial footer observation only updates
     an existing flag, so merely observing startup does not pin that default.
+    Selecting Manual pins ``default`` too: a selection overrides later settings edits.
 
     :param existing_args: Current launch args, or ``None``.
     :param mode: Confirmed permission mode, e.g. ``"auto"``.
@@ -2764,7 +2769,9 @@ def _merge_claude_permission_launch_args(
     while index < len(args):
         arg = args[index]
         if arg == "--permission-mode":
-            index += 2  # drop the flag and its separate value token
+            index += 1
+            if index < len(args) and not args[index].startswith("-"):
+                index += 1
             continue
         if arg.startswith("--permission-mode="):
             index += 1

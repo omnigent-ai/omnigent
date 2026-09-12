@@ -742,6 +742,10 @@ class _ForwardDedupeState:
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
     # which the web UI can observe on its own.
     posted_permission_mode: str | None = None
+    # Observation advances even when delivery fails; a pending switch must
+    # survive retries, including a switch back to the last posted mode.
+    observed_permission_mode: str | None = None
+    permission_mode_change_pending: bool = False
     # Monotonic deadline before which the next pane capture is skipped, so the
     # single ``capture-pane`` subprocess (feeding both the permission-mode and
     # /btw signals) spawns at _PANE_POLL_INTERVAL_S, not every poll.
@@ -5070,6 +5074,7 @@ async def _post_external_permission_mode_change(
     *,
     session_id: str,
     mode: str,
+    initial_observation: bool,
 ) -> None:
     """
     Post one ``external_permission_mode_change`` event to the Sessions API.
@@ -5080,11 +5085,15 @@ async def _post_external_permission_mode_change(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     :param mode: Permission mode the pane now shows, e.g. ``"auto"``.
+    :param initial_observation: Whether this reports startup rather than an observed switch.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "external_permission_mode_change", "data": {"permission_mode": mode}},
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": mode, "initial_observation": initial_observation},
+        },
     )
     resp.raise_for_status()
 
@@ -5143,18 +5152,28 @@ async def _relay_permission_mode(
     hides itself. Best-effort and idempotent — an unchanged or unreadable
     (``None``) mode is a no-op, and a failed POST is retried next poll.
 
+    Only a change between readable observations establishes a selection.
+    A switch before the first readable footer is indistinguishable from a
+    settings-derived startup mode and remains a passive observation.
+
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param mode: The permission-mode footer parsed from the pane, or ``None``.
     :param dedupe: Shared per-session dedupe state; mutated in place.
     """
-    if mode is None or mode == dedupe.posted_permission_mode:
+    if mode is None:
+        return
+    if dedupe.observed_permission_mode is not None and mode != dedupe.observed_permission_mode:
+        dedupe.permission_mode_change_pending = True
+    dedupe.observed_permission_mode = mode
+    if mode == dedupe.posted_permission_mode and not dedupe.permission_mode_change_pending:
         return
     try:
         await _post_external_permission_mode_change(
             client,
             session_id=session_id,
             mode=mode,
+            initial_observation=not dedupe.permission_mode_change_pending,
         )
     except httpx.HTTPError:
         _logger.debug(
@@ -5166,6 +5185,7 @@ async def _relay_permission_mode(
         )
         return
     dedupe.posted_permission_mode = mode
+    dedupe.permission_mode_change_pending = False
 
 
 async def _relay_btw_overlay(
