@@ -10701,10 +10701,16 @@ def create_runner_app(
                 )
             spec_entry = await spec_resolver(agent_id, session_id)
             if spec_entry is None:
+                # The session still references agent_id, but its stored bundle
+                # no longer resolves (deleted or rebound out from under the
+                # live session). A session-lifecycle condition, not a generic
+                # NOT_FOUND: the distinct code lets the terminal-ensure and
+                # turn-dispatch paths surface a lifecycle reason instead of a
+                # runner startup fault.
                 raise OmnigentError(
                     f"session spec resolver: agent {agent_id!r} for "
                     f"session {session_id!r} was not found",
-                    code=ErrorCode.NOT_FOUND,
+                    code=ErrorCode.SESSION_AGENT_MISSING,
                 )
             sub_agent_name = snapshot.sub_agent_name
             # Root the child at its own bundle dir. Always wrapped, so an
