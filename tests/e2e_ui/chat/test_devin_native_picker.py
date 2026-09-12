@@ -1,7 +1,6 @@
 """E2E: the New Chat picker offers Devin with its own model + effort lists.
 
-Devin is not ``fullySupported``, so it lives in the picker's Other group with the
-rest of the natives. Selecting it must surface:
+Selecting Devin in the New Chat picker must surface:
 
 * Devin's model **families** (from the host's ``devin-native`` catalog probe) —
   not Claude's or Pi's list; and
@@ -173,10 +172,31 @@ async def _open_picker(page) -> None:
     await page.get_by_test_id("new-chat-landing-agent-select").click()
 
 
+async def _reveal_devin(page):
+    """Return the Devin row locator, opening the Other submenu if needed.
+
+    The picker splits harnesses into a primary list and an Other submenu keyed on
+    ``fullySupported``. Which side Devin lands on is a product decision, so this
+    looks in the primary list first and only expands Other when it has to —
+    keeping the test about Devin's model/effort behaviour rather than its
+    placement.
+
+    :param page: The Playwright page with the picker already open.
+    :returns: The Devin row locator.
+    """
+    devin = page.get_by_test_id(f"new-chat-landing-agent-{_DEVIN_AGENT_ID}")
+    if await devin.count() > 0:
+        return devin
+    more = page.get_by_test_id("new-chat-landing-harness-more")
+    if await more.count() > 0:
+        await more.click()
+    return devin
+
+
 def test_devin_picker_offers_its_own_models_and_effort(
     seeded_session: tuple[str, str],
 ) -> None:
-    """Devin is offered in Other and exposes its families plus an Effort ladder."""
+    """Devin is offered and exposes its own families plus an Effort ladder."""
     base_url, session_id = seeded_session
     del session_id  # this flow only reads the picker; it creates no session
     _run_in_fresh_loop(_drive(base_url))
@@ -202,12 +222,13 @@ async def _drive(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # 1. Devin is offered, in the Other group alongside the other
-            #    non-primary natives.
+            # 1. Devin is offered. Deliberately NOT asserting whether it sits in
+            #    the primary list or behind Other: that placement is the
+            #    `fullySupported` product decision, and pinning it here would
+            #    make this test fail on a decision change rather than on a Devin
+            #    regression. `_reveal_devin` finds it either way.
             await _open_picker(page)
-            devin = page.get_by_test_id(f"new-chat-landing-agent-{_DEVIN_AGENT_ID}")
-            await expect(devin).to_have_count(0)
-            await page.get_by_test_id("new-chat-landing-harness-more").click()
+            devin = await _reveal_devin(page)
             await expect(devin).to_be_visible(timeout=30_000)
 
             # 2. Selecting Devin shows DEVIN's families, from the devin-native
@@ -219,6 +240,7 @@ async def _drive(base_url: str) -> None:
             await page.keyboard.press("Escape")
             await expect(page.get_by_role("menu")).to_have_count(0)
             await _open_picker(page)
+            await _reveal_devin(page)
             await expect(page.get_by_test_id("new-chat-landing-agent-models")).to_be_visible(
                 timeout=30_000
             )
