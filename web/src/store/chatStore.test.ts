@@ -13711,8 +13711,8 @@ describe("chatStore — interaction_phase analytics", () => {
   });
 });
 
-describe("beginLocalConversation — optimistic model seed (#7039)", () => {
-  it("seeds the selected model override so the temp view isn't the previous model", () => {
+describe("beginLocalConversation — optimistic model seed", () => {
+  it("seeds the selected model + effort + harness + identity, not the previous model", () => {
     seedConversationsCache([]);
     // A previous session left a cross-session sticky pick; it must NOT leak into
     // the optimistic view — the seed is authoritative.
@@ -13720,45 +13720,65 @@ describe("beginLocalConversation — optimistic model seed (#7039)", () => {
     const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
       modelOverride: "opus[1m]",
       reasoningEffort: "high",
+      harness: "claude-sdk",
       boundAgentId: "agent_xyz",
       boundAgentName: "Debby",
     })!;
     expect(isTempConvId(begun.tempConvId)).toBe(true);
-    const s = useChatStore.getState();
-    expect(s.sessionModelOverride).toBe("opus[1m]");
-    expect(s.sessionReasoningEffort).toBe("high");
-    expect(s.boundAgentId).toBe("agent_xyz");
-    expect(s.boundAgentName).toBe("Debby");
+    const state = useChatStore.getState();
+    expect(state.sessionModelOverride).toBe("opus[1m]");
+    expect(state.sessionReasoningEffort).toBe("high");
+    expect(state.sessionHarness).toBe("claude-sdk");
+    expect(state.boundAgentId).toBe("agent_xyz");
+    expect(state.boundAgentName).toBe("Debby");
   });
 
-  it("pins no model for a routing create", () => {
+  it("shows the resolved default model via llmModel when there is no override", () => {
     seedConversationsCache([]);
     const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
       modelOverride: null,
-      routing: true,
+      llmModel: "claude-opus-4-8",
+      harness: "claude-sdk",
+      boundAgentId: "agent_default",
+      boundAgentName: "Polly",
+    })!;
+    expect(begun).not.toBeNull();
+    const state = useChatStore.getState();
+    // No override, but the resolved default is visible so the temp view reads
+    // the real model rather than "agent default" / a stale pick.
+    expect(state.sessionModelOverride).toBeNull();
+    expect(state.llmModel).toBe("claude-opus-4-8");
+    expect(state.sessionHarness).toBe("claude-sdk");
+    expect(state.boundAgentName).toBe("Polly");
+  });
+
+  it("carries the routing flag + identity so the composer renders routing, not a model", () => {
+    seedConversationsCache([]);
+    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
+      modelOverride: null,
+      costControlModeOverride: "on",
+      harness: "claude-sdk",
       boundAgentId: "agent_auto",
+      boundAgentName: "Auto",
     })!;
     expect(begun).not.toBeNull();
-    const s = useChatStore.getState();
-    expect(s.sessionModelOverride).toBeNull();
-    expect(s.boundAgentId).toBe("agent_auto");
+    const state = useChatStore.getState();
+    // routingOn === costControlModeOverride === "on" drives the routing label,
+    // and the model stays unpinned — matching the normalized routing create.
+    expect(state.costControlModeOverride).toBe("on");
+    expect(state.sessionModelOverride).toBeNull();
+    expect(state.sessionHarness).toBe("claude-sdk");
+    expect(state.boundAgentId).toBe("agent_auto");
   });
 
-  it("leaves model null for a default create (no override)", () => {
-    seedConversationsCache([]);
-    const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
-      modelOverride: null,
-    })!;
-    expect(begun).not.toBeNull();
-    expect(useChatStore.getState().sessionModelOverride).toBeNull();
-  });
-
-  it("preserves the seeded model across the temp→real rekey", () => {
+  it("preserves the seeded model + identity across the temp→real rekey", () => {
     seedSession("conv_real");
     seedConversationsCache([]);
     const begun = beginLocalConversation("hi", undefined, undefined, undefined, {
       modelOverride: "opus[1m]",
+      harness: "claude-sdk",
       boundAgentId: "agent_xyz",
+      boundAgentName: "Debby",
     })!;
     hydrateLocalConversation(
       begun.tempConvId,
@@ -13772,13 +13792,18 @@ describe("beginLocalConversation — optimistic model seed (#7039)", () => {
     );
     // The registry rekey copies entry state, so the real entry carries the seed
     // until the server snapshot binds authoritative values.
-    expect(useChatStore.getState().sessionModelOverride).toBe("opus[1m]");
+    const state = useChatStore.getState();
+    expect(state.sessionModelOverride).toBe("opus[1m]");
+    expect(state.sessionHarness).toBe("claude-sdk");
+    expect(state.boundAgentName).toBe("Debby");
   });
 
   it("is backward compatible: a 4-arg call seeds no model fields", () => {
     seedConversationsCache([]);
     useChatStore.setState({ selectedModel: "claude-sonnet-4-6" });
     beginLocalConversation("hi", undefined);
-    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    const state = useChatStore.getState();
+    expect(state.sessionModelOverride).toBeNull();
+    expect(state.sessionHarness).toBeNull();
   });
 });

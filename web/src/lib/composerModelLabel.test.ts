@@ -22,6 +22,11 @@ describe("nativeModelLabel", () => {
     );
   });
 
+  it("folds catalog-prefixed ids the same way", () => {
+    expect(nativeModelLabel({ id: "system.ai.claude-opus-4-8[1m]" })).toBe("Opus 4.8 (1M context)");
+    expect(nativeModelLabel({ id: "databricks-claude-sonnet-4-6" })).toBe("Sonnet 4.6");
+  });
+
   it("falls back to the advertised display name for a non-Claude row", () => {
     expect(nativeModelLabel({ id: "gpt-5.6-luna", displayName: "GPT-5.6 Luna" })).toBe(
       "GPT-5.6 Luna",
@@ -41,12 +46,12 @@ describe("defaultModelLabel", () => {
   });
 });
 
-describe("compactModelTriggerLabel (#7094)", () => {
+describe("compactModelTriggerLabel", () => {
   it("collapses Default (X) to X", () => {
     expect(compactModelTriggerLabel("Default (Opus 4.8)")).toBe("Opus 4.8");
   });
 
-  it("KEEPS the (1M context) variant — the regression this fixes", () => {
+  it("keeps the (1M context) variant instead of stripping it", () => {
     expect(compactModelTriggerLabel("Opus 4.8 (1M context)")).toBe("Opus 4.8 (1M context)");
     expect(compactModelTriggerLabel("Default (Opus 4.8 (1M context))")).toBe(
       "Opus 4.8 (1M context)",
@@ -58,11 +63,11 @@ describe("compactModelTriggerLabel (#7094)", () => {
   });
 });
 
-describe("landing ↔ chat label parity (#7094)", () => {
+describe("landing ↔ chat label parity", () => {
   it("the trigger label matches the chat status label for the same picked row", () => {
     const row: NativeModelOption = { id: "opus[1m]", model: "claude-opus-4-8[1m]" };
     // Landing derives its trigger from nativeModelLabel; chat derives from the
-    // raw model id via the catalog. Both must land on the same string.
+    // raw model id. Both must land on the same string.
     const landing = compactModelTriggerLabel(nativeModelLabel(row));
     const chat = formatStatusModelLabel(row.model!, [row]);
     expect(landing).toBe("Opus 4.8 (1M context)");
@@ -71,28 +76,47 @@ describe("landing ↔ chat label parity (#7094)", () => {
   });
 });
 
-describe("formatStatusModelLabel catalog/source transitions (flicker)", () => {
-  it("is STABLE for a Claude alias across the pre-catalog → catalog window", () => {
-    // Before the catalog resolves (empty options) and after it arrives, a
-    // Claude alias renders identically — no async flicker for this path.
+describe("formatStatusModelLabel — Claude id folding (catalog-free)", () => {
+  it("folds a full Claude id without any catalog", () => {
+    expect(formatStatusModelLabel("claude-opus-4-8[1m]", [])).toBe("Opus 4.8 (1M context)");
+    expect(formatStatusModelLabel("claude-sonnet-4-6", [])).toBe("Sonnet 4.6");
+  });
+
+  it("folds catalog-prefixed ids without any catalog", () => {
+    expect(formatStatusModelLabel("system.ai.claude-opus-4-8[1m]", [])).toBe(
+      "Opus 4.8 (1M context)",
+    );
+    expect(formatStatusModelLabel("databricks-claude-sonnet-4-6", [])).toBe("Sonnet 4.6");
+  });
+
+  it("is stable for a full Claude id across the pre-catalog → catalog window", () => {
+    const before = formatStatusModelLabel("claude-opus-4-8[1m]", []);
+    const after = formatStatusModelLabel("claude-opus-4-8[1m]", [
+      { id: "opus[1m]", model: "claude-opus-4-8[1m]" },
+    ]);
+    expect(before).toBe("Opus 4.8 (1M context)");
+    expect(after).toBe("Opus 4.8 (1M context)");
+    expect(before).toBe(after);
+  });
+});
+
+describe("formatStatusModelLabel — source transitions", () => {
+  it("fills the version for a bare alias once the catalog arrives, keeping the variant", () => {
+    // A bare alias legitimately withholds the version the client can't yet
+    // know; the catalog supplies it. The (1M context) variant is present in
+    // both, so the distinguishing suffix never pops in or out — but the label
+    // does change (version fills in), so this is a real transition, not stable.
     const before = formatStatusModelLabel("opus[1m]", []);
     const after = formatStatusModelLabel("opus[1m]", [
       { id: "opus[1m]", model: "claude-opus-4-8[1m]" },
     ]);
     expect(before).toBe("Opus (1M context)");
     expect(after).toBe("Opus 4.8 (1M context)");
-    // The alias form omits the version the client can't yet know; the catalog
-    // supplies it. Both keep the (1M context) variant, so the distinguishing
-    // suffix never pops in or out — the documented residual is only the
-    // version digits, which the alias intentionally withholds.
     expect(before).toContain("(1M context)");
     expect(after).toContain("(1M context)");
   });
 
   it("resolves a Codex raw id to its display name once the catalog arrives", () => {
-    // Documented transition: raw id pre-catalog, friendly name post-catalog.
-    // The #7039 seed guarantees this is the SELECTED model, never the previous
-    // session's, so the transition is raw→pretty for the right model.
     expect(formatStatusModelLabel("gpt-5.6-luna", [])).toBe("gpt-5.6-luna");
     expect(
       formatStatusModelLabel("gpt-5.6-luna", [{ id: "gpt-5.6-luna", displayName: "GPT-5.6 Luna" }]),
@@ -105,7 +129,7 @@ describe("formatStatusModelLabel catalog/source transitions (flicker)", () => {
   });
 });
 
-describe("effort normalization (#7026 single source)", () => {
+describe("effort normalization (single source)", () => {
   it("normalizes xhigh → xHigh", () => {
     expect(normalizeEffortLabel("xhigh")).toBe("xHigh");
     expect(normalizeEffortLabel("XHIGH")).toBe("xHigh");

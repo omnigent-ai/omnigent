@@ -10,7 +10,7 @@ import {
   CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
 } from "@/lib/nativeHarnessModes";
 
-describe("codexCreateApprovalOptions (#7070)", () => {
+describe("codexCreateApprovalOptions", () => {
   it("includes the bypass entry as the 4th create-time option", () => {
     const values = codexCreateApprovalOptions().map((o) => o.value);
     expect(values).toEqual([

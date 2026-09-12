@@ -1,13 +1,13 @@
 // Create-time Codex approval option source, shared by the composer permission
 // picker on landing (and available to the fork dialog). Always includes the
 // DANGEROUS full-bypass entry as a 4th option so the quick menu offers the same
-// explicit opt-in the Edit config modal already does (#7070).
+// explicit opt-in the Edit config modal does.
 //
-// SCOPE: create-time only. A RUNNING codex session switches approval through
+// SCOPE: create-time only. A running codex session switches approval through
 // Codex's `/permissions` popup, which has no bypass row (bypass is a launch
-// flag) — see `omnigent/codex_approval_modes.py` and `@/lib/codexApprovalMode`.
-// So the running-session picker keeps the runtime presets (no bypass); this
-// module never widens that surface, and nothing here auto-enables bypass.
+// flag) — see `@/lib/codexApprovalMode`. So the running-session picker keeps the
+// runtime presets (no bypass); this module never widens that surface, and
+// nothing here auto-enables bypass.
 
 import {
   CODEX_NATIVE_APPROVAL_MODES,

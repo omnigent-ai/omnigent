@@ -1,13 +1,10 @@
 // Canonical model / effort label formatting for the composer, shared by the
-// landing dialog and the in-session chat composer so the two surfaces render
-// the SAME label for the same model and can't diverge or flicker (#7094).
+// landing dialog and the in-session chat composer so both surfaces render the
+// same label for the same model.
 //
 // Pure leaf module (no React, no store) so the landing screen, the chat page,
-// the harness config controls, and the store can all import one source of
-// truth. `nativeModelLabel` / `defaultModelLabel` live here (and are re-exported
-// from `HarnessConfigControls.tsx` for callers that import them from there);
-// `formatStatusModelLabel` / `formatStatusEffortLabel` / `formatModelEffortStatusLabel`
-// moved here from `ChatPage.tsx`.
+// the harness config controls, and the store can all depend on one source of
+// truth without a circular import.
 
 import { findNativeModelOption } from "@/lib/codexNativeModels";
 import type { NativeModelOption } from "@/lib/types";
@@ -23,7 +20,7 @@ export interface NativeModelLabelFields {
 
 /** A catalog row's user-facing name: what the harness advertises, else its id.
  *
- * Claude aliases fold to a `Family Major.Minor (1M context)` spelling; the
+ * Claude ids fold to a `Family Major.Minor (1M context)` spelling. The
  * ` (1M context)` variant suffix is load-bearing and always preserved so a 1M
  * model reads distinctly from its 200k sibling. */
 export function nativeModelLabel(option: NativeModelLabelFields): string {
@@ -43,38 +40,37 @@ export function nativeModelLabel(option: NativeModelLabelFields): string {
 
 /**
  * Label for the Model row's "Default" choice, naming the model it resolves to
- * when the catalog marks one.
- *
- * Shared by the landing dialog and the in-session composer: read from one place
- * so the same session can't read "Default" in one gear and
- * "Default (GPT-5.6-Luna)" in the other.
+ * when the catalog marks one, so the same session can't read "Default" in one
+ * place and "Default (GPT-5.6-Luna)" in another.
  *
  * @param options Harness catalog rows; at most one is marked default.
  * @returns ``Default (<name>)``, or plain ``Default`` when unmarked.
  */
 export function defaultModelLabel(options: readonly NativeModelLabelFields[]): string {
-  const dflt = options.find((option) => option.isDefault);
-  return dflt ? `Default (${nativeModelLabel(dflt)})` : "Default";
+  const defaultOption = options.find((option) => option.isDefault);
+  return defaultOption ? `Default (${nativeModelLabel(defaultOption)})` : "Default";
 }
 
 /**
- * The canonical model label for the composer harness trigger.
+ * The model label for the composer harness trigger.
  *
  * Collapses a `Default (X)` value to just `X` (the trigger names the resolved
- * model, not the "Default" wrapper) but — unlike the old landing-only
- * `compactHarnessTriggerValue` — PRESERVES the ` (1M context)` variant suffix.
- * Stripping it (the #7094 bug) made the landing trigger read "Opus 4.8" while
- * the chat status line read "Opus 4.8 (1M context)" for the same model.
+ * model, not the "Default" wrapper) while PRESERVING the ` (1M context)`
+ * variant suffix, so the trigger and the chat status line read the same for a
+ * 1M model.
  */
 export function compactModelTriggerLabel(value: string): string {
   return /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
 }
 
 /**
- * The advertised display label for a raw model id — the in-session status
- * source. Prefers the session's Codex catalog row, else a version-agnostic
- * friendly form for an alias-shaped id the catalog doesn't list (e.g. during
- * the pre-catalog window), else the raw id, or ``null`` when no model is known.
+ * The display label for a raw model id — the in-session status source.
+ *
+ * Prefers the session's Codex catalog row, then the shared Claude-id folding
+ * (so a full or catalog-prefixed id like ``claude-opus-4-8[1m]`` or
+ * ``system.ai.claude-opus-4-8[1m]`` renders as ``Opus 4.8 (1M context)`` even
+ * with no catalog), then a version-agnostic friendly form for a bare alias, and
+ * finally the raw id. ``null`` when no model is known.
  */
 export function formatStatusModelLabel(
   model: string | null,
@@ -82,13 +78,16 @@ export function formatStatusModelLabel(
 ): string | null {
   const raw = model?.trim();
   if (!raw) return null;
-  const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
   if (codexOption) return nativeModelLabel(codexOption);
-  // An alias-shaped id the session's catalog doesn't list: render it friendly
+  // Fold a full/catalog-prefixed Claude id through the same helper the catalog
+  // rows use, so a known model reads identically with or without the catalog.
+  const folded = nativeModelLabel({ id: raw, model: raw });
+  if (folded !== raw) return folded;
+  // A bare alias the catalog doesn't list (e.g. before it resolves): render it
   // mechanically — "sonnet" → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]"
-  // → "Sonnet (1M context)" — without claiming a version the client can't know.
-  const alias = /^([a-z]+)(?:_(\d+))?(\[1m\])?$/.exec(lower);
+  // → "Sonnet (1M context)" — without claiming a version we can't know.
+  const alias = /^([a-z]+)(?:_(\d+))?(\[1m\])?$/.exec(raw.toLowerCase());
   if (alias) {
     let label = `${alias[1]!.charAt(0).toUpperCase()}${alias[1]!.slice(1)}`;
     if (alias[2]) label += ` ${alias[2]}`;
@@ -99,7 +98,7 @@ export function formatStatusModelLabel(
 }
 
 /** Normalize a reasoning-effort value to its display label — the single place
- *  `xhigh` becomes `xHigh` (#7026). Any other value is capitalized. */
+ *  ``xhigh`` becomes ``xHigh``. Any other value is capitalized. */
 export function normalizeEffortLabel(effort: string): string {
   if (effort.toLowerCase() === "xhigh") return "xHigh";
   return effort.charAt(0).toUpperCase() + effort.slice(1);

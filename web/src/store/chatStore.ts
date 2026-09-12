@@ -268,10 +268,10 @@ function removeConvRow(tempId: string): void {
  */
 /**
  * The model/agent identity the optimistic conversation should show while
- * `createSession` is in flight (#7039). Derived from the SAME normalized create
+ * `createSession` is in flight. Every field mirrors the SAME normalized create
  * request the POST sends — NOT raw picker state — so the temp view matches the
- * session that binds: a routing create pins no model, a default create sends no
- * override, and a concrete/1M pick carries its exact id.
+ * session that binds. When cost-control routing is on the composer renders the
+ * routing label over any model, so the model fields stay `null` there.
  */
 export interface OptimisticSessionModel {
   /** The `model_override` the create POSTs, or `null` when none (default/routing). */
@@ -286,12 +286,14 @@ export interface OptimisticSessionModel {
   harness?: string | null;
   /** Model context window, when known up front. Omit to leave unset. */
   contextWindow?: number | null;
+  /** The `cost_control_mode_override` the create POSTs. `"on"` makes the
+   *  composer render the routing label instead of a model. */
+  costControlModeOverride?: "on" | "off" | null;
+  /** The `subagent_routing_override` the create POSTs, when set. */
+  subagentRoutingOverride?: "on" | "off" | null;
   /** Bound agent identity for the composer, when resolved. */
   boundAgentId?: string | null;
   boundAgentName?: string | null;
-  /** True when the create routes per turn (smart routing / pinned native route):
-   *  no concrete model is pinned so the temp view shows routing, not a model. */
-  routing?: boolean;
 }
 
 export function beginLocalConversation(
@@ -329,27 +331,28 @@ export function beginLocalConversation(
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
 
-  // Seed the model/agent identity so the optimistic composer shows the SELECTED
+  // Seed the model/agent identity so the optimistic composer shows the selected
   // model (with the caller's pending spinner) instead of the previous session's
-  // or a blank one (#7039). A routing create pins no model — leave the fields at
-  // their initial nulls so the temp view reads as routing, matching the create.
+  // or a blank one. Every field mirrors the normalized create request; when
+  // cost-control routing is on the composer renders the routing label over any
+  // model, so a routing create simply leaves the model fields null.
   const modelSeed: Partial<ConversationState> =
     model === undefined
       ? {}
       : {
+          sessionModelOverride: model.modelOverride,
+          sessionReasoningEffort: model.reasoningEffort ?? null,
           boundAgentId: model.boundAgentId ?? null,
           boundAgentName: model.boundAgentName ?? null,
-          ...(model.routing === true
-            ? {}
-            : {
-                sessionModelOverride: model.modelOverride,
-                sessionReasoningEffort: model.reasoningEffort ?? null,
-                ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
-                ...(model.harness !== undefined ? { sessionHarness: model.harness } : {}),
-                ...(model.contextWindow !== undefined
-                  ? { contextWindow: model.contextWindow }
-                  : {}),
-              }),
+          ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
+          ...(model.harness !== undefined ? { sessionHarness: model.harness } : {}),
+          ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+          ...(model.costControlModeOverride !== undefined
+            ? { costControlModeOverride: model.costControlModeOverride }
+            : {}),
+          ...(model.subagentRoutingOverride !== undefined
+            ? { subagentRoutingOverride: model.subagentRoutingOverride }
+            : {}),
         };
 
   const entry = conversationRegistry.acquire(tempConvId);

@@ -31,7 +31,7 @@ export interface RoutingModelOption {
 
 // The model-label helpers are canonical in the shared leaf module so the
 // landing dialog, the chat status line, and this file all format a model the
-// same way (#7094). Re-exported here so existing callers that import them from
+// same way. Re-exported here so callers that import them from
 // HarnessConfigControls keep working.
 export { defaultModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
 export type { NativeModelLabelFields } from "@/lib/composerModelLabel";
