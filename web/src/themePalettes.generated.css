@@ -57,7 +57,7 @@
   --popover-foreground: oklch(0.965 0.003 240);
   --primary: #e8ecf0;
   --primary-foreground: #11171c;
-  --selection-background: rgba(240, 1, 150, 0.15);
+  --selection-background: rgba(240, 1, 150, 0.25);
   --selection-foreground: #f9a8d4;
   --secondary: #1f272d;
   --secondary-foreground: #e8ecf0;
@@ -154,7 +154,7 @@
   --popover-foreground: #f8f8f2;
   --primary: #bd93f9;
   --primary-foreground: #282a36;
-  --selection-background: rgba(189, 147, 249, 0.15);
+  --selection-background: rgba(189, 147, 249, 0.25);
   --selection-foreground: #f8f8f2;
   --secondary: #343746;
   --secondary-foreground: #f8f8f2;
@@ -249,7 +249,7 @@
   --popover-foreground: #e6edf3;
   --primary: #238636;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(35, 134, 54, 0.15);
+  --selection-background: rgba(35, 134, 54, 0.25);
   --selection-foreground: #e6edf3;
   --secondary: #21262d;
   --secondary-foreground: #e6edf3;
@@ -341,7 +341,7 @@
   --popover-foreground: #cdd6f4;
   --primary: #cba6f7;
   --primary-foreground: #1e1e2e;
-  --selection-background: rgba(203, 166, 247, 0.15);
+  --selection-background: rgba(203, 166, 247, 0.25);
   --selection-foreground: #cdd6f4;
   --secondary: #313244;
   --secondary-foreground: #cdd6f4;
@@ -436,7 +436,7 @@
   --popover-foreground: #ebdbb2;
   --primary: #fe8019;
   --primary-foreground: #282828;
-  --selection-background: rgba(254, 128, 25, 0.15);
+  --selection-background: rgba(254, 128, 25, 0.25);
   --selection-foreground: #ebdbb2;
   --secondary: #3c3836;
   --secondary-foreground: #ebdbb2;
@@ -531,7 +531,7 @@
   --popover-foreground: #839496;
   --primary: #268bd2;
   --primary-foreground: #fdf6e3;
-  --selection-background: rgba(38, 139, 210, 0.2);
+  --selection-background: rgba(38, 139, 210, 0.25);
   --selection-foreground: #eee8d5;
   --secondary: #073642;
   --secondary-foreground: #839496;
@@ -623,7 +623,7 @@
   --popover-foreground: #eceff4;
   --primary: #88c0d0;
   --primary-foreground: #2e3440;
-  --selection-background: rgba(136, 192, 208, 0.2);
+  --selection-background: rgba(136, 192, 208, 0.25);
   --selection-foreground: #eceff4;
   --secondary: #3b4252;
   --secondary-foreground: #eceff4;

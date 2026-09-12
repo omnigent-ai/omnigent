@@ -142,7 +142,7 @@ describe("customTheme", () => {
 
     expect(variants.light.selectionBackground).toBe("rgba(240, 1, 150, 0.1)");
     expect(variants.light.selectionForeground).toBe("#651249");
-    expect(variants.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.15)");
+    expect(variants.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.25)");
     expect(variants.dark.selectionForeground).toBe("#f9a8d4");
   });
 
@@ -151,7 +151,7 @@ describe("customTheme", () => {
     const variants = deriveCustomTheme({ ...theme, accent: "#2563eb", darkAccent: "#f59e0b" });
 
     expect(variants.light.selectionBackground).toBe("rgba(37, 99, 235, 0.1)");
-    expect(variants.dark.selectionBackground).toBe("rgba(245, 158, 11, 0.15)");
+    expect(variants.dark.selectionBackground).toBe("rgba(245, 158, 11, 0.25)");
     expect(variants.light.selectionForeground).toBe(variants.light.foreground);
     expect(variants.dark.selectionForeground).toBe(variants.dark.foreground);
   });

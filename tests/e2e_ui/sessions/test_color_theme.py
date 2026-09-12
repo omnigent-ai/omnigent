@@ -483,13 +483,13 @@ def test_omnigent_selection_keeps_the_brand_tint(
 
     Omnigent's selection is the sidebar's active-item tint, not an opaque
     primary-colour block: ``rgba(240, 1, 150, 0.1)`` with plum text in light
-    mode and ``rgba(240, 1, 150, 0.15)`` with pink text in dark mode.
+    mode and ``rgba(240, 1, 150, 0.25)`` with pink text in dark mode.
     """
     base_url, session_id = seeded_session
     seed_committed_turn(session_id, prompt="Hello", reply="Select this reply.")
     expected = {
         "Light": ["rgba(240, 1, 150, 0.1)", "rgb(101, 18, 73)"],
-        "Dark": ["rgba(240, 1, 150, 0.15)", "rgb(249, 168, 212)"],
+        "Dark": ["rgba(240, 1, 150, 0.25)", "rgb(249, 168, 212)"],
     }
     _open_appearance(page, base_url)
     _pick_palette(page, "Omnigent")
