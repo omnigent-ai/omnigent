@@ -21,7 +21,7 @@ from fastapi.routing import APIRoute
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
-from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
+from omnigent.debug_logging import add_audit_attrs, debug_event, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
     NewConversationItem,
@@ -1813,6 +1813,10 @@ def register_events_routes(
                 # For SDK/non-native sub-agents the parent runner already
                 # holds the child's state — no re-initialization needed.
                 _runner_needs_session_init = _is_native_terminal_session(conv)
+        # Runner id the host reported launching on this request, when the
+        # relaunch path below ran; drives the never-connected diagnostics
+        # at the unavailable raise.
+        relaunched_runner_id: str | None = None
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = cast(
@@ -1916,7 +1920,6 @@ def register_events_routes(
                         return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id
                 else:
-                    relaunched_runner_id = None
                     # The host tunnel is gone entirely. A managed
                     # host's sandbox is relaunchable — provision a new
                     # generation under the same host identity and ride
@@ -1935,8 +1938,6 @@ def register_events_routes(
                             raise _session_not_found()
                         conv = conv_after_relaunch
                         runner_client = await _get_runner_client(session_id, runner_router)
-            else:
-                relaunched_runner_id = None
             if runner_client is None:
                 _logger.info(
                     "Waiting up to %.0fs for host %s to spawn a runner for session %s",
@@ -2003,6 +2004,51 @@ def register_events_routes(
             # approval) are best-effort and silently skip when no
             # runner is bound — item events can't, because that
             # would desync conversation store and harness state.
+            if relaunched_runner_id:
+                # The host accepted the launch, yet the runner never
+                # connected within the grace. Name the failed phase in the
+                # user-facing detail (the SPA surfaces it verbatim — see
+                # describeSendFailure in web/src/store/chatStore.ts) and
+                # leave an ERROR correlated by runner token + session id:
+                # every other funnel phase records this outcome at INFO
+                # or below, leaving operators nothing to find.
+                exit_report = (
+                    runner_exit_reports.get(relaunched_runner_id)
+                    if runner_exit_reports is not None
+                    else None
+                )
+                if exit_report:
+                    launch_detail = f"the runner exited before connecting: {exit_report}"
+                else:
+                    launch_detail = (
+                        "it never connected to the server within "
+                        f"{_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S:.0f}s — the "
+                        "runner process may be hung or unable to reach the "
+                        "server. Check the runner log on the host."
+                    )
+                launch_message = (
+                    f"The host launched runner {relaunched_runner_id} for "
+                    f"this session, but {launch_detail}"
+                )
+                _logger.error(
+                    "Runner %s for session %s launched on host %s but did not "
+                    "connect within %.0fs; failing the send as runner_unavailable (%s)",
+                    relaunched_runner_id,
+                    session_id,
+                    conv.host_id,
+                    _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    launch_detail,
+                    extra=debug_event(
+                        "runner_never_connected",
+                        session_id=session_id,
+                        runner_id=relaunched_runner_id,
+                        host_id=conv.host_id,
+                    ),
+                )
+                raise OmnigentError(
+                    launch_message,
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             raise OmnigentError(
                 "No runner bound for session",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
