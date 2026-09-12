@@ -204,10 +204,11 @@ function createBrowserViewRegistry({
   }
 
   // Right-click menu for the child view — the shell window's own menu covers
-  // only the shell webContents, so without one a pane link can be neither
-  // opened externally nor copied. "Open Link in Browser" is user-chosen, so
-  // shell.openExternal is safe here (unlike the page-initiated path above).
-  // Items are plain data; the host (main.js) builds the actual Electron Menu.
+  // only the shell webContents, so without one a pane link or image can be
+  // neither opened externally nor copied. "Open Link in Browser" is
+  // user-chosen, so shell.openExternal is safe here (unlike the page-initiated
+  // path above). Items are plain data; the host (main.js) builds the actual
+  // Electron Menu.
   function attachViewContextMenu(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
@@ -224,6 +225,10 @@ function createBrowserViewRegistry({
           label: "Copy Link Address",
           click: () => copyTextToClipboard(params.linkURL),
         });
+      }
+      if (params.mediaType === "image" && params.hasImageContents) {
+        if (items.length > 0) items.push({ type: "separator" });
+        items.push({ label: "Copy Image", click: () => wc.copyImageAt(params.x, params.y) });
       }
       if (typeof params.selectionText === "string" && params.selectionText.trim() !== "") {
         if (items.length > 0) items.push({ type: "separator" });

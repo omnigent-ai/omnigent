@@ -46,6 +46,17 @@ const MOCK_LLM_SERVER = path.join(
 /** The Python interpreter used to run the server + mock (override for venvs). */
 const PYTHON = process.env.OMNIGENT_PYTHON || "python3";
 
+/** Worktree-first PYTHONPATH for spawned python processes: the repo root plus
+ * its local SDK packages (`omnigent_client` lives in sdks/python-client, and
+ * the server imports it at startup), ahead of whatever the ambient env has —
+ * ambient entries may be relative and break when cwd is web/electron. */
+const PYTHON_PATH = [
+  REPO_ROOT,
+  path.join(REPO_ROOT, "sdks", "python-client"),
+  path.join(REPO_ROOT, "sdks", "ui"),
+  process.env.PYTHONPATH || "",
+].join(path.delimiter);
+
 /** A minimal agent spec, mirroring conftest's _TEST_AGENT_YAML. The
  * ``executor.harness`` is required (the spec loader rejects the spec without
  * it), so keep the shape in sync with the Python suite's fixture. */
@@ -63,7 +74,8 @@ os_env:
     type: none
 `;
 
-const HEALTH_TIMEOUT_MS = 30_000;
+// Generous: a cold `omnigent server` boot on a loaded CI box can exceed 30s.
+const HEALTH_TIMEOUT_MS = 120_000;
 const HEALTH_POLL_MS = 500;
 
 /**
@@ -151,9 +163,14 @@ async function waitForHealthy(url, label, logPath) {
  * not a blank window.
  *
  * @param {string} tmpDir A scratch dir for the db, artifacts, agent, and logs.
- * @returns {Promise<{ serverUrl: string, close: () => Promise<void> }>}
+ * @param {object} [opts]
+ * @param {Object<string, string>} [opts.serverEnv] Extra env for the server
+ *   process, merged last (after the ambient-runner-env strip) so a test can
+ *   e.g. set OMNIGENT_RUNNER_TUNNEL_TOKEN to accept its own sibling runner.
+ * @returns {Promise<{ serverUrl: string, mockUrl: string,
+ *   close: () => Promise<void> }>}
  */
-async function spawnServer(tmpDir) {
+async function spawnServer(tmpDir, opts = {}) {
   if (!fs.existsSync(path.join(WEB_UI_DIST, "index.html"))) {
     throw new Error(
       `SPA bundle missing at ${WEB_UI_DIST}. Build it first:\n` +
@@ -173,7 +190,7 @@ async function spawnServer(tmpDir) {
 
   const mockOut = fs.openSync(mockLog, "w");
   const mockProc = spawn(PYTHON, [MOCK_LLM_SERVER, String(mockPort)], {
-    env: { ...process.env, PYTHONPATH: REPO_ROOT },
+    env: { ...process.env, PYTHONPATH: PYTHON_PATH },
     stdio: ["ignore", mockOut, mockOut],
   });
   // A bad PYTHON (ENOENT) fires 'error' async; surface it as a rejection rather
@@ -226,11 +243,12 @@ async function spawnServer(tmpDir) {
     {
       env: {
         ...cleanEnv,
-        PYTHONPATH: REPO_ROOT,
+        PYTHONPATH: PYTHON_PATH,
         OPENAI_BASE_URL: `${mockUrl}/v1`,
         OPENAI_API_KEY: "mock-key",
         ANTHROPIC_API_KEY: "",
         OMNIGENT_WEB_UI_DIST: WEB_UI_DIST,
+        ...(opts.serverEnv || {}),
       },
       stdio: ["ignore", serverOut, serverOut],
     },
@@ -267,7 +285,7 @@ async function spawnServer(tmpDir) {
     await close();
     throw serverSpawnError ?? err;
   }
-  return { serverUrl, close };
+  return { serverUrl, mockUrl, close };
 }
 
 /** Whether ffmpeg is on PATH — needed for the composited display capture. */
@@ -479,6 +497,7 @@ module.exports = {
   APP_ROOT,
   REPO_ROOT,
   WEB_UI_DIST,
+  PYTHON_PATH,
   desktopDepsAvailable,
   findFreePort,
   spawnServer,
