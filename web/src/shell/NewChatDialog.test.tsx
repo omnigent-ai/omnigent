@@ -1660,16 +1660,25 @@ describe("NewChatLandingScreen", () => {
       "-mb-px",
       "h-[37px]",
       "min-w-0",
-      "items-start",
-      "gap-2",
+      "items-center",
+      "gap-0.5",
+      "md:gap-2",
       "rounded-t-2xl",
       "border",
       "border-b-0",
       "bg-muted/70",
       "px-2",
-      "pt-1.5",
+      "py-1.5",
     );
-    expect(workspace).toHaveClass("h-6", "gap-1", "rounded-md", "px-1", "text-xs", "leading-4");
+    expect(workspace).toHaveClass(
+      "h-6",
+      "gap-1",
+      "rounded-md",
+      "px-0.5",
+      "md:px-1",
+      "text-xs",
+      "leading-4",
+    );
     expect(composer).toHaveClass("min-h-[105px]");
     expect(composer).toContainElement(actions);
     expect(actions).toHaveClass("justify-between", "gap-2", "px-2", "pt-1", "pb-2");
@@ -1714,7 +1723,8 @@ describe("NewChatLandingScreen", () => {
       "gap-1",
       "rounded-md",
       "bg-transparent",
-      "px-1",
+      "px-0.5",
+      "md:px-1",
       "text-xs",
       "leading-4",
     );
@@ -3273,7 +3283,8 @@ describe("NewChatLandingScreen", () => {
       "h-6",
       "max-w-[calc(50%-0.25rem)]",
       "gap-1",
-      "px-1",
+      "px-0.5",
+      "md:px-1",
       "text-xs",
       "leading-4",
     );

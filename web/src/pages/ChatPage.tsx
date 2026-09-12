@@ -3346,15 +3346,17 @@ function ComposerImpl(
           {/* Trailing status cluster — the wrapper owns the right alignment so
               it holds even when the self-nulling indicators render nothing. */}
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
-            <ComposerPrLink
-              prCount={composerGit.prCount}
-              prNumber={composerGit.prNumber}
-              onOpen={openComposerGithubTab}
-            />
-            <ComposerContextRing
-              contextWindow={composerContextWindow}
-              tokensUsed={composerTokensUsed}
-            />
+            <div className="flex items-center gap-2 empty:hidden">
+              <ComposerPrLink
+                prCount={composerGit.prCount}
+                prNumber={composerGit.prNumber}
+                onOpen={openComposerGithubTab}
+              />
+              <ComposerContextRing
+                contextWindow={composerContextWindow}
+                tokensUsed={composerTokensUsed}
+              />
+            </div>
             <BackgroundTaskIndicator />
             <SubagentTaskIndicator conversationId={composerSessionId} />
           </div>
