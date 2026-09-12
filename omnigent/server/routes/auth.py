@@ -590,7 +590,7 @@ def create_auth_router(
         _cli_tickets[ticket_id] = _CliTicket()
         return {
             "ticket": ticket_id,
-            "login_url": f"/auth/login?ticket={ticket_id}",
+            "login_url": f"/auth/login?{urlencode({'ticket': ticket_id})}",
         }
 
     @router.get("/cli-poll")

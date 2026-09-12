@@ -10,10 +10,35 @@ const getServerPicker = vi.fn();
 const switchServer = vi.fn();
 const openServerSetup = vi.fn();
 
+function identityOf(rawUrl: string): string | null {
+  try {
+    const url = new URL(rawUrl);
+    const query = new URLSearchParams();
+    if (url.hostname.endsWith(".databricks.com")) {
+      for (const organization of url.searchParams.getAll("o")) query.append("o", organization);
+    }
+    return `${url.origin}${query.size ? `?${query}` : ""}`;
+  } catch {
+    return null;
+  }
+}
+
+function labelOf(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    const identity = identityOf(rawUrl);
+    return `${url.host}${identity?.includes("?") ? `/${identity.slice(identity.indexOf("?"))}` : ""}`;
+  } catch {
+    return rawUrl;
+  }
+}
+
 vi.mock("@/lib/nativeBridge", () => ({
   getServerPicker: () => getServerPicker(),
   switchServer: (url: string) => switchServer(url),
   openServerSetup: () => openServerSetup(),
+  serverDisplayLabel: (url: string) => labelOf(url),
+  workspaceIdentityKey: (url: string) => identityOf(url),
 }));
 
 function renderPicker() {
@@ -113,6 +138,28 @@ describe("SidebarServerPicker", () => {
     // Once on the sidebar row and once as the checked managed menu item.
     expect(screen.getAllByText("managed.example.com")).toHaveLength(2);
     expect(screen.queryByText("Recents")).toBeNull();
+  });
+
+  it("renders and switches distinct organizations on one Databricks origin", async () => {
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://dbc-a.cloud.databricks.com",
+      currentServerUrl: workspaceA,
+      managedServers: [workspaceA, workspaceB],
+      recentServers: [],
+    });
+    renderPicker();
+
+    const trigger = await openMenu();
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "Server: dbc-a.cloud.databricks.com/?o=workspace-a. Switch server",
+    );
+    expect(screen.getAllByText("dbc-a.cloud.databricks.com/?o=workspace-a")).toHaveLength(2);
+
+    fireEvent.click(screen.getByText("dbc-a.cloud.databricks.com/?o=workspace-b"));
+    await waitFor(() => expect(switchServer).toHaveBeenCalledWith(workspaceB));
   });
 
   it("switches to a recent server on select", async () => {
