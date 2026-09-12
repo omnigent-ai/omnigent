@@ -1624,8 +1624,9 @@ describe("NewChatLandingScreen", () => {
     } as unknown as ReturnType<typeof useHostWorktrees>);
     renderLanding();
 
+    // The empty composer rests at one row: no minimum taller than the draft.
+    expect(screen.getByTestId("new-chat-landing-input")).not.toHaveClass("min-h-[42px]");
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
-      "min-h-[42px]",
       "max-h-[180px]",
       "overflow-y-auto",
       "p-0",
@@ -1670,7 +1671,7 @@ describe("NewChatLandingScreen", () => {
       "pt-1.5",
     );
     expect(workspace).toHaveClass("h-6", "gap-1", "rounded-md", "px-1", "text-xs", "leading-4");
-    expect(composer).toHaveClass("min-h-[105px]");
+    expect(composer).not.toHaveClass("min-h-[105px]");
     expect(composer).toContainElement(actions);
     expect(actions).toHaveClass("justify-between", "gap-2", "px-2", "pt-1", "pb-2");
     expect(actions).not.toHaveClass("mt-2");
