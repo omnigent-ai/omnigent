@@ -84,6 +84,78 @@ class TestRunTurn:
         ]
 
     @pytest.mark.asyncio
+    async def test_composes_family_and_effort_into_the_variant(
+        self, tmp_path: Path, injections: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # config.model is the family and reasoning_effort rides config.extra;
+        # Devin has no --effort flag, so they recombine into one variant id.
+        calls: list[tuple[str, str | None]] = []
+
+        def _resolve(family: str, effort: str | None) -> str:
+            calls.append((family, effort))
+            return f"{family}-{effort}" if effort else family
+
+        monkeypatch.setattr(
+            "omnigent.harnesses.devin_native.main.resolve_devin_launch_model", _resolve
+        )
+        await _run(
+            _executor(tmp_path),
+            "go",
+            ExecutorConfig(model="claude-opus-5", extra={"reasoning_effort": "xhigh"}),
+        )
+        assert calls == [("claude-opus-5", "xhigh")]
+        assert injections == [("model", "claude-opus-5-xhigh"), ("message", "go")]
+
+    @pytest.mark.asyncio
+    async def test_effort_switch_mid_chat_retypes_model(
+        self, tmp_path: Path, injections: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Changing only the effort on the same family must re-apply /model — the
+        # variant id changed, which is the whole point of an in-chat effort dial.
+        monkeypatch.setattr(
+            "omnigent.harnesses.devin_native.main.resolve_devin_launch_model",
+            lambda family, effort: f"{family}-{effort}" if effort else family,
+        )
+        executor = _executor(tmp_path)
+        await _run(
+            executor,
+            "one",
+            ExecutorConfig(model="claude-opus-5", extra={"reasoning_effort": "high"}),
+        )
+        await _run(
+            executor,
+            "two",
+            ExecutorConfig(model="claude-opus-5", extra={"reasoning_effort": "xhigh"}),
+        )
+        assert injections == [
+            ("model", "claude-opus-5-high"),
+            ("message", "one"),
+            ("model", "claude-opus-5-xhigh"),
+            ("message", "two"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_variant_resolution_is_cached(
+        self, tmp_path: Path, injections: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A repeated (family, effort) must not re-shell ``devin models list``.
+        calls: list[tuple[str, str | None]] = []
+
+        def _resolve(family: str, effort: str | None) -> str:
+            calls.append((family, effort))
+            return f"{family}-{effort}"
+
+        monkeypatch.setattr(
+            "omnigent.harnesses.devin_native.main.resolve_devin_launch_model", _resolve
+        )
+        executor = _executor(tmp_path)
+        cfg = ExecutorConfig(model="swe-2", extra={"reasoning_effort": "high"})
+        await _run(executor, "one", cfg)
+        await _run(executor, "two", cfg)
+        assert calls == [("swe-2", "high")]
+        assert injections.count(("model", "swe-2-high")) == 1
+
+    @pytest.mark.asyncio
     async def test_injection_failure_surfaces_as_executor_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

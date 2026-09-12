@@ -31,10 +31,14 @@ class DevinNativeExecutor(Executor):
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._inject_lock = asyncio.Lock()
-        # The model the pane is currently on, so a routed turn only types
-        # ``/model`` when the model actually changes. ``None`` = not yet known;
-        # the launch ``--model`` already put the pane on the spec's model.
+        # The model variant the pane is currently on, so a turn only types
+        # ``/model`` when it actually changes. ``None`` = not yet known; the
+        # launch ``--model`` already put the pane on the spec's model+effort.
         self._applied_model: str | None = None
+        # Cache of ``(family, effort) -> variant`` so recomposing a repeated pick
+        # never re-shells ``devin models list``. Devin has no ``--effort`` flag,
+        # so effort is folded into the model id and applied through ``/model``.
+        self._variant_cache: dict[tuple[str, str | None], str] = {}
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` — output is shown by the embedded terminal."""
@@ -71,18 +75,21 @@ class DevinNativeExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         """Inject the latest web-UI user message into the Devin TUI pane.
 
-        When intelligent routing picks a model for this turn it arrives as
-        ``config.model``; the ``/model`` switch and the message injection are
-        applied under one lock so the pane cannot interleave them.
+        A model and/or effort pick for this turn arrives as ``config.model``
+        (the family) and ``config.extra["reasoning_effort"]``. Devin has no
+        ``--effort`` flag, so the two are recombined into one variant id and
+        applied via ``/model``; the switch and the message injection run under
+        one lock so the pane cannot interleave them.
 
-        :param config: Per-turn executor config. Only ``config.model`` is used.
+        :param config: Per-turn executor config. ``config.model`` (family) and
+            ``config.extra["reasoning_effort"]`` are recombined into the variant.
         """
         del tools, system_prompt
         text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="devin native turn had no user text to send")
             return
-        wanted_model = config.model if config is not None else None
+        wanted_model = await self._resolve_variant(config)
         try:
             async with self._inject_lock:
                 if wanted_model and wanted_model != self._applied_model:
@@ -95,6 +102,34 @@ class DevinNativeExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    async def _resolve_variant(self, config: ExecutorConfig | None) -> str | None:
+        """Recombine the turn's (model family, effort) into one Devin variant id.
+
+        :param config: Per-turn config; ``config.model`` is the family and
+            ``config.extra["reasoning_effort"]`` the effort rung.
+        :returns: The composed variant (e.g. ``claude-opus-5-xhigh``), the bare
+            family when no effort is set or the pair has no such variant, or
+            ``None`` when no model is selected (the pane keeps its launch model).
+            Each ``(family, effort)`` is cached so a repeated pick never re-shells
+            ``devin models list``.
+        """
+        if config is None or not config.model:
+            return None
+        family = config.model
+        effort: str | None = None
+        raw = (config.extra or {}).get("reasoning_effort")
+        if isinstance(raw, str) and raw:
+            effort = raw
+        key = (family, effort)
+        cached = self._variant_cache.get(key)
+        if cached is not None:
+            return cached
+        from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
+
+        variant = await asyncio.to_thread(resolve_devin_launch_model, family, effort)
+        self._variant_cache[key] = variant
+        return variant
 
 
 def _bridge_dir_from_env() -> Path:
