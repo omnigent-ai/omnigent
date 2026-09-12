@@ -40,19 +40,25 @@ vi.mock("@/hooks/useGithub", () => ({
 }));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.
+// The hoisted spy records the args so a test can assert the page passes the
+// real session id / host / workspace / creation branch (not fixtures).
+const { composerGitStatusArgsSpy } = vi.hoisted(() => ({ composerGitStatusArgsSpy: vi.fn() }));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
-  useComposerGitStatus: () => ({
-    branch: null,
-    branchState: "unknown",
-    isWorktree: null,
-    worktreePath: null,
-    creationBranch: null,
-    repoNameWithOwner: null,
-    prCount: 0,
-    prNumber: null,
-    refresh: () => {},
-    refreshing: false,
-  }),
+  useComposerGitStatus: (args: unknown) => {
+    composerGitStatusArgsSpy(args);
+    return {
+      branch: null,
+      branchState: "unknown",
+      isWorktree: null,
+      worktreePath: null,
+      creationBranch: null,
+      repoNameWithOwner: null,
+      prCount: 0,
+      prNumber: null,
+      refresh: () => {},
+      refreshing: false,
+    };
+  },
 }));
 // SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
 // so the indicator self-hides (no active children) in isolated composer renders.
@@ -1738,6 +1744,22 @@ describe("Composer shared visible controls", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {
+    // The workspace bar is fed by the page adapter, not fixtures: assert the
+    // page threads the actual session identity through useComposerGitStatus.
+    composerGitStatusArgsSpy.mockClear();
+    useChatStore.setState({ conversationId: "conv_git_args", gitBranch: "feature/x" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "conv_git_args",
+        creationBranch: "feature/x",
+        hostId: null,
+        workspace: null,
+      }),
+    );
   });
 
   it("dispatches the shared permission picker to the session setter", async () => {

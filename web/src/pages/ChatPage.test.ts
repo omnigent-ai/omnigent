@@ -39,10 +39,12 @@ import {
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
+  modelPickerKindForConv,
   unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 
 // The Composer's read-only and disabled states are derived from
 // permissionLevel. These tests pin the derivation logic so a
@@ -1821,6 +1823,30 @@ describe("routing eligibility gates", () => {
     // just because the conversation is a fresh temp id.
     const seededNoAgent = { ...seededNative, agentName: null } as unknown as Session;
     expect(isCostRoutingEligible(info(true), seededNoAgent)).toBe(false);
+  });
+
+  it("derives the temp-session native model-picker kind from the seeded native harness (#7039 P1)", () => {
+    // The temp capabilitySource has no server session and no sidebar wrapper
+    // identity, so it derives the wrapper label from the SEEDED native harness
+    // (the create identity). Without this the native model/effort/permission
+    // controls fail closed on the optimistic route. Mirrors the ChatPage
+    // derivation: nativeCodingAgentForHarness(seededHarness).wrapperLabel →
+    // modelPickerKindForConv.
+    for (const [harness, kind] of [
+      ["codex-native", "codex"],
+      ["claude-native", "claude"],
+    ] as const) {
+      const native = nativeCodingAgentForHarness(harness);
+      expect(native).toBeDefined();
+      const capabilitySource = {
+        labels: { [WRAPPER_LABEL_KEY]: native!.wrapperLabel },
+        harness,
+      };
+      expect(modelPickerKindForConv(capabilitySource)).toBe(kind);
+    }
+    // A bundle/SDK harness has no native picker — controls correctly stay hidden
+    // (the seed's pickedHarness fallback for a non-native agent).
+    expect(modelPickerKindForConv({ labels: {}, harness: "claude-sdk" })).toBeNull();
   });
 
   it("a non-native SDK session is subagent-routing eligible whatever its harness", () => {

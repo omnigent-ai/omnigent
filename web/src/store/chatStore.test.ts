@@ -5700,6 +5700,32 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       // The visible conversation's sticky pick is untouched.
       expect(useChatStore.getState().selectedEffort).toBe("high");
     });
+
+    it("keeps a backgrounded reset-to-null authoritative so a warm switch won't leak sticky (#7039)", () => {
+      // A resets to agent default (null) in the background; another session left
+      // the app-global sticky at "high". A's explicit null must stay
+      // AUTHORITATIVE on its entry (sessionEffortSeeded=true) so a warm switch
+      // back reads null — not the leaked "high" sticky. Regression for the
+      // background-null A→B→A leak.
+      bindConversationForTest("conv_effort_null_bg");
+      bindConversationForTest("conv_effort_null_fg");
+      useChatStore.setState({ selectedEffort: "high" });
+
+      handleSessionEvent(
+        {
+          type: "session_reasoning_effort",
+          conversationId: "conv_effort_null_bg",
+          reasoningEffort: null,
+        },
+        "conv_effort_null_bg",
+      );
+
+      const entry = conversationRegistry.peek("conv_effort_null_bg")!.getState();
+      expect(entry.sessionReasoningEffort).toBeNull();
+      expect(entry.sessionEffortSeeded).toBe(true);
+      // The background reset never touches the app-global sticky.
+      expect(useChatStore.getState().selectedEffort).toBe("high");
+    });
   });
 
   describe("session.collaboration_mode", () => {

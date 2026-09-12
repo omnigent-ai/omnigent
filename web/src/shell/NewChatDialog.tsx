@@ -4798,12 +4798,20 @@ export function NewChatLandingScreen() {
             modelOverride: normalizedModelOverride,
             llmModel: resolvedDefaultModel,
             reasoningEffort: normalizedReasoningEffort,
-            harness: smartRoutingHarnessSelected ? null : (pickedHarness ?? null),
+            // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
+            // usually-null pickedHarness for a native agent — so the temp page
+            // adapter can re-derive the native model/effort/permission identity.
+            harness: smartRoutingHarnessSelected
+              ? null
+              : (selectedNativeHarness ?? pickedHarness ?? null),
             costControlModeOverride: costControlOverride ?? null,
             boundAgentId: effectiveAgentId,
             // Name (not just id) so the in-session temp composer can evaluate
             // routing eligibility (isCostRoutingSession needs a bound agent).
             boundAgentName: agent?.display_name ?? agent?.name ?? null,
+            // Chosen host so temp routing's per-family gateway guard uses the
+            // real host (null for a sandbox create).
+            hostId: sandboxSelected ? null : selectedHostId,
           });
           if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
         } catch {

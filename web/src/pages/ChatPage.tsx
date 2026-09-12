@@ -538,6 +538,7 @@ export function ChatPage() {
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
   const composerSessionHarness = useChatStore((s) => s.sessionHarness);
+  const composerSeededHostId = useChatStore((s) => s.sessionHostId);
   // Fallback for session-scoped agents (created by `omnigent run --server`):
   // the sessions-derived list only carries id+name, so fetch the full
   // agent object for the active session. Drives the picker's
@@ -675,8 +676,12 @@ export function ChatPage() {
   // gateway check the external router requires.
   const serverInfo = useServerInfo();
   const { data: hostRows } = useHosts();
-  const sessionHost =
-    hostRows?.find((row) => row.host_id === (activeSession?.hostId ?? null)) ?? null;
+  // During the temp window there is no server session, so fall back to the
+  // seeded chosen host so routing's per-family gateway guard runs against the
+  // real host (not the "unknown host reads as backed" default).
+  const effectiveHostId =
+    activeSession?.hostId ?? (isTempConvId(activeConversationId) ? composerSeededHostId : null);
+  const sessionHost = hostRows?.find((row) => row.host_id === effectiveHostId) ?? null;
   // A just-created (temp) conversation has no server session row yet, so
   // derive routing eligibility from the optimistic seed (bound agent + create
   // harness) through the SAME guards — never assume a temp id is eligible.
@@ -1010,13 +1015,22 @@ export function ChatPage() {
   // Once present, the live session snapshot is authoritative. Memoized so the
   // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
   // stable identity across the switch's re-render burst.
-  const capabilitySource = useMemo(
-    () => ({
-      labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
-      harness: activeSession?.harness ?? null,
-    }),
-    [activeSession, activeConv],
-  );
+  const capabilitySource = useMemo(() => {
+    if (activeSession)
+      return { labels: activeSession.labels ?? {}, harness: activeSession.harness };
+    // Temp/optimistic window: no server session and the sidebar row carries no
+    // native identity, so derive the wrapper label from the SEEDED native
+    // harness (create identity) — otherwise the native model/effort/permission
+    // controls fail closed until the real snapshot arrives.
+    if (isTempConvId(urlConvId)) {
+      const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
+      return {
+        labels: nativeAgent ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel } : {},
+        harness: composerSessionHarness,
+      };
+    }
+    return { labels: activeConv?.labels ?? {}, harness: null };
+  }, [activeSession, activeConv, urlConvId, composerSessionHarness]);
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
   // reported `llmModel` — falling back to the sticky preference only

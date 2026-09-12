@@ -294,6 +294,9 @@ export interface OptimisticSessionModel {
   /** Bound agent identity for the composer, when resolved. */
   boundAgentId?: string | null;
   boundAgentName?: string | null;
+  /** Selected host id, so the temp composer can evaluate routing's per-family
+   *  gateway guard against the real chosen host during the pre-session window. */
+  hostId?: string | null;
 }
 
 export function beginLocalConversation(
@@ -348,6 +351,7 @@ export function beginLocalConversation(
           sessionEffortSeeded: model.reasoningEffort !== undefined,
           boundAgentId: model.boundAgentId ?? null,
           boundAgentName: model.boundAgentName ?? null,
+          sessionHostId: model.hostId ?? null,
           ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
           ...(model.harness !== undefined ? { sessionHarness: model.harness } : {}),
           ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
@@ -680,13 +684,21 @@ export interface ConversationState {
    */
   sessionReasoningEffort: string | null;
   /**
-   * True when the optimistic create seeded this conversation's effort (including
-   * an intentional ``null`` "no effort"), so ``sessionReasoningEffort`` is
-   * authoritative and must NOT fall back to the app-global sticky pick. Cleared
-   * once the server hydrates the real effort. This is what distinguishes a
-   * deliberately-seeded null from an unhydrated null.
+   * True when ``sessionReasoningEffort`` is AUTHORITATIVE for this conversation
+   * — set by the optimistic create seed (incl. an intentional ``null``) and by a
+   * live ``session_reasoning_effort`` report (also incl. null) — so the composer
+   * must NOT fall back to the app-global sticky pick. Distinguishes a
+   * deliberately-seeded / live-reported null from an unhydrated null. Cold
+   * hydration (bind) deliberately leaves this false: it folds the sticky pref
+   * into the value itself.
    */
   sessionEffortSeeded: boolean;
+  /**
+   * Selected host id seeded at optimistic create, so the temp composer can run
+   * routing's per-family gateway guard against the real chosen host before the
+   * server session (which then owns ``hostId``) exists. ``null`` when unknown.
+   */
+  sessionHostId: string | null;
   /**
    * Per-session cost-control switch for the active session: ``"on"``
    * activates the spec's configured cost-control mode, ``"off"``
@@ -1714,6 +1726,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionModelOverride: null,
   sessionReasoningEffort: null,
   sessionEffortSeeded: false,
+  sessionHostId: null,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
@@ -6099,8 +6112,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // wrong until a refresh.
       applyToNamedConversation(event.conversationId, {
         sessionReasoningEffort: event.reasoningEffort,
-        // The live report supersedes any optimistic effort seed.
-        sessionEffortSeeded: false,
+        // The live report is the AUTHORITATIVE per-session effort — including an
+        // explicit null ("reset to agent default"). Keep the authority flag set
+        // so a background reset-to-null is retained through a warm A→B→A switch
+        // (never falling back to another session's sticky pick). Cold hydration
+        // is different: bind folds the sticky pref into the value on purpose.
+        sessionEffortSeeded: true,
       });
       // `selectedEffort` is the app-global sticky pick, so only adopt a value
       // reported by the conversation the user is actually looking at.
