@@ -184,7 +184,7 @@ describe("themePalette", () => {
     const omni = PALETTES.find((palette) => palette.id === "omni")!;
     expect(omni.tokens.light.selectionBackground).toBe("rgba(240, 1, 150, 0.1)");
     expect(omni.tokens.light.selectionForeground).toBe("#651249");
-    expect(omni.tokens.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.25)");
+    expect(omni.tokens.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.3)");
     expect(omni.tokens.dark.selectionForeground).toBe("#f9a8d4");
   });
 
