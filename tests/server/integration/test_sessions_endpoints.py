@@ -7830,6 +7830,35 @@ async def test_post_external_permission_mode_change_persists_label_and_publishes
     assert snapshot["terminal_launch_args"] is None
 
 
+@pytest.mark.parametrize("initial_args", [None, [], ["--model", "opus"]])
+async def test_post_external_permission_mode_transition_persists_for_relaunch(
+    client: httpx.AsyncClient,
+    initial_args: list[str] | None,
+) -> None:
+    """A live mode change survives relaunch when no mode flag was supplied."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], terminal_launch_args=initial_args)
+    endpoint = f"/v1/sessions/{session['id']}"
+
+    for index, mode in enumerate(("default", "auto", "default")):
+        response = await client.post(
+            f"{endpoint}/events",
+            json={"type": "external_permission_mode_change", "data": {"permission_mode": mode}},
+        )
+        assert response.status_code == 202, response.text
+        snapshot = (await client.get(endpoint)).json()
+        assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == mode
+        if index == 0:
+            # The initial observation leaves the settings default unpinned.
+            assert snapshot["terminal_launch_args"] == initial_args
+            continue
+        assert snapshot["terminal_launch_args"] == [
+            *(initial_args or []),
+            "--permission-mode",
+            mode,
+        ]
+
+
 async def test_post_external_permission_mode_change_rewrites_launch_arg(
     client: httpx.AsyncClient,
 ) -> None:
@@ -9878,9 +9907,8 @@ async def test_patch_permission_mode_persists_label_and_forwards_event(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "auto"
-    # No launch --permission-mode to rewrite, so none is fabricated (see the
-    # rewrite-existing test below for the persist-to-launch-args case).
-    assert resp.json()["terminal_launch_args"] is None
+    # An explicit selection must survive relaunch even without a launch flag.
+    assert resp.json()["terminal_launch_args"] == ["--permission-mode", "auto"]
     forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
     assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
     assert forwards[0].body == {"type": "permission_mode_change", "permission_mode": "auto"}
