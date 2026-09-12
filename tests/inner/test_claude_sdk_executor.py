@@ -1279,6 +1279,62 @@ class TestConstructor(unittest.TestCase):
 
             self.assertEqual(paths, [config_path, credentials_path])
 
+    def test_claude_internal_write_roots_grant_cli_tmp_runtime_dir(self):
+        """The grants must cover the CLI's hardcoded ``/tmp/claude-<uid>``.
+
+        The Claude CLI anchors its per-uid runtime dir at Node's
+        ``os.tmpdir()`` with a hardcoded ``/tmp`` fallback, while omnigent's
+        tempdir-anchored grant follows ``tempfile.gettempdir()`` (macOS:
+        ``/var/folders/.../T``). When the two diverge, a seatbelt profile
+        built from these roots denies the CLI's ``open('/tmp/claude-<uid>')``
+        (EPERM) and session launch dies at connect — so the roots must name
+        the ``/tmp`` spelling too.
+        """
+        from omnigent._platform import stable_user_id
+        from omnigent.inner.claude_sdk_executor import _claude_internal_write_roots
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            fake_tmp = Path(td) / "var_folders" / "T"
+            fake_tmp.mkdir(parents=True)
+            with (
+                patch(
+                    "omnigent.inner.claude_sdk_executor.pathlib.Path.home",
+                    return_value=home,
+                ),
+                patch.object(tempfile, "tempdir", str(fake_tmp)),
+            ):
+                roots = _claude_internal_write_roots()
+
+        uid = stable_user_id()
+        self.assertIn(Path("/tmp") / f"claude-{uid}", roots)
+        self.assertIn(fake_tmp / f"claude-{uid}", roots)
+
+    def test_claude_internal_write_roots_dedupe_when_tempdir_is_tmp(self):
+        """When the system tempdir already is ``/tmp``, no duplicate grant."""
+        from omnigent.inner.claude_sdk_executor import _claude_internal_write_roots
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            with (
+                patch(
+                    "omnigent.inner.claude_sdk_executor.pathlib.Path.home",
+                    return_value=home,
+                ),
+                patch.object(tempfile, "tempdir", "/tmp"),
+            ):
+                roots = _claude_internal_write_roots()
+
+        self.assertEqual(len(roots), len(set(roots)))
+
 
 # ---------------------------------------------------------------------------
 # Tests: MCP tool building
