@@ -281,7 +281,10 @@ function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
  */
 export function isCostRoutingEligible(
   serverInfo: ServerInfoValue,
-  session: Session | null | undefined,
+  // Only the fields the guards below read, so a temp/optimistic session can be
+  // evaluated from its seed without fabricating a whole Session. A real Session
+  // is structurally assignable.
+  session: Pick<Session, "agentName" | "parentSessionId" | "harness" | "labels"> | null | undefined,
   host?: { gateway_inference?: Record<string, boolean> | null } | null,
 ): boolean {
   if (serverInfo === "loading" || !serverInfo.smart_routing_enabled) return false;
@@ -539,6 +542,7 @@ export function ChatPage() {
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
+  const composerSessionHarness = useChatStore((s) => s.sessionHarness);
   // Fallback for session-scoped agents (created by `omnigent run --server`):
   // the sessions-derived list only carries id+name, so fetch the full
   // agent object for the active session. Drives the picker's
@@ -678,7 +682,18 @@ export function ChatPage() {
   const { data: hostRows } = useHosts();
   const sessionHost =
     hostRows?.find((row) => row.host_id === (activeSession?.hostId ?? null)) ?? null;
-  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession, sessionHost);
+  // A just-created (temp) conversation has no server session row yet, so
+  // derive routing eligibility from the optimistic seed (bound agent + create
+  // harness) through the SAME guards — never assume a temp id is eligible.
+  const optimisticRoutingSession =
+    activeSession == null && isTempConvId(activeConversationId) && boundAgentName != null
+      ? { agentName: boundAgentName, parentSessionId: null, harness: composerSessionHarness }
+      : null;
+  const costRoutingEligible = isCostRoutingEligible(
+    serverInfo,
+    activeSession ?? optimisticRoutingSession,
+    sessionHost,
+  );
   // Sub-agent routing is a separate knob with a different gate: a native CLI
   // can't per-turn route itself, but the sub-agents it spawns are routed per
   // spawn — where the launch actually installed that apparatus. See

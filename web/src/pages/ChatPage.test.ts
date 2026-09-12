@@ -1805,6 +1805,24 @@ describe("routing eligibility gates", () => {
     expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
   });
 
+  it("evaluates an optimistic (temp) seeded session by the same rules, harness-only", () => {
+    // The in-session temp composer builds this shape from the create seed:
+    // a bound-agent name + the create harness, with NO wrapper labels. Native
+    // detection falls back to the harness, so it is eligible under the judge.
+    const seededNative = {
+      agentName: "coder",
+      parentSessionId: null,
+      harness: "claude-native",
+    } as unknown as Session;
+    expect(isCostRoutingEligible(info(true, { external: false, oss: true }), seededNative)).toBe(
+      true,
+    );
+    // A seed with no bound agent is NOT eligible — the guard is never bypassed
+    // just because the conversation is a fresh temp id.
+    const seededNoAgent = { ...seededNative, agentName: null } as unknown as Session;
+    expect(isCostRoutingEligible(info(true), seededNoAgent)).toBe(false);
+  });
+
   it("a non-native SDK session is subagent-routing eligible whatever its harness", () => {
     // Its spawns go through the session-create path, not the native hook, so the
     // harness allowlist doesn't apply.

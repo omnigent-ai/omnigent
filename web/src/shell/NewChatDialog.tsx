@@ -4779,6 +4779,9 @@ export function NewChatLandingScreen() {
             harness: smartRoutingHarnessSelected ? null : (pickedHarness ?? null),
             costControlModeOverride: costControlOverride ?? null,
             boundAgentId: effectiveAgentId,
+            // Name (not just id) so the in-session temp composer can evaluate
+            // routing eligibility (isCostRoutingSession needs a bound agent).
+            boundAgentName: agent?.display_name ?? agent?.name ?? null,
           });
           if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
         } catch {
