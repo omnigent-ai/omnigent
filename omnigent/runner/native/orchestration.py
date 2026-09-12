@@ -4365,6 +4365,15 @@ async def _auto_create_codex_terminal(
         )
         or None
     )
+    # Dev/testing override: force Codex's real startup trust/hook-review box to
+    # appear by skipping the runner's auto-acknowledgements (below) and the
+    # hook-trust bypass flag. Lets the startup-prompt recovery path be exercised
+    # end to end (a detached pane parks on the box regardless of client attach),
+    # unlike TERM=dumb, which only bites when a client is attached during boot.
+    # Off in production; set only by dev/repro_codex_startup_prompt.py.
+    _force_startup_trust_prompt = (
+        os.environ.get("OMNIGENT_CODEX_FORCE_STARTUP_TRUST_PROMPT") == "1"
+    )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
     app_server = await asyncio.to_thread(
@@ -4384,13 +4393,15 @@ async def _auto_create_codex_terminal(
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
-        trust_project=True,
+        # (Disabled by the dev-only startup-prompt override so the real box can
+        # be exercised — see _force_startup_trust_prompt.)
+        trust_project=not _force_startup_trust_prompt,
         # Codex ignores --dangerously-bypass-hook-trust for the startup
         # hook-review screen on a persistent ``resume`` attach, which strands a
         # resumed web session behind the interactive "Hooks need review" prompt.
         # Persist trust for every merged hook so the review finds nothing to
         # review. See trust_all_codex_hooks.
-        trust_all_hooks=True,
+        trust_all_hooks=not _force_startup_trust_prompt,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
@@ -4566,8 +4577,11 @@ async def _auto_create_codex_terminal(
             # this flag. Otherwise a transient ``codex --version`` failure strands
             # the queued web message behind the terminal-only review screen.
             bypass_hook_trust=(
-                app_server.codex_cli_version is None
-                or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+                not _force_startup_trust_prompt
+                and (
+                    app_server.codex_cli_version is None
+                    or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+                )
             ),
         )
         # Apply the per-harness startup command/args override from config
@@ -4647,6 +4661,12 @@ async def _auto_create_codex_terminal(
 
     # Adopt the thread the fresh TUI creates and run the forwarder in the
     # background, so session creation never blocks on TUI startup.
+    # Resolve the pane so the fresh-launch path can tell a recoverable startup
+    # prompt (directory-trust, hook-review, TERM "Continue anyway?") from a
+    # genuine failure when the thread-start wait times out.
+    _codex_tmux_socket, _codex_tmux_target = _terminal_tmux_pane(
+        resource_registry, session_id, "codex", "main"
+    )
     _forwarder_task = asyncio.create_task(
         (
             _codex_discover_thread_and_forward(
@@ -4658,6 +4678,8 @@ async def _auto_create_codex_terminal(
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
+                tmux_socket=_codex_tmux_socket,
+                tmux_target=_codex_tmux_target,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4707,6 +4729,57 @@ async def _auto_create_codex_terminal(
     return terminal_view
 
 
+# Substrings that identify an interactive prompt Codex parks its startup on
+# in the detached pane — one a human at the terminal can answer, but which no
+# thread-start deadline can. Each maps to a short, user-facing description of
+# what the pane is waiting for. Matched case-insensitively against the captured
+# pane text. Ordered most- to least-specific; the first hit wins.
+_CODEX_STARTUP_PROMPT_MARKERS: tuple[tuple[str, str], ...] = (
+    ("hooks need review", "a hook-review prompt"),
+    ("do you trust the contents", "a directory-trust prompt"),
+    ("continue anyway", "a terminal-compatibility prompt"),
+    ("term is set to", "a terminal-compatibility prompt"),
+)
+
+
+async def _codex_pane_interactive_prompt(
+    tmux_socket: Path | None,
+    tmux_target: str | None,
+) -> str | None:
+    """
+    Describe the interactive prompt a Codex pane is parked on, if any.
+
+    Captures the detached Codex pane and matches its text against
+    :data:`_CODEX_STARTUP_PROMPT_MARKERS`. A hit means the TUI is blocked on a
+    prompt a human can answer from the terminal — a directory-trust screen, a
+    hook-review screen, or a ``TERM``-compatibility "Continue anyway?" gate — so
+    the caller keeps the terminal alive instead of reaping it on the
+    thread-start timeout. Fully defensive: any capture failure returns ``None``
+    (treat as "no recoverable prompt").
+
+    :param tmux_socket: The pane's tmux socket, or ``None`` when the terminal
+        is not locally reachable.
+    :param tmux_target: The pane's tmux target, or ``None``.
+    :returns: A short description of the prompt (e.g. ``"a hook-review
+        prompt"``), or ``None`` when no known prompt is visible.
+    """
+    if tmux_socket is None or tmux_target is None:
+        return None
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    try:
+        raw = await _run_tmux_capture(str(tmux_socket), tmux_target)
+    except Exception:  # noqa: BLE001 - detection must never sink the launch
+        return None
+    if not raw:
+        return None
+    text = raw.decode("utf-8", errors="replace").lower()
+    for marker, description in _CODEX_STARTUP_PROMPT_MARKERS:
+        if marker in text:
+            return description
+    return None
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -4717,6 +4790,8 @@ async def _codex_discover_thread_and_forward(
     event_client: CodexAppServerClient,
     routing_summary: str,
     login_required: bool = False,
+    tmux_socket: Path | None = None,
+    tmux_target: str | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4753,6 +4828,13 @@ async def _codex_discover_thread_and_forward(
         the thread-start timeout), while thread discovery keeps listening
         so an interactive sign-in from the terminal still recovers the
         session.
+    :param tmux_socket: The Codex pane's tmux socket, used to capture the pane
+        when the thread-start wait times out so a recoverable interactive
+        prompt (directory-trust, hook-review, ``TERM`` "Continue anyway?") is
+        distinguished from a genuine startup failure. ``None`` when the pane is
+        not locally reachable (the timeout then stays fatal as before).
+    :param tmux_target: The Codex pane's tmux target, paired with
+        ``tmux_socket``.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4805,7 +4887,35 @@ async def _codex_discover_thread_and_forward(
                 # so this wait only serves a possible interactive sign-in.
                 thread_id = await wait_for_thread_started(event_client, timeout=None)
             else:
-                thread_id = await wait_for_thread_started(event_client)
+                try:
+                    thread_id = await wait_for_thread_started(event_client)
+                except TimeoutError:
+                    # The bounded wait elapsed. If the pane is parked on an
+                    # interactive prompt a human can answer (directory-trust,
+                    # hook-review, or a TERM "Continue anyway?" gate), don't
+                    # reap the terminal: record an actionable fail-fast notice
+                    # so a headless turn fails immediately with guidance, then
+                    # keep listening with no deadline so answering the prompt in
+                    # the terminal recovers the session. A timeout with no such
+                    # prompt is a genuine startup failure and falls through to
+                    # the fatal path below.
+                    prompt = await _codex_pane_interactive_prompt(tmux_socket, tmux_target)
+                    if prompt is None:
+                        raise
+                    _logger.warning(
+                        "Codex TUI for %s is parked on %s in its terminal; keeping "
+                        "the terminal attachable instead of failing the session on "
+                        "the thread-start timeout",
+                        session_id,
+                        prompt,
+                    )
+                    write_bridge_startup_error(
+                        bridge_dir,
+                        f"Codex is waiting on {prompt} in its terminal and cannot "
+                        "start this turn yet. Open the Terminal for this session and "
+                        f"answer the prompt to continue. Launch routing: {routing_summary}.",
+                    )
+                    thread_id = await wait_for_thread_started(event_client, timeout=None)
         except (TimeoutError, RuntimeError) as exc:
             # Expected failure modes of wait_for_thread_started: the TUI exited
             # at startup, or the event stream ended before a thread was
@@ -4829,10 +4939,11 @@ async def _codex_discover_thread_and_forward(
             )
             return
 
-        if login_required:
-            # The user signed in (or the TUI otherwise started a thread):
-            # the pre-recorded fail-fast cause no longer applies.
-            clear_bridge_startup_error(bridge_dir)
+        # The thread started, so any pre-recorded fail-fast cause no longer
+        # applies — whether it was the login-fallback notice recorded up front
+        # or the interactive-prompt notice recorded on the thread-start
+        # timeout. Clearing when nothing was recorded is a harmless no-op.
+        clear_bridge_startup_error(bridge_dir)
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
