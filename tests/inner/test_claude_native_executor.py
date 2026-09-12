@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
@@ -1334,19 +1336,29 @@ async def test_a_routed_first_message_switches_the_model_exactly_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_operation", ["message_delivery", "model_switch"])
 async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    delivery_operation: str,
 ) -> None:
     """A readiness timeout cannot leave a failed turn's pane alive."""
     bridge_dir = tmp_path / "bridge"
     killed: list[Path] = []
 
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
-        del bridge_dir_arg, content, timeout_s
-        raise ClaudePromptTimeout("terminal did not become ready")
+    def fail_inject(bridge_dir_arg: Path, **kwargs: object) -> None:
+        del bridge_dir_arg, kwargs
+        raise ClaudePromptTimeout(
+            "terminal did not become ready",
+            diagnostics={"readiness_polls": 199, "readiness_timeout_s": 30.0},
+        )
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_timeout")
+    if delivery_operation == "model_switch":
+        monkeypatch.setattr(claude_native_executor, "inject_slash_command", fail_inject)
+        monkeypatch.setattr(ClaudeNativeExecutor, "_model_command_arg", lambda self, model: "test")
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
@@ -1366,6 +1378,18 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1
+    row = record_to_row(errors[0], "harness")
+    assert row["event_name"] == "harness_prompt_delivery_timeout"
+    assert row["session_id"] == "conv_timeout"
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert attributes["delivery_operation"] == delivery_operation
+    assert attributes["message_delivered"] == "False"
+    assert attributes["cleanup_succeeded"] == "True"
+    assert attributes["readiness_polls"] == "199"
+    assert attributes["readiness_timeout_s"] == "30.0"
 
 
 @pytest.mark.asyncio
@@ -1405,6 +1429,7 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A failed hard-stop remains visible beside the delivery error."""
 
@@ -1432,6 +1457,12 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     assert isinstance(events[0], ExecutorError)
     assert "terminal did not become ready" in events[0].message
     assert "Cleanup also failed: tmux kill failed" in events[0].message
+    timeout_record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "harness_prompt_delivery_timeout"
+    )
+    assert timeout_record.attributes["cleanup_succeeded"] is False
 
 
 @pytest.mark.asyncio

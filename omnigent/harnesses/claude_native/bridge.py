@@ -418,6 +418,10 @@ def validate_claude_hook_interpreter_compatibility(
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
 
+    def __init__(self, message: str, *, diagnostics: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics or {})
+
 
 class TmuxSessionNotAdvertised(RuntimeError):
     """The bridge's tmux target was not advertised before the deadline."""
@@ -5058,6 +5062,29 @@ def _format_terminal_failure_tail(pane: str) -> str:
     return f" Last terminal output:\n{tail}"
 
 
+def _readiness_observations(pane: str) -> dict[str, object]:
+    """Return bounded visibility signals, not inferred causes or terminal text."""
+    normalized = pane.casefold()
+    return {
+        "readiness_config_setup_visible": any(
+            marker in normalized
+            for marker in ("generating claude-code mcp client config", "managed settings drift")
+        ),
+        "readiness_auth_flow_visible": any(
+            marker in normalized
+            for marker in ("dbcert:", "logging in via sso", "oauth2/v1/authorize")
+        ),
+        "readiness_fullscreen_prompt_visible": "try the new fullscreen renderer?" in normalized,
+        "readiness_external_import_prompt_visible": (
+            "allow external claude.md file imports?" in normalized
+        ),
+        "readiness_dialog_visible": any(
+            marker in normalized for marker in ("enter to confirm", "enter to continue")
+        ),
+        "readiness_dead_pane_visible": "pane is dead" in normalized,
+    }
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -5093,7 +5120,8 @@ def _wait_for_claude_prompt_ready(
         a startup crash, a torn/empty capture under a mid-turn repaint, or
         a box that never appeared — is diagnosable from the error alone.
     """
-    deadline = time.monotonic() + timeout_s
+    started_at = time.monotonic()
+    deadline = started_at + timeout_s
     polls = 0
     empty_polls = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
@@ -5126,7 +5154,16 @@ def _wait_for_claude_prompt_ready(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        + _format_terminal_failure_tail(last_nonempty),
+        diagnostics={
+            "readiness_stage": "input_prompt",
+            "readiness_timeout_s": timeout_s,
+            "readiness_elapsed_ms": round((time.monotonic() - started_at) * 1000),
+            "readiness_polls": polls,
+            "readiness_empty_captures": empty_polls,
+            "readiness_last_capture_empty": not bool(pane.strip()),
+            **_readiness_observations(last_nonempty),
+        },
     )
 
 

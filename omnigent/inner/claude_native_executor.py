@@ -200,6 +200,7 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's aliases / custom slot; a
         # bare catalog id is ignored and the pane keeps its old model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        delivery_operation = "model_switch" if wanted_model_arg is not None else "message_delivery"
         try:
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
@@ -219,17 +220,28 @@ class ClaudeNativeExecutor(Executor):
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
+                    delivery_operation = "message_delivery"
                     await asyncio.to_thread(
                         inject_user_message,
                         self._bridge_dir,
                         content=text,
                     )
         except ClaudePromptTimeout as exc:
+            cleanup_error = self._reap_failed_turn()
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
-                extra={"session_id": self._request_session_id},
+                extra={
+                    "event_name": "harness_prompt_delivery_timeout",
+                    "session_id": self._request_session_id,
+                    "attributes": {
+                        **exc.diagnostics,
+                        "harness": "claude-native",
+                        "delivery_operation": delivery_operation,
+                        "message_delivered": False,
+                        "cleanup_succeeded": cleanup_error is None,
+                    },
+                },
             )
-            cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"

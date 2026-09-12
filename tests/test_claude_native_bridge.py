@@ -8143,6 +8143,43 @@ def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatc
     assert len(body) <= 51
 
 
+@pytest.mark.parametrize(
+    ("pane", "signal"),
+    [
+        ("Generating claude-code MCP client config...", "readiness_config_setup_visible"),
+        ("Managed settings drift detected", "readiness_config_setup_visible"),
+        ("dbcert: Logging in via SSO...", "readiness_auth_flow_visible"),
+        ("Try the new fullscreen renderer?", "readiness_fullscreen_prompt_visible"),
+        ("Allow external CLAUDE.md file imports?", "readiness_external_import_prompt_visible"),
+        ("Enter to confirm", "readiness_dialog_visible"),
+        ("Pane is dead (status 0)", "readiness_dead_pane_visible"),
+    ],
+)
+def test_readiness_timeout_has_structured_observations_without_pane_contents(
+    monkeypatch: pytest.MonkeyPatch, pane: str, signal: str
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda socket_path, tmux_target: pane + "\nprivate-terminal-content",
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock", "main", timeout_s=0.0
+        )
+
+    diagnostics = excinfo.value.diagnostics
+    assert diagnostics["readiness_stage"] == "input_prompt"
+    assert diagnostics["readiness_polls"] == 1
+    assert diagnostics["readiness_empty_captures"] == 0
+    assert diagnostics["readiness_last_capture_empty"] is False
+    assert diagnostics["readiness_timeout_s"] == 0.0
+    assert diagnostics["readiness_elapsed_ms"] >= 0
+    assert diagnostics[signal] is True
+    assert "private-terminal-content" not in str(diagnostics)
+    assert pane not in str(diagnostics)
+
+
 def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8198,7 +8235,7 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: "",
     )
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
@@ -8210,6 +8247,9 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     assert "1 polls, 1 empty captures" in message
     # No pane text to surface when every capture was empty.
     assert "Last terminal output:" not in message
+    assert excinfo.value.diagnostics["readiness_polls"] == 1
+    assert excinfo.value.diagnostics["readiness_empty_captures"] == 1
+    assert excinfo.value.diagnostics["readiness_last_capture_empty"] is True
 
 
 def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
