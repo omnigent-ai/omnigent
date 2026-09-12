@@ -7903,7 +7903,7 @@ async def test_post_external_permission_mode_change_is_quiet_when_unchanged(
 @pytest.mark.parametrize(
     "mode",
     [
-        "bypassPermissions",  # real CLI mode, but not one shift+tab can reach
+        "dontAsk",  # real CLI mode, but never rendered as a pane footer
         "turbo",  # not a mode at all
         "",
     ],
@@ -7931,6 +7931,49 @@ async def test_post_external_permission_mode_change_rejects_unsupported_modes(
 
     assert resp.status_code == 400, resp.text
     assert "external_permission_mode_change" in resp.text
+
+
+async def test_post_external_permission_mode_change_accepts_bypass_read_back(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane reporting bypass lands on the label and rewrites the launch arg.
+
+    Bypass is launch-only and stays rejected as a PATCH target, but a session
+    launched into it (or cycled back to it inside the TUI) must read back as
+    bypass, or the picker shows a stale mode and a relaunch reopens in the
+    mode last recorded instead of the one the pane is in.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--model", "opus", "--permission-mode", "auto"],
+    )
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": "bypassPermissions"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == ["session.permission_mode"]
+    assert published[0][1]["permission_mode"] == "bypassPermissions"
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "bypassPermissions"
+    assert snapshot["terminal_launch_args"] == [
+        "--model",
+        "opus",
+        "--permission-mode",
+        "bypassPermissions",
+    ]
 
 
 async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
