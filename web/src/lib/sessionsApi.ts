@@ -990,6 +990,15 @@ export async function updateSession(
      * workspace files. Owner-only server-side. `true`/`false` set or clear it.
      */
     shareWorkspaceFiles?: boolean;
+    /**
+     * Repoint the session's working directory to a browsed location, in wire
+     * form relative to the runner's env root: `""` = the env root, a plain
+     * relative path = a folder inside it (viewer/edit reach), a leading-`/`
+     * absolute path = the owner's machine (owner-gated). The runner resolves
+     * it to an absolute path and enforces sandbox reach; the server persists
+     * the resolved path, so new shells and turns cd into it.
+     */
+    workspace?: string;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -1019,6 +1028,9 @@ export async function updateSession(
   }
   if (updates.shareWorkspaceFiles !== undefined) {
     body.share_workspace_files = updates.shareWorkspaceFiles;
+  }
+  if (updates.workspace !== undefined) {
+    body.workspace = updates.workspace;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;

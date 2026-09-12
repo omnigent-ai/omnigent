@@ -2303,6 +2303,16 @@ class UpdateSessionRequest(BaseModel):
         A list (including ``[]``) replaces the stored value wholesale
         — resume is last-write-wins, never an append. Bounds (count /
         length) are validated server-side. ``None`` leaves unchanged.
+    :param workspace: Repoint the session's working directory (where
+        turns run and new shells open) to a folder the file browser
+        re-rooted onto. The wire form mirrors the browse APIs: ``""``
+        is the environment root, a path with no leading ``/`` is
+        resolved under it (viewer/edit level), and a leading-``/``
+        absolute path is the owner's own machine (owner-gated, exactly
+        like absolute browsing). The bound runner resolves the target
+        against its live environment root and enforces the session's
+        sandbox reach, then the server persists the resolved absolute
+        path. Omitting the field leaves the workspace unchanged.
     :param silent: When ``True``, persist metadata changes but skip
         the runner-side side effects — specifically the
         native ``/effort`` / ``/model`` / Codex collaboration-mode
@@ -2343,6 +2353,7 @@ class UpdateSessionRequest(BaseModel):
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
     project_id: str | None = None
+    workspace: str | None = None
     silent: bool = False
 
     model_config = ConfigDict(extra="forbid")

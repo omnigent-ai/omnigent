@@ -13,6 +13,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
+import { updateSession } from "@/lib/sessionsApi";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
@@ -318,6 +319,14 @@ export function FilesPanel({
         else browseLocationCache.set(conversationId, next);
       }
       setBrowseLocation(next);
+      // Re-rooting the browser also repoints the session's working directory so
+      // new shells and turns cd into the browsed folder. Same wire form the tree
+      // uses; fire-and-forget (a viewer's PATCH or offline runner fails harmlessly).
+      if (conversationId) {
+        void updateSession(conversationId, {
+          workspace: relativizeToWorkspace(next, workspaceRoot),
+        }).catch(() => {});
+      }
     },
     [workspaceRoot, conversationId],
   );

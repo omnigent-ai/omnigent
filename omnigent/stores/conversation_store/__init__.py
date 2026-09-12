@@ -1509,6 +1509,41 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_workspace(
+        self,
+        conversation_id: str,
+        workspace: str,
+    ) -> Conversation:
+        """
+        Repoint the session's working directory.
+
+        Sets the canonical absolute ``workspace`` path the runner cd's
+        into for turns and new shells. Used by the file browser's
+        "working folder" re-root: a resolved absolute path replaces the
+        stored value with last-write-wins semantics, so a later turn or
+        shell starts in the browsed folder.
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
+
+        Only ever sets a non-empty path, so the row can never move to
+        the (``host_id`` set, ``workspace`` NULL) combination the
+        ``ck_conversations_workspace_required_for_host`` constraint
+        forbids.
+
+        :param conversation_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param workspace: Canonical absolute workspace path the runner
+            resolved from the browse target, e.g.
+            ``"/Users/corey/projects/myapp/subdir"``.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If no conversation row
+            with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
     def set_external_session_id(
         self,
         conversation_id: str,
