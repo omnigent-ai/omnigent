@@ -48,14 +48,11 @@ async function fetchLatestError(id: string, signal: AbortSignal): Promise<boolea
 function liveError(id: string): boolean | undefined {
   const entry = conversationRegistry.peek(id);
   const state = entry?.getState();
-  if (
-    entry?.disposed ||
-    !state ||
-    state.loadingConversation ||
-    state.conversationLoadError !== null ||
-    state.abortController === null ||
-    state.abortController.signal.aborted
-  ) {
+  if (entry?.disposed || !state || state.conversationLoadError !== null) return undefined;
+  // The initial history request will supply the latest message. Wait for it
+  // even before the stream controller is installed, without a second read.
+  if (state.loadingConversation) return false;
+  if (state.abortController === null || state.abortController.signal.aborted) {
     return undefined;
   }
   if (state.status === "streaming" || state.terminalPending) return false;

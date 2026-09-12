@@ -1422,7 +1422,10 @@ function ProjectFolder({
     );
   }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
   const errors = useSessionErrors(conversations);
-  const marker = projectMarkerState(conversations, errors);
+  const startingConversationId = useChatStore((s) =>
+    s.status === "streaming" || s.terminalPending ? s.conversationId : null,
+  );
+  const marker = projectMarkerState(conversations, errors, startingConversationId);
 
   // Publish the folder's rendered rows upward so projects-scope bulk selection
   // resolves them (the parent sources its action set from these, not the global
@@ -2462,27 +2465,32 @@ function UngroupDropZone() {
 function projectMarkerState(
   conversations: Conversation[],
   errors: readonly boolean[],
+  startingConversationId: string | null,
 ): SessionState | null {
   let awaiting = 0;
+  let running = false;
+  let starting = false;
   let error = false;
   let unseen = false;
-  let running = false;
   for (const [i, c] of conversations.entries()) {
     const state = getSessionState(c, errors[i]);
     if (state?.kind === "awaiting") {
       awaiting += state.count;
+    } else if (state?.kind === "running") {
+      running = true;
+    } else if (c.id === startingConversationId) {
+      starting = true;
     } else if (state?.kind === "error") {
       error = true;
     } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
       unseen = true;
-    } else if (state?.kind === "running") {
-      running = true;
     }
   }
   if (awaiting > 0) return { kind: "awaiting", count: awaiting };
+  if (running) return { kind: "running" };
+  if (starting) return { kind: "starting" };
   if (error) return { kind: "error" };
   if (unseen) return { kind: "unseen" };
-  if (running) return { kind: "running" };
   return null;
 }
 

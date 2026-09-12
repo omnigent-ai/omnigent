@@ -132,6 +132,43 @@ describe("useSessionErrors", () => {
     expect(fetchPage).not.toHaveBeenCalled();
   });
 
+  it("waits for an in-flight history load instead of requesting a redundant tail", async () => {
+    const entry = conversationRegistry.acquire(session.id);
+    entry.setState({ loadingConversation: true });
+    const { wrapper } = harness();
+    const hook = renderHook(() => useSessionErrors([session]), { wrapper });
+    await act(async () => {});
+    expect(fetchPage).not.toHaveBeenCalled();
+
+    await act(async () => entry.setState({ abortController: new AbortController() }));
+    expect(fetchPage).not.toHaveBeenCalled();
+
+    await act(async () =>
+      entry.setState({ blocks: itemsToBlocks(errorPage.items), loadingConversation: false }),
+    );
+    expect(hook.result.current).toEqual([true]);
+    expect(fetchPage).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a tail if the in-flight history load fails", async () => {
+    const entry = conversationRegistry.acquire(session.id);
+    entry.setState({ loadingConversation: true, abortController: new AbortController() });
+    fetchPage.mockResolvedValue(errorPage);
+    const { wrapper } = harness();
+    const hook = renderHook(() => useSessionErrors([session]), { wrapper });
+    await act(async () => {});
+    expect(fetchPage).not.toHaveBeenCalled();
+
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        conversationLoadError: new Error("history unavailable"),
+      }),
+    );
+    await waitFor(() => expect(hook.result.current).toEqual([true]));
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back to the latest item after a live transcript is evicted", async () => {
     const entry = conversationRegistry.acquire(session.id);
     entry.setState({

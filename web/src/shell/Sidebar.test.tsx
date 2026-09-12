@@ -2422,7 +2422,65 @@ describe("Sidebar collapsed project marker", () => {
     ).toBeInTheDocument();
   });
 
-  it("prioritizes a pending approval over another session's error", () => {
+  it.each(["failed", "idle"] as const)(
+    "prioritizes a running session over an unread $0 sibling",
+    (status) => {
+      projectsMock.push("Customer X");
+      seedReadState([
+        { id: "conv_other", viewer_last_seen: 199 },
+        { id: "conv_running", viewer_last_seen: 199 },
+      ]);
+      mockConversations([
+        conv("conv_other", "Codex", {
+          labels: { omni_project: "Customer X" },
+          status,
+          updated_at: 200,
+        }),
+        conv("conv_running", "Codex", {
+          labels: { omni_project: "Customer X" },
+          status: "running",
+          updated_at: 200,
+        }),
+      ]);
+      renderSidebar();
+
+      const header = screen.getByRole("button", { name: /^Customer X/ });
+      expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "running",
+      );
+      expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+    },
+  );
+
+  it.each([
+    { status: "streaming" as const, terminalPending: false },
+    { status: "idle" as const, terminalPending: true },
+  ])("prioritizes startup over a previous error for $status/$terminalPending", (startup) => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_error", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "failed",
+      }),
+    ]);
+    useChatStore.setState({ conversationId: "conv_error", ...startup });
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+
+    act(() => useChatStore.setState({ status: "idle", terminalPending: false }));
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  it("prioritizes a pending approval over running and errored sessions", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_error", "Codex", {
@@ -2432,6 +2490,10 @@ describe("Sidebar collapsed project marker", () => {
       conv("conv_awaiting", "Codex", {
         labels: { omni_project: "Customer X" },
         pending_elicitations_count: 2,
+      }),
+      conv("conv_running", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
       }),
     ]);
     renderSidebar();
