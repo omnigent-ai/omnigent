@@ -3360,14 +3360,19 @@ export function NewChatLandingScreen() {
   useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
-    : selectedNativeHarness === "pi-native"
-      ? PI_NATIVE_EFFORTS
-      : selectedNativeHarness === "codex-native"
-        ? codexEffortLevelsForModel(
-            codexModelOptions,
-            pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-          ).map((value) => ({ value, label: codexPickerEffortLabel(value) }))
-        : [];
+    : selectedNativeHarness === "devin-native"
+      ? // Devin encodes effort as a model-variant suffix over exactly the
+        // Anthropic rung set; the runner recombines the pair at launch
+        // (resolve_devin_launch_model), so the picker offers the same ladder.
+        CLAUDE_NATIVE_EFFORTS
+      : selectedNativeHarness === "pi-native"
+        ? PI_NATIVE_EFFORTS
+        : selectedNativeHarness === "codex-native"
+          ? codexEffortLevelsForModel(
+              codexModelOptions,
+              pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
+            ).map((value) => ({ value, label: codexPickerEffortLabel(value) }))
+          : [];
   const selectPickerModel = (model: string) => {
     if (!selectedNativeHarness) return;
     userPickedModelRef.current = true;

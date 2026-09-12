@@ -147,7 +147,11 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "devin",
     sortRank: 28,
     capabilities: ["devinMode"],
-    fullySupported: true,
+    // Deliberately NOT fullySupported: that flag pins the picker's primary list
+    // to Claude Code + Codex and is guarded by a test asserting exactly those
+    // two, so promoting a brand-new harness there is a product call for a
+    // maintainer, not a side effect of adding it. Devin folds into "More" with
+    // the other natives; flipping this is a one-line change.
   },
   {
     key: "cursor",
