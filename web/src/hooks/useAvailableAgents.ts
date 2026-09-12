@@ -24,6 +24,14 @@ export interface AvailableAgent {
   // host-discovered skills only resolve once a runner is bound, so
   // they're absent here. Empty on older servers without the field.
   skills: { name: string; description: string }[];
+  // Raw spec ``icon`` from GET /v1/agents: an emoji grapheme, or a relative
+  // image path served via GET /v1/agents/{id}/icon. Resolved for display by
+  // ``resolveAgentIcon`` (see @/lib/agentIcon), which the picker card honours
+  // before its harness/iconKind fallback. Omitted (like ``builtin`` /
+  // ``created_at``) when the spec declares none, when the server predates the
+  // field, or on a session-derived row before hover enrichment — a missing
+  // value means "no declared icon", so the fallback glyph is used.
+  icon?: string | null;
   // Server-seeded built-in (deterministic, name-derived id) vs a
   // user-registered template. Only set on catalog rows from GET /v1/agents;
   // omitted on session-derived agents and on older servers without the field
@@ -99,6 +107,7 @@ interface BuiltinAgentWire {
   description?: string | null;
   harness?: string | null;
   skills?: { name: string; description: string }[];
+  icon?: string | null;
   // True only for server-seeded built-ins (deterministic id). Absent on
   // older servers, where every catalog row degrades to a protected entry.
   builtin?: boolean;
@@ -152,6 +161,9 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     // undefined as "protected" (same as true), so omission is safe.
     ...(a.builtin !== undefined ? { builtin: a.builtin } : {}),
     ...(a.created_at !== undefined ? { created_at: a.created_at } : {}),
+    // Omit when the server sends no icon so an absent value stays absent
+    // (matches the "no declared icon" contract and keeps toEqual stable).
+    ...(a.icon != null ? { icon: a.icon } : {}),
   }));
 }
 
@@ -236,6 +248,7 @@ interface AgentObjectWire {
   description?: string | null;
   harness?: string | null;
   skills?: { name: string; description: string }[];
+  icon?: string | null;
 }
 
 /**
@@ -251,6 +264,9 @@ function sessionAgentFromScan(scanned: ScannedSessionAgent): AvailableAgent {
     description: null,
     harness: null,
     skills: [],
+    // icon intentionally omitted: absent means "no declared icon"; the full
+    // spec (incl. any icon) is filled in on hover by
+    // prefetchAvailableAgentDetails, like harness/description.
     sessionId: scanned.sessionId,
     // builtin/created_at intentionally omitted: session-derived agents never
     // seed the catalog, and their recency comes from the scanned session's
@@ -286,6 +302,10 @@ export async function prefetchAvailableAgentDetails(
               description: json.description ?? null,
               harness: json.harness ?? null,
               skills: json.skills ?? [],
+              // Omit when absent so the enriched row matches the "no declared
+              // icon" contract (and toEqual stays stable) rather than pinning
+              // an explicit null key.
+              ...(json.icon != null ? { icon: json.icon } : {}),
             },
       );
       // If enrichment reveals this agent is a native coding agent (e.g. a

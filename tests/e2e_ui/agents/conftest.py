@@ -240,3 +240,94 @@ def joke_subagents_session(
             except subprocess.TimeoutExpired:
                 respawned_runner.kill()
                 respawned_runner.wait(timeout=5)
+
+
+_ICON_AGENT_NAME = "icon_agent"
+# The declared emoji icon the Agents rail must render for this agent's row.
+_ICON_AGENT_EMOJI = "\U0001f98a"  # 🦊
+
+
+def _icon_agent_bundle() -> bytes:
+    """Build a strict ``config.yaml`` bundle declaring an emoji ``icon``.
+
+    Strict ``spec_version: 1`` (config.yaml) is used because only that
+    parser reads the spec ``icon`` field; the omnigent-flavored single-file
+    path (used by ``seeded_session``) does not carry it. No LLM turn is
+    involved in the icon journey, so the ``llm``/``executor`` blocks only
+    need to satisfy spec validation and session bind.
+
+    :returns: The ``.tar.gz`` bytes ready for multipart upload.
+    """
+    config = (
+        "spec_version: 1\n"
+        f"name: {_ICON_AGENT_NAME}\n"
+        f'icon: "{_ICON_AGENT_EMOJI}"\n'
+        "prompt: You are a friendly assistant. Say hello.\n"
+        "llm:\n"
+        "  model: gpt-4o-mini\n"
+        "  connection:\n"
+        "    api_key: test-key\n"
+        "executor:\n"
+        "  config:\n"
+        "    harness: openai-agents\n"
+        "os_env:\n"
+        "  type: caller_process\n"
+        "  cwd: .\n"
+        "  sandbox:\n"
+        "    type: none\n"
+    )
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = config.encode()
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+@pytest.fixture
+def emoji_icon_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """Create a runner-bound session whose agent declares an emoji icon.
+
+    Same runner-respawn + bind contract as ``seeded_session`` in the parent
+    conftest, but the uploaded bundle declares ``icon: 🦊`` so the Agents
+    rail's main row can render that grapheme. No message is sent — the icon is
+    read from the bound agent object, so this stays a fast, LLM-free check.
+
+    :param live_server: Spawned server fixture from the parent conftest.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+
+    create_resp = httpx.post(
+        f"{live_server}/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _icon_agent_bundle(), "application/gzip")},
+        timeout=30.0,
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+
+    patch_resp = httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    )
+    patch_resp.raise_for_status()
+
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
