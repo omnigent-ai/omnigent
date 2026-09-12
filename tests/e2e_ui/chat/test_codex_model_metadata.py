@@ -136,7 +136,7 @@ def test_codex_native_picker_uses_raw_model_metadata(
     # The read-only composer label shows the resolved model + effort; the
     # harness identity moved into the config gear's hover tooltip.
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
-        "Codex Pretty 5.5", timeout=15_000
+        "databricks-gpt-5-5", timeout=15_000
     )
     expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
@@ -150,7 +150,7 @@ def test_codex_native_picker_uses_raw_model_metadata(
 
     model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.5"]')
     expect(model_row).to_be_visible()
-    expect(model_row).to_contain_text("Codex Pretty 5.5")
+    expect(model_row).to_contain_text("databricks-gpt-5-5")
     # Re-select the current model to close the listbox without sending Escape
     # to the surrounding dialog.
 
@@ -187,7 +187,7 @@ def test_custom_codex_native_agent_keeps_model_and_effort_controls(
     page.goto(f"{base_url}/c/{session_id}")
 
     expect(page.get_by_test_id("composer-agent-model-value")).to_have_text(
-        "Codex Pretty 5.5", timeout=15_000
+        "databricks-gpt-5-5", timeout=15_000
     )
     expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("xHigh")
 
@@ -381,7 +381,7 @@ def test_codex_gear_offers_host_probe_rows_before_the_session_catalog(
 
     model_row = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]')
     expect(model_row).to_be_visible()
-    expect(model_row).to_contain_text("GPT-5.6-Luna")
+    expect(model_row).to_contain_text("gpt-5.6-luna")
     # Re-select the current model to close the listbox without sending
     # Escape to the surrounding dialog.
 

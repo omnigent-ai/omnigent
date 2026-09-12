@@ -803,7 +803,7 @@ describe("NewChatLandingScreen project prefill", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
     fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${CLAUDE_AGENT_ID}`));
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "sonnet" }));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
 
     // The project default (Opus) lands afterwards — it must not reseed.

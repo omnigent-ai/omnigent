@@ -147,10 +147,6 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.limits import (
-    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-)
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
@@ -160,6 +156,10 @@ from omnigent.runtime.websocket_metrics import (
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.tunnel_limits import (
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)

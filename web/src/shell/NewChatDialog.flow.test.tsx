@@ -372,6 +372,7 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         expect.any(Object),
         project,
+        expect.objectContaining({ boundAgentId: "ag_hello", reasoningEffort: null }),
       ),
     );
     await waitFor(() =>
@@ -1565,7 +1566,7 @@ describe("NewChatLandingScreen create flow", () => {
     // Model, effort and permission mode share Claude Code's one config modal;
     // both can be set in one visit and commit together on Save.
     openAgentModels("ag_native");
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "opus" }));
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
@@ -1614,13 +1615,13 @@ describe("NewChatLandingScreen create flow", () => {
       '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
-    expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
+    expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
     fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
       target: { value: "gpt sol" },
     });
-    expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
-    expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
-    fireEvent.click(screen.getByText("GPT 5.6 Sol"));
+    expect(screen.getByText("omnigent-openai/system.ai.gpt-5-6-sol")).toBeInTheDocument();
+    expect(screen.queryByText("omnigent/databricks-claude-sonnet-4-6")).toBeNull();
+    fireEvent.click(screen.getByText("omnigent-openai/system.ai.gpt-5-6-sol"));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -1678,7 +1679,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     openAgentModels("ag_native");
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "opus" }));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));

@@ -189,7 +189,7 @@ def test_row14_pick_stays_pending_until_the_harness_confirms(
 
     page.goto(f"{base_url}/c/{session_id}")
     chip = page.get_by_test_id("composer-agent-config-value")
-    expect(chip).to_contain_text("Sonnet 5", timeout=15_000)
+    expect(chip).to_contain_text("system.ai.claude-sonnet-5", timeout=15_000)
 
     _open_gear_model_dropdown(page)
     page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
@@ -197,8 +197,8 @@ def test_row14_pick_stays_pending_until_the_harness_confirms(
     # Unconfirmed: the chip keeps the reported model and a pending indicator
     # shows. (The PATCH round-trip completes; confirmation has not arrived.)
     page.wait_for_timeout(800)
-    expect(chip).to_contain_text("Sonnet 5")
-    expect(chip).not_to_contain_text("Opus")
+    expect(chip).to_contain_text("system.ai.claude-sonnet-5")
+    expect(chip).not_to_contain_text("opus")
     expect(page.get_by_test_id("composer-model-pending")).to_be_visible()
 
     # The harness confirms: the report names the model the pane now runs.
@@ -207,7 +207,7 @@ def test_row14_pick_stays_pending_until_the_harness_confirms(
         "session.model",
         {"conversation_id": session_id, "model": "system.ai.claude-opus-4-10"},
     )
-    expect(chip).to_contain_text("Opus 4.10", timeout=10_000)
+    expect(chip).to_contain_text("system.ai.claude-opus-4-10", timeout=10_000)
     expect(page.get_by_test_id("composer-model-pending")).to_have_count(0)
 
 
@@ -232,7 +232,7 @@ def test_row15_failed_switch_surfaces_error_and_keeps_the_reported_model(
 
     page.goto(f"{base_url}/c/{session_id}")
     chip = page.get_by_test_id("composer-agent-config-value")
-    expect(chip).to_contain_text("Sonnet 5", timeout=15_000)
+    expect(chip).to_contain_text("system.ai.claude-sonnet-5", timeout=15_000)
 
     _open_gear_model_dropdown(page)
     page.locator('[role="menuitemcheckbox"][data-model-id="haiku"]').click()
@@ -270,5 +270,5 @@ def test_row15_failed_switch_surfaces_error_and_keeps_the_reported_model(
             continue
     expect(detail).to_be_visible(timeout=5_000)
     # The chip never claimed the pick: it keeps the pane's reported model.
-    expect(chip).to_contain_text("Sonnet 5")
-    expect(chip).not_to_contain_text("Haiku")
+    expect(chip).to_contain_text("system.ai.claude-sonnet-5")
+    expect(chip).not_to_contain_text("haiku")

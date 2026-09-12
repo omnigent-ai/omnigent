@@ -237,6 +237,12 @@ _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mo
 _CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
     {"default", "acceptEdits", "plan", "auto"}
 )
+# Modes the forwarder can read off the pane footer. A session launched into
+# ``bypassPermissions`` reports it so the label and picker show the real mode;
+# it is still not a PATCH target.
+_CLAUDE_NATIVE_READABLE_PERMISSION_MODES: frozenset[str] = _CLAUDE_NATIVE_PERMISSION_MODES | {
+    "bypassPermissions"
+}
 
 
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
@@ -915,6 +921,7 @@ __all__ = [
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
     "_CLAUDE_NATIVE_PERMISSION_MODES",
     "_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY",
+    "_CLAUDE_NATIVE_READABLE_PERMISSION_MODES",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",

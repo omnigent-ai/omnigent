@@ -71,6 +71,7 @@ from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
+from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -136,6 +137,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_HARNESS,
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CLAUDE_NATIVE_PERMISSION_MODES,
+    _CLAUDE_NATIVE_READABLE_PERMISSION_MODES,
     _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
     _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
     _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
@@ -2586,7 +2588,8 @@ async def _persist_external_permission_mode_change(
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row for ``session_id`` at the route boundary.
-    :param body: Event body; ``data.permission_mode`` must be a switchable mode.
+    :param body: Event body; ``data.permission_mode`` must be a mode the pane
+        footer can report (the switchable modes plus ``bypassPermissions``).
     :param conversation_store: Store used to upsert the mode label.
     :returns: None.
     :raises OmnigentError: If ``data.permission_mode`` is missing or unsupported.
@@ -2599,10 +2602,10 @@ async def _persist_external_permission_mode_change(
             code=ErrorCode.INVALID_INPUT,
         )
     mode = raw_mode.strip()
-    if mode not in _CLAUDE_NATIVE_PERMISSION_MODES:
+    if mode not in _CLAUDE_NATIVE_READABLE_PERMISSION_MODES:
         raise OmnigentError(
             "external_permission_mode_change requires data.permission_mode in "
-            f"{sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}; got {mode!r}",
+            f"{sorted(_CLAUDE_NATIVE_READABLE_PERMISSION_MODES)}; got {mode!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     # Reflect the switch into terminal_launch_args so a relaunch reopens in this
@@ -2735,6 +2738,40 @@ def _merge_codex_permission_launch_args(
     return [*merged, *permission_args]
 
 
+def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], bool]:
+    """
+    Drop every permission-mode selector from Claude launch args.
+
+    Removes ``--permission-mode`` (space- or ``=``-joined) and the standalone
+    ``--dangerously-skip-permissions``, which Claude treats as
+    ``--permission-mode bypassPermissions``; leaving that flag next to a pinned
+    mode would resume the session in bypass under a restricted label.
+
+    :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
+    :returns: The remaining args in order, and whether a selector was present.
+    """
+    stripped: list[str] = []
+    had_flag = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dangerously-skip-permissions":
+            had_flag = True
+            index += 1
+            continue
+        if arg == "--permission-mode":
+            had_flag = True
+            index += 2  # drop the flag and its separate value token
+            continue
+        if arg.startswith("--permission-mode="):
+            had_flag = True
+            index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return stripped, had_flag
+
+
 def _merge_claude_permission_launch_args(
     existing_args: list[str] | None,
     mode: str,
@@ -2745,7 +2782,8 @@ def _merge_claude_permission_launch_args(
     launcher restores the mode from ``terminal_launch_args`` — not the label.
     Rewrite the existing ``--permission-mode`` entry (space- or ``=``-joined) to
     the current mode, preserving other args in order, so a cold resume reopens
-    in the mode the user last chose.
+    in the mode the user last chose. A standalone ``--dangerously-skip-permissions``
+    counts as an existing ``--permission-mode bypassPermissions``.
 
     Returns ``existing_args`` unchanged when they carry no ``--permission-mode``:
     a session launched without the flag (manual, or a ``settings.json``
@@ -2755,23 +2793,33 @@ def _merge_claude_permission_launch_args(
     settings default on relaunch. Those sessions surface the live mode through
     the permission-mode label instead.
     """
-    args = list(existing_args or ())
-    if not any(a == "--permission-mode" or a.startswith("--permission-mode=") for a in args):
+    stripped, had_flag = _strip_claude_permission_launch_arg(list(existing_args or ()))
+    if not had_flag:
         return existing_args
-    merged: list[str] = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--permission-mode":
-            index += 2  # drop the flag and its separate value token
-            continue
-        if arg.startswith("--permission-mode="):
-            index += 1
-            continue
-        merged.append(arg)
-        index += 1
-    merged.extend(("--permission-mode", mode))
-    return merged
+    return [*stripped, "--permission-mode", mode]
+
+
+def _pin_claude_permission_launch_args(
+    existing_args: list[str] | None,
+    mode: str,
+) -> list[str]:
+    """
+    Set ``--permission-mode`` to ``mode`` in Claude launch args, adding it when absent.
+
+    For a switch the user made deliberately (the web picker, confirmed by the
+    runner) the mode must survive a cold resume even when the session was
+    created without the flag: the launcher rebuilds Claude's args from
+    ``terminal_launch_args`` alone and never reads the mode label, so a
+    label-only record reopens the session in Claude's default (manual) mode.
+    Pinning ``"default"`` is a deliberate choice of Claude's manual mode and
+    overrides a ``permissions.defaultMode`` in the user's settings on relaunch.
+
+    :param existing_args: Current launch args, e.g. ``["--model", "opus"]`` or ``None``.
+    :param mode: Runner-confirmed mode, e.g. ``"auto"``.
+    :returns: The args with exactly one trailing ``--permission-mode <mode>``.
+    """
+    stripped, _ = _strip_claude_permission_launch_arg(list(existing_args or ()))
+    return [*stripped, "--permission-mode", mode]
 
 
 def _handle_external_session_todos(
@@ -4679,7 +4727,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
     if raw_error_code and raw_error_message:
         error: dict[str, str] = {
-            "code": raw_error_code,
+            "code": classify_native_turn_error(raw_error_code, raw_error_message),
             "message": raw_error_message,
         }
         for key, label in (
@@ -10792,6 +10840,7 @@ __all__ = [
     "_persist_policy_deny_sentinel",
     "_persist_session_status_error_labels",
     "_persist_stored_session_bundle",
+    "_pin_claude_permission_launch_args",
     "_policy_notice_from_ensure_response",
     "_poll_request_disconnect",
     "_presentation_labels_for_agent",

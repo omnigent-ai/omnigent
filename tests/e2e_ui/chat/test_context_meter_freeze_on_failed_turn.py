@@ -45,7 +45,7 @@ _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 # The composer status tray's context ring exposes its value via aria-label,
 # e.g. "1% of context used".
-_RING = '[data-testid="composer-status-line"] [aria-label$="of context used"]'
+_RING = '[data-testid="composer-context-ring"][aria-label$="of context used"]'
 
 # Spec-declared window; percentages below derive from it.
 _CONTEXT_WINDOW = 200_000

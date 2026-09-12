@@ -2439,7 +2439,7 @@ export function NewChatLandingScreen() {
       sandboxSelected
         ? CLAUDE_NATIVE_MODELS.map((model) => ({
             id: model.id,
-            displayName: model.label,
+            displayName: model.id,
           }))
         : (hostClaudeModelOptions ?? []).map((option) => ({
             id: option.id,
@@ -2462,7 +2462,8 @@ export function NewChatLandingScreen() {
         ? []
         : (hostPiModelOptions ?? []).map((option) => ({
             id: option.id,
-            displayName: option.displayName ?? option.id,
+            model: option.model,
+            displayName: nativeModelLabel(option),
             source: option.source,
           })),
     [hostPiModelOptions, sandboxSelected],

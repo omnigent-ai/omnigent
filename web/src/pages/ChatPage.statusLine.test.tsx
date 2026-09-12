@@ -425,7 +425,7 @@ describe("composerHarnessLabel", () => {
 });
 
 describe("formatModelEffortStatusLabel", () => {
-  it("uses Codex display names exactly as returned in model metadata", () => {
+  it("uses the actual Codex model ID from model metadata", () => {
     expect(
       formatModelEffortStatusLabel("gpt-5.5", "xhigh", [
         {
@@ -442,7 +442,7 @@ describe("formatModelEffortStatusLabel", () => {
           isDefault: true,
         },
       ]),
-    ).toBe("codex says GPT-5.5 xHigh");
+    ).toBe("databricks-gpt-5-5 xHigh");
   });
 
   it("leaves unknown model ids raw", () => {
@@ -452,27 +452,27 @@ describe("formatModelEffortStatusLabel", () => {
     );
   });
 
-  it("prefers the catalog display name for a Claude [1m] alias", () => {
+  it("resolves an exact Claude alias to its catalog model ID", () => {
     expect(
       formatModelEffortStatusLabel("sonnet[1m]", "high", [
         { id: "sonnet[1m]", model: "claude-sonnet-5[1m]", displayName: "Sonnet 5 (1M context)" },
       ]),
-    ).toBe("Sonnet 5 (1M context) High");
+    ).toBe("claude-sonnet-5[1m] High");
   });
 
-  it("renders a catalog-less Claude [1m] alias friendly without claiming a version", () => {
-    expect(formatModelEffortStatusLabel("sonnet[1m]", "high")).toBe("Sonnet (1M context) High");
-    expect(formatModelEffortStatusLabel("opus[1m]", null)).toBe("Opus (1M context)");
+  it("preserves a catalog-less Claude alias without claiming a version", () => {
+    expect(formatModelEffortStatusLabel("sonnet[1m]", "high")).toBe("sonnet[1m] High");
+    expect(formatModelEffortStatusLabel("opus[1m]", null)).toBe("opus[1m]");
   });
 
-  it("title-cases catalog-less alias-shaped ids mechanically", () => {
-    expect(formatModelEffortStatusLabel("sonnet", null)).toBe("Sonnet");
-    expect(formatModelEffortStatusLabel("sonnet_5", null)).toBe("Sonnet 5");
-    expect(formatModelEffortStatusLabel("fable", null)).toBe("Fable");
+  it("preserves catalog-less IDs verbatim", () => {
+    expect(formatModelEffortStatusLabel("sonnet", null)).toBe("sonnet");
+    expect(formatModelEffortStatusLabel("sonnet_5", null)).toBe("sonnet_5");
+    expect(formatModelEffortStatusLabel("fable", null)).toBe("fable");
   });
 
   it("omits missing pieces", () => {
-    expect(formatModelEffortStatusLabel("opus", null)).toBe("Opus");
+    expect(formatModelEffortStatusLabel("opus", null)).toBe("opus");
     expect(formatModelEffortStatusLabel(null, "low")).toBe("Low");
     expect(formatModelEffortStatusLabel(null, null)).toBeNull();
   });

@@ -2568,10 +2568,11 @@ function ComposerImpl(
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
-  // /compact is only functional for native wrappers (claude-native,
-  // codex-native) which inject the slash command into the terminal.
-  // SDK harnesses (openai-agents-sdk, claude-sdk) don't support it yet.
-  const showCompact = isNativeWrapper;
+  // /compact is functional for native wrappers (claude-native,
+  // codex-native), which inject the slash command into the terminal, and
+  // for claude-sdk, whose runner sends /compact to the live SDK client to
+  // trigger native compaction. Other SDK harnesses don't support it yet.
+  const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -3363,7 +3364,7 @@ function ComposerImpl(
               tokensUsed={composerTokensUsed}
             />
             <BackgroundTaskIndicator />
-            <SubagentTaskIndicator conversationId={conversationId} />
+            <SubagentTaskIndicator conversationId={composerSessionId} />
           </div>
         </ComposerWorkspaceBar>
       </div>

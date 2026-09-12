@@ -256,11 +256,14 @@ _PERMISSION_MODE_FOOTERS: dict[str, str] = {
     "acceptEdits": "accept edits on",
     "plan": "plan mode on",
     "auto": "auto mode on",
+    # Launch-only, but readable: a pane launched into bypass must report
+    # its own mode so the cycler has a starting point to leave it from.
+    "bypassPermissions": "bypass permissions on",
 }
-# Modes shift+tab can reach. ``dontAsk`` is never in the cycle and
-# ``bypassPermissions`` only joins it when launched into, so both are
-# rejected up front.
-CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS)
+# Modes shift+tab can reach from any session. ``dontAsk`` is never in the
+# cycle and ``bypassPermissions`` only joins it when launched into, so
+# neither is a switch target.
+CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {"bypassPermissions"}
 # Cap on shift+tab presses. The cycle is 3-5 modes wide depending on which
 # optional modes are enabled, so a full lap plus slack proves the target is
 # unreachable rather than slow.
@@ -1224,9 +1227,9 @@ def approval_wait_marker_path(session_id: str, *, bridge_dir: Path | None = None
     """
     Return the marker path a parked permission hook keeps fresh.
 
-    One marker per hook process: concurrent prompts on one session (a
-    permission request and an AskUserQuestion, or parallel tool calls) each
-    own a file, so the first to finish never clears another's evidence.
+    One marker per hook process: concurrent prompts on one session (parallel
+    tool calls each raising a permission request) own separate files, so the
+    first to finish never clears another's evidence.
 
     :param session_id: Omnigent session id whose verdict a hook is waiting
         on, e.g. ``"conv_abc123"``.
@@ -2051,36 +2054,11 @@ def build_hook_settings(
             "command": evaluate_policy_command,
         }
 
-        # In bypassPermissions mode PermissionRequest never fires, so
-        # AskUserQuestion needs its own PreToolUse hook to surface the
-        # form. It's a no-op in other modes to avoid double-surfacing.
-        ask_uq_command_parts = [
-            python,
-            "-I",
-            "-m",
-            "omnigent.harnesses.claude_native.hook",
-            "ask-user-question",
-            "--bridge-dir",
-            str(bridge_dir),
-        ]
-        ask_uq_hook: _JsonObject = {
-            "type": "command",
-            "command": shlex.join(ask_uq_command_parts),
-            # Short timeout: if the web-UI elicitation isn't answered
-            # within 10s, the hook returns empty output so Claude falls
-            # through to its TUI picker in bypassPermissions mode. In
-            # default mode this hook exits immediately (no-op), so the
-            # timeout is irrelevant there.
-            "timeout": 10,
-        }
-        # The ``AskUserQuestion`` matcher only fires if that tool is actually
-        # callable. A session launched with ``--disallowedTools AskUserQuestion``
-        # (e.g. the exit-plan-mode e2e fixture) can never trigger this hook, so
-        # the registration is dormant there — harmless, just never reached.
-        hooks["PreToolUse"] = [
-            {"matcher": "AskUserQuestion", "hooks": [ask_uq_hook]},
-            {"hooks": [evaluate_policy_hook]},
-        ]
+        # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
+        # permission prompt for the question in every mode, bypass included, so
+        # the PermissionRequest hook above carries it. A second forwarder here
+        # parked a duplicate elicitation and the web showed two identical cards.
+        hooks["PreToolUse"] = [{"hooks": [evaluate_policy_hook]}]
         # PostToolUse already has TodoWrite and TaskUpdate matchers
         # for the transcript forwarder (the observer ``hook``). Append
         # a catch-all policy evaluation entry so TOOL_RESULT policies
@@ -2216,12 +2194,10 @@ def url_component(value: str) -> str:
 # Claude falls back to plain assistant text + a normal user reply,
 # which already round-trips through the existing chat-input pipeline.
 #
-# Currently empty: ``AskUserQuestion`` routes through a dedicated
-# ``PreToolUse`` hook (registered in ``build_hook_settings``) that
-# surfaces the question + options to the web UI as an elicitation
-# form and injects the user's answer via ``updatedInput``, and
-# ``ExitPlanMode`` surfaces through the standard ``PermissionRequest``
-# hook as an approve/reject elicitation card.
+# Currently empty: ``AskUserQuestion`` and ``ExitPlanMode`` both surface
+# through the standard ``PermissionRequest`` hook — the question as an
+# elicitation form whose answers come back via ``updatedInput``, the plan
+# as an approve/reject card.
 _OMNIGENT_DISALLOWED_TOOLS: tuple[str, ...] = ()
 
 
