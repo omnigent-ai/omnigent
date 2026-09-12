@@ -7745,6 +7745,19 @@ def _dispatch_run(
             f"Use `{cli_invocation()} run --server {target}` instead."
         )
 
+    # Pure argument validation, so it runs before any dispatch branch: the
+    # direct-server and native-harness shapes return early and would
+    # otherwise bypass it.
+    if fork_session_id is not None:
+        if resume_conversation_id or resume_latest or resume_picker:
+            raise click.ClickException(
+                "--fork is mutually exclusive with --resume and --continue."
+            )
+        if prompt is not None:
+            raise click.ClickException(
+                "--fork requires interactive REPL mode; remove -p/--prompt."
+            )
+
     if target is None:
         # Truthiness, not ``is not None``: an empty ``--server ""`` selects local
         # mode (see ``_ensure_backend``), so it must not be treated as a direct
@@ -7877,16 +7890,6 @@ def _dispatch_run(
             raise click.ClickException(
                 "--server is for binding a LOCAL agent YAML to a remote "
                 "server. Pass a YAML path as the target (got a URL)."
-            )
-
-    if fork_session_id is not None:
-        if resume_conversation_id or resume_latest or resume_picker:
-            raise click.ClickException(
-                "--fork is mutually exclusive with --resume and --continue."
-            )
-        if prompt is not None:
-            raise click.ClickException(
-                "--fork requires interactive REPL mode; remove -p/--prompt."
             )
 
     harness = canonicalize_harness(harness)

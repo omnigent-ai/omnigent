@@ -4522,6 +4522,73 @@ def test_run_server_without_agent_dispatches_direct_server(
     )
 
 
+def test_fork_with_prompt_rejected_on_direct_server_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run --server URL --fork ID -p`` is rejected before dispatch.
+
+    The direct-server (no-AGENT) branch returns early, so the fork guard must
+    run before it: otherwise the invalid combination reaches ``run_chat`` and
+    dies later with an unhandled runner-resolution ``RuntimeError`` instead of
+    the friendly usage error the local-YAML shape produces.
+    """
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "http://localhost:8000", "--fork", "0" * 32, "-p", "hi"],
+    )
+
+    assert result.exit_code != 0
+    assert "--fork requires interactive REPL mode" in result.output
+    run_chat.assert_not_called()
+
+
+def test_fork_with_resume_rejected_on_direct_server_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run --server URL --fork ID --continue`` is rejected before dispatch."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "http://localhost:8000", "--fork", "0" * 32, "--continue"],
+    )
+
+    assert result.exit_code != 0
+    assert "--fork is mutually exclusive with --resume and --continue" in result.output
+    run_chat.assert_not_called()
+
+
+def test_fork_with_prompt_rejected_before_native_harness_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native-harness launcher shape is guarded too.
+
+    ``_dispatch_native_terminal_harness`` also returns before the guard's old
+    location, so the hoisted guard must fire before that dispatch as well.
+    """
+    native_dispatch = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.cli._dispatch_native_terminal_harness", native_dispatch)
+
+    with pytest.raises(ClickException, match="--fork requires interactive REPL mode"):
+        _dispatch_run(
+            target=None,
+            tools=None,
+            harness="claude-native",
+            model=None,
+            prompt="hi",
+            system_prompt=None,
+            fork_session_id="0" * 32,
+        )
+
+    native_dispatch.assert_not_called()
+
+
 @pytest.mark.parametrize("alias", ["", "local", "LOCAL", " local "])
 def test_run_local_server_alias_beats_configured_remote(
     alias: str, monkeypatch: pytest.MonkeyPatch
