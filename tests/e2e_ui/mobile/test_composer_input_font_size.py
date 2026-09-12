@@ -42,14 +42,16 @@ def _metrics(element: Locator) -> dict[str, Any]:
 
 def _exercise_input(page: Page, element: Locator, *, mobile: bool) -> None:
     expect(element).to_be_visible(timeout=30_000)
-    element.tap() if mobile else element.click()
+    # The landing's interactive skill pills can cover the input's center.
+    activate = element.tap if mobile else element.click
+    activate(position={"x": 8, "y": 8})
     expect(element).to_be_focused()
     element.fill("First line")
     element.press("Enter" if mobile else "Shift+Enter")
     page.keyboard.insert_text("Second line")
     expect(element).to_have_value("First line\nSecond line")
     element.blur()
-    element.tap() if mobile else element.click()
+    activate(position={"x": 8, "y": 8})
     expect(element).to_be_focused()
     expect(element).to_have_value("First line\nSecond line")
 
