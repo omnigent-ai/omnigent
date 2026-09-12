@@ -22,6 +22,7 @@ import {
   listRunners,
   openSessionStream,
   postEvent,
+  retryRateLimitedTurn,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -1142,6 +1143,132 @@ describe("stopSession", () => {
     expect(url).toBe("/v1/sessions/conv_abc/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "stop_session", data: {} });
     expect(out.queued).toBe(false);
+  });
+});
+
+describe("retryRateLimitedTurn", () => {
+  it.each([
+    { queued: true, item_id: "ci_retry" },
+    { queued: true, pending_id: "pending_retry" },
+  ])("submits a continuation for an accepted retry: %o", async (response) => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(response));
+
+    await retryRateLimitedTurn("conv_retry");
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "Please continue from where you left off before the rate limit error.",
+          },
+        ],
+      },
+    });
+  });
+
+  it("shares one in-flight continuation across error cards in the same session", async () => {
+    let finishRetry: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishRetry = resolve;
+        }),
+    );
+
+    const first = retryRateLimitedTurn("conv_retry");
+    const second = retryRateLimitedTurn("conv_retry");
+
+    expect(second).toBe(first);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    finishRetry?.(mockJsonResponse({ queued: true }));
+    await Promise.all([first, second]);
+
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+    await retryRateLimitedTurn("conv_retry");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("releases a shared failed attempt so a later retry can succeed", async () => {
+    let finishRetry: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishRetry = resolve;
+        }),
+    );
+
+    const first = retryRateLimitedTurn("conv_retry");
+    const second = retryRateLimitedTurn("conv_retry");
+    const outcomes = Promise.allSettled([first, second]);
+    finishRetry?.(mockJsonResponse({ queued: false, denied: true }));
+
+    expect(await outcomes).toEqual([
+      { status: "rejected", reason: new Error("The retry was blocked by a policy") },
+      { status: "rejected", reason: new Error("The retry was blocked by a policy") },
+    ]);
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+    await retryRateLimitedTurn("conv_retry");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("allows different sessions to retry independently", async () => {
+    let finishFirst: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+
+    const first = retryRateLimitedTurn("conv_first");
+    await retryRateLimitedTurn("conv_second");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/sessions/conv_first/events",
+      "/v1/sessions/conv_second/events",
+    ]);
+    finishFirst?.(mockJsonResponse({ queued: true }));
+    await first;
+  });
+
+  it("rejects policy denials so the error card remains actionable", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, denied: true }));
+
+    await expect(retryRateLimitedTurn("conv_retry")).rejects.toThrow(
+      "The retry was blocked by a policy",
+    );
+  });
+
+  it("rejects a response that did not queue a continuation", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
+
+    await expect(retryRateLimitedTurn("conv_retry")).rejects.toThrow("The retry was not accepted");
+  });
+
+  it("propagates the server's dispatch error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "runner_unavailable", message: "The host is offline" } },
+        { ok: false, status: 503 },
+      ),
+    );
+
+    await expect(retryRateLimitedTurn("conv_retry")).rejects.toMatchObject({
+      code: "runner_unavailable",
+      message: "The host is offline",
+      status: 503,
+    });
   });
 });
 

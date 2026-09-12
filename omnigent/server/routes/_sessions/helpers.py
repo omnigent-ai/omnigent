@@ -71,6 +71,7 @@ from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
+from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -4679,7 +4680,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
     if raw_error_code and raw_error_message:
         error: dict[str, str] = {
-            "code": raw_error_code,
+            "code": classify_native_turn_error(raw_error_code, raw_error_message),
             "message": raw_error_message,
         }
         for key, label in (

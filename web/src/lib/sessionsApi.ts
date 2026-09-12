@@ -1300,6 +1300,37 @@ export function retrySession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "retry_session", data: {} });
 }
 
+// Multiple error cards can describe the same failed turn.
+const rateLimitedTurnRetries = new Map<string, Promise<void>>();
+
+/** Continue a rate-limited turn without replaying the original prompt or tools. */
+export function retryRateLimitedTurn(sessionId: string): Promise<void> {
+  const pending = rateLimitedTurnRetries.get(sessionId);
+  if (pending) return pending;
+
+  const retry = postEvent(sessionId, {
+    type: "message",
+    data: {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: "Please continue from where you left off before the rate limit error.",
+        },
+      ],
+    },
+  })
+    .then((result) => {
+      if (result.denied) throw new Error("The retry was blocked by a policy");
+      if (!result.queued) throw new Error("The retry was not accepted");
+    })
+    .finally(() => {
+      rateLimitedTurnRetries.delete(sessionId);
+    });
+  rateLimitedTurnRetries.set(sessionId, retry);
+  return retry;
+}
+
 /**
  * Resolve an outstanding elicitation via its dedicated URL endpoint
  * (URL-based elicitation): `POST /v1/sessions/{id}/elicitations/{eid}/resolve`

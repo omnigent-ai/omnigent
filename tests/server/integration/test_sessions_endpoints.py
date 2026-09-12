@@ -4995,6 +4995,66 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_codex_c
     assert error["message"] == "You've hit your usage limit."
 
 
+@pytest.mark.parametrize("wire_output", [False, True])
+async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_output: bool,
+) -> None:
+    """Native 429 reports retain a retryable code on the stream and snapshot."""
+    detail = (
+        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded "
+        "workspace input tokens per minute rate limit for databricks-test-model. "
+        "Work with your Databricks account team to request a higher FMAPI rate limit tier."
+    )
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    response_id = "resp_native_rate_limit"
+    item_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": response_id,
+                "source_id": "src_native_rate_limit",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": detail}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
+    data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    if wire_output:
+        data["output"] = detail
+    status_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert status_resp.status_code == 202, status_resp.text
+    failed_events = [event for event in published if event.get("status") == "failed"]
+    assert len(failed_events) == 1
+    expected = {"code": "rate_limit_exceeded", "message": detail}
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == expected["code"]
+    assert error["message"] == expected["message"]
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    assert snapshot_resp.json()["last_task_error"] == expected
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

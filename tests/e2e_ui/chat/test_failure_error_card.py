@@ -16,6 +16,8 @@ independent of any live turn.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -192,6 +194,94 @@ def test_live_native_failure_status_surfaces_each_turn(
     second_pill = pills.nth(1)
     second_pill.locator('button[aria-expanded="false"]').click()
     expect(second_pill.get_by_test_id("error-message-content")).to_contain_text(message)
+
+
+@pytest.mark.parametrize("status_includes_output", [False, True], ids=["stored", "forwarded"])
+def test_databricks_rate_limit_is_retryable_live_and_after_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+    status_includes_output: bool,
+) -> None:
+    """A native 429 keeps its Retry action after reloading the failed turn."""
+    base_url, session_id = seeded_session
+    prompt = "Which parts are missing from this today?"
+    response_id = "native_turn_rate_limit"
+    message = (
+        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded "
+        "workspace input tokens per minute rate limit for databricks-test-model. "
+        "Work with your Databricks account team to request a higher FMAPI rate limit tier."
+    )
+    seed_committed_turn(session_id, prompt=prompt, reply=message, response_id=response_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_role("textbox", name="Message the agent")
+    expect(composer).to_be_visible(timeout=15_000)
+
+    _publish_native_status(base_url, session_id, "running", response_id=response_id)
+    _publish_native_status(
+        base_url,
+        session_id,
+        "failed",
+        response_id=response_id,
+        output=message if status_includes_output else None,
+    )
+    pill = page.get_by_test_id("error-pill")
+    headline = "The model's rate limit was reached. Wait a moment, then retry."
+    expect(pill).to_contain_text(headline, timeout=15_000)
+    expect(pill.get_by_role("button", name="Retry", exact=True)).to_be_visible()
+    pill.get_by_role("button", name=headline, exact=False).click()
+    expect(pill.get_by_test_id("error-message-content")).to_contain_text(message)
+
+    page.reload()
+    expect(pill).to_contain_text(headline, timeout=15_000)
+    expect(pill.get_by_role("button", name="Retry", exact=True)).to_be_visible()
+
+    if screenshot_dir := os.environ.get("E2E_SCREENSHOT_DIR"):
+        Path(screenshot_dir).mkdir(parents=True, exist_ok=True)
+        suffix = "forwarded" if status_includes_output else "stored"
+        page.screenshot(path=str(Path(screenshot_dir) / f"rate-limit-retry-{suffix}.png"))
+
+    retry_payloads: list[dict[str, object]] = []
+
+    def _continue_turn(route: Route) -> None:
+        payload = route.request.post_data_json
+        if not isinstance(payload, dict) or payload.get("type") not in {
+            "message",
+            "retry_session",
+        }:
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"queued": True}),
+        )
+
+    page.route(f"**/v1/sessions/{session_id}/events", _continue_turn)
+    composer.fill("Keep this unsent draft.")
+    pill.get_by_role("button", name="Retry", exact=True).click()
+    expect(pill).to_have_count(0)
+    assert retry_payloads == [
+        {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Please continue from where you left off before the rate limit error."
+                        ),
+                    }
+                ],
+            },
+        }
+    ]
+    expect(composer).to_have_value("Keep this unsent draft.")
+    expect(
+        page.locator('[data-testid="message-bubble"][data-role="user"]').filter(has_text=prompt)
+    ).to_have_count(1)
 
 
 def test_failed_turn_surfaces_error_as_pill_not_raw_text(

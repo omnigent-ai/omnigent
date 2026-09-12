@@ -30,6 +30,12 @@ const TERMINAL_ERROR = [
   "Pane is dead (status 0, Tue Aug 11 17:00:46 2026)",
 ].join("\n");
 
+const RATE_LIMIT_ERROR = [
+  "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded workspace",
+  "input tokens per minute rate limit for databricks-test-model. Work with your",
+  "Databricks account team to request a higher FMAPI rate limit tier.",
+].join(" ");
+
 describe("ErrorBanner", () => {
   beforeEach(() => vi.mocked(copyText).mockClear());
 
@@ -403,6 +409,58 @@ describe("ErrorBanner", () => {
     );
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
+
+  it("retries classified rate-limit errors and preserves the provider's details", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={RATE_LIMIT_ERROR}
+        source="llm"
+        code="rate_limit_exceeded"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model's rate limit was reached. Wait a moment, then retry.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /model's rate limit was reached/i }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(RATE_LIMIT_ERROR);
+
+    const retry = screen.getByRole("button", { name: "Retry" });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent(/^Retrying$/);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+
+    await act(async () => resolveRetry?.());
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+  });
+
+  it("does not offer rate-limit retry without a handler", () => {
+    render(<ErrorBanner message={RATE_LIMIT_ERROR} source="llm" code="rate_limit_exceeded" />);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it.each(["native_turn_error", "codex_turn_error", "codex_reauth_required", "unauthorized"])(
+    "does not infer rate-limit retry from the message for code %s",
+    (code) => {
+      render(
+        <ErrorBanner message={RATE_LIMIT_ERROR} source="execution" code={code} onRetry={vi.fn()} />,
+      );
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
 
   it.each(["executor_error", "connection_error", "runner_error", "wrong_replica"])(
     "does not offer reconnect for live-runner code %s",

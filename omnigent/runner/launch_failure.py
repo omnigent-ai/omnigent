@@ -15,6 +15,7 @@ covers them all. A new harness quirk becomes one entry in
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -22,6 +23,7 @@ from omnigent.cli_invocation import cli_invocation
 
 __all__ = [
     "FailureDiagnosis",
+    "classify_native_turn_error",
     "classify_terminal_failure",
     "describe_failure_code",
 ]
@@ -173,6 +175,43 @@ def classify_terminal_failure(
     return None
 
 
+_RATE_LIMIT_ERROR = re.compile(
+    r"\b(?:rate[ _-]limit[ _-](?:error|exceeded|reached)|request_limit_exceeded"
+    r"|too many requests)\b",
+    re.IGNORECASE,
+)
+_NATIVE_ERROR_HTTP_STATUS = re.compile(
+    r"\b(?:http(?:/\d(?:\.\d)?)?|status(?:[ _]code)?|api error|request rejected)"
+    r"\s*[:=(]?\s*(\d{3})\b",
+    re.IGNORECASE,
+)
+_PERMANENT_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "credit balance is too low",
+)
+
+
+def classify_native_turn_error(code: str, message: str) -> str:
+    """Refine a native turn's generic code when its text identifies a rate limit.
+
+    :param code: Existing error code; specific diagnoses are preserved.
+    :param message: Native harness error text, from its status or transcript.
+    :returns: The semantic rate-limit code, or the existing code if unrecognized.
+    """
+    if code not in {"native_turn_error", "codex_turn_error"}:
+        return code
+    status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
+    status = status_match.group(1) if status_match else None
+    if status in {"401", "403"}:
+        return code
+    if any(marker in message.lower() for marker in _PERMANENT_QUOTA_MARKERS):
+        return code
+    if status == "429" or _RATE_LIMIT_ERROR.search(message):
+        return "rate_limit_exceeded"
+    return code
+
+
 # --- failure-code English fallbacks -------------------------------------------
 # Every server-emitted failure code, mapped to a one-line human sentence, so
 # even an unclassified failure reads as English instead of a raw enum. Terminal
@@ -198,6 +237,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
     "native_turn_error": "The agent ran into an error during this turn.",
+    "rate_limit_exceeded": "The model's rate limit was reached. Wait a moment, then retry.",
 }
 
 

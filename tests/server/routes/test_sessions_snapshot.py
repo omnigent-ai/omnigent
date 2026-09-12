@@ -562,6 +562,44 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_code", "expected_code"),
+    [
+        ("native_turn_error", "rate_limit_exceeded"),
+        ("codex_turn_error", "rate_limit_exceeded"),
+        ("codex_reauth_required", "codex_reauth_required"),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
+    stored_code: str,
+    expected_code: str,
+) -> None:
+    """Failures saved without a rate-limit code become retryable on reload."""
+    session_id = "319c3d34a4ab4e6d983872bf898a19b4"
+    message = "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": stored_code,
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_rate_limit", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == stored_code
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     """A session whose runner has no exit report is not marked failed.
 
