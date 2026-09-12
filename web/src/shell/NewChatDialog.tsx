@@ -5544,7 +5544,7 @@ export function NewChatLandingScreen() {
                   textarea; the pills themselves opt back in. */}
                     {pillSkills.length > 0 && message.length === 0 && (
                       <div className="pointer-events-none absolute inset-x-3 top-3 flex flex-wrap items-center gap-2">
-                        <span className="text-ui text-muted-foreground">
+                        <span className="composer-input-text text-ui text-muted-foreground">
                           Describe a task, or try a skill
                         </span>
                         <SkillPills skills={pillSkills} onPick={applySkillPill} />
