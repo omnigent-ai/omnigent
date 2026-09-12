@@ -415,14 +415,14 @@ works with four kinds of credentials:
 |---|---|---|
 | 🔑 | **API key** | A first-party vendor key for Anthropic, OpenAI, and similar providers |
 | 🎟️ | **Subscription** | A Claude Pro/Max or ChatGPT plan, via the official `claude` / `codex` CLIs |
-| 🌐 | **Gateway** | Any OpenAI- or Anthropic-compatible `base_url` and key (OpenRouter, LiteLLM, Ollama, vLLM, Azure) |
+| 🌐 | **Gateway** | Any OpenAI- or Anthropic-compatible `base_url` and key (OpenRouter, LiteLLM, Ollama, llama-server, vLLM, Azure) |
 | 🧱 | **Databricks** | A Databricks workspace profile (requires the `databricks` extra) |
 
 Defaults are per agent, so a Claude default and a Codex default coexist. You
 can also switch models in the middle of a session with the `/model` command.
 
 <details>
-<summary>Gateway base URLs (OpenRouter, Ollama)</summary>
+<summary>Gateway base URLs (OpenRouter, Ollama, llama-server)</summary>
 
 When you add a **Gateway** credential, `omnigent setup` asks for a base URL
 and a key. The base URL depends on which agent you point it at:
@@ -432,6 +432,7 @@ and a key. The base URL depends on which agent you point it at:
 | **OpenRouter** | Claude Code | `https://openrouter.ai/api` | your OpenRouter key (`sk-or-…`) |
 | **OpenRouter** | Codex / OpenAI agents | `https://openrouter.ai/api/v1` | your OpenRouter key (`sk-or-…`) |
 | **Ollama** (local) | Codex / OpenAI agents | `http://localhost:11434/v1` | any value (Ollama ignores it) |
+| **llama-server** (local) | Codex / OpenAI agents | `http://localhost:8080/v1` | any value (unless `llama-server` is configured with `--api-key`) |
 
 For Claude Code, point at OpenRouter's Anthropic-compatible endpoint
 (`…/api`, **not** `…/api/v1`). For Codex and the OpenAI-agents harness, use
