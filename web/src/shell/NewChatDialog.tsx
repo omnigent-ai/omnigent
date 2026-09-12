@@ -20,6 +20,10 @@ import {
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
+  codexCreateApprovalOptions,
+  applyCodexApprovalSelection,
+} from "@/lib/codexApprovalOptions";
+import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
   ComposerSendButton,
@@ -3515,7 +3519,12 @@ export function NewChatLandingScreen() {
     : supportsPermissionMode
       ? CLAUDE_NATIVE_PERMISSION_MODES
       : supportsApprovalMode
-        ? CODEX_NATIVE_APPROVAL_MODES
+        ? // Codex's create-time quick picker offers the dangerous bypass choice
+          // (#7070), matching the Advanced modal; other approval harnesses keep
+          // their plain preset list.
+          selectedNativeHarness === "codex-native"
+          ? codexCreateApprovalOptions()
+          : CODEX_NATIVE_APPROVAL_MODES
         : supportsCursorMode
           ? CURSOR_NATIVE_EXEC_MODES
           : supportsAgySkipPermissions
@@ -3525,6 +3534,19 @@ export function NewChatLandingScreen() {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
     else if (supportsApprovalMode) {
+      if (selectedNativeHarness === "codex-native") {
+        // Bypass is the most-permissive Approval choice, not a separate knob:
+        // arming it keeps the underlying preset and persists the bypass token
+        // exactly as the Advanced modal does (create-time only; runtime
+        // /permissions has no bypass row).
+        const selection = applyCodexApprovalSelection(mode, approvalMode);
+        setApprovalMode(selection.approvalMode);
+        setBypassSandbox(selection.bypass);
+        writeHarnessOption(selectedNativeHarness, {
+          mode: selection.bypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : selection.approvalMode,
+        });
+        return;
+      }
       setApprovalMode(mode);
       setBypassSandbox(false);
     } else if (supportsCursorMode) setCursorExecMode(mode);
