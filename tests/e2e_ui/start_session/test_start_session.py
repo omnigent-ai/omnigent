@@ -2123,6 +2123,9 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
                 await expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
             await page.get_by_test_id("new-chat-landing-permission-option-bypass").click()
             await expect(approval).to_contain_text("Bypass approvals & sandbox")
+            await expect(
+                page.get_by_test_id("new-chat-landing-permission-menu")
+            ).not_to_be_visible()
             await approval.click()
             await page.get_by_role("menuitem", name="Full access", exact=True).click()
             await expect(approval).to_contain_text("Full access")
@@ -3648,9 +3651,15 @@ async def _drive_agy_skip_permissions(base_url: str, session_id: str) -> None:
             await expect(banner).to_be_visible()
             await expect(banner).to_contain_text("Danger")
 
+            await expect(
+                page.get_by_test_id("new-chat-landing-permission-menu")
+            ).not_to_be_visible()
             await skip.click()
             await page.get_by_test_id("new-chat-landing-permission-option-default").click()
             await expect(banner).not_to_be_visible()
+            await expect(
+                page.get_by_test_id("new-chat-landing-permission-menu")
+            ).not_to_be_visible()
             await skip.click()
             await page.get_by_test_id("new-chat-landing-permission-option-skip").click()
             await expect(banner).to_be_visible()
