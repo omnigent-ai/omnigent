@@ -1093,7 +1093,9 @@ def _claude_alias_row(alias: str, resolution: dict[str, str]) -> dict[str, objec
 class ClaudeModelProbe:
     """One harness enumeration: picker rows plus the bare-launch default.
 
-    :param alias_rows: The printed aliases as deduplicated picker rows.
+    :param alias_rows: The offered picker rows: printed aliases resolved and
+        deduplicated, constrained to the CLI's visible ``models`` menu when
+        the harness reports one (menu-only entries appear as their own rows).
     :param default_model: The model the enumeration run itself launched on
         (its init event's ``model``) — what a no-pick launch of this config
         actually runs — or ``None`` when unreadable.
@@ -1133,6 +1135,89 @@ def _parse_claude_enumeration_aliases(stdout: str) -> list[str]:
     return _parse_claude_model_aliases(stdout)
 
 
+def _parse_claude_visible_models(stdout: str) -> list[dict[str, str]]:
+    """Extract the init event's visible ``models`` menu from a stream-json run.
+
+    The enumeration run's initialization event carries the menu the CLI's own
+    interactive picker offers under this account/configuration — managed and
+    custom entries included. Entries are read verbatim (exact id, harness
+    display name); an init event without a usable ``models`` list yields
+    ``[]`` (older harness releases omit it).
+
+    :param stdout: The enumeration run's decoded stdout.
+    :returns: Menu entries as ``{"id", "displayName"}``, in menu order.
+    """
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "system":
+            continue
+        if event.get("subtype") != "init":
+            continue
+        models = event.get("models")
+        if not isinstance(models, list):
+            return []
+        menu: list[dict[str, str]] = []
+        for entry in models:
+            if not isinstance(entry, dict):
+                continue
+            model_id = entry.get("id")
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            display = entry.get("displayName")
+            menu.append(
+                {
+                    "id": model_id,
+                    "displayName": display if isinstance(display, str) and display else model_id,
+                }
+            )
+        return menu
+    return []
+
+
+def _constrain_rows_to_visible_menu(
+    alias_rows: list[dict[str, object]],
+    visible_menu: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    """Keep only rows the CLI's visible menu offers; add the ones it has.
+
+    The usage line enumerates every *settable* alias — help-only names the
+    interactive picker never shows included — while the visible menu is what
+    the CLI's own picker actually offers. Alias rows resolving outside the
+    menu are dropped (a ``[1m]`` context variant folds onto its base model
+    and stays), and menu entries no alias resolved to (managed/custom rows)
+    become their own rows, launched by their exact menu id.
+
+    :param alias_rows: The deduplicated alias rows, in print order.
+    :param visible_menu: The init event's menu entries, in menu order.
+    :returns: The picker rows the CLI's menu vouches for.
+    """
+    from omnigent.models.claude_model_vocabulary import normalized_model_id
+
+    menu_ids = {normalized_model_id(entry["id"]) for entry in visible_menu}
+    covered: set[str] = set()
+    rows: list[dict[str, object]] = []
+    for row in alias_rows:
+        matched = {
+            normalized_model_id(str(row["model"])),
+            normalized_model_id(str(row["id"])),
+        } & menu_ids
+        if not matched:
+            continue
+        covered.update(matched)
+        rows.append(row)
+    for entry in visible_menu:
+        if normalized_model_id(entry["id"]) in covered:
+            continue
+        rows.append({"id": entry["id"], "model": entry["id"], "displayName": entry["displayName"]})
+    return rows
+
+
 async def probe_claude_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> ClaudeModelProbe | None:
@@ -1144,8 +1229,12 @@ async def probe_claude_model_options(
     this config actually runs — the truthful "Default") makes Claude Code
     print its own alias list. Each printed alias is then resolved to its
     concrete model by a per-alias harness run. All outputs are read
-    verbatim; no selection semantics are replicated here. Runs for every
-    config shape, including the bare subscription launch (``None`` config).
+    verbatim; no selection semantics are replicated here. When the init
+    event reports the visible ``models`` menu, rows are constrained to it:
+    help-only aliases are dropped and menu-only (managed/custom) entries are
+    added, so the probe offers what the CLI's own picker offers. Runs for
+    every config shape, including the bare subscription launch (``None``
+    config).
 
     :param claude_config: The resolved native launch config
         (:func:`resolve_native_claude_config`), or ``None``.
@@ -1206,6 +1295,12 @@ async def probe_claude_model_options(
             continue
         seen_models.add(row["model"])
         alias_rows.append(row)
+    # The init event's visible menu is what the CLI's own picker offers this
+    # account; when reported, it decides WHICH rows exist — the usage line
+    # still supplies the launchable alias spellings.
+    visible_menu = _parse_claude_visible_models(text)
+    if visible_menu:
+        alias_rows = _constrain_rows_to_visible_menu(alias_rows, visible_menu)
     return ClaudeModelProbe(
         alias_rows=alias_rows,
         default_model=default_resolution.get("model"),
@@ -2235,7 +2330,7 @@ def _fetch_external_session_id_for_redirect(
         if resp.status_code >= 400:
             return None
         payload = resp.json()
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
@@ -2738,7 +2833,7 @@ def _ucode_config_for_profile(
             live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
             live_models = live_catalog.families
             routable_models = live_catalog.model_ids
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.warning(
                 "native-claude: live Databricks model discovery failed for profile %r; "
                 "using cached ucode models",
@@ -3431,7 +3526,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -3852,7 +3947,7 @@ async def _attach_with_transcript_forwarder(
                 await forwarder
             except asyncio.CancelledError:
                 pass
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # The forwarder is best-effort mirroring. A bug there
                 # (corrupt transcript JSONL, file-system error, anything
                 # uncaught in the parser) must not skip the Omnigent terminal
@@ -3950,7 +4045,7 @@ async def _attach_with_reconnect(
         if not first_attempt and recover is not None:
             try:
                 await recover()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _logger.warning(
                     "%s-native reconnect recovery callback raised; retrying attach anyway",
                     session_name.lower(),

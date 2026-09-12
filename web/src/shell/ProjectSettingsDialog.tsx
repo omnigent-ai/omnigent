@@ -41,7 +41,6 @@ import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
@@ -278,16 +277,13 @@ export function ProjectSettingsDialog({
     selectedNativeSpec?.harness ?? "",
     harnessTakesModel && modelCatalogHostId !== null,
   );
-  const modelOptions = useMemo(() => {
-    const live = (hostModelOptions ?? []).map((o) => ({
-      id: o.id,
-      label: o.displayName ?? o.id,
-    }));
-    if (live.length > 0) return live;
-    return selectedNativeSpec?.harness === "claude-native"
-      ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
-      : [];
-  }, [hostModelOptions, selectedNativeSpec]);
+  // Live host-resolved rows only: with no catalog the control degrades to
+  // the disabled "no catalog" hint below. A hardcoded list here would offer
+  // models nothing established the host's CLI can launch.
+  const modelOptions = useMemo(
+    () => (hostModelOptions ?? []).map((o) => ({ id: o.id, label: o.displayName ?? o.id })),
+    [hostModelOptions],
+  );
   // Keep a stored model the current options don't list as a labeled fallback
   // item, so opening + saving the dialog doesn't silently drop the default.
   const storedModelMissing = model !== NONE && !modelOptions.some((m) => m.id === model);
