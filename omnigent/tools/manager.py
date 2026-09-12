@@ -331,8 +331,8 @@ class ToolManager:
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
-                    "Available: web_search, web_fetch, upload_file, "
-                    "list_files, download_file, "
+                    "Available: web_search, web_read, web_fetch, "
+                    "upload_file, list_files, download_file, "
                     "search_conversations, export_agent. "
                     "Note: list_comments and update_comment are "
                     "framework-owned and auto-registered; they cannot "
