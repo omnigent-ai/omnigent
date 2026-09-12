@@ -99,6 +99,11 @@ import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/gi
 import { randomUUID } from "@/lib/randomUUID";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import {
+  describeImagePreparationFailure,
+  isHeicImageFile,
+  prepareImageAttachment,
+} from "@/lib/imageCompression";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -2322,16 +2327,44 @@ export function NewChatLandingScreen() {
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn.
   const [files, setFiles] = useState<File[]>(() => restoredDraft?.files ?? []);
+  const [preparingAttachmentCount, setPreparingAttachmentCount] = useState(0);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentBatchRef = useRef(0);
   // Reject unsupported types (only images, PDF, and text/code) and oversized
   // files here, before the session exists. Without this the upload only fails
   // after the session is created and navigated into, where the first turn's
   // 415 strands the typed message in a session the user never wanted.
   const addFiles = (incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
-    if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
-    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+    const batch = ++attachmentBatchRef.current;
+    setPreparingAttachmentCount((count) => count + 1);
+    void (async () => {
+      try {
+        // Images first go through preparation: HEIC/HEIF becomes JPEG and an
+        // oversized image shrinks under the cap, so a phone photo attaches
+        // instead of bouncing off the size check below.
+        const prepared: File[] = [];
+        const errors: string[] = [];
+        for (const file of incoming) {
+          if (!file.type.startsWith("image/") && !isHeicImageFile(file)) {
+            prepared.push(file);
+            continue;
+          }
+          // oxlint-disable-next-line no-await-in-loop
+          const result = await prepareImageAttachment(file);
+          if (result.ok) prepared.push(result.file);
+          else errors.push(describeImagePreparationFailure(file.name || "image", result.reason));
+        }
+        const validation = validateAttachments(prepared);
+        if (validation.accepted.length > 0) setFiles((prev) => [...prev, ...validation.accepted]);
+        // A newer batch may already have posted its own error; keep that one.
+        if (batch === attachmentBatchRef.current) {
+          setAttachmentError([...errors, ...validation.errors].join("\n") || null);
+        }
+      } finally {
+        setPreparingAttachmentCount((count) => count - 1);
+      }
+    })();
   };
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -4246,7 +4279,8 @@ export function NewChatLandingScreen() {
     message.trim().length > 0 &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
-    !creating;
+    !creating &&
+    preparingAttachmentCount === 0;
 
   // Why submit is disabled, surfaced as the button's tooltip. Checked in the
   // order a user fills the form — location first, then message — so the
@@ -4254,21 +4288,23 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : sandboxSelected && sandboxRepoOverCap
-      ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-          maxSandboxRepos === 1 ? "repository" : "repositories"
-        } — remove the extras`
-      : sandboxSelected && !sandboxRepoValid
-        ? "Please enter a valid repository URL"
-        : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-          ? "Selected host is unavailable. Reconnect it or choose another host."
-          : !sandboxSelected && (!selectedHostId || !workspaceValid)
-            ? "Please choose a host and working directory"
-            : configuredAgentUnavailable && selectedAgent == null
-              ? "This project's configured agent is unavailable — pick an agent to continue"
-              : message.trim().length === 0
-                ? "Enter a message to get started"
-                : null;
+    : preparingAttachmentCount > 0
+      ? "Preparing attachment"
+      : sandboxSelected && sandboxRepoOverCap
+        ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+            maxSandboxRepos === 1 ? "repository" : "repositories"
+          } — remove the extras`
+        : sandboxSelected && !sandboxRepoValid
+          ? "Please enter a valid repository URL"
+          : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+            ? "Selected host is unavailable. Reconnect it or choose another host."
+            : !sandboxSelected && (!selectedHostId || !workspaceValid)
+              ? "Please choose a host and working directory"
+              : configuredAgentUnavailable && selectedAgent == null
+                ? "This project's configured agent is unavailable — pick an agent to continue"
+                : message.trim().length === 0
+                  ? "Enter a message to get started"
+                  : null;
 
   // Chip display labels.
   const worktreeHeader = composerWorktreeHeaderState({
@@ -5559,7 +5595,7 @@ export function NewChatLandingScreen() {
                       ref={fileInputRef}
                       type="file"
                       multiple
-                      accept="image/*,application/pdf,text/*,application/json"
+                      accept="image/*,.heic,.heif,application/pdf,text/*,application/json"
                       className="hidden"
                       data-testid="new-chat-landing-file-input"
                       onChange={(e) => {

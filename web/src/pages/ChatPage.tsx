@@ -54,6 +54,7 @@ import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import { describeImagePreparationFailure, prepareImageAttachment } from "@/lib/imageCompression";
 import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
@@ -2285,6 +2286,9 @@ function ComposerImpl(
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  // Images still decoding/re-encoding; send waits so a fast Enter does not
+  // drop the photo that is about to land in `files`.
+  const [preparingAttachmentCount, setPreparingAttachmentCount] = useState(0);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
@@ -2953,18 +2957,37 @@ function ComposerImpl(
   });
 
   const addFiles = (incoming: File[]) => {
-    // Reject unsupported types (only images, PDF, and text/code) and
-    // oversized files up front — before the upload — with a friendly
-    // message. The server enforces the same limits authoritatively.
-    const { accepted, errors } = validateAttachments(incoming);
-    if (accepted.length > 0) {
-      setFiles((prev) => [...prev, ...accepted]);
-      dirtyRef.current = true;
-      // Return focus to the composer so the user can keep typing right
-      // after attaching (the file picker / paperclip button steals it).
-      if (!isMobileRef.current) textareaRef.current?.focus();
-    }
-    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+    setPreparingAttachmentCount((count) => count + 1);
+    void (async () => {
+      try {
+        // Images first go through preparation: HEIC/HEIF becomes JPEG and an
+        // oversized image shrinks under the cap, so a phone photo attaches
+        // instead of bouncing off the size check below.
+        const prepared: File[] = [];
+        const errors: string[] = [];
+        for (const file of incoming) {
+          // oxlint-disable-next-line no-await-in-loop
+          const result = await prepareImageAttachment(file);
+          if (result.ok) prepared.push(result.file);
+          else errors.push(describeImagePreparationFailure(file.name || "image", result.reason));
+        }
+        // Reject unsupported types (only images, PDF, and text/code) and
+        // oversized files up front — before the upload — with a friendly
+        // message. The server enforces the same limits authoritatively.
+        const validation = validateAttachments(prepared);
+        errors.push(...validation.errors);
+        if (validation.accepted.length > 0) {
+          setFiles((prev) => [...prev, ...validation.accepted]);
+          dirtyRef.current = true;
+          // Return focus to the composer so the user can keep typing right
+          // after attaching (the file picker / paperclip button steals it).
+          if (!isMobileRef.current) textareaRef.current?.focus();
+        }
+        setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+      } finally {
+        setPreparingAttachmentCount((count) => count - 1);
+      }
+    })();
   };
 
   // Files dropped anywhere in the chat column attach here, not just on the
@@ -3006,6 +3029,7 @@ function ComposerImpl(
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
+      preparingAttachmentCount > 0 ||
       disabled ||
       hasPendingElicitation
     )
@@ -3288,7 +3312,7 @@ function ComposerImpl(
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*,application/json"
+        accept="image/*,.heic,.heif,application/pdf,text/*,application/json"
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {
@@ -3706,7 +3730,11 @@ function ComposerImpl(
                       disabled={
                         showInterruptButton
                           ? isReadOnly
-                          : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                          : !hasDraft ||
+                            preparingAttachmentCount > 0 ||
+                            disabled ||
+                            isReadOnly ||
+                            hasPendingElicitation
                       }
                       title={showInterruptButton ? "Interrupt" : undefined}
                       label={showInterruptButton ? "Interrupt" : "Send"}
