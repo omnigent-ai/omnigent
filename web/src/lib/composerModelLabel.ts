@@ -35,9 +35,11 @@ export function nativeModelLabel(option: NativeModelLabelFields): string {
   if (!resolved) return label;
   const [, family, major, minor, context] = resolved;
   const has1M = Boolean(context);
-  // Advertised name with any harness prefix / context marker peeled off.
+  // Advertised name with any harness prefix / context marker peeled off. The
+  // marker has several spellings in the wild (`[1m]`, `(1M)`, `(1M context)`);
+  // normalize them all so the recognized suffix is re-applied consistently.
   const advertised = label
-    .replace(/\s*(?:\[1m\]|\(1M context\))$/i, "")
+    .replace(/\s*(?:\[1m\]|\(1m(?: context)?\))$/i, "")
     .replace(/^Claude /i, "")
     .trim();
   // Whether the advertised name is the recognized family (optionally with a

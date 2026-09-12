@@ -122,6 +122,28 @@ describe("nativeModelLabel — managed catalog rows (wire model carries the vari
       nativeModelLabel({ id: "custom", model: "claude-sonnet-4-6", displayName: "Sonnet 5" }),
     ).toBe("Sonnet 5");
   });
+
+  it("normalizes the '(1M)' displayName spelling to the canonical suffix", () => {
+    // Exact gateway-probed fixture: displayName carries the short '(1M)' marker.
+    expect(
+      nativeModelLabel({
+        id: "opus[1m]",
+        model: "claude-opus-4-8[1m]",
+        displayName: "Opus 4.8 (1M)",
+      }),
+    ).toBe("Opus 4.8 (1M context)");
+  });
+
+  it("gateway '(1M)' row and its catalog-free id render identically", () => {
+    const wire = "claude-opus-4-8[1m]";
+    const catalogFree = formatStatusModelLabel(wire, []);
+    const withCatalog = formatStatusModelLabel(wire, [
+      { id: "opus[1m]", model: wire, displayName: "Opus 4.8 (1M)" },
+    ]);
+    expect(catalogFree).toBe("Opus 4.8 (1M context)");
+    expect(withCatalog).toBe("Opus 4.8 (1M context)");
+    expect(catalogFree).toBe(withCatalog);
+  });
 });
 
 describe("formatStatusModelLabel — Claude id folding (catalog-free)", () => {
