@@ -2168,6 +2168,49 @@ export function resetLandingDraft(): void {
   writeLandingDraft(null);
 }
 
+/**
+ * Restore a first message stranded by a failed session load to the next
+ * landing visit: the create succeeded (so the draft was already cleared)
+ * but the session never became viewable, leaving the typed text with no
+ * composer to surface it. Only the text and attachments come back — every
+ * picker slot keeps the same fresh-visit default it would have anyway. A
+ * non-empty draft the user composed since is never overwritten.
+ */
+export function restoreLandingDraftMessage(message: string, files: File[]): void {
+  if (message.trim() === "" && files.length === 0) return;
+  if (
+    landingDraft !== null &&
+    (landingDraft.message.trim() !== "" || landingDraft.files.length > 0)
+  ) {
+    return;
+  }
+  writeLandingDraft({
+    project: "",
+    message,
+    files,
+    pickedAgentId: null,
+    selectedHostId: null,
+    sandboxSelected: false,
+    sandboxProvider: null,
+    sandboxRepoSelections: readLastSandboxRepos(),
+    workspace: "",
+    branchName: "",
+    autoSeededBranch: "",
+    prefilledBranch: "",
+    permissionMode: CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    approvalMode: CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+    bypassSandbox: false,
+    cursorExecMode: CURSOR_NATIVE_DEFAULT_EXEC_MODE,
+    agySkipMode: AGY_NATIVE_DEFAULT_SKIP_MODE,
+    pickedHarness: null,
+    pickedModel: "",
+    pickedEffort: "",
+    costControlMode: null,
+    agentFromConfig: false,
+    workspaceFromConfig: false,
+  });
+}
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
