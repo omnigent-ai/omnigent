@@ -26,7 +26,18 @@ export function latestActivityIsError(blocks: readonly AnyBlock[]): boolean | un
       case "slash_command":
       case "terminal_command":
       case "file":
+      case "policy_denied":
+      case "routing_decision":
+      case "elicitation":
         return false;
+      case "retry":
+      case "compaction_loading":
+      case "compaction":
+        break;
+      default: {
+        const exhaustive: never = block;
+        return exhaustive;
+      }
     }
   }
   return undefined;

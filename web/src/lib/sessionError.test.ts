@@ -53,6 +53,20 @@ describe("latestActivityIsError", () => {
     text("Recovered."),
     { type: "user_message", ctx, content: [{ type: "input_text", text: "API Error: please fix" }] },
     { type: "tool_result", ctx, callId: "call1", name: "test", output: "done", agentName: "" },
+    { type: "policy_denied", ctx, reason: "Approval required", phase: "request" },
+    { type: "routing_decision", ctx, model: "test-model", applied: true, rationale: "Selected" },
+    {
+      type: "elicitation",
+      ctx,
+      elicitationId: "approval1",
+      message: "Continue?",
+      phase: "tool_call",
+      policyName: "approval",
+      contentPreview: "",
+      requestedSchema: {},
+      status: "responded",
+      response: { action: "accept" },
+    },
     { ...error, level: "info" },
   ] satisfies AnyBlock[])("clears an old error after newer $type activity", (newer) => {
     expect(latestActivityIsError([error, newer])).toBe(false);
@@ -76,8 +90,16 @@ describe("latestActivityIsError", () => {
     ).toBe(true);
   });
 
-  it("leaves empty/metadata-only windows unknown", () => {
+  it("leaves an empty window unknown", () => {
     expect(latestActivityIsError([])).toBeUndefined();
-    expect(latestActivityIsError([{ type: "compaction", ctx }])).toBeUndefined();
+  });
+
+  it.each([
+    { type: "compaction", ctx },
+    { type: "compaction_loading", ctx },
+    { type: "retry", ctx, source: "llm", attempt: 1, maxAttempts: 2, delaySeconds: 1 },
+  ] satisfies AnyBlock[])("skips $type bookkeeping without hiding an earlier error", (metadata) => {
+    expect(latestActivityIsError([metadata])).toBeUndefined();
+    expect(latestActivityIsError([error, metadata])).toBe(true);
   });
 });
