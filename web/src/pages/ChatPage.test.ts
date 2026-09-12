@@ -1149,6 +1149,37 @@ describe("subAgentComposerLabel", () => {
     // Degenerate snapshot — the tray still needs something to render.
     expect(subAgentComposerLabel(mkSession())).toBe("sub-agent");
   });
+
+  it("prefers the Task description for a Claude Code sub-agent", () => {
+    // Its title's suffix is an opaque hex id, so the title-split rule
+    // would put "a09d1dd1d8dbc0151" in the tray.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "general-purpose:a09d1dd1d8dbc0151",
+          subAgentName: "general-purpose",
+          labels: {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.description": "wave-worker-696",
+          },
+        }),
+      ),
+    ).toBe("wave-worker-696");
+  });
+
+  it("uses the bare agent name for a description-less namespaced Claude sub-agent", () => {
+    // "rpw-published:debug-lead" carries its own colon, so splitting the
+    // title on the first one left the id half showing.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "rpw-published:debug-lead:a361e6a6aa05689cb",
+          subAgentName: "rpw-published:debug-lead",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ),
+    ).toBe("debug-lead");
+  });
 });
 
 // ── containsMarkdownTable ──────────────────────────────────────────────────
@@ -1265,9 +1296,22 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    expect(Object.keys(map)).toEqual(Object.keys(BUILTIN_SLASH_COMMANDS));
+    // /btw is gated off by default (claude-native only), so it's excluded here.
+    expect(Object.keys(map)).toEqual(
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+    );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /btw only when showBtw is true (claude-native)", () => {
+    // Off by default and when explicitly false.
+    expect(buildSlashCommandMap([], true, true)["/btw"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false)["/btw"]).toBeUndefined();
+    // On when the session is claude-native.
+    expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/btw"],
+    );
   });
 
   it("omits /effort when effort controls are hidden", () => {
@@ -1317,9 +1361,9 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills.
+    // surfaces built-ins above user skills. /btw is gated off by default.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
       "/triage-issues",
       "/mlflow-bug",
     ]);

@@ -1,7 +1,7 @@
 """add version and distribution to hosts
 
-Revision ID: gg1b2c3d4e5f
-Revises: gf1b2c3d4e5f
+Revision ID: gh1b2c3d4e5f
+Revises: gg1b2c3d4e5f
 Create Date: 2026-09-10 00:00:00.000000
 
 Adds ``hosts.version`` — the omnigent version a host reports in its
@@ -20,8 +20,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "gg1b2c3d4e5f"
-down_revision: str | None = "gf1b2c3d4e5f"
+revision: str = "gh1b2c3d4e5f"
+down_revision: str | None = "gg1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

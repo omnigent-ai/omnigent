@@ -110,6 +110,20 @@ Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
 brew install omnigent-ai/tap/omnigent
 ```
 
+For source builds on networks that require package mirrors, replace these example
+URLs with your mirrors:
+
+```bash
+HOMEBREW_PIP_INDEX_URL='https://pypi.example.com/simple' \
+HOMEBREW_CARGO_INDEX_URL='https://cargo.example.com/index/' \
+  brew install --build-from-source omnigent-ai/tap/omnigent
+```
+
+The PyPI setting also routes pip's isolated build dependencies through the mirror.
+The Cargo setting takes a sparse registry index URL ending in `/`, without the
+`sparse+` prefix. Both overrides are optional and do not affect prebuilt-bottle
+installs.
+
 Or install straight from the repo:
 
 ```bash

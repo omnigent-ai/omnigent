@@ -1341,6 +1341,15 @@ class SessionGitOptions(BaseModel):
         return self
 
 
+# Upper bound on repositories a single managed session may clone. Generous for
+# the realistic multi-repo case (a handful) while bounding three things a larger
+# set would grow: the sandbox's parallel git-clone fan-out on a small node, the
+# per-repo relaunch labels (one each, carried in every session snapshot), and an
+# abusive request.
+# ponytail: bump this one constant if larger repo sets ever need supporting.
+_MAX_MANAGED_WORKSPACES = 10
+
+
 class _SessionCreateRequestBase(BaseModel):
     """
     JSON request body for ``POST /v1/sessions``.
@@ -1407,6 +1416,14 @@ class _SessionCreateRequestBase(BaseModel):
         inside the sandbox and the cloned directory becomes the
         stored session workspace (paths are rejected; ``None``
         gives an empty server-created workspace).
+    :param workspaces: ``host_type: "managed"`` only — clone SEVERAL
+        repositories into one sandbox. A list of git repository URLs
+        (each optionally ``#<branch>``), same grammar as ``workspace``.
+        The server clones them in parallel as siblings under the
+        sandbox workspace; the agent starts in that parent directory
+        (or, when the list has exactly one entry, directly inside that
+        repo — matching single-``workspace`` behaviour). Mutually
+        exclusive with ``workspace``; ``None`` or ``[]`` means no repo.
     :param git: Optional git worktree options. When set, the server
         creates a worktree for a new branch on the host and starts
         the runner in it; ``workspace`` is then interpreted as the
@@ -1487,6 +1504,7 @@ class _SessionCreateRequestBase(BaseModel):
     host_id: str | None = None
     sandbox_provider: str | None = None
     workspace: str | None = None
+    workspaces: list[str] | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
@@ -1531,8 +1549,9 @@ class _SessionCreateRequestBase(BaseModel):
 
         :returns: The validated instance.
         :raises ValueError: On ``"managed"`` + ``host_id``, a managed
-            workspace that isn't a valid repository URL, or an
-            external repository-URL workspace.
+            workspace/workspaces that isn't a valid repository URL,
+            ``workspace`` and ``workspaces`` set together, too many
+            ``workspaces``, or an external repository-URL workspace.
         """
         # Lazy import: schemas is imported by nearly every module, so
         # pulling the (FastAPI/click-importing) managed-hosts module in
@@ -1545,13 +1564,23 @@ class _SessionCreateRequestBase(BaseModel):
                     "host_type 'managed' lets the server provision the host; "
                     "host_id must not be set"
                 )
-            if self.workspace is not None:
+            if self.workspace is not None and self.workspaces is not None:
+                raise ValueError(
+                    "set either 'workspace' (one repository) or 'workspaces' "
+                    "(several) for host_type 'managed', not both"
+                )
+            if self.workspaces is not None and len(self.workspaces) > _MAX_MANAGED_WORKSPACES:
+                raise ValueError(
+                    f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
+                    f"repositories in 'workspaces' (got {len(self.workspaces)})"
+                )
+            for candidate in self.managed_repo_workspaces():
                 try:
-                    parse_repo_workspace(self.workspace)
+                    parse_repo_workspace(candidate)
                 except ValueError as exc:
                     raise ValueError(
-                        "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') as workspace: {exc}"
+                        "host_type 'managed' takes git repository URLs "
+                        f"(optionally '#<branch>') as workspace(s): {exc}"
                     ) from exc
             return self
         if self.sandbox_provider is not None:
@@ -1559,12 +1588,37 @@ class _SessionCreateRequestBase(BaseModel):
                 "sandbox_provider only applies to host_type 'managed' — "
                 "external hosts are not server-provisioned"
             )
+        if self.workspaces:
+            raise ValueError(
+                "'workspaces' (multi-repo clone) requires host_type 'managed' — "
+                "external hosts take a single absolute path in 'workspace'"
+            )
         if self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "
                 "external hosts take an absolute path on the host"
             )
         return self
+
+    def managed_repo_workspaces(self) -> list[str]:
+        """
+        The managed session's repository workspaces as a normalized list.
+
+        ``workspaces`` when given, else the single ``workspace`` as a
+        one-element list, else empty. ``workspace`` and ``workspaces``
+        are mutually exclusive (:meth:`_check_managed_host_fields`), so at
+        most one source is populated. Meaningful only for
+        ``host_type: "managed"`` (an external ``workspace`` is a host path,
+        not a repo URL); callers gate on that.
+
+        :returns: Raw repository-URL strings (each optionally
+            ``#<branch>``); empty for an empty sandbox workspace.
+        """
+        if self.workspaces:
+            return list(self.workspaces)
+        if self.workspace is not None:
+            return [self.workspace]
+        return []
 
 
 class SessionCreateRequest(_SessionCreateRequestBase):
@@ -3678,6 +3732,41 @@ class SessionSupersededEvent(_SSEEventBase):
     reason: Literal["clear"] = "clear"
 
 
+class SessionBtwSidechatEvent(_SSEEventBase):
+    """
+    A Claude Code ``/btw`` side-chat exchange to show transiently.
+
+    ``/btw`` opens an ephemeral side conversation whose answer Claude Code
+    keeps only in its in-TUI overlay — it is never written to the session
+    transcript. The claude-native forwarder scrapes the settled overlay
+    from the pane and emits this event so the managed web UI can show the
+    same ephemeral overlay (dismissed with Escape), WITHOUT adding a
+    persisted side-chat turn to the main conversation.
+
+    Category: **transient** (SSE-only), live-only by design. Nothing is
+    persisted and there is no SSE replay, so a reload drops the overlay —
+    matching the terminal, where Escape closes it and leaves no history.
+
+    The wire shape is FLAT (not enveloped):
+    ``{"type": "session.btw_sidechat", "conversation_id": <id>,
+    "question": <str>, "answer": <str>, "truncated": <bool>}``.
+
+    :param type: Always ``"session.btw_sidechat"``.
+    :param conversation_id: The conversation whose stream this rides.
+    :param question: The ``/btw`` request line as typed, e.g.
+        ``"/btw is this backward compatible?"``.
+    :param answer: The side-chat answer text.
+    :param truncated: True when the pane clipped a longer answer; the web
+        overlay notes it and points at the terminal for the full text.
+    """
+
+    type: Literal["session.btw_sidechat"]
+    conversation_id: str
+    question: str
+    answer: str
+    truncated: bool = False
+
+
 # ── Response pass-through events (response.*) ──────────────────────
 
 
@@ -4674,6 +4763,7 @@ ServerStreamEvent = Annotated[
     | SessionInterruptedEvent
     | SessionCreatedEvent
     | SessionSupersededEvent
+    | SessionBtwSidechatEvent
     | SessionPresenceEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────
     | SessionResourceCreatedEvent

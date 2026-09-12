@@ -66,6 +66,7 @@ from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -2029,7 +2030,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         workspace="/ws",
         parent_pid=42,
         initial_auth_token="host-bootstrap-bearer",
+        interactive_shells=["zsh", "bash"],
     )
+
+    assert env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] == '["zsh", "bash"]'
 
     # Process essentials + the locale family pass through.
     assert env["PATH"] == "/usr/bin:/bin"
@@ -4251,8 +4255,29 @@ def test_run_host_process_announces_session_log_dir_on_start(
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
 
 
+class _ConnectReachedThenPark:
+    """Async-CM stand-in for ``websockets.asyncio.client.connect``.
+
+    Signals that the host reached its connect attempt (the step that
+    registers it), then parks until the test cancels ``run()`` so a
+    background startup task can be observed completing meanwhile.
+    """
+
+    def __init__(self, reached: asyncio.Event) -> None:
+        self._reached = reached
+
+    async def __aenter__(self) -> object:
+        self._reached.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
 async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Host startup reclaims native bridge dirs orphaned by a crashed runner.
 
@@ -4260,21 +4285,46 @@ async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
     never runs its explicit-delete cleanup, and if no new runner ever
     launches on the machine the runner-side startup sweep never fires
     either — so ``~/.omnigent`` grows without bound. The host daemon's own
-    (re)start is the reliable moment to reap: ``run()`` must invoke the
-    cross-harness bridge-dir sweep before entering the connect loop.
+    (re)start is the reliable moment to reap — in the background: the sweep
+    must complete while the connect loop (which registers the host) is
+    already underway, not as a startup prerequisite, and it must be torn
+    down cleanly when ``run()`` exits.
     """
-    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
-    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    import websockets.asyncio.client as ws_client
+
+    import omnigent.runner._entry as entry_mod
+
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    connect_reached = asyncio.Event()
+    monkeypatch.setattr(
+        ws_client, "connect", lambda url, **kwargs: _ConnectReachedThenPark(connect_reached)
+    )
     sweeps: list[int] = []
     monkeypatch.setattr(
         "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
         lambda: sweeps.append(1) or 3,
     )
     host = _host()
+    host._capabilities_initialized = True
+    host._zygote_disabled = True  # keep the test from prestarting a zygote
 
-    await host.run()
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
+    run_task = asyncio.create_task(host.run())
+    try:
+        await asyncio.wait_for(connect_reached.wait(), timeout=10.0)
+        sweep_task = host._bridge_sweep_task
+        assert sweep_task is not None, "run() never launched the bridge-dir sweep"
+        # The host is parked in its connect attempt; the sweep completes
+        # concurrently rather than gating registration.
+        await asyncio.wait_for(asyncio.shield(sweep_task), timeout=10.0)
+    finally:
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await run_task
 
     assert sweeps == [1]
+    assert "Reaped 3 orphaned native bridge dir(s)" in caplog.text
+    assert host._bridge_sweep_task is None, "run() teardown left the sweep task"
 
 
 async def test_run_survives_a_failing_native_bridge_dir_sweep(
@@ -4299,6 +4349,23 @@ async def test_run_survives_a_failing_native_bridge_dir_sweep(
 
     # Startup completes (run returns via the clean cancel) despite the raise.
     await host.run()
+
+
+async def test_bridge_dir_sweep_failure_is_contained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing sweep is housekeeping: it must never escape its background task."""
+
+    def _boom() -> int:
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        _boom,
+    )
+    host = _host()
+    # Must swallow the failure (logged at debug), not raise.
+    await host._sweep_orphaned_bridge_dirs()
 
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(

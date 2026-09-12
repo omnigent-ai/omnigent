@@ -68,6 +68,16 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         # An unrecognised effort is dropped (not a Claude effort), so it
         # never reaches the CLI as a bogus ``--effort`` value.
         ("bogus-effort", None, None, ()),
+        # A leading positional prompt (how the CLI forwards ``-p``) keeps
+        # its place ahead of pass-through value flags, and the model
+        # default is appended after — re-appending the prompt last would
+        # let a variadic flag like ``--mcp-config`` swallow it.
+        (
+            None,
+            "claude-opus-4-7",
+            ["hello", "--mcp-config", "mcp.json"],
+            ("hello", "--mcp-config", "mcp.json", "--model", "claude-opus-4-7"),
+        ),
     ],
     ids=[
         "effort-only",
@@ -78,6 +88,7 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         "all-none",
         "empty-passthrough-still-adds-model",
         "unknown-effort-dropped",
+        "leading-prompt-stays-first",
     ],
 )
 def test_build_claude_native_base_args(
@@ -151,6 +162,32 @@ def test_build_claude_native_base_args_resume_prefix(
             resume_external_session_id=resume,
         )
         == expected
+    )
+
+
+def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resume() -> None:
+    """
+    A pinned ``--permission-mode`` reaches the cold-resume argv unchanged.
+
+    The server pins a picker-confirmed mode into ``terminal_launch_args``
+    precisely because this builder is the only thing a relaunch consults;
+    the pass-through must land after ``--resume`` and survive the
+    ``--model`` default so the resumed Claude opens in the chosen mode.
+    """
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override="claude-opus-5",
+        terminal_launch_args=["--permission-mode", "auto"],
+        resume_external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+    )
+
+    assert args == (
+        "--resume",
+        "02857840-6362-408f-b41f-309e396ed7c6",
+        "--permission-mode",
+        "auto",
+        "--model",
+        "claude-opus-5",
     )
 
 

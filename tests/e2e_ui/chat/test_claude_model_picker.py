@@ -450,7 +450,7 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
 
     # The composer label already shows the concrete routable id.
     expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(
-        default_model, timeout=15_000
+        "Sonnet 4.5", timeout=15_000
     )
     _screenshot(page, "unpinned-gateway-composer")
 
@@ -877,22 +877,9 @@ def test_claude_native_permission_mode_switch_persists(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    gear = page.get_by_test_id("composer-config-gear")
-    expect(gear).to_be_visible(timeout=15_000)
-    gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-
-    # The permission-mode picker is visible for claude-native sessions whose
-    # current mode is known (non-empty label).
-    perm = page.get_by_test_id("composer-config-permission-mode")
-    expect(perm).to_be_visible()
+    perm = page.get_by_test_id("composer-permission-chip")
+    expect(perm).to_be_visible(timeout=15_000)
     perm.click()
-
-    # Located by data attribute, not accessible name: each option renders its
-    # label and description together, so the name is never the bare label.
-    page.locator('[role="option"][data-permission-mode="auto"]').click()
-
-    # Save commits the draft and fires the PATCH.
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -900,6 +887,7 @@ def test_claude_native_permission_mode_switch_persists(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.get_by_test_id("composer-permission-option-auto").click()
 
     assert patch_bodies[-1] == {"permission_mode": "auto"}
+    expect(perm).to_contain_text("Auto")

@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass
 from typing import cast
 
-from sqlalchemy import Engine, and_, or_, select, update
+from sqlalchemy import Engine, or_, select, tuple_, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -104,6 +104,10 @@ class Host:
     deleted_at: int | None = None
     version: str | None = None
     distribution: str | None = None
+
+
+ManagedSandboxScanCursor = tuple[str, int, str]
+ManagedSandboxScanRow = tuple[int, Host]
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -766,58 +770,83 @@ class HostStore:
             )
             return [_row_to_host(row) for row in rows]
 
-    def list_managed_sandbox_workspace_ids(self) -> list[int]:
-        """List workspaces with active or pending managed sandbox generations.
+    def list_current_managed_sandbox_hosts_page(
+        self,
+        *,
+        after: ManagedSandboxScanCursor | None,
+        limit: int,
+    ) -> list[ManagedSandboxScanRow]:
+        """Page through hosts whose current sandbox-id slot is populated.
 
-        This is the privileged discovery query used by the server-wide managed
-        sandbox reaper. Unlike normal request-path store methods, it
-        intentionally spans workspace partitions; the reaper immediately enters
-        each returned :func:`workspace_scope` before reading sessions or hosts.
+        This privileged reaper scan intentionally spans workspaces. Ordering by
+        the indexed ``(sandbox_id, workspace_id, host_id)`` tuple makes every
+        query bounded while allowing a complete deterministic traversal.
 
-        :returns: Workspace ids in ascending order.
+        :param after: Exclusive keyset cursor from the prior page.
+        :param limit: Maximum rows returned by this query.
+        :returns: ``(workspace_id, host)`` rows in cursor order.
         """
-        with self._session("list_managed_sandbox_workspaces") as session:
-            return list(
-                session.execute(
-                    select(SqlHost.workspace_id)
-                    .where(
-                        SqlHost.sandbox_provider.is_not(None),
-                        or_(
-                            SqlHost.sandbox_id.is_not(None),
-                            SqlHost.terminating_sandbox_id.is_not(None),
-                        ),
-                    )
-                    .distinct()
-                    .order_by(SqlHost.workspace_id.asc())
-                ).scalars()
-            )
-
-    def list_stale_managed_sandbox_hosts(self, older_than_epoch: int) -> list[Host]:
-        """List stale active and pending managed sandboxes in this workspace.
-
-        :param older_than_epoch: Latest included host heartbeat timestamp.
-        :returns: Stale generations ordered from oldest to newest.
-        """
-        with self._session("list_stale_managed_sandbox_hosts") as session:
-            rows = (
-                session.query(SqlHost)
-                .filter(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.sandbox_provider.is_not(None),
-                    or_(
-                        SqlHost.deleted_at.is_not(None),
-                        SqlHost.terminating_sandbox_id.is_not(None),
-                        and_(
-                            SqlHost.terminating_sandbox_id.is_(None),
-                            SqlHost.sandbox_id.is_not(None),
-                            SqlHost.updated_at <= older_than_epoch,
-                        ),
-                    ),
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._session("list_current_managed_sandbox_hosts_page") as session:
+            stmt = (
+                select(SqlHost)
+                .where(SqlHost.sandbox_id.is_not(None))
+                .order_by(
+                    SqlHost.sandbox_id.asc(),
+                    SqlHost.workspace_id.asc(),
+                    SqlHost.host_id.asc(),
                 )
-                .order_by(SqlHost.updated_at.asc(), SqlHost.host_id.asc())
-                .all()
+                .limit(limit)
             )
-            return [_row_to_host(row) for row in rows]
+            if after is not None:
+                stmt = stmt.where(
+                    tuple_(SqlHost.sandbox_id, SqlHost.workspace_id, SqlHost.host_id) > after
+                )
+            rows = session.execute(stmt).scalars().all()
+            return [(row.workspace_id, _row_to_host(row)) for row in rows]
+
+    def list_terminating_managed_sandbox_hosts_page(
+        self,
+        *,
+        after: ManagedSandboxScanCursor | None,
+        limit: int,
+    ) -> list[ManagedSandboxScanRow]:
+        """Page through hosts whose terminating sandbox-id slot is populated.
+
+        This privileged reaper scan intentionally spans workspaces. Ordering by
+        the indexed ``(terminating_sandbox_id, workspace_id, host_id)`` tuple
+        makes every query bounded while allowing a complete deterministic
+        traversal.
+
+        :param after: Exclusive keyset cursor from the prior page.
+        :param limit: Maximum rows returned by this query.
+        :returns: ``(workspace_id, host)`` rows in cursor order.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._session("list_terminating_managed_sandbox_hosts_page") as session:
+            stmt = (
+                select(SqlHost)
+                .where(SqlHost.terminating_sandbox_id.is_not(None))
+                .order_by(
+                    SqlHost.terminating_sandbox_id.asc(),
+                    SqlHost.workspace_id.asc(),
+                    SqlHost.host_id.asc(),
+                )
+                .limit(limit)
+            )
+            if after is not None:
+                stmt = stmt.where(
+                    tuple_(
+                        SqlHost.terminating_sandbox_id,
+                        SqlHost.workspace_id,
+                        SqlHost.host_id,
+                    )
+                    > after
+                )
+            rows = session.execute(stmt).scalars().all()
+            return [(row.workspace_id, _row_to_host(row)) for row in rows]
 
     def get_host(self, host_id: str) -> Host | None:
         """

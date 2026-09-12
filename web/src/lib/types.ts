@@ -288,6 +288,12 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /**
+   * Whether the session is archived. Carried on the snapshot because it is
+   * the only carrier for a session opened directly by URL — the default
+   * sidebar list excludes archived rows. `false`/absent for active sessions.
+   */
+  archived?: boolean;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status

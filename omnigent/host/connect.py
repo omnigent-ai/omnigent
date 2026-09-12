@@ -27,7 +27,12 @@ from typing import Any, Literal, Protocol, SupportsIndex, SupportsInt, cast
 import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
-from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import (
+    IS_POSIX,
+    WINDOWS_ENV_PASSTHROUGH,
+    installed_interactive_shells,
+    normalize_interactive_shells,
+)
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import (
     ORIGIN_WORKSPACE_ID_ENV_VAR,
@@ -128,6 +133,7 @@ from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_SLICE_KEY_ENV_VAR,
@@ -141,10 +147,6 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.limits import (
-    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-)
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
@@ -155,6 +157,10 @@ from omnigent.update_check import DISTRIBUTION_ENV, host_distribution
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.tunnel_limits import (
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -760,6 +766,7 @@ def _build_runner_env(
     initial_auth_token: str | None = None,
     host_id: str | None = None,
     harness: str | None = None,
+    interactive_shells: list[str] | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -842,6 +849,8 @@ def _build_runner_env(
         env[RUNNER_SLICE_KEY_ENV_VAR] = host_id
     if harness:
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
+    if interactive_shells is not None:
+        env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
     return env
 
 
@@ -980,6 +989,7 @@ class HostProcess:
         identity: HostIdentity,
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
+        interactive_shells: list[str] | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -988,9 +998,18 @@ class HostProcess:
         :param lifecycle_lock: Optional guard binding this daemon's lifetime
             to its registry record. When present, the daemon holds the lock
             and self-terminates once the record is deleted or reassigned.
+        :param interactive_shells: Optional shell inventory override for tests.
+            By default the host discovers its installed shells once at startup.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._interactive_shells = normalize_interactive_shells(
+            interactive_shells
+            if interactive_shells is not None
+            else installed_interactive_shells()
+        )
+        if not self._interactive_shells:
+            self._interactive_shells = ["bash"]
         self._runners: dict[str, _RunnerHandle] = {}
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
@@ -1064,6 +1083,9 @@ class HostProcess:
         self._supersede_stop_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
+        # Background sweep of native bridge dirs orphaned by prior runs; kept
+        # off the startup path so it never delays registration (see run()).
+        self._bridge_sweep_task: asyncio.Task[None] | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -1743,6 +1765,7 @@ class HostProcess:
             initial_auth_token=initial_auth_token,
             host_id=self._identity.host_id,
             harness=frame.harness,
+            interactive_shells=self._interactive_shells,
         )
         # The runner serves one primary session (plus any co-located subagents);
         # pass it so runner-level log records can be attributed to that session.
@@ -3391,6 +3414,17 @@ class HostProcess:
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
 
+    async def _sweep_orphaned_bridge_dirs(self) -> None:
+        """Reclaim native bridge dirs orphaned by prior runs (best-effort)."""
+        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+        try:
+            reaped = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
+            if reaped:
+                _logger.info("Reaped %d orphaned native bridge dir(s) from prior runs", reaped)
+        except Exception:  # noqa: BLE001 — housekeeping must never break the host
+            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -3421,19 +3455,12 @@ class HostProcess:
         # that died uncleanly (crash / SIGKILL / host restart mid-run). The
         # runner performs the same sweep at its own startup, but after a
         # crash no new runner may ever launch on this machine, so the host
-        # (re)start is the reliable moment to reclaim them. Best-effort and
-        # off-loop: a sweep failure must never block host registration.
-        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
-
-        try:
-            reaped_bridge_dirs = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
-            if reaped_bridge_dirs:
-                _logger.info(
-                    "Reaped %d orphaned native bridge dir(s) from prior runs",
-                    reaped_bridge_dirs,
-                )
-        except Exception:  # noqa: BLE001 — housekeeping must never block registration
-            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
+        # (re)start is the reliable moment to reclaim them. Runs as a
+        # background task: a slow sweep (many stale dirs) must not sit on the
+        # critical path of the connect loop below, which registers the host.
+        self._bridge_sweep_task = asyncio.create_task(
+            self._sweep_orphaned_bridge_dirs(), name="host-bridge-dir-sweep"
+        )
         # Detect wake from system suspend (laptop sleep) and force-drop the
         # then-dead tunnel so the reconnect loop reattaches within seconds
         # instead of waiting out the ~90s keepalive ping timeout.
@@ -3630,6 +3657,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._reaper_task
                 self._reaper_task = None
+            if self._bridge_sweep_task is not None:
+                self._bridge_sweep_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._bridge_sweep_task
+                self._bridge_sweep_task = None
             if self._suspend_task is not None:
                 self._suspend_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3933,6 +3965,7 @@ class HostProcess:
             runners=self._alive_runner_ids(),
             configured_harnesses=self._configured_harnesses,
             gateway_inference=self._gateway_inference,
+            interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
             distribution=host_distribution(),
@@ -4269,6 +4302,7 @@ def run_host_process(
     *,
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
+    interactive_shells: list[str] | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -4286,6 +4320,8 @@ def run_host_process(
     :param lifecycle_lock: A lock already acquired by an auto-launched daemon
         before it claimed the registry record. When provided, it is retained
         for the host process lifetime instead of acquiring another handle.
+    :param interactive_shells: Optional shell inventory override for tests.
+        By default the host discovers its installed shells once at startup.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
@@ -4369,7 +4405,12 @@ def run_host_process(
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
-    host = HostProcess(identity, server_url, lifecycle_lock=lifecycle_lock)
+    host = HostProcess(
+        identity,
+        server_url,
+        lifecycle_lock=lifecycle_lock,
+        interactive_shells=interactive_shells,
+    )
     try:
         asyncio.run(host.run())
     except HostConnectError as exc:

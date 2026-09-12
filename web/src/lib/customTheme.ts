@@ -367,6 +367,8 @@ function rebaseVariant(
     ),
     primary: primaryChanged ? primary : base.primary,
     primaryForeground: primaryChanged ? readableForeground(primary) : base.primaryForeground,
+    selectionBackground: base.selectionBackground,
+    selectionForeground: base.selectionForeground,
     secondary: rebaseColor(base.secondary, reference.secondary, current.secondary),
     secondaryForeground: rebaseColor(
       base.secondaryForeground,
@@ -410,8 +412,14 @@ function rebaseVariant(
     ),
     sidebarBorder: rebaseColor(base.sidebarBorder, reference.border, current.border),
     sidebarRing: primaryChanged ? primary : base.sidebarRing,
-    sidebarActive: base.sidebarActive,
-    sidebarActiveForeground: base.sidebarActiveForeground,
+    // Tint the active-row highlight with the accent so it tracks a custom
+    // accent color; keep the hand-tuned base tint when the accent is unchanged.
+    // The rebased sidebar foreground stays legible on the low-alpha tint and
+    // mirrors the default token model's `var(--sidebar-foreground)`.
+    sidebarActive: primaryChanged ? setAlpha(primary, 0.12) : base.sidebarActive,
+    sidebarActiveForeground: primaryChanged
+      ? rebaseColor(base.sidebarForeground, reference.foreground, current.foreground)
+      : base.sidebarActiveForeground,
     sidebarBackground: base.sidebarBackground,
     shellBackground: base.shellBackground,
   };

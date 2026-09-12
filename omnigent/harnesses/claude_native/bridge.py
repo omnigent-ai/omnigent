@@ -256,11 +256,14 @@ _PERMISSION_MODE_FOOTERS: dict[str, str] = {
     "acceptEdits": "accept edits on",
     "plan": "plan mode on",
     "auto": "auto mode on",
+    # Launch-only, but readable: a pane launched into bypass must report
+    # its own mode so the cycler has a starting point to leave it from.
+    "bypassPermissions": "bypass permissions on",
 }
-# Modes shift+tab can reach. ``dontAsk`` is never in the cycle and
-# ``bypassPermissions`` only joins it when launched into, so both are
-# rejected up front.
-CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS)
+# Modes shift+tab can reach from any session. ``dontAsk`` is never in the
+# cycle and ``bypassPermissions`` only joins it when launched into, so
+# neither is a switch target.
+CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {"bypassPermissions"}
 # Cap on shift+tab presses. The cycle is 3-5 modes wide depending on which
 # optional modes are enabled, so a full lap plus slack proves the target is
 # unreachable rather than slow.
@@ -4164,6 +4167,180 @@ def _permission_mode_from_pane(pane: str) -> str | None:
     return None
 
 
+# ── /btw side-chat overlay ─────────────────────────────────────────
+# Claude Code's ``/btw`` ("by the way") opens an in-TUI overlay that
+# answers a side question without ever persisting it — not to the
+# transcript JSONL, the message-deltas file, or any hook. The rendered
+# pane is the only place the answer exists, so the forwarder scrapes it
+# from there (read-only) to mirror the exchange into the managed web UI.
+#
+# The overlay draws a ``▔`` top border, the ``/btw <question>`` line(s)
+# (4-space indent; prior side turns stack above the current one), a
+# blank, the answer (6-space indent), a blank, and a footer pinned to the
+# pane's bottom. The answer is rendered atomically once generation
+# finishes — it does not stream chunk-by-chunk into the pane.
+_BTW_OVERLAY_BORDER_GLYPH = "▔"
+_BTW_FOOTER_CLOSE_HINT = "Esc to close"
+# A settled overlay's footer offers copy + fork; while the answer is
+# still generating the footer carries neither and a ``✻ Answering…`` line
+# shows in the region. Both conditions gate "the exchange is complete".
+_BTW_FOOTER_COMPLETE_HINTS = ("c to copy", "f to fork")
+_BTW_ANSWERING_HINT = "Answering"
+_BTW_QUESTION_PREFIX = "/btw"
+# Read-only capture cannot tell a complete tall answer from one the pane
+# clipped (both end in a blank + footer), so an overlay whose border→footer
+# span reaches this many rows is flagged possibly-truncated. This
+# over-flags long *complete* answers, which is acceptable for the
+# best-effort relay (the note points the reader at the terminal).
+_BTW_TRUNCATION_MIN_SPAN_ROWS = 12
+
+
+@dataclass(frozen=True)
+class BtwOverlay:
+    """
+    A completed Claude Code ``/btw`` side-chat exchange scraped from the pane.
+
+    :param question: The ``/btw <question>`` line as typed, e.g.
+        ``"/btw is this backward compatible?"``, or ``None`` when the
+        question scrolled out of the visible overlay (a long answer).
+    :param answer: The visible answer text, dedented and stripped.
+    :param truncated: True when the overlay likely clipped a longer
+        answer (best-effort heuristic; see
+        :data:`_BTW_TRUNCATION_MIN_SPAN_ROWS`).
+    """
+
+    question: str | None
+    answer: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class PaneSignals:
+    """
+    The poll-time signals scraped from a single Claude pane capture.
+
+    Bundled so the forwarder reads the pane ONCE per poll and parses every
+    footer-derived signal from that one ``capture-pane`` subprocess, instead
+    of spawning a separate capture per signal.
+
+    :param permission_mode: The ``--permission-mode`` footer value, e.g.
+        ``"auto"``, or ``None`` when no mode footer is visible.
+    :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
+        when none is shown / it is still generating.
+    """
+
+    permission_mode: str | None = None
+    btw_overlay: BtwOverlay | None = None
+
+
+def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
+    """
+    Parse a *completed* ``/btw`` side-chat overlay from a captured pane.
+
+    Returns ``None`` when no overlay is visible, the answer is still
+    generating (completion gate unmet), or no answer text is present — so
+    a caller only ever relays a settled exchange.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The parsed overlay, or ``None``.
+    """
+    lines = pane.splitlines()
+    footer_idx = next(
+        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
+        None,
+    )
+    if footer_idx is None:
+        return None
+    footer = lines[footer_idx]
+    if not all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
+        return None
+    border_idx = next(
+        (i for i in range(footer_idx - 1, -1, -1) if _BTW_OVERLAY_BORDER_GLYPH in lines[i]),
+        None,
+    )
+    if border_idx is None:
+        return None
+    region = lines[border_idx + 1 : footer_idx]
+    # A ``✻ Answering…`` line means the (current) exchange is still in
+    # flight even though a completed footer is on screen — bail.
+    if any(_BTW_ANSWERING_HINT in line for line in region):
+        return None
+    # The current turn's question is the LAST ``/btw`` line; earlier side
+    # turns stack above it. Its answer is everything after it.
+    question_idx = next(
+        (
+            i
+            for i in range(len(region) - 1, -1, -1)
+            if region[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
+        ),
+        None,
+    )
+    if question_idx is None:
+        question = None
+        answer_lines = region
+    else:
+        question = region[question_idx].strip()
+        answer_lines = region[question_idx + 1 :]
+    answer = _dedent_overlay_lines(answer_lines)
+    if not answer:
+        return None
+    truncated = (footer_idx - border_idx) >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+    return BtwOverlay(question=question, answer=answer, truncated=truncated)
+
+
+def _btw_overlay_present(pane: str) -> bool:
+    """
+    Report whether a ``/btw`` overlay is currently on screen.
+
+    Broader than :func:`_btw_overlay_from_pane` (which only matches a
+    *settled* exchange): this also matches a multi-turn overlay and one
+    still generating, since dismissing should work in any of those states.
+    It is deliberately specific to the ``/btw`` footer so
+    :func:`dismiss_btw_overlay` never spends an Escape on a bare composer
+    (where Escape would cancel an in-flight turn).
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: True when the ``/btw`` overlay is visible.
+    """
+    lines = pane.splitlines()
+    footer_idx = next(
+        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
+        None,
+    )
+    if footer_idx is None:
+        return False
+    if not any(_BTW_OVERLAY_BORDER_GLYPH in line for line in lines[:footer_idx]):
+        return False
+    footer = lines[footer_idx]
+    # The /btw footer offers copy+fork (single, settled), switch (multi-turn),
+    # or the region shows the answering spinner (still generating). Requiring
+    # one of these keeps a model picker / confirm dialog (other "Esc to close"
+    # surfaces) from matching.
+    if all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
+        return True
+    if "to switch" in footer:
+        return True
+    return any(_BTW_ANSWERING_HINT in line for line in lines[:footer_idx])
+
+
+def _dedent_overlay_lines(overlay_lines: list[str]) -> str:
+    """
+    Strip the common leading indent from captured overlay lines.
+
+    Mirrors :func:`textwrap.dedent` without the import, preserving the
+    answer's relative indentation (nested lists, code) while removing the
+    overlay's fixed left margin and any trailing pad from ``capture-pane``.
+
+    :param overlay_lines: Raw pane lines of the answer region.
+    :returns: The dedented, stripped text.
+    """
+    non_blank = [line for line in overlay_lines if line.strip()]
+    indent = min((len(line) - len(line.lstrip(" ")) for line in non_blank), default=0)
+    return "\n".join(
+        line[indent:].rstrip() if line.strip() else "" for line in overlay_lines
+    ).strip()
+
+
 def _read_settled_permission_mode(
     socket_path: str,
     tmux_target: str,
@@ -6319,6 +6496,87 @@ def read_permission_mode(bridge_dir: Path) -> str | None:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return None
     return _permission_mode_from_pane(_capture_pane(socket_path, tmux_target))
+
+
+def read_btw_overlay(bridge_dir: Path) -> BtwOverlay | None:
+    """
+    Read a completed ``/btw`` side-chat overlay from the Claude pane.
+
+    Non-blocking, best-effort, and strictly read-only — it captures the
+    pane but never sends keystrokes, so it cannot race the executor's
+    message injections (the forwarder and executor run in separate
+    processes with no shared pane-write lock). Returns ``None`` when the
+    terminal isn't up, no settled overlay is shown, or nothing parses.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: The parsed overlay, or ``None``.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return None
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return None
+    return _btw_overlay_from_pane(_capture_pane(socket_path, tmux_target))
+
+
+def read_pane_signals(bridge_dir: Path) -> PaneSignals:
+    """
+    Read every poll-time footer signal from ONE Claude pane capture.
+
+    Non-blocking, best-effort, read-only. Captures the pane a single time
+    and parses both the permission-mode footer and any settled ``/btw``
+    overlay from it, so the forwarder spawns one ``capture-pane``
+    subprocess per poll rather than one per signal. Returns an empty
+    :class:`PaneSignals` when the terminal isn't up.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: The parsed pane signals (fields ``None`` when absent).
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return PaneSignals()
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return PaneSignals()
+    pane = _capture_pane(socket_path, tmux_target)
+    return PaneSignals(
+        permission_mode=_permission_mode_from_pane(pane),
+        btw_overlay=_btw_overlay_from_pane(pane),
+    )
+
+
+def dismiss_btw_overlay(bridge_dir: Path) -> bool:
+    """
+    Close a visible ``/btw`` overlay in the pane by sending Escape.
+
+    Called from the runner when the reader dismisses the web-side overlay,
+    so the two views close in lockstep. Escape is sent ONLY when the
+    ``/btw`` overlay is verifiably on screen (:func:`_btw_overlay_present`)
+    — a blind Escape on the bare composer would cancel an in-flight turn.
+    Runs in the runner (the pane's writer), so it does not race the
+    executor's injections. Best-effort: a no-op when the overlay is not
+    shown, since the next injected message dismisses it anyway.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: True when an Escape was sent, False when no overlay was shown.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return False
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return False
+    if not _btw_overlay_present(_capture_pane(socket_path, tmux_target)):
+        return False
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+    return True
 
 
 def read_claude_status_model(bridge_dir: Path) -> str | None:

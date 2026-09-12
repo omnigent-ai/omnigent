@@ -3172,6 +3172,18 @@
             ],
             "title": "Role",
             "type": "string"
+          },
+          "stream_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native live-preview stream finalized by this assistant message. Persisted so reconnect snapshots can suppress delayed preview chunks after the authoritative item.",
+            "title": "Stream Message Id"
           }
         },
         "required": [
@@ -4550,6 +4562,17 @@
             ],
             "title": "Sandbox Provider"
           },
+          "sandbox_provider_capabilities": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "boolean"
+              },
+              "type": "object"
+            },
+            "default": {},
+            "title": "Sandbox Provider Capabilities",
+            "type": "object"
+          },
           "sandbox_providers": {
             "items": {
               "type": "string"
@@ -4636,6 +4659,7 @@
             "response.reasoning_text.delta": "#/components/schemas/ReasoningTextDeltaEvent",
             "response.retry": "#/components/schemas/RetryEvent",
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
+            "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
             "session.codex_approval_mode": "#/components/schemas/SessionCodexApprovalModeEvent",
@@ -4725,6 +4749,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSupersededEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionBtwSidechatEvent"
           },
           {
             "$ref": "#/components/schemas/SessionPresenceEvent"
@@ -4881,6 +4908,59 @@
           "agent_name"
         ],
         "title": "SessionAgentChangedEvent",
+        "type": "object"
+      },
+      "SessionBtwSidechatEvent": {
+        "description": "A Claude Code `/btw` side-chat exchange to show transiently.\n\n`/btw` opens an ephemeral side conversation whose answer Claude Code\nkeeps only in its in-TUI overlay \u2014 it is never written to the session\ntranscript. The claude-native forwarder scrapes the settled overlay\nfrom the pane and emits this event so the managed web UI can show the\nsame ephemeral overlay (dismissed with Escape), WITHOUT adding a\npersisted side-chat turn to the main conversation.\n\nCategory: **transient** (SSE-only), live-only by design. Nothing is\npersisted and there is no SSE replay, so a reload drops the overlay \u2014\nmatching the terminal, where Escape closes it and leaves no history.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.btw_sidechat\", \"conversation_id\": <id>, \"question\": <str>, \"answer\": <str>, \"truncated\": <bool>}`.",
+        "properties": {
+          "answer": {
+            "description": "The side-chat answer text.",
+            "title": "Answer",
+            "type": "string"
+          },
+          "conversation_id": {
+            "description": "The conversation whose stream this rides.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "question": {
+            "description": "The `/btw` request line as typed, e.g. `\"/btw is this backward compatible?\"`.",
+            "title": "Question",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "truncated": {
+            "default": false,
+            "description": "True when the pane clipped a longer answer; the web overlay notes it and points at the terminal for the full text.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "type": {
+            "const": "session.btw_sidechat",
+            "description": "Always `\"session.btw_sidechat\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "question",
+          "answer"
+        ],
+        "title": "SessionBtwSidechatEvent",
         "type": "object"
       },
       "SessionChangedFilesInvalidatedEvent": {

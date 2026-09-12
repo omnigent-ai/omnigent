@@ -11,6 +11,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
   composeSandboxWorkspace,
+  composeSandboxWorkspaces,
   composerWorktreeHeaderState,
   deriveHomeDir,
   deriveRepoName,
@@ -580,6 +581,18 @@ describe("sandbox repository helpers", () => {
     ["  https://github.com/org/repo  ", " main ", "https://github.com/org/repo#main"],
   ])("composeSandboxWorkspace(%j, %j) === %j", (url, branch, expected) => {
     expect(composeSandboxWorkspace(url, branch)).toBe(expected);
+  });
+
+  it("composeSandboxWorkspaces maps each selection and drops blank-url entries", () => {
+    expect(
+      composeSandboxWorkspaces([
+        { url: "https://github.com/org/api", branch: "main" },
+        { url: "https://github.com/org/web", branch: "" },
+        // A stray blank-URL entry contributes nothing (never invents "#main").
+        { url: "   ", branch: "dev" },
+      ]),
+    ).toEqual(["https://github.com/org/api#main", "https://github.com/org/web"]);
+    expect(composeSandboxWorkspaces([])).toEqual([]);
   });
 
   it.each<[string, string | null]>([
@@ -1461,6 +1474,7 @@ describe("NewChatLandingScreen", () => {
     cleanup();
     localStorage.clear();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("renders the inline composer with the prompt headline", () => {
@@ -1515,6 +1529,68 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it.each([false, true])(
+    "restores an offline remembered host and requires an explicit switch (managed=%s)",
+    async (managedSandboxesEnabled) => {
+      localStorage.setItem("omnigent:last-host-choice", "host_2");
+      localStorage.setItem(
+        RECENT_KEY,
+        JSON.stringify({ host_1: ["/Users/corey/repo"], host_2: ["/work/repo"] }),
+      );
+      mockHosts([host("online", 1), host("offline", 2)]);
+      renderLanding({ managed_sandboxes_enabled: managedSandboxesEnabled });
+
+      const chip = screen.getByTestId("new-chat-landing-host-chip");
+      await waitFor(() => expect(chip).toHaveAccessibleName("Host: machine-2, Offline"));
+      const input = screen.getByTestId("new-chat-landing-input");
+      fireEvent.change(input, { target: { value: "Work on this repository" } });
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+        "Working directory: /work/repo",
+      );
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_2");
+
+      fireEvent.pointerDown(chip, { button: 0 });
+      expect(screen.getByTestId("new-chat-landing-host-host_2")).toHaveAttribute(
+        "data-active",
+        "true",
+      );
+      fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_1");
+    },
+  );
+
+  it.each(["offline", "missing"])(
+    "blocks creation when the selected host becomes %s and recovers when it returns",
+    async (availability) => {
+      localStorage.setItem("omnigent:last-host-choice", "host_1");
+      renderLanding();
+      const input = screen.getByTestId("new-chat-landing-input");
+      fireEvent.change(input, { target: { value: "Work on this repository" } });
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      await waitFor(() => expect(submit).toBeEnabled());
+
+      mockHosts([host("online", 2), ...(availability === "offline" ? [host("offline", 1)] : [])]);
+      fireEvent.change(input, { target: { value: "Keep working on this repository" } });
+      expect(submit).toBeDisabled();
+      fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_1");
+
+      mockHosts([host("online", 2), host("online", 1)]);
+      fireEvent.change(input, { target: { value: "Continue on the same host" } });
+      expect(submit).toBeEnabled();
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        "Host: machine-1, Online",
+      );
+    },
+  );
+
   it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
     renderLanding();
 
@@ -1530,6 +1606,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("renders the reference two-layer composer with one in-form control row", () => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (X11; Linux x86_64)");
     vi.stubGlobal(
       "SpeechRecognition",
       class {
@@ -1634,7 +1711,7 @@ describe("NewChatLandingScreen", () => {
     expect(permission.querySelector("span")).not.toHaveClass("hidden");
     expect(worktree).toHaveClass(
       "h-6",
-      "max-w-[180px]",
+      "max-w-[calc(50%-0.25rem)]",
       "gap-1",
       "rounded-md",
       "bg-transparent",
@@ -1659,13 +1736,13 @@ describe("NewChatLandingScreen", () => {
       "max-w-full",
       "gap-1",
       "rounded-lg",
-      "pl-2",
-      "pr-0",
+      "px-2",
+      "py-0",
       "text-[13px]",
       "leading-5",
       "md:min-h-7",
     );
-    expect(harness).not.toHaveClass("px-2");
+    expect(harness).not.toHaveClass("pr-0");
     expect(voice).toHaveClass("size-8", "md:size-7");
     expect(submit).toHaveClass("size-8", "md:size-7");
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
@@ -1703,8 +1780,12 @@ describe("NewChatLandingScreen", () => {
         expect(control.compareDocumentPosition(nextControl)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
       }
     }
-    const harnessShell = harness.parentElement;
+    // The tooltip-trigger wrapper keeps the truncation chain flowing (flex +
+    // min-w-0); the rounded shell sits outside it.
+    const harnessTooltipWrapper = harness.parentElement;
     expect(harness).toHaveClass("min-w-0", "w-auto");
+    expect(harnessTooltipWrapper).toHaveClass("flex", "min-w-0");
+    const harnessShell = harnessTooltipWrapper?.parentElement;
     expect(harnessShell).toHaveClass("min-w-0", "items-center", "rounded-lg");
     expect(harnessShell).not.toHaveClass("flex-1", "md:flex-none");
     expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveClass("size-4");
@@ -1734,7 +1815,22 @@ describe("NewChatLandingScreen", () => {
     expect(worktree).toBeDisabled();
   });
 
-  it("renders structured model and effort details in the harness picker", () => {
+  it("resolves family-only host labels in the landing picker", () => {
+    mockClaudeModels([
+      { id: "opus", model: "system.ai.claude-opus-4-6", displayName: "Opus", isDefault: true },
+    ]);
+    renderLanding();
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.6, Effort Default");
+    fireEvent.pointerDown(picker, { button: 0 });
+    const summary = screen.getByTestId("new-chat-landing-agent-summary-a1");
+    expect(summary).toHaveTextContent("Opus 4.6");
+    expect(summary).toHaveClass("text-right");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.6");
+  });
+
+  it("renders structured model and effort details in the harness picker", async () => {
     mockClaudeModels([
       {
         id: "opus",
@@ -1750,7 +1846,18 @@ describe("NewChatLandingScreen", () => {
     expect(picker).not.toHaveTextContent("Claude Code");
     expect(picker).not.toHaveTextContent("Default");
     expect(picker).toHaveAccessibleName("Claude Code, Model Opus 4.8, Effort Default");
-    expect(picker).toHaveAttribute("title", "Claude Code, Model Opus 4.8, Effort Default");
+    // The hover summary is a styled tooltip with bold keys, never the
+    // unstyled native `title` hover.
+    expect(picker).not.toHaveAttribute("title");
+    fireEvent.focus(picker);
+    const pickerTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
+    expect(pickerTooltip).toHaveTextContent("Harness: Claude Code");
+    expect(pickerTooltip).toHaveTextContent("Model: Default (Opus 4.8)");
+    expect(pickerTooltip).toHaveTextContent("Effort: Default");
+    for (const key of within(pickerTooltip).getAllByText(/^(Harness|Model|Effort):$/)) {
+      expect(key).toHaveClass("font-semibold");
+    }
+    fireEvent.blur(picker);
     const productIcon = screen.getByTestId("new-chat-landing-agent-icon").querySelector("img");
     expect(screen.getByTestId("new-chat-landing-agent-icon")).toHaveClass("size-4");
     expect(productIcon).toHaveClass("size-4");
@@ -1766,7 +1873,8 @@ describe("NewChatLandingScreen", () => {
       "min-w-0",
       "whitespace-normal",
       "break-words",
-      "text-ui",
+      "text-[13px]",
+      "leading-5",
       "font-medium",
       "text-foreground",
     );
@@ -1775,7 +1883,7 @@ describe("NewChatLandingScreen", () => {
 
     fireEvent.pointerDown(picker, { button: 0 });
     const [rootMenu] = screen.getAllByRole("menu");
-    expect(rootMenu).toHaveClass("w-[22rem]", "min-w-0", "composer-agent-menu");
+    expect(rootMenu).toHaveClass("w-[17.5rem]", "min-w-0", "composer-agent-menu");
     expect(screen.getByTestId("new-chat-landing-agent-a1").querySelector("img")).toHaveAttribute(
       "src",
       productIcon?.getAttribute("src"),
@@ -1784,7 +1892,7 @@ describe("NewChatLandingScreen", () => {
     expect(editConfig).toHaveTextContent(/^Edit$/);
     expect(editConfig).toHaveAttribute("aria-label", "Edit Claude Code configuration");
     expect(editConfig).toHaveClass("composer-agent-edit");
-    expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveClass("text-left");
+    expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveClass("text-right");
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toContainElement(editConfig);
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
     const menus = screen.getAllByRole("menu");
@@ -1803,7 +1911,8 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
       "shrink-0",
-      "text-ui",
+      "text-[13px]",
+      "leading-5",
       "font-normal",
       "text-muted-foreground",
     );
@@ -1929,9 +2038,9 @@ describe("NewChatLandingScreen", () => {
     const model = screen.getByTestId("new-chat-landing-agent-model-value");
     const voice = screen.getByRole("button", { name: "Voice dictation" });
     const submit = screen.getByTestId("new-chat-landing-submit");
-    expect(picker).toHaveClass("w-auto", "max-w-full", "pl-2", "pr-0");
+    expect(picker).toHaveClass("w-auto", "max-w-full", "px-2", "py-0");
     expect(picker).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
-    expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "px-2");
+    expect(picker).not.toHaveClass("sm:max-w-[14rem]", "md:max-w-[17rem]", "pr-0");
     expect(model).toHaveClass("min-w-0", "whitespace-normal", "break-words");
     expect(model).not.toHaveClass("truncate");
     expect(model).toHaveTextContent("Extraordinarily Long Claude Model Name");
@@ -2047,14 +2156,19 @@ describe("NewChatLandingScreen", () => {
     expect(notices).toContainElement(error);
   });
 
-  it("keeps compact host and working-directory controls accessibly named", () => {
+  it.each([
+    ["Mozilla/5.0 (X11; Linux x86_64)", "This machine"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "This Mac"],
+    ["unknown-browser", "machine-1"],
+  ])("keeps compact controls accessibly named for %s", (userAgent, label) => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(userAgent);
     renderLanding();
 
     const hostTrigger = screen.getByTestId("new-chat-landing-host-chip");
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
-    expect(hostTrigger).toHaveAccessibleName("Host: This machine, Online");
+    expect(hostTrigger).toHaveAccessibleName(`Host: ${label}, Online`);
     expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
-    expect(hostTrigger).toHaveAttribute("title", "Host: This machine, Online");
+    expect(hostTrigger).toHaveAttribute("title", `Host: ${label}, Online`);
     expect(within(hostTrigger).getByTestId("new-chat-landing-host-status")).toHaveClass(
       "bg-success",
     );
@@ -2145,20 +2259,21 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
   });
 
-  it("keeps the responsive sandbox repository trigger accessibly named", () => {
+  it("keeps the responsive sandbox repository trigger accessibly named", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
 
     const repositoryTrigger = screen.getByTestId("new-chat-landing-repo-chip");
-    expect(repositoryTrigger).toHaveAccessibleName("Sandbox repository: Not selected");
+    expect(repositoryTrigger).toHaveAccessibleName("Sandbox repositories: None selected");
     expect(within(repositoryTrigger).getByText("Repository")).toHaveClass("hidden", "lg:block");
     fireEvent.click(repositoryTrigger);
+    // Paste a URL and add it — the chip's accessible name reflects the single
+    // pick using the server's clone-dir naming.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/omnigent-ai/omnigent.git" },
     });
-    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
-      target: { value: "feature" },
-    });
-    expect(repositoryTrigger).toHaveAccessibleName("Sandbox repository: omnigent#feature");
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
+    expect(repositoryTrigger).toHaveAccessibleName("Sandbox repositories: omnigent");
   });
 
   it("names Claude and Codex model and effort details in the harness trigger", () => {
@@ -3156,6 +3271,7 @@ describe("NewChatLandingScreen", () => {
     expect(workspaceLabel).toHaveClass("min-w-0", "truncate", "text-left");
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveClass(
       "h-6",
+      "max-w-[calc(50%-0.25rem)]",
       "gap-1",
       "px-1",
       "text-xs",
@@ -3832,7 +3948,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
   });
 
-  it("offers a GitHub repo picker that fills the sandbox repo URL + branch", async () => {
+  it("adds a GitHub repo from the picker with a branch", async () => {
     // enabled_connections has github + a connected /repos response → the picker renders
     // inside the repo chip and drives the same URL/branch state as the
     // free-text fields.
@@ -3872,25 +3988,24 @@ describe("NewChatLandingScreen", () => {
     );
 
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
-    // Open the searchable repo combobox, filter by typing, then pick the repo.
+    // Open the "Add repository" combobox, filter by typing, then pick the repo.
     fireEvent.click(await screen.findByTestId("new-chat-landing-repo-select"));
     fireEvent.change(await screen.findByTestId("new-chat-landing-repo-search"), {
       target: { value: "hello" },
     });
     fireEvent.click(await screen.findByRole("option", { name: /octo\/hello/ }));
 
-    // Picking the repo composes the clone URL into the shared URL field.
-    expect((screen.getByTestId("new-chat-landing-repo-input") as HTMLInputElement).value).toBe(
-      "https://github.com/octo/hello.git",
-    );
+    // Picking the repo adds it as a row; the chip reflects the single pick using
+    // the server's clone-dir naming.
+    const row = await screen.findByTestId("new-chat-landing-repo-row");
+    expect(row.textContent).toContain("octo/hello");
+    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("hello");
 
-    // Its branches load into the searchable branch combobox; open it, wait for
-    // the async list, then choosing one fills the branch.
+    // The row's branches load into a searchable branch combobox; open it, wait
+    // for the async list, then choosing one updates the chip label.
     fireEvent.click(await screen.findByTestId("new-chat-landing-repo-branch-select"));
     fireEvent.click(await screen.findByRole("option", { name: "dev" }));
-    expect(
-      (screen.getByTestId("new-chat-landing-repo-branch-input") as HTMLInputElement).value,
-    ).toBe("dev");
+    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("hello#dev");
   });
 
   it("hides the GitHub repo picker when the GitHub App is disabled", async () => {
@@ -4104,49 +4219,103 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-provisioning")).toBeNull();
   });
 
-  it("sends the repository inputs as the managed workspace string", async () => {
+  it("sends the added repositories as the managed workspaces list", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
-    renderLanding({ managed_sandboxes_enabled: true });
+    // The multi-repo picker only shows for a provider that declares the
+    // capability; agent_sandbox does.
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+    });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     // The repository chip replaces the file-browser workspace chip in
     // sandbox mode.
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
-    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
-      target: { value: "https://github.com/org/myrepo" },
-    });
-    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
-      target: { value: "release-1.2" },
-    });
-    // The chip reflects the pick using the server's clone-dir naming.
+    // Paste two URLs and add each — they become sibling rows the server clones
+    // in parallel; the chip shows the count.
+    const paste = screen.getByTestId("new-chat-landing-repo-input");
+    fireEvent.change(paste, { target: { value: "https://github.com/org/api" } });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    fireEvent.change(paste, { target: { value: "https://github.com/org/web" } });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await waitFor(() => expect(screen.getAllByTestId("new-chat-landing-repo-row")).toHaveLength(2));
     expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain(
-      "myrepo#release-1.2",
+      "2 repositories",
     );
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-      target: { value: "audit the repo" },
+      target: { value: "audit the repos" },
     });
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-    // One composed string — the Docker-build-context-style form the
-    // server parses and clones. host_id/git stay absent (422 otherwise).
-    expect(body.workspace).toBe("https://github.com/org/myrepo#release-1.2");
+    // A list of Docker-build-context-style strings the server parses and clones
+    // in parallel. host_id/git stay absent (422 otherwise).
+    expect(body.workspaces).toEqual(["https://github.com/org/api", "https://github.com/org/web"]);
     expect(body.host_type).toBe("managed");
     expect("host_id" in body).toBe(false);
     expect("git" in body).toBe(false);
   });
 
-  it("clears a drafted sandbox repository when remounting under another project", async () => {
+  it("caps the picker at one repository for a single-repo provider", async () => {
+    // A provider that doesn't declare multi_repo gets a single-repo picker: once
+    // one repo is added, the add controls disappear so no second can be picked.
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_provider_capabilities: { modal: { multi_repo: false } },
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/api" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
+    // At the cap: the add controls (paste input included) are gone.
+    expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull();
+    expect(screen.getAllByTestId("new-chat-landing-repo-row")).toHaveLength(1);
+  });
+
+  it("blocks submit when remembered repos exceed a single-repo provider's cap", async () => {
+    // Two repos remembered from a prior multi-repo session seed the picker; on a
+    // single-repo provider they're over cap, so submit is blocked (with a
+    // warning) rather than 422'd after the session row is created.
+    localStorage.setItem(
+      "omnigent:last-sandbox-repos",
+      JSON.stringify([
+        { url: "https://github.com/org/api", branch: "" },
+        { url: "https://github.com/org/web", branch: "" },
+      ]),
+    );
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_provider_capabilities: { modal: { multi_repo: false } },
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "go" } });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    expect(screen.getByTestId("new-chat-landing-repo-overcap")).toBeInTheDocument();
+    expect((screen.getByTestId("new-chat-landing-submit") as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it("clears drafted sandbox repositories when remounting under another project", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
-    // Project Alpha's composer: stage a sandbox repo + branch, then navigate
-    // away (unmount parks them in the module-scoped landing draft).
+    // Project Alpha's composer: stage a sandbox repo, then navigate away
+    // (unmount parks the selections in the module-scoped landing draft).
     renderLanding({ managed_sandboxes_enabled: true }, "/?project=Alpha");
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
@@ -4154,15 +4323,14 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/alpha-repo" },
     });
-    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
-      target: { value: "alpha-main" },
-    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
     // Unmount WITHOUT resetting the draft — the leak under test rides in it.
     cleanup();
 
-    // Project Beta's composer: the repo inputs compose the managed create's
-    // workspace string, so Alpha's repo/branch must not survive — otherwise
-    // Beta's sandbox silently clones another project's repository.
+    // Project Beta's composer: the selections compose the managed create's
+    // workspaces, so Alpha's repo must not survive — otherwise Beta's sandbox
+    // silently clones another project's repository.
     renderLanding({ managed_sandboxes_enabled: true }, "/?project=Beta");
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository"),
@@ -4175,9 +4343,9 @@ describe("NewChatLandingScreen", () => {
     const [, init] = authenticatedFetchMock.mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
     expect(body.host_type).toBe("managed");
-    // Blank repo inputs compose to an omitted workspace (empty server-created
-    // one) — not Alpha's repo#branch.
-    expect(body.workspace).toBeUndefined();
+    // No selections carried over → an empty workspaces list (empty server-created
+    // workspace), not Alpha's repo.
+    expect(body.workspaces).toEqual([]);
   });
 
   it("carries the picked provider in the managed create when several are offered", async () => {
@@ -4267,7 +4435,7 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("blocks submit on an invalid repository URL or a dangling branch", () => {
+  it("gates the add-repository button on a valid URL; submit stays enabled", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
@@ -4278,20 +4446,21 @@ describe("NewChatLandingScreen", () => {
     // No repo at all is a valid sandbox create (empty workspace).
     expect(submit.disabled).toBe(false);
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
-    // A branch with no repository is dangling — nothing to clone it from.
-    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
-      target: { value: "main" },
-    });
-    expect(submit.disabled).toBe(true);
-    // An unusable URL shape would 422 server-side; gate it inline.
+    const add = screen.getByTestId("new-chat-landing-repo-add") as HTMLButtonElement;
+    // An unusable URL shape can't be added (it would 422 server-side); the
+    // half-typed input is not a selection, so submit stays enabled.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "org/repo" },
     });
-    expect(submit.disabled).toBe(true);
-    // Completing a valid URL re-enables submit.
+    expect(add.disabled).toBe(true);
+    expect(submit.disabled).toBe(false);
+    // A valid URL enables Add; adding it keeps submit enabled.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/repo" },
     });
+    expect(add.disabled).toBe(false);
+    fireEvent.click(add);
+    await screen.findByTestId("new-chat-landing-repo-row");
     expect(submit.disabled).toBe(false);
   });
 });
@@ -4957,7 +5126,7 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
   });
 
-  it("shows the selected host's model provider in the compact selector tooltip", () => {
+  it("shows the selected host's model provider in the compact selector tooltip", async () => {
     useHostModelOptionsMock.mockImplementation(
       (_hostId, harness) =>
         (harness === "claude-native"
@@ -4971,10 +5140,15 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
           : CODEX_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
     );
     renderLanding();
-    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAttribute(
-      "title",
-      "Claude Code, Model Default, Effort Default, Connection Claude subscription",
-    );
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).not.toHaveAttribute("title");
+    fireEvent.focus(picker);
+    const pickerTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
+    expect(pickerTooltip).toHaveTextContent("Harness: Claude Code");
+    expect(pickerTooltip).toHaveTextContent("Model: Default");
+    expect(pickerTooltip).toHaveTextContent("Effort: Default");
+    expect(pickerTooltip).toHaveTextContent("Connection: Claude subscription");
+    fireEvent.blur(picker);
   });
 
   it("reflects an armed Codex bypass in the anchored Approval control", () => {
@@ -6012,14 +6186,20 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toHaveAttribute("data-disabled");
   });
 
-  it("reads 'Smart Routing' on the composer chip and highlights only its own row", () => {
+  it("reads 'Smart Routing' on the composer chip and highlights only its own row", async () => {
     renderLanding({ smart_routing_enabled: true });
     selectSmartRoutingHarness();
     const chip = screen.getByTestId("new-chat-landing-agent-select");
     expect(chip.textContent).toContain("Smart Routing");
     // The placeholder wrapper must not be named — the router owns the pick.
     expect(chip.textContent).not.toContain("Claude Code");
-    expect(chip).toHaveAttribute("title", "Harness and model picked per task by smart routing");
+    // The routing description rides the styled tooltip, not the native hover.
+    expect(chip).not.toHaveAttribute("title");
+    fireEvent.pointerEnter(chip);
+    fireEvent.focus(chip);
+    const chipTooltip = await screen.findByTestId("new-chat-landing-agent-tooltip");
+    expect(chipTooltip).toHaveTextContent("Harness and model picked per task by smart routing");
+    fireEvent.blur(chip);
     // Two rows lit at once would misreport what runs.
     openPicker();
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toHaveAttribute("data-active", "true");

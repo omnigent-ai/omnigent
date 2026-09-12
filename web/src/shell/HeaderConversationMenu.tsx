@@ -8,6 +8,7 @@ import {
 } from "react";
 import {
   ArchiveIcon,
+  ArchiveRestoreIcon,
   ChevronLeftIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -114,6 +115,7 @@ export function HeaderConversationMenu({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isArchived = conversation.archived === true;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
@@ -172,6 +174,12 @@ export function HeaderConversationMenu({
 
   const archiveConversation = () => {
     closeMenu();
+    if (isArchived) {
+      // Unarchiving keeps the user on the session — no redirect home and no
+      // Undo toast (mirrors the sidebar row's Unarchive).
+      archive.mutate({ id: conversation.id, archived: false });
+      return;
+    }
     // The row leaves the sidebar optimistically (useArchiveConversation flips
     // the cached `archived` flag in onMutate), and we're viewing the session
     // being archived, so leave its chat surface now — synchronously, like
@@ -305,8 +313,12 @@ export function HeaderConversationMenu({
         className={itemClass}
         onSelect={archiveConversation}
       >
-        <ArchiveIcon className="size-3.5" />
-        Archive
+        {isArchived ? (
+          <ArchiveRestoreIcon className="size-3.5" />
+        ) : (
+          <ArchiveIcon className="size-3.5" />
+        )}
+        {isArchived ? "Unarchive" : "Archive"}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"

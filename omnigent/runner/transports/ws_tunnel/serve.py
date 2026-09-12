@@ -50,17 +50,17 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_body,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.limits import (
-    RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-)
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
 )
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.tunnel_limits import (
+    RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 
 _logger = logging.getLogger(__name__)
 
