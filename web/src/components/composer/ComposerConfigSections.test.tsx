@@ -92,19 +92,78 @@ describe("ComposerConfigSections", () => {
     expect(screen.getByText("Opus (current)")).toBeInTheDocument();
   });
 
-  it("renders the same composed structure for the chat and landing callers (parity)", () => {
-    // Both surfaces feed the SAME component, so a chat-keyed and a landing-keyed
-    // section render identical structure — the guard against the two composers
-    // drifting back into separate page-local config menus.
-    const shape = (root: HTMLElement) => ({
-      header: within(root).getByText("Models").textContent,
-      rows: within(root).getAllByRole("menuitemcheckbox").length,
+  it("renders the same section framework for the genuinely-different chat and landing inputs (parity)", () => {
+    // Feed the DIFFERENT data each real adapter supplies — chat: a "Default" +
+    // a disabled "(current)" row; landing: a search leading slot + "Harness
+    // default" + a wrapping model row — and assert both still produce the SAME
+    // shared framework: a Models section (header + checkbox rows) and a
+    // separator-led Effort section. This is the guard against the two composers
+    // drifting back into separate page-local config menus (not a same-fixture
+    // tautology).
+    const assertFramework = (modelsTestId: string, effortTestId: string) => {
+      const models = screen.getByTestId(modelsTestId);
+      expect(within(models).getByText("Models")).toBeInTheDocument();
+      expect(within(models).getAllByRole("menuitemcheckbox").length).toBeGreaterThan(0);
+      const efforts = screen.getByTestId(effortTestId);
+      expect(within(efforts).getByText("Effort")).toBeInTheDocument();
+      expect(within(efforts).getAllByRole("menuitemcheckbox").length).toBeGreaterThan(0);
+    };
+
+    // Chat adapter shape (ChatPage.configContent).
+    const { unmount } = renderSections({
+      models: {
+        testId: "composer-agent-models",
+        header: "Models",
+        choices: [
+          { key: "__default__", label: "Default", checked: true, onSelect: vi.fn() },
+          { key: "opus", label: "Opus 4.8", checked: false, onSelect: vi.fn() },
+          { key: "__current__", label: "Opus 4.8 (current)", checked: false, disabled: true },
+        ],
+      },
+      efforts: {
+        testId: "composer-agent-efforts",
+        header: "Effort",
+        choices: [
+          { key: "default", label: "Default", checked: true, onSelect: vi.fn() },
+          { key: "high", label: "High", checked: false, onSelect: vi.fn() },
+        ],
+      },
     });
-    const { unmount } = renderSections({ models: modelsSection("composer-agent-models") });
-    const chat = shape(screen.getByTestId("composer-agent-models"));
+    assertFramework("composer-agent-models", "composer-agent-efforts");
     unmount();
-    renderSections({ models: modelsSection("new-chat-landing-agent-models") });
-    const landing = shape(screen.getByTestId("new-chat-landing-agent-models"));
-    expect(landing).toEqual(chat);
+
+    // Landing adapter shape (NewChatDialog.selectedConfigContent): a search
+    // leading slot + "Harness default" + a wrapping model row.
+    renderSections({
+      models: {
+        testId: "new-chat-landing-agent-models",
+        header: "Models",
+        leading: <input aria-label="Search models" />,
+        choices: [
+          { key: "__default__", label: "Harness default", checked: true, onSelect: vi.fn() },
+          {
+            key: "opus",
+            label: "Opus 4.8 (1M context)",
+            checked: false,
+            onSelect: vi.fn(),
+            title: "Opus 4.8 (1M context)",
+            className: "whitespace-normal break-words",
+          },
+        ],
+      },
+      efforts: {
+        testId: "new-chat-landing-agent-efforts",
+        header: "Effort",
+        choices: [
+          { key: "default", label: "Default", checked: true, onSelect: vi.fn() },
+          { key: "high", label: "High", checked: false, onSelect: vi.fn() },
+        ],
+      },
+    });
+    assertFramework("new-chat-landing-agent-models", "new-chat-landing-agent-efforts");
+    // The landing's page-local search slot renders inside the shared section.
+    expect(
+      within(screen.getByTestId("new-chat-landing-agent-models")).getByLabelText("Search models"),
+    ).toBeInTheDocument();
   });
 });
