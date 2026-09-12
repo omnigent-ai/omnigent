@@ -12,4 +12,15 @@ the two in sync, so releases are cut by bumping pyproject alone (via
 ``scripts/update_versions.py``).
 """
 
+import hashlib
+from pathlib import Path
+
 VERSION = "0.14.0.dev0"
+
+
+def webapp_build_id(index_html: Path) -> str | None:
+    """Fingerprint the built SPA, or return None for an absent/unreadable bundle."""
+    try:
+        return hashlib.sha256(index_html.read_bytes()).hexdigest()
+    except OSError:
+        return None

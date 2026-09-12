@@ -2312,17 +2312,21 @@ def create_app(
             }
         return result
 
+    from omnigent.version import webapp_build_id
+
+    # Snapshot the served bundle once per app startup, including API-only installs.
+    build_id = webapp_build_id(_WEB_UI_DIST / "index.html")
+
     @app.get("/api/version")
-    async def version() -> dict[str, str]:
+    async def version() -> dict[str, str | None]:
         """
-        Return the installed omnigent package version.
+        Return the installed package version and built SPA fingerprint.
 
         Used by the web UI to include version info in bug reports.
 
-        :returns: ``{"version": "<semver string>"}``,
-            e.g. ``{"version": "0.1.0"}``.
+        :returns: Package version and nullable ``webapp_build_id``.
         """
-        return {"version": _server_version()}
+        return {"version": _server_version(), "webapp_build_id": build_id}
 
     @app.get("/.well-known/omnigent.json")
     async def well_known_manifest() -> dict[str, object]:

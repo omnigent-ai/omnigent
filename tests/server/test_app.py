@@ -8,6 +8,7 @@ they live here following the source ↔ test directory mirroring rule.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -72,6 +73,58 @@ def test_server_version_reads_version_constant() -> None:
     from omnigent.version import VERSION
 
     assert server_app._server_version() == VERSION
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bundle", ["present", "missing", "unreadable"])
+async def test_version_snapshots_webapp_build_id(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bundle: str
+) -> None:
+    """The fingerprint hashes exact built bytes once, and tolerates API-only installs."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.version import VERSION
+
+    dist = tmp_path / "web-ui"
+    dist.mkdir()
+    index = dist / "index.html"
+    content = b'<html><script src="/assets/app-first.js"></script></html>\r\n'
+    if bundle == "present":
+        index.write_bytes(content)
+    elif bundle == "unreadable":
+        index.mkdir()
+    monkeypatch.setattr(server_app, "_WEB_UI_DIST", dist)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    def make_app() -> FastAPI:
+        return server_app.create_app(
+            agent_store=SqlAlchemyAgentStore(db_uri),
+            file_store=SqlAlchemyFileStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            artifact_store=artifact_store,
+            agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        )
+
+    app = make_app()
+    expected = hashlib.sha256(content).hexdigest() if bundle == "present" else None
+    if bundle == "unreadable":
+        index.rmdir()
+    changed = b'<html><script src="/assets/app-second.js"></script></html>'
+    index.write_bytes(changed)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        for _ in range(2):
+            response = await c.get("/api/version")
+            assert response.status_code == 200
+            assert response.json() == {"version": VERSION, "webapp_build_id": expected}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_app()), base_url="http://test"
+    ) as c:
+        response = await c.get("/api/version")
+        assert response.json() == {
+            "version": VERSION,
+            "webapp_build_id": hashlib.sha256(changed).hexdigest(),
+        }
 
 
 @pytest.mark.asyncio
