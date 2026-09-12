@@ -1715,7 +1715,18 @@ def register_resources_routes(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        artifact_store.delete(file_id)
+        # Best-effort blob cleanup: the metadata row is already gone, so
+        # a failing store backend must not fail the delete — the blob
+        # leaks and can be reaped later.
+        try:
+            artifact_store.delete(file_id)
+        except Exception:
+            _logger.warning(
+                "Failed to delete file blob during file delete: session=%s file_id=%s",
+                session_id,
+                file_id,
+                exc_info=True,
+            )
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.deleted",

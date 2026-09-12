@@ -2085,6 +2085,41 @@ async def test_delete_session_file(
     assert get_resp.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_delete_session_file_survives_blob_delete_failure(
+    file_client: httpx.AsyncClient,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """DELETE /resources/files/{id} succeeds when blob cleanup fails.
+
+    The metadata row is deleted before the blob, so a store-backend
+    failure raised out of ``artifact_store.delete`` would 500 after the
+    row is already gone — leaving a phantom file whose retry can only
+    404. Blob cleanup is best-effort: the delete must still succeed.
+    """
+    upload = await file_client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
+        files={"file": ("temp.txt", b"gone", "text/plain")},
+    )
+    file_id = upload.json()["id"]
+
+    def _failing_delete(key: str) -> None:
+        raise RuntimeError("artifact backend unavailable")
+
+    artifact_store.delete = _failing_delete  # type: ignore[method-assign]
+
+    resp = await file_client.delete(
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}",
+    )
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+
+    get_resp = await file_client.get(
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}",
+    )
+    assert get_resp.status_code == 404
+
+
 # ── files:copy — lineage-scoped file copy tests ─────────────────
 
 
