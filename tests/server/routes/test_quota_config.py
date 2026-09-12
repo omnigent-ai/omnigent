@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.errors import OmnigentError
-from omnigent.server.routes import quota_config
+from omnigent.server.routes import _quota_controller, quota_config
 
 
 def _app() -> FastAPI:
@@ -40,11 +40,13 @@ def _request(method: str, **kwargs: Any) -> httpx.Response:
 
 
 def test_get_returns_authoritative_controller_policy(monkeypatch: Any) -> None:
-    async def proxy(method: str, body: dict[str, object] | None = None) -> dict[str, object]:
-        assert (method, body) == ("GET", None)
+    async def proxy(
+        method: str, path: str, body: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        assert (method, path, body) == ("GET", "/v1/burst-policy", None)
         return _policy()
 
-    monkeypatch.setattr(quota_config, "_proxy", proxy)
+    monkeypatch.setattr(quota_config, "proxy", proxy)
     response = _request("GET")
     assert response.status_code == 200
     assert response.json() == _policy()
@@ -53,17 +55,20 @@ def test_get_returns_authoritative_controller_policy(monkeypatch: Any) -> None:
 def test_patch_translates_to_admin_put_with_server_idempotency_key(monkeypatch: Any) -> None:
     seen: dict[str, object] = {}
 
-    async def proxy(method: str, body: dict[str, object] | None = None) -> dict[str, object]:
-        seen.update({"method": method, "body": body})
+    async def proxy(
+        method: str, path: str, body: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        seen.update({"method": method, "path": path, "body": body})
         return {**_policy(), "max_burst_factor": 2.5, "adaptive_enabled": False}
 
-    monkeypatch.setattr(quota_config, "_proxy", proxy)
+    monkeypatch.setattr(quota_config, "proxy", proxy)
     response = _request(
         "PATCH",
         json={"max_burst_factor": 2.5, "adaptive_enabled": False},
     )
     assert response.status_code == 200
     assert seen["method"] == "PUT"
+    assert seen["path"] == "/v1/burst-policy"
     body = seen["body"]
     assert isinstance(body, dict)
     assert body["max_burst_factor"] == 2.5
@@ -86,10 +91,10 @@ def test_controller_token_file_must_be_owner_only(monkeypatch: Any, tmp_path: Pa
     token_file.chmod(0o644)
     monkeypatch.setenv("LLMQ_CONTROLLER_TOKEN_FILE", str(token_file))
     with pytest.raises(OmnigentError, match="credentials are unavailable"):
-        quota_config._read_controller_token()
+        _quota_controller.read_controller_token()
 
     token_file.chmod(0o600)
-    assert quota_config._read_controller_token() == "secret"
+    assert _quota_controller.read_controller_token() == "secret"
 
 
 def test_controller_token_file_rejects_links(monkeypatch: Any, tmp_path: Path) -> None:
@@ -100,13 +105,13 @@ def test_controller_token_file_rejects_links(monkeypatch: Any, tmp_path: Path) -
     hardlink.hardlink_to(token_file)
     monkeypatch.setenv("LLMQ_CONTROLLER_TOKEN_FILE", str(hardlink))
     with pytest.raises(OmnigentError, match="credentials are unavailable"):
-        quota_config._read_controller_token()
+        _quota_controller.read_controller_token()
 
     symlink = tmp_path / "symlink"
     symlink.symlink_to(token_file)
     monkeypatch.setenv("LLMQ_CONTROLLER_TOKEN_FILE", str(symlink))
     with pytest.raises(OmnigentError, match="credentials are unavailable"):
-        quota_config._read_controller_token()
+        _quota_controller.read_controller_token()
 
 
 @pytest.mark.parametrize("factor", [0.5, float("inf"), float("nan")])

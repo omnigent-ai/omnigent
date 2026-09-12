@@ -8658,6 +8658,7 @@ async def _create_session_from_existing_agent(
     except Exception:  # noqa: BLE001
         pass
 
+    seed_warnings: list[dict[str, str]] = []
     if body.initial_items:
         runner_client = await _get_runner_client(conv.id, runner_router)
         if runner_client is None:
@@ -8674,6 +8675,42 @@ async def _create_session_from_existing_agent(
                 for item in body.initial_items
             ]
             await asyncio.to_thread(conversation_store.append, conv.id, new_items)
+            # Keep the original event envelopes so a later runner bind can
+            # replay them through the normal dispatch path.  The transcript
+            # seed above remains the durable history copy; this state is only
+            # the delivery ledger and is cleared after dispatch succeeds.
+            await asyncio.to_thread(
+                conversation_store.set_session_state,
+                conv.id,
+                {
+                    **conv.session_state,
+                    "pending_initial_items": [item.model_dump(mode="json") for item in body.initial_items],
+                    "pending_initial_items_warning": "initial_items_seeded_not_dispatched",
+                },
+            )
+            # Seeding is a silent downgrade: the caller asked for a prompt and
+            # got history. That is invisible in the session snapshot -- the item
+            # is present and looks delivered -- so a client that creates a
+            # session with a first prompt and waits, waits forever. Say so in
+            # the create response and the log rather than leaving the caller to
+            # infer it from a session that never leaves ``idle``.
+            seed_warnings.append(
+                {
+                    "code": "initial_items_seeded_not_dispatched",
+                    "message": (
+                        "No runner was available at creation, so initial_items were stored "
+                        "as history and will not run. Post them to "
+                        "POST /v1/sessions/{id}/events once the session is bound."
+                    ),
+                }
+            )
+            _logger.warning(
+                "initial_items seeded without dispatch session=%s items=%d runner_id=%s",
+                conv.id,
+                len(new_items),
+                conv.runner_id,
+                extra={"session_id": conv.id},
+            )
         else:
             await _ensure_runner_relay_ready(
                 conv.id,
@@ -8715,7 +8752,7 @@ async def _create_session_from_existing_agent(
             agent_cache=agent_cache,
             liveness_lookup=liveness_lookup,
         ),
-        project_resolution.warnings,
+        (*project_resolution.warnings, *seed_warnings),
     )
 
 

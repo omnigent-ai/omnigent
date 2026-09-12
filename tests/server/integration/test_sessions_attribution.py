@@ -501,6 +501,63 @@ async def test_single_user_local_actor_not_attributed(
 
 
 @pytest.mark.asyncio
+async def test_initial_items_without_a_runner_warn_they_will_not_run(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Seeding is a downgrade, and the create response has to say so.
+
+    With no runner bound, ``initial_items`` are persisted as history and never
+    dispatched. The item then looks delivered in the session snapshot, so a
+    caller that creates a session with a first prompt and waits, waits forever.
+    The warning is the only signal that the prompt will not run.
+    """
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+
+    resp = await auth_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "kick off"}],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    warnings = resp.json().get("warnings") or []
+    codes = [warning["code"] for warning in warnings]
+    assert "initial_items_seeded_not_dispatched" in codes, warnings
+
+
+@pytest.mark.asyncio
+async def test_create_without_initial_items_raises_no_seed_warning(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """The warning is about a downgrade that happened, not a missing runner.
+
+    The app UI creates sessions with an empty ``initial_items`` and posts the
+    first message separately; nothing was downgraded there, so warning about it
+    would be noise on the common path.
+    """
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+
+    resp = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "initial_items": []},
+    )
+
+    assert resp.status_code == 201, resp.text
+    codes = [warning["code"] for warning in (resp.json().get("warnings") or [])]
+    assert "initial_items_seeded_not_dispatched" not in codes
+
+
+@pytest.mark.asyncio
 async def test_initial_items_record_creator(
     auth_client: httpx.AsyncClient,
     db_uri: str,

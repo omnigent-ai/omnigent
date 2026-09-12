@@ -156,6 +156,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _build_session_response,
     _create_session_from_bundle,
     _create_session_from_existing_agent,
+    _dispatch_session_event_to_runner,
     _ensure_runner_relay_ready,
     _get_session_snapshot,
     _is_native_terminal_session,
@@ -174,6 +175,7 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     SessionAgentChangedEvent,
     SessionCreateRequest,
+    SessionEventInput,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
@@ -1944,6 +1946,44 @@ def register_core_routes(
                     _runner_client,
                     conversation_store,
                 )
+                # A create with initial_items can precede runner startup. The
+                # create path stores those events as history plus a durable
+                # delivery ledger; replay them now that the runner is ready.
+                if _runner_client is not None:
+                    pending = list((conv.session_state or {}).get("pending_initial_items", []))
+                    if pending:
+                        agent = (
+                            await asyncio.to_thread(agent_store.get, conv.agent_id)
+                            if conv.agent_id is not None
+                            else None
+                        )
+                        for index, raw_item in enumerate(pending):
+                            await _dispatch_session_event_to_runner(
+                                session_id,
+                                conv,
+                                SessionEventInput.model_validate(raw_item),
+                                conversation_store,
+                                _runner_client,
+                                agent_name=agent.name if agent is not None else None,
+                                file_store=file_store,
+                                artifact_store=artifact_store,
+                                runner_router=runner_router,
+                            )
+                            remaining = pending[index + 1 :]
+                            next_state = dict(conv.session_state or {})
+                            if remaining:
+                                next_state["pending_initial_items"] = remaining
+                            else:
+                                next_state.pop("pending_initial_items", None)
+                                next_state.pop("pending_initial_items_warning", None)
+                            await asyncio.to_thread(
+                                conversation_store.set_session_state,
+                                session_id,
+                                next_state,
+                            )
+                            conv = conv.__class__(
+                                **{**conv.__dict__, "session_state": next_state}
+                            )
         else:
             conv = conv_for_collaboration_mode
             if conv is None:

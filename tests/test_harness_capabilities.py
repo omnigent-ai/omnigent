@@ -25,6 +25,7 @@ from omnigent.harness_capabilities import (
 from omnigent.harness_plugins import (
     HarnessContribution,
     harness_capabilities,
+    harness_capabilities_by_spelling,
     harness_catalog,
     harness_setup_steps_by_spelling,
     native_agents,
@@ -264,6 +265,40 @@ def test_setup_steps_by_spelling_covers_native_and_installable_ids() -> None:
     # Installable ids that are NOT picker rows still resolve.
     assert "opencode" in by_spelling
     assert "qwen" in by_spelling
+
+
+def test_capabilities_by_spelling_covers_every_declaring_harness() -> None:
+    """The by-spelling map serves what the registry declares.
+
+    ``harness_catalog`` only carries capabilities for picker rows, and the
+    native wrappers a session declares are not picker rows — so the catalog
+    alone answered "what can this harness do?" for a third of the harnesses
+    that declare an answer.
+    """
+    by_spelling = harness_capabilities_by_spelling()
+    declared = harness_capabilities()
+
+    assert set(by_spelling) == set(declared)
+    # Every native wrapper a session can declare resolves...
+    native_spellings = {agent.harness for agent in native_agents()}
+    assert native_spellings <= set(by_spelling), native_spellings - set(by_spelling)
+    # ...including the ones the picker never lists.
+    picker_ids = {row["id"] for row in harness_catalog()}
+    assert "claude-native" not in picker_ids
+    assert "claude-native" in by_spelling
+
+    # Values mirror the declaration, so the two views cannot drift.
+    for harness, record in declared.items():
+        assert by_spelling[harness] == record.as_dict(), harness
+
+
+def test_capabilities_by_spelling_matches_catalog_rows_that_have_them() -> None:
+    """Where both views cover a harness they must agree."""
+    by_spelling = harness_capabilities_by_spelling()
+    for row in harness_catalog():
+        capabilities = row.get("capabilities")
+        if capabilities is not None:
+            assert by_spelling[str(row["id"])] == capabilities, row["id"]
 
 
 def test_fork_history_axis_matches_canonical_declarations() -> None:
