@@ -41,7 +41,7 @@ from omnigent.onboarding.provider_config import (
     _VALID_FAMILIES,
     _config_path,
     _parse_provider,
-    resolve_secret,
+    credential_for_block,
 )
 
 _logger = logging.getLogger(__name__)
@@ -249,9 +249,9 @@ def provider_delete(name: str, config_path: str | None = None) -> dict[str, Any]
 def provider_test(name: str, config_path: str | None = None) -> dict[str, Any]:
     """Probe a provider's endpoint with its own credential.
 
-    Resolves the credential exactly as a turn would (:func:`resolve_secret`
-    for ``api_key_ref``, ``$VAR`` expansion for inline keys, subcommand
-    execution for ``auth_command``) and issues one authenticated
+    Resolves the credential exactly as a turn would
+    (:func:`credential_for_block` for ``api_key_ref`` and inline keys,
+    subcommand execution for ``auth_command``) and issues one authenticated
     ``GET {base_url}/models``. The credential value is sent only to the
     provider's own ``base_url`` and is never included in the result.
 
@@ -295,12 +295,8 @@ def provider_test(name: str, config_path: str | None = None) -> dict[str, Any]:
             code=ErrorCode.INVALID_INPUT,
         )
 
-    secret: str | None = None
-    if isinstance(block.get("api_key_ref"), str):
-        secret = resolve_secret(block["api_key_ref"])
-    elif isinstance(block.get("api_key"), str):
-        secret = resolve_secret(block["api_key"])
-    elif isinstance(block.get("auth_command"), str):
+    secret: str | None = credential_for_block(block)
+    if secret is None and isinstance(block.get("auth_command"), str):
         proc = subprocess.run(
             block["auth_command"], shell=True, capture_output=True, text=True, timeout=15
         )
