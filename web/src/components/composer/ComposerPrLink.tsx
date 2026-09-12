@@ -1,4 +1,5 @@
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
 import { cn } from "@/lib/utils";
 
 /**
@@ -36,7 +37,12 @@ export function ComposerPrLink({
       )}
     >
       <GithubMono size={14} aria-hidden />
-      <span className="tabular-nums whitespace-nowrap underline underline-offset-2">
+      <span
+        className={cn(
+          "tabular-nums whitespace-nowrap underline underline-offset-2",
+          COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
+        )}
+      >
         {prCount > 1 ? `${prCount} PRs` : `#${prNumber}`}
       </span>
     </button>

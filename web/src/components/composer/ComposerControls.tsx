@@ -1,4 +1,4 @@
-import { forwardRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import { forwardRef, useRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import {
   ChevronDownIcon,
   FolderIcon,
@@ -16,13 +16,20 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { COMPOSER_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
+import {
+  COMPOSER_COLLAPSED_LABEL_CLASS,
+  COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
+  useCollapsedWorkspaceLabels,
+} from "./ChatComposer";
 
 export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+  const barRef = useRef<HTMLDivElement>(null);
+  useCollapsedWorkspaceLabels(barRef);
   return (
     <div
+      ref={barRef}
       className={cn(
-        "relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-start gap-2 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 pt-1.5",
+        "group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-start gap-2 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 pt-1.5",
         className,
       )}
       {...props}
@@ -46,7 +53,12 @@ export const ComposerWorkspaceTrigger = forwardRef<
       {...props}
     >
       <Icon className="size-3.5 shrink-0" />
-      <span className="min-w-0 truncate text-left">{label}</span>
+      <span
+        data-workspace-collapse-label=""
+        className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+      >
+        {label}
+      </span>
       <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
     </button>
   );

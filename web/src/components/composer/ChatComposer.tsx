@@ -28,6 +28,10 @@ export const COMPOSER_LABELS_MIN_GAP_PX = 24;
 export const COMPOSER_COLLAPSED_LABEL_CLASS =
   "group-data-[labels=collapsed]/composer-actions:hidden";
 
+/** Hides a workspace-bar chip's text label while the bar is collapsed to icons. */
+export const COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS =
+  "group-data-[labels=collapsed]/composer-workspace:hidden";
+
 export interface ComposerKeyIntent {
   shouldSubmitFromKeyboard: boolean;
   shouldPreferSendOverCompletion: boolean;
@@ -151,6 +155,45 @@ function useCollapsedComposerLabels(
       mutationObserver.disconnect();
     };
   }, [rowRef, widthRef, leadingRef, trailingRef]);
+}
+
+/**
+ * Collapse the workspace bar's chip labels to icons whenever the bar cannot
+ * show every label in full — a chip is truncating, or the row overflows its
+ * width — and restore them once they fit again. The verdict lands on the bar
+ * as `data-labels="collapsed"`, which `COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS`
+ * turns into `display: none` on each chip label.
+ *
+ * The bar's height is fixed, so it is safe to resize-observe directly — the
+ * collapse never changes the observed box, so there is no probe element and no
+ * observer loop. Every measure probes the expanded layout first (labels shown),
+ * so the verdict never feeds on its own collapsed widths.
+ */
+export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null>) {
+  useLayoutEffect(() => {
+    const bar = barRef.current;
+    if (!bar) return;
+    const measure = () => {
+      delete bar.dataset.labels;
+      // Not laid out yet (hidden, or jsdom): keep the current verdict.
+      if (!(bar.clientWidth > 0)) return;
+      const labels = bar.querySelectorAll<HTMLElement>("[data-workspace-collapse-label]");
+      const cramped =
+        bar.scrollWidth > bar.clientWidth + 1 ||
+        Array.from(labels).some((label) => label.scrollWidth > label.clientWidth + 1);
+      if (cramped) bar.dataset.labels = "collapsed";
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(bar);
+    const mutationObserver = new MutationObserver(measure);
+    mutationObserver.observe(bar, { childList: true, characterData: true, subtree: true });
+    return () => {
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+    };
+  }, [barRef]);
 }
 
 export function ComposerTextInput({
