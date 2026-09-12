@@ -7667,6 +7667,26 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
     "space, or /clear to start a new conversation."
 )
 
+# Claude Code's output-token-limit constant: a response ending with
+# stop_reason "max_tokens" makes the CLI synthesize "API Error: Claude's
+# response exceeded the <N> output token maximum. To configure this
+# behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
+# and fail the turn. That remedy — an env var of the running CLI process —
+# is unreachable from the Omnigent web chat, so the raw record is a dead
+# end there, exactly like the context-overflow constant above. Matched
+# loosely (any count, either apostrophe, optional "API Error: " prefix) so
+# a CLI limit or wording bump doesn't silently retire the rewrite.
+_OUTPUT_TOKEN_LIMIT_RE = re.compile(
+    r"^(?:API Error: )?Claude['’]s response exceeded the [\d,]+ output token maximum\.",
+    re.IGNORECASE,
+)
+
+_OUTPUT_TOKEN_LIMIT_REPLACEMENT = (
+    "Output limit reached — the response exceeded the model’s maximum "
+    "output length and was cut off. Ask for a shorter answer, or break "
+    "the request into smaller pieces and continue step by step."
+)
+
 # Claude Code points its auth failures at ``/login`` — a dead end in the
 # web chat, where ``/login`` is a dropped command: it is escaped into
 # plain text and answered by the same expired session with the same
@@ -7772,6 +7792,8 @@ def _assistant_message_item(
     stripped = text.strip()
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         display_text = _CONTEXT_OVERFLOW_REPLACEMENT
+    elif _OUTPUT_TOKEN_LIMIT_RE.match(stripped):
+        display_text = _OUTPUT_TOKEN_LIMIT_REPLACEMENT
     elif is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         display_text = f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return ClaudeTranscriptItem(

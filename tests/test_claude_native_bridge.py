@@ -1312,6 +1312,64 @@ def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str)
     assert "/clear" in text
 
 
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Verbatim CLI constant (@anthropic-ai/claude-code 2.1.236).
+        "API Error: Claude's response exceeded the 32000 output token "
+        "maximum. To configure this behavior, set the "
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
+        # Without the "API Error: " prefix (the TUI adds its own).
+        "Claude's response exceeded the 32000 output token maximum. "
+        "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS "
+        "environment variable.",
+        # A raised limit, comma-formatted, with a typographic apostrophe.
+        "API Error: Claude’s response exceeded the 64,000 output token "
+        "maximum. To configure this behavior, set the "
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
+    ],
+)
+def test_read_transcript_rewrites_output_token_limit(tmp_path: Path, raw_text: str) -> None:
+    """
+    The CLI's output-token-limit error is rewritten to actionable guidance.
+
+    The constant's named remedy — setting CLAUDE_CODE_MAX_OUTPUT_TOKENS on
+    the running CLI process — cannot be performed from the web chat, so
+    relaying it raw strands the user, exactly like the context-overflow
+    constant. The rewrite gives remedies the web user can act on.
+    """
+    text = _assistant_transcript_text(tmp_path, raw_text)
+
+    assert "Output limit reached" in text
+    assert "shorter" in text
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in text
+    assert "output token maximum" not in text
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Model prose that merely quotes the constant mid-sentence.
+        "The line 'API Error: Claude's response exceeded the 32000 output "
+        "token maximum.' means the reply was truncated by the CLI.",
+        # Similar wording that is not the constant.
+        "Claude's response exceeded expectations this time.",
+    ],
+)
+def test_read_transcript_leaves_output_token_prose_untouched(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    Prose about the limit is not the CLI constant and must survive.
+
+    The rewrite is anchored to a record that *starts* with the constant;
+    a model answer quoting or paraphrasing it is a real turn whose text
+    the user asked for, so it is forwarded as-is.
+    """
+    assert _assistant_transcript_text(tmp_path, raw_text) == raw_text
+
+
 def _assistant_transcript_text(
     tmp_path: Path,
     raw_text: str,
