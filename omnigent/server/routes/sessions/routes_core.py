@@ -30,11 +30,12 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id
+from omnigent.db.utils import generate_agent_id, generate_file_id
 from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
+    StoredFile,
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
@@ -2879,6 +2880,37 @@ def register_core_routes(
         else:
             fork_project_id = fork_resolution.project_id
 
+        # The deep-copied items reference the source's session-scoped file
+        # resources by raw file_id (attachment blocks are persisted
+        # pre-resolution), but a fork owns none of those rows — its own file
+        # endpoints would 404, so the web transcript shows broken
+        # attachments and a native transcript rebuild receives the file_id
+        # unresolved. Pre-allocate a fork-owned id per copyable source file;
+        # the store rewrites the copied items to those ids, and the copies
+        # themselves are materialized right after the fork commits.
+        fork_file_id_map: dict[str, str] = {}
+        fork_source_files: list[StoredFile] = []
+        if file_store is not None and artifact_store is not None:
+            files_after: str | None = None
+            while True:
+                files_page = await asyncio.to_thread(
+                    file_store.list,
+                    source_id,
+                    limit=1000,
+                    after=files_after,
+                    order="asc",
+                )
+                for stored_file in files_page.data:
+                    # A file whose blob is already gone can't be copied;
+                    # leaving its references on the source id degrades the
+                    # same way the source session already does.
+                    if await asyncio.to_thread(artifact_store.exists, stored_file.id):
+                        fork_source_files.append(stored_file)
+                        fork_file_id_map[stored_file.id] = generate_file_id()
+                if not files_page.has_more or not files_page.data:
+                    break
+                files_after = files_page.last_id
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -2913,6 +2945,7 @@ def register_core_routes(
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
                 project_id=fork_project_id,
+                file_id_map=fork_file_id_map,
             )
         except LookupError as exc:
             raise OmnigentError(
@@ -2926,6 +2959,36 @@ def register_core_routes(
                 str(exc),
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+
+        # Materialize the fork-owned file copies the rewritten items now
+        # reference — before the fork is announced or returned, so no reader
+        # sees the ids dangling. One file at a time keeps peak memory at a
+        # single blob. A failed copy is logged and skipped: that one
+        # attachment degrades exactly as a missing file already does.
+        if file_store is not None and artifact_store is not None:
+            for stored_file in fork_source_files:
+                copied_file_id = fork_file_id_map[stored_file.id]
+                try:
+                    file_content = await asyncio.to_thread(artifact_store.get, stored_file.id)
+                    await asyncio.to_thread(artifact_store.put, copied_file_id, file_content)
+                    await asyncio.to_thread(
+                        file_store.create,
+                        filename=stored_file.filename,
+                        bytes=stored_file.bytes,
+                        content_type=stored_file.content_type,
+                        session_id=new_conv.id,
+                        file_id=copied_file_id,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "failed to copy file %s into fork %s of session %s",
+                        stored_file.id,
+                        new_conv.id,
+                        source_id,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(artifact_store.delete, copied_file_id)
 
         # Grant ownership BEFORE scheduling the managed launch, mirroring
         # both create paths: a managed-guard failure (misconfigured server,

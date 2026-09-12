@@ -70,6 +70,7 @@ class SqlAlchemyFileStore(FileStore):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        file_id: str | None = None,
     ) -> StoredFile:
         """
         Record a new file in the database.
@@ -79,9 +80,11 @@ class SqlAlchemyFileStore(FileStore):
         :param content_type: MIME type.
         :param session_id: Owning session id, or ``None`` for
             global files.
+        :param file_id: Caller-chosen id (a fork pre-allocates ids for
+            the file copies it creates), or ``None`` to generate one.
         :returns: The newly created :class:`StoredFile`.
         """
-        file_id = generate_file_id()
+        file_id = file_id if file_id is not None else generate_file_id()
         created_at = now_epoch()
 
         def write(session: Session) -> StoredFile:
