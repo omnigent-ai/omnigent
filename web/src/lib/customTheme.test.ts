@@ -114,7 +114,7 @@ describe("customTheme", () => {
     expect(deriveCustomTheme({ ...theme, contrast: 50 })).toEqual(palette.tokens);
   });
 
-  it.each(PALETTES)("preserves $label selection contrast when customizing accents", (palette) => {
+  it.each(PALETTES)("keeps $label's opaque selection pair when customizing accents", (palette) => {
     for (const accent of ["#000000", "#777777", "#ffffff"]) {
       const variants = deriveCustomTheme({
         ...createCustomThemeFromPalette(palette),
@@ -125,10 +125,32 @@ describe("customTheme", () => {
       });
 
       for (const mode of ["light", "dark"] as const) {
+        // Translucent tints follow the accent instead; see the Omnigent cases.
+        if (!palette.tokens[mode].selectionBackground.startsWith("#")) continue;
         expect(variants[mode].selectionBackground).toBe(palette.tokens[mode].selectionBackground);
         expect(variants[mode].selectionForeground).toBe(palette.tokens[mode].selectionForeground);
       }
     }
+  });
+
+  it("keeps Omnigent's selection tint after contrast changes", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({ ...theme, contrast: 53 });
+
+    expect(variants.light.selectionBackground).toBe("rgba(240, 1, 150, 0.1)");
+    expect(variants.light.selectionForeground).toBe("#651249");
+    expect(variants.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.15)");
+    expect(variants.dark.selectionForeground).toBe("#f9a8d4");
+  });
+
+  it("tints the text selection with a custom accent, like the sidebar's active row", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({ ...theme, accent: "#2563eb", darkAccent: "#f59e0b" });
+
+    expect(variants.light.selectionBackground).toBe("rgba(37, 99, 235, 0.1)");
+    expect(variants.dark.selectionBackground).toBe("rgba(245, 158, 11, 0.15)");
+    expect(variants.light.selectionForeground).toBe(variants.light.foreground);
+    expect(variants.dark.selectionForeground).toBe(variants.dark.foreground);
   });
 
   it("keeps Omnigent's selected-session colors after contrast changes", () => {

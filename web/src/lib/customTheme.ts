@@ -332,6 +332,26 @@ function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
   };
 }
 
+/**
+ * Translucent selection tints (Omnigent's brand wash) follow a custom accent
+ * the way the sidebar's active row does, with the rebased page foreground as
+ * text. Opaque, hand-tuned pairs stay put so their contrast survives any accent.
+ */
+function rebaseSelection(
+  base: PaletteTokens,
+  primary: string | null,
+  foreground: string,
+): Pick<PaletteTokens, "selectionBackground" | "selectionForeground"> {
+  const alpha = parseCssColor(base.selectionBackground)?.alpha ?? 1;
+  if (primary === null || alpha >= 1) {
+    return {
+      selectionBackground: base.selectionBackground,
+      selectionForeground: base.selectionForeground,
+    };
+  }
+  return { selectionBackground: setAlpha(primary, alpha), selectionForeground: foreground };
+}
+
 function rebaseVariant(
   base: PaletteTokens,
   reference: GeneratedThemeVariant,
@@ -367,8 +387,7 @@ function rebaseVariant(
     ),
     primary: primaryChanged ? primary : base.primary,
     primaryForeground: primaryChanged ? readableForeground(primary) : base.primaryForeground,
-    selectionBackground: base.selectionBackground,
-    selectionForeground: base.selectionForeground,
+    ...rebaseSelection(base, primaryChanged ? primary : null, foreground),
     secondary: rebaseColor(base.secondary, reference.secondary, current.secondary),
     secondaryForeground: rebaseColor(
       base.secondaryForeground,

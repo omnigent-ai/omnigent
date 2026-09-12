@@ -11,8 +11,8 @@
   --popover-foreground: #11171c;
   --primary: #11171c;
   --primary-foreground: #ffffff;
-  --selection-background: #11171c;
-  --selection-foreground: #ffffff;
+  --selection-background: rgba(240, 1, 150, 0.1);
+  --selection-foreground: #651249;
   --secondary: #eceef1;
   --secondary-foreground: #27272a;
   --muted: #0000000f;
@@ -57,8 +57,8 @@
   --popover-foreground: oklch(0.965 0.003 240);
   --primary: #e8ecf0;
   --primary-foreground: #11171c;
-  --selection-background: #e8ecf0;
-  --selection-foreground: #11171c;
+  --selection-background: rgba(240, 1, 150, 0.15);
+  --selection-foreground: #f9a8d4;
   --secondary: #1f272d;
   --secondary-foreground: #e8ecf0;
   --muted: color-mix(in srgb, #92a4b3 15%, #262f36);

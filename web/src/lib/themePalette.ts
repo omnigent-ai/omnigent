@@ -227,6 +227,10 @@ export const PALETTES: readonly PaletteMeta[] = [
         popoverForeground: "#11171c",
         primary: "#11171c",
         primaryForeground: "#ffffff",
+        // Selection is the brand tint that also marks the sidebar's active
+        // row, not an opaque primary block (near-black on this palette).
+        selectionBackground: "rgba(240, 1, 150, 0.1)",
+        selectionForeground: "#651249",
         secondary: "#eceef1",
         muted: "#0000000f",
         mutedForeground: "#71717a",
@@ -254,6 +258,10 @@ export const PALETTES: readonly PaletteMeta[] = [
         popover: "rgba(26, 33, 41, 0.8)",
         primary: "#e8ecf0",
         primaryForeground: "#11171c",
+        // pink-300 rather than the sidebar's pink-400 so selected text stays
+        // >= 4.5:1 over the tinted code and muted surfaces.
+        selectionBackground: "rgba(240, 1, 150, 0.15)",
+        selectionForeground: "#f9a8d4",
         secondary: "#1f272d",
         secondaryForeground: "#e8ecf0",
         muted: "color-mix(in srgb, #92a4b3 15%, #262f36)",
