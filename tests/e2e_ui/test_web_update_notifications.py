@@ -35,9 +35,15 @@ def test_web_update_reload_and_later(page: Page, live_server: str) -> None:
     expect(page.get_by_test_id("sidebar-wordmark")).to_be_attached()
     page.wait_for_function("document.readyState === 'complete'")
 
-    def poll() -> None:
+    def poll(event: str = "online") -> None:
         with page.expect_response("**/api/version"):
-            page.evaluate("window.dispatchEvent(new Event('online'))")
+            page.evaluate(
+                """event => {
+                    const target = event === 'visibilitychange' ? document : window;
+                    target.dispatchEvent(new Event(event));
+                }""",
+                event,
+            )
         # A following task lets the fetch continuation consume the response.
         page.evaluate("() => new Promise(resolve => setTimeout(resolve, 0))")
 
@@ -45,10 +51,10 @@ def test_web_update_reload_and_later(page: Page, live_server: str) -> None:
     banner = page.get_by_role("status", name="Web app update")
     expect(banner).not_to_be_visible()
     build_id = "deployed"
-    poll()
+    poll("visibilitychange")
     expect(banner).not_to_be_visible()
     page.evaluate("window.dispatchEvent(new Event('blur'))")
-    poll()
+    # The follow-up confirms the deploy without another foreground/network event.
     expect(banner).to_be_visible()
     assert page.evaluate("window.__webUpdateNotifications") == [
         {
@@ -68,7 +74,6 @@ def test_web_update_reload_and_later(page: Page, live_server: str) -> None:
     assert page.evaluate("window.__webUpdateNotifications.length") == 1
 
     build_id = "deployed-again"
-    poll()
     poll()
     expect(banner).to_be_visible()
     with page.expect_navigation(wait_until="domcontentloaded"):
