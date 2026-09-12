@@ -724,22 +724,13 @@ function SidebarImpl({
   const scrollIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const markScrolling = useCallback(() => {
     setIsScrolling(true);
-    if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
+    clearTimeout(scrollIdleTimer.current ?? undefined);
     scrollIdleTimer.current = setTimeout(() => setIsScrolling(false), SCROLLBAR_HIDE_DELAY_MS);
   }, []);
-  useEffect(
-    () => () => {
-      if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
-    },
-    [],
-  );
+  useEffect(() => () => clearTimeout(scrollIdleTimer.current ?? undefined), []);
   const setScrollContainer = useCallback((node: HTMLElement | null) => {
     scrollContainerRef.current = node;
     setHasScrolled((node?.scrollTop ?? 0) > 0);
-    // A freshly (re)mounted list — e.g. returning from Settings — starts with
-    // the scrollbar hidden.
-    if (scrollIdleTimer.current) clearTimeout(scrollIdleTimer.current);
-    setIsScrolling(false);
   }, []);
 
   // Inbox badge — total approval prompts across loaded rows. We read from both
