@@ -42,6 +42,7 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
+import { WebUpdateBanner } from "@/components/WebUpdateBanner";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
