@@ -295,6 +295,23 @@ def truncate_sse(body: str, keep_events: int) -> str:
     return "".join(f"{seg}\n\n" for seg in kept)
 
 
+async def paced_sse(sse_body: str, chunk_delay: float) -> AsyncIterator[str]:
+    """Yield *sse_body*, one event at a time when *chunk_delay* paces it.
+
+    ``0`` keeps the historical single-chunk body; a positive value yields each
+    ``\\n\\n``-delimited event separately and sleeps between events, so live
+    surfaces render intermediate deltas instead of one instant repaint.
+    """
+    if chunk_delay > 0:
+        for event in sse_body.split("\n\n"):
+            if not event:
+                continue
+            yield event + "\n\n"
+            await asyncio.sleep(chunk_delay)
+    else:
+        yield sse_body
+
+
 def sse_streaming_text(text: str, model: str = "mock-model") -> str:
     """
     Build SSE with text deltas followed by a completed event.
@@ -756,9 +773,10 @@ class QueuedResponse:
     # this text before the ``text`` block — scripts a turn where the model
     # visibly thinks before answering.
     thinking: str | None = None
-    # Seconds to sleep between SSE events on ``/v1/messages``. ``0`` keeps the
-    # historical single-chunk body; a small value paces the stream so live
-    # surfaces (a native TUI) visibly render intermediate deltas.
+    # Seconds to sleep between SSE events on ``/v1/messages`` and
+    # ``/v1/responses``. ``0`` keeps the historical single-chunk body; a small
+    # value paces the stream so live surfaces (the web SPA, a native TUI)
+    # visibly render intermediate deltas.
     chunk_delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
@@ -1039,11 +1057,8 @@ async def create_response(
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
-    async def _generate() -> AsyncIterator[str]:
-        yield sse_body
-
     return StreamingResponse(
-        _generate(),
+        paced_sse(sse_body, qr.chunk_delay),
         media_type="text/event-stream",
     )
 
@@ -1105,22 +1120,8 @@ async def create_message(
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
-    chunk_delay = qr.chunk_delay
-
-    async def _generate() -> AsyncIterator[str]:
-        if chunk_delay > 0:
-            # Pace the stream one SSE event at a time so live surfaces
-            # render intermediate deltas instead of one instant repaint.
-            for event in sse_body.split("\n\n"):
-                if not event:
-                    continue
-                yield event + "\n\n"
-                await asyncio.sleep(chunk_delay)
-        else:
-            yield sse_body
-
     return StreamingResponse(
-        _generate(),
+        paced_sse(sse_body, qr.chunk_delay),
         media_type="text/event-stream",
     )
 
