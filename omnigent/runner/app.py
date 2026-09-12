@@ -7273,15 +7273,16 @@ def create_runner_app(
             # later episode's matching notice is wrongly deduped.
             _last_rewake_notice.pop(parent_session_id, None)
             _stranded_wake_parents.discard(parent_session_id)
-        # A parent whose wake POST exhausted its retries has no pending flag,
-        # but its inbox still holds an undelivered result — rescue it too.
-        stranded_retry = parent_session_id in _stranded_wake_parents
-        if parent_session_id not in _subagent_wake_pending and not stranded_retry:
+            # Keep the wake-pending flag consistent with a drained inbox.
+            _subagent_wake_pending.discard(parent_session_id)
             return
+        # The inbox still holds undelivered results, so recover regardless of
+        # the wake-pending flag: _run_turn_bg discards it at turn start, so a
+        # delivered wake whose turn ends without draining the inbox leaves no
+        # flag behind. Clear both markers so _schedule_subagent_wake's
+        # double-wake guard lets the recovery wake through.
         _subagent_wake_pending.discard(parent_session_id)
         _stranded_wake_parents.discard(parent_session_id)
-        if drained:
-            return
         entries = list_subagent_work(parent_session_id)
         if not entries:
             return
