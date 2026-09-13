@@ -998,12 +998,10 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");
     const file = new File(["diagram"], "new-diagram.png", { type: "image/png" });
-    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
-      target: { files: [file] },
-    });
-    expect(screen.getByText("new-diagram.png")).toBeTruthy();
-
     await act(async () => {
+      fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+        target: { files: [file] },
+      });
       resolveCreate({ ok: true, json: async () => ({ id: "conv_started" }) } as Response);
     });
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("older session");

@@ -2391,10 +2391,14 @@ function NewChatLandingComposer({ draftScope }: { draftScope: string }) {
   // 415 strands the typed message in a session the user never wanted.
   const addFiles = (incoming: File[]) => {
     const { accepted, errors } = validateAttachments(incoming);
-    if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
+    if (accepted.length > 0) {
+      landingDraftRevision += 1;
+      setFiles((prev) => [...prev, ...accepted]);
+    }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
   const removeFile = (index: number) => {
+    if (index >= 0 && index < files.length) landingDraftRevision += 1;
     setFiles((prev) => prev.filter((_, i) => i !== index));
     setAttachmentError(null);
   };
