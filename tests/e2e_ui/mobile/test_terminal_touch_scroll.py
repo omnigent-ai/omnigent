@@ -39,6 +39,8 @@ the scrollable element) the swipe moves the view and the test passes.
 from __future__ import annotations
 
 import os
+import time
+from collections.abc import Callable
 
 from playwright.sync_api import Browser, Page, ViewportSize, expect
 
@@ -80,6 +82,58 @@ def _scroll_state(page: Page) -> dict[str, float]:
     state = page.evaluate(_SCROLL_STATE)
     assert state is not None, "visible terminal pane / xterm scrollbar not found"
     return state
+
+
+def _overflowed_and_pinned(s: dict[str, float]) -> bool:
+    """Real overflow (slider under half the track) with the view at the bottom."""
+    return (
+        s["sliderHeight"] > 0
+        and s["sliderHeight"] < s["trackHeight"] / 2
+        and s["sliderTop"] + s["sliderHeight"] >= s["trackHeight"] - 3
+    )
+
+
+def _wait_for_scroll(
+    page: Page,
+    predicate: Callable[[dict[str, float]], bool],
+    what: str,
+    timeout_s: float = 10.0,
+) -> dict[str, float]:
+    """Poll the scrollbar geometry until ``predicate`` holds.
+
+    :param page: Page with the terminal pane open.
+    :param predicate: Condition on the scroll-state dict to wait for.
+    :param what: Human description for the timeout error.
+    :param timeout_s: Give-up horizon in seconds.
+    :returns: The first scroll state satisfying ``predicate``.
+    """
+    last: dict[str, float] | None = None
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        last = page.evaluate(_SCROLL_STATE)
+        if last is not None and predicate(last):
+            return last
+        page.wait_for_timeout(200)
+    raise AssertionError(f"timed out waiting for {what}; last scroll state: {last}")
+
+
+def _settled_pinned(page: Page, timeout_s: float = 30.0) -> dict[str, float]:
+    """Wait until output stops streaming and the view is pinned at the bottom.
+
+    Requires overflow, the slider touching the track's end (the live view),
+    and two consecutive samples that agree — a single read mid-stream races
+    the still-growing buffer (the slider keeps shrinking as lines land) and
+    corrupts every later position comparison.
+    """
+    prev: dict[str, float] | None = None
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        s = page.evaluate(_SCROLL_STATE)
+        if s is not None and _overflowed_and_pinned(s) and s == prev:
+            return s
+        prev = s
+        page.wait_for_timeout(300)
+    raise AssertionError(f"terminal output never settled pinned at the live bottom: {prev}")
 
 
 def _touch_swipe(page: Page, x: float, y_from: float, y_to: float, steps: int = 12) -> None:
@@ -175,20 +229,10 @@ def test_terminal_touch_swipe_scrolls_back(
         page.keyboard.type(fill_cmd)
         page.keyboard.press("Enter")
 
-        # Wait until xterm has accumulated overflow: the vertical slider
-        # shrinks below the track and sits pinned at its max top (live view).
-        deadline_ms = 30_000
-        waited = 0
-        while waited < deadline_ms:
-            s = page.evaluate(_SCROLL_STATE)
-            if s and s["sliderHeight"] > 0 and s["sliderTop"] > 50:
-                break
-            page.wait_for_timeout(500)
-            waited += 500
-        pinned = _scroll_state(page)
-        assert pinned["sliderTop"] > 50, (
-            f"terminal never accumulated scrollback (slider never left the top): {pinned}"
-        )
+        # Wait until xterm has accumulated overflow AND the output has
+        # finished streaming: the slider shrinks below the track, sits
+        # pinned at its max top (live view), and stops changing.
+        pinned = _settled_pinned(page)
 
         box = terminal_view.bounding_box()
         assert box is not None
@@ -198,19 +242,18 @@ def test_terminal_touch_swipe_scrolls_back(
         # the input path, not missing data).
         page.mouse.move(cx, box["y"] + box["height"] / 2)
         page.mouse.wheel(0, -800)
-        page.wait_for_timeout(600)
-        after_wheel = _scroll_state(page)
-        assert after_wheel["sliderTop"] < pinned["sliderTop"] - 1, (
-            f"wheel scroll did not move scrollback (harness problem, not the "
-            f"reported bug): pinned={pinned} after={after_wheel}"
+        _wait_for_scroll(
+            page,
+            lambda s: s["sliderTop"] < pinned["sliderTop"] - 1,
+            "the wheel scroll to move the scrollback (harness problem, not the reported bug)",
         )
         # Re-pin to the live bottom so the touch step starts from the same
         # state the reporter did.
         page.mouse.wheel(0, 100_000)
-        page.wait_for_timeout(600)
-        repinned = _scroll_state(page)
-        assert repinned["sliderTop"] >= pinned["sliderTop"] - 1, (
-            f"could not re-pin the terminal to the live bottom: {repinned}"
+        repinned = _wait_for_scroll(
+            page,
+            _overflowed_and_pinned,
+            "the view to re-pin to the live bottom after the sanity scroll",
         )
 
         # Step 4 — the reported gesture: finger drag DOWNWARD on the output
@@ -222,7 +265,15 @@ def test_terminal_touch_swipe_scrolls_back(
         # Step 5 — the scrollback must have moved back (slider moved up).
         # On the unfixed build nothing routes touch into the scroll machinery,
         # so the slider stays pinned and this assertion fails — the bug.
+        # Bounded poll: a working build applies the scroll during the drag,
+        # but give paint/momentum a moment before failing.
+        deadline = time.monotonic() + 5.0
         after_touch = _scroll_state(page)
+        while (
+            after_touch["sliderTop"] >= repinned["sliderTop"] - 1 and time.monotonic() < deadline
+        ):
+            page.wait_for_timeout(200)
+            after_touch = _scroll_state(page)
         assert after_touch["sliderTop"] < repinned["sliderTop"] - 1, (
             "touch swipe did not scroll the terminal scrollback: the view "
             f"stayed pinned to the live bottom (sliderTop "
