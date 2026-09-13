@@ -12152,9 +12152,7 @@ def _verify_databricks_server_token(
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:
-        raise _AuthFailure(
-            f"Could not reach {server}/v1/me to verify login: {exc}"
-        ) from exc
+        raise _AuthFailure(f"Could not reach {server}/v1/me to verify login: {exc}") from exc
 
 
 @dataclass(frozen=True)

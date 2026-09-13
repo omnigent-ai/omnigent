@@ -79,7 +79,7 @@ class _FakeDatabricksEdge(http.server.BaseHTTPRequestHandler):
     server_version = "databricks"
     sys_version = ""
 
-    def log_message(self, fmt: str, *args: object) -> None:  # noqa: A002
+    def log_message(self, fmt: str, *args: object) -> None:
         pass  # keep pexpect transcripts clean
 
     def _json(
@@ -94,7 +94,7 @@ class _FakeDatabricksEdge(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+    def do_GET(self) -> None:
         split = urlsplit(self.path)
         if split.path == "/.well-known/databricks-config":
             # Account-acting host: an account_id but no workspace_id.
@@ -110,9 +110,7 @@ class _FakeDatabricksEdge(http.server.BaseHTTPRequestHandler):
                 )
                 return
             if self.mode == "always-403":
-                self._json(
-                    403, {"error_code": "PERMISSION_DENIED", "message": "no app access"}
-                )
+                self._json(403, {"error_code": "PERMISSION_DENIED", "message": "no app access"})
                 return
             org = parse_qs(split.query).get("o", [None])[0]
             if org == _WORKSPACE_ID:
@@ -120,9 +118,7 @@ class _FakeDatabricksEdge(http.server.BaseHTTPRequestHandler):
             else:
                 # Unrouted request resolves to the account, which rejects
                 # the workspace token.
-                self._json(
-                    403, {"error_code": "PERMISSION_DENIED", "message": "account host"}
-                )
+                self._json(403, {"error_code": "PERMISSION_DENIED", "message": "account host"})
             return
         # Any other path: the workspace web app answers 404 with the
         # ``Server: databricks`` signature (what makes the CLI adopt the
@@ -138,12 +134,22 @@ def edge_cert(tmp_path_factory: pytest.TempPathFactory) -> Path:
     cert_dir = tmp_path_factory.mktemp("edge_cert")
     result = subprocess.run(
         [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-            "-keyout", str(cert_dir / "key.pem"),
-            "-out", str(cert_dir / "cert.pem"),
-            "-days", "2",
-            "-subj", "/CN=localhost",
-            "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(cert_dir / "key.pem"),
+            "-out",
+            str(cert_dir / "cert.pem"),
+            "-days",
+            "2",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
         ],
         capture_output=True,
         check=False,
@@ -320,9 +326,7 @@ def test_host_autologin_inherits_workspace_selector(
                 pexpect.EOF,
             ]
         )
-        transcript = (child.before or "") + (
-            child.after if isinstance(child.after, str) else ""
-        )
+        transcript = (child.before or "") + (child.after if isinstance(child.after, str) else "")
         assert idx == 0, (
             "host auto-login did not complete: the token verify was rejected "
             "(the ?o= workspace selector was dropped) or the CLI "

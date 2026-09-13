@@ -30,9 +30,7 @@ def _run_main_with_failure(
         raise exc
 
     monkeypatch.setattr(cli_module, "cli", raising_cli)
-    monkeypatch.setattr(
-        sys, "argv", argv or ["omnigent", "host", "--server", "https://x"]
-    )
+    monkeypatch.setattr(sys, "argv", argv or ["omnigent", "host", "--server", "https://x"])
     with pytest.raises(SystemExit) as exc_info:
         cli_module.main()
     code = exc_info.value.code
