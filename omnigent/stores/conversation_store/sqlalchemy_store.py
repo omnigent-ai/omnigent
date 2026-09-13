@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import suppress
 from typing import Any, Protocol, cast
 
 from sqlalchemy import (
@@ -79,6 +80,7 @@ from omnigent.entities import (
     parse_item_data,
 )
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
@@ -100,6 +102,36 @@ from omnigent.stores.conversation_store import (
 )
 
 _logger = logging.getLogger(__name__)
+
+_SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
+
+
+def _decode_session_state(
+    value: str | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Split policy state from the reserved native Plan snapshot."""
+    state = json.loads(value) if value else {}
+    if not isinstance(state, dict):
+        raise TypeError("session_state must decode to an object")
+    raw_todos = state.pop(_SESSION_TODOS_STATE_KEY, None)
+    todos: list[dict[str, Any]] = []
+    if raw_todos is not None:
+        with suppress(TypeError, ValueError):
+            todos = validate_session_todos(raw_todos)
+    return state, todos
+
+
+def _encode_session_state(
+    state: dict[str, Any],
+    todos: list[dict[str, Any]] | None,
+) -> str:
+    """Serialize policy state while preserving an optional Plan snapshot."""
+    payload = dict(state)
+    payload.pop(_SESSION_TODOS_STATE_KEY, None)
+    if todos:
+        payload[_SESSION_TODOS_STATE_KEY] = todos
+    return json.dumps(payload, separators=(",", ":"))
+
 
 # Server-side deadline (ms) for the content-search query in
 # ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
@@ -206,9 +238,7 @@ def _to_conversation(
         callers pass the JOINed ``{key: value}`` map.
     :returns: A :class:`Conversation` dataclass instance.
     """
-    session_state: dict[str, Any] = {}
-    if meta and meta.session_state:
-        session_state = json.loads(meta.session_state)
+    session_state, session_todos = _decode_session_state(meta.session_state if meta else None)
     session_usage: dict[str, Any] = {}
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
@@ -231,6 +261,7 @@ def _to_conversation(
         labels=labels if labels is not None else {},
         session_state=session_state,
         session_usage=session_usage,
+        session_todos=session_todos,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
         reported_model=overrides["reported_model"],
@@ -1368,28 +1399,27 @@ class SqlAlchemyConversationStore(ConversationStore):
         state: dict[str, Any],
     ) -> None:
         """
-        Persist the full session-state snapshot for a conversation.
+        Persist policy session state while preserving the reserved Plan key.
 
-        Serializes *state* as JSON and writes it to the
-        ``session_state`` column on the ``conversations`` table.
+        Writes the encoded object to conversation metadata. The internal Plan
+        snapshot is retained but never exposed through the caller's *state*.
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
         :param state: The complete session-state dict to persist.
         """
-        import json
-
-        encoded_state = json.dumps(state)
 
         def write(session: Session) -> None:
-            session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
-                )
-                .values(session_state=encoded_state)
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
             )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            if meta is not None:
+                _, todos = _decode_session_state(meta.session_state)
+                meta.session_state = _encode_session_state(state, todos)
 
         run_write_transaction(self._session_immediate, "set_session_state", write)
 
@@ -1426,6 +1456,33 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_session_usage", write)
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Store a validated Plan snapshot in metadata; empty clears it.
+
+        :returns: ``False`` when the metadata row no longer exists, else ``True``.
+        """
+        validated = validate_session_todos(todos)
+
+        def write(session: Session) -> bool:
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            if meta is None:
+                return False
+            state, _ = _decode_session_state(meta.session_state)
+            meta.session_state = _encode_session_state(state, validated)
+            return True
+
+        return run_write_transaction(self._session_immediate, "set_session_todos", write)
 
     def set_conversation_project(
         self,
@@ -4558,9 +4615,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
 
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta_query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                meta_query = meta_query.with_for_update()
+            meta = session.scalars(meta_query).first()
             if meta is not None:
                 meta.external_session_id = None
+                state, _ = _decode_session_state(meta.session_state)
+                meta.session_state = _encode_session_state(state, None)
                 # Launch flags are CLI-specific: a switch to a different CLI
                 # (e.g. claude-code → pi) leaves the prior CLI's flags stale —
                 # Claude Code's ``--permission-mode`` makes pi exit 1 at launch.

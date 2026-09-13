@@ -67,6 +67,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
@@ -213,7 +214,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
-    _session_todos_cache,
     build_policy_engine,
     get_agent_cache,
     get_caps,
@@ -2822,21 +2822,20 @@ def _pin_claude_permission_launch_args(
     return [*stripped, "--permission-mode", mode]
 
 
-def _handle_external_session_todos(
+async def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,
+    conversation_store: ConversationStore,
 ) -> None:
     """
-    Cache and broadcast a todo-list update from a native forwarder.
+    Persist and broadcast a todo-list update from a native forwarder.
 
     Sent by the claude-native forwarder (from ``TodoWrite``) and the
     codex-native forwarder (from Codex plan updates); the panel is
     harness-agnostic.
 
-    Updates the in-memory ``_session_todos_cache`` so subsequent
-    ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``
-    field without a file read. Then publishes a ``session.todos`` SSE event
-    so connected web clients update their todo panel immediately.
+    Store the latest display snapshot before updating SSE clients. A replacement
+    Server can recover it without waking the harness.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -2851,20 +2850,15 @@ def _handle_external_session_todos(
             "external_session_todos requires data.todos to be a list",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Filter to well-formed items before caching so that malformed entries
-    # from a buggy forwarder version don't persist in the snapshot.  The
-    # same filter is applied by sse.ts on the live-event path; keeping the
-    # two in sync means the snapshot and live panel always show the same set.
-    valid_statuses = {"pending", "in_progress", "completed"}
-    validated: list[dict[str, Any]] = [
-        t
-        for t in todos
-        if isinstance(t, dict)
-        and isinstance(t.get("content"), str)
-        and t.get("status") in valid_statuses
-        and isinstance(t.get("activeForm"), str)
-    ]
-    _session_todos_cache[session_id] = validated
+    try:
+        validated = validate_session_todos(todos)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    persisted = await asyncio.to_thread(
+        conversation_store.set_session_todos, session_id, validated
+    )
+    if not persisted:
+        return
     event = SessionTodosEvent(
         type="session.todos",
         conversation_id=session_id,

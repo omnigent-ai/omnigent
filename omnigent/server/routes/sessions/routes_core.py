@@ -186,6 +186,7 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionResponse,
     SessionSwitchAgentRequest,
+    SessionTodosEvent,
     UpdateSessionRequest,
 )
 from omnigent.stores import AgentStore, ConversationStore
@@ -217,6 +218,23 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+
+async def _reset_runner_and_clear_todos_after_switch(
+    session_id: str, conversation_store: ConversationStore
+) -> None:
+    """Finish retiring the old runner, then clear and broadcast its Plan."""
+    try:
+        await _reset_runner_resources_after_switch(session_id)
+    finally:
+        # Connected clients keep the old agent's Plan until teardown finishes, so
+        # clear after: a late old-runner Plan POST cannot survive this clear.
+        cleared = await asyncio.to_thread(conversation_store.set_session_todos, session_id, [])
+        if cleared:
+            from omnigent.server.routes import sessions as facade
+
+            event = SessionTodosEvent(type="session.todos", conversation_id=session_id, todos=[])
+            facade.session_stream.publish(session_id, event.model_dump())
 
 
 def register_core_routes(
@@ -3203,7 +3221,9 @@ def register_core_routes(
         # (doing it mid-turn would wedge the turn); the next access
         # re-materializes from the new agent's spec, preserving the workspace /
         # worktree (cwd comes from the runner workspace).
-        background_tasks.add_task(_reset_runner_resources_after_switch, session_id)
+        background_tasks.add_task(
+            _reset_runner_and_clear_todos_after_switch, session_id, conversation_store
+        )
 
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
         level = await _get_permission_level(user_id, session_id, permission_store)

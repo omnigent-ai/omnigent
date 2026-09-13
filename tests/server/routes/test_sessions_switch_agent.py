@@ -70,10 +70,15 @@ class _ConversationStore:
         self._convs = conversations
         self._items = items_by_conv or {}
         self.switch_calls: list[dict[str, Any]] = []
+        self.todo_updates: list[list[dict[str, Any]]] = []
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """:returns: The conversation if present, else None."""
         return self._convs.get(conversation_id)
+
+    def set_session_todos(self, conversation_id: str, todos: list[dict[str, Any]]) -> bool:
+        self.todo_updates.append(todos)
+        return conversation_id in self._convs
 
     def switch_conversation_agent(
         self,
@@ -647,9 +652,14 @@ async def test_switch_schedules_runner_resource_reset(
     )
     _patch_family_helpers(monkeypatch, same_family=True, native=True, labels={})
     reset_calls: list[str] = []
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        sessions_mod.session_stream, "publish", lambda _, event: published.append(event)
+    )
 
     async def _record_reset(session_id: str) -> None:
         reset_calls.append(session_id)
+        conv_store.set_session_todos(session_id, [{"content": "stale"}])
 
     monkeypatch.setattr(sessions_mod, "_reset_runner_resources_after_switch", _record_reset)
     client = TestClient(_build_app(conv_store, agent_store))
@@ -666,6 +676,8 @@ async def test_switch_schedules_runner_resource_reset(
     # take effect on the cached primary env and a stale terminal could shadow
     # the rebuild.
     assert reset_calls == ["e9f8f58523cec9a57d3bdf93be543e8c"]
+    assert conv_store.todo_updates == [[{"content": "stale"}], []]
+    assert published[-1]["type"] == "session.todos" and published[-1]["todos"] == []
 
 
 class _RunnerClientStub:

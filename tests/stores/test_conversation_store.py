@@ -78,6 +78,9 @@ def test_fork_drops_import_provenance_labels(
             "kept": "yes",
         },
     )
+    conversation_store.set_session_todos(
+        source.id, [{"content": "fork", "status": "pending", "activeForm": "forking"}]
+    )
 
     fork = conversation_store.fork_conversation(source.id)
 
@@ -2051,6 +2054,9 @@ async def test_delete_conversation(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     conv = conversation_store.create_conversation()
+    conversation_store.set_session_todos(
+        conv.id, [{"content": "late", "status": "pending", "activeForm": "waiting"}]
+    )
     conversation_store.append(
         conv.id,
         [
@@ -2064,6 +2070,7 @@ async def test_delete_conversation(
     assert await conversation_store.delete_conversation(conv.id) is True
     assert conversation_store.get_conversation(conv.id) is None
     assert conversation_store.list_items(conv.id).data == []
+    assert not conversation_store.set_session_todos(conv.id, [])
     assert await conversation_store.delete_conversation(conv.id) is False
 
 
@@ -4621,6 +4628,7 @@ def test_fork_conversation_drops_instance_scoped_labels(
     assert fork.labels == {"omnigent.wrapper": "claude-code-native-ui"}, (
         f"Fork must drop instance-scoped labels, kept {fork.labels!r}"
     )
+    assert fork.session_todos == []
 
 
 def test_fork_extra_labels_rearm_bypass_over_the_always_drop(
@@ -5237,6 +5245,9 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         conv_id, model_override="claude-opus-4-7", reasoning_effort="high"
     )
     conversation_store.set_external_session_id(conv_id, "old-native-uuid")
+    conversation_store.set_session_todos(
+        conv_id, [{"content": "switch", "status": "pending", "activeForm": "switching"}]
+    )
     conversation_store.set_labels(
         conv_id,
         {
@@ -5292,6 +5303,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     # Native runtime state belongs to the old harness → cleared so the next
     # turn cold-starts and rebuilds from items.
     assert updated.external_session_id is None
+    assert updated.session_todos == []
     # Labels: target ui/wrapper applied, carry-history + previous-builtin
     # stamped, and the old instance-scoped stopped marker dropped.
     assert updated.labels[UI_MODE_LABEL_KEY] == UI_MODE_TERMINAL_VALUE
@@ -5667,12 +5679,18 @@ def test_set_session_state_overwrites(
 ) -> None:
     """set_session_state replaces the entire state dict."""
     conv = conversation_store.create_conversation()
+    todos = [{"content": "keep", "status": "pending", "activeForm": "keeping"}]
+    conversation_store.set_session_todos(conv.id, todos)
     conversation_store.set_session_state(conv.id, {"v": 1})
-    conversation_store.set_session_state(conv.id, {"v": 2, "new_key": True})
+    conversation_store.set_session_state(
+        conv.id,
+        {"v": 2, "new_key": True, "_omnigent_native_plan_snapshot_v1": [{"forged": 1}]},
+    )
 
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.session_state == {"v": 2, "new_key": True}
+    assert fetched.session_todos == todos
 
 
 def test_set_session_state_empty_dict(

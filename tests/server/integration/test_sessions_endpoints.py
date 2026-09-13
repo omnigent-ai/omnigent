@@ -8589,70 +8589,54 @@ async def test_post_external_session_todos_updates_snapshot(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``external_session_todos`` persists the list in the in-memory cache so
+    ``external_session_todos`` persists the list so
     the snapshot returned by GET /v1/sessions/{id} reflects it.
 
     The root bug this tests: ``_EXTERNAL_SESSION_TODOS_TYPE`` was missing
     from ``_ALLOWED_EVENT_TYPES``, so every POST was rejected with a 400
-    before ``_handle_external_session_todos`` could populate the cache.
+    before ``_handle_external_session_todos`` could update the snapshot.
     As a result the snapshot always returned ``todos: []`` even when
     Claude had active tasks.
     """
-    from omnigent.server.routes import sessions as sessions_module
-
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    sessions_module._session_todos_cache.pop(session["id"], None)
 
     todos = [
         {"content": "Do something", "status": "in_progress", "activeForm": "Doing it"},
     ]
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={"type": "external_session_todos", "data": {"todos": todos}},
-        )
-        assert resp.status_code in (200, 202), resp.text
-
-        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-        # The snapshot todos field must match exactly what was posted.
-        # A failure here means _session_todos_cache was not populated (the
-        # original bug), or the snapshot builder ignores the cache.
-        assert snapshot["todos"] == todos
-    finally:
-        sessions_module._session_todos_cache.pop(session["id"], None)
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_todos", "data": {"todos": todos}},
+    )
+    assert resp.status_code in (200, 202), resp.text
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["todos"] == todos
 
 
 async def test_post_external_session_todos_empty_list_clears_snapshot(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    An empty ``todos`` list is valid and overwrites the previous cache entry.
+    An empty ``todos`` list is valid and overwrites the persisted snapshot.
 
     Claude posts an empty list when all tasks are done. The panel should
     disappear (renders nothing on empty); the snapshot must reflect the
     cleared list so a page refresh also shows the empty state.
     """
-    from omnigent.server.routes import sessions as sessions_module
-
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    sessions_module._session_todos_cache[session["id"]] = [
-        {"content": "Old task", "status": "pending", "activeForm": "Doing it"}
-    ]
-
-    try:
+    old_todos = [{"content": "Old task", "status": "pending", "activeForm": "Doing it"}]
+    for todos in (old_todos, []):
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
-            json={"type": "external_session_todos", "data": {"todos": []}},
+            json={"type": "external_session_todos", "data": {"todos": todos}},
         )
         assert resp.status_code in (200, 202), resp.text
-
-        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-        # Empty list must replace the previous cache entry, not be ignored.
-        assert snapshot["todos"] == []
-    finally:
-        sessions_module._session_todos_cache.pop(session["id"], None)
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_todos", "data": {"todos": old_todos * 101}},
+    )
+    assert rejected.status_code == 400
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["todos"] == []
 
 
 async def test_post_external_session_todos_rejects_missing_todos(
@@ -8681,8 +8665,8 @@ async def test_post_external_session_todos_rejects_non_list_todos(
     """
     A non-list ``data.todos`` value is rejected with a 400.
 
-    The handler asserts ``isinstance(todos, list)`` before caching;
-    a dict or string would corrupt the cache and produce a malformed
+    The handler asserts ``isinstance(todos, list)`` before persistence;
+    a dict or string would corrupt the snapshot and produce a malformed
     ``session.todos`` SSE payload downstream.
     """
     agent = await create_test_agent(client)
@@ -8701,7 +8685,7 @@ async def test_post_external_session_todos_filters_malformed_items(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Individual malformed todo items are dropped before caching / broadcast.
+    Individual malformed todo items are dropped before persistence / broadcast.
 
     The top-level payload is a valid list (so this is not the 400-rejection
     path), but ``_handle_external_session_todos`` keeps only items with a
@@ -8710,8 +8694,6 @@ async def test_post_external_session_todos_filters_malformed_items(
     applies on the live path, so a buggy forwarder version can't poison the
     snapshot or the in-chat Plan tracker with half-formed entries.
     """
-    from omnigent.server.routes import sessions as sessions_module
-
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
@@ -8719,8 +8701,6 @@ async def test_post_external_session_todos_filters_malformed_items(
     )
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    sessions_module._session_todos_cache.pop(session["id"], None)
-
     good = {"content": "Real task", "status": "in_progress", "activeForm": "Doing it"}
     todos = [
         good,
@@ -8730,23 +8710,16 @@ async def test_post_external_session_todos_filters_malformed_items(
         "not-a-dict",
         {"status": "pending", "activeForm": "x"},  # missing content
     ]
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={"type": "external_session_todos", "data": {"todos": todos}},
-        )
-        assert resp.status_code in (200, 202), resp.text
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_todos", "data": {"todos": todos}},
+    )
+    assert resp.status_code in (200, 202), resp.text
 
-        # Only the well-formed item survives — on both the live SSE channel
-        # and the cached snapshot the tracker reads on bind.
-        todo_events = [ev for _sid, ev in published if ev.get("type") == "session.todos"]
-        assert len(todo_events) == 1
-        assert todo_events[0]["todos"] == [good]
-
-        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-        assert snapshot["todos"] == [good]
-    finally:
-        sessions_module._session_todos_cache.pop(session["id"], None)
+    todo_events = [ev for _sid, ev in published if ev.get("type") == "session.todos"]
+    assert len(todo_events) == 1
+    assert todo_events[0]["todos"] == [good]
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["todos"] == [good]
 
 
 async def test_post_external_mcp_startup_publishes_session_mcp_startup(

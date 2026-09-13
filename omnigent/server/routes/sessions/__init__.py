@@ -333,7 +333,6 @@ from omnigent.server.routes._sessions.common import (
     _session_sandbox_status_cache as _session_sandbox_status_cache,
     _session_status_cache as _session_status_cache,
     _session_terminal_pending_cache as _session_terminal_pending_cache,
-    _session_todos_cache as _session_todos_cache,
     get_server_host_registry as get_server_host_registry,
     get_server_runner_router as get_server_runner_router,
     set_server_host_registry as set_server_host_registry,

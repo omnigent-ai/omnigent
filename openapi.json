@@ -6858,7 +6858,7 @@
             "title": "Title"
           },
           "todos": {
-            "description": "Current Claude Code todo list items for `omnigent claude` sessions, as raw dicts from Claude's todo JSON file. Each dict has `content`, `status`, and `activeForm` keys. Empty list for non-claude-native sessions or when no todos have been reported yet. Sourced from the Omnigent server's in-memory `_session_todos_cache`.",
+            "description": "Current native Plan items reported by a harness. Each has `content`, `status`, and `activeForm`. Persisted in conversation metadata; empty before the first report or after an explicit clear.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -7330,7 +7330,7 @@
         "type": "object"
       },
       "SessionTodosEvent": {
-        "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets web render a\nlive todo panel in the right column without polling.",
+        "description": "Plan/TODO update from a native terminal-backed session.\n\nEmitted after an `external_session_todos` POST from a native\nharness forwarder, which captures structured Plan updates from\nClaude or Codex and forwards them to the Omnigent server. Lets web\nrender a live todo panel in the right column without polling.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -7351,7 +7351,7 @@
             "title": "Sequence Number"
           },
           "todos": {
-            "description": "Current todo items read from Claude's todo file. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, the gerund form) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is populated by `_session_todos_cache` at snapshot build time.",
+            "description": "Current native Plan/TODO items from a harness. Each entry is a raw dict with `content` (str), `status` (`\"pending\"` | `\"in_progress\"` | `\"completed\"`), and `activeForm` (str, display activity) keys, e.g. `[{\"content\": \"Fix the bug\", \"status\": \"in_progress\", \"activeForm\": \"Fixing the bug\"}]`. Category: **transient** (SSE-only). On reconnect, clients seed the panel from the session snapshot's `todos` field, which is restored from persisted metadata at snapshot build time.",
             "items": {
               "additionalProperties": true,
               "type": "object"

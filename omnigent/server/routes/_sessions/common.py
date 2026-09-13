@@ -570,9 +570,6 @@ _SESSION_UPDATES_MAX_WATCHED: int = 500
 _SHARED_DISCOVERY_KEY = "__all__"
 
 
-_session_todos_cache: dict[str, list[dict[str, Any]]] = {}
-
-
 _session_terminal_pending_cache: dict[str, bool] = {}
 
 
@@ -1074,7 +1071,6 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
-    "_session_todos_cache",
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",
