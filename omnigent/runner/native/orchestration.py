@@ -2535,7 +2535,8 @@ async def _auto_create_cursor_terminal(
     await _cancel_auto_forwarder_task(session_id)
     from omnigent.harnesses.cursor_native.bridge import (
         approve_mcp_server_for_workspace,
-        bridge_dir_for_session_id,
+        bridge_dir_for_bridge_id,
+        write_active_session_id,
         write_fork_preamble,
         write_hooks_config,
         write_mcp_config,
@@ -2548,7 +2549,15 @@ async def _auto_create_cursor_terminal(
     from omnigent.harnesses.cursor_native.status import clear_cursor_status_state
     from omnigent.harnesses.cursor_native.usage import clear_cursor_usage_state
 
-    bridge_dir = bridge_dir_for_session_id(session_id)
+    # A rotated conversation keeps the bridge dir of the conversation that
+    # launched the pane, named by the bridge-id label.
+    bridge_id = session_id
+    if server_client is not None:
+        bridge_id = await _cursor_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=session_id,
+        )
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
 
     # Shared native-terminal snapshot reader (workspace + terminal_launch_args
     # + model_override), also used by the pi-native launch.
@@ -2633,6 +2642,9 @@ async def _auto_create_cursor_terminal(
                 extra={"session_id": session_id},
             )
     write_mcp_config(Path(workspace), bridge_dir)
+    # Claim the pane for this conversation. The shared MCP bridge reads the same
+    # key, so pane-originated tool calls attribute to whoever owns it now.
+    write_active_session_id(bridge_dir, session_id)
     # Register the cursor ``stop`` hook that captures per-turn token usage into
     # the bridge dir for the usage forwarder below (see cursor_native_usage).
     write_hooks_config(Path(workspace), bridge_dir)
@@ -7696,7 +7708,7 @@ async def _delete_native_bridge_dirs(
     (antigravity/claude/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
     the per-target ``FileNotFoundError`` swallow makes wrong-harness / already-gone
     cases a no-op, while other ``OSError``s are logged at debug rather than hidden.
-    Antigravity/claude/codex/opencode bridge ids can be rotated via a session
+    Antigravity/claude/codex/cursor/opencode bridge ids can be rotated via a session
     label, so resolve those too (falling back to *session_id*, the un-rotated key);
     the remaining families key purely on *session_id*.
 
@@ -7723,7 +7735,10 @@ async def _delete_native_bridge_dirs(
         bridge_dir_for_bridge_id as codex_bridge_dir,
     )
     from omnigent.harnesses.cursor_native.bridge import (
-        bridge_dir_for_session_id as cursor_bridge_dir,
+        CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.harnesses.cursor_native.bridge import (
+        bridge_dir_for_bridge_id as cursor_bridge_dir,
     )
     from omnigent.harnesses.goose_native.bridge import (
         bridge_dir_for_session_id as goose_bridge_dir,
@@ -7764,6 +7779,7 @@ async def _delete_native_bridge_dirs(
         claude_bridge_dir(session_id),
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
+        cursor_bridge_dir(labels.get(CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         cursor_bridge_dir(session_id),
         goose_bridge_dir(session_id),
         hermes_bridge_dir(session_id),
@@ -7817,6 +7833,43 @@ async def _claude_native_bridge_id_for_session(
         )
     )
     bridge_id = labels.get(BRIDGE_ID_LABEL_KEY)
+    if isinstance(bridge_id, str) and bridge_id:
+        return bridge_id
+    return session_id
+
+
+async def _cursor_native_bridge_id_for_session(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    session_labels: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the bridge id label for a cursor-native session.
+
+    The cursor mirror of :func:`_claude_native_bridge_id_for_session`: a
+    ``/clear`` rotation binds a fresh conversation to the pane the original
+    conversation launched, and the label names that original conversation.
+
+    :param server_client: Omnigent server client used to fetch the session
+        snapshot.
+    :param session_id: Omnigent session/conversation id, e.g.
+        ``"conv_abc123"``.
+    :param session_labels: Labels already in hand, or ``None`` to fetch them.
+    :returns: Opaque bridge id from
+        ``omnigent.cursor_native.bridge_id`` when present, otherwise
+        *session_id* for a conversation that owns its own pane.
+    """
+    from omnigent.harnesses.cursor_native.bridge import CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY
+
+    labels = (
+        session_labels
+        if session_labels is not None
+        else await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+    )
+    bridge_id = labels.get(CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY)
     if isinstance(bridge_id, str) and bridge_id:
         return bridge_id
     return session_id

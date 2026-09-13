@@ -306,10 +306,12 @@ def test_builtin_native_provider_bridge_id_label_keys_match_constants() -> None:
     """
     from omnigent.harnesses.antigravity_native.bridge import ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY
     from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.harnesses.cursor_native.bridge import CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY
     from omnigent.harnesses.opencode_native.bridge import OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY
 
     expected = {
         "codex": CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+        "cursor": CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY,
         "opencode": OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
         "antigravity": ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     }
